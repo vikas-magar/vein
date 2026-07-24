@@ -1,0 +1,6 @@
+target/
+.idea/
+*.puffin
+*.spill
+docs
+.DS_Store

@@ -1,0 +1,15 @@
+[package]
+name = "vcs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+error = { path = "../error" }
+iceberg                 = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
+futures      = { workspace = true }
+moka = { workspace = true }
+rkyv = { workspace = true }
+tracing   = { workspace = true }
+
+[dev-dependencies]

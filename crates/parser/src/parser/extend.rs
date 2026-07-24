@@ -1,0 +1,67 @@
+use crate::token::TokenKind;
+use crate::parser::Parser;
+
+impl Parser {
+    pub(crate) fn parse_pipe_extend(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+        self.expect(TokenKind::Extend)?;
+        let mut items = Vec::new();
+        loop {
+            let expr = self.parse_expr()?;
+            let alias = if let Ok(TokenKind::As) = self.peek().map(|t| &t.kind) {
+                self.next_token()?;
+                Some(self.expect_ident()?)
+            } else { None };
+            items.push(crate::ast::pipe_op::SelectItem { expr, alias });
+            match self.peek().map(|t| &t.kind) {
+                Ok(TokenKind::Comma) => { self.next_token()?; }
+                _ => break,
+            }
+        }
+        Ok(crate::ast::pipe_op::PipeOperator::Extend { items })
+    }
+
+    pub(crate) fn parse_pipe_set(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+        self.expect(TokenKind::Set)?;
+        let mut assignments = Vec::new();
+        loop {
+            let col = self.expect_ident()?;
+            self.expect(TokenKind::Eq)?;
+            let expr = self.parse_expr()?;
+            assignments.push((col, expr));
+            match self.peek().map(|t| &t.kind) {
+                Ok(TokenKind::Comma) => { self.next_token()?; }
+                _ => break,
+            }
+        }
+        Ok(crate::ast::pipe_op::PipeOperator::Set { assignments })
+    }
+
+    pub(crate) fn parse_pipe_drop(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+        self.expect(TokenKind::Drop)?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_ident()?);
+            match self.peek().map(|t| &t.kind) {
+                Ok(TokenKind::Comma) => { self.next_token()?; }
+                _ => break,
+            }
+        }
+        Ok(crate::ast::pipe_op::PipeOperator::Drop { columns })
+    }
+
+    pub(crate) fn parse_pipe_rename(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+        self.expect(TokenKind::Rename)?;
+        let mut renames = Vec::new();
+        loop {
+            let from = self.expect_ident()?;
+            self.expect(TokenKind::As)?;
+            let to = self.expect_ident()?;
+            renames.push((from, to));
+            match self.peek().map(|t| &t.kind) {
+                Ok(TokenKind::Comma) => { self.next_token()?; }
+                _ => break,
+            }
+        }
+        Ok(crate::ast::pipe_op::PipeOperator::Rename { renames })
+    }
+}

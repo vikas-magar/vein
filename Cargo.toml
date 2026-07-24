@@ -1,0 +1,50 @@
+[package]
+name = "vein"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/vcs",
+    "crates/exec",
+    "crates/error",
+    "crates/parser"
+]
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+tokio = { version = "1", features = ["full"] }
+arrow = "59.1.0"
+arrow-array = "59.1.0"
+arrow-schema = "59.1.0"
+parquet = "59.1.0"
+s2n-quic = { version = "1.83.0", features = ["provider-tls-rustls"] }
+bytes = "1.0"
+libc = "0.2"
+tracing = "0.1"
+thiserror = "2.0.19"
+serde = { version = "1.0", features = ["derive"] }
+rkyv = { version = "=0.8.17", features = ["alloc"] }
+futures = "0.3"
+rand = "0.8"
+moka = { version = "0.12", features = ["future"] }
+iceberg = "0.10.0"
+iceberg-storage-opendal = { version = "0.10.0", features = ["opendal-fs", "opendal-s3"] }
+strum = { version = "0.26", features = ["derive"] }
+ordered-float = "4.0"
+
+[dependencies]
+common = { path = "crates/common" }
+parser = { path = "crates/parser" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1

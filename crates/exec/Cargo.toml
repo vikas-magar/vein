@@ -1,0 +1,17 @@
+[package]
+name = "exec"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../common" }
+error = { path = "../error" }
+tokio = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
