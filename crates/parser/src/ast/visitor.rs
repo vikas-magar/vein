@@ -20,51 +20,51 @@ impl Expr {
     fn accept_children<V: ExprVisitor>(&self, visitor: &mut V) -> Result<(), PlanError> {
         match self {
             Expr::BinaryOp { left, right, .. } => {
-                left.accept(visitor)?;
-                right.accept(visitor)
+                left.node.accept(visitor)?;
+                right.node.accept(visitor)
             }
-            Expr::UnaryOp { expr, .. } => expr.accept(visitor),
+            Expr::UnaryOp { expr, .. } => expr.node.accept(visitor),
             Expr::Function { args, .. } => {
                 for arg in args {
-                    arg.accept(visitor)?;
+                    arg.node.accept(visitor)?;
                 }
                 Ok(())
             }
             Expr::WindowFunction { args, partition_by, order_by, .. } => {
                 for arg in args {
-                    arg.accept(visitor)?;
+                    arg.node.accept(visitor)?;
                 }
                 for expr in partition_by {
-                    expr.accept(visitor)?;
+                    expr.node.accept(visitor)?;
                 }
                 for ob in order_by {
-                    ob.expr.accept(visitor)?;
+                    ob.expr.node.accept(visitor)?;
                 }
                 Ok(())
             }
             Expr::Case { operands, results, else_result, .. } => {
                 for op in operands {
-                    op.accept(visitor)?;
+                    op.node.accept(visitor)?;
                 }
                 for res in results {
-                    res.accept(visitor)?;
+                    res.node.accept(visitor)?;
                 }
                 if let Some(else_expr) = else_result {
-                    else_expr.accept(visitor)?;
+                    else_expr.node.accept(visitor)?;
                 }
                 Ok(())
             }
-            Expr::Cast { expr, .. } => expr.accept(visitor),
-            Expr::Alias { expr, .. } => expr.accept(visitor),
+            Expr::Cast { expr, .. } => expr.node.accept(visitor),
+            Expr::Alias { expr, .. } => expr.node.accept(visitor),
             Expr::Between { expr, low, high, .. } => {
-                expr.accept(visitor)?;
-                low.accept(visitor)?;
-                high.accept(visitor)
+                expr.node.accept(visitor)?;
+                low.node.accept(visitor)?;
+                high.node.accept(visitor)
             }
             Expr::InList { expr, list, .. } => {
-                expr.accept(visitor)?;
+                expr.node.accept(visitor)?;
                 for item in list {
-                    item.accept(visitor)?;
+                    item.node.accept(visitor)?;
                 }
                 Ok(())
             }
@@ -75,51 +75,51 @@ impl Expr {
     fn accept_children_mut<V: ExprVisitor>(&mut self, visitor: &mut V) -> Result<(), PlanError> {
         match self {
             Expr::BinaryOp { left, right, .. } => {
-                left.accept_mut(visitor)?;
-                right.accept_mut(visitor)
+                left.node.accept_mut(visitor)?;
+                right.node.accept_mut(visitor)
             }
-            Expr::UnaryOp { expr, .. } => expr.accept_mut(visitor),
+            Expr::UnaryOp { expr, .. } => expr.node.accept_mut(visitor),
             Expr::Function { args, .. } => {
                 for arg in args {
-                    arg.accept_mut(visitor)?;
+                    arg.node.accept_mut(visitor)?;
                 }
                 Ok(())
             }
             Expr::WindowFunction { args, partition_by, order_by, .. } => {
                 for arg in args {
-                    arg.accept_mut(visitor)?;
+                    arg.node.accept_mut(visitor)?;
                 }
                 for expr in partition_by {
-                    expr.accept_mut(visitor)?;
+                    expr.node.accept_mut(visitor)?;
                 }
                 for ob in order_by {
-                    ob.expr.accept_mut(visitor)?;
+                    ob.expr.node.accept_mut(visitor)?;
                 }
                 Ok(())
             }
             Expr::Case { operands, results, else_result, .. } => {
                 for op in operands {
-                    op.accept_mut(visitor)?;
+                    op.node.accept_mut(visitor)?;
                 }
                 for res in results {
-                    res.accept_mut(visitor)?;
+                    res.node.accept_mut(visitor)?;
                 }
                 if let Some(else_expr) = else_result {
-                    else_expr.accept_mut(visitor)?;
+                    else_expr.node.accept_mut(visitor)?;
                 }
                 Ok(())
             }
-            Expr::Cast { expr, .. } => expr.accept_mut(visitor),
-            Expr::Alias { expr, .. } => expr.accept_mut(visitor),
+            Expr::Cast { expr, .. } => expr.node.accept_mut(visitor),
+            Expr::Alias { expr, .. } => expr.node.accept_mut(visitor),
             Expr::Between { expr, low, high, .. } => {
-                expr.accept_mut(visitor)?;
-                low.accept_mut(visitor)?;
-                high.accept_mut(visitor)
+                expr.node.accept_mut(visitor)?;
+                low.node.accept_mut(visitor)?;
+                high.node.accept_mut(visitor)
             }
             Expr::InList { expr, list, .. } => {
-                expr.accept_mut(visitor)?;
+                expr.node.accept_mut(visitor)?;
                 for item in list {
-                    item.accept_mut(visitor)?;
+                    item.node.accept_mut(visitor)?;
                 }
                 Ok(())
             }
@@ -152,25 +152,23 @@ mod tests {
 
     #[test]
     fn test_column_collector_recursive() {
-        // a + b + c  =>  BinaryOp(Plus, BinaryOp(Plus, Column(a), Column(b)), Column(c))
-        let c = Expr::Column { table: None, column: "c".into(), span: Default::default() };
-        let b = Expr::Column { table: None, column: "b".into(), span: Default::default() };
-        let a = Expr::Column { table: None, column: "a".into(), span: Default::default() };
-        let ab = Expr::BinaryOp {
+        use crate::ast::expr::SpannedExpr;
+        let c = SpannedExpr { span: Default::default(), node: Expr::Column { table: None, column: "c".into() } };
+        let b = SpannedExpr { span: Default::default(), node: Expr::Column { table: None, column: "b".into() } };
+        let a = SpannedExpr { span: Default::default(), node: Expr::Column { table: None, column: "a".into() } };
+        let ab = SpannedExpr { span: Default::default(), node: Expr::BinaryOp {
             left: Box::new(a),
             op: BinaryOp::Plus,
             right: Box::new(b),
-            span: Default::default(),
-        };
-        let abc = Expr::BinaryOp {
+        }};
+        let abc = SpannedExpr { span: Default::default(), node: Expr::BinaryOp {
             left: Box::new(ab),
             op: BinaryOp::Plus,
             right: Box::new(c),
-            span: Default::default(),
-        };
+        }};
 
         let mut collector = ColumnCollector { columns: vec![] };
-        abc.accept(&mut collector).unwrap();
+        abc.node.accept(&mut collector).unwrap();
 
         assert_eq!(collector.columns.len(), 3);
         assert_eq!(collector.columns[0].1, "a");
@@ -180,19 +178,18 @@ mod tests {
 
     #[test]
     fn test_inlist_visits_children() {
-        // x IN (1, y)  =>  InList { expr: Column(x), list: [Literal(1), Column(y)] }
-        let x = Expr::Column { table: None, column: "x".into(), span: Default::default() };
-        let y = Expr::Column { table: None, column: "y".into(), span: Default::default() };
-        let one = Expr::Literal(Literal::Int(1), Default::default());
-        let inlist = Expr::InList {
+        use crate::ast::expr::SpannedExpr;
+        let x = SpannedExpr { span: Default::default(), node: Expr::Column { table: None, column: "x".into() } };
+        let y = SpannedExpr { span: Default::default(), node: Expr::Column { table: None, column: "y".into() } };
+        let one = SpannedExpr { span: Default::default(), node: Expr::Literal(Literal::Int(1)) };
+        let inlist = SpannedExpr { span: Default::default(), node: Expr::InList {
             expr: Box::new(x),
             list: vec![one, y],
             negated: false,
-            span: Default::default(),
-        };
+        }};
 
         let mut collector = ColumnCollector { columns: vec![] };
-        inlist.accept(&mut collector).unwrap();
+        inlist.node.accept(&mut collector).unwrap();
 
         assert_eq!(collector.columns.len(), 2);
         assert_eq!(collector.columns[0].1, "x");

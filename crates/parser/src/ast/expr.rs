@@ -3,66 +3,40 @@ use crate::ast::data_type::DataType;
 use crate::ast::query::Query;
 use crate::token::Span;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Spanned<T> {
+    pub node: T,
+    pub span: Span,
+}
+
+pub type SpannedExpr = Spanned<Expr>;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
-    Column { table: Option<String>, column: String, span: Span },
-    Wildcard { table: Option<String>, span: Span },
-    Literal(Literal, Span),
-    BinaryOp { left: Box<Expr>, op: BinaryOp, right: Box<Expr>, span: Span },
-    UnaryOp { op: UnaryOp, expr: Box<Expr>, span: Span },
-    Function { name: String, args: Vec<Expr>, distinct: bool, span: Span },
+    Column { table: Option<String>, column: String },
+    Wildcard { table: Option<String> },
+    Literal(Literal),
+    BinaryOp { left: Box<SpannedExpr>, op: BinaryOp, right: Box<SpannedExpr> },
+    UnaryOp { op: UnaryOp, expr: Box<SpannedExpr> },
+    Function { name: String, args: Vec<SpannedExpr>, distinct: bool },
     WindowFunction {
         name: String,
-        args: Vec<Expr>,
+        args: Vec<SpannedExpr>,
         distinct: bool,
-        partition_by: Vec<Expr>,
+        partition_by: Vec<SpannedExpr>,
         order_by: Vec<super::pipe_op::OrderByExpr>,
         window_frame: Option<super::pipe_op::WindowFrame>,
-        span: Span,
     },
-    Case { operands: Vec<Expr>, results: Vec<Expr>, else_result: Option<Box<Expr>>, span: Span },
-    Cast { expr: Box<Expr>, data_type: DataType, span: Span },
-    Subquery(Box<Query>, Span),
-    Alias { expr: Box<Expr>, alias: String, span: Span },
-    Between { expr: Box<Expr>, low: Box<Expr>, high: Box<Expr>, negated: bool, span: Span },
-    InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool, span: Span },
-    Like { expr: Box<Expr>, pattern: Box<Expr>, negated: bool, span: Span },
-    Exists { subquery: Box<Query>, negated: bool, span: Span },
-    ScalarSubquery(Box<Query>, Span),
-    TypedString { data_type: DataType, value: String, span: Span },
-}
-
-impl Expr {
-    pub fn span(&self) -> Span {
-        match self {
-            Self::Column { span, .. } => *span,
-            Self::Wildcard { span, .. } => *span,
-            Self::Literal(_, span) => *span,
-            Self::BinaryOp { span, .. } => *span,
-            Self::UnaryOp { span, .. } => *span,
-            Self::Function { span, .. } => *span,
-            Self::WindowFunction { span, .. } => *span,
-            Self::Case { span, .. } => *span,
-            Self::Cast { span, .. } => *span,
-            Self::Subquery(_, span) => *span,
-            Self::Alias { span, .. } => *span,
-            Self::Between { span, .. } => *span,
-            Self::InList { span, .. } => *span,
-            Self::Like { span, .. } => *span,
-            Self::Exists { span, .. } => *span,
-            Self::ScalarSubquery(_, span) => *span,
-            Self::TypedString { span, .. } => *span,
-        }
-    }
-}
-
-impl PartialEq for Expr {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Literal(a, _), Self::Literal(b, _)) => a == b,
-            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
-        }
-    }
+    Case { operands: Vec<SpannedExpr>, results: Vec<SpannedExpr>, else_result: Option<Box<SpannedExpr>> },
+    Cast { expr: Box<SpannedExpr>, data_type: DataType },
+    Subquery(Box<Query>),
+    Alias { expr: Box<SpannedExpr>, alias: String },
+    Between { expr: Box<SpannedExpr>, low: Box<SpannedExpr>, high: Box<SpannedExpr>, negated: bool },
+    InList { expr: Box<SpannedExpr>, list: Vec<SpannedExpr>, negated: bool },
+    Like { expr: Box<SpannedExpr>, pattern: Box<SpannedExpr>, negated: bool },
+    Exists { subquery: Box<Query>, negated: bool },
+    ScalarSubquery(Box<Query>),
+    TypedString { data_type: DataType, value: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]

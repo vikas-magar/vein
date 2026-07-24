@@ -10,7 +10,7 @@ fn parse_query(input: &str) -> Result<Query, ParseError> {
     Parser::new(input).parse_query()
 }
 
-fn parse_expr(input: &str) -> Result<Expr, ParseError> {
+fn parse_expr(input: &str) -> Result<parser::ast::expr::SpannedExpr, ParseError> {
     let wrapped = format!("FROM t |> SELECT {}", input);
     let query = parse_query(&wrapped)?;
     match query.pipes.into_iter().next() {
@@ -89,19 +89,19 @@ fn test_aggregate() {
 #[test]
 fn test_window_frame_rows() {
     let expr = parse_expr("sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)").unwrap();
-    assert!(matches!(expr, Expr::WindowFunction { .. }));
+    assert!(matches!(expr.node, Expr::WindowFunction { .. }));
 }
 
 #[test]
 fn test_window_frame_unbounded() {
     let expr = parse_expr("sum(x) OVER (ROWS UNBOUNDED PRECEDING)").unwrap();
-    assert!(matches!(expr, Expr::WindowFunction { .. }));
+    assert!(matches!(expr.node, Expr::WindowFunction { .. }));
 }
 
 #[test]
 fn test_window_frame_current_row() {
     let expr = parse_expr("sum(x) OVER (ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)").unwrap();
-    assert!(matches!(expr, Expr::WindowFunction { .. }));
+    assert!(matches!(expr.node, Expr::WindowFunction { .. }));
 }
 
 #[test]
@@ -141,43 +141,43 @@ fn test_incomplete_pipe() {
 #[test]
 fn test_scalar_subquery() {
     let expr = parse_expr("(FROM t |> SELECT count(*))").unwrap();
-    assert!(matches!(expr, Expr::ScalarSubquery(_, _)));
+    assert!(matches!(expr.node, Expr::ScalarSubquery(_)));
 }
 
 #[test]
 fn test_exists_subquery() {
     let expr = parse_expr("EXISTS (FROM t |> SELECT 1)").unwrap();
-    assert!(matches!(expr, Expr::Exists { negated: false, .. }));
+    assert!(matches!(expr.node, Expr::Exists { negated: false, .. }));
 }
 
 #[test]
 fn test_not_exists_subquery() {
     let expr = parse_expr("NOT EXISTS (FROM t |> SELECT 1)").unwrap();
-    assert!(matches!(expr, Expr::Exists { negated: true, .. }));
+    assert!(matches!(expr.node, Expr::Exists { negated: true, .. }));
 }
 
 #[test]
 fn test_typed_string() {
     let expr = parse_expr("DATE '2024-01-01'").unwrap();
-    assert!(matches!(expr, Expr::TypedString { .. }));
+    assert!(matches!(expr.node, Expr::TypedString { .. }));
 }
 
 #[test]
 fn test_interval_literal() {
     let expr = parse_expr("INTERVAL '1 day'").unwrap();
-    assert!(matches!(expr, Expr::TypedString { data_type: parser::ast::data_type::DataType::Interval { .. }, .. }));
+    assert!(matches!(expr.node, Expr::TypedString { data_type: parser::ast::data_type::DataType::Interval { .. }, .. }));
 }
 
 #[test]
 fn test_in_subquery() {
     let expr = parse_expr("x IN (FROM t |> SELECT id)").unwrap();
-    assert!(matches!(expr, Expr::InList { .. }));
+    assert!(matches!(expr.node, Expr::InList { .. }));
 }
 
 #[test]
 fn test_not_in_subquery() {
     let expr = parse_expr("x NOT IN (FROM t |> SELECT id)").unwrap();
-    assert!(matches!(expr, Expr::InList { negated: true, .. }));
+    assert!(matches!(expr.node, Expr::InList { negated: true, .. }));
 }
 
 #[test]

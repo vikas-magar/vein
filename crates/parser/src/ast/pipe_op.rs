@@ -1,22 +1,22 @@
-use crate::ast::expr::Expr;
+use crate::ast::expr::SpannedExpr;
 use crate::ast::query::{Query, SetOpKind};
 use crate::logical_plan::JoinType;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PipeOperator {
     Select { items: Vec<SelectItem> },
-    Where { predicate: Expr },
-    Aggregate { group_by: Vec<Expr>, aggregates: Vec<AggregateExpr> },
+    Where { predicate: SpannedExpr },
+    Aggregate { group_by: Vec<SpannedExpr>, aggregates: Vec<AggregateExpr> },
     OrderBy { order_bys: Vec<OrderByExpr> },
     Limit { limit: u64, offset: u64 },
     Extend { items: Vec<SelectItem> },
-    Set { assignments: Vec<(String, Expr)> },
+    Set { assignments: Vec<(String, SpannedExpr)> },
     Drop { columns: Vec<String> },
     Rename { renames: Vec<(String, String)> },
     As { alias: String },
     Distinct,
     Join { join: JoinClause },
-    Call { name: String, args: Vec<Expr> },
+    Call { name: String, args: Vec<SpannedExpr> },
     TableSample { method: String, percent: f64 },
     Assert { condition: String, message: Option<String> },
     SetOp { kind: SetOpKind, right: Box<Query>, all: bool },
@@ -28,19 +28,19 @@ pub enum PipeOperator {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SelectItem {
-    pub expr: Expr,
+    pub expr: SpannedExpr,
     pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AggregateExpr {
-    pub expr: Expr,
+    pub expr: SpannedExpr,
     pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OrderByExpr {
-    pub expr: Expr,
+    pub expr: SpannedExpr,
     pub asc: bool,
     pub nulls_first: bool,
 }
@@ -72,7 +72,7 @@ pub enum WindowFrameBound {
 pub struct JoinClause {
     pub join_type: JoinType,
     pub right: Box<Query>,
-    pub predicate: Option<Expr>,
+    pub predicate: Option<SpannedExpr>,
     pub using: Vec<String>,
 }
 

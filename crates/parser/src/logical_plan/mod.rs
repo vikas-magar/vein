@@ -6,7 +6,7 @@ pub use builder::PlanBuilder;
 pub use error::PlanError;
 pub use tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 
-use crate::ast::expr::Expr;
+use crate::ast::expr::SpannedExpr;
 use crate::ast::pipe_op::OrderByExpr;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14,23 +14,23 @@ pub enum LogicalPlan {
     Scan {
         source: ScanSource,
         projection: Option<Vec<String>>,
-        filters: Vec<Expr>,
+        filters: Vec<SpannedExpr>,
         limit: Option<usize>,
     },
-    Filter { predicate: Expr, input: Box<LogicalPlan> },
-    Projection { expr: Vec<Expr>, input: Box<LogicalPlan> },
-    Aggregate { group_expr: Vec<Expr>, aggregate_expr: Vec<Expr>, input: Box<LogicalPlan> },
+    Filter { predicate: SpannedExpr, input: Box<LogicalPlan> },
+    Projection { expr: Vec<SpannedExpr>, input: Box<LogicalPlan> },
+    Aggregate { group_expr: Vec<SpannedExpr>, aggregate_expr: Vec<SpannedExpr>, input: Box<LogicalPlan> },
     Sort { order_by: Vec<OrderByExpr>, input: Box<LogicalPlan> },
     Limit { limit: usize, offset: usize, input: Box<LogicalPlan> },
     Distinct { input: Box<LogicalPlan> },
-    Join { join_type: JoinType, left: Box<LogicalPlan>, right: Box<LogicalPlan>, predicate: Option<Expr>, using: Vec<String> },
+    Join { join_type: JoinType, left: Box<LogicalPlan>, right: Box<LogicalPlan>, predicate: Option<SpannedExpr>, using: Vec<String> },
     TableAlias { alias: String, input: Box<LogicalPlan> },
     SubqueryAlias { alias: String, input: Box<LogicalPlan> },
     SetOp { kind: SetOpType, all: bool, left: Box<LogicalPlan>, right: Box<LogicalPlan> },
-    Extend { items: Vec<Expr>, input: Box<LogicalPlan> },
+    Extend { items: Vec<SpannedExpr>, input: Box<LogicalPlan> },
     Drop { columns: Vec<String>, input: Box<LogicalPlan> },
     Assert { condition: String, message: Option<String>, input: Box<LogicalPlan> },
-    Call { name: String, args: Vec<Expr> },
+    Call { name: String, args: Vec<SpannedExpr> },
     Write { target: crate::ast::pipe_op::WriteTarget, input: Box<LogicalPlan> },
     With { ctes: Vec<crate::ast::pipe_op::CommonTableExpr>, input: Box<LogicalPlan> },
     Empty,

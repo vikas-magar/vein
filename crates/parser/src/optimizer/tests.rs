@@ -1,7 +1,7 @@
 use ordered_float::OrderedFloat;
 
 use crate::ast::data_type::DataType;
-use crate::ast::expr::{BinaryOp, Expr, Literal};
+use crate::ast::expr::{BinaryOp, Expr, Literal, SpannedExpr};
 use crate::logical_plan::{LogicalPlan, ScanSource, TreeNode};
 use crate::optimizer::optimize;
 use crate::token::Span;
@@ -19,64 +19,64 @@ fn scan(name: &str) -> LogicalPlan {
     }
 }
 
-fn filter(pred: Expr, input: LogicalPlan) -> LogicalPlan {
+fn filter(pred: SpannedExpr, input: LogicalPlan) -> LogicalPlan {
     LogicalPlan::Filter { predicate: pred, input: Box::new(input) }
 }
 
-fn project(exprs: Vec<Expr>, input: LogicalPlan) -> LogicalPlan {
+fn project(exprs: Vec<SpannedExpr>, input: LogicalPlan) -> LogicalPlan {
     LogicalPlan::Projection { expr: exprs, input: Box::new(input) }
 }
 
-fn col(name: &str) -> Expr {
-    Expr::Column { table: None, column: name.to_string(), span: span() }
+fn col(name: &str) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::Column { table: None, column: name.to_string() } }
 }
 
-fn int(n: i64) -> Expr {
-    Expr::Literal(Literal::Int(n), span())
+fn int(n: i64) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::Literal(Literal::Int(n)) }
 }
 
-fn float(n: f64) -> Expr {
-    Expr::Literal(Literal::Float(OrderedFloat(n)), span())
+fn float(n: f64) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::Literal(Literal::Float(OrderedFloat(n))) }
 }
 
-fn strlit(s: &str) -> Expr {
-    Expr::Literal(Literal::String(s.to_string()), span())
+fn strlit(s: &str) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::Literal(Literal::String(s.to_string())) }
 }
 
-fn typed_string_date(value: &str) -> Expr {
-    Expr::TypedString { data_type: DataType::Date, value: value.to_string(), span: span() }
+fn typed_string_date(value: &str) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::TypedString { data_type: DataType::Date, value: value.to_string() } }
 }
 
-fn between(expr: Expr, low: Expr, high: Expr) -> Expr {
-    Expr::Between { expr: Box::new(expr), low: Box::new(low), high: Box::new(high), negated: false, span: span() }
+fn between(expr: SpannedExpr, low: SpannedExpr, high: SpannedExpr) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::Between { expr: Box::new(expr), low: Box::new(low), high: Box::new(high), negated: false } }
 }
 
-fn gt(left: Expr, right: Expr) -> Expr {
-    Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(left), right: Box::new(right), span: span() }
+fn gt(left: SpannedExpr, right: SpannedExpr) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(left), right: Box::new(right) } }
 }
 
-fn ge(left: Expr, right: Expr) -> Expr {
-    Expr::BinaryOp { op: BinaryOp::Geq, left: Box::new(left), right: Box::new(right), span: span() }
+fn ge(left: SpannedExpr, right: SpannedExpr) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Geq, left: Box::new(left), right: Box::new(right) } }
 }
 
-fn lt(left: Expr, right: Expr) -> Expr {
-    Expr::BinaryOp { op: BinaryOp::Lt, left: Box::new(left), right: Box::new(right), span: span() }
+fn lt(left: SpannedExpr, right: SpannedExpr) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Lt, left: Box::new(left), right: Box::new(right) } }
 }
 
-fn eq(left: Expr, right: Expr) -> Expr {
-    Expr::BinaryOp { op: BinaryOp::Eq, left: Box::new(left), right: Box::new(right), span: span() }
+fn eq(left: SpannedExpr, right: SpannedExpr) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Eq, left: Box::new(left), right: Box::new(right) } }
 }
 
-fn and(left: Expr, right: Expr) -> Expr {
-    Expr::BinaryOp { op: BinaryOp::And, left: Box::new(left), right: Box::new(right), span: span() }
+fn and(left: SpannedExpr, right: SpannedExpr) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::And, left: Box::new(left), right: Box::new(right) } }
 }
 
-fn or(left: Expr, right: Expr) -> Expr {
-    Expr::BinaryOp { op: BinaryOp::Or, left: Box::new(left), right: Box::new(right), span: span() }
+fn or(left: SpannedExpr, right: SpannedExpr) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Or, left: Box::new(left), right: Box::new(right) } }
 }
 
-fn in_list(expr: Expr, items: Vec<Expr>) -> Expr {
-    Expr::InList { expr: Box::new(expr), list: items, negated: false, span: span() }
+fn in_list(expr: SpannedExpr, items: Vec<SpannedExpr>) -> SpannedExpr {
+    SpannedExpr { span: span(), node: Expr::InList { expr: Box::new(expr), list: items, negated: false } }
 }
 
 /// Count Filter nodes in a plan tree.
@@ -95,7 +95,7 @@ fn count_filter_nodes(plan: &LogicalPlan) -> usize {
 #[test]
 fn test_filter_pushdown_simple() {
     let plan = filter(
-        Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("x")), right: Box::new(int(5)), span: span() },
+        SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("x")), right: Box::new(int(5)) } },
         scan("t"),
     );
     let (optimized, fired) = optimize(&plan, None);
@@ -109,7 +109,7 @@ fn test_filter_pushdown_simple() {
 #[test]
 fn test_filter_pushdown_double_evaluation() {
     let plan = filter(
-        Expr::BinaryOp { op: BinaryOp::Eq, left: Box::new(col("a")), right: Box::new(int(1)), span: span() },
+        SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Eq, left: Box::new(col("a")), right: Box::new(int(1)) } },
         scan("t"),
     );
     let (optimized, _) = optimize(&plan, None);
@@ -119,15 +119,15 @@ fn test_filter_pushdown_double_evaluation() {
 
 #[test]
 fn test_filter_pushdown_partial() {
-    let pushable = Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("x")), right: Box::new(int(5)), span: span() };
-    let non_pushable = Expr::BinaryOp {
+    let pushable = SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("x")), right: Box::new(int(5)) } };
+    let non_pushable = SpannedExpr { span: span(), node: Expr::BinaryOp {
         op: BinaryOp::Gt,
-        left: Box::new(Expr::BinaryOp {
-            op: BinaryOp::Plus, left: Box::new(col("x")), right: Box::new(int(1)), span: span(),
-        }),
-        right: Box::new(int(10)), span: span(),
-    };
-    let conjunct = Expr::BinaryOp { op: BinaryOp::And, left: Box::new(pushable), right: Box::new(non_pushable), span: span() };
+        left: Box::new(SpannedExpr { span: span(), node: Expr::BinaryOp {
+            op: BinaryOp::Plus, left: Box::new(col("x")), right: Box::new(int(1))
+        } }),
+        right: Box::new(int(10)),
+    } };
+    let conjunct = SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::And, left: Box::new(pushable), right: Box::new(non_pushable) } };
     let plan = filter(conjunct, scan("t"));
     let (optimized, fired) = optimize(&plan, None);
     assert!(fired.contains(&"filter_pushdown"));
@@ -145,7 +145,7 @@ fn test_filter_pushdown_partial() {
 #[test]
 fn test_filter_below_projection() {
     let plan = filter(
-        Expr::BinaryOp { op: BinaryOp::Eq, left: Box::new(col("a")), right: Box::new(int(1)), span: span() },
+        SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Eq, left: Box::new(col("a")), right: Box::new(int(1)) } },
         project(vec![col("a"), col("b")], scan("t")),
     );
     let (optimized, fired) = optimize(&plan, None);
@@ -192,7 +192,7 @@ fn test_limit_pushdown_blocked_by_filter() {
     let plan = LogicalPlan::Limit {
         limit: 10, offset: 0,
         input: Box::new(filter(
-            Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)), span: span() },
+            SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)) } },
             scan("t"),
         )),
     };
@@ -226,9 +226,9 @@ fn test_projection_pushdown_aggregate() {
         vec![col("x")],
         LogicalPlan::Aggregate {
             group_expr: vec![col("x")],
-            aggregate_expr: vec![Expr::Function {
-                name: "sum".into(), args: vec![col("y")], distinct: false, span: span(),
-            }],
+            aggregate_expr: vec![SpannedExpr { span: span(), node: Expr::Function {
+                name: "sum".into(), args: vec![col("y")], distinct: false
+            } }],
             input: Box::new(scan("t")),
         },
     );
@@ -257,7 +257,7 @@ fn test_multi_pass_pipeline() {
         input: Box::new(project(
             vec![col("a")],
             filter(
-                Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)), span: span() },
+                SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)) } },
                 scan("t"),
             ),
         )),
@@ -284,7 +284,7 @@ fn test_optimizer_convergence() {
         input: Box::new(project(
             vec![col("a")],
             filter(
-                Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)), span: span() },
+                SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)) } },
                 scan("t"),
             ),
         )),
@@ -373,13 +373,13 @@ fn test_filter_remaining_preserved_through_aggregate() {
     // should keep ALL predicates (no silent dropping of remaining).
     let pred = and(
         gt(col("x"), int(5)),
-        Expr::BinaryOp {
+        SpannedExpr { span: span(), node: Expr::BinaryOp {
             op: BinaryOp::Gt,
-            left: Box::new(Expr::BinaryOp {
-                op: BinaryOp::Plus, left: Box::new(col("x")), right: Box::new(int(1)), span: span(),
-            }),
-            right: Box::new(int(10)), span: span(),
-        },
+            left: Box::new(SpannedExpr { span: span(), node: Expr::BinaryOp {
+                op: BinaryOp::Plus, left: Box::new(col("x")), right: Box::new(int(1))
+            } }),
+            right: Box::new(int(10)),
+        } },
     );
     let agg = LogicalPlan::Aggregate {
         group_expr: vec![col("x")],
@@ -405,14 +405,14 @@ fn test_filter_remaining_preserved_through_aggregate() {
     }
 }
 
-fn split_conjunction_for_test(expr: &Expr) -> Vec<Expr> {
-    match expr {
+fn split_conjunction_for_test(expr: &SpannedExpr) -> Vec<SpannedExpr> {
+    match &expr.node {
         Expr::BinaryOp { op: BinaryOp::And, left, right, .. } => {
             let mut result = split_conjunction_for_test(left);
             result.extend(split_conjunction_for_test(right));
             result
         }
-        other => vec![other.clone()],
+        _other => vec![expr.clone()],
     }
 }
 

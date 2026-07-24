@@ -10,7 +10,7 @@ pub use projection_pushdown::ProjectionPushdown;
 mod tests {
     use super::*;
     use crate::logical_plan::{LogicalPlan, ScanSource};
-    use crate::ast::expr::{BinaryOp, Expr, Literal};
+    use crate::ast::expr::{BinaryOp, Expr, Literal, SpannedExpr};
     use crate::optimizer::OptimizerRule;
     use crate::token::Span;
 
@@ -27,25 +27,25 @@ mod tests {
         }
     }
 
-    fn filter(pred: Expr, input: LogicalPlan) -> LogicalPlan {
+    fn filter(pred: SpannedExpr, input: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Filter { predicate: pred, input: Box::new(input) }
     }
 
-    fn project(exprs: Vec<Expr>, input: LogicalPlan) -> LogicalPlan {
+    fn project(exprs: Vec<SpannedExpr>, input: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Projection { expr: exprs, input: Box::new(input) }
     }
 
-    fn col(name: &str) -> Expr {
-        Expr::Column { table: None, column: name.to_string(), span: span() }
+    fn col(name: &str) -> SpannedExpr {
+        SpannedExpr { span: span(), node: Expr::Column { table: None, column: name.to_string() } }
     }
 
-    fn int(n: i64) -> Expr {
-        Expr::Literal(Literal::Int(n), span())
+    fn int(n: i64) -> SpannedExpr {
+        SpannedExpr { span: span(), node: Expr::Literal(Literal::Int(n)) }
     }
 
     #[test]
     fn test_filter_into_scan() {
-        let plan = filter(Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)), span: span() }, scan("t"));
+        let plan = filter(SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)) } }, scan("t"));
         let result = FilterPushdown.apply(&plan).unwrap();
         assert!(result.transformed);
         match result.data {
@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn test_filter_below_projection() {
         let plan = filter(
-            Expr::BinaryOp { op: BinaryOp::Eq, left: Box::new(col("a")), right: Box::new(int(1)), span: span() },
+            SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Eq, left: Box::new(col("a")), right: Box::new(int(1)) } },
             project(vec![col("a"), col("b")], scan("t")),
         );
         let result = FilterPushdown.apply(&plan).unwrap();
@@ -133,7 +133,7 @@ mod tests {
             input: Box::new(project(
                 vec![col("a"), col("b")],
                 filter(
-                    Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)), span: span() },
+                    SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)) } },
                     scan("t"),
                 ),
             )),
@@ -154,20 +154,19 @@ mod tests {
     #[test]
     fn test_filter_partial_pushdown() {
         // Filter with a mix of pushable (col > 1) and non-pushable (col + 1 > 2) predicates
-        let and_pred = Expr::BinaryOp {
+        let and_pred = SpannedExpr { span: span(), node: Expr::BinaryOp {
             op: BinaryOp::And,
-            left: Box::new(Expr::BinaryOp {
-                op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)), span: span(),
-            }),
-            right: Box::new(Expr::BinaryOp {
+            left: Box::new(SpannedExpr { span: span(), node: Expr::BinaryOp {
+                op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)),
+            } }),
+            right: Box::new(SpannedExpr { span: span(), node: Expr::BinaryOp {
                 op: BinaryOp::Gt,
-                left: Box::new(Expr::BinaryOp {
-                    op: BinaryOp::Plus, left: Box::new(col("a")), right: Box::new(int(1)), span: span(),
-                }),
-                right: Box::new(int(2)), span: span(),
-            }),
-            span: span(),
-        };
+                left: Box::new(SpannedExpr { span: span(), node: Expr::BinaryOp {
+                    op: BinaryOp::Plus, left: Box::new(col("a")), right: Box::new(int(1)),
+                } }),
+                right: Box::new(int(2)),
+            } }),
+        } };
         let plan = filter(and_pred, scan("t"));
         let result = FilterPushdown.apply(&plan).unwrap();
         assert!(result.transformed);
@@ -188,13 +187,13 @@ mod tests {
     #[test]
     fn test_filter_non_pushable_retained() {
         // Filter with only non-pushable predicates
-        let expr = Expr::BinaryOp {
+        let expr = SpannedExpr { span: span(), node: Expr::BinaryOp {
             op: BinaryOp::Gt,
-            left: Box::new(Expr::BinaryOp {
-                op: BinaryOp::Plus, left: Box::new(col("a")), right: Box::new(int(1)), span: span(),
-            }),
-            right: Box::new(int(2)), span: span(),
-        };
+            left: Box::new(SpannedExpr { span: span(), node: Expr::BinaryOp {
+                op: BinaryOp::Plus, left: Box::new(col("a")), right: Box::new(int(1)),
+            } }),
+            right: Box::new(int(2)),
+        } };
         let plan = filter(expr.clone(), scan("t"));
         let result = FilterPushdown.apply(&plan).unwrap();
         assert!(!result.transformed);
@@ -249,7 +248,7 @@ mod tests {
             input: Box::new(project(
                 vec![col("a")],
                 filter(
-                    Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)), span: span() },
+                    SpannedExpr { span: span(), node: Expr::BinaryOp { op: BinaryOp::Gt, left: Box::new(col("a")), right: Box::new(int(1)) } },
                     scan("t"),
                 ),
             )),

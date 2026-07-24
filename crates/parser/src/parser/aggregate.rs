@@ -52,10 +52,12 @@ impl Parser {
                 };
 
                 let final_expr = match alias {
-                    Some(a) => crate::ast::expr::Expr::Alias {
-                        span: expr.span(),
-                        expr: Box::new(expr),
-                        alias: a,
+                    Some(a) => crate::ast::expr::SpannedExpr {
+                        span: expr.span,
+                        node: crate::ast::expr::Expr::Alias {
+                            expr: Box::new(expr),
+                            alias: a,
+                        },
                     },
                     None => expr,
                 };
@@ -120,7 +122,7 @@ mod tests {
             assert_eq!(group_by.len(), 2, "Should have 2 group_by expressions");
             // y AS year is an alias expression
             assert!(
-                matches!(group_by[0], crate::ast::expr::Expr::Alias { ref alias, .. } if alias == "year")
+                matches!(group_by[0].node, crate::ast::expr::Expr::Alias { ref alias, .. } if alias == "year")
             );
         } else {
             panic!("Expected Aggregate");

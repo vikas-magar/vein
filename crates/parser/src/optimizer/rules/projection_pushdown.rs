@@ -68,7 +68,7 @@ impl OptimizerRule for ProjectionPushdown {
     }
 }
 
-fn extract_column_names(exprs: &[Expr]) -> Vec<String> {
+fn extract_column_names(exprs: &[crate::ast::expr::SpannedExpr]) -> Vec<String> {
     let mut cols = Vec::new();
     for e in exprs {
         collect_columns(e, &mut cols);
@@ -76,8 +76,9 @@ fn extract_column_names(exprs: &[Expr]) -> Vec<String> {
     cols
 }
 
-fn collect_columns(expr: &Expr, cols: &mut Vec<String>) {
-    match expr {
+use crate::ast::expr::SpannedExpr;
+fn collect_columns(expr: &SpannedExpr, cols: &mut Vec<String>) {
+    match &expr.node {
         Expr::Column { column, .. } => {
             if !cols.contains(column) {
                 cols.push(column.clone());
@@ -87,7 +88,7 @@ fn collect_columns(expr: &Expr, cols: &mut Vec<String>) {
             collect_columns(left, cols);
             collect_columns(right, cols);
         }
-        Expr::UnaryOp { expr: inner, .. } => collect_columns(inner, cols),
+        Expr::UnaryOp { expr: inner, .. } => collect_columns(inner.as_ref(), cols),
         Expr::Function { args, .. } => {
             for a in args {
                 collect_columns(a, cols);
@@ -104,15 +105,15 @@ fn collect_columns(expr: &Expr, cols: &mut Vec<String>) {
                 collect_columns(&o.expr, cols);
             }
         }
-        Expr::Cast { expr: inner, .. } => collect_columns(inner, cols),
-        Expr::Alias { expr: inner, .. } => collect_columns(inner, cols),
+        Expr::Cast { expr: inner, .. } => collect_columns(inner.as_ref(), cols),
+        Expr::Alias { expr: inner, .. } => collect_columns(inner.as_ref(), cols),
         Expr::Between { expr: inner, low, high, .. } => {
-            collect_columns(inner, cols);
-            collect_columns(low, cols);
-            collect_columns(high, cols);
+            collect_columns(inner.as_ref(), cols);
+            collect_columns(low.as_ref(), cols);
+            collect_columns(high.as_ref(), cols);
         }
         Expr::InList { expr: inner, list, .. } => {
-            collect_columns(inner, cols);
+            collect_columns(inner.as_ref(), cols);
             for l in list {
                 collect_columns(l, cols);
             }

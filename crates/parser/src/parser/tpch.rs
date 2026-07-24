@@ -154,41 +154,41 @@ mod tests {
 
     // --- helper functions ---
 
-    fn contains_between(expr: &Expr) -> bool {
-        match expr {
+    fn contains_between(expr: &crate::ast::expr::SpannedExpr) -> bool {
+        match &expr.node {
             Expr::Between { .. } => true,
             Expr::BinaryOp { left, right, .. } => {
-                contains_between(left) || contains_between(right)
+                contains_between(left.as_ref()) || contains_between(right.as_ref())
             }
             _ => false,
         }
     }
 
-    fn contains_typed_string(expr: &Expr) -> bool {
-        match expr {
+    fn contains_typed_string(expr: &crate::ast::expr::SpannedExpr) -> bool {
+        match &expr.node {
             Expr::TypedString { .. } => true,
             Expr::BinaryOp { left, right, .. } => {
-                contains_typed_string(left) || contains_typed_string(right)
+                contains_typed_string(left.as_ref()) || contains_typed_string(right.as_ref())
             }
             _ => false,
         }
     }
 
-    fn contains_exists(expr: &Expr) -> bool {
-        match expr {
+    fn contains_exists(expr: &crate::ast::expr::SpannedExpr) -> bool {
+        match &expr.node {
             Expr::Exists { .. } => true,
             Expr::BinaryOp { left, right, .. } => {
-                contains_exists(left) || contains_exists(right)
+                contains_exists(left.as_ref()) || contains_exists(right.as_ref())
             }
             _ => false,
         }
     }
 
-    fn contains_in_list(expr: &Expr) -> bool {
-        match expr {
+    fn contains_in_list(expr: &crate::ast::expr::SpannedExpr) -> bool {
+        match &expr.node {
             Expr::InList { .. } => true,
             Expr::BinaryOp { left, right, .. } => {
-                contains_in_list(left) || contains_in_list(right)
+                contains_in_list(left.as_ref()) || contains_in_list(right.as_ref())
             }
             _ => false,
         }
