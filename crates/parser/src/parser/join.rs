@@ -78,3 +78,26 @@ impl Parser {
         })
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::pipe_op::PipeOperator;
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+        fn test_join() {
+            let q = parse_query("FROM t |> JOIN other ON t.id = other.id").unwrap();
+            assert!(matches!(q.pipes[0], PipeOperator::Join { .. }));
+    
+            let q = parse_query("FROM t |> LEFT JOIN other AS o ON t.id = o.id").unwrap();
+            assert!(matches!(q.pipes[0], PipeOperator::Join { .. }));
+    
+            let q = parse_query("FROM t |> CROSS JOIN other").unwrap();
+            assert!(matches!(q.pipes[0], PipeOperator::Join { .. }));
+    
+            let q = parse_query("FROM t |> JOIN other USING (id)").unwrap();
+            assert!(matches!(q.pipes[0], PipeOperator::Join { .. }));
+        }
+
+}

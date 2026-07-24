@@ -35,3 +35,22 @@ impl Parser {
         })
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::pipe_op::PipeOperator;
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+        fn test_call() {
+            let q = parse_query("FROM t |> CALL my_func(1, 'x')").unwrap();
+            if let PipeOperator::Call { name, args } = &q.pipes[0] {
+                assert_eq!(name, "my_func");
+                assert_eq!(args.len(), 2);
+            } else {
+                panic!("expected Call");
+            }
+        }
+
+}

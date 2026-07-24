@@ -28,3 +28,22 @@ impl Parser {
         Ok(crate::ast::pipe_op::PipeOperator::With { ctes })
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::pipe_op::PipeOperator;
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+        fn test_with_cte() {
+            let q = parse_query("FROM t |> WITH x AS (FROM y |> SELECT 1)").unwrap();
+            if let PipeOperator::With { ctes } = &q.pipes[0] {
+                assert_eq!(ctes.len(), 1);
+                assert_eq!(ctes[0].alias, "x");
+            } else {
+                panic!("expected With");
+            }
+        }
+
+}

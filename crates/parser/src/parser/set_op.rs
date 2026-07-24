@@ -24,3 +24,23 @@ impl Parser {
         Ok(crate::ast::pipe_op::PipeOperator::SetOp { kind, right: Box::new(right), all })
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::pipe_op::PipeOperator;
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+        fn test_union() {
+            let q = parse_query("FROM t |> UNION ALL (FROM u |> SELECT 1)").unwrap();
+            assert!(matches!(q.pipes[0], PipeOperator::SetOp { .. }));
+        }
+
+    #[test]
+        fn test_intersect() {
+            let q = parse_query("FROM t |> INTERSECT DISTINCT (FROM u |> SELECT 1)").unwrap();
+            assert!(matches!(q.pipes[0], PipeOperator::SetOp { .. }));
+        }
+
+}

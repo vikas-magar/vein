@@ -33,3 +33,100 @@ impl Parser {
         }
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::pipe_op::PipeOperator;
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+        fn test_limit_only() {
+            let q = parse_query("FROM t |> LIMIT 5").unwrap();
+            if let PipeOperator::Limit { limit, offset } = q.pipes[0] {
+                assert_eq!(limit, 5);
+                assert_eq!(offset, 0);
+            } else {
+                panic!("expected Limit");
+            }
+        }
+
+    #[test]
+        fn test_limit_with_offset() {
+            let q = parse_query("FROM t |> LIMIT 10 OFFSET 20").unwrap();
+            if let PipeOperator::Limit { limit, offset } = q.pipes[0] {
+                assert_eq!(limit, 10);
+                assert_eq!(offset, 20);
+            } else {
+                panic!("expected Limit");
+            }
+        }
+
+    #[test]
+        fn test_distinct() {
+            let q = parse_query("FROM t |> DISTINCT").unwrap();
+            assert_eq!(q.pipes[0], PipeOperator::Distinct);
+        }
+
+    #[test]
+        fn test_set() {
+            let q = parse_query("FROM t |> SET salary = 0").unwrap();
+            if let PipeOperator::Set { assignments } = &q.pipes[0] {
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].0, "salary");
+            } else {
+                panic!("expected Set");
+            }
+        }
+
+    #[test]
+        fn test_drop() {
+            let q = parse_query("FROM t |> DROP temp_col").unwrap();
+            if let PipeOperator::Drop { columns } = &q.pipes[0] {
+                assert_eq!(columns, &["temp_col"]);
+            } else {
+                panic!("expected Drop");
+            }
+        }
+
+    #[test]
+        fn test_rename() {
+            let q = parse_query("FROM t |> RENAME old_name AS new_name").unwrap();
+            if let PipeOperator::Rename { renames } = &q.pipes[0] {
+                assert_eq!(renames.len(), 1);
+                assert_eq!(renames[0], ("old_name".into(), "new_name".into()));
+            } else {
+                panic!("expected Rename");
+            }
+        }
+
+    #[test]
+        fn test_assert_simple() {
+            let q = parse_query("FROM t |> ASSERT age >= 0").unwrap();
+            assert!(matches!(q.pipes[0], PipeOperator::Assert { .. }));
+        }
+
+    #[test]
+        fn test_write() {
+            let q = parse_query("FROM t |> WRITE results_table").unwrap();
+            assert!(matches!(q.pipes[0], PipeOperator::Write { .. }));
+        }
+
+    #[test]
+        fn test_tablesample() {
+            let q = parse_query("FROM t |> TABLESAMPLE bernoulli(25.0)").unwrap();
+            if let PipeOperator::TableSample { method, percent } = &q.pipes[0] {
+                assert_eq!(method, "bernoulli");
+                assert_eq!(*percent, 25.0);
+            } else {
+                panic!("expected TableSample");
+            }
+        }
+
+    #[test]
+        fn test_pivot_unsupported() {
+            let err = parse_query("FROM t |> PIVOT ...").unwrap_err();
+            assert!(err.to_string().contains("Unsupported"));
+        }
+
+}

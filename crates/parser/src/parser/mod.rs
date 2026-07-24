@@ -25,7 +25,7 @@ pub use error::ParseError;
 mod error;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod test_utils;
 
 const DEFAULT_RECURSION_LIMIT: usize = 50;
 
@@ -261,4 +261,78 @@ impl Parser {
 
         Ok(source)
     }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::pipe_op::PipeOperator;
+    use crate::ast::query::TableSource;
+    use super::*;
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+        fn test_from_tokens_simple_query() {
+            let tokens = vec![
+                spanned(TokenKind::From, "FROM"),
+                spanned(TokenKind::Ident, "users"),
+                spanned(TokenKind::Pipe, "|>"),
+                spanned(TokenKind::Select, "SELECT"),
+                spanned(TokenKind::Ident, "name"),
+            ];
+            let mut parser = Parser::from_tokens(tokens);
+            let q = parser.parse_query().unwrap();
+            assert_eq!(q.source, TableSource::Table { name: "users".into(), alias: None });
+            assert_eq!(q.pipes.len(), 1);
+        }
+
+    #[test]
+        fn test_from_tokens_not_in() {
+            let tokens = vec![
+                spanned(TokenKind::From, "FROM"),
+                spanned(TokenKind::Ident, "t"),
+                spanned(TokenKind::Pipe, "|>"),
+                spanned(TokenKind::Select, "SELECT"),
+                spanned(TokenKind::Ident, "x"),
+                spanned(TokenKind::Comma, ","),
+                spanned(TokenKind::Ident, "y"),
+                spanned(TokenKind::Pipe, "|>"),
+                spanned(TokenKind::Where, "WHERE"),
+                spanned(TokenKind::Ident, "x"),
+                spanned(TokenKind::Not, "NOT"),
+                spanned(TokenKind::In, "IN"),
+                spanned(TokenKind::LParen, "("),
+                spanned(TokenKind::Number, "1"),
+                spanned(TokenKind::Comma, ","),
+                spanned(TokenKind::Number, "2"),
+                spanned(TokenKind::RParen, ")"),
+            ];
+            let mut parser = Parser::from_tokens(tokens);
+            let q = parser.parse_query().unwrap();
+            assert_eq!(q.pipes.len(), 2);
+            assert!(matches!(q.pipes[1], PipeOperator::Where { .. }));
+        }
+
+    #[test]
+        fn test_from_tokens_not_exists() {
+            let tokens = vec![
+                spanned(TokenKind::From, "FROM"),
+                spanned(TokenKind::Ident, "t"),
+                spanned(TokenKind::Pipe, "|>"),
+                spanned(TokenKind::Where, "WHERE"),
+                spanned(TokenKind::Not, "NOT"),
+                spanned(TokenKind::Exists, "EXISTS"),
+                spanned(TokenKind::LParen, "("),
+                spanned(TokenKind::From, "FROM"),
+                spanned(TokenKind::Ident, "u"),
+                spanned(TokenKind::Pipe, "|>"),
+                spanned(TokenKind::Select, "SELECT"),
+                spanned(TokenKind::Number, "1"),
+                spanned(TokenKind::RParen, ")"),
+            ];
+            let mut parser = Parser::from_tokens(tokens);
+            let q = parser.parse_query().unwrap();
+            assert_eq!(q.pipes.len(), 1);
+        }
+
 }

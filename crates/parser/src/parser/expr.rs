@@ -611,3 +611,104 @@ fn token_to_binary_op(kind: &TokenKind) -> BinaryOp {
         _ => BinaryOp::Eq, // fallback
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+        fn test_expr_binary_op() {
+            let expr = parse_expr("1 + 2").unwrap();
+            assert!(matches!(expr, Expr::BinaryOp { op: crate::ast::expr::BinaryOp::Plus, .. }));
+        }
+
+    #[test]
+        fn test_expr_mul_precedence() {
+            let expr = parse_expr("1 + 2 * 3").unwrap();
+            assert!(matches!(expr, Expr::BinaryOp { op: crate::ast::expr::BinaryOp::Plus, .. }));
+        }
+
+    #[test]
+        fn test_expr_parentheses() {
+            let expr = parse_expr("(1 + 2) * 3").unwrap();
+            assert!(matches!(expr, Expr::BinaryOp { op: crate::ast::expr::BinaryOp::Multiply, .. }));
+        }
+
+    #[test]
+        fn test_expr_is_null() {
+            let expr = parse_expr("name IS NULL").unwrap();
+            assert!(matches!(expr, Expr::UnaryOp { op: crate::ast::expr::UnaryOp::IsNull, .. }));
+        }
+
+    #[test]
+        fn test_expr_in_list() {
+            let expr = parse_expr("x IN (1, 2, 3)").unwrap();
+            assert!(matches!(expr, Expr::InList { .. }));
+        }
+
+    #[test]
+        fn test_expr_between() {
+            let expr = parse_expr("x BETWEEN 1 AND 10").unwrap();
+            assert!(matches!(expr, Expr::Between { .. }));
+        }
+
+    #[test]
+        fn test_expr_like() {
+            let expr = parse_expr("name LIKE '%foo%'").unwrap();
+            assert!(matches!(expr, Expr::Like { negated: false, .. }));
+    
+            let expr_not = parse_expr("name NOT LIKE '%foo%'").unwrap();
+            assert!(matches!(expr_not, Expr::Like { negated: true, .. }));
+        }
+
+    #[test]
+        fn test_expr_not() {
+            let expr = parse_expr("NOT active").unwrap();
+            assert!(matches!(expr, Expr::UnaryOp { op: crate::ast::expr::UnaryOp::Not, .. }));
+        }
+
+    #[test]
+        fn test_expr_negate() {
+            let expr = parse_expr("-42").unwrap();
+            assert!(matches!(expr, Expr::UnaryOp { op: crate::ast::expr::UnaryOp::Negate, .. }));
+        }
+
+    #[test]
+        fn test_expr_function() {
+            let expr = parse_expr("count(*)").unwrap();
+            assert!(matches!(expr, Expr::Function { .. }));
+        }
+
+    #[test]
+        fn test_expr_qualified_column() {
+            let expr = parse_expr("t.name").unwrap();
+            assert!(matches!(expr, Expr::Column { table: Some(_), .. }));
+        }
+
+    #[test]
+        fn test_expr_wildcard() {
+            let expr = parse_expr("*").unwrap();
+            assert!(matches!(expr, Expr::Wildcard { .. }));
+        }
+
+    #[test]
+        fn test_expr_cast() {
+            let expr = parse_expr("CAST(age AS bigint)").unwrap();
+            assert!(matches!(expr, Expr::Cast { .. }));
+        }
+
+    #[test]
+        fn test_expr_string_concat() {
+            let expr = parse_expr("a || ' ' || b").unwrap();
+            assert!(matches!(expr, Expr::BinaryOp { op: crate::ast::expr::BinaryOp::Concat, .. }));
+        }
+
+    #[test]
+        fn test_expr_case() {
+            let expr = parse_expr("CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END").unwrap();
+            assert!(matches!(expr, Expr::Case { .. }));
+        }
+
+}

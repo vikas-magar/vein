@@ -52,3 +52,32 @@ impl Parser {
         Ok(crate::ast::pipe_op::PipeOperator::Limit { limit: limit_value, offset })
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::pipe_op::PipeOperator;
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+        fn test_order_by_desc() {
+            let q = parse_query("FROM t |> ORDER age DESC").unwrap();
+            if let PipeOperator::OrderBy { order_bys } = &q.pipes[0] {
+                assert_eq!(order_bys.len(), 1);
+                assert!(!order_bys[0].asc);
+            } else {
+                panic!("expected OrderBy");
+            }
+        }
+
+    #[test]
+        fn test_order_by_nulls_first() {
+            let q = parse_query("FROM t |> ORDER age DESC NULLS FIRST").unwrap();
+            if let PipeOperator::OrderBy { order_bys } = &q.pipes[0] {
+                assert!(order_bys[0].nulls_first);
+            } else {
+                panic!("expected OrderBy");
+            }
+        }
+
+}

@@ -13,3 +13,17 @@ impl Parser {
         Ok(crate::ast::pipe_op::PipeOperator::Distinct)
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::pipe_op::PipeOperator;
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+        fn test_as_alias() {
+            let q = parse_query("FROM t |> AS my_view").unwrap();
+            assert_eq!(q.pipes[0], PipeOperator::As { alias: "my_view".into() });
+        }
+
+}

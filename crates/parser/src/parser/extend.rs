@@ -65,3 +65,22 @@ impl Parser {
         Ok(crate::ast::pipe_op::PipeOperator::Rename { renames })
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::pipe_op::PipeOperator;
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+        fn test_extend() {
+            let q = parse_query("FROM t |> EXTEND salary * 2 AS bonus").unwrap();
+            if let PipeOperator::Extend { items } = &q.pipes[0] {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].alias, Some("bonus".into()));
+            } else {
+                panic!("expected Extend");
+            }
+        }
+
+}
