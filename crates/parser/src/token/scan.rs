@@ -46,6 +46,8 @@ pub fn keyword(text: &str) -> Option<TokenKind> {
         "assert" => Some(TokenKind::Assert),
         "write" => Some(TokenKind::Write),
         "with" => Some(TokenKind::With),
+        "fork" => Some(TokenKind::Fork),
+        "tee" => Some(TokenKind::Tee),
         "recursive" => Some(TokenKind::Recursive),
         "pivot" => Some(TokenKind::Pivot),
         "unpivot" => Some(TokenKind::Unpivot),

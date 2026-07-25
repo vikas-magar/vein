@@ -24,6 +24,8 @@ impl Parser {
             Ok(TokenKind::Pivot) => self.parse_pipe_pivot(),
             Ok(TokenKind::Unpivot) => self.parse_pipe_unpivot(),
             Ok(TokenKind::With) => self.parse_pipe_with(),
+            Ok(TokenKind::Fork) => self.parse_pipe_fork(),
+            Ok(TokenKind::Tee) => self.parse_pipe_tee(),
             Ok(TokenKind::Union) | Ok(TokenKind::Intersect) | Ok(TokenKind::Except) => self.parse_pipe_set_op(),
             _ => Err(super::ParseError::Expected {
                 expected: "pipe operator (SELECT, WHERE, AGGREGATE, etc.)".into(),
@@ -31,6 +33,46 @@ impl Parser {
                 span: self.peek_span().unwrap_or_default(),
             }),
         }
+    }
+
+    pub(crate) fn parse_pipe_fork(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+        self.expect(TokenKind::Fork)?;
+        self.expect(TokenKind::LParen)?;
+        let mut pipelines = Vec::new();
+        loop {
+            let mut pipeline = Vec::new();
+            while let Ok(()) = self.expect_pipe() {
+                pipeline.push(self.parse_pipe_operator()?);
+            }
+            pipelines.push(pipeline);
+            if let Ok(TokenKind::Comma) = self.peek().map(|t| &t.kind) {
+                self.next_token()?;
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(crate::ast::pipe_op::PipeOperator::Fork { pipelines })
+    }
+
+    pub(crate) fn parse_pipe_tee(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+        self.expect(TokenKind::Tee)?;
+        self.expect(TokenKind::LParen)?;
+        let mut pipelines = Vec::new();
+        loop {
+            let mut pipeline = Vec::new();
+            while let Ok(()) = self.expect_pipe() {
+                pipeline.push(self.parse_pipe_operator()?);
+            }
+            pipelines.push(pipeline);
+            if let Ok(TokenKind::Comma) = self.peek().map(|t| &t.kind) {
+                self.next_token()?;
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(crate::ast::pipe_op::PipeOperator::Tee { pipelines })
     }
 }
 
@@ -128,5 +170,38 @@ mod tests {
             let err = parse_query("FROM t |> PIVOT ...").unwrap_err();
             assert!(err.to_string().contains("Unsupported"));
         }
+
+    #[test]
+        fn test_unpivot_unsupported() {
+            let err = parse_query("FROM t |> UNPIVOT ...").unwrap_err();
+            assert!(err.to_string().contains("Unsupported"));
+        }
+
+    #[test]
+    fn test_parse_fork_positive() {
+        let q = parse_query("FROM t |> FORK ( |> WHERE x = 1, |> SELECT y )").unwrap();
+        if let PipeOperator::Fork { pipelines } = &q.pipes[0] {
+            assert_eq!(pipelines.len(), 2);
+            assert!(matches!(pipelines[0][0], PipeOperator::Where { .. }));
+            assert!(matches!(pipelines[1][0], PipeOperator::Select { .. }));
+        } else {
+            panic!("Expected FORK");
+        }
+    }
+
+    #[test]
+    fn test_parse_fork_negative_missing_paren() {
+        let err = parse_query("FROM t |> FORK |> WHERE x = 1").unwrap_err();
+        assert!(err.to_string().contains("Expected LParen"));
+    }
+
+    #[test]
+    fn test_parse_tee_positive() {
+        let q = parse_query("FROM t |> TEE ( |> DROP x ) |> LIMIT 10").unwrap();
+        assert_eq!(q.pipes.len(), 2);
+        assert!(matches!(q.pipes[0], PipeOperator::Tee { .. }));
+        assert!(matches!(q.pipes[1], PipeOperator::Limit { .. }));
+    }
+
 
 }

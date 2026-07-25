@@ -24,6 +24,8 @@ pub enum PipeOperator {
     Unpivot,
     With { ctes: Vec<CommonTableExpr> },
     Write { target: WriteTarget },
+    Fork { pipelines: Vec<Vec<PipeOperator>> },
+    Tee { pipelines: Vec<Vec<PipeOperator>> },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

@@ -58,6 +58,8 @@ pub enum TokenKind {
     Assert,
     Write,
     With,
+    Fork,
+    Tee,
     Recursive,
     Pivot,
     Unpivot,

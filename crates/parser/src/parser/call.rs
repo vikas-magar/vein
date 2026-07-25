@@ -29,9 +29,46 @@ impl Parser {
 
     pub(crate) fn parse_pipe_write(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
         self.expect(TokenKind::Write)?;
-        let table = self.expect_ident()?;
+        
+        let table = if let Ok(TokenKind::String) = self.peek().map(|t| &t.kind) {
+            let tok = self.next_token()?;
+            tok.text[1..tok.text.len()-1].to_string()
+        } else {
+            self.expect_ident()?
+        };
+
+        let mut options = Vec::new();
+        
+        // Optionally parse WITH
+        if let Ok(TokenKind::With) = self.peek().map(|t| &t.kind) {
+            self.next_token()?;
+        }
+
+        if let Ok(TokenKind::LParen) = self.peek().map(|t| &t.kind) {
+            self.next_token()?; // consume '('
+            loop {
+                if let Ok(TokenKind::RParen) = self.peek().map(|t| &t.kind) {
+                    break;
+                }
+                let key = self.expect_ident()?;
+                self.expect(TokenKind::Eq)?;
+                let val_tok = self.next_token()?;
+                let val = match val_tok.kind {
+                    TokenKind::String | TokenKind::DoubleQuotedIdent => val_tok.text[1..val_tok.text.len()-1].to_string(),
+                    TokenKind::Ident | TokenKind::Number => val_tok.text,
+                    _ => return Err(super::ParseError::Unexpected { token: format!("{:?}", val_tok.kind), span: val_tok.span }),
+                };
+                options.push((key, val));
+                match self.peek().map(|t| &t.kind) {
+                    Ok(TokenKind::Comma) => { self.next_token()?; }
+                    _ => break,
+                }
+            }
+            self.expect(TokenKind::RParen)?;
+        }
+
         Ok(crate::ast::pipe_op::PipeOperator::Write {
-            target: crate::ast::pipe_op::WriteTarget { table, options: vec![] },
+            target: crate::ast::pipe_op::WriteTarget { table, options },
         })
     }
 }
@@ -53,4 +90,16 @@ mod tests {
             }
         }
 
+    #[test]
+        fn test_write_with_options() {
+            let q = parse_query("FROM t |> WRITE 's3://bucket' (mode='append', format='parquet')").unwrap();
+            if let PipeOperator::Write { target } = &q.pipes[0] {
+                assert_eq!(target.table, "s3://bucket");
+                assert_eq!(target.options.len(), 2);
+                assert_eq!(target.options[0], ("mode".into(), "append".into()));
+                assert_eq!(target.options[1], ("format".into(), "parquet".into()));
+            } else {
+                panic!("expected Write");
+            }
+        }
 }
