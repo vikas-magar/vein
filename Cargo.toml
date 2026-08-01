@@ -11,7 +11,7 @@ members = [
     "crates/exec",
     "crates/error",
     "crates/parser"
-    , "crates/planner", "crates/master", "crates/server"]
+    , "crates/planner", "crates/master", "crates/server", "crates/vfs"]
 
 [workspace.dependencies]
 async-trait = "0.1.89"
