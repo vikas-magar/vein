@@ -1,23 +1,23 @@
 use crate::ast::expr::Expr;
-use crate::logical_plan::PlanError;
+use crate::parser::ParseError;
 
 pub trait ExprVisitor: Sized {
-    fn visit_expr(&mut self, expr: &Expr) -> Result<(), PlanError>;
-    fn visit_expr_mut(&mut self, expr: &mut Expr) -> Result<(), PlanError>;
+    fn visit_expr(&mut self, expr: &Expr) -> Result<(), ParseError>;
+    fn visit_expr_mut(&mut self, expr: &mut Expr) -> Result<(), ParseError>;
 }
 
 impl Expr {
-    pub fn accept<V: ExprVisitor>(&self, visitor: &mut V) -> Result<(), PlanError> {
+    pub fn accept<V: ExprVisitor>(&self, visitor: &mut V) -> Result<(), ParseError> {
         visitor.visit_expr(self)?;
         self.accept_children(visitor)
     }
 
-    pub fn accept_mut<V: ExprVisitor>(&mut self, visitor: &mut V) -> Result<(), PlanError> {
+    pub fn accept_mut<V: ExprVisitor>(&mut self, visitor: &mut V) -> Result<(), ParseError> {
         visitor.visit_expr_mut(self)?;
         self.accept_children_mut(visitor)
     }
 
-    fn accept_children<V: ExprVisitor>(&self, visitor: &mut V) -> Result<(), PlanError> {
+    fn accept_children<V: ExprVisitor>(&self, visitor: &mut V) -> Result<(), ParseError> {
         match self {
             Expr::BinaryOp { left, right, .. } => {
                 left.node.accept(visitor)?;
@@ -72,7 +72,7 @@ impl Expr {
         }
     }
 
-    fn accept_children_mut<V: ExprVisitor>(&mut self, visitor: &mut V) -> Result<(), PlanError> {
+    fn accept_children_mut<V: ExprVisitor>(&mut self, visitor: &mut V) -> Result<(), ParseError> {
         match self {
             Expr::BinaryOp { left, right, .. } => {
                 left.node.accept_mut(visitor)?;
@@ -133,14 +133,14 @@ pub struct ColumnCollector {
 }
 
 impl ExprVisitor for ColumnCollector {
-    fn visit_expr(&mut self, expr: &Expr) -> Result<(), PlanError> {
+    fn visit_expr(&mut self, expr: &Expr) -> Result<(), ParseError> {
         if let Expr::Column { table, column, .. } = expr {
             self.columns.push((table.clone(), column.clone()));
         }
         Ok(())
     }
 
-    fn visit_expr_mut(&mut self, _expr: &mut Expr) -> Result<(), PlanError> {
+    fn visit_expr_mut(&mut self, _expr: &mut Expr) -> Result<(), ParseError> {
         Ok(())
     }
 }

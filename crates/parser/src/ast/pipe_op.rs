@@ -1,7 +1,13 @@
 use crate::ast::expr::SpannedExpr;
 use crate::ast::query::{Query, SetOpKind};
-use crate::logical_plan::JoinType;
-
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PipeOperator {
     Select { items: Vec<SelectItem> },

@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use async_trait::async_trait;
+
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use error::{Result, VeinError};
-use common::pipeline::SourceStage;
+
 
 /// A `SourceStage` that reads a local Parquet file and produces `RecordBatch`es.
 pub struct ParquetScanStage {
@@ -32,11 +32,9 @@ impl ParquetScanStage {
     }
 }
 
-#[async_trait]
-impl SourceStage for ParquetScanStage {
-    type Output = RecordBatch;
-
-    async fn init(&mut self) -> Result<()> {
+impl ParquetScanStage {
+    /// Initialize the scan stage by opening the parquet file and building the reader.
+    pub async fn init(&mut self) -> Result<()> {
         let path = self.file_path.clone();
         let projection = self.projection.clone();
 
@@ -101,7 +99,8 @@ impl SourceStage for ParquetScanStage {
         Ok(())
     }
 
-    async fn produce(&mut self) -> Result<Option<Self::Output>> {
+    /// Produce the next RecordBatch from the parquet file.
+    pub async fn produce(&mut self) -> Result<Option<RecordBatch>> {
         if self.finished {
             return Ok(None);
         }
@@ -121,9 +120,7 @@ impl SourceStage for ParquetScanStage {
         }
     }
 
-    async fn finish(&mut self) -> Result<Option<Self::Output>> {
-        Ok(None)
-    }
+
 }
 
 #[cfg(test)]

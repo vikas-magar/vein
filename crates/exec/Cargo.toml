@@ -6,12 +6,20 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 error = { path = "../error" }
+parser = { path = "../parser" }
+planner = { path = "../planner" }
 tokio = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
+opendal = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-bytes = { workspace = true }
+rkyv = { workspace = true }
+s2n-quic = { workspace = true }
+dashmap = "5.5"
+flume = "0.11"
 
 [dev-dependencies]
 tempfile = "3"

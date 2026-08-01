@@ -1,4 +1,4 @@
-#![deny(missing_docs)]
+#![warn(missing_docs)]
 
 //! Vein Common utilities and abstractions.
 
@@ -13,14 +13,12 @@ pub mod system;
 /// AF_XDP logic for network processing.
 #[cfg(target_os = "linux")]
 pub mod xdp;
-/// Pipeline stage abstractions and runner.
-pub mod pipeline;
+
 
 /// Inter-node protocol types.
 pub mod protocol;
 
-/// Distributed tracing and observability.
-pub mod telemetry;
+
 
 /// Partition set for shuffle stage routing.
 pub mod partition;

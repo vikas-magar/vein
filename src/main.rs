@@ -1,4 +1,4 @@
-use parser::PlanBuilder;
+
 use parser::Parser;
 
 fn main() {
@@ -9,11 +9,7 @@ fn main() {
 
     match parser.parse_query() {
         Ok(ast) => {
-            println!("{:?}", ast);
-            match PlanBuilder::build(&ast) {
-                Ok(plan) => println!("{:?}", plan),
-                Err(e) => println!("{:?}", e),
-            }
+            println!("{:#?}", ast);
         }
         Err(e) => {
             println!("{:?}", e);

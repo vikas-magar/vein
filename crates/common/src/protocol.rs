@@ -6,7 +6,19 @@ use serde::{Deserialize, Serialize};
 use crate::identifiers::{NodeId, PartitionId, QueryId, StageId, TaskId};
 
 /// Kind of a Vein cluster node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+
 pub enum NodeKind {
     /// Query coordinator node.
     Master,
@@ -19,7 +31,10 @@ pub enum NodeKind {
 }
 
 /// Load snapshot of a node, sent in heartbeats.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
 pub struct NodeLoad {
     /// Number of active tasks.
     pub active_tasks: u16,
@@ -30,7 +45,11 @@ pub struct NodeLoad {
 }
 
 /// Control events sent as QUIC datagrams (<1200 bytes).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
 pub enum VeinControlEvent {
     /// A table's metadata has changed; VCS is broadcasting the new snapshot.
     TableInvalidated {
@@ -54,6 +73,8 @@ pub enum VeinControlEvent {
         /// Wall-clock duration in nanoseconds.
         duration_ns: u64,
     },
+    /// A new task assigned to this Executor.
+    DispatchTask(ExecuteTask),
     /// A task has failed on an Executor.
     TaskFailed {
         /// The failed task.
@@ -104,11 +125,28 @@ pub enum VeinControlEvent {
     },
 }
 
+/// Supported file formats for storage scans.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum FileFormat {
+    /// Apache Parquet
+    Parquet,
+    /// Comma-Separated Values
+    Csv,
+    /// JavaScript Object Notation
+    Json,
+}
+
 /// Self-contained file scan instruction for an Executor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct FileScanTask {
-    /// Path or URL to the Parquet file.
-    pub file_path: String,
+    /// List of URIs/Paths to the files.
+    pub files: Vec<String>,
+    /// The format of the files.
+    pub format: FileFormat,
     /// Optional byte range within the file.
     pub byte_range: Option<Range<u64>>,
     /// Column IDs to read (projection pushdown).
@@ -122,7 +160,10 @@ pub struct FileScanTask {
 }
 
 /// Minimal field schema for protocol serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
 pub struct FieldSchema {
     /// Iceberg field ID.
     pub field_id: i32,
@@ -133,7 +174,11 @@ pub struct FieldSchema {
 }
 
 /// Operator applied by an Executor to a data stream.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
 pub enum Operator {
     /// Row-level filter predicate.
     Filter {
@@ -183,7 +228,11 @@ pub enum Operator {
 }
 
 /// Aggregate expression for partial hash aggregation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
 pub enum AggregateExpr {
     /// COUNT(input).
     Count {
@@ -213,7 +262,10 @@ pub enum AggregateExpr {
 }
 
 /// Sort key with direction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
 pub struct SortKey {
     /// Column ID.
     pub column: i32,
@@ -221,8 +273,47 @@ pub struct SortKey {
     pub descending: bool,
 }
 
+/// Source of data for a stage.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
+pub enum DataSource {
+    /// Read from static storage (e.g., Parquet).
+    File(FileScanTask),
+    /// Read from the Ephemeral Shuffle Service (Exchange).
+    Exchange(ExchangeSource),
+    /// Read from an infinite event stream (e.g., Kafka).
+    Stream(StreamSource),
+    /// A source that generates data directly (e.g. VALUES).
+    Memory,
+}
+
+/// Read from ESS.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
+pub struct ExchangeSource {
+    /// The upstream stage ID that produced the data.
+    pub upstream_stage_id: StageId,
+}
+
+/// Read from an infinite stream.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
+pub struct StreamSource {
+    /// E.g., Kafka topic name.
+    pub topic: String,
+}
+
 /// Target for shuffle output (ESS address + partition info).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
 pub struct ShuffleTarget {
     /// ESS node address.
     pub ess_addr: SocketAddr,
@@ -230,21 +321,71 @@ pub struct ShuffleTarget {
     pub num_partitions: u16,
 }
 
+/// Target for persistent storage output.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
+pub struct StorageTarget {
+    /// The path or table URI.
+    pub destination_uri: String,
+}
+
+/// Sink for data produced by a stage.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
+pub enum DataSink {
+    /// Push data to the Shuffle Service for the next stage.
+    Shuffle(ShuffleTarget),
+    /// Stream data directly back to the Query Coordinator/Client.
+    Client,
+    /// Write data out to storage (e.g., Iceberg commit).
+    Storage(StorageTarget),
+    /// Discard the data (useful for some benchmarks or tests).
+    Discard,
+}
+
+/// Mode of execution for a task.
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+
+pub enum ExecutionMode {
+    /// Finite batch execution (e.g., reading Parquet files).
+    Batch,
+    /// Infinite stream execution (DBSP incremental multi-epoch).
+    Streaming,
+}
+
 /// Task dispatched from Master to Executor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
 pub struct ExecuteTask {
+    /// Execution mode (Batch or Streaming).
+    pub mode: ExecutionMode,
     /// Unique task identifier.
     pub task_id: TaskId,
     /// Query this task belongs to.
     pub query_id: QueryId,
     /// Stage this task is part of.
     pub stage_id: StageId,
-    /// File scan instruction, if this task reads data.
-    pub file_scan: Option<FileScanTask>,
+    /// Data source for this task.
+    pub source: DataSource,
     /// Operators to apply to the data stream.
     pub operators: Vec<Operator>,
-    /// Where to send the output (None = final stage).
-    pub output_to: Option<ShuffleTarget>,
+    /// Where to send the output.
+    pub sink: DataSink,
 }
 
 /// Payload sent from Executor to ESS.
@@ -261,7 +402,11 @@ pub struct ShufflePayload {
 }
 
 /// Request from Client to Master.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
 pub enum ProtocolRequest {
     /// Execute a SQL query.
     ExecuteSql {
@@ -276,12 +421,26 @@ pub enum ProtocolRequest {
 }
 
 /// Response from Master to Client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+
 pub enum ProtocolResponse {
     /// Query accepted and assigned an ID.
     QuerySubmitted {
         /// The assigned query ID.
         query_id: QueryId,
+    },
+    /// A chunk of result data (Arrow IPC).
+    Data {
+        /// Serialized Arrow IPC batch.
+        batch: Vec<u8>,
+    },
+    /// The query finished successfully.
+    QueryCompleted {
+        /// Total rows produced (for batch queries).
+        row_count: u64,
     },
     /// Query successfully cancelled.
     QueryCancelled {
@@ -296,7 +455,6 @@ pub enum ProtocolResponse {
 }
 
 #[cfg(test)]
-#[allow(missing_docs)]
 mod tests {
     use super::*;
 
@@ -311,15 +469,20 @@ mod tests {
     #[test]
     fn test_execute_task_serde() {
         let task = ExecuteTask {
+            mode: ExecutionMode::Batch,
             task_id: TaskId::new(),
             query_id: QueryId::new(),
             stage_id: StageId::new(),
-            file_scan: None,
+            source: DataSource::Memory,
             operators: vec![
-                Operator::Filter { expr: "col > 10".into() },
-                Operator::Project { columns: vec![0, 1, 2] },
+                Operator::Filter {
+                    expr: "col > 10".into(),
+                },
+                Operator::Project {
+                    columns: vec![0, 1, 2],
+                },
             ],
-            output_to: None,
+            sink: DataSink::Client,
         };
         let json = serde_json::to_string(&task).unwrap();
         let back: ExecuteTask = serde_json::from_str(&json).unwrap();
@@ -328,7 +491,9 @@ mod tests {
 
     #[test]
     fn test_protocol_request_serde() {
-        let req = ProtocolRequest::ExecuteSql { sql: "SELECT * FROM t".into() };
+        let req = ProtocolRequest::ExecuteSql {
+            sql: "SELECT * FROM t".into(),
+        };
         let json = serde_json::to_string(&req).unwrap();
         let back: ProtocolRequest = serde_json::from_str(&json).unwrap();
         match back {
@@ -339,7 +504,9 @@ mod tests {
 
     #[test]
     fn test_protocol_response_serde() {
-        let resp = ProtocolResponse::QuerySubmitted { query_id: QueryId::new() };
+        let resp = ProtocolResponse::QuerySubmitted {
+            query_id: QueryId::new(),
+        };
         let json = serde_json::to_string(&resp).unwrap();
         let back: ProtocolResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, ProtocolResponse::QuerySubmitted { .. }));

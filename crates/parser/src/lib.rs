@@ -10,15 +10,9 @@
 //! compiles each pipe segment into execution operators.
 
 pub mod ast;
-pub mod logical_plan;
-pub mod optimizer;
 pub mod parser;
 pub mod token;
 
-pub use logical_plan::{
-    JoinType, LogicalPlan, PlanBuilder, PlanError, ScanSource, TreeNode, Transformed,
-};
-pub use optimizer::optimize;
 pub use parser::{ParseError, Parser};
 pub use token::lexer::Lexer;
 pub use token::{SpannedToken, TokenKind};

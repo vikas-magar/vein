@@ -1,0 +1,17 @@
+[package]
+name = "master"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../common" }
+error = { path = "../error" }
+planner = { path = "../planner" }
+vcs = { path = "../vcs" }
+
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+s2n-quic = { workspace = true }

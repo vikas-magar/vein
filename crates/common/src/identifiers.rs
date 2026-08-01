@@ -4,7 +4,7 @@ use std::fmt;
 
 macro_rules! id_newtype {
     ($name:ident, $inner:ty, $vis:vis) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
         #[doc = concat!("A newtype identifier for `", stringify!($name), "`.")]
         $vis struct $name($inner);
 

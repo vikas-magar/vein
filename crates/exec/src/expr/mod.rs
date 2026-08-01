@@ -1,0 +1,41 @@
+use std::any::Any;
+use std::fmt::Debug;
+
+use arrow::array::ArrayRef;
+use arrow::datatypes::{DataType, Schema};
+use arrow::record_batch::RecordBatch;
+use error::Result;
+
+/// A physical expression that can be evaluated against a RecordBatch.
+pub trait PhysicalExpr: Debug + Send + Sync {
+    /// Returns the expression as `Any` so it can be downcast for matching.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Get the data type of this expression, given the schema of the input.
+    fn data_type(&self, input_schema: &Schema) -> Result<DataType>;
+
+    /// Indicates whether this expression always produces the same output for the same input.
+    fn is_deterministic(&self) -> bool {
+        true
+    }
+
+    /// Evaluate the expression against a RecordBatch.
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef>;
+}
+
+/// Column expression implementations.
+pub mod column;
+/// Literal expression implementations.
+pub mod literal;
+/// Cast expression implementations.
+pub mod cast;
+/// Binary expression implementations.
+pub mod binary;
+/// Function registry and Scalar UDF implementations.
+pub mod registry;
+
+pub use column::ColumnExpr;
+pub use literal::{LiteralExpr, LiteralValue};
+pub use cast::CastExpr;
+pub use binary::{BinaryExpr, BinaryOperator};
+pub use registry::{FunctionRegistry, ScalarUDFImpl, ScalarFunctionExpr};
