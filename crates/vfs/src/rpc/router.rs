@@ -32,7 +32,7 @@ pub struct RpcRouter {
 }
 
 impl RpcRouter {
-    pub fn new(
+    pub async fn new(
         ingestion: Arc<IngestionBuffer>,
         metadata: Arc<dyn MetadataEngine>,
         block_manager: Arc<dyn BlockManager>,
@@ -42,6 +42,7 @@ impl RpcRouter {
         ca_cert_path: String,
     ) -> Result<Self> {
         let peer_pool = PeerPool::new(&ca_cert_path)?;
+        let seq = metadata.load_sequence().await.unwrap_or(1);
         Ok(Self {
             ingestion,
             metadata,
@@ -49,7 +50,7 @@ impl RpcRouter {
             cluster_map,
             local_node_id,
             archipelago,
-            sequence: Arc::new(AtomicU64::new(1)),
+            sequence: Arc::new(AtomicU64::new(seq)),
             heal_daemon: Arc::new(HealDaemon::new()),
             peer_pool: Arc::new(tokio::sync::Mutex::new(peer_pool)),
         })
@@ -172,6 +173,13 @@ impl RpcRouter {
                     node_id: self.local_node_id.clone(),
                     sequence: self.sequence.fetch_add(1, Ordering::SeqCst),
                 };
+                let seq_val = self.sequence.load(Ordering::SeqCst);
+                let meta = self.metadata.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = meta.persist_sequence(seq_val).await {
+                        tracing::warn!("Failed to persist sequence: {}", e);
+                    }
+                });
                 let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
                 {
@@ -382,6 +390,12 @@ mod tests {
         async fn load_consensus_log(&self) -> Result<Vec<([u8; 16], u8, Vec<u8>)>> {
             Ok(vec![])
         }
+        async fn load_sequence(&self) -> Result<u64> {
+            Ok(1)
+        }
+        async fn persist_sequence(&self, _seq: u64) -> Result<()> {
+            Ok(())
+        }
     }
 
     struct DummyBlockManager;
@@ -446,6 +460,7 @@ mod tests {
             archipelago.clone(),
             "".into(),
         )
+        .await
         .unwrap();
 
         assert_eq!(router.local_node_id, "node1");
@@ -469,6 +484,7 @@ mod tests {
             archipelago.clone(),
             "".into(),
         )
+        .await
         .unwrap();
         let decision_other = router_other.routing_decision("/test/file.bin").unwrap();
         assert_eq!(decision_other, RoutingDecision::Forward(owner));
@@ -525,6 +541,7 @@ mod tests {
             archipelago.clone(),
             "".into(),
         )
+        .await
         .unwrap();
 
         let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
@@ -591,6 +608,7 @@ mod tests {
             archipelago.clone(),
             "".into(),
         )
+        .await
         .unwrap();
 
         let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
@@ -663,6 +681,7 @@ mod tests {
             archipelago.clone(),
             "".into(),
         )
+        .await
         .unwrap();
 
         let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
@@ -725,6 +744,7 @@ mod tests {
             archipelago.clone(),
             "".into(),
         )
+        .await
         .unwrap();
 
         let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
@@ -746,6 +766,81 @@ mod tests {
         let pid = ProposalId::from_wire_bytes(pid_bytes).unwrap();
         assert_eq!(pid.node_id, "node1");
         assert_eq!(pid.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn test_router_sequence_persisted_and_reloaded_across_restarts() {
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = crate::VfsConfig {
+            metadata_db_path: temp_dir.path().join("router_seq_meta.redb"),
+            local_cache_dir: temp_dir.path().join("router_seq_cache"),
+            ..Default::default()
+        };
+
+        let block_manager = Arc::new(DummyBlockManager);
+        let archipelago = Arc::new(tokio::sync::RwLock::new(
+            crate::consensus::archipelago::ArchipelagoState::new(1),
+        ));
+
+        let mut cluster_map = ClusterMap::new();
+        cluster_map.add_node(Node {
+            id: "node1".into(),
+            weight: 1.0,
+            ip: "127.0.0.1:4001".into(),
+            port: 0,
+        });
+        let cluster_map = Arc::new(cluster_map);
+
+        // Instance 1: Initial sequence is loaded as 1. Push proposal will use seq 1 and advance counter to 2.
+        {
+            let metadata = Arc::new(crate::metadata::RedbMetadataEngine::init(&config).await.unwrap());
+            let router = RpcRouter::new(
+                Arc::new(IngestionBuffer::new(config.clone(), block_manager.clone(), metadata.clone())),
+                metadata.clone(),
+                block_manager.clone(),
+                cluster_map.clone(),
+                "node1".into(),
+                archipelago.clone(),
+                "".into(),
+            )
+            .await
+            .unwrap();
+
+            let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
+            let path = "/test/seq_persist.bin";
+            client_stream.write_u64(path.len() as u64).await.unwrap();
+            client_stream.write_all(path.as_bytes()).await.unwrap();
+            client_stream.write_all(b"data").await.unwrap();
+            client_stream.shutdown().await.unwrap();
+
+            let res = router.process_push(&mut server_stream).await;
+            assert!(res.is_ok());
+
+            // Give fire-and-forget persist_sequence task a moment to finish
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Instance 2 (simulating restart): RpcRouter::new loads sequence from metadata engine
+        {
+            let metadata2 = Arc::new(crate::metadata::RedbMetadataEngine::init(&config).await.unwrap());
+            let router2 = RpcRouter::new(
+                Arc::new(IngestionBuffer::new(config, block_manager.clone(), metadata2.clone())),
+                metadata2.clone(),
+                block_manager,
+                cluster_map,
+                "node1".into(),
+                archipelago,
+                "".into(),
+            )
+            .await
+            .unwrap();
+
+            let seq_loaded = router2.sequence.load(Ordering::SeqCst);
+            assert!(seq_loaded >= 2, "Loaded sequence {} should be >= 2 after 1 push", seq_loaded);
+            assert_eq!(seq_loaded, 2);
+        }
     }
 }
 

@@ -98,6 +98,7 @@ pub(crate) fn compound_key(path: &str, offset: u64, algo: &HashAlgo) -> Vec<u8> 
 
 const EXTENTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vfs_extents_v2");
 const CONSENSUS_TABLE: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("consensus_proposals");
+const SEQUENCE_TABLE: TableDefinition<&str, u64> = TableDefinition::new("sequence_counters");
 
 /// Implementation of the MetadataEngine using `redb` for zero-copy, transactional storage.
 pub struct RedbMetadataEngine {
@@ -152,6 +153,8 @@ impl MetadataEngine for RedbMetadataEngine {
 
             write_txn.open_table(CONSENSUS_TABLE)
                 .map_err(|e| VfsError::Metadata(format!("Consensus table creation failed: {e}")))?;
+            write_txn.open_table(SEQUENCE_TABLE)
+                .map_err(|e| VfsError::Metadata(format!("Sequence table creation failed: {e}")))?;
         }
         write_txn.commit()
             .map_err(|e| VfsError::Metadata(format!("Commit failed: {e}")))?;
@@ -279,6 +282,38 @@ impl MetadataEngine for RedbMetadataEngine {
                 entries.push((pid_bytes, status, op_bytes));
             }
             Ok(entries)
+        })
+        .await
+        .map_err(|e| VfsError::Internal(format!("Tokio spawn blocking failed: {}", e)))?
+    }
+
+    async fn load_sequence(&self) -> Result<u64> {
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let table = read_txn.open_table(SEQUENCE_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
+            if let Some(access) = table.get("archipelago_seq").map_err(|e| VfsError::Metadata(e.to_string()))? {
+                Ok(access.value())
+            } else {
+                Ok(1)
+            }
+        })
+        .await
+        .map_err(|e| VfsError::Internal(format!("Tokio spawn blocking failed: {}", e)))?
+    }
+
+    async fn persist_sequence(&self, seq: u64) -> Result<()> {
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let write_txn = db.begin_write().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            {
+                let mut table = write_txn.open_table(SEQUENCE_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                table.insert("archipelago_seq", seq).map_err(|e| VfsError::Metadata(e.to_string()))?;
+            }
+            write_txn.commit().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            Ok(())
         })
         .await
         .map_err(|e| VfsError::Internal(format!("Tokio spawn blocking failed: {}", e)))?
@@ -441,5 +476,31 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(entries.contains(&(pid_bytes1, 0, op1.to_vec())));
         assert!(entries.contains(&(pid_bytes2, 1, op2.to_vec())));
+    }
+
+    #[tokio::test]
+    async fn test_persist_and_load_sequence_across_restarts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("meta_seq.db");
+        let config = VfsConfig {
+            metadata_db_path: db_path.clone(),
+            ..Default::default()
+        };
+
+        // Session 1: Initial default sequence is 1, persist sequence 42
+        {
+            let engine = RedbMetadataEngine::init(&config).await.unwrap();
+            let seq = engine.load_sequence().await.unwrap();
+            assert_eq!(seq, 1);
+            engine.persist_sequence(42).await.unwrap();
+        }
+
+        // Session 2: Reload and verify sequence survived restart
+        {
+            let engine2 = RedbMetadataEngine::init(&config).await.unwrap();
+            let loaded_seq = engine2.load_sequence().await.unwrap();
+            assert!(loaded_seq >= 42, "loaded_seq {} should be >= 42", loaded_seq);
+            assert_eq!(loaded_seq, 42);
+        }
     }
 }

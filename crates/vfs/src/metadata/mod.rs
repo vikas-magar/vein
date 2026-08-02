@@ -33,6 +33,12 @@ pub trait MetadataEngine: Send + Sync {
 
     /// Loads all consensus proposals from storage.
     async fn load_consensus_log(&self) -> Result<Vec<([u8; 16], u8, Vec<u8>)>>;
+
+    /// Loads the persisted sequence counter.
+    async fn load_sequence(&self) -> Result<u64>;
+
+    /// Persists the sequence counter to storage.
+    async fn persist_sequence(&self, seq: u64) -> Result<()>;
 }
 
 pub mod redb_engine;

@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vfs::consensus::archipelago::ArchipelagoState::new(1),
     ));
     
-    let router = RpcRouter::new(ingestion, metadata, block_manager, cluster_map, local_node_id, archipelago, "/Users/anvi/Next/vein/cert.pem".to_string())?;
+    let router = RpcRouter::new(ingestion, metadata, block_manager, cluster_map, local_node_id, archipelago, "/Users/anvi/Next/vein/cert.pem".to_string()).await?;
     
     let bind_addr = "127.0.0.1:4000".to_string();
     let bind_addr_clone = bind_addr.clone();
