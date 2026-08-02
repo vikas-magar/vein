@@ -55,6 +55,9 @@ impl ArchipelagoState {
     /// Inserts the proposal payload, records the implicit vote from the proposer (`pid.node_id`),
     /// sets initial state to `Proposed`, and advances to `Committed` if quorum is reached.
     pub fn propose(&mut self, pid: ProposalId, payload: Vec<u8>) -> Result<(), VfsError> {
+        if self.proposals.contains_key(&pid) {
+            return Err(VfsError::Internal("Proposal already exists".into()));
+        }
         let proposer_id = pid.node_id.clone();
         self.proposals.insert(pid.clone(), payload);
         self.status.insert(pid.clone(), ProposalState::Proposed);
@@ -145,5 +148,15 @@ mod tests {
         // Voting twice from node1 (proposer) should not increase vote set size
         state.vote(&pid, "node1").unwrap();
         assert_eq!(state.get_status(&pid), Some(ProposalState::Proposed));
+    }
+
+    #[test]
+    fn test_duplicate_proposal_returns_error() {
+        let mut state = ArchipelagoState::new(3);
+        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+
+        state.propose(pid.clone(), b"payload1".to_vec()).unwrap();
+        let res = state.propose(pid.clone(), b"payload2".to_vec());
+        assert!(matches!(res, Err(VfsError::Internal(_))));
     }
 }

@@ -5,6 +5,7 @@ use crate::topology::crush::{ClusterMap, Node};
 use crate::{Result, VfsError};
 use s2n_quic::{stream::BidirectionalStream, Server};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -21,6 +22,7 @@ pub struct RpcRouter {
     cluster_map: Arc<ClusterMap>,
     local_node_id: String,
     archipelago: Arc<tokio::sync::RwLock<crate::consensus::archipelago::ArchipelagoState>>,
+    sequence: AtomicU64,
 }
 
 impl RpcRouter {
@@ -39,6 +41,7 @@ impl RpcRouter {
             cluster_map,
             local_node_id,
             archipelago,
+            sequence: AtomicU64::new(1),
         }
     }
 
@@ -133,10 +136,12 @@ impl RpcRouter {
                 tracing::info!("Proposing metadata update to Archipelago");
                 let pid = crate::consensus::archipelago::ProposalId {
                     node_id: self.local_node_id.clone(),
-                    sequence: 1,
+                    sequence: self.sequence.fetch_add(1, Ordering::SeqCst),
                 };
                 let mut arch = self.archipelago.write().await;
-                let _ = arch.propose(pid, b"mock_payload".to_vec());
+                if let Err(e) = arch.propose(pid, b"mock_payload".to_vec()) {
+                    tracing::error!("Failed to propose to Archipelago: {}", e);
+                }
             }
         }
 
@@ -231,6 +236,7 @@ impl Clone for RpcRouter {
             cluster_map: self.cluster_map.clone(),
             local_node_id: self.local_node_id.clone(),
             archipelago: self.archipelago.clone(),
+            sequence: AtomicU64::new(self.sequence.load(Ordering::SeqCst)),
         }
     }
 }
