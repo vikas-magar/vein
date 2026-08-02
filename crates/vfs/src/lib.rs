@@ -3,6 +3,7 @@
 pub mod block;
 pub mod config;
 pub mod error;
+pub mod consensus;
 pub mod ingest;
 pub mod metadata;
 pub mod rpc;
