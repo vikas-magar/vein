@@ -1,7 +1,10 @@
 use crate::block::BlockManager;
+use crate::consensus::archipelago::ProposalId;
+use crate::consensus::op::ConsensusOp;
 use crate::ingest::buffer::IngestionBuffer;
 use crate::metadata::{Extent, MetadataEngine};
 use crate::recovery::heal::HealDaemon;
+use crate::rpc::peer_pool::PeerPool;
 use crate::topology::crush::{ClusterMap, Node};
 use crate::{Result, VfsError};
 use s2n_quic::{stream::BidirectionalStream, Server};
@@ -25,6 +28,7 @@ pub struct RpcRouter {
     archipelago: Arc<tokio::sync::RwLock<crate::consensus::archipelago::ArchipelagoState>>,
     sequence: Arc<AtomicU64>,
     heal_daemon: Arc<HealDaemon>,
+    peer_pool: Arc<tokio::sync::Mutex<PeerPool>>,
 }
 
 impl RpcRouter {
@@ -35,8 +39,10 @@ impl RpcRouter {
         cluster_map: Arc<ClusterMap>,
         local_node_id: String,
         archipelago: Arc<tokio::sync::RwLock<crate::consensus::archipelago::ArchipelagoState>>,
-    ) -> Self {
-        Self {
+        ca_cert_path: String,
+    ) -> Result<Self> {
+        let peer_pool = PeerPool::new(&ca_cert_path)?;
+        Ok(Self {
             ingestion,
             metadata,
             block_manager,
@@ -45,7 +51,8 @@ impl RpcRouter {
             archipelago,
             sequence: Arc::new(AtomicU64::new(1)),
             heal_daemon: Arc::new(HealDaemon::new()),
-        }
+            peer_pool: Arc::new(tokio::sync::Mutex::new(peer_pool)),
+        })
     }
 
     pub fn routing_decision(&self, path: &str) -> Result<RoutingDecision> {
@@ -103,6 +110,7 @@ impl RpcRouter {
             3 => self.handle_pull(&mut stream).await,
             4 => self.handle_eof(&mut stream).await,
             5 => self.handle_delete(&mut stream).await,
+            0x10 => self.handle_vote_request(&mut stream).await,
             _ => Err(VfsError::Internal("Unknown Opcode".to_string())),
         };
 
@@ -238,6 +246,38 @@ impl RpcRouter {
         stream.write_all(&[0x00]).await?;
         Ok(())
     }
+
+    async fn handle_vote_request(&self, stream: &mut BidirectionalStream) -> Result<()> {
+        let mut pid_buf = [0u8; 16];
+        stream.read_exact(&mut pid_buf).await?;
+        let pid = ProposalId::from_wire_bytes(&pid_buf)?;
+
+        let payload_len = stream.read_u64().await?;
+        if payload_len > 10 * 1024 * 1024 {
+            return Err(VfsError::Internal(format!(
+                "Payload too long: {}",
+                payload_len
+            )));
+        }
+
+        let mut payload_buf = vec![0u8; payload_len as usize];
+        stream.read_exact(&mut payload_buf).await?;
+        let _op = ConsensusOp::deserialize(&payload_buf)?;
+
+        let status_byte = {
+            let mut arch = self.archipelago.write().await;
+            match arch.vote(&pid, &self.local_node_id) {
+                Ok(()) => 0x00u8,
+                Err(_) => 0x01u8,
+            }
+        };
+
+        stream.write_u8(0x11).await?;
+        stream.write_all(&pid.to_wire_bytes()).await?;
+        stream.write_u8(status_byte).await?;
+
+        Ok(())
+    }
 }
 
 impl Clone for RpcRouter {
@@ -251,6 +291,7 @@ impl Clone for RpcRouter {
             archipelago: self.archipelago.clone(),
             sequence: self.sequence.clone(), // Arc clone — all connections share one counter
             heal_daemon: self.heal_daemon.clone(),
+            peer_pool: self.peer_pool.clone(),
         }
     }
 }
@@ -341,7 +382,9 @@ mod tests {
             cluster_map.clone(),
             "node1".into(),
             archipelago.clone(),
-        );
+            "".into(),
+        )
+        .unwrap();
 
         assert_eq!(router.local_node_id, "node1");
         assert_eq!(router.cluster_map.nodes.len(), 2);
@@ -362,7 +405,9 @@ mod tests {
             router.cluster_map.clone(),
             other_node_id.into(),
             archipelago.clone(),
-        );
+            "".into(),
+        )
+        .unwrap();
         let decision_other = router_other.routing_decision("/test/file.bin").unwrap();
         assert_eq!(decision_other, RoutingDecision::Forward(owner));
     }

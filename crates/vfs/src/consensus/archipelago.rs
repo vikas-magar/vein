@@ -12,6 +12,40 @@ pub struct ProposalId {
     pub sequence: u64,
 }
 
+impl ProposalId {
+    /// Serializes `ProposalId` into a 16-byte wire representation.
+    ///
+    /// The first 8 bytes contain the UTF-8 bytes of `node_id` (null-padded if < 8 bytes, truncated if > 8 bytes).
+    /// The remaining 8 bytes contain `sequence` in big-endian byte order.
+    pub fn to_wire_bytes(&self) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        let node_bytes = self.node_id.as_bytes();
+        let len = node_bytes.len().min(8);
+        buf[..len].copy_from_slice(&node_bytes[..len]);
+        buf[8..16].copy_from_slice(&self.sequence.to_be_bytes());
+        buf
+    }
+
+    /// Deserializes a 16-byte wire representation into a `ProposalId`.
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, VfsError> {
+        if bytes.len() < 16 {
+            return Err(VfsError::Internal(
+                "Wire bytes too short for ProposalId".into(),
+            ));
+        }
+        let node_id_raw = &bytes[..8];
+        let null_pos = node_id_raw.iter().position(|&b| b == 0).unwrap_or(8);
+        let node_id = String::from_utf8(node_id_raw[..null_pos].to_vec())
+            .map_err(|_| VfsError::Internal("Invalid UTF-8 in ProposalId node_id".into()))?;
+        let sequence = u64::from_be_bytes(
+            bytes[8..16]
+                .try_into()
+                .map_err(|_| VfsError::Internal("Invalid ProposalId sequence".into()))?,
+        );
+        Ok(Self { node_id, sequence })
+    }
+}
+
 /// State of a proposal in the Archipelago consensus pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProposalState {
@@ -158,5 +192,14 @@ mod tests {
         state.propose(pid.clone(), b"payload1".to_vec()).unwrap();
         let res = state.propose(pid.clone(), b"payload2".to_vec());
         assert!(matches!(res, Err(VfsError::Internal(_))));
+    }
+
+    #[test]
+    fn test_proposal_id_wire_bytes_roundtrip() {
+        let pid = ProposalId { node_id: "node1".into(), sequence: 42 };
+        let bytes = pid.to_wire_bytes();
+        assert_eq!(bytes.len(), 16);
+        let parsed = ProposalId::from_wire_bytes(&bytes).unwrap();
+        assert_eq!(parsed, pid);
     }
 }
