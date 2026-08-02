@@ -8,6 +8,7 @@ pub mod ingest;
 pub mod metadata;
 pub mod rpc;
 pub mod topology;
+pub mod recovery;
 
 pub use config::VfsConfig;
 pub use error::{Result, VfsError};
