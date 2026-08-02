@@ -9,6 +9,15 @@ pub struct Node {
     pub weight: f64,
     /// IP address or network address of the node.
     pub ip: String,
+    /// TCP/UDP port the node listens on (used by QUIC PeerPool).
+    pub port: u16,
+}
+
+impl Node {
+    /// Returns the address string `"ip:port"` for this node.
+    pub fn addr(&self) -> String {
+        format!("{}:{}", self.ip, self.port)
+    }
 }
 
 /// Represents the cluster topology map containing all member nodes.
@@ -60,6 +69,12 @@ impl ClusterMap {
             .cloned()
             .ok_or_else(|| crate::VfsError::Internal("No valid nodes in cluster map".into()))
     }
+
+    /// Returns all nodes whose `id` differs from `node_id`.
+    /// Used by the QUIC PeerPool to enumerate broadcast targets.
+    pub fn all_nodes_except<'a>(&'a self, node_id: &str) -> Vec<&'a Node> {
+        self.nodes.iter().filter(|n| n.id != node_id).collect()
+    }
 }
 
 /// Deterministically hashes a combination of `node_id` and `block_id` into an `f64` in `[0.0, 1.0)`.
@@ -87,8 +102,8 @@ mod tests {
     #[test]
     fn test_straw2_placement() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node1".into(), weight: 1.0, ip: "127.0.0.1".into() });
-        map.add_node(Node { id: "node2".into(), weight: 2.0, ip: "127.0.0.2".into() });
+        map.add_node(Node { id: "node1".into(), weight: 1.0, ip: "127.0.0.1".into(), port: 0 });
+        map.add_node(Node { id: "node2".into(), weight: 2.0, ip: "127.0.0.2".into(), port: 0 });
         
         let owner = map.get_owner("block_x").unwrap();
         assert!(owner.id == "node1" || owner.id == "node2");
@@ -103,8 +118,8 @@ mod tests {
     #[test]
     fn test_straw2_deterministic_placement() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node1".into(), weight: 1.0, ip: "127.0.0.1".into() });
-        map.add_node(Node { id: "node2".into(), weight: 2.0, ip: "127.0.0.2".into() });
+        map.add_node(Node { id: "node1".into(), weight: 1.0, ip: "127.0.0.1".into(), port: 0 });
+        map.add_node(Node { id: "node2".into(), weight: 2.0, ip: "127.0.0.2".into(), port: 0 });
 
         let owner1 = map.get_owner("block_test_123").unwrap();
         let owner2 = map.get_owner("block_test_123").unwrap();
@@ -114,8 +129,8 @@ mod tests {
     #[test]
     fn test_straw2_zero_weight_node() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.1".into() });
-        map.add_node(Node { id: "node_active".into(), weight: 1.0, ip: "127.0.0.2".into() });
+        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.1".into(), port: 0 });
+        map.add_node(Node { id: "node_active".into(), weight: 1.0, ip: "127.0.0.2".into(), port: 0 });
 
         for i in 0..100 {
             let block_id = format!("block_{}", i);
@@ -127,8 +142,8 @@ mod tests {
     #[test]
     fn test_straw2_weight_distribution() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node_w1".into(), weight: 1.0, ip: "127.0.0.1".into() });
-        map.add_node(Node { id: "node_w3".into(), weight: 3.0, ip: "127.0.0.2".into() });
+        map.add_node(Node { id: "node_w1".into(), weight: 1.0, ip: "127.0.0.1".into(), port: 0 });
+        map.add_node(Node { id: "node_w3".into(), weight: 3.0, ip: "127.0.0.2".into(), port: 0 });
 
         let mut w1_count = 0;
         let mut w3_count = 0;
@@ -151,9 +166,9 @@ mod tests {
     #[test]
     fn test_straw2_boundary_and_edge_cases() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node_neg".into(), weight: -1.0, ip: "127.0.0.1".into() });
-        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.2".into() });
-        map.add_node(Node { id: "node_pos".into(), weight: 0.5, ip: "127.0.0.3".into() });
+        map.add_node(Node { id: "node_neg".into(), weight: -1.0, ip: "127.0.0.1".into(), port: 0 });
+        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.2".into(), port: 0 });
+        map.add_node(Node { id: "node_pos".into(), weight: 0.5, ip: "127.0.0.3".into(), port: 0 });
 
         let owner = map.get_owner("block_edge").unwrap();
         assert_eq!(owner.id, "node_pos");
@@ -162,9 +177,44 @@ mod tests {
     #[test]
     fn test_straw2_all_zero_or_negative_weights() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node_neg".into(), weight: -1.0, ip: "127.0.0.1".into() });
-        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.2".into() });
+        map.add_node(Node { id: "node_neg".into(), weight: -1.0, ip: "127.0.0.1".into(), port: 0 });
+        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.2".into(), port: 0 });
 
         assert!(map.get_owner("block_x").is_err());
+    }
+
+    #[test]
+    fn test_all_nodes_except_only_node() {
+        let mut map = ClusterMap::new();
+        map.add_node(Node { id: "solo".into(), weight: 1.0, ip: "10.0.0.1".into(), port: 8080 });
+        let peers = map.all_nodes_except("solo");
+        assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn test_all_nodes_except_excludes_self() {
+        let mut map = ClusterMap::new();
+        map.add_node(Node { id: "a".into(), weight: 1.0, ip: "10.0.0.1".into(), port: 8080 });
+        map.add_node(Node { id: "b".into(), weight: 1.0, ip: "10.0.0.2".into(), port: 8081 });
+        map.add_node(Node { id: "c".into(), weight: 1.0, ip: "10.0.0.3".into(), port: 8082 });
+        let peers = map.all_nodes_except("a");
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().all(|n| n.id != "a"));
+    }
+
+    #[test]
+    fn test_all_nodes_except_includes_others() {
+        let mut map = ClusterMap::new();
+        map.add_node(Node { id: "x".into(), weight: 1.0, ip: "10.0.0.1".into(), port: 9000 });
+        map.add_node(Node { id: "y".into(), weight: 1.0, ip: "10.0.0.2".into(), port: 9001 });
+        let peers = map.all_nodes_except("x");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, "y");
+    }
+
+    #[test]
+    fn test_node_addr() {
+        let node = Node { id: "n1".into(), weight: 1.0, ip: "192.168.1.10".into(), port: 4433 };
+        assert_eq!(node.addr(), "192.168.1.10:4433");
     }
 }

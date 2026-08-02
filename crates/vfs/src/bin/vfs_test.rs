@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         id: "node1".to_string(),
         weight: 1.0,
         ip: config.node_ip.clone(),
+        port: 0,
     });
     let cluster_map = Arc::new(cluster_map);
     let local_node_id = "node1".to_string();
