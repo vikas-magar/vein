@@ -62,7 +62,7 @@ pub enum ProposalState {
 }
 
 /// State machine manager for Archipelago consensus.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ArchipelagoState {
     /// Total number of nodes in the consensus cluster.
     pub total_nodes: usize,
@@ -72,6 +72,8 @@ pub struct ArchipelagoState {
     pub status: HashMap<ProposalId, ProposalState>,
     /// Set of voter node IDs for each proposal.
     pub votes: HashMap<ProposalId, HashSet<String>>,
+    /// Oneshot notification channels for proposals waiting for consensus commit.
+    pub callbacks: HashMap<ProposalId, tokio::sync::oneshot::Sender<()>>,
 }
 
 impl ArchipelagoState {
@@ -82,12 +84,25 @@ impl ArchipelagoState {
             proposals: HashMap::new(),
             status: HashMap::new(),
             votes: HashMap::new(),
+            callbacks: HashMap::new(),
         }
     }
 
     /// Returns the fast path quorum size required for instant commit.
     pub fn fast_path_quorum(&self) -> usize {
         (self.total_nodes / 2) + 1
+    }
+
+    /// Internal helper to check quorum and fire oneshot callback upon commit.
+    fn check_quorum(&mut self, pid: &ProposalId) {
+        if let Some(votes) = self.votes.get(pid) {
+            if votes.len() >= self.fast_path_quorum() {
+                self.status.insert(pid.clone(), ProposalState::Committed);
+                if let Some(tx) = self.callbacks.remove(pid) {
+                    let _ = tx.send(()); // best-effort; receiver may have timed out
+                }
+            }
+        }
     }
 
     /// Proposes a new payload for consensus.
@@ -104,18 +119,32 @@ impl ArchipelagoState {
 
         let mut node_votes = HashSet::new();
         node_votes.insert(proposer_id);
+        self.votes.insert(pid.clone(), node_votes);
 
-        if node_votes.len() >= self.fast_path_quorum() {
-            self.status.insert(pid.clone(), ProposalState::Committed);
-        }
-
-        self.votes.insert(pid, node_votes);
+        self.check_quorum(&pid);
         Ok(())
+    }
+
+    /// Proposes a new payload for consensus with a oneshot notification callback.
+    ///
+    /// The `notify` oneshot channel will be triggered when the proposal reaches quorum and enters `Committed` state.
+    pub fn propose_with_callback(
+        &mut self,
+        pid: ProposalId,
+        payload: Vec<u8>,
+        notify: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(), VfsError> {
+        if self.proposals.contains_key(&pid) {
+            return Err(VfsError::Internal("Proposal already exists".into()));
+        }
+        self.callbacks.insert(pid.clone(), notify);
+        self.propose(pid, payload)
     }
 
     /// Casts a vote for an existing proposal by `voter_id`.
     ///
-    /// If the vote count reaches or exceeds `fast_path_quorum()`, updates status to `Committed`.
+    /// If the vote count reaches or exceeds `fast_path_quorum()`, updates status to `Committed`
+    /// and fires any registered oneshot callback.
     pub fn vote(&mut self, pid: &ProposalId, voter_id: &str) -> Result<(), VfsError> {
         let node_votes = self
             .votes
@@ -123,10 +152,7 @@ impl ArchipelagoState {
             .ok_or_else(|| VfsError::NotFound(format!("Proposal not found: {:?}", pid)))?;
 
         node_votes.insert(voter_id.to_string());
-
-        if node_votes.len() >= self.fast_path_quorum() {
-            self.status.insert(pid.clone(), ProposalState::Committed);
-        }
+        self.check_quorum(pid);
 
         Ok(())
     }
@@ -207,5 +233,58 @@ mod tests {
         assert_eq!(bytes.len(), 16);
         let parsed = ProposalId::from_wire_bytes(&bytes).unwrap();
         assert_eq!(parsed, pid);
+    }
+
+    #[test]
+    fn test_propose_with_callback_fires_oneshot_on_quorum() {
+        let mut state = ArchipelagoState::new(3);
+        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+
+        state
+            .propose_with_callback(pid.clone(), b"payload".to_vec(), tx)
+            .unwrap();
+
+        // 1 vote out of 3, quorum is 2 -> callback not fired yet
+        assert_eq!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+        assert_eq!(state.get_status(&pid), Some(ProposalState::Proposed));
+
+        // 2nd vote reaches quorum -> callback fires
+        state.vote(&pid, "node2").unwrap();
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert_eq!(state.get_status(&pid), Some(ProposalState::Committed));
+    }
+
+    #[test]
+    fn test_propose_with_callback_does_not_fire_without_quorum() {
+        let mut state = ArchipelagoState::new(3);
+        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+
+        state
+            .propose_with_callback(pid.clone(), b"payload".to_vec(), tx)
+            .unwrap();
+
+        // Quorum is 2, only 1 vote exists -> callback does not fire
+        assert_eq!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+        assert_eq!(state.get_status(&pid), Some(ProposalState::Proposed));
+    }
+
+    #[test]
+    fn test_propose_with_callback_timed_out_receiver_no_panic() {
+        let mut state = ArchipelagoState::new(3);
+        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        state
+            .propose_with_callback(pid.clone(), b"payload".to_vec(), tx)
+            .unwrap();
+
+        // Drop receiver (simulating timeout or cancelled caller)
+        drop(rx);
+
+        // Voting to reach quorum should handle closed channel gracefully without panic
+        assert!(state.vote(&pid, "node2").is_ok());
+        assert_eq!(state.get_status(&pid), Some(ProposalState::Committed));
     }
 }
