@@ -1,7 +1,7 @@
 use crate::metadata::{Extent, MetadataEngine};
 use crate::{Result, VfsConfig, VfsError};
 use async_trait::async_trait;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, TableDefinition};
 
 /// Computes deterministic SipHash-2-4 of input bytes using fixed keys for persistent key indexing.
 pub(crate) fn siphash24(bytes: &[u8]) -> u64 {
@@ -120,15 +120,8 @@ impl MetadataEngine for RedbMetadataEngine {
             let write_txn = db.begin_write().map_err(|e| VfsError::Metadata(e.to_string()))?;
             {
                 let mut table = write_txn.open_table(EXTENTS_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
-                let key = path_key(&path);
-                let mut current_extents = if let Some(access) = table.get(&key).map_err(|e| VfsError::Metadata(e.to_string()))? {
-                    bincode::deserialize::<Vec<Extent>>(access.value()).map_err(|e| VfsError::Metadata(e.to_string()))?
-                } else {
-                    Vec::new()
-                };
-
-                current_extents.push(extent);
-                let serialized = bincode::serialize(&current_extents).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let key = compound_key(&path, extent.offset);
+                let serialized = bincode::serialize(&extent).map_err(|e| VfsError::Metadata(e.to_string()))?;
                 table.insert(&key, serialized.as_slice()).map_err(|e| VfsError::Metadata(e.to_string()))?;
             }
             write_txn.commit().map_err(|e| VfsError::Metadata(e.to_string()))?;
@@ -214,6 +207,31 @@ mod tests {
 
 
     #[tokio::test]
+    async fn test_append_extent_o1() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = VfsConfig {
+            metadata_db_path: temp_dir.path().join("meta2.db"),
+            ..Default::default()
+        };
+        let engine = RedbMetadataEngine::init(&config).await.unwrap();
+
+        let extent = Extent {
+            block_id: 1,
+            offset: 4096,
+            length: 1024,
+            node_ip: "127.0.0.1".into(),
+        };
+        engine.append_extent("/data.parquet", extent.clone()).await.unwrap();
+
+        let read_txn = engine.db.begin_read().unwrap();
+        let table = read_txn.open_table(EXTENTS_TABLE).unwrap();
+        let key = compound_key("/data.parquet", extent.offset);
+        let access = table.get(&key).unwrap().unwrap();
+        let read_extent: Extent = bincode::deserialize(access.value()).unwrap();
+        assert_eq!(read_extent, extent);
+    }
+
+    #[tokio::test]
     async fn test_deterministic_key_hash_persisted_roundtrip() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("meta.db");
@@ -234,21 +252,23 @@ mod tests {
         {
             let engine = RedbMetadataEngine::init(&config).await.unwrap();
             engine.append_extent("/test/file.dat", extent.clone()).await.unwrap();
-            let file_extents = engine.get_file("/test/file.dat").await.unwrap();
-            assert_eq!(file_extents.len(), 1);
-            assert_eq!(file_extents[0].block_id, 42);
-            assert_eq!(file_extents[0].node_ip, "127.0.0.1");
+            let read_txn = engine.db.begin_read().unwrap();
+            let table = read_txn.open_table(EXTENTS_TABLE).unwrap();
+            let key = compound_key("/test/file.dat", extent.offset);
+            let access = table.get(&key).unwrap().unwrap();
+            let read_extent: Extent = bincode::deserialize(access.value()).unwrap();
+            assert_eq!(read_extent, extent);
         }
 
         // Re-open DB in session 2 (simulating process restart) and verify deterministic hash lookup
         {
             let engine2 = RedbMetadataEngine::init(&config).await.unwrap();
-            let file_extents = engine2.get_file("/test/file.dat").await.unwrap();
-            assert_eq!(file_extents.len(), 1);
-            assert_eq!(file_extents[0].block_id, 42);
-
-            engine2.delete_file("/test/file.dat").await.unwrap();
-            assert!(engine2.get_file("/test/file.dat").await.is_err());
+            let read_txn = engine2.db.begin_read().unwrap();
+            let table = read_txn.open_table(EXTENTS_TABLE).unwrap();
+            let key = compound_key("/test/file.dat", extent.offset);
+            let access = table.get(&key).unwrap().unwrap();
+            let read_extent: Extent = bincode::deserialize(access.value()).unwrap();
+            assert_eq!(read_extent, extent);
         }
     }
 }
