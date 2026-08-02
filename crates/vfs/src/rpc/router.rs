@@ -247,7 +247,11 @@ impl RpcRouter {
         Ok(())
     }
 
-    async fn handle_vote_request(&self, stream: &mut BidirectionalStream) -> Result<()> {
+    /// Processes a vote request over any async read/write stream.
+    pub async fn process_vote_request<S>(&self, stream: &mut S) -> Result<()>
+    where
+        S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
+    {
         let mut pid_buf = [0u8; 16];
         stream.read_exact(&mut pid_buf).await?;
         let pid = ProposalId::from_wire_bytes(&pid_buf)?;
@@ -277,6 +281,10 @@ impl RpcRouter {
         stream.write_u8(status_byte).await?;
 
         Ok(())
+    }
+
+    async fn handle_vote_request(&self, stream: &mut BidirectionalStream) -> Result<()> {
+        self.process_vote_request(stream).await
     }
 }
 
@@ -422,7 +430,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rpc_router_vote_request_handling() {
+    async fn test_process_vote_request_duplex_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let cluster_map = Arc::new(ClusterMap::new());
         let metadata = Arc::new(DummyMetadataEngine);
         let block_manager = Arc::new(DummyBlockManager);
@@ -432,7 +442,7 @@ mod tests {
 
         let pid = ProposalId {
             node_id: "node1".into(),
-            sequence: 10,
+            sequence: 42,
         };
         {
             let mut arch = archipelago.write().await;
@@ -442,8 +452,8 @@ mod tests {
         let router = RpcRouter::new(
             Arc::new(IngestionBuffer::new(
                 crate::VfsConfig {
-                    local_cache_dir: std::path::PathBuf::from("/tmp/test_vote_req_cache"),
-                    metadata_db_path: std::path::PathBuf::from("/tmp/test_vote_req_meta.redb"),
+                    local_cache_dir: std::path::PathBuf::from("/tmp/test_proc_vote_cache"),
+                    metadata_db_path: std::path::PathBuf::from("/tmp/test_proc_vote_meta.redb"),
                     block_size_bytes: 1024,
                     max_ingestion_buffer_bytes: 1024,
                     node_ip: "127.0.0.1".into(),
@@ -463,17 +473,98 @@ mod tests {
         )
         .unwrap();
 
-        // Exercise Archipelago voting as performed inside handle_vote_request
-        let status = {
-            let mut arch = router.archipelago.write().await;
-            arch.vote(&pid, &router.local_node_id)
-        };
-        assert!(status.is_ok());
+        let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
 
-        let arch = router.archipelago.read().await;
-        assert_eq!(
-            arch.get_status(&pid),
-            Some(crate::consensus::archipelago::ProposalState::Committed)
-        );
+        let op = ConsensusOp::AppendExtent {
+            path: "/test/file.txt".into(),
+            offset: 0,
+            length: 100,
+        };
+        let op_bytes = op.serialize().unwrap();
+
+        // Write VOTE_REQUEST wire payload into client stream
+        client_stream.write_all(&pid.to_wire_bytes()).await.unwrap();
+        client_stream.write_u64(op_bytes.len() as u64).await.unwrap();
+        client_stream.write_all(&op_bytes).await.unwrap();
+
+        // Process request on server stream
+        let res = router.process_vote_request(&mut server_stream).await;
+        assert!(res.is_ok());
+
+        // Read and verify VOTE_REPLY frame on client stream: 0x11 opcode + 16-byte pid + 0x00 (Accept)
+        let reply_opcode = client_stream.read_u8().await.unwrap();
+        assert_eq!(reply_opcode, 0x11);
+
+        let mut reply_pid_bytes = [0u8; 16];
+        client_stream.read_exact(&mut reply_pid_bytes).await.unwrap();
+        let reply_pid = ProposalId::from_wire_bytes(&reply_pid_bytes).unwrap();
+        assert_eq!(reply_pid, pid);
+
+        let status_byte = client_stream.read_u8().await.unwrap();
+        assert_eq!(status_byte, 0x00); // 0x00 = Accept
+    }
+
+    #[tokio::test]
+    async fn test_process_vote_request_reject_unknown_proposal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cluster_map = Arc::new(ClusterMap::new());
+        let metadata = Arc::new(DummyMetadataEngine);
+        let block_manager = Arc::new(DummyBlockManager);
+        let archipelago = Arc::new(tokio::sync::RwLock::new(
+            crate::consensus::archipelago::ArchipelagoState::new(2),
+        ));
+
+        let router = RpcRouter::new(
+            Arc::new(IngestionBuffer::new(
+                crate::VfsConfig {
+                    local_cache_dir: std::path::PathBuf::from("/tmp/test_proc_rej_cache"),
+                    metadata_db_path: std::path::PathBuf::from("/tmp/test_proc_rej_meta.redb"),
+                    block_size_bytes: 1024,
+                    max_ingestion_buffer_bytes: 1024,
+                    node_ip: "127.0.0.1".into(),
+                    storage_backend: "memory".into(),
+                    storage_config: std::collections::HashMap::new(),
+                    metadata_hash_algo: Default::default(),
+                },
+                block_manager.clone(),
+                metadata.clone(),
+            )),
+            metadata,
+            block_manager,
+            cluster_map,
+            "node2".into(),
+            archipelago.clone(),
+            "".into(),
+        )
+        .unwrap();
+
+        let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 999,
+        };
+        let op = ConsensusOp::DeleteFile {
+            path: "/test/file.txt".into(),
+        };
+        let op_bytes = op.serialize().unwrap();
+
+        client_stream.write_all(&pid.to_wire_bytes()).await.unwrap();
+        client_stream.write_u64(op_bytes.len() as u64).await.unwrap();
+        client_stream.write_all(&op_bytes).await.unwrap();
+
+        let res = router.process_vote_request(&mut server_stream).await;
+        assert!(res.is_ok());
+
+        let reply_opcode = client_stream.read_u8().await.unwrap();
+        assert_eq!(reply_opcode, 0x11);
+
+        let mut reply_pid_bytes = [0u8; 16];
+        client_stream.read_exact(&mut reply_pid_bytes).await.unwrap();
+        let reply_pid = ProposalId::from_wire_bytes(&reply_pid_bytes).unwrap();
+        assert_eq!(reply_pid, pid);
+
+        let status_byte = client_stream.read_u8().await.unwrap();
+        assert_eq!(status_byte, 0x01); // 0x01 = Reject
     }
 }
