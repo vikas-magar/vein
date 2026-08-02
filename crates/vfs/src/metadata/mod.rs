@@ -27,6 +27,12 @@ pub trait MetadataEngine: Send + Sync {
 
     /// Removes a logical file path entirely.
     async fn delete_file(&self, path: &str) -> Result<()>;
+
+    /// Persists a consensus proposal to storage.
+    async fn persist_proposal(&self, pid_bytes: [u8; 16], status: u8, op_bytes: &[u8]) -> Result<()>;
+
+    /// Loads all consensus proposals from storage.
+    async fn load_consensus_log(&self) -> Result<Vec<([u8; 16], u8, Vec<u8>)>>;
 }
 
 pub mod redb_engine;

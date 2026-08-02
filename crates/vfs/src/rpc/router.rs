@@ -206,6 +206,11 @@ impl RpcRouter {
                     .await
                     .map_err(|_| VfsError::Internal("consensus timeout: quorum not reached".into()))?
                     .map_err(|_| VfsError::Internal("consensus channel dropped".into()))?;
+
+                // Persist committed proposal
+                if let Err(e) = self.archipelago.read().await.persist_committed(&pid, &op, &self.metadata).await {
+                    tracing::warn!("Failed to persist consensus log: {}", e);
+                }
             }
         }
 
@@ -370,6 +375,12 @@ mod tests {
         }
         async fn delete_file(&self, _path: &str) -> Result<()> {
             Ok(())
+        }
+        async fn persist_proposal(&self, _pid_bytes: [u8; 16], _status: u8, _op_bytes: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn load_consensus_log(&self) -> Result<Vec<([u8; 16], u8, Vec<u8>)>> {
+            Ok(vec![])
         }
     }
 
@@ -677,6 +688,64 @@ mod tests {
             arch.status.get(&pid),
             Some(&crate::consensus::archipelago::ProposalState::Committed)
         );
+    }
+
+    #[tokio::test]
+    async fn test_single_node_handle_push_persists_to_redb() {
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = crate::VfsConfig {
+            metadata_db_path: temp_dir.path().join("router_persist_meta.redb"),
+            local_cache_dir: temp_dir.path().join("router_persist_cache"),
+            ..Default::default()
+        };
+
+        let metadata = Arc::new(crate::metadata::RedbMetadataEngine::init(&config).await.unwrap());
+        let block_manager = Arc::new(DummyBlockManager);
+        let archipelago = Arc::new(tokio::sync::RwLock::new(
+            crate::consensus::archipelago::ArchipelagoState::new(1),
+        ));
+
+        let mut cluster_map = ClusterMap::new();
+        cluster_map.add_node(Node {
+            id: "node1".into(),
+            weight: 1.0,
+            ip: "127.0.0.1:4001".into(),
+            port: 0,
+        });
+        let cluster_map = Arc::new(cluster_map);
+
+        let router = RpcRouter::new(
+            Arc::new(IngestionBuffer::new(config, block_manager.clone(), metadata.clone())),
+            metadata.clone(),
+            block_manager,
+            cluster_map,
+            "node1".into(),
+            archipelago.clone(),
+            "".into(),
+        )
+        .unwrap();
+
+        let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
+
+        let path = "/test/push_persist.bin";
+        client_stream.write_u64(path.len() as u64).await.unwrap();
+        client_stream.write_all(path.as_bytes()).await.unwrap();
+        client_stream.write_all(b"data").await.unwrap();
+        client_stream.shutdown().await.unwrap();
+
+        let res = router.process_push(&mut server_stream).await;
+        assert!(res.is_ok());
+
+        // Verify the proposal log was persisted in redb metadata engine
+        let log = metadata.load_consensus_log().await.unwrap();
+        assert_eq!(log.len(), 1);
+        let (pid_bytes, status, _op_bytes) = &log[0];
+        assert_eq!(*status, 1); // Committed
+        let pid = ProposalId::from_wire_bytes(pid_bytes).unwrap();
+        assert_eq!(pid.node_id, "node1");
+        assert_eq!(pid.sequence, 1);
     }
 }
 

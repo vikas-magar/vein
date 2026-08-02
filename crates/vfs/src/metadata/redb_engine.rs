@@ -97,6 +97,7 @@ pub(crate) fn compound_key(path: &str, offset: u64, algo: &HashAlgo) -> Vec<u8> 
 
 
 const EXTENTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vfs_extents_v2");
+const CONSENSUS_TABLE: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("consensus_proposals");
 
 /// Implementation of the MetadataEngine using `redb` for zero-copy, transactional storage.
 pub struct RedbMetadataEngine {
@@ -148,6 +149,9 @@ impl MetadataEngine for RedbMetadataEngine {
                 write_txn.open_table(EXTENTS_TABLE)
                     .map_err(|e| VfsError::Metadata(format!("Table creation failed: {e}")))?;
             }
+
+            write_txn.open_table(CONSENSUS_TABLE)
+                .map_err(|e| VfsError::Metadata(format!("Consensus table creation failed: {e}")))?;
         }
         write_txn.commit()
             .map_err(|e| VfsError::Metadata(format!("Commit failed: {e}")))?;
@@ -229,6 +233,52 @@ impl MetadataEngine for RedbMetadataEngine {
             }
             write_txn.commit().map_err(|e| VfsError::Metadata(e.to_string()))?;
             Ok(())
+        })
+        .await
+        .map_err(|e| VfsError::Internal(format!("Tokio spawn blocking failed: {}", e)))?
+    }
+
+    async fn persist_proposal(&self, pid_bytes: [u8; 16], status: u8, op_bytes: &[u8]) -> Result<()> {
+        let db = self.db.clone();
+        let op_bytes = op_bytes.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let write_txn = db.begin_write().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            {
+                let mut table = write_txn.open_table(CONSENSUS_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let mut val = Vec::with_capacity(1 + op_bytes.len());
+                val.push(status);
+                val.extend_from_slice(&op_bytes);
+                table.insert(pid_bytes, val.as_slice()).map_err(|e| VfsError::Metadata(e.to_string()))?;
+            }
+            write_txn.commit().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| VfsError::Internal(format!("Tokio spawn blocking failed: {}", e)))?
+    }
+
+    async fn load_consensus_log(&self) -> Result<Vec<([u8; 16], u8, Vec<u8>)>> {
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let table = read_txn.open_table(CONSENSUS_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
+
+            let mut entries = Vec::new();
+            let range = table.range::<[u8; 16]>(..).map_err(|e| VfsError::Metadata(e.to_string()))?;
+            for item in range {
+                let (key, value) = item.map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let pid_bytes: [u8; 16] = key.value();
+                let val_slice = value.value();
+                if val_slice.is_empty() {
+                    continue;
+                }
+                let status = val_slice[0];
+                let op_bytes = val_slice[1..].to_vec();
+                entries.push((pid_bytes, status, op_bytes));
+            }
+            Ok(entries)
         })
         .await
         .map_err(|e| VfsError::Internal(format!("Tokio spawn blocking failed: {}", e)))?
@@ -368,5 +418,28 @@ mod tests {
         engine.delete_file("/test.txt").await.unwrap();
         let err = engine.get_file("/test.txt").await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_persist_and_load_consensus_log() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = VfsConfig {
+            metadata_db_path: temp_dir.path().join("meta_consensus.db"),
+            ..Default::default()
+        };
+        let engine = RedbMetadataEngine::init(&config).await.unwrap();
+
+        let pid_bytes1 = [1u8; 16];
+        let pid_bytes2 = [2u8; 16];
+        let op1 = b"op1_payload";
+        let op2 = b"op2_payload";
+
+        engine.persist_proposal(pid_bytes1, 0, op1).await.unwrap();
+        engine.persist_proposal(pid_bytes2, 1, op2).await.unwrap();
+
+        let entries = engine.load_consensus_log().await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&(pid_bytes1, 0, op1.to_vec())));
+        assert!(entries.contains(&(pid_bytes2, 1, op2.to_vec())));
     }
 }

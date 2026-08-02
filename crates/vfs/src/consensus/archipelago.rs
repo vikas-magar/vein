@@ -1,6 +1,9 @@
 //! Archipelago leaderless SMR protocol state and types.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use crate::consensus::op::ConsensusOp;
+use crate::metadata::MetadataEngine;
 use crate::VfsError;
 
 /// Unique identifier for a proposal in Archipelago consensus.
@@ -161,6 +164,47 @@ impl ArchipelagoState {
     pub fn get_status(&self, pid: &ProposalId) -> Option<ProposalState> {
         self.status.get(pid).cloned()
     }
+
+    /// Persists a committed proposal to the metadata store.
+    pub async fn persist_committed(
+        &self,
+        pid: &ProposalId,
+        op: &ConsensusOp,
+        metadata: &Arc<dyn MetadataEngine>,
+    ) -> Result<(), VfsError> {
+        let pid_bytes = pid.to_wire_bytes();
+        let op_bytes = op.serialize()?;
+        metadata.persist_proposal(pid_bytes, 1, &op_bytes).await
+    }
+
+    /// Restores Archipelago consensus state from a log of proposal entries.
+    ///
+    /// Only entries with status == 1 (Committed) are restored; uncommitted proposals are discarded.
+    pub fn restore_from_log(total_nodes: usize, entries: Vec<([u8; 16], u8, Vec<u8>)>) -> Self {
+        let mut state = Self::new(total_nodes);
+        for (pid_bytes, status, op_bytes) in entries {
+            if status == 1 {
+                let pid = match ProposalId::from_wire_bytes(&pid_bytes) {
+                    Ok(pid) => pid,
+                    Err(e) => {
+                        tracing::warn!("Failed to parse ProposalId from log entry: {}", e);
+                        continue;
+                    }
+                };
+                if let Err(e) = ConsensusOp::deserialize(&op_bytes) {
+                    tracing::warn!("Failed to deserialize ConsensusOp for proposal {:?}: {}", pid, e);
+                    continue;
+                }
+
+                state.proposals.insert(pid.clone(), op_bytes);
+                state.status.insert(pid.clone(), ProposalState::Committed);
+                let mut node_votes = HashSet::new();
+                node_votes.insert(pid.node_id.clone());
+                state.votes.insert(pid, node_votes);
+            }
+        }
+        state
+    }
 }
 
 #[cfg(test)]
@@ -286,5 +330,38 @@ mod tests {
         // Voting to reach quorum should handle closed channel gracefully without panic
         assert!(state.vote(&pid, "node2").is_ok());
         assert_eq!(state.get_status(&pid), Some(ProposalState::Committed));
+    }
+
+    #[test]
+    fn test_restore_from_log_filters_uncommitted_and_reconstructs_state() {
+        let pid1 = ProposalId {
+            node_id: "node1".into(),
+            sequence: 1,
+        };
+        let pid2 = ProposalId {
+            node_id: "node2".into(),
+            sequence: 2,
+        };
+        let op1 = ConsensusOp::AppendExtent {
+            path: "/file1".into(),
+            offset: 0,
+            length: 100,
+        };
+        let op2 = ConsensusOp::DeleteFile {
+            path: "/file2".into(),
+        };
+
+        let entries = vec![
+            (pid1.to_wire_bytes(), 1u8, op1.serialize().unwrap()),
+            (pid2.to_wire_bytes(), 0u8, op2.serialize().unwrap()),
+        ];
+
+        let state = ArchipelagoState::restore_from_log(3, entries);
+
+        assert_eq!(state.total_nodes, 3);
+        assert_eq!(state.get_status(&pid1), Some(ProposalState::Committed));
+        assert_eq!(state.get_status(&pid2), None);
+        assert_eq!(state.proposals.get(&pid1), Some(&op1.serialize().unwrap()));
+        assert!(state.votes.get(&pid1).unwrap().contains("node1"));
     }
 }
