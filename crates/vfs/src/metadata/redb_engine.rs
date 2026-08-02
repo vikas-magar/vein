@@ -1,7 +1,7 @@
 use crate::metadata::{Extent, MetadataEngine};
 use crate::{Result, VfsConfig, VfsError};
 use async_trait::async_trait;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 
 /// Computes deterministic SipHash-2-4 of input bytes using fixed keys for persistent key indexing.
 pub(crate) fn siphash24(bytes: &[u8]) -> u64 {
@@ -81,10 +81,7 @@ pub(crate) fn compound_key(path: &str, offset: u64) -> [u8; 16] {
     key
 }
 
-/// Constructs a 16-byte key for path-level extent list indexing `[SipHash(File_Path): 8 bytes] + [0: 8 bytes]`.
-pub(crate) fn path_key(path: &str) -> [u8; 16] {
-    compound_key(path, 0)
-}
+
 
 const EXTENTS_TABLE: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("vfs_extents");
 
@@ -138,14 +135,22 @@ impl MetadataEngine for RedbMetadataEngine {
         tokio::task::spawn_blocking(move || {
             let read_txn = db.begin_read().map_err(|e| VfsError::Metadata(e.to_string()))?;
             let table = read_txn.open_table(EXTENTS_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
-            let key = path_key(&path);
+            
+            let start_key = compound_key(&path, 0);
+            let end_key = compound_key(&path, u64::MAX);
 
-            if let Some(access) = table.get(&key).map_err(|e| VfsError::Metadata(e.to_string()))? {
-                let extents = bincode::deserialize::<Vec<Extent>>(access.value()).map_err(|e| VfsError::Metadata(e.to_string()))?;
-                Ok(extents)
-            } else {
-                Err(VfsError::NotFound(path.to_string()))
+            let mut extents = Vec::new();
+            let range = table.range::<&[u8; 16]>(&start_key..=&end_key).map_err(|e| VfsError::Metadata(e.to_string()))?;
+            for item in range {
+                let (_, value) = item.map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let ext: Extent = bincode::deserialize(value.value()).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                extents.push(ext);
             }
+
+            if extents.is_empty() {
+                return Err(VfsError::NotFound(path));
+            }
+            Ok(extents)
         })
         .await
         .map_err(|e| VfsError::Internal(format!("Tokio spawn blocking failed: {}", e)))?
@@ -159,8 +164,19 @@ impl MetadataEngine for RedbMetadataEngine {
             let write_txn = db.begin_write().map_err(|e| VfsError::Metadata(e.to_string()))?;
             {
                 let mut table = write_txn.open_table(EXTENTS_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
-                let key = path_key(&path);
-                table.remove(&key).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let start_key = compound_key(&path, 0);
+                let end_key = compound_key(&path, u64::MAX);
+
+                let mut keys_to_delete = Vec::new();
+                let range = table.range::<&[u8; 16]>(&start_key..=&end_key).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                for item in range {
+                    let (key, _) = item.map_err(|e| VfsError::Metadata(e.to_string()))?;
+                    keys_to_delete.push(*key.value());
+                }
+
+                for key in keys_to_delete {
+                    table.remove(&key).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                }
             }
             write_txn.commit().map_err(|e| VfsError::Metadata(e.to_string()))?;
             Ok(())
@@ -270,5 +286,39 @@ mod tests {
             let read_extent: Extent = bincode::deserialize(access.value()).unwrap();
             assert_eq!(read_extent, extent);
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_and_delete_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = VfsConfig {
+            metadata_db_path: temp_dir.path().join("meta3.db"),
+            ..Default::default()
+        };
+        let engine = RedbMetadataEngine::init(&config).await.unwrap();
+
+        let ext1 = Extent {
+            block_id: 1,
+            offset: 0,
+            length: 1024,
+            node_ip: "127.0.0.1".into(),
+        };
+        let ext2 = Extent {
+            block_id: 1,
+            offset: 1024,
+            length: 512,
+            node_ip: "127.0.0.1".into(),
+        };
+
+        engine.append_extent("/test.txt", ext1.clone()).await.unwrap();
+        engine.append_extent("/test.txt", ext2.clone()).await.unwrap();
+
+        let extents = engine.get_file("/test.txt").await.unwrap();
+        assert_eq!(extents.len(), 2);
+        assert_eq!(extents[1].length, 512);
+
+        engine.delete_file("/test.txt").await.unwrap();
+        let err = engine.get_file("/test.txt").await;
+        assert!(err.is_err());
     }
 }
