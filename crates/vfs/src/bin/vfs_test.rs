@@ -59,8 +59,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let cluster_map = Arc::new(cluster_map);
     let local_node_id = "node1".to_string();
+    let archipelago = Arc::new(tokio::sync::RwLock::new(
+        vfs::consensus::archipelago::ArchipelagoState::new(1),
+    ));
     
-    let router = RpcRouter::new(ingestion, metadata, block_manager, cluster_map, local_node_id);
+    let router = RpcRouter::new(ingestion, metadata, block_manager, cluster_map, local_node_id, archipelago);
     
     let bind_addr = "127.0.0.1:4000".to_string();
     let bind_addr_clone = bind_addr.clone();

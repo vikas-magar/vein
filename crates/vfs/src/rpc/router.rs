@@ -20,6 +20,7 @@ pub struct RpcRouter {
     block_manager: Arc<dyn BlockManager>,
     cluster_map: Arc<ClusterMap>,
     local_node_id: String,
+    archipelago: Arc<tokio::sync::RwLock<crate::consensus::archipelago::ArchipelagoState>>,
 }
 
 impl RpcRouter {
@@ -29,6 +30,7 @@ impl RpcRouter {
         block_manager: Arc<dyn BlockManager>,
         cluster_map: Arc<ClusterMap>,
         local_node_id: String,
+        archipelago: Arc<tokio::sync::RwLock<crate::consensus::archipelago::ArchipelagoState>>,
     ) -> Self {
         Self {
             ingestion,
@@ -36,6 +38,7 @@ impl RpcRouter {
             block_manager,
             cluster_map,
             local_node_id,
+            archipelago,
         }
     }
 
@@ -126,7 +129,15 @@ impl RpcRouter {
                 stream.write_all(&[0x00]).await?;
                 return Ok(());
             }
-            RoutingDecision::Local => {}
+            RoutingDecision::Local => {
+                tracing::info!("Proposing metadata update to Archipelago");
+                let pid = crate::consensus::archipelago::ProposalId {
+                    node_id: self.local_node_id.clone(),
+                    sequence: 1,
+                };
+                let mut arch = self.archipelago.write().await;
+                let _ = arch.propose(pid, b"mock_payload".to_vec());
+            }
         }
 
         let mut buf = [0u8; 65536]; // 64KB chunks
@@ -219,6 +230,7 @@ impl Clone for RpcRouter {
             block_manager: self.block_manager.clone(),
             cluster_map: self.cluster_map.clone(),
             local_node_id: self.local_node_id.clone(),
+            archipelago: self.archipelago.clone(),
         }
     }
 }
@@ -283,6 +295,9 @@ mod tests {
 
         let metadata = Arc::new(DummyMetadataEngine);
         let block_manager = Arc::new(DummyBlockManager);
+        let archipelago = Arc::new(tokio::sync::RwLock::new(
+            crate::consensus::archipelago::ArchipelagoState::new(2),
+        ));
 
         let router = RpcRouter::new(
             Arc::new(IngestionBuffer::new(
@@ -303,6 +318,7 @@ mod tests {
             block_manager,
             cluster_map.clone(),
             "node1".into(),
+            archipelago.clone(),
         );
 
         assert_eq!(router.local_node_id, "node1");
@@ -323,6 +339,7 @@ mod tests {
             router.block_manager.clone(),
             router.cluster_map.clone(),
             other_node_id.into(),
+            archipelago.clone(),
         );
         let decision_other = router_other.routing_decision("/test/file.bin").unwrap();
         assert_eq!(decision_other, RoutingDecision::Forward(owner));
