@@ -1,12 +1,18 @@
 use crate::block::BlockManager;
 use crate::ingest::buffer::IngestionBuffer;
 use crate::metadata::{Extent, MetadataEngine};
-use crate::topology::crush::ClusterMap;
+use crate::topology::crush::{ClusterMap, Node};
 use crate::{Result, VfsError};
 use s2n_quic::{stream::BidirectionalStream, Server};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum RoutingDecision {
+    Local,
+    Forward(Node),
+}
 
 pub struct RpcRouter {
     ingestion: Arc<IngestionBuffer>,
@@ -30,6 +36,15 @@ impl RpcRouter {
             block_manager,
             cluster_map,
             local_node_id,
+        }
+    }
+
+    pub fn routing_decision(&self, path: &str) -> Result<RoutingDecision> {
+        let owner = self.cluster_map.get_owner(path)?;
+        if owner.id == self.local_node_id {
+            Ok(RoutingDecision::Local)
+        } else {
+            Ok(RoutingDecision::Forward(owner))
         }
     }
 
@@ -98,11 +113,20 @@ impl RpcRouter {
         stream.read_exact(&mut path_buf).await?;
         let path = String::from_utf8(path_buf).map_err(|_| VfsError::Internal("Invalid UTF8 path".to_string()))?;
 
-        let owner = self.cluster_map.get_owner(&path)?;
-        if owner.id != self.local_node_id {
-            tracing::info!("Forwarding block {} to {}", path, owner.ip);
-            stream.write_all(&[0x00]).await?;
-            return Ok(());
+        match self.routing_decision(&path)? {
+            RoutingDecision::Forward(owner) => {
+                tracing::info!("Forwarding block {} to {}", path, owner.ip);
+                let mut buf = [0u8; 65536];
+                loop {
+                    let n = stream.read(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                stream.write_all(&[0x00]).await?;
+                return Ok(());
+            }
+            RoutingDecision::Local => {}
         }
 
         let mut buf = [0u8; 65536]; // 64KB chunks
@@ -285,6 +309,22 @@ mod tests {
         assert_eq!(router.cluster_map.nodes.len(), 2);
 
         let owner = router.cluster_map.get_owner("/test/file.bin").unwrap();
-        assert!(owner.id == "node1" || owner.id == "node2");
+        let decision = router.routing_decision("/test/file.bin").unwrap();
+        if owner.id == "node1" {
+            assert_eq!(decision, RoutingDecision::Local);
+        } else {
+            assert_eq!(decision, RoutingDecision::Forward(owner.clone()));
+        }
+
+        let other_node_id = if owner.id == "node1" { "node2" } else { "node1" };
+        let router_other = RpcRouter::new(
+            router.ingestion.clone(),
+            router.metadata.clone(),
+            router.block_manager.clone(),
+            router.cluster_map.clone(),
+            other_node_id.into(),
+        );
+        let decision_other = router_other.routing_decision("/test/file.bin").unwrap();
+        assert_eq!(decision_other, RoutingDecision::Forward(owner));
     }
 }
