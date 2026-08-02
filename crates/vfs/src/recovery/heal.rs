@@ -1,11 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// A node within a HEAL Merkle Tree.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MerkleNode {
-    pub hash: [u8; 32],
-}
+// TODO: Phase 5 — intermediate node representation (MerkleNode) will be added
+// when the HEAL engine needs to expose per-node proofs for partial tree sync.
 
 /// A Merkle Tree representation for anti-entropy sync in HEAL engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,13 +81,14 @@ impl HealDaemon {
         // caller beat us here; return None to signal "already running".
         if self
             .running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return None;
         }
         Some(tokio::spawn(async move {
             loop {
+                // TODO: Phase 5 — accept Arc<RwLock<ArchipelagoState>>, call diff() against peer roots.
                 tracing::debug!("HEAL daemon anti-entropy check");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
@@ -159,8 +157,9 @@ mod tests {
 
         let missing = tree1.diff(&tree2);
         assert_eq!(missing.len(), 2);
-        assert_eq!(missing[0], *blake3::hash(b"block2").as_bytes());
-        assert_eq!(missing[1], *blake3::hash(b"block3").as_bytes());
+        // diff() makes no ordering guarantee — use set-membership assertions.
+        assert!(missing.contains(&*blake3::hash(b"block2").as_bytes()));
+        assert!(missing.contains(&*blake3::hash(b"block3").as_bytes()));
     }
 
     #[tokio::test]
