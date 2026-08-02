@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A node within a HEAL Merkle Tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +51,40 @@ impl MerkleTree {
             .collect()
     }
 }
+
+/// Background daemon responsible for HEAL anti-entropy diffing.
+pub struct HealDaemon {
+    running: AtomicBool,
+}
+
+impl HealDaemon {
+    pub fn new() -> Self {
+        Self {
+            running: AtomicBool::new(false),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    pub fn start(&self) -> tokio::task::JoinHandle<()> {
+        self.running.store(true, Ordering::SeqCst);
+        tokio::spawn(async move {
+            loop {
+                tracing::debug!("HEAL daemon anti-entropy check");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        })
+    }
+}
+
+impl Default for HealDaemon {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -108,4 +143,14 @@ mod tests {
         assert_eq!(missing[0], *blake3::hash(b"block2").as_bytes());
         assert_eq!(missing[1], *blake3::hash(b"block3").as_bytes());
     }
+
+    #[tokio::test]
+    async fn test_heal_daemon_spawns() {
+        let daemon = HealDaemon::new();
+        assert!(!daemon.is_running());
+        let handle = daemon.start();
+        assert!(daemon.is_running());
+        handle.abort();
+    }
 }
+

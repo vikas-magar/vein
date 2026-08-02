@@ -1,6 +1,7 @@
 use crate::block::BlockManager;
 use crate::ingest::buffer::IngestionBuffer;
 use crate::metadata::{Extent, MetadataEngine};
+use crate::recovery::heal::HealDaemon;
 use crate::topology::crush::{ClusterMap, Node};
 use crate::{Result, VfsError};
 use s2n_quic::{stream::BidirectionalStream, Server};
@@ -23,6 +24,7 @@ pub struct RpcRouter {
     local_node_id: String,
     archipelago: Arc<tokio::sync::RwLock<crate::consensus::archipelago::ArchipelagoState>>,
     sequence: AtomicU64,
+    heal_daemon: Arc<HealDaemon>,
 }
 
 impl RpcRouter {
@@ -42,6 +44,7 @@ impl RpcRouter {
             local_node_id,
             archipelago,
             sequence: AtomicU64::new(1),
+            heal_daemon: Arc::new(HealDaemon::new()),
         }
     }
 
@@ -55,6 +58,8 @@ impl RpcRouter {
     }
 
     pub async fn start(&self, bind_addr: &str, cert_path: &str, key_path: &str) -> Result<()> {
+        self.heal_daemon.start();
+
         let mut server = Server::builder()
             .with_tls((Path::new(cert_path), Path::new(key_path)))
             .map_err(|e| VfsError::Internal(e.to_string()))?
@@ -64,6 +69,7 @@ impl RpcRouter {
             .map_err(|e| VfsError::Internal(e.to_string()))?;
 
         tracing::info!("VeinFS RPC Router listening on QUIC {}", bind_addr);
+
 
         while let Some(mut connection) = server.accept().await {
             let router = self.clone();
@@ -237,6 +243,7 @@ impl Clone for RpcRouter {
             local_node_id: self.local_node_id.clone(),
             archipelago: self.archipelago.clone(),
             sequence: AtomicU64::new(self.sequence.load(Ordering::SeqCst)),
+            heal_daemon: self.heal_daemon.clone(),
         }
     }
 }
