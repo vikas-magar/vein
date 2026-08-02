@@ -23,7 +23,7 @@ pub struct RpcRouter {
     cluster_map: Arc<ClusterMap>,
     local_node_id: String,
     archipelago: Arc<tokio::sync::RwLock<crate::consensus::archipelago::ArchipelagoState>>,
-    sequence: AtomicU64,
+    sequence: Arc<AtomicU64>,
     heal_daemon: Arc<HealDaemon>,
 }
 
@@ -43,7 +43,7 @@ impl RpcRouter {
             cluster_map,
             local_node_id,
             archipelago,
-            sequence: AtomicU64::new(1),
+            sequence: Arc::new(AtomicU64::new(1)),
             heal_daemon: Arc::new(HealDaemon::new()),
         }
     }
@@ -130,7 +130,11 @@ impl RpcRouter {
 
         match self.routing_decision(&path)? {
             RoutingDecision::Forward(owner) => {
-                tracing::info!("Forwarding block {} to {}", path, owner.ip);
+                // Drain the incoming stream to cleanly end the QUIC stream,
+                // then reply 0x01 (not-owner) so the client knows the write
+                // was NOT accepted and must be retried against the correct node.
+                // 0x00 (success) here would be silent data loss.
+                tracing::info!("Not owner for {}; owner is {}. Draining and rejecting.", path, owner.ip);
                 let mut buf = [0u8; 65536];
                 loop {
                     let n = stream.read(&mut buf).await?;
@@ -138,7 +142,7 @@ impl RpcRouter {
                         break;
                     }
                 }
-                stream.write_all(&[0x00]).await?;
+                stream.write_all(&[0x01]).await?; // 0x01 = NOT_OWNER; client must retry
                 return Ok(());
             }
             RoutingDecision::Local => {
@@ -245,7 +249,7 @@ impl Clone for RpcRouter {
             cluster_map: self.cluster_map.clone(),
             local_node_id: self.local_node_id.clone(),
             archipelago: self.archipelago.clone(),
-            sequence: AtomicU64::new(self.sequence.load(Ordering::SeqCst)),
+            sequence: self.sequence.clone(), // Arc clone — all connections share one counter
             heal_daemon: self.heal_daemon.clone(),
         }
     }

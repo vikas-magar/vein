@@ -1,0 +1,63 @@
+version: '3.8'
+
+volumes:
+  certs-data:
+
+services:
+  cert-generator:
+    image: alpine/openssl
+    entrypoint: ["/bin/sh", "-c"]
+    volumes:
+      - certs-data:/certs
+    command: >
+      "
+      if [ ! -f /certs/server.crt ]; then
+        echo 'Generating self-signed certificate for QUIC TLS...';
+        openssl req -x509 -newkey rsa:4096 -keyout /certs/server.key -out /certs/server.crt -days 365 -nodes -subj '/CN=localhost'
+      else
+        echo 'Certificate already exists.';
+      fi
+      "
+
+  master:
+    build: .
+    depends_on:
+      cert-generator:
+        condition: service_completed_successfully
+    volumes:
+      - certs-data:/certs
+    environment:
+      - RUST_LOG=info
+    command: vein-server master --bind 0.0.0.0:8080 --cert /certs/server.crt --key /certs/server.key
+    ports:
+      - "8080:8080/udp"
+
+  executor-1:
+    build: .
+    depends_on:
+      cert-generator:
+        condition: service_completed_successfully
+      master:
+        condition: service_started
+    volumes:
+      - certs-data:/certs
+    environment:
+      - RUST_LOG=info
+    command: vein-server executor --bind 0.0.0.0:8081 --master master:8080 --cert /certs/server.crt --key /certs/server.key
+    ports:
+      - "8081:8081/udp"
+
+  executor-2:
+    build: .
+    depends_on:
+      cert-generator:
+        condition: service_completed_successfully
+      master:
+        condition: service_started
+    volumes:
+      - certs-data:/certs
+    environment:
+      - RUST_LOG=info
+    command: vein-server executor --bind 0.0.0.0:8082 --master master:8080 --cert /certs/server.crt --key /certs/server.key
+    ports:
+      - "8082:8082/udp"
