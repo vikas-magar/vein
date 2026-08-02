@@ -4,6 +4,7 @@ use vfs::block::{BlockManager, MmapBlockManager};
 use vfs::metadata::{MetadataEngine, RedbMetadataEngine};
 use vfs::ingest::buffer::IngestionBuffer;
 use vfs::rpc::router::RpcRouter;
+use vfs::topology::crush::{ClusterMap, Node};
 use common::transport::build_quic_client;
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,7 +51,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metadata.clone(),
     ));
     
-    let router = RpcRouter::new(ingestion, metadata, block_manager);
+    let mut cluster_map = ClusterMap::new();
+    cluster_map.add_node(Node {
+        id: "node1".to_string(),
+        weight: 1.0,
+        ip: config.node_ip.clone(),
+    });
+    let cluster_map = Arc::new(cluster_map);
+    let local_node_id = "node1".to_string();
+    
+    let router = RpcRouter::new(ingestion, metadata, block_manager, cluster_map, local_node_id);
     
     let bind_addr = "127.0.0.1:4000".to_string();
     let bind_addr_clone = bind_addr.clone();

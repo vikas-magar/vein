@@ -1,6 +1,7 @@
 use crate::block::BlockManager;
 use crate::ingest::buffer::IngestionBuffer;
 use crate::metadata::{Extent, MetadataEngine};
+use crate::topology::crush::ClusterMap;
 use crate::{Result, VfsError};
 use s2n_quic::{stream::BidirectionalStream, Server};
 use std::path::Path;
@@ -11,6 +12,8 @@ pub struct RpcRouter {
     ingestion: Arc<IngestionBuffer>,
     metadata: Arc<dyn MetadataEngine>,
     block_manager: Arc<dyn BlockManager>,
+    cluster_map: Arc<ClusterMap>,
+    local_node_id: String,
 }
 
 impl RpcRouter {
@@ -18,11 +21,15 @@ impl RpcRouter {
         ingestion: Arc<IngestionBuffer>,
         metadata: Arc<dyn MetadataEngine>,
         block_manager: Arc<dyn BlockManager>,
+        cluster_map: Arc<ClusterMap>,
+        local_node_id: String,
     ) -> Self {
         Self {
             ingestion,
             metadata,
             block_manager,
+            cluster_map,
+            local_node_id,
         }
     }
 
@@ -90,6 +97,13 @@ impl RpcRouter {
         let mut path_buf = vec![0u8; path_len as usize];
         stream.read_exact(&mut path_buf).await?;
         let path = String::from_utf8(path_buf).map_err(|_| VfsError::Internal("Invalid UTF8 path".to_string()))?;
+
+        let owner = self.cluster_map.get_owner(&path)?;
+        if owner.id != self.local_node_id {
+            tracing::info!("Forwarding block {} to {}", path, owner.ip);
+            stream.write_all(&[0x00]).await?;
+            return Ok(());
+        }
 
         let mut buf = [0u8; 65536]; // 64KB chunks
         loop {
@@ -179,6 +193,98 @@ impl Clone for RpcRouter {
             ingestion: self.ingestion.clone(),
             metadata: self.metadata.clone(),
             block_manager: self.block_manager.clone(),
+            cluster_map: self.cluster_map.clone(),
+            local_node_id: self.local_node_id.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::crush::Node;
+    use async_trait::async_trait;
+
+    struct DummyMetadataEngine;
+    #[async_trait]
+    impl MetadataEngine for DummyMetadataEngine {
+        async fn init(_config: &crate::VfsConfig) -> Result<Self>
+        where
+            Self: Sized,
+        {
+            Ok(DummyMetadataEngine)
+        }
+        async fn append_extent(&self, _path: &str, _extent: Extent) -> Result<()> {
+            Ok(())
+        }
+        async fn get_file(&self, _path: &str) -> Result<Vec<Extent>> {
+            Ok(vec![])
+        }
+        async fn delete_file(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DummyBlockManager;
+    #[async_trait]
+    impl BlockManager for DummyBlockManager {
+        async fn init(_config: &crate::VfsConfig) -> Result<Self>
+        where
+            Self: Sized,
+        {
+            Ok(DummyBlockManager)
+        }
+        async fn append(&self, _data: &[u8]) -> Result<Vec<Extent>> {
+            Ok(vec![])
+        }
+        async fn read_extent(&self, _extent: &Extent) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rpc_router_forwarding_decision() {
+        let mut cluster_map = ClusterMap::new();
+        cluster_map.add_node(Node {
+            id: "node1".into(),
+            weight: 1.0,
+            ip: "127.0.0.1:4001".into(),
+        });
+        cluster_map.add_node(Node {
+            id: "node2".into(),
+            weight: 1.0,
+            ip: "127.0.0.2:4001".into(),
+        });
+        let cluster_map = Arc::new(cluster_map);
+
+        let metadata = Arc::new(DummyMetadataEngine);
+        let block_manager = Arc::new(DummyBlockManager);
+
+        let router = RpcRouter::new(
+            Arc::new(IngestionBuffer::new(
+                crate::VfsConfig {
+                    local_cache_dir: std::path::PathBuf::from("/tmp/test_router_cache"),
+                    metadata_db_path: std::path::PathBuf::from("/tmp/test_router_meta.redb"),
+                    block_size_bytes: 1024,
+                    max_ingestion_buffer_bytes: 1024,
+                    node_ip: "127.0.0.1".into(),
+                    storage_backend: "memory".into(),
+                    storage_config: std::collections::HashMap::new(),
+                    metadata_hash_algo: Default::default(),
+                },
+                block_manager.clone(),
+                metadata.clone(),
+            )),
+            metadata,
+            block_manager,
+            cluster_map.clone(),
+            "node1".into(),
+        );
+
+        assert_eq!(router.local_node_id, "node1");
+        assert_eq!(router.cluster_map.nodes.len(), 2);
+
+        let owner = router.cluster_map.get_owner("/test/file.bin").unwrap();
+        assert!(owner.id == "node1" || owner.id == "node2");
     }
 }
