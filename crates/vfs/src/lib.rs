@@ -6,6 +6,7 @@ pub mod error;
 pub mod ingest;
 pub mod metadata;
 pub mod rpc;
+pub mod topology;
 
 pub use config::VfsConfig;
 pub use error::{Result, VfsError};
