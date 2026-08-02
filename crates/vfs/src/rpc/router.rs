@@ -4,7 +4,7 @@ use crate::consensus::op::ConsensusOp;
 use crate::ingest::buffer::IngestionBuffer;
 use crate::metadata::{Extent, MetadataEngine};
 use crate::recovery::heal::HealDaemon;
-use crate::rpc::peer_pool::PeerPool;
+use crate::rpc::peer_pool::{PeerPool, VoteReply};
 use crate::topology::crush::{ClusterMap, Node};
 use crate::{Result, VfsError};
 use s2n_quic::{stream::BidirectionalStream, Server};
@@ -127,6 +127,13 @@ impl RpcRouter {
     }
 
     async fn handle_push(&self, stream: &mut BidirectionalStream) -> Result<()> {
+        self.process_push(stream).await
+    }
+
+    pub async fn process_push<S>(&self, stream: &mut S) -> Result<()>
+    where
+        S: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
         let path_len = stream.read_u64().await?;
         if path_len > 4096 {
             return Err(VfsError::Internal(format!("Path too long: {}", path_len)));
@@ -154,15 +161,51 @@ impl RpcRouter {
                 return Ok(());
             }
             RoutingDecision::Local => {
-                tracing::info!("Proposing metadata update to Archipelago");
-                let pid = crate::consensus::archipelago::ProposalId {
+                // Phase 1: Propose + broadcast
+                let op = ConsensusOp::AppendExtent {
+                    path: path.clone(),
+                    offset: 0,
+                    length: 0, // will be refined as chunks arrive; use 0 as placeholder
+                };
+                let payload = op.serialize()?;
+                let pid = ProposalId {
                     node_id: self.local_node_id.clone(),
                     sequence: self.sequence.fetch_add(1, Ordering::SeqCst),
                 };
-                let mut arch = self.archipelago.write().await;
-                if let Err(e) = arch.propose(pid, b"mock_payload".to_vec()) {
-                    tracing::error!("Failed to propose to Archipelago: {}", e);
+                let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+                {
+                    let mut arch = self.archipelago.write().await;
+                    arch.propose_with_callback(pid.clone(), payload.clone(), tx)?;
                 }
+
+                // Broadcast to peers (fire-and-forget per peer; quorum drives commit)
+                let peers = self.cluster_map.all_nodes_except(&self.local_node_id);
+                for peer in peers {
+                    let peer = peer.clone();
+                    let pid2 = pid.clone();
+                    let op2 = op.clone();
+                    let pool = self.peer_pool.clone();
+                    let arch = self.archipelago.clone();
+                    tokio::spawn(async move {
+                        match pool.lock().await.send_vote_request(&peer, &pid2, &op2).await {
+                            Ok(VoteReply::Accept) => {
+                                let mut a = arch.write().await;
+                                if let Err(e) = a.vote(&pid2, &peer.id) {
+                                    tracing::warn!("vote error from peer {}: {}", peer.id, e);
+                                }
+                            }
+                            Ok(VoteReply::Reject) => tracing::warn!("peer {} rejected proposal {:?}", peer.id, pid2),
+                            Err(e) => tracing::warn!("vote_request to {} failed: {}", peer.id, e),
+                        }
+                    });
+                }
+
+                // Wait for quorum (2s timeout)
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+                    .await
+                    .map_err(|_| VfsError::Internal("consensus timeout: quorum not reached".into()))?
+                    .map_err(|_| VfsError::Internal("consensus channel dropped".into()))?;
             }
         }
 
@@ -567,4 +610,73 @@ mod tests {
         let status_byte = client_stream.read_u8().await.unwrap();
         assert_eq!(status_byte, 0x01); // 0x01 = Reject
     }
+
+    #[tokio::test]
+    async fn test_single_node_handle_push_commit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut cluster_map = ClusterMap::new();
+        cluster_map.add_node(Node {
+            id: "node1".into(),
+            weight: 1.0,
+            ip: "127.0.0.1:4001".into(),
+            port: 0,
+        });
+        let cluster_map = Arc::new(cluster_map);
+
+        let metadata = Arc::new(DummyMetadataEngine);
+        let block_manager = Arc::new(DummyBlockManager);
+        let archipelago = Arc::new(tokio::sync::RwLock::new(
+            crate::consensus::archipelago::ArchipelagoState::new(1),
+        ));
+
+        let router = RpcRouter::new(
+            Arc::new(IngestionBuffer::new(
+                crate::VfsConfig {
+                    local_cache_dir: std::path::PathBuf::from("/tmp/test_single_push_cache"),
+                    metadata_db_path: std::path::PathBuf::from("/tmp/test_single_push_meta.redb"),
+                    block_size_bytes: 1024,
+                    max_ingestion_buffer_bytes: 1024,
+                    node_ip: "127.0.0.1".into(),
+                    storage_backend: "memory".into(),
+                    storage_config: std::collections::HashMap::new(),
+                    metadata_hash_algo: Default::default(),
+                },
+                block_manager.clone(),
+                metadata.clone(),
+            )),
+            metadata,
+            block_manager,
+            cluster_map,
+            "node1".into(),
+            archipelago.clone(),
+            "".into(),
+        )
+        .unwrap();
+
+        let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
+
+        let path = "/test/single_push.bin";
+        client_stream.write_u64(path.len() as u64).await.unwrap();
+        client_stream.write_all(path.as_bytes()).await.unwrap();
+        client_stream.write_all(b"payload data").await.unwrap();
+        client_stream.shutdown().await.unwrap();
+
+        let res = router.process_push(&mut server_stream).await;
+        assert!(res.is_ok());
+
+        let status_byte = client_stream.read_u8().await.unwrap();
+        assert_eq!(status_byte, 0x00);
+
+        let arch = archipelago.read().await;
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 1,
+        };
+        assert_eq!(
+            arch.status.get(&pid),
+            Some(&crate::consensus::archipelago::ProposalState::Committed)
+        );
+    }
 }
+
