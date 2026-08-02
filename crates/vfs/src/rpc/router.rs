@@ -58,7 +58,10 @@ impl RpcRouter {
     }
 
     pub async fn start(&self, bind_addr: &str, cert_path: &str, key_path: &str) -> Result<()> {
-        self.heal_daemon.start();
+        // Fire-and-forget: the handle is intentionally dropped; the task runs for
+        // the lifetime of the process. The double-start guard in HealDaemon::start()
+        // ensures only one loop is ever spawned even if RpcRouter::start() is called again.
+        let _ = self.heal_daemon.start();
 
         let mut server = Server::builder()
             .with_tls((Path::new(cert_path), Path::new(key_path)))

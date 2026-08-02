@@ -64,18 +64,37 @@ impl HealDaemon {
         }
     }
 
+    /// Returns `true` if `start()` has been called at least once.
+    ///
+    /// Note: this is fire-and-forget semantics. The flag is **not** reset when the
+    /// backing task is aborted externally. For this stub, "running" means "has ever
+    /// been started", which is sufficient for the double-start guard below.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
 
-    pub fn start(&self) -> tokio::task::JoinHandle<()> {
-        self.running.store(true, Ordering::SeqCst);
-        tokio::spawn(async move {
+    /// Starts the HEAL anti-entropy background loop.
+    ///
+    /// Returns `Some(JoinHandle)` on the first call, and `None` on every subsequent
+    /// call (double-start guard via `compare_exchange`). Callers must not start the
+    /// daemon more than once; in production the handle is intentionally dropped
+    /// (fire-and-forget — the task lives for the lifetime of the process).
+    pub fn start(&self) -> Option<tokio::task::JoinHandle<()>> {
+        // Atomically flip false → true. If the old value was already true another
+        // caller beat us here; return None to signal "already running".
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        Some(tokio::spawn(async move {
             loop {
                 tracing::debug!("HEAL daemon anti-entropy check");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
-        })
+        }))
     }
 }
 
@@ -148,9 +167,19 @@ mod tests {
     async fn test_heal_daemon_spawns() {
         let daemon = HealDaemon::new();
         assert!(!daemon.is_running());
-        let handle = daemon.start();
+        let handle = daemon.start().expect("first start should return a handle");
         assert!(daemon.is_running());
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_heal_daemon_no_double_start() {
+        let daemon = HealDaemon::new();
+        let first = daemon.start();
+        assert!(first.is_some(), "first call must return a handle");
+        let second = daemon.start();
+        assert!(second.is_none(), "second call must be a no-op");
+        first.unwrap().abort();
     }
 }
 
