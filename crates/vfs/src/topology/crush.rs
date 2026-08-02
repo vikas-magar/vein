@@ -39,21 +39,26 @@ impl ClusterMap {
         let mut best_node = None;
 
         for node in &self.nodes {
-            let score = if node.weight <= 0.0 {
-                f64::NEG_INFINITY
-            } else {
-                let h = hash_node_block(&node.id, block_id);
-                let one_minus_h = (1.0_f64 - h).max(f64::EPSILON);
-                one_minus_h.ln() / node.weight
-            };
+            if node.weight <= 0.0 {
+                continue;
+            }
 
-            if best_node.is_none() || score > max_score {
+            let h = hash_node_block(&node.id, block_id);
+            let one_minus_h = (1.0_f64 - h).max(f64::EPSILON);
+            // Standard Ceph Straw2 score calculation: draw = ln(r) / weight where r = (1 - h) in (0, 1].
+            // Since ln(r) <= 0, dividing by a larger node weight produces a score closer to 0 (i.e. higher score),
+            // correctly favoring nodes with higher weights proportionally.
+            let score = one_minus_h.ln() / node.weight;
+
+            if score > max_score {
                 max_score = score;
                 best_node = Some(node);
             }
         }
 
-        Ok(best_node.expect("nodes is non-empty").clone())
+        best_node
+            .cloned()
+            .ok_or_else(|| crate::VfsError::Internal("No valid nodes in cluster map".into()))
     }
 }
 
@@ -152,5 +157,14 @@ mod tests {
 
         let owner = map.get_owner("block_edge").unwrap();
         assert_eq!(owner.id, "node_pos");
+    }
+
+    #[test]
+    fn test_straw2_all_zero_or_negative_weights() {
+        let mut map = ClusterMap::new();
+        map.add_node(Node { id: "node_neg".into(), weight: -1.0, ip: "127.0.0.1".into() });
+        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.2".into() });
+
+        assert!(map.get_owner("block_x").is_err());
     }
 }
