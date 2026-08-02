@@ -1,6 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Default)]
+pub enum HashAlgo {
+    SipHash24,
+    #[default]
+    Blake3,
+}
+
 /// Configuration for the VFS node to prevent hardcoding.
 #[derive(Debug, Clone)]
 pub struct VfsConfig {
@@ -24,6 +31,9 @@ pub struct VfsConfig {
     
     /// Generic key-value pairs for the OpenDAL builder
     pub storage_config: HashMap<String, String>,
+
+    /// The algorithm used for hashing metadata keys
+    pub metadata_hash_algo: HashAlgo,
 }
 
 impl Default for VfsConfig {
@@ -40,6 +50,7 @@ impl Default for VfsConfig {
             node_ip: "127.0.0.1".to_string(),
             storage_backend: "fs".to_string(),
             storage_config,
+            metadata_hash_algo: HashAlgo::Blake3,
         }
     }
 }

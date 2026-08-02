@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_ip: "127.0.0.1".to_string(),
         storage_backend: "s3".to_string(),
         storage_config,
+        metadata_hash_algo: Default::default(),
     };
 
     // Clean up old state
