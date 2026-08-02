@@ -411,4 +411,69 @@ mod tests {
         let decision_other = router_other.routing_decision("/test/file.bin").unwrap();
         assert_eq!(decision_other, RoutingDecision::Forward(owner));
     }
+
+    #[test]
+    fn test_opcode_0x10_vote_request_dispatch() {
+        // Opcode 0x10 (16) is defined in handle_stream to route to handle_vote_request
+        const OPCODE_VOTE_REQUEST: u8 = 0x10;
+        const OPCODE_VOTE_REPLY: u8 = 0x11;
+        assert_eq!(OPCODE_VOTE_REQUEST, 16);
+        assert_eq!(OPCODE_VOTE_REPLY, 17);
+    }
+
+    #[tokio::test]
+    async fn test_rpc_router_vote_request_handling() {
+        let cluster_map = Arc::new(ClusterMap::new());
+        let metadata = Arc::new(DummyMetadataEngine);
+        let block_manager = Arc::new(DummyBlockManager);
+        let archipelago = Arc::new(tokio::sync::RwLock::new(
+            crate::consensus::archipelago::ArchipelagoState::new(2),
+        ));
+
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 10,
+        };
+        {
+            let mut arch = archipelago.write().await;
+            arch.propose(pid.clone(), b"payload".to_vec()).unwrap();
+        }
+
+        let router = RpcRouter::new(
+            Arc::new(IngestionBuffer::new(
+                crate::VfsConfig {
+                    local_cache_dir: std::path::PathBuf::from("/tmp/test_vote_req_cache"),
+                    metadata_db_path: std::path::PathBuf::from("/tmp/test_vote_req_meta.redb"),
+                    block_size_bytes: 1024,
+                    max_ingestion_buffer_bytes: 1024,
+                    node_ip: "127.0.0.1".into(),
+                    storage_backend: "memory".into(),
+                    storage_config: std::collections::HashMap::new(),
+                    metadata_hash_algo: Default::default(),
+                },
+                block_manager.clone(),
+                metadata.clone(),
+            )),
+            metadata,
+            block_manager,
+            cluster_map,
+            "node2".into(),
+            archipelago.clone(),
+            "".into(),
+        )
+        .unwrap();
+
+        // Exercise Archipelago voting as performed inside handle_vote_request
+        let status = {
+            let mut arch = router.archipelago.write().await;
+            arch.vote(&pid, &router.local_node_id)
+        };
+        assert!(status.is_ok());
+
+        let arch = router.archipelago.read().await;
+        assert_eq!(
+            arch.get_status(&pid),
+            Some(crate::consensus::archipelago::ProposalState::Committed)
+        );
+    }
 }

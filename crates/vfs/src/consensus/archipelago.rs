@@ -15,9 +15,15 @@ pub struct ProposalId {
 impl ProposalId {
     /// Serializes `ProposalId` into a 16-byte wire representation.
     ///
-    /// The first 8 bytes contain the UTF-8 bytes of `node_id` (null-padded if < 8 bytes, truncated if > 8 bytes).
+    /// The first 8 bytes contain the UTF-8 bytes of `node_id`.
+    /// Note: Node IDs longer than 8 bytes are truncated to the first 8 bytes.
     /// The remaining 8 bytes contain `sequence` in big-endian byte order.
     pub fn to_wire_bytes(&self) -> [u8; 16] {
+        debug_assert!(
+            self.node_id.len() <= 8,
+            "Node ID '{}' exceeds 8-byte wire representation limit and will be truncated",
+            self.node_id
+        );
         let mut buf = [0u8; 16];
         let node_bytes = self.node_id.as_bytes();
         let len = node_bytes.len().min(8);
