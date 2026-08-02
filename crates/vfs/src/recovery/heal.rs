@@ -33,6 +33,22 @@ impl MerkleTree {
 
         Self { root_hash, leaves }
     }
+
+    /// Returns the set difference of leaf hashes present in `other` but missing in `self`.
+    /// If root hashes are equal, returns an empty list immediately.
+    pub fn diff(&self, other: &MerkleTree) -> Vec<[u8; 32]> {
+        if self.root_hash == other.root_hash {
+            return Vec::new();
+        }
+
+        let self_set: std::collections::HashSet<&[u8; 32]> = self.leaves.iter().collect();
+        other
+            .leaves
+            .iter()
+            .filter(|hash| !self_set.contains(hash))
+            .copied()
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -61,5 +77,35 @@ mod tests {
 
         assert_eq!(tree1.root_hash, tree2.root_hash);
         assert_ne!(tree1.root_hash, tree3.root_hash);
+    }
+
+    #[test]
+    fn test_merkle_tree_diff() {
+        let tree1 = MerkleTree::new(vec![b"block1".to_vec(), b"block2".to_vec()]);
+        let tree2 = MerkleTree::new(vec![b"block1".to_vec(), b"block3".to_vec()]); // block2 replaced
+
+        let missing = tree1.diff(&tree2); // What tree2 has that tree1 doesn't
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], *blake3::hash(b"block3").as_bytes());
+    }
+
+    #[test]
+    fn test_merkle_tree_diff_identical() {
+        let tree1 = MerkleTree::new(vec![b"block1".to_vec(), b"block2".to_vec()]);
+        let tree2 = MerkleTree::new(vec![b"block1".to_vec(), b"block2".to_vec()]);
+
+        let missing = tree1.diff(&tree2);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_merkle_tree_diff_disjoint() {
+        let tree1 = MerkleTree::new(vec![b"block1".to_vec()]);
+        let tree2 = MerkleTree::new(vec![b"block2".to_vec(), b"block3".to_vec()]);
+
+        let missing = tree1.diff(&tree2);
+        assert_eq!(missing.len(), 2);
+        assert_eq!(missing[0], *blake3::hash(b"block2").as_bytes());
+        assert_eq!(missing[1], *blake3::hash(b"block3").as_bytes());
     }
 }
