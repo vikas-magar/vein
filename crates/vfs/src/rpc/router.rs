@@ -174,12 +174,9 @@ impl RpcRouter {
                     sequence: self.sequence.fetch_add(1, Ordering::SeqCst),
                 };
                 let seq_val = self.sequence.load(Ordering::SeqCst);
-                let meta = self.metadata.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = meta.persist_sequence(seq_val).await {
-                        tracing::warn!("Failed to persist sequence: {}", e);
-                    }
-                });
+                if let Err(e) = self.metadata.persist_sequence(seq_val).await {
+                    tracing::warn!("Failed to persist sequence: {}", e);
+                }
                 let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
                 {
