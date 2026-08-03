@@ -195,7 +195,7 @@ impl RpcRouter {
                     tokio::spawn(async move {
                         let timeout_res = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
-                            pool.lock().await.send_vote_request(&peer, &pid2, &op2),
+                            async { pool.lock().await.send_vote_request(&peer, &pid2, &op2).await },
                         )
                         .await;
 
