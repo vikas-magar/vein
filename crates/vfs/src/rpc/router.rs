@@ -427,14 +427,14 @@ mod tests {
         cluster_map.add_node(Node {
             id: "node1".into(),
             weight: 1.0,
-            ip: "127.0.0.1:4001".into(),
-            port: 0,
+            ip: "127.0.0.1".into(),
+            port: 4001,
         });
         cluster_map.add_node(Node {
             id: "node2".into(),
             weight: 1.0,
-            ip: "127.0.0.2:4001".into(),
-            port: 0,
+            ip: "127.0.0.2".into(),
+            port: 4001,
         });
         let cluster_map = Arc::new(cluster_map);
 
@@ -655,8 +655,8 @@ mod tests {
         cluster_map.add_node(Node {
             id: "node1".into(),
             weight: 1.0,
-            ip: "127.0.0.1:4001".into(),
-            port: 0,
+            ip: "127.0.0.1".into(),
+            port: 4001,
         });
         let cluster_map = Arc::new(cluster_map);
 
@@ -737,8 +737,8 @@ mod tests {
         cluster_map.add_node(Node {
             id: "node1".into(),
             weight: 1.0,
-            ip: "127.0.0.1:4001".into(),
-            port: 0,
+            ip: "127.0.0.1".into(),
+            port: 4001,
         });
         let cluster_map = Arc::new(cluster_map);
 
@@ -795,8 +795,8 @@ mod tests {
         cluster_map.add_node(Node {
             id: "node1".into(),
             weight: 1.0,
-            ip: "127.0.0.1:4001".into(),
-            port: 0,
+            ip: "127.0.0.1".into(),
+            port: 4001,
         });
         let cluster_map = Arc::new(cluster_map);
 

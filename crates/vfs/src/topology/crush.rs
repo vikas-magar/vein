@@ -102,8 +102,8 @@ mod tests {
     #[test]
     fn test_straw2_placement() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node1".into(), weight: 1.0, ip: "127.0.0.1".into(), port: 0 });
-        map.add_node(Node { id: "node2".into(), weight: 2.0, ip: "127.0.0.2".into(), port: 0 });
+        map.add_node(Node { id: "node1".into(), weight: 1.0, ip: "127.0.0.1".into(), port: 4001 });
+        map.add_node(Node { id: "node2".into(), weight: 2.0, ip: "127.0.0.2".into(), port: 4002 });
         
         let owner = map.get_owner("block_x").unwrap();
         assert!(owner.id == "node1" || owner.id == "node2");
@@ -118,8 +118,8 @@ mod tests {
     #[test]
     fn test_straw2_deterministic_placement() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node1".into(), weight: 1.0, ip: "127.0.0.1".into(), port: 0 });
-        map.add_node(Node { id: "node2".into(), weight: 2.0, ip: "127.0.0.2".into(), port: 0 });
+        map.add_node(Node { id: "node1".into(), weight: 1.0, ip: "127.0.0.1".into(), port: 4001 });
+        map.add_node(Node { id: "node2".into(), weight: 2.0, ip: "127.0.0.2".into(), port: 4002 });
 
         let owner1 = map.get_owner("block_test_123").unwrap();
         let owner2 = map.get_owner("block_test_123").unwrap();
@@ -129,8 +129,8 @@ mod tests {
     #[test]
     fn test_straw2_zero_weight_node() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.1".into(), port: 0 });
-        map.add_node(Node { id: "node_active".into(), weight: 1.0, ip: "127.0.0.2".into(), port: 0 });
+        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.1".into(), port: 4001 });
+        map.add_node(Node { id: "node_active".into(), weight: 1.0, ip: "127.0.0.2".into(), port: 4002 });
 
         for i in 0..100 {
             let block_id = format!("block_{}", i);
@@ -142,8 +142,8 @@ mod tests {
     #[test]
     fn test_straw2_weight_distribution() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node_w1".into(), weight: 1.0, ip: "127.0.0.1".into(), port: 0 });
-        map.add_node(Node { id: "node_w3".into(), weight: 3.0, ip: "127.0.0.2".into(), port: 0 });
+        map.add_node(Node { id: "node_w1".into(), weight: 1.0, ip: "127.0.0.1".into(), port: 4001 });
+        map.add_node(Node { id: "node_w3".into(), weight: 3.0, ip: "127.0.0.2".into(), port: 4002 });
 
         let mut w1_count = 0;
         let mut w3_count = 0;
@@ -166,9 +166,9 @@ mod tests {
     #[test]
     fn test_straw2_boundary_and_edge_cases() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node_neg".into(), weight: -1.0, ip: "127.0.0.1".into(), port: 0 });
-        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.2".into(), port: 0 });
-        map.add_node(Node { id: "node_pos".into(), weight: 0.5, ip: "127.0.0.3".into(), port: 0 });
+        map.add_node(Node { id: "node_neg".into(), weight: -1.0, ip: "127.0.0.1".into(), port: 4001 });
+        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.2".into(), port: 4002 });
+        map.add_node(Node { id: "node_pos".into(), weight: 0.5, ip: "127.0.0.3".into(), port: 4003 });
 
         let owner = map.get_owner("block_edge").unwrap();
         assert_eq!(owner.id, "node_pos");
@@ -177,8 +177,8 @@ mod tests {
     #[test]
     fn test_straw2_all_zero_or_negative_weights() {
         let mut map = ClusterMap::new();
-        map.add_node(Node { id: "node_neg".into(), weight: -1.0, ip: "127.0.0.1".into(), port: 0 });
-        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.2".into(), port: 0 });
+        map.add_node(Node { id: "node_neg".into(), weight: -1.0, ip: "127.0.0.1".into(), port: 4001 });
+        map.add_node(Node { id: "node_zero".into(), weight: 0.0, ip: "127.0.0.2".into(), port: 4002 });
 
         assert!(map.get_owner("block_x").is_err());
     }
