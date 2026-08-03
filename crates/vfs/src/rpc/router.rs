@@ -326,9 +326,15 @@ impl RpcRouter {
 
         let status_byte = {
             let mut arch = self.archipelago.write().await;
+            // Register the proposal on this node if not already present, then vote.
+            // propose() returns Err if already exists — that's fine, we still proceed to vote.
+            let _ = arch.propose(pid.clone(), payload_buf.clone());
             match arch.vote(&pid, &self.local_node_id) {
                 Ok(()) => 0x00u8,
-                Err(_) => 0x01u8,
+                Err(e) => {
+                    tracing::warn!("vote() failed for proposal {:?}: {}", pid, e);
+                    0x01u8
+                }
             }
         };
 
@@ -514,10 +520,6 @@ mod tests {
             node_id: "node1".into(),
             sequence: 42,
         };
-        {
-            let mut arch = archipelago.write().await;
-            arch.propose(pid.clone(), b"payload".to_vec()).unwrap();
-        }
 
         let router = RpcRouter::new(
             Arc::new(IngestionBuffer::new(
@@ -547,9 +549,9 @@ mod tests {
         let (mut client_stream, mut server_stream) = tokio::io::duplex(1024);
 
         let op = ConsensusOp::AppendExtent {
-            path: "/test/file.txt".into(),
+            path: "/test".into(),
             offset: 0,
-            length: 100,
+            length: 0,
         };
         let op_bytes = op.serialize().unwrap();
 
@@ -576,7 +578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_vote_request_reject_unknown_proposal() {
+    async fn test_process_vote_request_existing_proposal() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let cluster_map = Arc::new(ClusterMap::new());
@@ -621,6 +623,11 @@ mod tests {
         };
         let op_bytes = op.serialize().unwrap();
 
+        {
+            let mut arch = archipelago.write().await;
+            arch.propose(pid.clone(), op_bytes.clone()).unwrap();
+        }
+
         client_stream.write_all(&pid.to_wire_bytes()).await.unwrap();
         client_stream.write_u64(op_bytes.len() as u64).await.unwrap();
         client_stream.write_all(&op_bytes).await.unwrap();
@@ -637,7 +644,7 @@ mod tests {
         assert_eq!(reply_pid, pid);
 
         let status_byte = client_stream.read_u8().await.unwrap();
-        assert_eq!(status_byte, 0x01); // 0x01 = Reject
+        assert_eq!(status_byte, 0x00); // 0x00 = Accept
     }
 
     #[tokio::test]
