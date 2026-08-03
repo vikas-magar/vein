@@ -1,5 +1,8 @@
 //! Peer connection pool for Archipelago consensus.
 
+use common::transport::{build_quic_client, ConnectionManager, QuicClient};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use crate::consensus::archipelago::ProposalId;
 use crate::consensus::op::ConsensusOp;
 use crate::topology::crush::Node;
@@ -17,6 +20,7 @@ pub enum VoteReply {
 /// Peer connection pool holding client transport configuration.
 pub struct PeerPool {
     ca_cert_path: String,
+    client: Option<QuicClient>,
 }
 
 impl PeerPool {
@@ -24,6 +28,7 @@ impl PeerPool {
     pub fn new(ca_cert_path: &str) -> Result<Self, VfsError> {
         Ok(Self {
             ca_cert_path: ca_cert_path.to_string(),
+            client: None,
         })
     }
 
@@ -36,13 +41,75 @@ impl PeerPool {
     pub async fn send_vote_request(
         &mut self,
         node: &Node,
-        _pid: &ProposalId,
-        _op: &ConsensusOp,
+        pid: &ProposalId,
+        op: &ConsensusOp,
     ) -> Result<VoteReply, VfsError> {
-        Err(VfsError::Internal(format!(
-            "PeerPool: not connected to {}",
-            node.addr()
-        )))
+        if self.client.is_none() {
+            let raw_client = build_quic_client(&self.ca_cert_path)
+                .map_err(|e| VfsError::Internal(format!("Failed to build quic client: {}", e)))?;
+            self.client = Some(QuicClient::new(raw_client));
+        }
+
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| VfsError::Internal("QuicClient not initialized".to_string()))?;
+        let mut stream = client
+            .open_stream(&node.addr())
+            .await
+            .map_err(|e| VfsError::Internal(format!("Failed to open stream to {}: {}", node.addr(), e)))?;
+
+        // Send opcode 0x10
+        stream
+            .write_u8(0x10)
+            .await
+            .map_err(|e| VfsError::Internal(format!("Failed to write opcode: {}", e)))?;
+
+        // Send pid
+        stream
+            .write_all(&pid.to_wire_bytes())
+            .await
+            .map_err(|e| VfsError::Internal(format!("Failed to write pid: {}", e)))?;
+
+        // Send op
+        let payload = op.serialize()?;
+        stream
+            .write_u64(payload.len() as u64)
+            .await
+            .map_err(|e| VfsError::Internal(format!("Failed to write payload len: {}", e)))?;
+        stream
+            .write_all(&payload)
+            .await
+            .map_err(|e| VfsError::Internal(format!("Failed to write payload: {}", e)))?;
+
+        // Read reply
+        let reply_opcode = stream
+            .read_u8()
+            .await
+            .map_err(|e| VfsError::Internal(format!("Failed to read reply opcode: {}", e)))?;
+        if reply_opcode != 0x11 {
+            return Err(VfsError::Internal(format!(
+                "Unexpected reply opcode: {}",
+                reply_opcode
+            )));
+        }
+
+        let mut pid_buf = [0u8; 16];
+        stream
+            .read_exact(&mut pid_buf)
+            .await
+            .map_err(|e| VfsError::Internal(format!("Failed to read reply pid: {}", e)))?;
+
+        let status = stream
+            .read_u8()
+            .await
+            .map_err(|e| VfsError::Internal(format!("Failed to read reply status: {}", e)))?;
+
+        match status {
+            0x00 => Ok(VoteReply::Accept),
+            0x01 => Ok(VoteReply::Reject),
+            _ => Err(VfsError::Internal(format!("Unknown reply status: {}", status))),
+        }
     }
 }
 
@@ -56,6 +123,7 @@ mod tests {
         assert!(pool.is_ok());
         let pool = pool.unwrap();
         assert_eq!(pool.ca_cert_path(), "/dev/null");
+        assert!(pool.client.is_none());
     }
 
     #[test]
@@ -69,3 +137,4 @@ mod tests {
         assert_eq!(deserialized, VoteReply::Accept);
     }
 }
+
