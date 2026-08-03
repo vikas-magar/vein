@@ -47,7 +47,7 @@ pub fn load_topology(
     for peer in &cluster_config.peers {
         cluster_map.add_node(vfs::topology::crush::Node {
             id: peer.id.clone(),
-            weight: peer.weight as f64,
+            weight: peer.weight,
             ip: peer.ip.clone(),
             port: peer.port,
         });
@@ -74,25 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_str = std::fs::read_to_string(&cli.config)?;
     let cluster_config: ClusterConfig = toml::from_str(&config_str)?;
 
-    let mut cluster_map = vfs::topology::crush::ClusterMap::new();
-    let mut bind_addr = None;
-
-    for peer in &cluster_config.peers {
-        cluster_map.add_node(vfs::topology::crush::Node {
-            id: peer.id.clone(),
-            weight: peer.weight as f64,
-            ip: peer.ip.clone(),
-            port: peer.port,
-        });
-
-        if peer.id == cli.node_id {
-            bind_addr = Some(format!("{}:{}", peer.ip, peer.port));
-        }
-    }
-
-    let bind_addr = bind_addr.ok_or_else(|| {
-        format!("Node ID '{}' not found in configuration peers list", cli.node_id)
-    })?;
+    let (_cluster_map, bind_addr) = load_topology(&cluster_config, &cli.node_id)?;
 
     tracing::info!("Topology loaded. {} peers found. Binding to {}", cluster_config.peers.len(), bind_addr);
 
