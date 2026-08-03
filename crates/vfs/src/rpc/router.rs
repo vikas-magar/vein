@@ -193,15 +193,24 @@ impl RpcRouter {
                     let pool = self.peer_pool.clone();
                     let arch = self.archipelago.clone();
                     tokio::spawn(async move {
-                        match pool.lock().await.send_vote_request(&peer, &pid2, &op2).await {
-                            Ok(VoteReply::Accept) => {
+                        let timeout_res = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            pool.lock().await.send_vote_request(&peer, &pid2, &op2),
+                        )
+                        .await;
+
+                        match timeout_res {
+                            Ok(Ok(VoteReply::Accept)) => {
                                 let mut a = arch.write().await;
                                 if let Err(e) = a.vote(&pid2, &peer.id) {
                                     tracing::warn!("vote error from peer {}: {}", peer.id, e);
                                 }
                             }
-                            Ok(VoteReply::Reject) => tracing::warn!("peer {} rejected proposal {:?}", peer.id, pid2),
-                            Err(e) => tracing::warn!("vote_request to {} failed: {}", peer.id, e),
+                            Ok(Ok(VoteReply::Reject)) => {
+                                tracing::warn!("peer {} rejected proposal {:?}", peer.id, pid2)
+                            }
+                            Ok(Err(e)) => tracing::warn!("vote_request to {} failed: {}", peer.id, e),
+                            Err(_) => tracing::warn!("vote_request to {} timed out", peer.id),
                         }
                     });
                 }
