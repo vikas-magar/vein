@@ -109,7 +109,8 @@ pub async fn execute_parquet_scan(
             total_rows += batch.num_rows();
 
             tracing::trace!(rows = batch.num_rows(), "Pushing batch down pipeline");
-            next.push(batch)?;
+            todo!("Epic 1.2: convert RecordBatch to VeinBatch::Flat(DataChunk)");
+            // next.push(batch)?;
         }
 
         tracing::info!(path = %path, rows_processed = total_rows, "Finished scanning Parquet file");

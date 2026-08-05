@@ -1,4 +1,4 @@
-use arrow::record_batch::RecordBatch;
+// Removed unused RecordBatch
 use common::identifiers::TaskId;
 use std::sync::Arc;
 use common::protocol::{DataSource, DataSink, Operator};
@@ -9,19 +9,24 @@ use common::arrow::SelectionVector;
 /// A physical column of data (wraps Arrow Arrays for now).
 #[derive(Debug, Clone)]
 pub struct ValueVector {
+    /// The underlying array data.
     pub data: ArrayRef,
 }
 
 /// A horizontal slice of data processed in a pipeline.
 #[derive(Debug, Clone)]
 pub struct DataChunk {
+    /// The columns in this chunk.
     pub vectors: Vec<ValueVector>,
+    /// The selection vector indicating active rows.
     pub selection: SelectionVector,
 }
 
 /// Prepares the engine for Phase 3 (Factorization).
 pub enum VeinBatch {
+    /// A flat chunk of data.
     Flat(DataChunk),
+    /// A factorized chunk of data (Epic 3).
     Factorized(()), // Placeholder for Epic 3
 }
 

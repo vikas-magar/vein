@@ -27,8 +27,9 @@ impl Memory {
 #[async_trait::async_trait(?Send)]
 impl Source for Memory {
     async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()> {
-        if let Some(batch) = self.batch.take() {
-            next.push(batch)?;
+        if let Some(_batch) = self.batch.take() {
+            todo!("Epic 1.2: convert RecordBatch to VeinBatch::Flat(DataChunk)");
+            // next.push(batch)?;
         }
         next.flush()?;
         Ok(())

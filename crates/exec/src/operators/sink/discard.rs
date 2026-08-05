@@ -1,6 +1,6 @@
 use arrow::record_batch::RecordBatch;
 use common::Result;
-use crate::daemon::pipeline::{PipelineNode, Sink};
+use crate::daemon::pipeline::{PipelineNode, Sink, VeinBatch};
 use tracing::info;
 
 /// A simple sink that discards all data.
@@ -17,8 +17,8 @@ impl Discard {
 }
 
 impl PipelineNode for Discard {
-    fn push(&mut self, batch: RecordBatch) -> Result<()> {
-        self.rows_seen += batch.num_rows();
+    fn push(&mut self, _batch: VeinBatch) -> Result<()> {
+        // self.rows_seen += batch.num_rows();
         Ok(())
     }
 
