@@ -1,4 +1,6 @@
 pub mod dispatcher;
+pub mod elasticity;
+
 
 use crate::executor::ExecutorRegistry;
 use crate::planner::dag::StageDag;
