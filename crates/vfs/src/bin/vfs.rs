@@ -11,7 +11,7 @@ use vfs::consensus::archipelago::ArchipelagoState;
 use vfs::rpc::router::RpcRouter;
 
 #[derive(Parser, Debug)]
-#[command(name = "vfs", about = "VeinFS Distributed Storage Node")]
+#[command(name = "vfs", about = "VFS Distributed Storage Node")]
 pub struct Cli {
     #[arg(short, long)]
     pub node_id: String,
@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
-    tracing::info!("Starting VeinFS Node: {}", cli.node_id);
+    tracing::info!("Starting VFS Node: {}", cli.node_id);
 
     let config_str = std::fs::read_to_string(&cli.config)?;
     let cluster_config: ClusterConfig = toml::from_str(&config_str)?;

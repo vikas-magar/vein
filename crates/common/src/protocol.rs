@@ -1,9 +1,10 @@
-use std::net::SocketAddr;
+#![allow(missing_docs)]
+
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identifiers::{NodeId, PartitionId, QueryId, StageId, TaskId};
+use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
 
 /// Kind of a Vein cluster node.
 #[derive(
@@ -26,8 +27,6 @@ pub enum NodeKind {
     Executor,
     /// Catalog and metadata service.
     Vcs,
-    /// External Shuffle Service node.
-    Ess,
 }
 
 /// Load snapshot of a node, sent in heartbeats.
@@ -89,7 +88,7 @@ pub enum VeinControlEvent {
         /// Query the task belongs to.
         query_id: QueryId,
     },
-    /// Explicitly drain a shuffle partition at the ESS.
+    /// Explicitly drain a shuffle partition in VFS.
     ExplicitDrain {
         /// Query owning the partition.
         query_id: QueryId,
@@ -107,7 +106,7 @@ pub enum VeinControlEvent {
         /// Current load.
         load: NodeLoad,
     },
-    /// A map-stage has finished producing all data; partitions are ready at ESS.
+    /// A map-stage has finished producing all data; partitions are ready in VFS.
     StageReady {
         /// Query the stage belongs to.
         query_id: QueryId,
@@ -155,8 +154,8 @@ pub struct FileScanTask {
     pub projected_schema: Vec<FieldSchema>,
     /// Task identifier for reporting.
     pub task_id: TaskId,
-    /// ESS address to send output to, if applicable.
-    pub ess_target: Option<SocketAddr>,
+    /// VFS path prefix to send output to, if applicable.
+    pub shuffle_target_path: Option<String>,
 }
 
 /// Minimal field schema for protocol serialization.
@@ -281,7 +280,7 @@ pub struct SortKey {
 pub enum DataSource {
     /// Read from static storage (e.g., Parquet).
     File(FileScanTask),
-    /// Read from the Ephemeral Shuffle Service (Exchange).
+    /// Read from VFS (Exchange).
     Exchange(ExchangeSource),
     /// Read from an infinite event stream (e.g., Kafka).
     Stream(StreamSource),
@@ -289,7 +288,7 @@ pub enum DataSource {
     Memory,
 }
 
-/// Read from ESS.
+/// Read from VFS Exchange.
 #[derive(
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
@@ -309,14 +308,14 @@ pub struct StreamSource {
     pub topic: String,
 }
 
-/// Target for shuffle output (ESS address + partition info).
+/// Target for shuffle output (VFS path prefix + partition info).
 #[derive(
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 
 pub struct ShuffleTarget {
-    /// ESS node address.
-    pub ess_addr: SocketAddr,
+    /// VFS path prefix (e.g. /vein/queries/q1/stage_1).
+    pub vfs_path_prefix: String,
     /// Number of shuffle partitions.
     pub num_partitions: u16,
 }
@@ -337,7 +336,7 @@ pub struct StorageTarget {
 )]
 
 pub enum DataSink {
-    /// Push data to the Shuffle Service for the next stage.
+    /// Push data to VFS for the next stage.
     Shuffle(ShuffleTarget),
     /// Stream data directly back to the Query Coordinator/Client.
     Client,
@@ -386,19 +385,6 @@ pub struct ExecuteTask {
     pub operators: Vec<Operator>,
     /// Where to send the output.
     pub sink: DataSink,
-}
-
-/// Payload sent from Executor to ESS.
-#[derive(Debug, Clone)]
-pub struct ShufflePayload {
-    /// Query this payload belongs to.
-    pub query_id: QueryId,
-    /// Stage this payload is part of.
-    pub stage_id: StageId,
-    /// Target partition.
-    pub partition: PartitionId,
-    /// Serialized Arrow IPC data.
-    pub data: bytes::Bytes,
 }
 
 /// Request from Client to Master.
