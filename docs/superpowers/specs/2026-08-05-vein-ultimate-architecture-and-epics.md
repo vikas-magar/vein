@@ -1,5 +1,5 @@
 # Vein Ultimate Architecture & Master Development Plan
-**Version**: 5.0 (Deep Kuzu & LadybugDB Integration)
+**Version**: 5.1 (Final Integration)
 **Date**: 2026-08-05
 
 This document represents the complete, end-to-end architectural vision and implementation plan for Vein. It synthesizes the exact internal implementations of Kuzu and LadybugDB (Factorized execution, Morsels, WCOJ) and maps them into Vein's distributed, cloud-native Rust architecture.
@@ -81,6 +81,21 @@ LadybugDB and DuckDB are strictly single-node, embedded databases. Vein takes th
   - Replace the heuristic query planner with a Reinforcement Learning agent that dynamically routes morsels through different join orderings to discover the mathematically fastest path in real time.
 - [ ] **Task 4.3: eBPF VFS Pushdown**
   - Compile simple filters to eBPF bytecode and push them to the VFS storage nodes so filtering happens *before* the network layer.
+
+---
+
+## Part 3: Kuzu Innovations for Vein (Innovation Matrix)
+
+This section maps the specific innovations discovered during the research phase (`kuzu_innovations_for_vein.md`) to their target realization in Vein's pipeline.
+
+| Innovation | Source | Implementation Phase | Estimated Performance Gain | Difficulty |
+|---|---|---|---|---|
+| **Hybrid Elastic Morsel Dispatcher** | Kuzu (Aug 2025 Paper) | Epic 2 | 2x-5x faster query time on skewed data | ⭐⭐⭐ |
+| **Factorized Arrow Batches** | Kuzu (CIDR 2023) | Epic 3 | 3x-50x shuffle data size reduction | ⭐⭐⭐⭐ |
+| **Worst-Case Optimal Joins (WCOJ)** | Kuzu + VLDB 2025 | Epic 4 | 3x-100x reduction in complexity for cyclic joins | ⭐⭐⭐⭐⭐ |
+| **ADOPT RL Join Ordering** | VLDB 2023 / ADOPT | Epic 4 | Eliminates catastrophic plans natively | ⭐⭐⭐⭐ |
+| **Intra-Query Elasticity** | TU Berlin 2025 | Epic 2 | Eliminates stage stragglers entirely | ⭐⭐⭐⭐ |
+| **eBPF JIT Filter Pushdown** | Vein Original | Epic 4 | 10x-100x scan speed vs user-space | ⭐⭐⭐ |
 
 ---
 **Status**: Ready for Execution. 
