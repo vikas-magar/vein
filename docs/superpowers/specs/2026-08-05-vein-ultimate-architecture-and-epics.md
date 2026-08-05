@@ -1,90 +1,87 @@
 # Vein Ultimate Architecture & Master Development Plan
-**Version**: 4.0 (Next-Generation Roadmap)
+**Version**: 5.0 (Deep Kuzu & LadybugDB Integration)
 **Date**: 2026-08-05
 
-This document represents the complete, end-to-end architectural vision and implementation plan for Vein. It synthesizes state-of-the-art research (Kuzu, Umbra, DuckDB, ADOPT) into a cloud-native, disaggregated OLAP engine.
+This document represents the complete, end-to-end architectural vision and implementation plan for Vein. It synthesizes the exact internal implementations of Kuzu and LadybugDB (Factorized execution, Morsels, WCOJ) and maps them into Vein's distributed, cloud-native Rust architecture.
 
 ---
 
-## Part 1: Complete Architecture & Tech Spec
+## Part 1: Deep Architecture & Execution Model
 
-### 1.1 The Disaggregated Storage Layer (VFS)
-Vein separates Compute and Storage to achieve infinite scale and fault tolerance.
-*   **VFS as the Backbone**: The Virtual File System (VFS) handles all persistent data and acts as the **Distributed Shuffle Service**.
-*   **Direct VFS Shuffle**: Compute nodes are stateless. Map tasks push intermediate Arrow data directly into VFS `IngestionBuffer`s, strictly bounding memory usage and preventing OOMs. Reduce tasks pull this data via QUIC.
+### 1.1 Vectorization & Selection Vectors (The Pipeline Engine)
+Both Kuzu and LadybugDB rely heavily on vectorized execution to utilize SIMD instructions and avoid branching.
+*   **The DataChunk**: Instead of passing raw `RecordBatch`es directly, Vein will process `DataChunk`s consisting of `ValueVector`s. 
+*   **Selection Vectors**: Vein will adopt the `SelectionVector` pattern. When a `Filter` operator processes a chunk, it **does not copy data**. It simply updates a bitmask/array (`SelectionView`) marking which row indices survived the filter. Subsequent operators in the pipeline only iterate over valid indices in the `SelectionVector`.
 
-### 1.2 The Storage-to-Compute Pipeline
-*   **Disk Reads (`io_uring` + eBPF)**: Workers read from local NVMe via `io_uring`. Data enters the kernel page cache where it is intercepted by a custom `vein_jit` eBPF program. Non-matching rows are dropped in the kernel; only matching rows are copied to user-space.
-*   **Network Reads (AF_XDP + s2n-quic)**: VFS shuffle blocks are transferred over QUIC running on top of AF_XDP raw sockets. This provides hardware-level kernel bypass (zero-copy networking) with reliable stream reassembly.
+### 1.2 Morsel-Driven Scheduling (Type 4 to Type 5 Evolution)
+Unlike traditional Volcano iterators, Vein uses a pipeline-breaker architecture. A pipeline executes until it hits a blocking operator (e.g., `HashJoinBuild`, `OrderByMerge`).
+*   **Type 4 Schedulers (DuckDB/LadybugDB Style)**: Vein's `TaskScheduler` splits pipeline execution into Morsels.
+    *   *Implementation*: A `ScanNode` has a `SharedState` object containing a counter (`currentCommittedGroupIdx`). When an idle thread inside our `WorkerPool` needs work, it calls `nextMorsel()`, takes a short-lived `std::sync::Mutex`, atomically claims a `nodeGroupIdx` (e.g., a Parquet row group), increments the counter, releases the lock, and processes the chunk.
+*   **Type 5 Schedulers (Kuzu Hybrid/Elastic Evolution)**: Type 4 fails under extreme data skew (one morsel takes 60 seconds, stranding the query).
+    *   *Implementation*: Vein's `Master` actively tracks the output sizes of morsels across the network. If a single VFS block or partition yields 40x more data than others, the Master cancels the long-running task, slices the remaining byte boundaries of that morsel into dozens of micro-morsels, and re-queues them. This elasticity guarantees uniform completion times.
 
-### 1.3 The Execution Engine (Morsel-Driven)
-*   **Type 4 Work-Stealing (Phase 1)**: The `WorkerPool` uses Tokio `LocalSet`s pinned to CPU cores. Idle threads steal `MorselTask`s (chunks of 100k rows) from busy threads.
-*   **Dual-Pool Isolation**: A dedicated thread pool handles async I/O (`io_uring`/QUIC), while the CPU pool exclusively runs pure compute pipelines, ensuring I/O never blocks processing.
-*   **Factorized Execution (Phase 3)**: Pipelines process `VeinBatch`es, which can be either flat `RecordBatch`es or compressed `FactorizedBatch`es. This eliminates intermediate result explosion during multi-table joins.
+### 1.3 Factorized Execution (The Join Revolution)
+Materializing flat rows during multi-way joins causes an O(N³) memory explosion. Vein adopts Kuzu's `FactorizedTable`.
+*   *Implementation*: Vein will wrap Arrow structures in a `VeinBatch { Flat, Factorized }` enum. Instead of flattening data during a 1-to-many join, the Hash Table stores collections of multi-valued fields as nested lists (`overflow_value_t`).
+*   When a Worker pushes data to the VFS during the shuffle phase, it serializes these *compressed, un-flattened* structures, reducing network and disk shuffle I/O by 10x-50x.
 
-### 1.4 The Intelligent Scheduler & Optimizer
-*   **Type 5 Hybrid Elastic Morsels (Phase 3)**: The Master tracks morsel completion rates. If it detects data skew (e.g., a VFS block is 40x larger than expected), it dynamically splits the in-flight morsel across more workers.
-*   **Intra-Query Elasticity**: The Master can dynamically add new compute nodes to a running Stage if the stage is falling behind its SLA.
-*   **RL-Based Join Optimization (Phase 4)**: The `planner` uses ADOPT (Reinforcement Learning) to find the optimal join attribute order at runtime by testing different paths and gathering feedback, eliminating the need for a brittle Cost-Based Optimizer.
-*   **Confidence-Bounded Early Stop (Phase 4)**: The Master halts cluster execution the millisecond an aggregation hits 99.9% statistical confidence, returning answers in milliseconds.
+### 1.4 Worst-Case Optimal Joins (WCOJ)
+Standard binary Hash Joins are catastrophic for cyclic queries (e.g., finding triangles).
+*   *Implementation*: The Vein Planner will inject `IntersectBuild` operators. Following Kuzu's `Intersect::intersectLists`, Vein will collect adjacency lists for identical node IDs. It performs iterative `twoWayIntersect()` calls, using synchronized `SelectionVector`s to progressively shrink the valid mask across all lists simultaneously without moving memory.
+
+### 1.5 Distributed VFS Shuffle (The Vein Advantage)
+LadybugDB and DuckDB are strictly single-node, embedded databases. Vein takes their world-class vertical execution and distributes it horizontally.
+*   Compute nodes are stateless. Morsel outputs bounded by pipeline breakers are pushed directly into the Virtual File System (VFS) via AF_XDP/s2n-quic.
 
 ---
 
-## Part 2: Implementation Plan & Epics
+## Part 2: Epics and Implementation Plan
 
-### Epic 1: The Disaggregated Pipeline Foundation
-*Laying the groundwork for a stateless, high-throughput engine.*
+### Epic 1: The Vectorized Type 4 Execution Engine (Foundation)
+*Rebuilding the core pipeline to support Morsels and Selection Vectors.*
 
-- [ ] **Task 1.1: Dual-Pool Worker Architecture**
-  - Refactor `WorkerPool` in `crates/exec/src/daemon/worker.rs`.
-  - Implement a dedicated Tokio multi-threaded runtime for I/O, and `LocalSet`s for CPU.
-- [ ] **Task 1.2: Introduce `VeinBatch` Pipeline Abstraction**
-  - Modify `crates/exec/src/daemon/pipeline.rs`.
-  - Create `VeinBatch { Flat, Factorized }` enum. Update `PipelineNode` trait.
-- [ ] **Task 1.3: Direct VFS Shuffle Implementation**
-  - Update `crates/exec/src/operators/sink/` to include a `VfsSink`.
-  - Ensure Map tasks flush `RecordBatch` data directly to VFS via QUIC.
-- [ ] **Task 1.4: eBPF JIT Compiler (`vein_jit`)**
-  - Create `crates/vein_jit`. Implement AST-to-eBPF bytecode translator for simple filters.
-  - Wire XDP hook in `common/src/xdp.rs` to load the compiled bytecode.
+- [ ] **Task 1.1: Selection Vectors & DataChunks**
+  - Create `SelectionVector` struct in `crates/common/src/`.
+  - Refactor `PipelineNode::push()` to accept a `DataChunk` containing `ValueVector`s and a `SelectionVector` rather than a flat Arrow `RecordBatch`.
+- [ ] **Task 1.2: The Pipeline Breaker Architecture**
+  - Implement `Pipeline` and `Task` structs in `crates/exec/`. Define operators that block execution (e.g., `HashJoinBuild`).
+- [ ] **Task 1.3: Type 4 Morsel Dispatcher (`SharedState`)**
+  - Modify `ScanSource` in `crates/exec/src/operators/source/`. 
+  - Implement `SharedState` with a Mutex-guarded `next_morsel()` function that hands out partition indices to idle workers in the `WorkerPool`.
+- [ ] **Task 1.4: Dual-Pool Isolation**
+  - Split `WorkerPool` into a CPU `LocalSet` pool and a standard `tokio` multi-threaded I/O pool to ensure kernel-bypass network I/O doesn't interrupt vector processing.
 
-### Epic 2: Adaptive Execution & Master Intelligence
-*Making the cluster resilient to stragglers and node failures.*
+### Epic 2: The Type 5 Distributed Scheduler (Elasticity)
+*Scaling the Type 4 single-node scheduler across the Vein cluster.*
 
-- [ ] **Task 2.1: Execution Telemetry Feedback Loop**
-  - Update `common::protocol::ExecuteTask` with feedback channels.
-  - Workers stream `rows_processed` and `bytes_produced` back to Master.
-- [ ] **Task 2.2: Intra-Query Elasticity (Scale-Out)**
-  - Modify `StageDag` and `ExecutorRegistry` in `crates/master/`.
-  - Add logic to assign newly joined cluster nodes to currently running Stages.
-- [ ] **Task 2.3: NUMA-Aware Task Dispatching**
-  - Update Master's dispatcher to prefer routing VFS read tasks to Compute nodes that physically reside in the same rack/zone as the VFS data block.
+- [ ] **Task 2.1: Execution Telemetry Loop**
+  - Add `ExecutionFeedback` messages. Workers report morsel throughput to the Master.
+- [ ] **Task 2.2: Type 5 Hybrid Elastic Splitting**
+  - Update `crates/master/src/scheduler/dispatcher.rs`.
+  - Add logic to detect skew: if a worker takes >200ms on a single morsel, cancel the task, split the remaining VFS block range into micro-morsels, and queue them to the `ExecutorRegistry`.
+- [ ] **Task 2.3: Direct VFS Shuffle Writer**
+  - Implement a `VfsSink` operator that writes pipelined `DataChunk`s directly to the VFS cluster over QUIC, fulfilling the disaggregated architecture.
 
-### Epic 3: Advanced Morsels & Factorization (The Kuzu Integration)
-*Achieving state-of-the-art processing density and eliminating data skew.*
+### Epic 3: Factorization & Compression
+*Implementing Kuzu's memory-saving innovations.*
 
-- [ ] **Task 3.1: Type 5 Hybrid Elastic Morsel Splitting**
-  - Update Master `scheduler/dispatcher.rs`.
-  - Implement skew detection: If a `MorselTask` telemetry shows massive output generation, cancel it, split the remaining byte range, and queue as micro-morsels.
-- [ ] **Task 3.2: Factorized Batch Execution**
-  - Implement symbolic factorized structures in `VeinBatch::Factorized`.
-  - Update the `HashJoin` operator to output `Factorized` batches instead of materializing the cartesian product.
-- [ ] **Task 3.3: VFS Compression for Factorized Data**
-  - Update `vfs/src/ingest/` to natively store factorized structures without flattening them, saving 10x-50x disk space during shuffles.
+- [ ] **Task 3.1: The `FactorizedTable` Abstraction**
+  - Create `FactorizedTable` in `crates/exec/` to store `UNFLAT` vectors.
+- [ ] **Task 3.2: Factorized Hash Join**
+  - Refactor the Hash Join operator. When joining a primary key to a foreign key, output a `Factorized` chunk with `overflow` list pointers instead of taking the cartesian product.
+- [ ] **Task 3.3: VFS Factorized Serialization**
+  - Update the `VfsSink` to natively serialize factorized nested lists to Arrow IPC without flattening them first.
 
-### Epic 4: Next-Gen Optimization (The 2026 Frontier)
-*Pushing Vein beyond the capabilities of commercial cloud data warehouses.*
+### Epic 4: WCOJ & Advanced Optimization (2026+)
+*The bleeding edge of query planning.*
 
-- [ ] **Task 4.1: Worst-Case Optimal Join (WCOJ) Operator**
-  - Implement `LeapfrogTrieJoin` in `crates/exec/src/operators/`.
-  - Build Trie indexes over Arrow dictionary columns.
-- [ ] **Task 4.2: ADOPT RL Join Optimizer**
-  - Remove static heuristics from `crates/planner/src/optimizer/`.
-  - Implement an RL agent that tests attribute orders in "episodes" during query execution, learning the fastest path automatically.
-- [ ] **Task 4.3: Confidence-Bounded Early Stop**
-  - Update the Master's Aggregation coordinator.
-  - Compute statistical confidence intervals on incoming morsel streams. Inject a global cancellation token when 99.9% confidence is reached for exploratory queries.
+- [ ] **Task 4.1: The Intersect Operator (WCOJ)**
+  - Implement `IntersectBuild` and `twoWayIntersect()` in Rust, ensuring `SelectionVector`s are sliced and synchronized accurately during execution.
+- [ ] **Task 4.2: ADOPT RL Join Enumerator**
+  - Replace the heuristic query planner with a Reinforcement Learning agent that dynamically routes morsels through different join orderings to discover the mathematically fastest path in real time.
+- [ ] **Task 4.3: eBPF VFS Pushdown**
+  - Compile simple filters to eBPF bytecode and push them to the VFS storage nodes so filtering happens *before* the network layer.
 
 ---
 **Status**: Ready for Execution. 
-**Next Step**: Subagent implementation of Epic 1, Task 1.1.
+**Next Step**: Initiate Epic 1 (Task 1.1: Selection Vectors & DataChunks).
