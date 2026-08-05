@@ -4,7 +4,7 @@
 **Date**: 2026-08-05
 
 ## 1. Overview
-This document details the low-level design for Vein's transition to a Morsel-driven, Vectorized execution engine. It replaces the naive `RecordBatch` pushing mechanism with SIMD-friendly `DataChunk`s, `SelectionVector`s, and a Type 4 `SharedState` morsel dispatcher.
+This document details the low-level design for Vein's transition to a Morsel-driven, Vectorized execution engine. It replaces the naive `RecordBatch` pushing mechanism with SIMD-friendly `DataChunk`s, `SelectionVector`s, and a Two-Tier Distributed lock-free morsel dispatcher.
 
 ## 2. Core Data Structures
 
@@ -73,28 +73,27 @@ pub trait PipelineNode: Send + Sync {
 }
 ```
 
-## 4. Morsel Dispatch & Concurrency (Type 4 Scheduler)
+## 4. Two-Tier Distributed Scheduling (Type 5)
 
-### 4.1 `SharedScanState` (`crates/exec/src/operators/source/scan.rs`)
-The mechanism for cooperative multitasking across threads reading the same table.
+### 4.1 Local Lock-Free Dispatcher (`crates/exec/src/operators/source/scan.rs`)
+Once a Compute node receives a Macro-Morsel from the Master, it uses hardware atomics to distribute work among its physical cores without OS lock contention.
 ```rust
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Shared state across all workers executing a specific ScanNode.
+/// Shared state across all local workers executing a specific Macro-Morsel.
 pub struct SharedScanState {
-    /// Total number of morsels (e.g., Parquet row groups) available.
+    /// Total number of micro-morsels (e.g., 100k row chunks) available locally.
     pub total_morsels: usize,
-    /// The next morsel index to be claimed.
-    pub current_morsel_idx: Mutex<usize>,
+    /// The next micro-morsel index to be claimed (Lock-Free).
+    pub current_morsel_idx: AtomicUsize,
 }
 
 impl SharedScanState {
-    /// Atomically claims the next morsel. Returns None if all morsels are claimed.
+    /// Hardware atomic increment. No Mutex, no waiting, no OS involvement.
+    #[inline(always)]
     pub fn next_morsel(&self) -> Option<usize> {
-        let mut idx = self.current_morsel_idx.lock().unwrap();
-        if *idx < self.total_morsels {
-            let claimed = *idx;
-            *idx += 1;
+        let claimed = self.current_morsel_idx.fetch_add(1, Ordering::Relaxed);
+        if claimed < self.total_morsels {
             Some(claimed)
         } else {
             None
@@ -113,20 +112,21 @@ pub struct WorkerPool {
 }
 ```
 **Concurrency Flow**:
-1. `WorkerPool` spins up N OS threads for Compute.
-2. An idle CPU thread pulls a `MorselTask`.
-3. The thread calls `SharedScanState::next_morsel()`.
-4. It reads the VFS block (yielding to the `io_runtime` for the physical I/O).
-5. It runs the synchronous `PipelineNode::push()` loop entirely in CPU memory.
-6. Pipeline breakers (or `VfsSink`) yield to `io_runtime` to flush over QUIC.
+1. `Master` assigns a 1GB **Macro-Morsel** to the `WorkerPool` over the network.
+2. `WorkerPool` initializes `SharedScanState` with 10,000 Micro-Morsels.
+3. 128 OS threads concurrently call `fetch_add()` to steal Micro-Morsels.
+4. Threads read VFS blocks (yielding to `io_runtime` for physical I/O).
+5. Threads run the synchronous `PipelineNode::push()` SIMD loop strictly in CPU memory.
+6. Local state is pushed back to VFS over QUIC.
+7. If the node falls behind, Master cancels the Task, takes back remaining Macro-Morsel boundaries, and re-dispatches to idle nodes.
 
-## 5. Sequence Diagram: Morsel Execution
-1. `Master` dispatches `ExecuteTask` to Worker Node.
-2. Worker `io_runtime` receives Task via QUIC.
-3. Task is queued into `flume::Receiver<MorselTask>`.
-4. Idle `cpu_handle` pulls `MorselTask`.
-5. Thread locks `SharedScanState`, gets `morsel_idx = 0`.
-6. Thread scans row group 0 -> emits `DataChunk`.
-7. `FilterNode` applies predicates, updates `SelectionVector` (zero-copy).
-8. `VfsSink` pushes final filtered `VeinBatch` to VFS.
-9. Thread loops back to step 5 until `next_morsel()` returns `None`.
+## 5. Sequence Diagram: Distributed Morsel Execution
+1. `Master` dispatches `ExecuteTask` (Macro-Morsel: VFS Blocks 0-100) to Worker Node A.
+2. Worker `io_runtime` receives Task via QUIC, creates `SharedScanState`.
+3. Idle `cpu_handle` (Core 1) pulls Task.
+4. Core 1 calls `fetch_add(1)`, atomically claims Micro-Morsel 0.
+5. Core 2 calls `fetch_add(1)`, atomically claims Micro-Morsel 1.
+6. Core 1 applies `FilterNode` predicates, updates `SelectionVector` (zero-copy).
+7. Core 1 `VfsSink` pushes final filtered `VeinBatch` to VFS.
+8. Core 1 loops back to step 4 instantly until `fetch_add` exceeds bounds.
+9. Node A notifies Master: "Macro-Morsel Complete".
