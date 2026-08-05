@@ -440,6 +440,63 @@ pub enum ProtocolResponse {
     },
 }
 
+/// Streaming telemetry from a compute node to the master.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct TaskTelemetry {
+    /// The task this telemetry is for.
+    pub task_id: TaskId,
+    /// Total morsels assigned to this task.
+    pub total_morsels_assigned: usize,
+    /// Morsels completed so far.
+    pub morsels_completed: usize,
+    /// Current processing speed.
+    pub rows_processed_per_sec: f64,
+}
+
+/// Response to a preempt command.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct PreemptResponse {
+    /// The task that was preempted.
+    pub task_id: TaskId,
+    /// Morsels completed before preemption.
+    pub morsels_completed: usize,
+    /// The boundary of work that the worker yielded back to the master
+    pub morsels_yielded: usize,
+}
+
+/// A macro-morsel task dispatched from Master to Worker.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct MorselTask {
+    /// Task identifier.
+    pub task_id: TaskId,
+    /// Upstream source.
+    pub source: DataSource,
+    /// Physical execution plan.
+    pub plan: Vec<Operator>,
+    /// Downstream sink.
+    pub sink: DataSink,
+}
+
+/// A command sent from the Master to a Compute Node for elasticity and scheduling.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum MasterCommand {
+    /// Dispatches a new Macro-Morsel to the worker
+    DispatchTask(MorselTask),
+    /// Forces the worker to pause and relinquish un-claimed Micro-Morsels
+    PreemptTask { 
+        /// The task to preempt.
+        task_id: TaskId 
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
