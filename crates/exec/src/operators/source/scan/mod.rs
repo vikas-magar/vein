@@ -7,6 +7,10 @@ use opendal::Operator;
 /// Parquet format decoding logic using OpenDAL
 pub mod parquet;
 
+/// Lock-free morsel dispatcher state
+pub mod state;
+pub use state::SharedScanState;
+
 /// A generic Source operator that scans files using OpenDAL and dispatches based on format.
 pub struct ScanSource {
     operator: Operator,

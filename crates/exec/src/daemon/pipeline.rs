@@ -80,6 +80,8 @@ pub trait PipelineBreaker: PipelineNode {
 
 /// Represents a single executable chain, bounded by a source and a pipeline breaker.
 pub struct Pipeline {
+    /// The source from which this pipeline reads data.
     pub source: Box<dyn Source>,
+    /// The terminating node that consumes data.
     pub breaker: Box<dyn PipelineBreaker>,
 }
