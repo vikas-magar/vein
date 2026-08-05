@@ -10,13 +10,28 @@ use arrow::record_batch::RecordBatch;
 use common::Result;
 /// A pool of OS threads pinning Tokio LocalSets for cache-local execution.
 pub struct WorkerPool {
-    handles: Vec<JoinHandle<()>>,
+    /// Pure compute threads pinned to CPU cores via Tokio LocalSets.
+    cpu_handles: Vec<JoinHandle<()>>,
+    /// Multi-threaded I/O runtime for network (QUIC) and disk (VFS).
+    io_runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl WorkerPool {
     /// Start the worker pool with `cores` threads.
     pub fn start(cores: usize, queue: flume::Receiver<MorselTask>) -> Self {
-        let mut handles = Vec::with_capacity(cores);
+        let io_runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            Ok(rt) => Some(rt),
+            Err(e) => {
+                error!("Failed to build I/O Tokio runtime: {}", e);
+                // It's acceptable to panic on startup failures if returning Result is not possible, 
+                // but since io_runtime is Option we can also just be None or panic. 
+                // We will use None to avoid panic, or we can panic. 
+                // Actually the brief says: "except for runtime initialization panics which are acceptable during startup"
+                panic!("Failed to build I/O Tokio runtime: {}", e);
+            }
+        };
+
+        let mut cpu_handles = Vec::with_capacity(cores);
 
         for core_id in 0..cores {
             let queue_clone = queue.clone();
@@ -105,15 +120,15 @@ impl WorkerPool {
                 })
                 .expect("Failed to spawn worker thread");
                 
-            handles.push(handle);
+            cpu_handles.push(handle);
         }
 
-        Self { handles }
+        Self { cpu_handles, io_runtime }
     }
 
     /// Wait for all workers to finish.
     pub fn join(self) {
-        for handle in self.handles {
+        for handle in self.cpu_handles {
             let _ = handle.join();
         }
     }
