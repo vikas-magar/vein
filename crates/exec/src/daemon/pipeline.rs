@@ -67,3 +67,19 @@ pub trait Transform: PipelineNode {}
 
 /// A marker trait for termination nodes that consume data.
 pub trait Sink: PipelineNode {}
+
+/// A pipeline breaker acts as the ultimate `Sink` for a pipeline.
+/// It absorbs `VeinBatch`es (e.g., building a hash table in memory) but does not
+/// immediately push them to the next operator.
+pub trait PipelineBreaker: PipelineNode {
+    /// Called when all morsels for the pipeline have been completely processed.
+    /// This signals the breaker to finalize its internal state (e.g., merge hash tables)
+    /// so it can act as a Source for the *next* pipeline.
+    fn finalize(&mut self) -> common::Result<()>;
+}
+
+/// Represents a single executable chain, bounded by a source and a pipeline breaker.
+pub struct Pipeline {
+    pub source: Box<dyn Source>,
+    pub breaker: Box<dyn PipelineBreaker>,
+}
