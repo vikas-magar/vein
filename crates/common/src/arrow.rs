@@ -9,6 +9,43 @@ use std::sync::Arc;
 
 use error::{Result, VeinError};
 
+/// A mask indicating which row indices in a ValueVector are valid.
+#[derive(Debug, Clone)]
+pub struct SelectionVector {
+    /// Array of valid indices. If None, all rows [0..size) are valid.
+    indices: Option<Vec<u32>>,
+    /// Number of valid rows currently selected.
+    size: usize,
+}
+
+impl SelectionVector {
+    /// Creates a dense selection vector of the given size (all rows valid).
+    pub fn new_dense(size: usize) -> Self {
+        Self { indices: None, size }
+    }
+    
+    /// Creates a sparse selection vector from the given array of valid indices.
+    pub fn new_sparse(indices: Vec<u32>) -> Self {
+        Self { size: indices.len(), indices: Some(indices) }
+    }
+    
+    /// Returns the true physical index for a given logical index.
+    #[inline(always)]
+    pub fn get_index(&self, logical_idx: usize) -> usize {
+        if let Some(indices) = &self.indices {
+            indices[logical_idx] as usize
+        } else {
+            logical_idx
+        }
+    }
+    
+    /// Returns the number of valid rows currently selected.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
+
 /// A pinned, boxed, sendable stream of `Result<RecordBatch>`.
 pub type SendableRecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
 

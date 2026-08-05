@@ -3,6 +3,27 @@ use common::identifiers::TaskId;
 use std::sync::Arc;
 use common::protocol::{DataSource, DataSink, Operator};
 use common::Result;
+use arrow::array::ArrayRef;
+use common::arrow::SelectionVector;
+
+/// A physical column of data (wraps Arrow Arrays for now).
+#[derive(Debug, Clone)]
+pub struct ValueVector {
+    pub data: ArrayRef,
+}
+
+/// A horizontal slice of data processed in a pipeline.
+#[derive(Debug, Clone)]
+pub struct DataChunk {
+    pub vectors: Vec<ValueVector>,
+    pub selection: SelectionVector,
+}
+
+/// Prepares the engine for Phase 3 (Factorization).
+pub enum VeinBatch {
+    Flat(DataChunk),
+    Factorized(()), // Placeholder for Epic 3
+}
 
 /// A chunk of work dynamically routed to an idle LocalSet.
 pub struct MorselTask {
@@ -21,8 +42,8 @@ pub struct MorselTask {
 /// Implementations must NEVER yield to an asynchronous scheduler.
 /// They must process the batch and immediately return or push to the next operator.
 pub trait PipelineNode: Send + Sync {
-    /// Pushes an Arrow record batch into the operator.
-    fn push(&mut self, batch: RecordBatch) -> Result<()>;
+    /// Pushes a chunk of data into the operator.
+    fn push(&mut self, batch: VeinBatch) -> Result<()>;
     
     /// Signals that no more data will be pushed.
     fn flush(&mut self) -> Result<()>;
