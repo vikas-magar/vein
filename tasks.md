@@ -1,38 +1,43 @@
-# Vein Database: Production Implementation Task List
+# Vein Database: Comprehensive Production Task List & Security Audit
 
-This document contains a minute, highly detailed breakdown of every technical task required to upgrade Vein from an architectural skeleton into a robust, highly extensible, production-grade distributed database. (Note: eBPF pushdown is explicitly excluded from this list for now).
+This document is the absolute ground-truth roadmap for taking Vein to a highly robust, secure, and advanced production state. It merges our structural analysis with a deep security/soundness audit and the requirement to implement cutting-edge academic database algorithms (WCOJ, ADOPT, Factorization).
 
-## 1. Networking & Transport (QUIC / RPC Layer)
-The engine's structural bounds exist, but the actual daemon loops and serializers must be built.
-*   **[ ] 1.1 Master QUIC Daemon Loop:** Implement the async `quinn::Endpoint` listener in `crates/server/src/main.rs` to continuously accept incoming connections from cluster nodes and clients.
-*   **[ ] 1.2 Executor QUIC Daemon Loop:** Implement the counterpart listener on the Executor nodes to receive task dispatches.
-*   **[ ] 1.3 Node Registration Handshake:** Build the protocol where Executors connect to the Master, authenticate, and are assigned a dynamic `NodeId` rather than hardcoding `1`.
-*   **[ ] 1.4 QuicTaskDispatcher Implementation:** Implement the `TaskDispatcher` trait in `crates/master` to serialize `MorselTask`s and push them over the network to the assigned Executor.
-*   **[ ] 1.5 Heartbeat & Telemetry Expansion:** Upgrade `NodeLoad` payloads to include fine-grained metrics (Disk I/O, Network I/O queue depth, CPU steal time) for the Elasticity Controller.
+## 1. CRITICAL: Security, Soundness, and Undefined Behavior (UB)
+These must be fixed before the system processes a single byte of untrusted input.
+*   **[ ] 1.1 Unchecked Rkyv Deserialization:** Add `#[derive(rkyv::bytecheck::CheckBytes)]` to all protocol structs (`VeinControlEvent`, `VfsRequest`, etc.) and use validating archive strategies to prevent out-of-bounds memory reads (UB).
+*   **[ ] 1.2 `&'static transmute` in Mmap:** Remove the `unsafe { std::mem::transmute(&mmap[..]) }` in `mmap_manager.rs`. Map the file and use owned buffers or pinned Mmap closures to prevent use-after-free UB.
+*   **[ ] 1.3 Global Block-ID Collisions:** Replace the naive 16-bit node-hash/sequence block ID generator in `mmap_manager.rs` with cluster-unique UUID v7 + a monotonic persisted counter to prevent silent data overwrites.
+*   **[ ] 1.4 Unbounded Network Allocations:** Add hard limits to `buffer.extend_from_slice()` and `read_to_end()` in `router.rs` and `server.rs`. Add read timeouts to all QUIC streams to prevent Slowloris OOM attacks.
+*   **[ ] 1.5 Cluster Identity Authentication:** Implement mTLS with client-cert verification in the QUIC listener. Reject consensus votes from unauthenticated IP addresses to prevent quorum forging.
 
-## 2. Query Parsing, Planning & Protocol (Frontend Layer)
-The parser is custom, but it must be connected to the physical execution engine via strong types.
-*   **[ ] 2.1 Strong Typed Protocol (AST):** Refactor `common::protocol::Operator::Filter` and `Project` to accept a serialized AST enum (e.g., via `bincode`) instead of a raw `String`.
-*   **[ ] 2.2 Strong Typed Protocol (Schema):** Refactor `FieldSchema` to use native Apache Arrow `DataType` enums instead of `data_type: String`.
-*   **[ ] 2.3 Logical Binder Completion:** Finish the `crates/planner` binder to handle all custom pipe-syntax operators (joins, multi-aggregations).
-*   **[ ] 2.4 Physical DAG Translation:** Implement `SqlPlanner::plan` in `crates/master` to lower the `LogicalPlan` into a `StageDag` of physical tasks.
-*   **[ ] 2.5 Dynamic Task Partitioning:** Update the Scheduler so that instead of dispatching 1 task per Stage, it dynamically calculates partition sizes and scatters `N` tasks across the cluster.
+## 2. Advanced Execution Engine (Data Plane)
+Upgrading the executor to support state-of-the-art graph/relational hybrid execution.
+*   **[ ] 2.1 Kuzu-Style Factorized Vectorized Execution:** Complete the Epic 3 implementation. Update `Filter` and `Project` operators to natively process `VeinBatch::Factorized` chunks instead of panicking or silently skipping.
+*   **[ ] 2.2 Worst-Case Optimal Joins (WCOJ):** Implement Generic Join / Leapfrog Triejoin algorithms for multi-way cyclic joins, drastically reducing intermediate memory blowup compared to standard binary Hash Joins.
+*   **[ ] 2.3 Arrow IPC Data Transit:** Replace the mocked `VfsSink.flush` (`.clear()`) with actual `arrow::ipc::writer::FileWriter` serialization.
+*   **[ ] 2.4 Strict Operator Validation:** Remove silent fallbacks. If an Executor receives an unsupported operator or expression, it must loudly fail the task rather than returning incorrect query results.
+*   **[ ] 2.5 Streaming Parquet Scan:** Replace the eager, blocking `collect::<Vec<_>>` memory bomb in the legacy parquet scanner with the true async OpenDAL stream reader.
 
-## 3. The Execution Engine (Data Plane)
-The lock-free multithreading works, but the physical operators need production data-handling logic.
-*   **[ ] 3.1 Arrow IPC Serialization:** Implement `arrow::ipc::writer::FileWriter` inside `VfsSink` and `NetworkSink` to seamlessly flatten `FactorizedChunk`s into zero-copy byte arrays.
-*   **[ ] 3.2 Arrow IPC Deserialization:** Implement the reverse logic for the QUIC stream listener to feed byte streams directly into operator memory.
-*   **[ ] 3.3 NetworkSink & NetworkSource:** Implement the operators required for intermediate Data Shuffles (e.g., sending data between executors for a distributed Group-By).
-*   **[ ] 3.4 Physical Expression Evaluator:** Implement the logic inside the Executor to parse the incoming binary AST from the Master and dynamically construct Arrow compute kernels.
-*   **[ ] 3.5 Hash Join Build Operator:** Implement `HashJoinBuild` to populate the `FactorizedTable` (currently only `HashJoinProbe` exists).
-*   **[ ] 3.6 Distributed Aggregation:** Implement local and global aggregation operators (`Sum`, `Count`, `GroupBy`) utilizing partitioned, lock-free Hash Tables.
-*   **[ ] 3.7 Graceful Task Cancellation:** Wire up the `CancellationToken` in the Executor control plane so the Master can instantly abort running pipelines.
+## 3. Distributed Scheduling & Query Optimization
+Transforming the Master node into an intelligent, adaptive coordinator.
+*   **[ ] 3.1 ADOPT (RL-Based Adaptive Join Optimization):** Implement Reinforcement Learning-based join ordering in the CBO/Planner to dynamically adjust join trees based on real-time execution statistics, replacing the mocked CBO memo.
+*   **[ ] 3.2 Hybrid Morsel Dispatching:** Implement dynamic task partitioning in `Scheduler::execute_batch_waves`. Instead of 1 task per stage, split stages into micro-morsels and dispatch them dynamically to Executors based on CPU telemetry.
+*   **[ ] 3.3 The QuicTaskDispatcher:** Implement the actual network transmission layer (`QuicTaskDispatcher`) so the Master can send `MorselTask`s to Executor nodes.
+*   **[ ] 3.4 Dynamic Retry & Failure Isolation:** Fix the scheduler bug where retries are pinned to `executors[0]`. Implement dynamic reassignment for failed tasks.
 
-## 4. The Storage Engine (VFS & Archipelago)
-The Leaderless SMR architecture is brilliant, but it requires strict durability and conflict resolution.
-*   **[ ] 4.1 Write-Ahead Log (WAL):** Implement a WAL for `ingest/buffer.rs` to guarantee that the 64MB memory buffer survives a kernel panic or power loss.
-*   **[ ] 4.2 Durable Disk Syncing:** Inject `fsync()` / `msync()` calls (or use `O_DIRECT`) after critical block appends in `mmap_manager.rs` to bypass the OS page cache safely.
-*   **[ ] 4.3 Redb Block Metadata Tracking:** Persist the `current_offset` of active `.bin` files into Redb so that upon crash recovery, unsealed blocks can be safely truncated without corruption.
-*   **[ ] 4.4 SMR Conflict Resolution:** Upgrade the Leaderless `ArchipelagoState` quorum algorithm to include vector clocks or dependency graphs (like EPaxos) to deterministically resolve simultaneous write collisions.
-*   **[ ] 4.5 True Merkle Radix Tree:** Replace the flat `Vec` of hashes with a real Merkle Radix tree for O(log N) cluster comparisons.
-*   **[ ] 4.6 Anti-Entropy Healing Protocol:** Replace the `sleep(5)` loop in `HealDaemon` with the actual background P2P RPC logic that compares Merkle roots and fetches missing block extents from peers.
+## 4. SQL Parser & Logical Binder
+Fixing semantic correctness bugs in the custom pipe-SQL frontend.
+*   **[ ] 4.1 Parser Truncation Bugs:** Fix postfix ops (`IN`, `BETWEEN`, `LIKE`) that return early and truncate clauses (e.g., `WHERE x IN (1,2) AND y > 3` drops the `AND`).
+*   **[ ] 4.2 Literal & Type Correctness:** Fix string literals keeping their quotes (`'foo' != 'foo'`), fix integer overflow silently wrapping to `0`, and fix `NULLS FIRST` defaulting on `ASC` sorts.
+*   **[ ] 4.3 Implicit Casts:** Update `binder/expr.rs` to insert implicit casts (e.g., comparing string to int) so queries don't panic at runtime.
+*   **[ ] 4.4 Complete Physical Translation:** Implement `SqlPlanner::plan` to fully translate Logical Plans into Physical DAGs.
+
+## 5. Storage Durability & Consensus (VFS Archipelago)
+Ensuring zero data loss and absolute cluster consistency.
+*   **[ ] 5.1 True Consensus Semantics:** The Leaderless SMR `ArchipelagoState` currently commits a placeholder `AppendExtent` before the data is written. Move data flush into the commit critical section. Implement vector clocks to resolve concurrent write collisions.
+*   **[ ] 5.2 Sequence Persistence Race:** Fix the `fetch_add` race condition in `router.rs` by persisting the exact CAS return value before using it for a Proposal ID.
+*   **[ ] 5.3 Silent Zero-Reads:** Fix `read_extent` on unsealed blocks. Track sealed ranges and return a "Retry" or "404" instead of silently returning arrays of zeros for data that hasn't synced yet.
+*   **[ ] 5.4 Upload Channel Backpressure:** Fix the `upload_tx.send` panic/block. If the upload channel to S3 is full, apply backpressure correctly rather than stalling all appends or silently losing blocks.
+*   **[ ] 5.5 Ingestion Buffer WAL & Cap:** Add a Write-Ahead Log to the 64MB ingestion buffer. Enforce a global `total_memory_usage` cap to prevent unbounded DashMap OOMs.
+*   **[ ] 5.6 SipHash24 Collision Fix:** Replace the fixed-key SipHash24 for block metadata with Blake3, and store the actual path to prevent catastrophic file interleaving.
+*   **[ ] 5.7 Anti-Entropy Merkle Healing:** Replace the stubbed `HealDaemon` flat array with a true Radix/Merkle Tree for logarithmic diffing, and implement the P2P missing-block fetch protocol.
