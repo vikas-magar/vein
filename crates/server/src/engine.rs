@@ -126,6 +126,8 @@ impl QueryEngine for DistributedCoordinator {
              return Err(error::VeinError::internal("No available executor nodes to dispatch tasks to"));
         }
         
+        let mut current_node_idx = 0;
+
         // For each stage in the DAG, dispatch it.
         for stage_id in physical_dag.topological_order() {
             if let Some(stage) = physical_dag.get_stage(stage_id) {
@@ -136,8 +138,10 @@ impl QueryEngine for DistributedCoordinator {
                     sink: stage.sink.clone(),
                 };
                 
-                // Extremely simple round-robin or first-node dispatch for now
-                let target_node = &available_nodes[0];
+                // Distribute tasks round-robin across all available healthy nodes in the cluster
+                let target_node = &available_nodes[current_node_idx % available_nodes.len()];
+                current_node_idx += 1;
+                
                 self.dispatcher.dispatch(target_node.node_id, task).await?;
             }
         }
