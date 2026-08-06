@@ -9,3 +9,5 @@ pub use planner::SqlPlanner;
 pub use scheduler::Scheduler;
 
 // We will add scheduler and planner modules here shortly.
+/// Abstract traits defining the system architecture.
+pub mod traits;

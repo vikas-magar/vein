@@ -13,3 +13,5 @@ pub mod recovery;
 
 pub use config::VfsConfig;
 pub use error::{Result, VfsError};
+/// Abstract traits defining the system architecture.
+pub mod traits;

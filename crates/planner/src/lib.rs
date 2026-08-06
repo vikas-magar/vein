@@ -16,3 +16,5 @@ pub mod binder;
 
 /// Extensible optimizer framework (Cascades, Rules, Cost Models).
 pub mod optimizer;
+/// Abstract traits defining the system architecture.
+pub mod traits;

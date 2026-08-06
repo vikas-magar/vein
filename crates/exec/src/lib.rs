@@ -16,3 +16,5 @@ pub mod operators;
 
 /// Executor daemon entrypoints and runtime environment.
 pub mod daemon;
+/// Abstract traits defining the system architecture.
+pub mod traits;
