@@ -22,12 +22,28 @@ pub struct DataChunk {
     pub selection: SelectionVector,
 }
 
+/// A group of vectors that share the same cardinality and selection mask.
+#[derive(Debug, Clone)]
+pub struct DataBlock {
+    /// The columns in this block.
+    pub vectors: Vec<ValueVector>,
+    /// The selection vector indicating active rows.
+    pub selection: SelectionVector,
+}
+
+/// A factorized chunk containing multiple independent data blocks.
+#[derive(Debug, Clone)]
+pub struct FactorizedChunk {
+    /// Each DataBlock represents a "factor" in the join.
+    pub blocks: Vec<DataBlock>,
+}
+
 /// Prepares the engine for Phase 3 (Factorization).
 pub enum VeinBatch {
     /// A flat chunk of data.
     Flat(DataChunk),
     /// A factorized chunk of data (Epic 3).
-    Factorized(()), // Placeholder for Epic 3
+    Factorized(FactorizedChunk),
 }
 
 /// A chunk of work dynamically routed to an idle LocalSet.

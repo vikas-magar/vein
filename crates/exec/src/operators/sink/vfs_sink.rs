@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn test_vfs_sink_push() {
         let mut sink = dummy_vfs_sink();
-        let batch = VeinBatch::Factorized(());
+        let batch = VeinBatch::Factorized(crate::daemon::pipeline::FactorizedChunk { blocks: vec![] });
         sink.push(batch).unwrap();
         assert_eq!(sink.buffers[0].len(), 1);
     }
