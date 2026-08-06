@@ -10,10 +10,3 @@ pub trait TaskDispatcher: Send + Sync {
     async fn dispatch(&self, node_id: u32, task: MorselTask) -> Result<()>;
 }
 
-/// Abstract Query Optimizer.
-/// Allows us to seamlessly swap a traditional Cost-Based Optimizer (Cascades) 
-/// with our cutting-edge Reinforcement Learning engine (ADOPT).
-pub trait JoinOptimizer: Send + Sync {
-    /// Takes a Logical AST and returns an optimized Physical DAG string (to be strongly typed later).
-    fn optimize_join_order(&self, logical_plan: String) -> Result<String>;
-}

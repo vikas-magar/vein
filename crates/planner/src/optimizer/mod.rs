@@ -9,3 +9,5 @@ pub mod rule;
 pub mod cost;
 /// Implementations of optimizer rules.
 pub mod rules;
+/// Adopt optimizer module.
+pub mod adopt_optimizer;

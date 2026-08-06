@@ -13,3 +13,11 @@ pub trait PhysicalPlanner: Send + Sync {
     /// Takes a Logical Plan and generates a distributed StageDag of MorselTasks.
     fn create_physical_plan(&self, logical_plan: String) -> Result<String>;
 }
+
+/// Abstract Query Optimizer.
+/// Allows us to seamlessly swap a traditional Cost-Based Optimizer (Cascades) 
+/// with our cutting-edge Reinforcement Learning engine (ADOPT).
+pub trait JoinOptimizer: Send + Sync {
+    /// Takes a Logical AST and returns an optimized Physical DAG string (to be strongly typed later).
+    fn optimize_join_order(&self, logical_plan: String) -> Result<String>;
+}

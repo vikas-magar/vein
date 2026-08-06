@@ -4,8 +4,10 @@
 //! and converting it into a valid, unoptimized `LogicalPlan`.
 
 /// Expression binding logic.
+/// Expression binding logic.
 pub mod expr;
-
+/// Default SQL Binder implementation.
+pub mod default_binder;
 use std::sync::Arc;
 use arrow::datatypes::{Schema, SchemaRef};
 use error::{Result, VeinError};

@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
 
-use master::traits::{TaskDispatcher, JoinOptimizer};
-use planner::traits::{LogicalBinder, PhysicalPlanner};
+use master::traits::TaskDispatcher;
+use planner::traits::{LogicalBinder, PhysicalPlanner, JoinOptimizer};
 
 /// The absolute highest-level abstraction for the Database Engine.
 /// Represents the complete end-to-end lifecycle from query submission to result retrieval.

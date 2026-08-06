@@ -1,6 +1,5 @@
 pub mod engine;
-pub mod master;
-pub mod mocks;
+pub mod daemon;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use std::sync::Arc;
@@ -64,18 +63,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             // 1. Dependency Injection: Wire the Traits!
             let coordinator = Arc::new(engine::DistributedCoordinator {
-                binder: Arc::new(mocks::MockBinder),
-                optimizer: Arc::new(mocks::MockOptimizer),
-                planner: Arc::new(mocks::MockPlanner),
-                dispatcher: Arc::new(mocks::MockDispatcher),
+                binder: Arc::new(planner::binder::default_binder::DefaultSqlBinder::new()),
+                optimizer: Arc::new(planner::optimizer::adopt_optimizer::AdoptJoinOptimizer::new()),
+                planner: Arc::new(master::planner::dag_planner::DagPhysicalPlanner::new()),
+                dispatcher: Arc::new(master::scheduler::quic_dispatcher::QuicTaskDispatcher::new()),
             });
             
             // 2. Start the Master Daemon
             let addr: std::net::SocketAddr = bind.parse()?;
-            let daemon = master::MasterDaemon::new(coordinator);
+            let daemon_server = daemon::MasterDaemon::new(coordinator);
             
             tokio::spawn(async move {
-                if let Err(e) = daemon.run(addr, &cert, &key).await {
+                if let Err(e) = daemon_server.run(addr, &cert, &key).await {
                     tracing::error!("Master Daemon crashed: {}", e);
                 }
             });
