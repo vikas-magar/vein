@@ -44,3 +44,35 @@ impl ElasticityController {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_elasticity_controller() {
+        let mut controller = ElasticityController::new();
+        let fast_task = TaskId::new();
+        let slow_task = TaskId::new();
+
+        let fast_telemetry = TaskTelemetry {
+            task_id: fast_task.clone(),
+            total_morsels_assigned: 100,
+            morsels_completed: 100,
+            rows_processed_per_sec: 2000.0,
+        };
+        let slow_telemetry = TaskTelemetry {
+            task_id: slow_task.clone(),
+            total_morsels_assigned: 100,
+            morsels_completed: 10,
+            rows_processed_per_sec: 500.0,
+        };
+
+        controller.update_telemetry(fast_telemetry, 100);
+        controller.update_telemetry(slow_telemetry, 100);
+
+        let stragglers = controller.evaluate_stragglers();
+        assert_eq!(stragglers.len(), 1);
+        assert_eq!(stragglers[0], slow_task);
+    }
+}

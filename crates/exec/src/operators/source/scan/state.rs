@@ -28,3 +28,41 @@ impl SharedScanState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_shared_scan_state_concurrent() {
+        let total_morsels = 1000;
+        let state = Arc::new(SharedScanState::new(total_morsels));
+        let claimed_morsels = Arc::new(Mutex::new(HashSet::new()));
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let state_clone = Arc::clone(&state);
+            let claimed_clone = Arc::clone(&claimed_morsels);
+            handles.push(thread::spawn(move || {
+                let mut local_claimed = Vec::new();
+                while let Some(morsel) = state_clone.next_morsel() {
+                    local_claimed.push(morsel);
+                }
+                let mut lock = claimed_clone.lock().unwrap();
+                for m in local_claimed {
+                    assert!(lock.insert(m), "morsel claimed twice");
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let lock = claimed_morsels.lock().unwrap();
+        assert_eq!(lock.len(), total_morsels);
+    }
+}

@@ -64,3 +64,32 @@ impl PipelineBreaker for VfsSink {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opendal::services::Memory;
+    use opendal::Operator;
+
+    fn dummy_vfs_sink() -> VfsSink {
+        let builder = Memory::default();
+        let op = Operator::new(builder).unwrap().finish();
+        VfsSink::new(op, 3, 1024)
+    }
+
+    #[test]
+    fn test_vfs_sink_initialization() {
+        let sink = dummy_vfs_sink();
+        assert_eq!(sink.num_partitions, 3);
+        assert_eq!(sink.buffers.len(), 3);
+        assert_eq!(sink.flush_threshold_bytes, 1024);
+    }
+
+    #[test]
+    fn test_vfs_sink_push() {
+        let mut sink = dummy_vfs_sink();
+        let batch = VeinBatch::Factorized(());
+        sink.push(batch).unwrap();
+        assert_eq!(sink.buffers[0].len(), 1);
+    }
+}

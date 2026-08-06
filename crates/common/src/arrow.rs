@@ -214,4 +214,21 @@ mod tests {
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded.iter().map(|b| b.num_rows()).sum::<usize>(), 15);
     }
+
+    #[test]
+    fn test_selection_vector_dense() {
+        let sv = SelectionVector::new_dense(5);
+        assert_eq!(sv.size(), 5);
+        assert_eq!(sv.get_index(0), 0);
+        assert_eq!(sv.get_index(3), 3);
+    }
+
+    #[test]
+    fn test_selection_vector_sparse() {
+        let sv = SelectionVector::new_sparse(vec![2, 4, 7]);
+        assert_eq!(sv.size(), 3);
+        assert_eq!(sv.get_index(0), 2);
+        assert_eq!(sv.get_index(1), 4);
+        assert_eq!(sv.get_index(2), 7);
+    }
 }
