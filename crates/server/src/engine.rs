@@ -27,6 +27,67 @@ pub struct DistributedCoordinator {
     pub dispatcher: Arc<dyn TaskDispatcher>,
 }
 
+impl DistributedCoordinator {
+    /// Creates a new builder for the DistributedCoordinator.
+    pub fn builder() -> DistributedCoordinatorBuilder {
+        DistributedCoordinatorBuilder {
+            binder: None,
+            optimizer: None,
+            planner: None,
+            dispatcher: None,
+        }
+    }
+}
+
+/// A builder for constructing a `DistributedCoordinator` with fluent DI configuration.
+pub struct DistributedCoordinatorBuilder {
+    binder: Option<Arc<dyn LogicalBinder>>,
+    optimizer: Option<Arc<dyn JoinOptimizer>>,
+    planner: Option<Arc<dyn PhysicalPlanner>>,
+    dispatcher: Option<Arc<dyn TaskDispatcher>>,
+}
+
+impl DistributedCoordinatorBuilder {
+    /// Injects the LogicalBinder strategy.
+    pub fn with_binder(mut self, binder: Arc<dyn LogicalBinder>) -> Self {
+        self.binder = Some(binder);
+        self
+    }
+    
+    /// Injects the JoinOptimizer strategy.
+    pub fn with_optimizer(mut self, optimizer: Arc<dyn JoinOptimizer>) -> Self {
+        self.optimizer = Some(optimizer);
+        self
+    }
+    
+    /// Injects the PhysicalPlanner strategy.
+    pub fn with_planner(mut self, planner: Arc<dyn PhysicalPlanner>) -> Self {
+        self.planner = Some(planner);
+        self
+    }
+    
+    /// Injects the TaskDispatcher network strategy.
+    pub fn with_dispatcher(mut self, dispatcher: Arc<dyn TaskDispatcher>) -> Self {
+        self.dispatcher = Some(dispatcher);
+        self
+    }
+    
+    /// Validates and constructs the final DistributedCoordinator.
+    pub fn build(self) -> Result<DistributedCoordinator> {
+        let binder = self.binder.ok_or_else(|| error::VeinError::internal("Missing LogicalBinder configuration"))?;
+        let optimizer = self.optimizer.ok_or_else(|| error::VeinError::internal("Missing JoinOptimizer configuration"))?;
+        let planner = self.planner.ok_or_else(|| error::VeinError::internal("Missing PhysicalPlanner configuration"))?;
+        let dispatcher = self.dispatcher.ok_or_else(|| error::VeinError::internal("Missing TaskDispatcher configuration"))?;
+        
+        Ok(DistributedCoordinator {
+            binder,
+            optimizer,
+            planner,
+            dispatcher,
+        })
+    }
+}
+
 #[async_trait]
 impl QueryEngine for DistributedCoordinator {
     async fn submit_query(&self, query: String) -> Result<Bytes> {
