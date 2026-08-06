@@ -15,4 +15,11 @@ pub trait LogicalBinder: Send + Sync {
 pub trait JoinOptimizer: Send + Sync {
     /// Takes a Logical AST and returns an optimized LogicalPlan.
     fn optimize_join_order(&self, logical_plan: LogicalPlan) -> Result<LogicalPlan>;
+    
+    /// Feeds runtime execution metrics back into the optimizer.
+    /// Crucial for Reinforcement Learning (ADOPT) to learn from mistakes and improve the policy.
+    fn report_telemetry(&self, _telemetry: common::protocol::QueryTelemetry) -> Result<()> {
+        // Default implementation does nothing (for static CBOs)
+        Ok(())
+    }
 }

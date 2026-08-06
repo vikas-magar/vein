@@ -365,6 +365,16 @@ pub enum ExecutionMode {
     Streaming,
 }
 
+/// Telemetry feedback from an executed query, used to train RL agents (like ADOPT).
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct QueryTelemetry {
+    pub query_id: QueryId,
+    pub execution_time_ms: u64,
+    pub rows_produced: u64,
+}
+
 /// Task dispatched from Master to Executor.
 #[derive(
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
