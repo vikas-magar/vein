@@ -1,4 +1,6 @@
 pub mod engine;
+pub mod master;
+pub mod mocks;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use std::sync::Arc;
@@ -59,7 +61,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Master { bind, cert, key } => {
             tracing::info!("Starting Vein Master node on {} (TLS: {})", bind, cert);
-            // TODO: Start Master QUIC Server and Scheduler
+            
+            // 1. Dependency Injection: Wire the Traits!
+            let coordinator = Arc::new(engine::DistributedCoordinator {
+                binder: Arc::new(mocks::MockBinder),
+                optimizer: Arc::new(mocks::MockOptimizer),
+                planner: Arc::new(mocks::MockPlanner),
+                dispatcher: Arc::new(mocks::MockDispatcher),
+            });
+            
+            // 2. Start the Master Daemon
+            let addr: std::net::SocketAddr = bind.parse()?;
+            let daemon = master::MasterDaemon::new(coordinator);
+            
+            tokio::spawn(async move {
+                if let Err(e) = daemon.run(addr, &cert, &key).await {
+                    tracing::error!("Master Daemon crashed: {}", e);
+                }
+            });
+            
             tokio::signal::ctrl_c().await?;
             tracing::info!("Shutting down Master node");
         }
