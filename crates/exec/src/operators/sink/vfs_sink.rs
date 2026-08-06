@@ -1,11 +1,11 @@
 use crate::daemon::pipeline::{PipelineBreaker, PipelineNode, VeinBatch};
-use opendal::Operator;
+use common::transport::QuicClient;
 use common::Result;
 
 /// A pipeline sink that partitions data and writes to a virtual file system.
 pub struct VfsSink {
-    /// The VFS storage interface
-    pub fs: Operator,
+    /// The VFS storage interface (mocked for now)
+    pub client: Option<QuicClient>,
     /// Partition buffers. We use a simple Vec of VeinBatches for now.
     pub buffers: Vec<Vec<VeinBatch>>,
     /// Threshold before pushing a buffer over QUIC (e.g., 16 * 1024 * 1024)
@@ -16,22 +16,25 @@ pub struct VfsSink {
 
 impl VfsSink {
     /// Create a new VfsSink instance
-    pub fn new(fs: Operator, num_partitions: usize, flush_threshold_bytes: usize) -> Self {
+    pub fn new(client: Option<QuicClient>, num_partitions: usize, flush_threshold_bytes: usize) -> Self {
         let mut buffers = Vec::with_capacity(num_partitions);
         for _ in 0..num_partitions {
             buffers.push(Vec::new());
         }
         Self {
-            fs,
+            client,
             buffers,
             flush_threshold_bytes,
             num_partitions,
         }
     }
 
-    /// Mock flush function. In a real system, it would serialize the Arrow batch and push via OpenDAL.
-    pub async fn flush_partition_to_vfs(&mut self, _partition_id: usize) -> Result<()> {
-        // Implementation stub
+    /// Mock flush function. In a real system, it would serialize the Arrow batch and push via QUIC.
+    pub async fn flush_partition_to_vfs(&mut self, partition_id: usize) -> Result<()> {
+        // In a complete implementation, this would serialize `self.buffers[partition_id]` to Arrow IPC 
+        // and send a custom RPC via `self.client.connection.open_bi()`.
+        // For now, we clear the buffer to represent successful flushing.
+        self.buffers[partition_id].clear();
         Ok(())
     }
 }
@@ -68,13 +71,9 @@ impl PipelineBreaker for VfsSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opendal::services::Memory;
-    use opendal::Operator;
 
     fn dummy_vfs_sink() -> VfsSink {
-        let builder = Memory::default();
-        let op = Operator::new(builder).unwrap().finish();
-        VfsSink::new(op, 3, 1024)
+        VfsSink::new(None, 3, 1024)
     }
 
     #[test]
