@@ -3,15 +3,19 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
 
-use master::traits::TaskDispatcher;
-use planner::traits::{LogicalBinder, PhysicalPlanner, JoinOptimizer};
+use master::traits::{TaskDispatcher, PhysicalPlanner};
+use master::executor::registry::ExecutorRegistry;
+use planner::traits::{LogicalBinder, JoinOptimizer};
+use parser::ast::query::Query;
+use common::identifiers::TaskId;
+use common::protocol::MorselTask;
 
 /// The absolute highest-level abstraction for the Database Engine.
 /// Represents the complete end-to-end lifecycle from query submission to result retrieval.
 #[async_trait]
 pub trait QueryEngine: Send + Sync {
-    /// Submits a raw SQL string, executes it across the cluster, and returns the final Arrow IPC result stream.
-    async fn submit_query(&self, query: String) -> Result<Bytes>;
+    /// Submits a query AST and returns the final result as Arrow IPC bytes.
+    async fn submit_query(&self, query: Query) -> Result<Bytes>;
 }
 
 /// The concrete Coordinator that wires all the abstract traits together.
@@ -25,6 +29,8 @@ pub struct DistributedCoordinator {
     pub planner: Arc<dyn PhysicalPlanner>,
     /// Abstract network layer for transmitting tasks to Executor nodes
     pub dispatcher: Arc<dyn TaskDispatcher>,
+    /// Cluster state for task distribution
+    pub registry: Arc<ExecutorRegistry>,
 }
 
 impl DistributedCoordinator {
@@ -35,6 +41,7 @@ impl DistributedCoordinator {
             optimizer: None,
             planner: None,
             dispatcher: None,
+            registry: None,
         }
     }
 }
@@ -45,6 +52,7 @@ pub struct DistributedCoordinatorBuilder {
     optimizer: Option<Arc<dyn JoinOptimizer>>,
     planner: Option<Arc<dyn PhysicalPlanner>>,
     dispatcher: Option<Arc<dyn TaskDispatcher>>,
+    registry: Option<Arc<ExecutorRegistry>>,
 }
 
 impl DistributedCoordinatorBuilder {
@@ -71,6 +79,12 @@ impl DistributedCoordinatorBuilder {
         self.dispatcher = Some(dispatcher);
         self
     }
+
+    /// Injects the ExecutorRegistry state.
+    pub fn with_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
     
     /// Validates and constructs the final DistributedCoordinator.
     pub fn build(self) -> Result<DistributedCoordinator> {
@@ -78,19 +92,21 @@ impl DistributedCoordinatorBuilder {
         let optimizer = self.optimizer.ok_or_else(|| error::VeinError::internal("Missing JoinOptimizer configuration"))?;
         let planner = self.planner.ok_or_else(|| error::VeinError::internal("Missing PhysicalPlanner configuration"))?;
         let dispatcher = self.dispatcher.ok_or_else(|| error::VeinError::internal("Missing TaskDispatcher configuration"))?;
+        let registry = self.registry.ok_or_else(|| error::VeinError::internal("Missing ExecutorRegistry configuration"))?;
         
         Ok(DistributedCoordinator {
             binder,
             optimizer,
             planner,
             dispatcher,
+            registry,
         })
     }
 }
 
 #[async_trait]
 impl QueryEngine for DistributedCoordinator {
-    async fn submit_query(&self, query: String) -> Result<Bytes> {
+    async fn submit_query(&self, query: Query) -> Result<Bytes> {
         // 1. BIND: Convert raw SQL AST to a Semantic Logical Plan
         let logical_plan = self.binder.bind(query)?;
         
@@ -98,15 +114,37 @@ impl QueryEngine for DistributedCoordinator {
         let optimized_plan = self.optimizer.optimize_join_order(logical_plan)?;
         
         // 3. PLAN: Lower the optimized logical plan into a distributed Physical DAG
-        let _physical_dag = self.planner.create_physical_plan(optimized_plan)?;
+        let physical_dag = self.planner.create_physical_plan(optimized_plan)?;
         
         // 4. DISPATCH: The Scheduler breaks the DAG into MorselTasks and uses the Dispatcher 
         // to send them over the network (e.g., via QUIC) to the Executor nodes.
-        // self.dispatcher.dispatch(node_id, task).await?;
+        let output_stage = physical_dag.output_stage_id();
+        tracing::info!("Dispatched DAG with output stage {:?}", output_stage);
+        
+        let available_nodes = self.registry.available(std::time::Duration::from_secs(10)).await;
+        if available_nodes.is_empty() {
+             return Err(error::VeinError::internal("No available executor nodes to dispatch tasks to"));
+        }
+        
+        // For each stage in the DAG, dispatch it.
+        for stage_id in physical_dag.topological_order() {
+            if let Some(stage) = physical_dag.get_stage(stage_id) {
+                let task = MorselTask {
+                    task_id: TaskId::new(),
+                    source: stage.source.clone(),
+                    plan: stage.operators.clone(),
+                    sink: stage.sink.clone(),
+                };
+                
+                // Extremely simple round-robin or first-node dispatch for now
+                let target_node = &available_nodes[0];
+                self.dispatcher.dispatch(target_node.node_id, task).await?;
+            }
+        }
         
         // 5. RECEIVE: The Master node waits for the final DataTransport stream from the Executors.
+        // TODO: Actually open the Arrow IPC stream receiver.
         
-        // Return placeholder bytes representing the final Arrow IPC result
         Ok(Bytes::new())
     }
 }
