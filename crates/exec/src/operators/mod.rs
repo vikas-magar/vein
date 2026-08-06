@@ -4,3 +4,5 @@ pub mod source;
 pub mod transform;
 /// Sink operators that consume data batches
 pub mod sink;
+/// Join operators
+pub mod join;
