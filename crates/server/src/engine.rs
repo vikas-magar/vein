@@ -4,8 +4,11 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 use master::traits::{TaskDispatcher, PhysicalPlanner};
+use master::executor::registry::ExecutorRegistry;
 use planner::traits::{LogicalBinder, JoinOptimizer};
 use parser::ast::query::Query;
+use common::identifiers::TaskId;
+use common::protocol::MorselTask;
 
 /// The absolute highest-level abstraction for the Database Engine.
 /// Represents the complete end-to-end lifecycle from query submission to result retrieval.
@@ -26,6 +29,8 @@ pub struct DistributedCoordinator {
     pub planner: Arc<dyn PhysicalPlanner>,
     /// Abstract network layer for transmitting tasks to Executor nodes
     pub dispatcher: Arc<dyn TaskDispatcher>,
+    /// Cluster state for task distribution
+    pub registry: Arc<ExecutorRegistry>,
 }
 
 impl DistributedCoordinator {
@@ -36,6 +41,7 @@ impl DistributedCoordinator {
             optimizer: None,
             planner: None,
             dispatcher: None,
+            registry: None,
         }
     }
 }
@@ -46,6 +52,7 @@ pub struct DistributedCoordinatorBuilder {
     optimizer: Option<Arc<dyn JoinOptimizer>>,
     planner: Option<Arc<dyn PhysicalPlanner>>,
     dispatcher: Option<Arc<dyn TaskDispatcher>>,
+    registry: Option<Arc<ExecutorRegistry>>,
 }
 
 impl DistributedCoordinatorBuilder {
@@ -72,6 +79,12 @@ impl DistributedCoordinatorBuilder {
         self.dispatcher = Some(dispatcher);
         self
     }
+
+    /// Injects the ExecutorRegistry state.
+    pub fn with_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
     
     /// Validates and constructs the final DistributedCoordinator.
     pub fn build(self) -> Result<DistributedCoordinator> {
@@ -79,12 +92,14 @@ impl DistributedCoordinatorBuilder {
         let optimizer = self.optimizer.ok_or_else(|| error::VeinError::internal("Missing JoinOptimizer configuration"))?;
         let planner = self.planner.ok_or_else(|| error::VeinError::internal("Missing PhysicalPlanner configuration"))?;
         let dispatcher = self.dispatcher.ok_or_else(|| error::VeinError::internal("Missing TaskDispatcher configuration"))?;
+        let registry = self.registry.ok_or_else(|| error::VeinError::internal("Missing ExecutorRegistry configuration"))?;
         
         Ok(DistributedCoordinator {
             binder,
             optimizer,
             planner,
             dispatcher,
+            registry,
         })
     }
 }
@@ -106,9 +121,30 @@ impl QueryEngine for DistributedCoordinator {
         let output_stage = physical_dag.output_stage_id();
         tracing::info!("Dispatched DAG with output stage {:?}", output_stage);
         
-        // 5. RECEIVE: The Master node waits for the final DataTransport stream from the Executors.
+        let available_nodes = self.registry.available(std::time::Duration::from_secs(10)).await;
+        if available_nodes.is_empty() {
+             return Err(error::VeinError::internal("No available executor nodes to dispatch tasks to"));
+        }
         
-        // Return placeholder bytes representing the final Arrow IPC result
+        // For each stage in the DAG, dispatch it.
+        for stage_id in physical_dag.topological_order() {
+            if let Some(stage) = physical_dag.get_stage(stage_id) {
+                let task = MorselTask {
+                    task_id: TaskId::new(),
+                    source: stage.source.clone(),
+                    plan: stage.operators.clone(),
+                    sink: stage.sink.clone(),
+                };
+                
+                // Extremely simple round-robin or first-node dispatch for now
+                let target_node = &available_nodes[0];
+                self.dispatcher.dispatch(target_node.node_id, task).await?;
+            }
+        }
+        
+        // 5. RECEIVE: The Master node waits for the final DataTransport stream from the Executors.
+        // TODO: Actually open the Arrow IPC stream receiver.
+        
         Ok(Bytes::new())
     }
 }

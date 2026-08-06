@@ -2,6 +2,7 @@ use common::Result;
 use async_trait::async_trait;
 use common::protocol::MorselTask;
 use crate::traits::TaskDispatcher;
+use common::identifiers::NodeId;
 
 /// The QUIC Task Dispatcher.
 /// Responsible for serializing `MorselTask`s and streaming them to the appropriate
@@ -16,9 +17,8 @@ impl QuicTaskDispatcher {
 
 #[async_trait]
 impl TaskDispatcher for QuicTaskDispatcher {
-    async fn dispatch(&self, node_id: u32, task: MorselTask) -> Result<()> {
-        // TODO: Look up QUIC connection for node_id and serialize task to Arrow IPC
-        tracing::info!("QUIC Dispatcher sending MorselTask to node {}", node_id);
+    async fn dispatch(&self, _node_id: NodeId, _task: MorselTask) -> Result<()> {
+        // TODO: Actually open a QUIC stream to the Executor node and serialize the MorselTask
         Ok(())
     }
 }

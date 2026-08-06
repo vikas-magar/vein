@@ -61,6 +61,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Master { bind, cert, key } => {
             tracing::info!("Starting Vein Master node on {} (TLS: {})", bind, cert);
             
+            let registry = Arc::new(master::executor::registry::ExecutorRegistry::new());
+            registry.start_health_check(std::time::Duration::from_secs(30));
+            
             // 1. Dependency Injection: Construct the Engine using the Builder Pattern!
             let coordinator = Arc::new(
                 engine::DistributedCoordinator::builder()
@@ -68,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_optimizer(Arc::new(planner::optimizer::adopt_optimizer::AdoptJoinOptimizer::new()))
                     .with_planner(Arc::new(master::planner::dag_planner::DagPhysicalPlanner::new()))
                     .with_dispatcher(Arc::new(master::scheduler::quic_dispatcher::QuicTaskDispatcher::new()))
+                    .with_registry(registry.clone())
                     .build()?
             );
             
@@ -89,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let addr: std::net::SocketAddr = bind.parse()?;
             
             let (tx, rx) = flume::unbounded();
-            let master_client = std::sync::Arc::new(common::transport::build_quic_client(&cert).unwrap());
+            let master_client = Arc::new(common::transport::build_quic_client(&cert).unwrap());
             let ctx = DaemonContext::new(common::identifiers::NodeId::from_raw(1), tx, master_client);
             
             // Start the CPU Worker Pool (e.g., 4 threads) to process MorselTasks
