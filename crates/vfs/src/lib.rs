@@ -1,6 +1,7 @@
 //! VeinFS: The Infinite Virtual Disk & Unified Data Plane
 
 pub mod block;
+pub mod ebpf;
 pub mod config;
 pub mod error;
 pub mod consensus;
