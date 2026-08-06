@@ -19,8 +19,40 @@ impl ProjectTransform {
 }
 
 impl PipelineNode for ProjectTransform {
-    fn push(&mut self, _batch: VeinBatch) -> Result<()> {
-        todo!("Epic 1.2: migrate operator logic to DataChunk")
+    fn push(&mut self, batch: VeinBatch) -> Result<()> {
+        match batch {
+            VeinBatch::Flat(chunk) => {
+                let mut fields = Vec::with_capacity(chunk.vectors.len());
+                let mut arrays = Vec::with_capacity(chunk.vectors.len());
+                for (i, vec) in chunk.vectors.iter().enumerate() {
+                    fields.push(arrow::datatypes::Field::new(
+                        &format!("col_{}", i),
+                        vec.data.data_type().clone(),
+                        true,
+                    ));
+                    arrays.push(vec.data.clone());
+                }
+                let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+                let record_batch = RecordBatch::try_new(schema, arrays)
+                    .map_err(|e| VeinError::internal(format!("Failed to create RecordBatch: {}", e)))?;
+
+                let mut new_vectors = Vec::with_capacity(self.exprs.len());
+                for expr in &self.exprs {
+                    let array = expr.evaluate(&record_batch)?;
+                    new_vectors.push(crate::daemon::pipeline::ValueVector { data: array });
+                }
+
+                let new_chunk = crate::daemon::pipeline::DataChunk {
+                    vectors: new_vectors,
+                    selection: chunk.selection,
+                };
+
+                self.next.push(VeinBatch::Flat(new_chunk))
+            }
+            VeinBatch::Factorized(_) => {
+                Err(VeinError::internal("Epic 3: project on factorized chunks"))
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<()> {

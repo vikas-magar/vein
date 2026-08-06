@@ -1,4 +1,5 @@
-use crate::daemon::pipeline::PipelineNode;
+use crate::daemon::pipeline::{PipelineNode, DataChunk, ValueVector, VeinBatch};
+use common::arrow::SelectionVector;
 use bytes::Bytes;
 use common::Result;
 use error::VeinError;
@@ -109,8 +110,17 @@ pub async fn execute_parquet_scan(
             total_rows += batch.num_rows();
 
             tracing::trace!(rows = batch.num_rows(), "Pushing batch down pipeline");
-            todo!("Epic 1.2: convert RecordBatch to VeinBatch::Flat(DataChunk)");
-            // next.push(batch)?;
+            let num_rows = batch.num_rows();
+            let vectors = batch
+                .columns()
+                .iter()
+                .map(|col| ValueVector { data: col.clone() })
+                .collect();
+            let chunk = DataChunk {
+                vectors,
+                selection: SelectionVector::new_dense(num_rows),
+            };
+            next.push(VeinBatch::Flat(chunk))?;
         }
 
         tracing::info!(path = %path, rows_processed = total_rows, "Finished scanning Parquet file");

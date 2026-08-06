@@ -1,6 +1,7 @@
 use arrow::record_batch::RecordBatch;
 use common::Result;
-use crate::daemon::pipeline::{PipelineNode, Source};
+use crate::daemon::pipeline::{PipelineNode, Source, DataChunk, ValueVector, VeinBatch};
+use common::arrow::SelectionVector;
 
 /// An in-memory data source for testing.
 pub struct Memory {
@@ -27,9 +28,18 @@ impl Memory {
 #[async_trait::async_trait(?Send)]
 impl Source for Memory {
     async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()> {
-        if let Some(_batch) = self.batch.take() {
-            todo!("Epic 1.2: convert RecordBatch to VeinBatch::Flat(DataChunk)");
-            // next.push(batch)?;
+        if let Some(batch) = self.batch.take() {
+            let num_rows = batch.num_rows();
+            let vectors = batch
+                .columns()
+                .iter()
+                .map(|col| ValueVector { data: col.clone() })
+                .collect();
+            let chunk = DataChunk {
+                vectors,
+                selection: SelectionVector::new_dense(num_rows),
+            };
+            next.push(VeinBatch::Flat(chunk))?;
         }
         next.flush()?;
         Ok(())
