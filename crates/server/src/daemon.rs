@@ -44,14 +44,24 @@ impl MasterDaemon {
                         // 2. Dispatch to the completely abstracted QueryEngine
                         if let Ok(query_string) = String::from_utf8(buf) {
                             tracing::info!("Received query: {}", query_string);
-                            match engine.submit_query(query_string).await {
-                                Ok(result_bytes) => {
-                                    // 3. Stream Arrow IPC result back to the client
-                                    let _ = stream.send(result_bytes).await;
+                            
+                            let mut parser = parser::Parser::new(&query_string);
+                            match parser.parse_query() {
+                                Ok(query_ast) => {
+                                    match engine.submit_query(query_ast).await {
+                                        Ok(result_bytes) => {
+                                            // 3. Stream Arrow IPC result back to the client
+                                            let _ = stream.send(result_bytes).await;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Query failed: {}", e);
+                                            let _ = stream.send(bytes::Bytes::from(format!("ERROR: {}", e))).await;
+                                        }
+                                    }
                                 }
                                 Err(e) => {
-                                    tracing::error!("Query failed: {}", e);
-                                    let _ = stream.send(bytes::Bytes::from(format!("ERROR: {}", e))).await;
+                                    tracing::error!("Parse failed: {:?}", e);
+                                    let _ = stream.send(bytes::Bytes::from(format!("PARSE ERROR: {:?}", e))).await;
                                 }
                             }
                         }

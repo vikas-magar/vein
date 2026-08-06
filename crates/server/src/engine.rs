@@ -3,15 +3,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
 
-use master::traits::TaskDispatcher;
-use planner::traits::{LogicalBinder, PhysicalPlanner, JoinOptimizer};
+use master::traits::{TaskDispatcher, PhysicalPlanner};
+use planner::traits::{LogicalBinder, JoinOptimizer};
+use parser::ast::query::Query;
 
 /// The absolute highest-level abstraction for the Database Engine.
 /// Represents the complete end-to-end lifecycle from query submission to result retrieval.
 #[async_trait]
 pub trait QueryEngine: Send + Sync {
-    /// Submits a raw SQL string, executes it across the cluster, and returns the final Arrow IPC result stream.
-    async fn submit_query(&self, query: String) -> Result<Bytes>;
+    /// Submits a query AST and returns the final result as Arrow IPC bytes.
+    async fn submit_query(&self, query: Query) -> Result<Bytes>;
 }
 
 /// The concrete Coordinator that wires all the abstract traits together.
@@ -90,7 +91,7 @@ impl DistributedCoordinatorBuilder {
 
 #[async_trait]
 impl QueryEngine for DistributedCoordinator {
-    async fn submit_query(&self, query: String) -> Result<Bytes> {
+    async fn submit_query(&self, query: Query) -> Result<Bytes> {
         // 1. BIND: Convert raw SQL AST to a Semantic Logical Plan
         let logical_plan = self.binder.bind(query)?;
         
@@ -98,11 +99,12 @@ impl QueryEngine for DistributedCoordinator {
         let optimized_plan = self.optimizer.optimize_join_order(logical_plan)?;
         
         // 3. PLAN: Lower the optimized logical plan into a distributed Physical DAG
-        let _physical_dag = self.planner.create_physical_plan(optimized_plan)?;
+        let physical_dag = self.planner.create_physical_plan(optimized_plan)?;
         
         // 4. DISPATCH: The Scheduler breaks the DAG into MorselTasks and uses the Dispatcher 
         // to send them over the network (e.g., via QUIC) to the Executor nodes.
-        // self.dispatcher.dispatch(node_id, task).await?;
+        let output_stage = physical_dag.output_stage_id();
+        tracing::info!("Dispatched DAG with output stage {:?}", output_stage);
         
         // 5. RECEIVE: The Master node waits for the final DataTransport stream from the Executors.
         
