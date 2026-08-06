@@ -126,7 +126,12 @@ impl QueryEngine for DistributedCoordinator {
              return Err(error::VeinError::internal("No available executor nodes to dispatch tasks to"));
         }
         
-        let mut current_node_idx = 0;
+        // Track simulated load during this dispatch loop to ensure we distribute fairly
+        // based on the telemetry feedback loop (heartbeat active_tasks).
+        let mut current_loads: Vec<(usize, usize)> = available_nodes.iter()
+            .enumerate()
+            .map(|(idx, n)| (idx, n.load.active_tasks as usize))
+            .collect();
 
         // For each stage in the DAG, dispatch it.
         for stage_id in physical_dag.topological_order() {
@@ -138,10 +143,12 @@ impl QueryEngine for DistributedCoordinator {
                     sink: stage.sink.clone(),
                 };
                 
-                // Distribute tasks round-robin across all available healthy nodes in the cluster
-                let target_node = &available_nodes[current_node_idx % available_nodes.len()];
-                current_node_idx += 1;
+                // Feedback-Loop Routing: Always pick the node with the absolute lowest load
+                current_loads.sort_by_key(|&(_, load)| load);
+                let best_idx = current_loads[0].0;
+                current_loads[0].1 += 1; // Simulate the added load so the next task goes elsewhere if needed
                 
+                let target_node = &available_nodes[best_idx];
                 self.dispatcher.dispatch(target_node.node_id, task).await?;
             }
         }
