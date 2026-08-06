@@ -1,3 +1,4 @@
+pub mod engine;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use std::sync::Arc;

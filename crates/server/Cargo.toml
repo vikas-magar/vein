@@ -19,3 +19,4 @@ flume = "0.11.1"
 rkyv = { workspace = true }
 s2n-quic = { workspace = true }
 bytes = "1.0"
+async-trait.workspace = true
