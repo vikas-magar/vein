@@ -61,13 +61,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Master { bind, cert, key } => {
             tracing::info!("Starting Vein Master node on {} (TLS: {})", bind, cert);
             
-            // 1. Dependency Injection: Wire the Traits!
-            let coordinator = Arc::new(engine::DistributedCoordinator {
-                binder: Arc::new(planner::binder::default_binder::DefaultSqlBinder::new()),
-                optimizer: Arc::new(planner::optimizer::adopt_optimizer::AdoptJoinOptimizer::new()),
-                planner: Arc::new(master::planner::dag_planner::DagPhysicalPlanner::new()),
-                dispatcher: Arc::new(master::scheduler::quic_dispatcher::QuicTaskDispatcher::new()),
-            });
+            // 1. Dependency Injection: Construct the Engine using the Builder Pattern!
+            let coordinator = Arc::new(
+                engine::DistributedCoordinator::builder()
+                    .with_binder(Arc::new(planner::binder::default_binder::DefaultSqlBinder::new()))
+                    .with_optimizer(Arc::new(planner::optimizer::adopt_optimizer::AdoptJoinOptimizer::new()))
+                    .with_planner(Arc::new(master::planner::dag_planner::DagPhysicalPlanner::new()))
+                    .with_dispatcher(Arc::new(master::scheduler::quic_dispatcher::QuicTaskDispatcher::new()))
+                    .build()?
+            );
             
             // 2. Start the Master Daemon
             let addr: std::net::SocketAddr = bind.parse()?;

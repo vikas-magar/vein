@@ -1,5 +1,6 @@
 use common::Result;
 use crate::traits::JoinOptimizer;
+use crate::plan::LogicalPlan;
 
 /// The ADOPT (RL-Based Adaptive Join Optimizer).
 /// Uses Reinforcement Learning telemetry from the cluster to dynamically reorder 
@@ -14,8 +15,8 @@ impl AdoptJoinOptimizer {
 }
 
 impl JoinOptimizer for AdoptJoinOptimizer {
-    fn optimize_join_order(&self, logical_plan: String) -> Result<String> {
+    fn optimize_join_order(&self, logical_plan: LogicalPlan) -> Result<LogicalPlan> {
         // TODO: Implement the ADOPT Q-learning state space evaluation here
-        Ok(format!("AdoptOptimized({})", logical_plan))
+        Ok(logical_plan)
     }
 }
