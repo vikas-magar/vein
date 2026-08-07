@@ -8,7 +8,7 @@ use crate::daemon::pipeline::VeinBatch;
 #[async_trait]
 pub trait DataTransport: Send + Sync {
     /// Stream Arrow IPC bytes to a remote executor node.
-    async fn send_stream(&self, node_id: u32, stream_id: String, data: Bytes) -> Result<()>;
+    async fn send_stream(&self, node_id: common::identifiers::NodeId, stream_id: String, data: Bytes) -> Result<()>;
     
     /// Receive a stream of Arrow IPC bytes from a remote executor node.
     async fn receive_stream(&self, stream_id: String) -> Result<Bytes>;

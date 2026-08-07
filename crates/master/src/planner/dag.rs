@@ -12,6 +12,28 @@ pub struct Stage {
     pub sink: DataSink,
 }
 
+impl Stage {
+    /// Generates physical morsels for this stage based on the underlying data source 
+    /// (e.g., Parquet row groups, VFS blocks).
+    /// This abstracts the Hybrid Elastic Morsel Splitting away from the dispatch loop.
+    pub fn generate_morsels(&self) -> Vec<common::protocol::MorselTask> {
+        // TODO(Storage): Query VFS/Parquet metadata to dynamically slice the `DataSource`
+        // into balanced `MorselTask`s to prevent skew.
+        // For now, we return a dynamic number of chunks as a placeholder.
+        let mut morsels = Vec::new();
+        let chunk_count = 10; 
+        for _ in 0..chunk_count {
+            morsels.push(common::protocol::MorselTask {
+                task_id: common::identifiers::TaskId::new(),
+                source: self.source.clone(), // This would be a sub-block pointer in reality
+                plan: self.operators.clone(),
+                sink: self.sink.clone(),
+            });
+        }
+        morsels
+    }
+}
+
 /// A directed edge representing data flow between stages.
 #[derive(Debug, Clone)]
 pub struct StageEdge {

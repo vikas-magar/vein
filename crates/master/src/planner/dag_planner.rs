@@ -20,6 +20,6 @@ impl DagPhysicalPlanner {
 impl PhysicalPlanner for DagPhysicalPlanner {
     fn create_physical_plan(&self, _logical_plan: LogicalPlan) -> Result<StageDag> {
         // TODO: Implement translation from LogicalPlan to StageDag
-        Ok(StageDag::new(vec![], vec![], StageId::from_raw(0), ExecutionMode::Batch).unwrap())
+        Err(error::VeinError::internal("DagPhysicalPlanner::create_physical_plan is not yet implemented"))
     }
 }

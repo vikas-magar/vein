@@ -19,6 +19,6 @@ impl QuicTaskDispatcher {
 impl TaskDispatcher for QuicTaskDispatcher {
     async fn dispatch(&self, _node_id: NodeId, _task: MorselTask) -> Result<()> {
         // TODO: Actually open a QUIC stream to the Executor node and serialize the MorselTask
-        Ok(())
+        Err(error::VeinError::internal("QuicTaskDispatcher::dispatch is not yet implemented"))
     }
 }

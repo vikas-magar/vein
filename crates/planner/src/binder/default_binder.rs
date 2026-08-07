@@ -19,15 +19,7 @@ impl DefaultSqlBinder {
 
 impl LogicalBinder for DefaultSqlBinder {
     fn bind(&self, _ast: Query) -> Result<LogicalPlan> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("dummy", DataType::Int64, false),
-        ]));
-        
-        Ok(LogicalPlan::Scan {
-            table_name: "dummy_table".to_string(),
-            projection: None,
-            filters: vec![],
-            schema,
-        })
+        // TODO: Implement actual catalog lookup and AST to LogicalPlan translation
+        Err(error::VeinError::internal("DefaultSqlBinder::bind is not yet implemented"))
     }
 }

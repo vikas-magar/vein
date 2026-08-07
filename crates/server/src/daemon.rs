@@ -51,17 +51,23 @@ impl MasterDaemon {
                                     match engine.submit_query(query_ast).await {
                                         Ok(result_bytes) => {
                                             // 3. Stream Arrow IPC result back to the client
-                                            let _ = stream.send(result_bytes).await;
+                                            if let Err(err) = stream.send(result_bytes).await {
+                                                tracing::warn!("Failed to send query result to client: {}", err);
+                                            }
                                         }
                                         Err(e) => {
                                             tracing::error!("Query failed: {}", e);
-                                            let _ = stream.send(bytes::Bytes::from(format!("ERROR: {}", e))).await;
+                                            if let Err(err) = stream.send(bytes::Bytes::from(format!("ERROR: {}", e))).await {
+                                                tracing::warn!("Failed to send query error payload to client: {}", err);
+                                            }
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     tracing::error!("Parse failed: {:?}", e);
-                                    let _ = stream.send(bytes::Bytes::from(format!("PARSE ERROR: {:?}", e))).await;
+                                    if let Err(err) = stream.send(bytes::Bytes::from(format!("PARSE ERROR: {:?}", e))).await {
+                                        tracing::warn!("Failed to send parse error payload to client: {}", err);
+                                    }
                                 }
                             }
                         }

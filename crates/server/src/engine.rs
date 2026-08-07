@@ -108,6 +108,9 @@ impl DistributedCoordinatorBuilder {
 impl QueryEngine for DistributedCoordinator {
     async fn submit_query(&self, query: Query) -> Result<Bytes> {
         // 1. BIND: Convert raw SQL AST to a Semantic Logical Plan
+        let query_id_str = format!("{:?}", query); // Simplified for telemetry
+        let start_time = std::time::Instant::now();
+        
         let logical_plan = self.binder.bind(query)?;
         
         // 2. OPTIMIZE: Apply cost-based or RL-based Join reordering
@@ -126,47 +129,57 @@ impl QueryEngine for DistributedCoordinator {
              return Err(error::VeinError::internal("No available executor nodes to dispatch tasks to"));
         }
         
-        // Track simulated load during this dispatch loop to ensure we distribute fairly
-        // based on the telemetry feedback loop (heartbeat active_tasks).
-        let mut current_loads: Vec<(usize, usize)> = available_nodes.iter()
-            .enumerate()
-            .map(|(idx, n)| (idx, n.load.active_tasks as usize))
-            .collect();
+        // Track simulated load using a Min-Heap for O(log N) routing (instead of O(N log N) sorting).
+        // BinaryHeap is a max-heap, so we use Reverse to make it a min-heap based on load.
+        // Tuple is (Load, NodeIdx).
+        let mut load_heap = std::collections::BinaryHeap::new();
+        for (idx, n) in available_nodes.iter().enumerate() {
+            load_heap.push(std::cmp::Reverse((n.load.active_tasks as usize, idx)));
+        }
 
         // For each stage in the DAG, dispatch it.
         for stage_id in physical_dag.topological_order() {
             if let Some(stage) = physical_dag.get_stage(stage_id) {
-                // Kuzu-inspired Hybrid Elastic Morsel Dispatching:
-                // Instead of dispatching the entire stage as one monolithic task,
-                // we break the data source (e.g., Parquet row groups, or VFS shuffle blocks)
-                // into many small morsel tasks. If a VFS block is huge (skew), we split it here.
+                // Generate Hybrid Elastic Morsels from the stage (delegated to the Stage abstraction)
+                let morsels = stage.generate_morsels();
                 
-                // TODO(Morsel-Driven): Dynamically query VFS/Parquet to determine true morsel splits.
-                // For now, we simulate this by breaking the stage into N morsel tasks.
-                let simulated_morsels = 10;
-                
-                for _morsel_idx in 0..simulated_morsels {
-                    let task = MorselTask {
-                        task_id: TaskId::new(),
-                        source: stage.source.clone(), // In reality, this would point to a specific sub-block
-                        plan: stage.operators.clone(),
-                        sink: stage.sink.clone(),
-                    };
-                    
-                    // Feedback-Loop Routing: Always pick the node with the absolute lowest load
-                    current_loads.sort_by_key(|&(_, load)| load);
-                    let best_idx = current_loads[0].0;
-                    current_loads[0].1 += 1; // Simulate the added load so the next task goes elsewhere if needed
-                    
-                    let target_node = &available_nodes[best_idx];
-                    self.dispatcher.dispatch(target_node.node_id, task).await?;
+                for task in morsels {
+                    // Feedback-Loop Routing: O(log N) pop least loaded, push back with +1 load
+                    if let Some(std::cmp::Reverse((current_load, best_idx))) = load_heap.pop() {
+                        let target_node = &available_nodes[best_idx];
+                        self.dispatcher.dispatch(target_node.node_id, task).await?;
+                        
+                        // Simulate added load
+                        load_heap.push(std::cmp::Reverse((current_load + 1, best_idx)));
+                    }
                 }
             }
         }
         
         // 5. RECEIVE: The Master node waits for the final DataTransport stream from the Executors.
         // TODO: Actually open the Arrow IPC stream receiver.
+        let final_rows_produced = 0; // Mocked for now until data transport is complete
+        
+        // 6. FEEDBACK: Report execution telemetry back to the Reinforcement Learning Optimizer
+        let telemetry = common::protocol::QueryTelemetry {
+            query_id: common::identifiers::QueryId::new(), // In reality we'd parse or generate this
+            execution_time_ms: start_time.elapsed().as_millis() as u64,
+            rows_produced: final_rows_produced,
+        };
+        let _ = self.optimizer.report_telemetry(telemetry);
         
         Ok(Bytes::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_builder_fails_without_dependencies() {
+        let builder = DistributedCoordinator::builder();
+        let result = builder.build();
+        assert!(result.is_err(), "Builder should fail if dependencies are not injected");
     }
 }
