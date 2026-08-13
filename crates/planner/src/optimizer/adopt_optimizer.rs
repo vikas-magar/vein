@@ -15,8 +15,8 @@ impl AdoptJoinOptimizer {
 }
 
 impl JoinOptimizer for AdoptJoinOptimizer {
-    fn optimize_join_order(&self, logical_plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn optimize_join(&self, logical_plan: &LogicalPlan) -> common::Result<LogicalPlan> {
         // TODO: Implement the ADOPT Q-learning state space evaluation here
-        Ok(logical_plan)
+        Ok(logical_plan.clone())
     }
 }

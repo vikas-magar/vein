@@ -1,20 +1,21 @@
 #![deny(missing_docs)]
-//! The Query Planner and Optimizer for Vein.
-//! 
-//! This crate is responsible for taking a raw, untyped AST from `parser`,
-//! binding it against a catalog to produce a valid `LogicalPlan`, and then
-//! heavily optimizing that plan using rule-based and cost-based optimizers.
 
-/// Logical expressions.
+//! Vein Planner: Semantic frontend of the engine
+//!
+//! Consumes the syntax-only AST produced by parser and produces a fully
+//! resolved, type-coerced LogicalPlan.
+
+/// Data types and schema definitions
+pub mod schema;
+/// Logical expressions and operators
 pub mod expr;
-
-/// Logical plan nodes.
+/// Logical query plan structures
 pub mod plan;
-
-/// Binder for AST -> LogicalPlan.
-pub mod binder;
-
-/// Extensible optimizer framework (Cascades, Rules, Cost Models).
-pub mod optimizer;
-/// Abstract traits defining the system architecture.
+/// Core traits for binder and optimizer
 pub mod traits;
+/// AST to Logical Plan binding logic
+pub mod binder;
+/// Plan optimization rules
+pub mod optimizer;
+/// Testing utilities (InMemory VCS Catalog)
+pub mod testing;

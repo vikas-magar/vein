@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use crate::plan::LogicalPlan;
 use crate::expr::{LogicalExpr, LogicalLiteral};
 use crate::optimizer::rule::{OptimizerRule, RuleType};
@@ -37,7 +36,7 @@ impl ConstantFoldingRule {
                 let new_input = self.optimize_node(input)?;
                 let new_predicate = self.optimize_expr(predicate)?;
                 Ok(LogicalPlan::Filter {
-                    input: Arc::new(new_input),
+                    input: Box::new(new_input),
                     predicate: new_predicate,
                 })
             }
@@ -45,7 +44,7 @@ impl ConstantFoldingRule {
                 let new_input = self.optimize_node(input)?;
                 let new_exprs: Result<Vec<_>> = exprs.iter().map(|e| self.optimize_expr(e)).collect();
                 Ok(LogicalPlan::Project {
-                    input: Arc::new(new_input),
+                    input: Box::new(new_input),
                     exprs: new_exprs?,
                     schema: schema.clone(),
                 })
@@ -64,7 +63,7 @@ impl ConstantFoldingRule {
 
                 // If both children are now literals, fold them!
                 if let (LogicalExpr::Literal(l_lit), LogicalExpr::Literal(r_lit)) = (&opt_left, &opt_right) {
-                    if let Some(folded) = Self::fold_literals(l_lit, *op, r_lit) {
+                    if let Some(folded) = Self::fold_literals(l_lit, op.clone(), r_lit) {
                         return Ok(LogicalExpr::Literal(folded));
                     }
                 }
@@ -72,7 +71,7 @@ impl ConstantFoldingRule {
                 // Couldn't fold, return the operation with (potentially) optimized children
                 Ok(LogicalExpr::BinaryOp {
                     left: Box::new(opt_left),
-                    op: *op,
+                    op: op.clone(),
                     right: Box::new(opt_right),
                     return_type: return_type.clone(),
                 })
@@ -104,8 +103,7 @@ impl ConstantFoldingRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expr::ResolvedColumn;
-    use arrow::datatypes::DataType;
+    use crate::schema::VeinDataType;
 
     #[test]
     fn test_constant_folding() {
@@ -117,11 +115,11 @@ mod tests {
                 left: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(10))),
                 op: BinaryOp::Plus,
                 right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(5))),
-                return_type: DataType::Int64,
+                return_type: VeinDataType::Int64,
             }),
             op: BinaryOp::Multiply,
             right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(2))),
-            return_type: DataType::Int64,
+            return_type: VeinDataType::Int64,
         };
 
         let folded = rule.optimize_expr(&expr).unwrap();

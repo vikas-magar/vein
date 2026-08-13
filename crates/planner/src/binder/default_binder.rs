@@ -1,25 +1,23 @@
-use common::Result;
-use crate::traits::LogicalBinder;
+use async_trait::async_trait;
 use parser::ast::query::Query;
 use crate::plan::LogicalPlan;
-use arrow::datatypes::{Schema, Field, DataType};
-use std::sync::Arc;
+use crate::traits::LogicalBinder;
 
-/// The Default SQL Binder.
-/// Responsible for parsing the raw SQL string into an AST, validating it against the catalog,
-/// and returning a serialized Semantic Logical Plan.
+/// The default implementation of the logical binder.
+/// Transforms an AST into a fully resolved logical plan.
 pub struct DefaultSqlBinder;
 
 impl DefaultSqlBinder {
-    /// Creates a new DefaultSqlBinder instance.
+    /// Creates a new instance of the default binder
     pub fn new() -> Self {
         Self {}
     }
 }
 
+#[async_trait]
 impl LogicalBinder for DefaultSqlBinder {
-    fn bind(&self, _ast: Query) -> Result<LogicalPlan> {
-        // TODO: Implement actual catalog lookup and AST to LogicalPlan translation
-        Err(error::VeinError::internal("DefaultSqlBinder::bind is not yet implemented"))
+    async fn bind(&self, _query: &Query) -> Result<LogicalPlan, error::VeinError> {
+        // Implementation will happen in Step 3
+        todo!("Step 3: Implement the DefaultSqlBinder::bind logic")
     }
 }
