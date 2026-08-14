@@ -184,7 +184,7 @@ impl Parser {
             TokenKind::LParen => {
                 let lparen = self.next_token()?;
                 if let Ok(TokenKind::From) = self.peek().map(|t| &t.kind) {
-                    return self.parse_subquery_in_parens(lparen.span);
+                    self.parse_subquery_in_parens(lparen.span)
                 } else {
                     let expr = self.parse_expr()?;
                     self.expect(TokenKind::RParen)?;

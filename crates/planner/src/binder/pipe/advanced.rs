@@ -1,8 +1,8 @@
 use error::{Result, VeinError};
-use parser::ast::query::Query;
 use parser::ast::pipe_op::{WriteTarget, CommonTableExpr};
 use parser::ast::expr::SpannedExpr;
 use crate::plan::LogicalPlan;
+use crate::plan::traversal::PlanTraversal;
 use crate::binder::context::BinderContext;
 use crate::binder::scope::ScopeStack;
 
@@ -55,6 +55,12 @@ pub fn bind_with(_input: LogicalPlan, _ctes: &[CommonTableExpr]) -> Result<Logic
 }
 
 /// Binds a PipeOperator::Write (Outputs stream to storage)
-pub fn bind_write(_input: LogicalPlan, _target: &WriteTarget) -> Result<LogicalPlan> {
-    Err(VeinError::internal("Write operator not yet fully implemented"))
+pub fn bind_write(input: LogicalPlan, target: &WriteTarget) -> Result<LogicalPlan> {
+    let schema = input.schema().clone();
+    Ok(LogicalPlan::Write {
+        input: Box::new(input),
+        target: target.table.clone(),
+        options: target.options.clone(),
+        schema: Box::new(schema),
+    })
 }

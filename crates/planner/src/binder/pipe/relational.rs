@@ -1,10 +1,11 @@
 use error::{Result, VeinError};
 use parser::ast::pipe_op::{SelectItem, AggregateExpr, JoinClause};
 use parser::ast::expr::SpannedExpr;
-use crate::plan::{LogicalPlan, JoinType};
+use crate::plan::LogicalPlan;
 use crate::schema::VeinSchema;
 use crate::binder::context::BinderContext;
 use crate::binder::scope::ScopeStack;
+use crate::plan::traversal::PlanTraversal;
 use crate::binder::expr::ExprBinder;
 
 /// Binds a PipeOperator::Where into a LogicalPlan::Filter
@@ -38,7 +39,7 @@ pub async fn bind_select<'a>(
         let col_name = item.alias.clone().unwrap_or_else(|| "unnamed_expr".to_string());
         
         new_fields.push(crate::schema::ResolvedColumn {
-            id: scopes.next_id(),
+            id: context.next_id(),
             name: col_name,
             qualifier: None,
             data_type: bound_expr.data_type(),
@@ -63,7 +64,7 @@ pub async fn bind_select<'a>(
 /// Binds a PipeOperator::Aggregate into a LogicalPlan::Aggregate
 pub async fn bind_aggregate<'a>(
     input: LogicalPlan,
-    group_by: &[SpannedExpr],
+    group_by: &[parser::ast::pipe_op::OrderByExpr],
     aggregates: &[AggregateExpr],
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack<'a>,
@@ -72,9 +73,9 @@ pub async fn bind_aggregate<'a>(
     let mut new_fields = Vec::new();
     
     for gb in group_by {
-        let bound_expr = ExprBinder::new(context, scopes).bind(gb).await?;
+        let bound_expr = ExprBinder::new(context, scopes).bind(&gb.expr).await?;
         new_fields.push(crate::schema::ResolvedColumn {
-            id: scopes.next_id(),
+            id: context.next_id(),
             name: "group_by_col".to_string(), // In a real engine, try to derive from expr
             qualifier: None,
             data_type: bound_expr.data_type(),
@@ -89,7 +90,7 @@ pub async fn bind_aggregate<'a>(
         let col_name = agg.alias.clone().unwrap_or_else(|| "agg_col".to_string());
         
         new_fields.push(crate::schema::ResolvedColumn {
-            id: scopes.next_id(),
+            id: context.next_id(),
             name: col_name,
             qualifier: None,
             data_type: bound_expr.data_type(),
@@ -114,8 +115,8 @@ pub async fn bind_aggregate<'a>(
 
 /// Binds a PipeOperator::Join into a LogicalPlan::Join
 pub async fn bind_join<'a>(
-    input: LogicalPlan,
-    join: &JoinClause,
+    _input: LogicalPlan,
+    _join: &JoinClause,
     _context: &mut BinderContext<'a>,
     _scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {

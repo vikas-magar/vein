@@ -62,16 +62,15 @@ impl ConstantFoldingRule {
                 let opt_right = self.optimize_expr(right)?;
 
                 // If both children are now literals, fold them!
-                if let (LogicalExpr::Literal(l_lit), LogicalExpr::Literal(r_lit)) = (&opt_left, &opt_right) {
-                    if let Some(folded) = Self::fold_literals(l_lit, op.clone(), r_lit) {
+                if let (LogicalExpr::Literal(l_lit), LogicalExpr::Literal(r_lit)) = (&opt_left, &opt_right)
+                    && let Some(folded) = Self::fold_literals(l_lit, *op, r_lit) {
                         return Ok(LogicalExpr::Literal(folded));
                     }
-                }
                 
                 // Couldn't fold, return the operation with (potentially) optimized children
                 Ok(LogicalExpr::BinaryOp {
                     left: Box::new(opt_left),
-                    op: op.clone(),
+                    op: *op,
                     right: Box::new(opt_right),
                     return_type: return_type.clone(),
                 })

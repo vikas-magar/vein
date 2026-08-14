@@ -1,4 +1,3 @@
-use common::Result;
 use crate::traits::JoinOptimizer;
 use crate::plan::LogicalPlan;
 

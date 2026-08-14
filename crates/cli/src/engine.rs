@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
 
-use master::traits::{TaskDispatcher, PhysicalPlanner};
-use master::executor::registry::ExecutorRegistry;
+use orchestrator::traits::{TaskDispatcher, PhysicalPlanner};
+use orchestrator::executor::registry::ExecutorRegistry;
 use planner::traits::{LogicalBinder, JoinOptimizer};
 use parser::ast::query::Query;
 use common::identifiers::TaskId;
@@ -27,10 +27,8 @@ pub struct DistributedCoordinator {
     pub optimizer: Arc<dyn JoinOptimizer>,
     /// Abstract layer for lowering Logical Plans to Physical DAGs
     pub planner: Arc<dyn PhysicalPlanner>,
-    /// Abstract network layer for transmitting tasks to Executor nodes
-    pub dispatcher: Arc<dyn TaskDispatcher>,
-    /// Cluster state for task distribution
-    pub registry: Arc<ExecutorRegistry>,
+    /// The cluster scheduler responsible for dispatching tasks
+    pub scheduler: Arc<orchestrator::scheduler::Scheduler>,
 }
 
 impl DistributedCoordinator {
@@ -40,8 +38,7 @@ impl DistributedCoordinator {
             binder: None,
             optimizer: None,
             planner: None,
-            dispatcher: None,
-            registry: None,
+            scheduler: None,
         }
     }
 }
@@ -51,8 +48,7 @@ pub struct DistributedCoordinatorBuilder {
     binder: Option<Arc<dyn LogicalBinder>>,
     optimizer: Option<Arc<dyn JoinOptimizer>>,
     planner: Option<Arc<dyn PhysicalPlanner>>,
-    dispatcher: Option<Arc<dyn TaskDispatcher>>,
-    registry: Option<Arc<ExecutorRegistry>>,
+    scheduler: Option<Arc<orchestrator::scheduler::Scheduler>>,
 }
 
 impl DistributedCoordinatorBuilder {
@@ -74,15 +70,9 @@ impl DistributedCoordinatorBuilder {
         self
     }
     
-    /// Injects the TaskDispatcher network strategy.
-    pub fn with_dispatcher(mut self, dispatcher: Arc<dyn TaskDispatcher>) -> Self {
-        self.dispatcher = Some(dispatcher);
-        self
-    }
-
-    /// Injects the ExecutorRegistry state.
-    pub fn with_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
-        self.registry = Some(registry);
+    /// Injects the Scheduler.
+    pub fn with_scheduler(mut self, scheduler: Arc<orchestrator::scheduler::Scheduler>) -> Self {
+        self.scheduler = Some(scheduler);
         self
     }
     
@@ -91,15 +81,13 @@ impl DistributedCoordinatorBuilder {
         let binder = self.binder.ok_or_else(|| error::VeinError::internal("Missing LogicalBinder configuration"))?;
         let optimizer = self.optimizer.ok_or_else(|| error::VeinError::internal("Missing JoinOptimizer configuration"))?;
         let planner = self.planner.ok_or_else(|| error::VeinError::internal("Missing PhysicalPlanner configuration"))?;
-        let dispatcher = self.dispatcher.ok_or_else(|| error::VeinError::internal("Missing TaskDispatcher configuration"))?;
-        let registry = self.registry.ok_or_else(|| error::VeinError::internal("Missing ExecutorRegistry configuration"))?;
+        let scheduler = self.scheduler.ok_or_else(|| error::VeinError::internal("Missing Scheduler configuration"))?;
         
         Ok(DistributedCoordinator {
             binder,
             optimizer,
             planner,
-            dispatcher,
-            registry,
+            scheduler,
         })
     }
 }
@@ -111,50 +99,22 @@ impl QueryEngine for DistributedCoordinator {
         let query_id_str = format!("{:?}", query); // Simplified for telemetry
         let start_time = std::time::Instant::now();
         
-        let logical_plan = self.binder.bind(query)?;
+        let logical_plan = self.binder.bind(&query).await?;
         
         // 2. OPTIMIZE: Apply cost-based or RL-based Join reordering
-        let optimized_plan = self.optimizer.optimize_join_order(logical_plan)?;
+        let optimized_plan = self.optimizer.optimize_join(&logical_plan)?;
         
         // 3. PLAN: Lower the optimized logical plan into a distributed Physical DAG
         let physical_dag = self.planner.create_physical_plan(optimized_plan)?;
         
-        // 4. DISPATCH: The Scheduler breaks the DAG into MorselTasks and uses the Dispatcher 
-        // to send them over the network (e.g., via QUIC) to the Executor nodes.
+        // 4. DISPATCH: The Scheduler breaks the DAG into MorselTasks and dispatches them efficiently.
         let output_stage = physical_dag.output_stage_id();
         tracing::info!("Dispatched DAG with output stage {:?}", output_stage);
         
-        let available_nodes = self.registry.available(std::time::Duration::from_secs(10)).await;
-        if available_nodes.is_empty() {
-             return Err(error::VeinError::internal("No available executor nodes to dispatch tasks to"));
-        }
+        let query_id = common::identifiers::QueryId::new();
+        let cancel_token = common::cancellation::CancellationToken::new();
         
-        // Track simulated load using a Min-Heap for O(log N) routing (instead of O(N log N) sorting).
-        // BinaryHeap is a max-heap, so we use Reverse to make it a min-heap based on load.
-        // Tuple is (Load, NodeIdx).
-        let mut load_heap = std::collections::BinaryHeap::new();
-        for (idx, n) in available_nodes.iter().enumerate() {
-            load_heap.push(std::cmp::Reverse((n.load.active_tasks as usize, idx)));
-        }
-
-        // For each stage in the DAG, dispatch it.
-        for stage_id in physical_dag.topological_order() {
-            if let Some(stage) = physical_dag.get_stage(stage_id) {
-                // Generate Hybrid Elastic Morsels from the stage (delegated to the Stage abstraction)
-                let morsels = stage.generate_morsels();
-                
-                for task in morsels {
-                    // Feedback-Loop Routing: O(log N) pop least loaded, push back with +1 load
-                    if let Some(std::cmp::Reverse((current_load, best_idx))) = load_heap.pop() {
-                        let target_node = &available_nodes[best_idx];
-                        self.dispatcher.dispatch(target_node.node_id, task).await?;
-                        
-                        // Simulate added load
-                        load_heap.push(std::cmp::Reverse((current_load + 1, best_idx)));
-                    }
-                }
-            }
-        }
+        self.scheduler.execute(query_id, physical_dag, cancel_token).await?;
         
         // 5. RECEIVE: The Master node waits for the final DataTransport stream from the Executors.
         // TODO: Actually open the Arrow IPC stream receiver.
@@ -166,7 +126,7 @@ impl QueryEngine for DistributedCoordinator {
             execution_time_ms: start_time.elapsed().as_millis() as u64,
             rows_produced: final_rows_produced,
         };
-        let _ = self.optimizer.report_telemetry(telemetry);
+        let _ = self.optimizer.report_telemetry();
         
         Ok(Bytes::new())
     }

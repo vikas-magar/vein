@@ -91,6 +91,25 @@ pub struct MockFunctionRegistry;
 
 impl FunctionRegistry for MockFunctionRegistry {
     fn resolve(&self, name: &str) -> Result<FunctionSignature, VeinError> {
+        let n = name.to_uppercase();
+        if n == "EMBED" {
+            return Ok(FunctionSignature {
+                return_type: VeinDataType::Vector(1536),
+                volatility: crate::expr::Volatility::Immutable,
+                arg_types: vec![VeinDataType::Utf8],
+                kind: crate::traits::FunctionKind::AiOperator,
+                bytecode_ref: None,
+            });
+        } else if n == "VECTOR_DISTANCE" {
+            return Ok(FunctionSignature {
+                return_type: VeinDataType::Float64,
+                volatility: crate::expr::Volatility::Immutable,
+                arg_types: vec![VeinDataType::Vector(0), VeinDataType::Vector(0)], // Accepts any dim in mock
+                kind: crate::traits::FunctionKind::Scalar,
+                bytecode_ref: None,
+            });
+        }
+
         Err(VeinError::internal(format!("Function '{}' not found", name)))
     }
 }

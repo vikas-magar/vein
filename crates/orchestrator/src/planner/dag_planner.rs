@@ -2,8 +2,6 @@ use common::Result;
 use crate::traits::PhysicalPlanner;
 use planner::plan::LogicalPlan;
 use crate::planner::dag::StageDag;
-use common::identifiers::StageId;
-use common::protocol::ExecutionMode;
 
 /// The DAG Physical Planner.
 /// Responsible for lowering the optimized logical plan into a highly parallel `StageDag`

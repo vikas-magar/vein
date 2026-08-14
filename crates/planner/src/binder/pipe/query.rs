@@ -15,52 +15,73 @@ use crate::binder::pipe::dataflow::{bind_set_op, bind_fork, bind_tee};
 use crate::binder::pipe::mutation::{bind_extend, bind_set, bind_drop, bind_rename, bind_as};
 use crate::binder::pipe::advanced::{bind_pivot, bind_unpivot, bind_table_sample, bind_assert, bind_call, bind_with, bind_write};
 
+use std::sync::Arc;
+use crate::traits::{LogicalBinder, SchemaProvider, FunctionRegistry};
+use async_trait::async_trait;
+
 /// Binds SQL query clauses into LogicalPlans
-pub struct QueryBinder<'a, 'b> {
-    context: &'a mut BinderContext<'b>,
-    scopes: &'a mut ScopeStack<'b>,
+pub struct QueryBinder {
+    catalog: Arc<dyn SchemaProvider>,
+    functions: Arc<dyn FunctionRegistry>,
 }
 
-impl<'a, 'b> QueryBinder<'a, 'b> {
-    /// Creates a new QueryBinder with the required context and scope stack
-    pub fn new(context: &'a mut BinderContext<'b>, scopes: &'a mut ScopeStack<'b>) -> Self {
-        Self { context, scopes }
+impl QueryBinder {
+    /// Creates a new QueryBinder with the required dependencies
+    pub fn new(catalog: Arc<dyn SchemaProvider>, functions: Arc<dyn FunctionRegistry>) -> Self {
+        Self { catalog, functions }
     }
+}
 
+#[async_trait]
+impl LogicalBinder for QueryBinder {
     /// Recursively binds a parsed SQL Query into a LogicalPlan tree
-    pub async fn bind(&mut self, query: &Query) -> Result<LogicalPlan> {
-        // 1. Bind the Source (FROM clause equivalent)
-        let plan = match &query.source {
-            TableSource::Table { name, alias } => {
-                let schema = self.context.catalog.get_table_schema(name).await?;
-                
-                let mut columns = Vec::new();
-                for field in &schema.fields {
-                    let mut bound_field = field.clone();
-                    bound_field.id = self.scopes.next_id();
-                    bound_field.qualifier = alias.clone().or_else(|| Some(name.clone()));
-                    columns.push(bound_field);
-                }
-                
-                self.scopes.push(Scope {
-                    columns: columns.clone(),
-                    qualifier: alias.clone().or_else(|| Some(name.clone())),
-                });
+    async fn bind(&self, query: &Query) -> Result<LogicalPlan> {
+        let catalog_ref = self.catalog.as_ref();
+        let functions_ref = self.functions.as_ref();
+        
+        let mut context = BinderContext::new(catalog_ref, functions_ref);
+        let mut scopes = ScopeStack::new(None);
 
-                LogicalPlan::Scan {
-                    table_name: name.clone(),
-                    version: None,
-                    projection: None,
-                    filters: vec![],
-                    schema: Box::new(VeinSchema { fields: columns }),
-                }
-            }
-            _ => return Err(VeinError::internal("Only Base Tables are supported right now in the binder")),
-        };
-
-        // 2. Process Pipe Operators sequentially using the standalone helper
-        bind_pipeline(plan, &query.pipes, &mut *self.context, &mut *self.scopes).await
+        bind_query_internal(query, &mut context, &mut scopes).await
     }
+}
+
+/// Helper to recursively bind a parsed SQL Query into a LogicalPlan tree
+pub async fn bind_query_internal<'a>(
+    query: &Query,
+    context: &mut BinderContext<'a>,
+    scopes: &mut ScopeStack<'a>,
+) -> Result<LogicalPlan> {
+    // 1. Bind the Source (FROM clause equivalent)
+    let plan = match &query.source {
+        TableSource::Table { name, alias } => {
+            let schema = context.catalog.get_table_schema(name).await?;
+            
+            let mut columns = Vec::new();
+            for field in &schema.fields {
+                let mut bound_field = field.clone();
+                bound_field.id = context.next_id();
+                bound_field.qualifier = alias.clone().or_else(|| Some(name.clone()));
+                columns.push(bound_field);
+            }
+            
+            scopes.push(Scope {
+                columns: columns.clone(),
+                qualifier: alias.clone().or_else(|| Some(name.clone())),
+            });
+
+            LogicalPlan::Scan {
+                table_name: name.clone(),
+                projection: None,
+                filters: vec![],
+                schema: Box::new(VeinSchema { fields: columns }),
+            }
+        }
+        _ => return Err(VeinError::internal("Only Base Tables are supported right now in the binder")),
+    };
+
+    // 2. Process Pipe Operators sequentially using the standalone helper
+    bind_pipeline(plan, &query.pipes, context, scopes).await
 }
 
 /// Binds a sequence of PipeOperators against an existing LogicalPlan
@@ -91,8 +112,8 @@ pub async fn bind_pipeline<'a>(
             // Projection Mutations
             PipeOperator::Extend { items } => bind_extend(plan, items, &mut *context, &mut *scopes).await?,
             PipeOperator::Set { assignments } => bind_set(plan, assignments, &mut *context, &mut *scopes).await?,
-            PipeOperator::Drop { columns } => bind_drop(plan, columns)?,
-            PipeOperator::Rename { renames } => bind_rename(plan, renames)?,
+            PipeOperator::Drop { columns } => bind_drop(plan, columns, &mut *scopes)?,
+            PipeOperator::Rename { renames } => bind_rename(plan, renames, &mut *scopes)?,
             PipeOperator::As { alias } => bind_as(plan, alias)?,
             
             // Advanced Analytical

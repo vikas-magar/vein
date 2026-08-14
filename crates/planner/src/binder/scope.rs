@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::schema::{ColumnId, ResolvedColumn};
+use crate::schema::ResolvedColumn;
 
 /// A single lexical scope containing available columns
 #[derive(Clone)]
@@ -20,7 +20,6 @@ pub struct ScopeStack<'a> {
     /// Pointer to outer scope to enable Correlated Subquery resolution
     pub parent: Option<&'a ScopeStack<'a>>, 
     scopes: Vec<Scope>,                 
-    next_col_id: ColumnId,              
     aliases: Vec<HashMap<String, (usize, ScopeIndex)>>,
 }
 
@@ -30,7 +29,6 @@ impl<'a> ScopeStack<'a> {
         Self {
             parent,
             scopes: Vec::new(),
-            next_col_id: ColumnId(1), // IDs start at 1
             aliases: Vec::new(),
         }
     }
@@ -56,13 +54,6 @@ impl<'a> ScopeStack<'a> {
         self.aliases.pop();
     }
 
-    /// Generates the next monotonically increasing ColumnId
-    pub fn next_id(&mut self) -> ColumnId {
-        let id = self.next_col_id;
-        self.next_col_id = ColumnId(self.next_col_id.0 + 1);
-        id
-    }
-
     /// Resolves a column reference by qualifier and name
     pub fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ResolvedColumn, error::VeinError> {
         // 1. Search local scopes (from innermost to outermost)
@@ -82,12 +73,11 @@ impl<'a> ScopeStack<'a> {
         }
 
         // 2. Search parent scope (for correlated subqueries)
-        if let Some(parent) = self.parent {
-            if let Ok(col) = parent.resolve(qualifier, name) {
+        if let Some(parent) = self.parent
+            && let Ok(col) = parent.resolve(qualifier, name) {
                 // If it's found in the parent, we might want to flag it as an OuterColumn later
                 return Ok(col);
             }
-        }
 
         Err(error::VeinError::internal(format!(
             "Column not found in current scope: {}.{}", 

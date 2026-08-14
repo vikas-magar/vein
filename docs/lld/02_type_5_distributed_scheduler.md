@@ -31,7 +31,7 @@ pub enum MasterCommand {
 pub struct PreemptResponse {
     pub task_id: TaskId,
     pub morsels_completed: usize,
-    /// The boundary of work that the worker yielded back to the master
+    /// The boundary of work that the worker yielded back to the orchestrator
     pub morsels_yielded: usize, 
 }
 ```

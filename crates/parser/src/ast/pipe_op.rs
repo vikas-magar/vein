@@ -12,7 +12,7 @@ pub enum JoinType {
 pub enum PipeOperator {
     Select { items: Vec<SelectItem> },
     Where { predicate: SpannedExpr },
-    Aggregate { group_by: Vec<SpannedExpr>, aggregates: Vec<AggregateExpr> },
+    Aggregate { group_by: Vec<OrderByExpr>, aggregates: Vec<AggregateExpr> },
     OrderBy { order_bys: Vec<OrderByExpr> },
     Limit { limit: u64, offset: u64 },
     Extend { items: Vec<SelectItem> },

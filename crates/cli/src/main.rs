@@ -61,18 +61,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Master { bind, cert, key } => {
             tracing::info!("Starting Vein Master node on {} (TLS: {})", bind, cert);
             
-            let registry = Arc::new(master::executor::registry::ExecutorRegistry::new());
-            registry.start_health_check(std::time::Duration::from_secs(30));
-            
-            // 1. Dependency Injection: Construct the Engine using the Builder Pattern!
+            let registry = Arc::new(orchestrator::executor::registry::ExecutorRegistry::new());
+            let dispatcher = Arc::new(orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::new());
+            let scheduler = Arc::new(orchestrator::scheduler::Scheduler::new(
+                registry.clone(),
+                dispatcher,
+                3, // max_retries
+                std::time::Duration::from_secs(30), // timeout
+            ));
+
             let coordinator = Arc::new(
                 engine::DistributedCoordinator::builder()
-                    .with_binder(Arc::new(planner::binder::default_binder::DefaultSqlBinder::new()))
+                    .with_binder(Arc::new(planner::binder::pipe::query::QueryBinder::new(
+                        Arc::new(planner::testing::InMemoryVcsCatalog::new()),
+                        Arc::new(planner::testing::MockFunctionRegistry),
+                    )))
                     .with_optimizer(Arc::new(planner::optimizer::adopt_optimizer::AdoptJoinOptimizer::new()))
-                    .with_planner(Arc::new(master::planner::dag_planner::DagPhysicalPlanner::new()))
-                    .with_dispatcher(Arc::new(master::scheduler::quic_dispatcher::QuicTaskDispatcher::new()))
-                    .with_registry(registry.clone())
-                    .build()?
+                    .with_planner(Arc::new(orchestrator::planner::dag_planner::DagPhysicalPlanner::new()))
+                    .with_scheduler(scheduler)
+                    .build()
+                    .unwrap(),
             );
             
             // 2. Start the Master Daemon

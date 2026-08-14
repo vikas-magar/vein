@@ -1,6 +1,7 @@
-use error::{Result, VeinError};
+use error::Result;
 use parser::ast::pipe_op::OrderByExpr;
 use crate::plan::{LogicalPlan, SortKey};
+use crate::plan::traversal::PlanTraversal;
 use crate::binder::context::BinderContext;
 use crate::binder::scope::ScopeStack;
 use crate::binder::expr::ExprBinder;

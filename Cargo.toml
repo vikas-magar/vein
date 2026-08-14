@@ -5,20 +5,12 @@ edition = "2024"
 
 [workspace]
 resolver = "2"
-members = [
-    "crates/common",
-    "crates/vcs",
-    "crates/exec",
-    "crates/error",
-    "crates/parser"
-    , "crates/planner", "crates/master", "crates/server", "crates/vfs", "crates/ebpf"]
+members = ["crates/common", "crates/vcs", "crates/exec", "crates/error", "crates/parser", "crates/planner", "crates/orchestrator", "crates/cli", "crates/vfs", "crates/ebpf"]
 
 [workspace.dependencies]
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["full"] }
 arrow = "59.1.0"
-arrow-array = "59.1.0"
-arrow-schema = "59.1.0"
 parquet = { version = "59.1.0", features = ["async", "arrow"] }
 opendal = "0.45"
 s2n-quic = { version = "1.83.0", features = ["provider-tls-rustls"] }
@@ -33,12 +25,13 @@ rand = "0.8"
 moka = { version = "0.12", features = ["future"] }
 iceberg = "0.10.0"
 iceberg-storage-opendal = { version = "0.10.0", features = ["opendal-fs", "opendal-s3"] }
-strum = { version = "0.26", features = ["derive"] }
-ordered-float = "4.0"
+strum = { version = "0.28.0", features = ["derive"] }
+ordered-float = "5.3.0"
 
 [dependencies]
-common = { path = "crates/common" }
 parser = { path = "crates/parser" }
+planner = { path = "crates/planner" }
+tokio = "1.52.3"
 
 [profile.release]
 opt-level = 3

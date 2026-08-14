@@ -5,6 +5,7 @@ use crate::plan::LogicalPlan;
 use crate::schema::VeinSchema;
 use crate::binder::context::BinderContext;
 use crate::binder::scope::ScopeStack;
+use crate::plan::traversal::PlanTraversal;
 use crate::binder::expr::ExprBinder;
 
 /// Binds a PipeOperator::Extend (Adds columns without dropping existing ones)
@@ -28,7 +29,7 @@ pub async fn bind_extend<'a>(
         let col_name = item.alias.clone().unwrap_or_else(|| "unnamed_expr".to_string());
         
         let new_col = crate::schema::ResolvedColumn {
-            id: scopes.next_id(),
+            id: context.next_id(),
             name: col_name,
             qualifier: None,
             data_type: bound_expr.data_type(),
@@ -68,7 +69,7 @@ pub async fn bind_set<'a>(
             let bound_expr = ExprBinder::new(context, scopes).bind(expr).await?;
             
             let new_col = crate::schema::ResolvedColumn {
-                id: scopes.next_id(),
+                id: context.next_id(),
                 name: col.name.clone(),
                 qualifier: col.qualifier.clone(),
                 data_type: bound_expr.data_type(),
@@ -105,7 +106,11 @@ pub async fn bind_set<'a>(
 }
 
 /// Binds a PipeOperator::Drop (Removes columns from the stream)
-pub fn bind_drop(input: LogicalPlan, columns: &[String]) -> Result<LogicalPlan> {
+pub fn bind_drop<'a>(
+    input: LogicalPlan,
+    columns: &[String],
+    scopes: &mut ScopeStack<'a>,
+) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = Vec::new();
     
@@ -116,9 +121,10 @@ pub fn bind_drop(input: LogicalPlan, columns: &[String]) -> Result<LogicalPlan> 
         }
     }
 
-    // Note: To make the dropped columns disappear from scope, we ideally push a new scope.
-    // But since bind_drop is synchronous and doesn't take scopes, we'll leave scope management to the caller
-    // or refactor it to take scopes later.
+    scopes.push(crate::binder::scope::Scope {
+        columns: new_fields.clone(),
+        qualifier: None,
+    });
 
     // Translates to a projection that includes everything EXCEPT the dropped columns
     Ok(LogicalPlan::Project {
@@ -129,7 +135,11 @@ pub fn bind_drop(input: LogicalPlan, columns: &[String]) -> Result<LogicalPlan> 
 }
 
 /// Binds a PipeOperator::Rename (Renames columns in the stream)
-pub fn bind_rename(input: LogicalPlan, renames: &[(String, String)]) -> Result<LogicalPlan> {
+pub fn bind_rename<'a>(
+    input: LogicalPlan,
+    renames: &[(String, String)],
+    scopes: &mut ScopeStack<'a>,
+) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = input.schema().fields.clone();
     
@@ -139,6 +149,11 @@ pub fn bind_rename(input: LogicalPlan, renames: &[(String, String)]) -> Result<L
         }
         bound_exprs.push(crate::expr::LogicalExpr::Column(col.clone()));
     }
+
+    scopes.push(crate::binder::scope::Scope {
+        columns: new_fields.clone(),
+        qualifier: None,
+    });
 
     // Translates to a projection with updated column names
     Ok(LogicalPlan::Project {

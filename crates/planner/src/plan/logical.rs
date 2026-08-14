@@ -1,64 +1,7 @@
 use crate::schema::{ColumnId, ResolvedColumn, VeinSchema};
 use crate::expr::LogicalExpr;
-
-/// The type of join to perform
-#[derive(Debug, Clone, PartialEq)]
-pub enum JoinType {
-    /// Inner join
-    Inner,
-    /// Left outer join
-    Left,
-    /// Right outer join
-    Right,
-    /// Full outer join
-    Full,
-    /// Cartesian cross join
-    Cross,
-}
-
-/// The kind of set operation
-#[derive(Debug, Clone, PartialEq)]
-pub enum SetOpKind {
-    /// Union of two sets
-    Union,
-    /// Intersection of two sets
-    Intersect,
-    /// Difference of two sets
-    Except,
-}
-
-/// A specific version or state of a table for Time Travel
-#[derive(Debug, Clone, PartialEq)]
-pub enum TableVersion {
-    /// Unix timestamp in milliseconds
-    Timestamp(i64),
-    /// A named branch in the VCS
-    Branch(String),
-    /// A specific commit hash in the VCS
-    Commit(String),
-}
-
-/// The network partitioning scheme for an Exchange node
-#[derive(Debug, Clone, PartialEq)]
-pub enum Partitioning {
-    /// Hash partition by a set of expressions
-    Hash(Vec<LogicalExpr>),
-    /// Round robin distribution
-    RoundRobin,
-    /// Single partition (gather all to one node)
-    Single,
-}
-
-/// Defines sorting order for a specific key
-#[derive(Debug, Clone, PartialEq)]
-pub struct SortKey {
-    /// The expression to sort by
-    pub expr: LogicalExpr,
-    /// Whether to sort in ascending order
-    pub asc: bool,
-    /// Whether nulls appear first
-    pub nulls_first: bool,
-}
+use parser::ast::query::SetOpKind;
+use super::types::SortKey;
 
 /// A node in the logical query plan tree
 #[derive(Debug, Clone, PartialEq)]
@@ -68,8 +11,6 @@ pub enum LogicalPlan {
     Scan {
         /// The name of the table
         table_name: String,
-        /// The optional version for time travel
-        version: Option<TableVersion>,
         /// The projection of column IDs to read
         projection: Option<Vec<ColumnId>>,
         /// The filters to push down
@@ -95,19 +36,7 @@ pub enum LogicalPlan {
         /// The resulting schema
         schema: Box<VeinSchema>,
     },
-    /// A join operation
-    Join {
-        /// The left input plan
-        left: Box<LogicalPlan>,
-        /// The right input plan
-        right: Box<LogicalPlan>,
-        /// The equi-join conditions
-        equi: Vec<(ResolvedColumn, ResolvedColumn)>,
-        /// The join type
-        join_type: JoinType,
-        /// The resulting schema
-        schema: Box<VeinSchema>,
-    },
+
     /// An aggregation operation
     Aggregate {
         /// The input plan
@@ -145,17 +74,6 @@ pub enum LogicalPlan {
     Distinct {
         /// The input plan
         input: Box<LogicalPlan>,
-        /// The resulting schema
-        schema: Box<VeinSchema>,
-    },
-
-    // ── Distributed Topology ────────────────────────────────
-    /// A network exchange operation (Shuffle)
-    Exchange {
-        /// The input plan
-        input: Box<LogicalPlan>,
-        /// The partitioning scheme
-        partition_scheme: Partitioning,
         /// The resulting schema
         schema: Box<VeinSchema>,
     },
@@ -264,29 +182,17 @@ pub enum LogicalPlan {
         /// The resulting schema
         schema: Box<VeinSchema>,
     },
-}
 
-impl LogicalPlan {
-    /// Returns the schema of the plan node
-    pub fn schema(&self) -> &VeinSchema {
-        todo!()
-    }
-
-    /// Returns a list of child plans for traversal
-    pub fn children(&self) -> Vec<&LogicalPlan> {
-        todo!()
-    }
-
-    /// Maps children using a mutable function
-    pub fn map_children<F>(&self, _f: &mut F) -> Result<LogicalPlan, error::VeinError>
-    where
-        F: FnMut(Box<LogicalPlan>) -> Result<Box<LogicalPlan>, error::VeinError>,
-    {
-        todo!()
-    }
-
-    /// Checks if the plan contains semantic nodes (which blocks relational sharing rules)
-    pub fn contains_semantic(&self) -> bool {
-        todo!()
-    }
+    // ── Output ──────────────────────────────────────────────
+    /// A write operator to a sink
+    Write {
+        /// The input plan
+        input: Box<LogicalPlan>,
+        /// The target URI (e.g. api://, kafka://)
+        target: String,
+        /// Additional options
+        options: Vec<(String, String)>,
+        /// The resulting schema (usually identical to input)
+        schema: Box<VeinSchema>,
+    },
 }

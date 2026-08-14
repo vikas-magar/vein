@@ -1,13 +1,11 @@
-pub mod dispatcher;
 pub mod quic_dispatcher;
 pub mod elasticity;
-
 
 use crate::executor::ExecutorRegistry;
 use crate::planner::dag::StageDag;
 use common::identifiers::{QueryId, TaskId};
 use common::protocol::{ExecuteTask, ExecutionMode};
-use dispatcher::TaskDispatcher;
+use crate::traits::TaskDispatcher;
 use error::VeinError;
 use std::sync::Arc;
 use std::time::Duration;

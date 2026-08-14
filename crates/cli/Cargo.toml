@@ -1,11 +1,11 @@
 [package]
-name = "server"
+name = "cli"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 common = { path = "../common" }
-master = { path = "../master" }
+orchestrator = { path = "../orchestrator" }
 exec = { path = "../exec" }
 error = { path = "../error" }
 planner = { path = "../planner" }

@@ -1,7 +1,8 @@
+
 use std::collections::HashMap;
 use crate::plan::LogicalPlan;
 use crate::traits::{SchemaProvider, FunctionRegistry};
-use crate::schema::VeinSchemaRef;
+use crate::schema::{VeinSchemaRef, ColumnId};
 
 /// Context for the binder, holding references to external catalogs and functions.
 pub struct BinderContext<'a> {
@@ -15,6 +16,8 @@ pub struct BinderContext<'a> {
     pub lineage_schema: Option<VeinSchemaRef>,
     /// Optional calibration schema for conformal prediction
     pub calibration_schema: Option<VeinSchemaRef>,
+    /// Global column ID generator for the query
+    pub next_col_id: ColumnId,
 }
 
 impl<'a> BinderContext<'a> {
@@ -26,6 +29,14 @@ impl<'a> BinderContext<'a> {
             ctes: HashMap::new(),
             lineage_schema: None,
             calibration_schema: None,
+            next_col_id: ColumnId(1),
         }
+    }
+
+    /// Generates the next monotonically increasing ColumnId
+    pub fn next_id(&mut self) -> ColumnId {
+        let id = self.next_col_id;
+        self.next_col_id = ColumnId(self.next_col_id.0 + 1);
+        id
     }
 }

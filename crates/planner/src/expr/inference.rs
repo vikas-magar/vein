@@ -1,4 +1,5 @@
 use crate::expr::{LogicalExpr, LogicalLiteral};
+use crate::plan::traversal::PlanTraversal;
 use crate::schema::VeinDataType;
 
 impl LogicalExpr {

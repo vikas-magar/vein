@@ -64,8 +64,10 @@ pub enum VeinDataType {
     // ── Nested & Collections ──────────────────────────────
     /// A variable length list of another type
     List(Box<VeinDataType>),
-    /// Fixed size list (Crucial for ML Vector Embeddings)
+    /// Fixed size list
     FixedSizeList(Box<VeinDataType>, i32),
+    /// High-dimensional vector for AI embeddings
+    Vector(u32),
     /// A nested struct of named fields
     Struct(Vec<ResolvedColumn>),
     /// A map of key-value pairs
@@ -117,6 +119,7 @@ impl VeinDataType {
             
             VeinDataType::List(inner) => DataType::List(Arc::new(Field::new("item", inner.to_arrow(), true))),
             VeinDataType::FixedSizeList(inner, size) => DataType::FixedSizeList(Arc::new(Field::new("item", inner.to_arrow(), true)), *size),
+            VeinDataType::Vector(dim) => DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), *dim as i32),
             VeinDataType::Struct(fields) => {
                 let arrow_fields = fields.iter()
                     .map(|f| Field::new(&f.name, f.data_type.to_arrow(), true))

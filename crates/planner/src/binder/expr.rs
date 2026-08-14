@@ -1,7 +1,6 @@
 use error::{Result, VeinError};
 use parser::ast::expr::{BinaryOp as AstBinaryOp, Expr, Literal as AstLiteral, SpannedExpr};
 use crate::expr::{LogicalExpr, LogicalLiteral};
-use crate::schema::ResolvedColumn;
 use crate::binder::context::BinderContext;
 use crate::binder::scope::ScopeStack;
 use crate::schema::data_type::VeinDataType;
@@ -52,7 +51,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 match signature.kind {
                     FunctionKind::AiOperator => {
                         // FinOps Security Hook: Prevent accidental $50k bills
-                        self.validate_ai_budget(&name, &bound_args)?;
+                        self.validate_ai_budget(name, &bound_args)?;
                         Ok(LogicalExpr::AiOperator {
                             name: name.clone(),
                             args: bound_args,

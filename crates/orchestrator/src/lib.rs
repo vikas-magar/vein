@@ -5,7 +5,6 @@ pub mod scheduler;
 
 pub use config::MasterConfig;
 pub use executor::ExecutorRegistry;
-pub use planner::SqlPlanner;
 pub use scheduler::Scheduler;
 
 // We will add scheduler and planner modules here shortly.

@@ -1031,6 +1031,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "clap",
+ "common",
+ "error",
+ "exec",
+ "flume",
+ "orchestrator",
+ "parser",
+ "planner",
+ "rkyv",
+ "s2n-quic",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2790,22 +2811,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "master"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "common",
- "error",
- "futures",
- "planner",
- "s2n-quic",
- "serde",
- "tokio",
- "tracing",
- "vcs",
-]
-
-[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3234,6 +3239,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "orchestrator"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "common",
+ "error",
+ "futures",
+ "planner",
+ "s2n-quic",
+ "serde",
+ "tokio",
+ "tracing",
+ "vcs",
+]
+
+[[package]]
 name = "ordered-float"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3247,6 +3268,15 @@ name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "ordered-float"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
 dependencies = [
  "num-traits",
  "rand 0.8.7",
@@ -3366,9 +3396,9 @@ dependencies = [
 name = "parser"
 version = "0.1.0"
 dependencies = [
- "ordered-float 4.6.0",
+ "ordered-float 5.3.0",
  "serde",
- "strum 0.26.3",
+ "strum 0.28.0",
  "thiserror 2.0.19",
 ]
 
@@ -3488,9 +3518,11 @@ name = "planner"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "common",
  "error",
  "parser",
+ "rkyv",
 ]
 
 [[package]]
@@ -4831,27 +4863,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "clap",
- "common",
- "error",
- "exec",
- "flume",
- "master",
- "parser",
- "planner",
- "rkyv",
- "s2n-quic",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5047,15 +5058,6 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
-version = "0.26.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
-dependencies = [
- "strum_macros 0.26.4",
-]
-
-[[package]]
-name = "strum"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
@@ -5064,16 +5066,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "strum_macros"
-version = "0.26.4"
+name = "strum"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
+checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
 dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "rustversion",
- "syn 2.0.118",
+ "strum_macros 0.28.0",
 ]
 
 [[package]]
@@ -5081,6 +5079,18 @@ name = "strum_macros"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -5670,8 +5680,9 @@ dependencies = [
 name = "vein"
 version = "0.1.0"
 dependencies = [
- "common",
  "parser",
+ "planner",
+ "tokio",
 ]
 
 [[package]]

@@ -28,7 +28,7 @@ services:
       - certs-data:/certs
     environment:
       - RUST_LOG=info
-    command: vein-server master --bind 0.0.0.0:8080 --cert /certs/server.crt --key /certs/server.key
+    command: vein-server orchestrator --bind 0.0.0.0:8080 --cert /certs/server.crt --key /certs/server.key
     ports:
       - "8080:8080/udp"
 
@@ -43,7 +43,7 @@ services:
       - certs-data:/certs
     environment:
       - RUST_LOG=info
-    command: vein-server executor --bind 0.0.0.0:8081 --master master:8080 --cert /certs/server.crt --key /certs/server.key
+    command: vein-server executor --bind 0.0.0.0:8081 --orchestrator orchestrator:8080 --cert /certs/server.crt --key /certs/server.key
     ports:
       - "8081:8081/udp"
 
@@ -58,6 +58,6 @@ services:
       - certs-data:/certs
     environment:
       - RUST_LOG=info
-    command: vein-server executor --bind 0.0.0.0:8082 --master master:8080 --cert /certs/server.crt --key /certs/server.key
+    command: vein-server executor --bind 0.0.0.0:8082 --orchestrator orchestrator:8080 --cert /certs/server.crt --key /certs/server.key
     ports:
       - "8082:8082/udp"

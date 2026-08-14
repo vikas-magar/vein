@@ -450,7 +450,7 @@ pub enum ProtocolResponse {
     },
 }
 
-/// Streaming telemetry from a compute node to the master.
+/// Streaming telemetry from a compute node to the orchestrator.
 #[derive(
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
@@ -474,7 +474,7 @@ pub struct PreemptResponse {
     pub task_id: TaskId,
     /// Morsels completed before preemption.
     pub morsels_completed: usize,
-    /// The boundary of work that the worker yielded back to the master
+    /// The boundary of work that the worker yielded back to the orchestrator
     pub morsels_yielded: usize,
 }
 
@@ -499,7 +499,7 @@ pub struct MorselTask {
 )]
 pub enum MasterCommand {
     /// Dispatches a new Macro-Morsel to the worker
-    DispatchTask(MorselTask),
+    DispatchTask(Box<MorselTask>),
     /// Forces the worker to pause and relinquish un-claimed Micro-Morsels
     PreemptTask {
         /// The task to preempt.

@@ -18,6 +18,7 @@ pub enum DataType {
     Timestamp { with_tz: bool },
     Interval { fields: IntervalField },
     Array(Box<DataType>),
+    Vector(u32),
     Struct(Vec<(String, DataType)>),
     Map { key: Box<DataType>, value: Box<DataType> },
 }
@@ -53,6 +54,7 @@ impl std::str::FromStr for DataType {
             "timestamptz" | "timestamp with time zone" => Ok(Self::Timestamp { with_tz: true }),
             "binary" => Ok(Self::Binary),
             "interval" => Ok(Self::Interval { fields: IntervalField::DayToSecond }),
+            "vector" => Ok(Self::Vector(0)), // Default 0 dimensions if parsed blindly from a raw string
             _ => Err(format!("unknown data type: {}", s)),
         }
     }

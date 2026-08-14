@@ -1,7 +1,3 @@
-use std::collections::HashMap;
-use crate::plan::LogicalPlan;
-use crate::traits::{SchemaProvider, FunctionRegistry};
-use crate::schema::VeinSchemaRef;
 
 /// Context and catalog resolution
 pub mod context;
@@ -11,5 +7,3 @@ pub mod scope;
 pub mod expr;
 /// Pipe query clause binding
 pub mod pipe;
-/// The default SQL binder implementation
-pub mod default_binder;

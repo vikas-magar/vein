@@ -62,7 +62,33 @@ impl Parser {
                     None => expr,
                 };
 
-                group_by.push(final_expr);
+                let mut asc = true;
+                if let Ok(TokenKind::Asc) = self.peek().map(|t| &t.kind) {
+                    self.next_token()?;
+                } else if let Ok(TokenKind::Desc) = self.peek().map(|t| &t.kind) {
+                    asc = false;
+                    self.next_token()?;
+                }
+                
+                let mut nulls_first = !asc;
+                if let Ok(TokenKind::Nulls) = self.peek().map(|t| &t.kind) {
+                    self.next_token()?;
+                    if let Ok(TokenKind::First) = self.peek().map(|t| &t.kind) {
+                        nulls_first = true;
+                        self.next_token()?;
+                    } else if let Ok(TokenKind::Last) = self.peek().map(|t| &t.kind) {
+                        nulls_first = false;
+                        self.next_token()?;
+                    } else {
+                        return Err(super::ParseError::Unsupported("Expected FIRST or LAST after NULLS".to_string()));
+                    }
+                }
+
+                group_by.push(crate::ast::pipe_op::OrderByExpr {
+                    expr: final_expr,
+                    asc,
+                    nulls_first,
+                });
 
                 match self.peek().map(|t| &t.kind) {
                     Ok(TokenKind::Comma) => {
@@ -122,7 +148,7 @@ mod tests {
             assert_eq!(group_by.len(), 2, "Should have 2 group_by expressions");
             // y AS year is an alias expression
             assert!(
-                matches!(group_by[0].node, crate::ast::expr::Expr::Alias { ref alias, .. } if alias == "year")
+                matches!(group_by[0].expr.node, crate::ast::expr::Expr::Alias { ref alias, .. } if alias == "year")
             );
         } else {
             panic!("Expected Aggregate");
