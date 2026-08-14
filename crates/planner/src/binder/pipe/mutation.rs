@@ -11,7 +11,7 @@ use crate::binder::expr::ExprBinder;
 /// Binds a PipeOperator::Extend (Adds columns without dropping existing ones)
 pub async fn bind_extend<'a>(
     input: LogicalPlan,
-    items: &[SelectItem],
+    items: &[SelectItem<'_>],
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
@@ -26,7 +26,7 @@ pub async fn bind_extend<'a>(
     // 2. Push the new extended columns
     for item in items {
         let bound_expr = ExprBinder::new(context, scopes).bind(&item.expr).await?;
-        let col_name = item.alias.clone().unwrap_or_else(|| "unnamed_expr".to_string());
+        let col_name = item.alias.map(|a| a.to_string()).unwrap_or_else(|| "unnamed_expr".to_string());
         
         let new_col = crate::schema::ResolvedColumn {
             id: context.next_id(),
@@ -56,7 +56,7 @@ pub async fn bind_extend<'a>(
 /// Binds a PipeOperator::Set (Updates existing columns)
 pub async fn bind_set<'a>(
     input: LogicalPlan,
-    assignments: &[(String, SpannedExpr)],
+    assignments: &[(&str, SpannedExpr<'_>)],
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
@@ -65,7 +65,7 @@ pub async fn bind_set<'a>(
     
     // Pass through or overwrite existing columns
     for col in &input.schema().fields {
-        if let Some((_, expr)) = assignments.iter().find(|(name, _)| name == &col.name) {
+        if let Some((_, expr)) = assignments.iter().find(|(name, _)| *name == col.name.as_str()) {
             let bound_expr = ExprBinder::new(context, scopes).bind(expr).await?;
             
             let new_col = crate::schema::ResolvedColumn {
@@ -87,7 +87,7 @@ pub async fn bind_set<'a>(
     
     // Check if any assignment targeted a non-existent column
     for (name, _) in assignments {
-        if !input.schema().fields.iter().any(|f| &f.name == name) {
+        if !input.schema().fields.iter().any(|f| f.name.as_str() == *name) {
             return Err(VeinError::internal(format!("SET operator cannot find column '{}'", name)));
         }
     }
@@ -108,14 +108,14 @@ pub async fn bind_set<'a>(
 /// Binds a PipeOperator::Drop (Removes columns from the stream)
 pub fn bind_drop<'a>(
     input: LogicalPlan,
-    columns: &[String],
+    columns: &[&str],
     scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = Vec::new();
     
     for col in &input.schema().fields {
-        if !columns.contains(&col.name) {
+        if !columns.contains(&col.name.as_str()) {
             bound_exprs.push(crate::expr::LogicalExpr::Column(col.clone()));
             new_fields.push(col.clone());
         }
@@ -137,15 +137,15 @@ pub fn bind_drop<'a>(
 /// Binds a PipeOperator::Rename (Renames columns in the stream)
 pub fn bind_rename<'a>(
     input: LogicalPlan,
-    renames: &[(String, String)],
+    renames: &[(&str, &str)],
     scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = input.schema().fields.clone();
     
     for col in &mut new_fields {
-        if let Some((_, new_name)) = renames.iter().find(|(old, _)| old == &col.name) {
-            col.name = new_name.clone();
+        if let Some((_, new_name)) = renames.iter().find(|(old, _)| *old == col.name.as_str()) {
+            col.name = (*new_name).to_string();
         }
         bound_exprs.push(crate::expr::LogicalExpr::Column(col.clone()));
     }

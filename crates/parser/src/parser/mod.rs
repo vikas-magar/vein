@@ -19,6 +19,7 @@ mod tpch;
 
 use crate::ast::query::Query;
 use crate::token::{Lexer, Span, SpannedToken, TokenKind};
+use std::borrow::Cow;
 
 pub use error::ParseError;
 
@@ -27,20 +28,24 @@ mod error;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
-const DEFAULT_RECURSION_LIMIT: usize = 50;
+/// Max expression nesting depth. Binary operator chains are parsed
+/// iteratively, so this only bounds explicit paren/unary nesting:
+/// ~4 stack frames (~1KB) per level keeps this safe on 2MB tokio
+/// worker stacks while allowing legitimate deep expressions.
+const DEFAULT_RECURSION_LIMIT: usize = 512;
 
-pub struct Parser {
-    lexer: Lexer,
-    tokens: Vec<SpannedToken>,
+pub struct Parser<'a> {
+    lexer: Lexer<'a>,
+    tokens: Vec<SpannedToken<'a>>,
     token_pos: usize,
-    peeked: Option<Result<SpannedToken, ParseError>>,
-    lookahead: Option<Result<SpannedToken, ParseError>>,
+    peeked: Option<Result<SpannedToken<'a>, ParseError>>,
+    lookahead: Option<Result<SpannedToken<'a>, ParseError>>,
     recursion_limit: usize,
     recursion_depth: usize,
 }
 
-impl Parser {
-    pub fn new(input: &str) -> Self {
+impl<'a> Parser<'a> {
+    pub fn new(input: &'a str) -> Self {
         Self {
             lexer: Lexer::new(input),
             tokens: vec![],
@@ -52,7 +57,7 @@ impl Parser {
         }
     }
 
-    pub fn from_tokens(tokens: Vec<SpannedToken>) -> Self {
+    pub fn from_tokens(tokens: Vec<SpannedToken<'a>>) -> Self {
         Self {
             lexer: Lexer::new(""),
             tokens,
@@ -82,7 +87,7 @@ impl Parser {
         self.recursion_depth = self.recursion_depth.saturating_sub(1);
     }
 
-    fn next_token(&mut self) -> Result<SpannedToken, ParseError> {
+    fn next_token(&mut self) -> Result<SpannedToken<'a>, ParseError> {
         if let Some(peeked_result) = self.peeked.take() {
             return peeked_result;
         }
@@ -90,7 +95,7 @@ impl Parser {
             return lookahead_result;
         }
         if self.token_pos < self.tokens.len() {
-            let token = self.tokens[self.token_pos].clone();
+            let token = self.tokens[self.token_pos];
             self.token_pos += 1;
             return Ok(token);
         }
@@ -99,13 +104,13 @@ impl Parser {
             Some(Err(lex_err)) => Err(ParseError::Lexical(lex_err)),
             None => Ok(SpannedToken {
                 kind: TokenKind::EOF,
-                text: String::new(),
+                text: "",
                 span: Span::default(),
             }),
         }
     }
 
-    fn peek(&mut self) -> Result<&SpannedToken, &ParseError> {
+    fn peek(&mut self) -> Result<&SpannedToken<'a>, &ParseError> {
         if self.peeked.is_none() {
             self.peeked = Some(self.next_token());
         }
@@ -116,7 +121,7 @@ impl Parser {
         Ok(self.peek()?.span)
     }
 
-    fn expect(&mut self, kind: TokenKind) -> Result<SpannedToken, ParseError> {
+    fn expect(&mut self, kind: TokenKind) -> Result<SpannedToken<'a>, ParseError> {
         let token = self.next_token()?;
         if token.kind == kind {
             Ok(token)
@@ -129,10 +134,11 @@ impl Parser {
         }
     }
 
-    fn expect_ident(&mut self) -> Result<String, ParseError> {
+    fn expect_ident(&mut self) -> Result<&'a str, ParseError> {
         let token = self.next_token()?;
         match token.kind {
-            TokenKind::Ident | TokenKind::DoubleQuotedIdent => Ok(token.text),
+            TokenKind::Ident => Ok(token.text),
+            TokenKind::DoubleQuotedIdent => Ok(&token.text[1..token.text.len() - 1]),
             _ => Err(ParseError::Expected {
                 expected: "identifier".into(),
                 found: format!("{:?}", token.kind),
@@ -141,8 +147,13 @@ impl Parser {
         }
     }
 
-    pub fn parse_query(&mut self) -> Result<Query, ParseError> {
-        match self.peek().map(|t| &t.kind) {
+    /// Returns the full source text being parsed (used to slice condition spans).
+    pub(crate) fn source(&self) -> &'a str {
+        self.lexer.source()
+    }
+
+    pub fn parse_query(&mut self) -> Result<Query<'a>, ParseError> {
+        let result = match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::From) => self.parse_pipe_query(),
             _ => {
                 let span = self.peek_span().unwrap_or_default();
@@ -153,10 +164,27 @@ impl Parser {
                     span,
                 })
             }
+        };
+
+        let query = result?;
+
+        // Validate the entire input was consumed: anything after the last `|>` clause is an error.
+        // An optional trailing semicolon is permitted (statement separator).
+        if let Ok(TokenKind::Semicolon) = self.peek().map(|t| &t.kind) {
+            self.next_token().ok();
+        }
+        match self.peek().map(|t| &t.kind) {
+            Ok(TokenKind::EOF) => Ok(query),
+            Ok(other) => Err(ParseError::Expected {
+                expected: "end of query".into(),
+                found: format!("{:?}", other),
+                span: self.peek_span().unwrap_or_default(),
+            }),
+            Err(_) => Ok(query),
         }
     }
 
-    pub(crate) fn parse_pipe_query(&mut self) -> Result<Query, ParseError> {
+    pub(crate) fn parse_pipe_query(&mut self) -> Result<Query<'a>, ParseError> {
         self.expect(TokenKind::From)?;
         let source = self.parse_table_source()?;
         let mut pipes = Vec::new();
@@ -185,8 +213,8 @@ impl Parser {
         }
     }
 
-    fn parse_table_source(&mut self) -> Result<crate::ast::query::TableSource, ParseError> {
-        let peek_kind = self.peek().map(|t| t.kind.clone()).unwrap_or(TokenKind::EOF);
+    fn parse_table_source(&mut self) -> Result<crate::ast::query::TableSource<'a>, ParseError> {
+        let peek_kind = self.peek().map(|t| t.kind).unwrap_or(TokenKind::EOF);
         let mut source = match peek_kind {
             TokenKind::LParen => {
                 self.next_token()?; // consume '('
@@ -197,7 +225,7 @@ impl Parser {
             TokenKind::String => {
                 let token = self.next_token()?;
                 let url = if token.text.starts_with('\'') || token.text.starts_with('"') {
-                    token.text[1..token.text.len()-1].to_string()
+                    &token.text[1..token.text.len()-1]
                 } else {
                     token.text
                 };
@@ -210,7 +238,7 @@ impl Parser {
                         self.expect(TokenKind::Eq)?;
                         let val_tok = self.next_token()?;
                         let val = match val_tok.kind {
-                            TokenKind::String | TokenKind::DoubleQuotedIdent => val_tok.text[1..val_tok.text.len()-1].to_string(),
+                            TokenKind::String | TokenKind::DoubleQuotedIdent => &val_tok.text[1..val_tok.text.len()-1],
                             TokenKind::Ident | TokenKind::Number => val_tok.text,
                             _ => return Err(ParseError::Unexpected { token: format!("{:?}", val_tok.kind), span: val_tok.span }),
                         };
@@ -225,13 +253,24 @@ impl Parser {
                 crate::ast::query::TableSource::ObjectStore { url, inline_options, alias: None }
             }
             _ => {
-                let mut name = self.expect_ident()?;
-                while let Ok(TokenKind::Dot) = self.peek().map(|t| &t.kind) {
+                let first = self.expect_ident()?;
+                if let Ok(TokenKind::Dot) = self.peek().map(|t| &t.kind) {
+                    // Qualified name (e.g. `a.b.c`): join the parts into an owned name
                     self.next_token()?; // consume '.'
-                    name.push('.');
-                    name.push_str(&self.expect_ident()?);
+                    let mut name = first.to_string();
+                    loop {
+                        name.push('.');
+                        name.push_str(self.expect_ident()?);
+                        if let Ok(TokenKind::Dot) = self.peek().map(|t| &t.kind) {
+                            self.next_token()?; // consume '.'
+                        } else {
+                            break;
+                        }
+                    }
+                    crate::ast::query::TableSource::Table { name: Cow::Owned(name), alias: None }
+                } else {
+                    crate::ast::query::TableSource::Table { name: Cow::Borrowed(first), alias: None }
                 }
-                crate::ast::query::TableSource::Table { name, alias: None }
             }
         };
 
@@ -332,6 +371,19 @@ mod tests {
             ];
             let mut parser = Parser::from_tokens(tokens);
             let q = parser.parse_query().unwrap();
+            assert_eq!(q.pipes.len(), 1);
+        }
+
+    #[test]
+        fn test_rejects_trailing_tokens() {
+            let mut parser = Parser::new("FROM t |> SELECT name garbage");
+            let err = parser.parse_query().unwrap_err();
+            assert!(matches!(err, ParseError::Expected { .. }));
+        }
+
+    #[test]
+        fn test_accepts_trailing_semicolon() {
+            let q = parse_query("FROM t |> SELECT name;").unwrap();
             assert_eq!(q.pipes.len(), 1);
         }
 

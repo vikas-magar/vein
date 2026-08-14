@@ -19,7 +19,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
     }
 
     /// Recursively binds an AST expression into a type-aware LogicalExpr
-    pub async fn bind(&mut self, ast: &SpannedExpr) -> Result<LogicalExpr> {
+    pub async fn bind(&mut self, ast: &SpannedExpr<'_>) -> Result<LogicalExpr> {
         match &ast.node {
             Expr::Column { table, column } => {
                 let resolved = self.scopes.resolve(table.as_deref(), column)?;
@@ -30,14 +30,14 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                     AstLiteral::Boolean(b) => LogicalLiteral::Boolean(*b),
                     AstLiteral::Int(i) => LogicalLiteral::Int64(*i),
                     AstLiteral::Float(f) => LogicalLiteral::Float64(f.0),
-                    AstLiteral::String(s) => LogicalLiteral::String(s.clone()),
+                    AstLiteral::String(s) => LogicalLiteral::String(s.to_string()),
                     AstLiteral::Null => LogicalLiteral::Null(VeinDataType::Null),
                 };
                 Ok(LogicalExpr::Literal(logical_lit))
             }
             Expr::Function { name, args, .. } => {
                 // 1. Ask the FunctionRegistry what kind of function this is (No hardcoding!)
-                let signature = self.context.functions.resolve(&name.to_string())?;
+                let signature = self.context.functions.resolve(name)?;
                 
                 // 2. Bind arguments recursively
                 let mut bound_args = Vec::with_capacity(args.len());
@@ -53,7 +53,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                         // FinOps Security Hook: Prevent accidental $50k bills
                         self.validate_ai_budget(name, &bound_args)?;
                         Ok(LogicalExpr::AiOperator {
-                            name: name.clone(),
+                            name: name.to_string(),
                             args: bound_args,
                             return_type: signature.return_type,
                         })
@@ -79,7 +79,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                     }
                     FunctionKind::Scalar | FunctionKind::Aggregate => {
                         Ok(LogicalExpr::FunctionCall {
-                            name: name.clone(),
+                            name: name.to_string(),
                             args: bound_args,
                             is_aggregate: signature.kind == FunctionKind::Aggregate,
                             return_type: signature.return_type,

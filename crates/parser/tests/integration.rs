@@ -6,13 +6,13 @@ use parser::ast::pipe_op::PipeOperator;
 use parser::ast::query::{Query, TableSource};
 use parser::parser::{ParseError, Parser};
 
-fn parse_query(input: &str) -> Result<Query, ParseError> {
+fn parse_query(input: &str) -> Result<Query<'_>, ParseError> {
     Parser::new(input).parse_query()
 }
 
-fn parse_expr(input: &str) -> Result<parser::ast::expr::SpannedExpr, ParseError> {
-    let wrapped = format!("FROM t |> SELECT {}", input);
-    let query = parse_query(&wrapped)?;
+fn parse_expr(input: &str) -> Result<parser::ast::expr::SpannedExpr<'_>, ParseError> {
+    let wrapped = Box::leak(format!("FROM t |> SELECT {}", input).into_boxed_str());
+    let query = parse_query(wrapped)?;
     match query.pipes.into_iter().next() {
         Some(PipeOperator::Select { mut items }) => Ok(items.remove(0).expr),
         Some(other) => panic!("expected Select, got {:?}", other),
@@ -24,7 +24,7 @@ fn parse_expr(input: &str) -> Result<parser::ast::expr::SpannedExpr, ParseError>
 fn test_object_store_source() {
     let q = parse_query("FROM 's3://bucket/data.csv' WITH (access_key = 'abc', region = 'us-east-1') AS t |> SELECT *").unwrap();
     if let TableSource::ObjectStore { url, inline_options, alias } = &q.source {
-        assert_eq!(url, "s3://bucket/data.csv");
+        assert_eq!(*url, "s3://bucket/data.csv");
         assert_eq!(inline_options.len(), 2);
         assert_eq!(inline_options[0], ("access_key".into(), "abc".into()));
         assert_eq!(inline_options[1], ("region".into(), "us-east-1".into()));

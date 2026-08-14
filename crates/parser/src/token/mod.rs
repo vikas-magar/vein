@@ -12,7 +12,7 @@ pub use span::{Span, Spanned, SpannedToken};
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, strum::EnumIter, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter, serde::Serialize, serde::Deserialize)]
 pub enum TokenKind {
     Select,
     From,

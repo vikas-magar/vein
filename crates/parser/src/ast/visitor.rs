@@ -1,23 +1,23 @@
 use crate::ast::expr::Expr;
 use crate::parser::ParseError;
 
-pub trait ExprVisitor: Sized {
-    fn visit_expr(&mut self, expr: &Expr) -> Result<(), ParseError>;
-    fn visit_expr_mut(&mut self, expr: &mut Expr) -> Result<(), ParseError>;
+pub trait ExprVisitor<'a>: Sized {
+    fn visit_expr(&mut self, expr: &Expr<'a>) -> Result<(), ParseError>;
+    fn visit_expr_mut(&mut self, expr: &mut Expr<'a>) -> Result<(), ParseError>;
 }
 
-impl Expr {
-    pub fn accept<V: ExprVisitor>(&self, visitor: &mut V) -> Result<(), ParseError> {
+impl<'a> Expr<'a> {
+    pub fn accept<V: ExprVisitor<'a>>(&self, visitor: &mut V) -> Result<(), ParseError> {
         visitor.visit_expr(self)?;
         self.accept_children(visitor)
     }
 
-    pub fn accept_mut<V: ExprVisitor>(&mut self, visitor: &mut V) -> Result<(), ParseError> {
+    pub fn accept_mut<V: ExprVisitor<'a>>(&mut self, visitor: &mut V) -> Result<(), ParseError> {
         visitor.visit_expr_mut(self)?;
         self.accept_children_mut(visitor)
     }
 
-    fn accept_children<V: ExprVisitor>(&self, visitor: &mut V) -> Result<(), ParseError> {
+    fn accept_children<V: ExprVisitor<'a>>(&self, visitor: &mut V) -> Result<(), ParseError> {
         match self {
             Expr::BinaryOp { left, right, .. } => {
                 left.node.accept(visitor)?;
@@ -68,11 +68,15 @@ impl Expr {
                 }
                 Ok(())
             }
+            Expr::Like { expr, pattern, .. } => {
+                expr.node.accept(visitor)?;
+                pattern.node.accept(visitor)
+            }
             _ => Ok(()),
         }
     }
 
-    fn accept_children_mut<V: ExprVisitor>(&mut self, visitor: &mut V) -> Result<(), ParseError> {
+    fn accept_children_mut<V: ExprVisitor<'a>>(&mut self, visitor: &mut V) -> Result<(), ParseError> {
         match self {
             Expr::BinaryOp { left, right, .. } => {
                 left.node.accept_mut(visitor)?;
@@ -123,24 +127,28 @@ impl Expr {
                 }
                 Ok(())
             }
+            Expr::Like { expr, pattern, .. } => {
+                expr.node.accept_mut(visitor)?;
+                pattern.node.accept_mut(visitor)
+            }
             _ => Ok(()),
         }
     }
 }
 
-pub struct ColumnCollector {
-    pub columns: Vec<(Option<String>, String)>,
+pub struct ColumnCollector<'a> {
+    pub columns: Vec<(Option<&'a str>, &'a str)>,
 }
 
-impl ExprVisitor for ColumnCollector {
-    fn visit_expr(&mut self, expr: &Expr) -> Result<(), ParseError> {
+impl<'a> ExprVisitor<'a> for ColumnCollector<'a> {
+    fn visit_expr(&mut self, expr: &Expr<'a>) -> Result<(), ParseError> {
         if let Expr::Column { table, column, .. } = expr {
-            self.columns.push((table.clone(), column.clone()));
+            self.columns.push((*table, *column));
         }
         Ok(())
     }
 
-    fn visit_expr_mut(&mut self, _expr: &mut Expr) -> Result<(), ParseError> {
+    fn visit_expr_mut(&mut self, _expr: &mut Expr<'a>) -> Result<(), ParseError> {
         Ok(())
     }
 }

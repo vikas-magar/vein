@@ -6,7 +6,7 @@ mod tests {
     use crate::ast::query::{Query, TableSource};
     use crate::parser::{ParseError, Parser};
 
-    fn parse_query(input: &str) -> Result<Query, ParseError> {
+    fn parse_query(input: &str) -> Result<Query<'_>, ParseError> {
         Parser::new(input).parse_query()
     }
 
@@ -154,7 +154,7 @@ mod tests {
 
     // --- helper functions ---
 
-    fn contains_between(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    fn contains_between(expr: &crate::ast::expr::SpannedExpr<'_>) -> bool {
         match &expr.node {
             Expr::Between { .. } => true,
             Expr::BinaryOp { left, right, .. } => {
@@ -164,7 +164,7 @@ mod tests {
         }
     }
 
-    fn contains_typed_string(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    fn contains_typed_string(expr: &crate::ast::expr::SpannedExpr<'_>) -> bool {
         match &expr.node {
             Expr::TypedString { .. } => true,
             Expr::BinaryOp { left, right, .. } => {
@@ -174,7 +174,7 @@ mod tests {
         }
     }
 
-    fn contains_exists(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    fn contains_exists(expr: &crate::ast::expr::SpannedExpr<'_>) -> bool {
         match &expr.node {
             Expr::Exists { .. } => true,
             Expr::BinaryOp { left, right, .. } => {
@@ -184,7 +184,7 @@ mod tests {
         }
     }
 
-    fn contains_in_list(expr: &crate::ast::expr::SpannedExpr) -> bool {
+    fn contains_in_list(expr: &crate::ast::expr::SpannedExpr<'_>) -> bool {
         match &expr.node {
             Expr::InList { .. } => true,
             Expr::BinaryOp { left, right, .. } => {

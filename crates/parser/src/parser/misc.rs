@@ -1,8 +1,8 @@
 use crate::token::TokenKind;
 use crate::parser::Parser;
 
-impl Parser {
-    pub(crate) fn parse_pipe_tablesample(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+impl<'a> Parser<'a> {
+    pub(crate) fn parse_pipe_tablesample(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         self.expect(TokenKind::TableSample)?;
         let method = self.expect_ident()?;
         self.expect(TokenKind::LParen)?;
@@ -15,11 +15,11 @@ impl Parser {
         Ok(crate::ast::pipe_op::PipeOperator::TableSample { method, percent })
     }
 
-    pub(crate) fn parse_pipe_pivot(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+    pub(crate) fn parse_pipe_pivot(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         Err(super::ParseError::Unsupported("PIVOT pipe operator not yet implemented".into()))
     }
 
-    pub(crate) fn parse_pipe_unpivot(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+    pub(crate) fn parse_pipe_unpivot(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         Err(super::ParseError::Unsupported("UNPIVOT pipe operator not yet implemented".into()))
     }
 }

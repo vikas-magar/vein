@@ -11,7 +11,7 @@ use crate::binder::expr::ExprBinder;
 /// Binds a PipeOperator::Where into a LogicalPlan::Filter
 pub async fn bind_where<'a>(
     input: LogicalPlan,
-    predicate: &SpannedExpr,
+    predicate: &SpannedExpr<'_>,
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
@@ -27,7 +27,7 @@ pub async fn bind_where<'a>(
 /// Binds a PipeOperator::Select into a LogicalPlan::Project
 pub async fn bind_select<'a>(
     input: LogicalPlan,
-    items: &[SelectItem],
+    items: &[SelectItem<'_>],
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
@@ -36,7 +36,7 @@ pub async fn bind_select<'a>(
     
     for item in items {
         let bound_expr = ExprBinder::new(context, scopes).bind(&item.expr).await?;
-        let col_name = item.alias.clone().unwrap_or_else(|| "unnamed_expr".to_string());
+        let col_name = item.alias.map(|a| a.to_string()).unwrap_or_else(|| "unnamed_expr".to_string());
         
         new_fields.push(crate::schema::ResolvedColumn {
             id: context.next_id(),
@@ -64,8 +64,8 @@ pub async fn bind_select<'a>(
 /// Binds a PipeOperator::Aggregate into a LogicalPlan::Aggregate
 pub async fn bind_aggregate<'a>(
     input: LogicalPlan,
-    group_by: &[parser::ast::pipe_op::OrderByExpr],
-    aggregates: &[AggregateExpr],
+    group_by: &[parser::ast::pipe_op::OrderByExpr<'_>],
+    aggregates: &[AggregateExpr<'_>],
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
@@ -87,7 +87,7 @@ pub async fn bind_aggregate<'a>(
     let mut bound_aggs = Vec::new();
     for agg in aggregates {
         let bound_expr = ExprBinder::new(context, scopes).bind(&agg.expr).await?;
-        let col_name = agg.alias.clone().unwrap_or_else(|| "agg_col".to_string());
+        let col_name = agg.alias.map(|a| a.to_string()).unwrap_or_else(|| "agg_col".to_string());
         
         new_fields.push(crate::schema::ResolvedColumn {
             id: context.next_id(),
@@ -116,7 +116,7 @@ pub async fn bind_aggregate<'a>(
 /// Binds a PipeOperator::Join into a LogicalPlan::Join
 pub async fn bind_join<'a>(
     _input: LogicalPlan,
-    _join: &JoinClause,
+    _join: &JoinClause<'_>,
     _context: &mut BinderContext<'a>,
     _scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {

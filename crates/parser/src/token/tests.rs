@@ -6,7 +6,7 @@ mod tests {
         let lexer = Lexer::new(input);
         lexer
             .filter_map(|r| r.ok())
-            .map(|t| (t.kind, t.text))
+            .map(|t| (t.kind, t.text.to_string()))
             .collect()
     }
 
@@ -189,7 +189,7 @@ mod tests {
     fn test_simple_pipe_query() {
         let input = "FROM users |> SELECT name, age |> WHERE age > 18";
         let tokens = tokenize(input);
-        let kinds: Vec<_> = tokens.iter().map(|(k, _)| k.clone()).collect();
+        let kinds: Vec<_> = tokens.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             kinds,
             vec![

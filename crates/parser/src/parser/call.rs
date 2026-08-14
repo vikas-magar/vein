@@ -1,8 +1,8 @@
 use crate::token::TokenKind;
 use crate::parser::Parser;
 
-impl Parser {
-    pub(crate) fn parse_pipe_call(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+impl<'a> Parser<'a> {
+    pub(crate) fn parse_pipe_call(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         self.expect(TokenKind::Call)?;
         let name = self.expect_ident()?;
         self.expect(TokenKind::LParen)?;
@@ -16,23 +16,30 @@ impl Parser {
         Ok(crate::ast::pipe_op::PipeOperator::Call { name, args })
     }
 
-    pub(crate) fn parse_pipe_assert(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+    pub(crate) fn parse_pipe_assert(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         self.expect(TokenKind::Assert)?;
-        let condition = self.expect_ident()?;
+        let expr = self.parse_expr()?;
+        let src = self.source();
+        let condition = if expr.span.start <= expr.span.end && expr.span.end <= src.len() {
+            &src[expr.span.start..expr.span.end]
+        } else {
+            ""
+        };
         let message = if let Ok(TokenKind::String) = self.peek().map(|t| &t.kind) {
-            Some(self.next_token()?.text)
+            let tok = self.next_token()?;
+            Some(&tok.text[1..tok.text.len() - 1])
         } else {
             None
         };
         Ok(crate::ast::pipe_op::PipeOperator::Assert { condition, message })
     }
 
-    pub(crate) fn parse_pipe_write(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+    pub(crate) fn parse_pipe_write(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         self.expect(TokenKind::Write)?;
         
         let table = if let Ok(TokenKind::String) = self.peek().map(|t| &t.kind) {
             let tok = self.next_token()?;
-            tok.text[1..tok.text.len()-1].to_string()
+            &tok.text[1..tok.text.len()-1]
         } else {
             self.expect_ident()?
         };
@@ -54,7 +61,7 @@ impl Parser {
                 self.expect(TokenKind::Eq)?;
                 let val_tok = self.next_token()?;
                 let val = match val_tok.kind {
-                    TokenKind::String | TokenKind::DoubleQuotedIdent => val_tok.text[1..val_tok.text.len()-1].to_string(),
+                    TokenKind::String | TokenKind::DoubleQuotedIdent => &val_tok.text[1..val_tok.text.len()-1],
                     TokenKind::Ident | TokenKind::Number => val_tok.text,
                     _ => return Err(super::ParseError::Unexpected { token: format!("{:?}", val_tok.kind), span: val_tok.span }),
                 };
@@ -83,7 +90,7 @@ mod tests {
         fn test_call() {
             let q = parse_query("FROM t |> CALL my_func(1, 'x')").unwrap();
             if let PipeOperator::Call { name, args } = &q.pipes[0] {
-                assert_eq!(name, "my_func");
+                assert_eq!(*name, "my_func");
                 assert_eq!(args.len(), 2);
             } else {
                 panic!("expected Call");

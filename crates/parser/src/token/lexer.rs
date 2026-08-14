@@ -1,17 +1,17 @@
 use crate::token::scan::keyword;
 use crate::token::{LexicalError, Span, SpannedToken, TokenKind};
 
-pub struct Lexer {
-    chars: Vec<char>,
+pub struct Lexer<'a> {
+    input: &'a str,
     pos: usize,
     line: usize,
     column: usize,
 }
 
-impl Lexer {
-    pub fn new(input: &str) -> Self {
+impl<'a> Lexer<'a> {
+    pub fn new(input: &'a str) -> Self {
         Self {
-            chars: input.chars().collect(),
+            input,
             pos: 0,
             line: 1,
             column: 1,
@@ -19,16 +19,18 @@ impl Lexer {
     }
 
     fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+        self.input[self.pos..].chars().next()
     }
 
     fn peek_next(&self) -> Option<char> {
-        self.chars.get(self.pos + 1).copied()
+        let mut chars = self.input[self.pos..].chars();
+        chars.next();
+        chars.next()
     }
 
     fn advance(&mut self) -> Option<char> {
-        let ch = self.chars.get(self.pos).copied()?;
-        self.pos += 1;
+        let ch = self.peek()?;
+        self.pos += ch.len_utf8();
         if ch == '\n' {
             self.line += 1;
             self.column = 1;
@@ -177,11 +179,16 @@ impl Lexer {
         }
     }
 
-    fn current_text(&self, start: usize) -> String {
-        self.chars[start..self.pos].iter().collect()
+    fn current_text(&self, start: usize) -> &'a str {
+        &self.input[start..self.pos]
     }
 
-    fn make_token(&self, start: usize, kind: TokenKind) -> SpannedToken {
+    /// Returns the full input text the lexer was constructed with.
+    pub(crate) fn source(&self) -> &'a str {
+        self.input
+    }
+
+    fn make_token(&self, start: usize, kind: TokenKind) -> SpannedToken<'a> {
         let text = self.current_text(start);
         let span = Span::new(start, self.pos, self.line, self.column);
         SpannedToken { kind, text, span }
@@ -196,16 +203,16 @@ impl Lexer {
     }
 }
 
-impl Iterator for Lexer {
-    type Item = Result<SpannedToken, LexicalError>;
+impl<'a> Iterator for Lexer<'a> {
+    type Item = Result<SpannedToken<'a>, LexicalError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.pos >= self.chars.len() { return None; }
+            if self.pos >= self.input.len() { return None; }
             self.skip_whitespace();
-            if self.pos >= self.chars.len() { return None; }
+            if self.pos >= self.input.len() { return None; }
 
-            let ch = self.chars[self.pos];
+            let ch = self.input[self.pos..].chars().next()?;
             let start = self.pos;
 
             return Some(match ch {
@@ -244,8 +251,8 @@ impl Iterator for Lexer {
                 }
                 ch if ch.is_ascii_alphabetic() || ch == '_' => {
                     self.scan_ident();
-                    let text: String = self.chars[start..self.pos].iter().collect();
-                    let kind = keyword(&text).unwrap_or(TokenKind::Ident);
+                    let text = self.current_text(start);
+                    let kind = keyword(text).unwrap_or(TokenKind::Ident);
                     Ok(self.make_token(start, kind))
                 }
                 '-' if self.peek_next() == Some('-') => {

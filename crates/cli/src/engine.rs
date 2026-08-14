@@ -15,7 +15,7 @@ use common::protocol::MorselTask;
 #[async_trait]
 pub trait QueryEngine: Send + Sync {
     /// Submits a query AST and returns the final result as Arrow IPC bytes.
-    async fn submit_query(&self, query: Query) -> Result<Bytes>;
+    async fn submit_query<'a>(&self, query: Query<'a>) -> Result<Bytes>;
 }
 
 /// The concrete Coordinator that wires all the abstract traits together.
@@ -94,7 +94,7 @@ impl DistributedCoordinatorBuilder {
 
 #[async_trait]
 impl QueryEngine for DistributedCoordinator {
-    async fn submit_query(&self, query: Query) -> Result<Bytes> {
+    async fn submit_query<'a>(&self, query: Query<'a>) -> Result<Bytes> {
         // 1. BIND: Convert raw SQL AST to a Semantic Logical Plan
         let query_id_str = format!("{:?}", query); // Simplified for telemetry
         let start_time = std::time::Instant::now();

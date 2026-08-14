@@ -9,7 +9,7 @@ use crate::binder::expr::ExprBinder;
 /// Binds a PipeOperator::OrderBy into a LogicalPlan::Sort
 pub async fn bind_order_by<'a>(
     input: LogicalPlan,
-    order_bys: &[OrderByExpr],
+    order_bys: &[OrderByExpr<'_>],
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {

@@ -11,7 +11,7 @@ use crate::binder::scope::ScopeStack;
 pub async fn bind_set_op<'a>(
     left: LogicalPlan,
     kind: &SetOpKind,
-    right: &Query,
+    right: &Query<'_>,
     all: bool,
     context: &mut BinderContext<'a>,
     _parent_scopes: &mut ScopeStack<'a>,
@@ -46,7 +46,7 @@ pub async fn bind_set_op<'a>(
 /// Helper function to bind branch pipelines for Fork and Tee
 async fn bind_branches<'a>(
     input: &LogicalPlan,
-    pipelines: &[Vec<parser::ast::pipe_op::PipeOperator>],
+    pipelines: &[Vec<parser::ast::pipe_op::PipeOperator<'_>>],
     context: &mut BinderContext<'a>,
     parent_scopes: &mut ScopeStack<'a>,
 ) -> Result<Vec<Box<LogicalPlan>>> {
@@ -69,7 +69,7 @@ async fn bind_branches<'a>(
 /// Binds a PipeOperator::Fork into a LogicalPlan::Fork
 pub async fn bind_fork<'a>(
     input: LogicalPlan,
-    pipelines: &[Vec<parser::ast::pipe_op::PipeOperator>],
+    pipelines: &[Vec<parser::ast::pipe_op::PipeOperator<'_>>],
     context: &mut BinderContext<'a>,
     parent_scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
@@ -85,7 +85,7 @@ pub async fn bind_fork<'a>(
 /// Binds a PipeOperator::Tee into a LogicalPlan::Tee
 pub async fn bind_tee<'a>(
     input: LogicalPlan,
-    pipelines: &[Vec<parser::ast::pipe_op::PipeOperator>],
+    pipelines: &[Vec<parser::ast::pipe_op::PipeOperator<'_>>],
     context: &mut BinderContext<'a>,
     parent_scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {

@@ -28,10 +28,10 @@ impl Default for Span {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SpannedToken {
+#[derive(Debug, Clone, Copy)]
+pub struct SpannedToken<'a> {
     pub kind: TokenKind,
-    pub text: String,
+    pub text: &'a str,
     pub span: Span,
 }
 

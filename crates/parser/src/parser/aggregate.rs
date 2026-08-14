@@ -1,10 +1,10 @@
 use crate::parser::Parser;
 use crate::token::TokenKind;
 
-impl Parser {
+impl<'a> Parser<'a> {
     pub(crate) fn parse_pipe_aggregate(
         &mut self,
-    ) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+    ) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         self.expect(TokenKind::Aggregate)?;
 
         let mut aggregates = Vec::new();
@@ -62,33 +62,7 @@ impl Parser {
                     None => expr,
                 };
 
-                let mut asc = true;
-                if let Ok(TokenKind::Asc) = self.peek().map(|t| &t.kind) {
-                    self.next_token()?;
-                } else if let Ok(TokenKind::Desc) = self.peek().map(|t| &t.kind) {
-                    asc = false;
-                    self.next_token()?;
-                }
-                
-                let mut nulls_first = !asc;
-                if let Ok(TokenKind::Nulls) = self.peek().map(|t| &t.kind) {
-                    self.next_token()?;
-                    if let Ok(TokenKind::First) = self.peek().map(|t| &t.kind) {
-                        nulls_first = true;
-                        self.next_token()?;
-                    } else if let Ok(TokenKind::Last) = self.peek().map(|t| &t.kind) {
-                        nulls_first = false;
-                        self.next_token()?;
-                    } else {
-                        return Err(super::ParseError::Unsupported("Expected FIRST or LAST after NULLS".to_string()));
-                    }
-                }
-
-                group_by.push(crate::ast::pipe_op::OrderByExpr {
-                    expr: final_expr,
-                    asc,
-                    nulls_first,
-                });
+                group_by.push(self.parse_order_suffix(final_expr)?);
 
                 match self.peek().map(|t| &t.kind) {
                     Ok(TokenKind::Comma) => {
@@ -148,7 +122,7 @@ mod tests {
             assert_eq!(group_by.len(), 2, "Should have 2 group_by expressions");
             // y AS year is an alias expression
             assert!(
-                matches!(group_by[0].expr.node, crate::ast::expr::Expr::Alias { ref alias, .. } if alias == "year")
+                matches!(group_by[0].expr.node, crate::ast::expr::Expr::Alias { ref alias, .. } if *alias == "year")
             );
         } else {
             panic!("Expected Aggregate");

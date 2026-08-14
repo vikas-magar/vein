@@ -28,12 +28,12 @@ pub fn bind_table_sample(input: LogicalPlan, method: &str, percent: f64) -> Resu
 }
 
 /// Binds a PipeOperator::Assert (Data Quality Validation)
-pub fn bind_assert(input: LogicalPlan, condition: &str, message: &Option<String>) -> Result<LogicalPlan> {
+pub fn bind_assert(input: LogicalPlan, condition: &str, message: &Option<&str>) -> Result<LogicalPlan> {
     let schema = input.schema().clone();
     Ok(LogicalPlan::Assert {
         input: Box::new(input),
         condition: condition.to_string(),
-        message: message.clone(),
+        message: message.map(|m| m.to_string()),
         schema: Box::new(schema),
     })
 }
@@ -42,7 +42,7 @@ pub fn bind_assert(input: LogicalPlan, condition: &str, message: &Option<String>
 pub async fn bind_call<'a>(
     _input: LogicalPlan,
     _name: &str,
-    _args: &[SpannedExpr],
+    _args: &[SpannedExpr<'_>],
     _context: &mut BinderContext<'a>,
     _scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
@@ -50,17 +50,17 @@ pub async fn bind_call<'a>(
 }
 
 /// Binds a PipeOperator::With (Common Table Expressions)
-pub fn bind_with(_input: LogicalPlan, _ctes: &[CommonTableExpr]) -> Result<LogicalPlan> {
+pub fn bind_with(_input: LogicalPlan, _ctes: &[CommonTableExpr<'_>]) -> Result<LogicalPlan> {
     Err(VeinError::internal("CTE (With) operator not yet fully implemented in pipe scope"))
 }
 
 /// Binds a PipeOperator::Write (Outputs stream to storage)
-pub fn bind_write(input: LogicalPlan, target: &WriteTarget) -> Result<LogicalPlan> {
+pub fn bind_write(input: LogicalPlan, target: &WriteTarget<'_>) -> Result<LogicalPlan> {
     let schema = input.schema().clone();
     Ok(LogicalPlan::Write {
         input: Box::new(input),
-        target: target.table.clone(),
-        options: target.options.clone(),
+        target: target.table.to_string(),
+        options: target.options.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         schema: Box::new(schema),
     })
 }

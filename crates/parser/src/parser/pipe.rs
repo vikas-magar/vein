@@ -1,8 +1,8 @@
 use crate::token::TokenKind;
 use crate::parser::Parser;
 
-impl Parser {
-    pub(crate) fn parse_pipe_operator(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+impl<'a> Parser<'a> {
+    pub(crate) fn parse_pipe_operator(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::Select) => self.parse_pipe_select(),
             Ok(TokenKind::Where) => self.parse_pipe_where(),
@@ -35,7 +35,7 @@ impl Parser {
         }
     }
 
-    pub(crate) fn parse_pipe_fork(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+    pub(crate) fn parse_pipe_fork(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         self.expect(TokenKind::Fork)?;
         self.expect(TokenKind::LParen)?;
         let mut pipelines = Vec::new();
@@ -55,7 +55,7 @@ impl Parser {
         Ok(crate::ast::pipe_op::PipeOperator::Fork { pipelines })
     }
 
-    pub(crate) fn parse_pipe_tee(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+    pub(crate) fn parse_pipe_tee(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         self.expect(TokenKind::Tee)?;
         self.expect(TokenKind::LParen)?;
         let mut pipelines = Vec::new();
@@ -158,7 +158,7 @@ mod tests {
         fn test_tablesample() {
             let q = parse_query("FROM t |> TABLESAMPLE bernoulli(25.0)").unwrap();
             if let PipeOperator::TableSample { method, percent } = &q.pipes[0] {
-                assert_eq!(method, "bernoulli");
+                assert_eq!(*method, "bernoulli");
                 assert_eq!(*percent, 25.0);
             } else {
                 panic!("expected TableSample");

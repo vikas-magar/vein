@@ -1,8 +1,8 @@
 use crate::token::TokenKind;
 use crate::parser::Parser;
 
-impl Parser {
-    pub(crate) fn parse_pipe_select(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+impl<'a> Parser<'a> {
+    pub(crate) fn parse_pipe_select(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         self.expect(TokenKind::Select)?;
         let mut items = Vec::new();
         loop {

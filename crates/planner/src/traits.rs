@@ -61,7 +61,7 @@ pub trait SchemaProvider: Send + Sync {
 #[async_trait]
 pub trait LogicalBinder: Send + Sync {
     /// Binds an AST Query into a validated, type-coerced LogicalPlan.
-    async fn bind(&self, query: &Query) -> Result<LogicalPlan, error::VeinError>;
+    async fn bind<'a>(&self, query: &'a Query<'a>) -> Result<LogicalPlan, error::VeinError>;
 }
 
 /// Interface for the ADOPT reinforcement learning join optimizer

@@ -35,7 +35,7 @@ impl QueryBinder {
 #[async_trait]
 impl LogicalBinder for QueryBinder {
     /// Recursively binds a parsed SQL Query into a LogicalPlan tree
-    async fn bind(&self, query: &Query) -> Result<LogicalPlan> {
+    async fn bind<'a>(&self, query: &'a Query<'a>) -> Result<LogicalPlan> {
         let catalog_ref = self.catalog.as_ref();
         let functions_ref = self.functions.as_ref();
         
@@ -48,7 +48,7 @@ impl LogicalBinder for QueryBinder {
 
 /// Helper to recursively bind a parsed SQL Query into a LogicalPlan tree
 pub async fn bind_query_internal<'a>(
-    query: &Query,
+    query: &Query<'_>,
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
@@ -61,17 +61,17 @@ pub async fn bind_query_internal<'a>(
             for field in &schema.fields {
                 let mut bound_field = field.clone();
                 bound_field.id = context.next_id();
-                bound_field.qualifier = alias.clone().or_else(|| Some(name.clone()));
+                bound_field.qualifier = alias.map(|a| a.to_string()).or_else(|| Some(name.to_string()));
                 columns.push(bound_field);
             }
             
             scopes.push(Scope {
                 columns: columns.clone(),
-                qualifier: alias.clone().or_else(|| Some(name.clone())),
+                qualifier: alias.map(|a| a.to_string()).or_else(|| Some(name.to_string())),
             });
 
             LogicalPlan::Scan {
-                table_name: name.clone(),
+                table_name: name.to_string(),
                 projection: None,
                 filters: vec![],
                 schema: Box::new(VeinSchema { fields: columns }),
@@ -87,7 +87,7 @@ pub async fn bind_query_internal<'a>(
 /// Binds a sequence of PipeOperators against an existing LogicalPlan
 pub async fn bind_pipeline<'a>(
     mut plan: LogicalPlan, 
-    pipes: &[PipeOperator],
+    pipes: &[PipeOperator<'_>],
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {

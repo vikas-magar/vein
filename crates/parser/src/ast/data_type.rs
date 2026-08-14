@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum DataType {
+pub enum DataType<'a> {
     Boolean,
     Int,
     TinyInt,
@@ -17,10 +17,17 @@ pub enum DataType {
     Time,
     Timestamp { with_tz: bool },
     Interval { fields: IntervalField },
-    Array(Box<DataType>),
+    #[serde(borrow)]
+    Array(Box<DataType<'a>>),
     Vector(u32),
-    Struct(Vec<(String, DataType)>),
-    Map { key: Box<DataType>, value: Box<DataType> },
+    #[serde(borrow)]
+    Struct(Vec<(&'a str, DataType<'a>)>),
+    Map {
+        #[serde(borrow)]
+        key: Box<DataType<'a>>,
+        #[serde(borrow)]
+        value: Box<DataType<'a>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -35,7 +42,7 @@ pub enum IntervalField {
     DayToSecond,
 }
 
-impl std::str::FromStr for DataType {
+impl<'a> std::str::FromStr for DataType<'a> {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {

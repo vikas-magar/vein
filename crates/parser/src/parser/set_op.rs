@@ -1,8 +1,8 @@
 use crate::token::TokenKind;
 use crate::parser::Parser;
 
-impl Parser {
-    pub(crate) fn parse_pipe_set_op(&mut self) -> Result<crate::ast::pipe_op::PipeOperator, super::ParseError> {
+impl<'a> Parser<'a> {
+    pub(crate) fn parse_pipe_set_op(&mut self) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         let kind = match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::Union) => { self.next_token()?; crate::ast::query::SetOpKind::Union }
             Ok(TokenKind::Intersect) => { self.next_token()?; crate::ast::query::SetOpKind::Intersect }

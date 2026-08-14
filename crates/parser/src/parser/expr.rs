@@ -26,43 +26,47 @@ fn prefix_prec(kind: &TokenKind) -> Option<(u32, bool)> {
     }
 }
 
-type WindowSpec = (Vec<SpannedExpr>, Vec<OrderByExpr>, Option<crate::ast::pipe_op::WindowFrame>);
+type WindowSpec<'a> = (Vec<SpannedExpr<'a>>, Vec<OrderByExpr<'a>>, Option<crate::ast::pipe_op::WindowFrame>);
 
-impl Parser {
-    pub fn parse_expr(&mut self) -> Result<SpannedExpr, ParseError> {
+impl<'a> Parser<'a> {
+    pub fn parse_expr(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
         self.enter_recursive()?;
         let result = self.parse_binary(0);
         self.exit_recursive();
         result
     }
 
-    fn parse_binary(&mut self, min_prec: u32) -> Result<SpannedExpr, ParseError> {
+    fn parse_binary(&mut self, min_prec: u32) -> Result<SpannedExpr<'a>, ParseError> {
         let mut left = self.parse_unary()?;
 
-        while let Ok(peek_kind) = self.peek().map(|t| t.kind.clone()) {
+        while let Ok(peek_kind) = self.peek().map(|t| t.kind) {
 
             // Handle NOT as special prefix within infix operators
+            let mut postfix_op = None;
             if peek_kind == TokenKind::Not {
                 let next = match self.peek_next_token_kind() {
                     Ok(k) => k,
                     Err(_) => break,
                 };
                 if next == TokenKind::In || next == TokenKind::Between || next == TokenKind::Like {
-                    let negated = true;
                     self.next_token()?; // consume NOT from peeked
                     self.next_token()?; // consume operator from lookahead
-                    return self.parse_postfix_binary(left, next, min_prec, Some(negated));
+                    postfix_op = Some((next, true));
                 }
-            }
-
-            // IN, BETWEEN, LIKE, IS are special postfix operators, not normal binary
-            if peek_kind == TokenKind::In
+            } else if peek_kind == TokenKind::In
                 || peek_kind == TokenKind::Between
                 || peek_kind == TokenKind::Like
                 || peek_kind == TokenKind::Is
             {
                 self.next_token()?;
-                return self.parse_postfix_binary(left, peek_kind, min_prec, None);
+                postfix_op = Some((peek_kind, false));
+            }
+
+            if let Some((op, negated)) = postfix_op {
+                // IN, BETWEEN, LIKE, IS are special postfix operators: apply them
+                // and CONTINUE the loop so trailing AND/OR terms are still parsed.
+                left = self.parse_postfix_binary(left, op, min_prec, Some(negated))?;
+                continue;
             }
 
             match infix_prec(&peek_kind) {
@@ -88,11 +92,11 @@ impl Parser {
     /// Handle IS, IN, BETWEEN, LIKE after left operand (possibly negated by NOT).
     fn parse_postfix_binary(
         &mut self,
-        left: SpannedExpr,
+        left: SpannedExpr<'a>,
         op: TokenKind,
         _min_prec: u32,
         negated: Option<bool>,
-    ) -> Result<SpannedExpr, ParseError> {
+    ) -> Result<SpannedExpr<'a>, ParseError> {
         let is_negated = negated.unwrap_or(false);
         let span = left.span;
 
@@ -142,9 +146,9 @@ impl Parser {
         }
     }
 
-    fn parse_unary(&mut self) -> Result<SpannedExpr, ParseError> {
+    fn parse_unary(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
         let peek_kind = match self.peek() {
-            Ok(t) => t.kind.clone(),
+            Ok(t) => t.kind,
             Err(_) => return self.parse_primary(),
         };
 
@@ -174,9 +178,9 @@ impl Parser {
         }
     }
 
-    fn parse_primary(&mut self) -> Result<SpannedExpr, ParseError> {
+    fn parse_primary(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
         let peek_kind = match self.peek() {
-            Ok(t) => t.kind.clone(),
+            Ok(t) => t.kind,
             Err(e) => return Err(e.clone()),
         };
 
@@ -212,7 +216,7 @@ impl Parser {
                 if let Ok(TokenKind::LParen) = self.peek().map(|t| &t.kind) {
                     self.parse_function_call(name, span)
                 } else {
-                    if let Some(typed) = self.parse_typed_string(name.clone(), span)? {
+                    if let Some(typed) = self.parse_typed_string(name, span)? {
                         return Ok(typed);
                     }
 
@@ -251,7 +255,8 @@ impl Parser {
             }
             TokenKind::String => {
                 let token = self.next_token()?;
-                Ok(SpannedExpr { span: token.span, node: Expr::Literal(Literal::String(token.text)) })
+                let value = &token.text[1..token.text.len() - 1];
+                Ok(SpannedExpr { span: token.span, node: Expr::Literal(Literal::String(value)) })
             }
             TokenKind::True => {
                 let token = self.next_token()?;
@@ -287,18 +292,18 @@ impl Parser {
         }
     }
 
-    fn parse_subquery_in_parens(&mut self, lparen_span: Span) -> Result<SpannedExpr, ParseError> {
+    fn parse_subquery_in_parens(&mut self, lparen_span: Span) -> Result<SpannedExpr<'a>, ParseError> {
         let query = self.parse_pipe_query()?;
         let rparen = self.expect(TokenKind::RParen)?;
         let span = lparen_span.union(rparen.span);
         Ok(SpannedExpr { span, node: Expr::ScalarSubquery(Box::new(query)) })
     }
 
-    fn parse_exists_subquery(&mut self, exists_span: Span) -> Result<SpannedExpr, ParseError> {
+    fn parse_exists_subquery(&mut self, exists_span: Span) -> Result<SpannedExpr<'a>, ParseError> {
         self.parse_exists_body(exists_span, false)
     }
 
-    fn parse_exists_body(&mut self, start_span: Span, negated: bool) -> Result<SpannedExpr, ParseError> {
+    fn parse_exists_body(&mut self, start_span: Span, negated: bool) -> Result<SpannedExpr<'a>, ParseError> {
         self.expect(TokenKind::LParen)?;
         let query = self.parse_pipe_query()?;
         let rparen = self.expect(TokenKind::RParen)?;
@@ -306,12 +311,12 @@ impl Parser {
         Ok(SpannedExpr { span, node: Expr::Exists { subquery: Box::new(query), negated } })
     }
 
-    fn parse_cast_expr(&mut self) -> Result<SpannedExpr, ParseError> {
+    fn parse_cast_expr(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
         self.expect(TokenKind::LParen)?;
         let expr = self.parse_expr()?;
         self.expect(TokenKind::As)?;
         let token = self.expect_ident()?;
-        let data_type: DataType = match token.parse() {
+        let data_type: DataType<'_> = match token.parse() {
             Ok(dt) => dt,
             Err(_) => return Err(ParseError::Unsupported(format!("unknown type: {}", token))),
         };
@@ -320,7 +325,7 @@ impl Parser {
         Ok(SpannedExpr { span, node: Expr::Cast { expr: Box::new(expr), data_type } })
     }
 
-    fn parse_case_expr(&mut self) -> Result<SpannedExpr, ParseError> {
+    fn parse_case_expr(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
         let mut operands = Vec::new();
         let mut results = Vec::new();
         let mut else_result = None;
@@ -371,7 +376,7 @@ impl Parser {
         Ok(SpannedExpr { span: Default::default(), node: Expr::Case { operands, results, else_result } })
     }
 
-    fn parse_function_call(&mut self, name: String, span: crate::token::Span) -> Result<SpannedExpr, ParseError> {
+    fn parse_function_call(&mut self, name: &'a str, span: crate::token::Span) -> Result<SpannedExpr<'a>, ParseError> {
         self.next_token()?; // consume LParen
         let distinct = if let Ok(TokenKind::Distinct) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
@@ -414,7 +419,7 @@ impl Parser {
         Ok(SpannedExpr { span, node: Expr::Function { name, args, distinct } })
     }
 
-    fn parse_window_spec(&mut self) -> Result<WindowSpec, ParseError> {
+    fn parse_window_spec(&mut self) -> Result<WindowSpec<'a>, ParseError> {
         self.expect(TokenKind::LParen)?;
 
         let mut partition_by = Vec::new();
@@ -504,14 +509,16 @@ impl Parser {
         }
     }
 
-    fn parse_typed_string(&mut self, type_name: String, ident_span: Span) -> Result<Option<SpannedExpr>, ParseError> {
+    fn parse_typed_string(&mut self, type_name: &'a str, ident_span: Span) -> Result<Option<SpannedExpr<'a>>, ParseError> {
         match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::String) => {
-                if let Ok(dt) = type_name.parse::<DataType>() {
+                let parsed: Result<DataType<'_>, _> = type_name.parse();
+                if let Ok(dt) = parsed {
                     let str_token = self.next_token()?;
+                    let value = &str_token.text[1..str_token.text.len() - 1];
                     return Ok(Some(SpannedExpr { span: ident_span.union(str_token.span), node: Expr::TypedString {
                         data_type: dt,
-                        value: str_token.text,
+                        value,
                     } }));
                 }
                 Ok(None)
@@ -520,25 +527,38 @@ impl Parser {
         }
     }
 
-    pub(crate) fn parse_order_by_expr(&mut self) -> Result<OrderByExpr, ParseError> {
-        let expr = self.parse_expr()?;
-        let asc = match self.peek().map(|t| &t.kind) {
-            Ok(TokenKind::Asc) => { self.next_token()?; true }
-            Ok(TokenKind::Desc) => { self.next_token()?; false }
-            _ => true,
-        };
-        let nulls_first = match self.peek().map(|t| &t.kind) {
-            Ok(TokenKind::Nulls) => {
-                self.next_token()?;
-                match self.peek().map(|t| &t.kind) {
-                    Ok(TokenKind::First) => { self.next_token()?; true }
-                    Ok(TokenKind::Last) => { self.next_token()?; false }
-                    _ => asc,
+    /// Parses the optional ASC/DESC and NULLS FIRST/LAST suffix shared by
+    /// ORDER BY, window ORDER BY, and GROUP BY expressions.
+    /// Defaults follow DuckDB: ASC -> NULLS LAST, DESC -> NULLS FIRST.
+    pub(crate) fn parse_order_suffix(&mut self, expr: SpannedExpr<'a>) -> Result<OrderByExpr<'a>, ParseError> {
+        let mut asc = true;
+        if let Ok(TokenKind::Asc) = self.peek().map(|t| &t.kind) {
+            self.next_token()?;
+        } else if let Ok(TokenKind::Desc) = self.peek().map(|t| &t.kind) {
+            self.next_token()?;
+            asc = false;
+        }
+
+        let mut nulls_first = !asc;
+        if let Ok(TokenKind::Nulls) = self.peek().map(|t| &t.kind) {
+            self.next_token()?;
+            match self.peek().map(|t| &t.kind) {
+                Ok(TokenKind::First) => { self.next_token()?; nulls_first = true; }
+                Ok(TokenKind::Last) => { self.next_token()?; nulls_first = false; }
+                _ => {
+                    return Err(ParseError::Unsupported(
+                        "Expected FIRST or LAST after NULLS".to_string(),
+                    ));
                 }
             }
-            _ => asc,
-        };
+        }
+
         Ok(OrderByExpr { expr, asc, nulls_first })
+    }
+
+    pub(crate) fn parse_order_by_expr(&mut self) -> Result<OrderByExpr<'a>, ParseError> {
+        let expr = self.parse_expr()?;
+        self.parse_order_suffix(expr)
     }
 
     pub(crate) fn parse_comma_separated<T>(
@@ -559,15 +579,15 @@ impl Parser {
     fn peek_next_token_kind(&mut self) -> Result<TokenKind, &ParseError> {
         let saved = self.peeked.take();
         let result = if self.token_pos < self.tokens.len() {
-            let token = self.tokens[self.token_pos].clone();
+            let token = self.tokens[self.token_pos];
             self.token_pos += 1;
-            let kind = token.kind.clone();
+            let kind = token.kind;
             self.lookahead = Some(Ok(token));
             Ok(kind)
         } else {
             match self.lexer.next() {
                 Some(Ok(t)) => {
-                    let kind = t.kind.clone();
+                    let kind = t.kind;
                     self.lookahead = Some(Ok(t));
                     Ok(kind)
                 }
