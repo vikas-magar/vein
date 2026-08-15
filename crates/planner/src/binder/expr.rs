@@ -1,10 +1,10 @@
-use error::{Result, VeinError};
-use parser::ast::expr::{BinaryOp as AstBinaryOp, Expr, Literal as AstLiteral, SpannedExpr};
-use crate::expr::{LogicalExpr, LogicalLiteral};
 use crate::binder::context::BinderContext;
 use crate::binder::scope::ScopeStack;
+use crate::expr::{LogicalExpr, LogicalLiteral};
 use crate::schema::data_type::VeinDataType;
 use crate::traits::{FunctionKind, RuntimeKind};
+use error::{Result, VeinError};
+use parser::ast::expr::{BinaryOp as AstBinaryOp, Expr, Literal as AstLiteral, SpannedExpr};
 
 /// Responsible for translating AST expressions into Logical Expressions
 pub struct ExprBinder<'a, 'b> {
@@ -38,11 +38,11 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
             Expr::Function { name, args, .. } => {
                 // 1. Ask the FunctionRegistry what kind of function this is (No hardcoding!)
                 let signature = self.context.functions.resolve(name)?;
-                
+
                 // 2. Bind arguments recursively
                 let mut bound_args = Vec::with_capacity(args.len());
                 for arg in args {
-                    // Because 'bind' is an async method on self, we can call it recursively 
+                    // Because 'bind' is an async method on self, we can call it recursively
                     // for each argument in the SpannedExpr vector!
                     let bound = Box::pin(self.bind(arg)).await?;
                     bound_args.push(bound);
@@ -58,25 +58,23 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                             return_type: signature.return_type,
                         })
                     }
-                    FunctionKind::UserDefined(runtime) => {
-                        match runtime {
-                            RuntimeKind::Wasm => Ok(LogicalExpr::WasmUdf {
-                                bytecode_ref: signature.bytecode_ref,
-                                args: bound_args,
-                                return_type: signature.return_type,
-                            }),
-                            RuntimeKind::Ebpf => Ok(LogicalExpr::EbpfUdf {
-                                bytecode_ref: signature.bytecode_ref,
-                                args: bound_args,
-                                return_type: signature.return_type,
-                            }),
-                            RuntimeKind::Python => Ok(LogicalExpr::PythonUdf {
-                                bytecode_ref: signature.bytecode_ref,
-                                args: bound_args,
-                                return_type: signature.return_type,
-                            }),
-                        }
-                    }
+                    FunctionKind::UserDefined(runtime) => match runtime {
+                        RuntimeKind::Wasm => Ok(LogicalExpr::WasmUdf {
+                            bytecode_ref: signature.bytecode_ref,
+                            args: bound_args,
+                            return_type: signature.return_type,
+                        }),
+                        RuntimeKind::Ebpf => Ok(LogicalExpr::EbpfUdf {
+                            bytecode_ref: signature.bytecode_ref,
+                            args: bound_args,
+                            return_type: signature.return_type,
+                        }),
+                        RuntimeKind::Python => Ok(LogicalExpr::PythonUdf {
+                            bytecode_ref: signature.bytecode_ref,
+                            args: bound_args,
+                            return_type: signature.return_type,
+                        }),
+                    },
                     FunctionKind::Scalar | FunctionKind::Aggregate => {
                         Ok(LogicalExpr::FunctionCall {
                             name: name.to_string(),
@@ -90,23 +88,27 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
             Expr::BinaryOp { left, op, right } => {
                 let bound_left = Box::pin(self.bind(left)).await?;
                 let bound_right = Box::pin(self.bind(right)).await?;
-                
+
                 let left_type = bound_left.data_type();
                 let right_type = bound_right.data_type();
-                
+
                 // Super basic type coercion (in a real engine this is much more complex)
                 let return_type = match op {
-                    AstBinaryOp::Eq | AstBinaryOp::Neq | AstBinaryOp::Lt | AstBinaryOp::Gt 
-                    | AstBinaryOp::Leq | AstBinaryOp::Geq | AstBinaryOp::And | AstBinaryOp::Or => {
-                        VeinDataType::Boolean
-                    },
+                    AstBinaryOp::Eq
+                    | AstBinaryOp::Neq
+                    | AstBinaryOp::Lt
+                    | AstBinaryOp::Gt
+                    | AstBinaryOp::Leq
+                    | AstBinaryOp::Geq
+                    | AstBinaryOp::And
+                    | AstBinaryOp::Or => VeinDataType::Boolean,
                     _ => {
                         // Math/Concat operators
                         if left_type == right_type {
                             left_type
                         } else {
                             // Needs cast, but for now just fallback to left_type
-                            left_type 
+                            left_type
                         }
                     }
                 };
@@ -122,14 +124,25 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 let bound = Box::pin(self.bind(expr)).await?;
                 use parser::ast::expr::UnaryOp as AstUnaryOp;
                 match op {
-                    AstUnaryOp::Not => Ok(LogicalExpr::Not { expr: Box::new(bound) }),
-                    AstUnaryOp::Negate => Ok(LogicalExpr::Negate { expr: Box::new(bound) }),
-                    AstUnaryOp::IsNull => Ok(LogicalExpr::IsNull { expr: Box::new(bound) }),
-                    AstUnaryOp::IsNotNull => Ok(LogicalExpr::IsNotNull { expr: Box::new(bound) }),
+                    AstUnaryOp::Not => Ok(LogicalExpr::Not {
+                        expr: Box::new(bound),
+                    }),
+                    AstUnaryOp::Negate => Ok(LogicalExpr::Negate {
+                        expr: Box::new(bound),
+                    }),
+                    AstUnaryOp::IsNull => Ok(LogicalExpr::IsNull {
+                        expr: Box::new(bound),
+                    }),
+                    AstUnaryOp::IsNotNull => Ok(LogicalExpr::IsNotNull {
+                        expr: Box::new(bound),
+                    }),
                     AstUnaryOp::Plus => Ok(bound),
                 }
             }
-            _ => Err(VeinError::internal(format!("Expression binding not implemented for: {:?}", ast.node))),
+            _ => Err(VeinError::internal(format!(
+                "Expression binding not implemented for: {:?}",
+                ast.node
+            ))),
         }
     }
 
@@ -139,7 +152,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         // 1. Check self.scopes for the table's row count cardinality.
         // 2. Multiply by average prompt token size.
         // 3. Compare against a contextual MAX_QUERY_COST variable.
-        
+
         let contextual_max_cost_usd = 10.00; // Hardcoded safety limit for now
         let estimated_cost_usd = 0.05; // Mock estimation
 

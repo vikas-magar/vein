@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 pub trait ConnectionManager: Send + Sync + 'static {
     /// The shared connection type returned by this manager.
     type Connection: Send + Sync + 'static;
-    
+
     /// The type of bidirectional stream returned by this manager.
     type Stream: Send + Sync;
 

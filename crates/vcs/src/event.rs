@@ -1,5 +1,5 @@
-use rkyv::{Archive, Deserialize, Serialize};
 use rkyv::rancor::Error as RkyvError;
+use rkyv::{Archive, Deserialize, Serialize};
 
 /// Events broadcast by VCS to all connected Master nodes.
 /// Sent as QUIC datagrams (unreliable) — small, < 1200 bytes each.

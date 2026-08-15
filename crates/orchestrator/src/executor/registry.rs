@@ -44,7 +44,13 @@ impl ExecutorRegistry {
     }
 
     /// Record a heartbeat from an executor node.
-    pub async fn record_heartbeat(&self, node_id: NodeId, addr: SocketAddr, kind: NodeKind, load: NodeLoad) {
+    pub async fn record_heartbeat(
+        &self,
+        node_id: NodeId,
+        addr: SocketAddr,
+        kind: NodeKind,
+        load: NodeLoad,
+    ) {
         let mut map = self.inner.write().await;
         map.insert(
             node_id,
@@ -87,7 +93,7 @@ impl ExecutorRegistry {
             .filter(|e| now.duration_since(e.last_seen) < timeout)
             .map(|e| e.info.clone())
             .collect();
-            
+
         // Sort by load (least loaded first). Simple heuristic based on active tasks.
         nodes.sort_by(|a, b| a.load.active_tasks.cmp(&b.load.active_tasks));
         nodes

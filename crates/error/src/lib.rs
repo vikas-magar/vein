@@ -18,7 +18,6 @@ pub type Result<T> = std::result::Result<T, VeinError>;
 #[derive(Debug, Error)]
 pub enum VeinError {
     // ── System ──────────────────────────────────────────────
-
     /// An I/O operation failed.
     #[error("I/O error: {context}")]
     Io {
@@ -42,13 +41,11 @@ pub enum VeinError {
     Serialization(String),
 
     // ── Catalog ──────────────────────────────────────────────
-
     /// A table or namespace was not found in the catalog.
     #[error("Not found: {0}")]
     NotFound(String),
 
     // ── Execution ────────────────────────────────────────────
-
     /// An error during pipeline stage execution.
     #[error("Stage error in {stage}: {message}")]
     StageError {
@@ -87,7 +84,6 @@ pub enum VeinError {
     ExecutionFailed(String),
 
     // ── Shuffle ──────────────────────────────────────────────
-
     /// A partition was drained more than once.
     #[error("Partition {0} already drained")]
     PartitionAlreadyDrained(u16),
@@ -101,7 +97,6 @@ pub enum VeinError {
     Shuffle(String),
 
     // ── Transport ────────────────────────────────────────────
-
     /// A connection failed.
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
@@ -111,7 +106,6 @@ pub enum VeinError {
     QuicSend(String),
 
     // ── Internal ─────────────────────────────────────────────
-
     /// An internal or unexpected error.
     #[error("Internal error: {message}")]
     Internal {

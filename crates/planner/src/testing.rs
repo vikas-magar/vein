@@ -1,5 +1,5 @@
-use crate::traits::{FunctionRegistry, FunctionSignature, SchemaProvider};
 use crate::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema, VeinSchemaRef};
+use crate::traits::{FunctionRegistry, FunctionSignature, SchemaProvider};
 use async_trait::async_trait;
 use error::VeinError;
 use std::collections::HashMap;
@@ -79,10 +79,9 @@ impl InMemoryVcsCatalog {
 #[async_trait]
 impl SchemaProvider for InMemoryVcsCatalog {
     async fn get_table_schema(&self, name: &str) -> Result<VeinSchemaRef, VeinError> {
-        self.tables
-            .get(name)
-            .cloned()
-            .ok_or_else(|| VeinError::internal(format!("Table '{}' not found in VCS Catalog", name)))
+        self.tables.get(name).cloned().ok_or_else(|| {
+            VeinError::internal(format!("Table '{}' not found in VCS Catalog", name))
+        })
     }
 }
 
@@ -110,6 +109,9 @@ impl FunctionRegistry for MockFunctionRegistry {
             });
         }
 
-        Err(VeinError::internal(format!("Function '{}' not found", name)))
+        Err(VeinError::internal(format!(
+            "Function '{}' not found",
+            name
+        )))
     }
 }

@@ -83,7 +83,7 @@ mod tests {
 
         let int_expr = LiteralExpr::new(LiteralValue::Int64(42));
         assert_eq!(int_expr.data_type(&schema).unwrap(), DataType::Int64);
-        
+
         let result = int_expr.evaluate(&batch).unwrap();
         let result_int = result.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(result_int.len(), 3);
@@ -92,4 +92,3 @@ mod tests {
         assert_eq!(result_int.value(2), 42);
     }
 }
-

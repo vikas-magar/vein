@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use crate::plan::LogicalPlan;
 use error::Result;
+use std::collections::HashMap;
 
 /// An ID representing an equivalence group in the Memo.
 pub type GroupId = usize;
@@ -19,7 +19,7 @@ pub struct Group {
 }
 
 /// The Memoization structure for the Cascades/Volcano Cost-Based Optimizer.
-/// 
+///
 /// Instead of duplicating massive plan trees, the CBO stores logically equivalent
 /// sub-plans in `Group`s.
 #[derive(Debug, Default)]
@@ -52,7 +52,7 @@ impl Memo {
             min_cost: None,
             best_expr_idx: None,
         };
-        
+
         self.groups.insert(id, group);
         Ok(id)
     }

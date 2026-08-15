@@ -21,14 +21,20 @@ pub struct SelectionVector {
 impl SelectionVector {
     /// Creates a dense selection vector of the given size (all rows valid).
     pub fn new_dense(size: usize) -> Self {
-        Self { indices: None, size }
+        Self {
+            indices: None,
+            size,
+        }
     }
-    
+
     /// Creates a sparse selection vector from the given array of valid indices.
     pub fn new_sparse(indices: Vec<u32>) -> Self {
-        Self { size: indices.len(), indices: Some(indices) }
+        Self {
+            size: indices.len(),
+            indices: Some(indices),
+        }
     }
-    
+
     /// Returns the true physical index for a given logical index.
     #[inline(always)]
     pub fn get_index(&self, logical_idx: usize) -> usize {
@@ -38,13 +44,12 @@ impl SelectionVector {
             logical_idx
         }
     }
-    
+
     /// Returns the number of valid rows currently selected.
     pub fn size(&self) -> usize {
         self.size
     }
 }
-
 
 /// A pinned, boxed, sendable stream of `Result<RecordBatch>`.
 pub type SendableRecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;

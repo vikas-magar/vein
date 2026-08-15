@@ -3522,7 +3522,6 @@ dependencies = [
  "common",
  "error",
  "parser",
- "rkyv",
 ]
 
 [[package]]

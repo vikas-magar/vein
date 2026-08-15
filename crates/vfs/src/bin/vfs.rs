@@ -1,13 +1,13 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use clap::Parser;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use vfs::VfsConfig;
-use vfs::metadata::{MetadataEngine, RedbMetadataEngine};
 use vfs::block::{BlockManager, MmapBlockManager};
-use vfs::ingest::buffer::IngestionBuffer;
 use vfs::consensus::archipelago::ArchipelagoState;
+use vfs::ingest::buffer::IngestionBuffer;
+use vfs::metadata::{MetadataEngine, RedbMetadataEngine};
 use vfs::rpc::router::RpcRouter;
 
 #[derive(Parser, Debug)]
@@ -67,7 +67,10 @@ pub fn load_topology(
     }
 
     let bind_addr = bind_addr.ok_or_else(|| {
-        format!("Node ID '{}' not found in configuration peers list", node_id)
+        format!(
+            "Node ID '{}' not found in configuration peers list",
+            node_id
+        )
     })?;
 
     Ok((cluster_map, bind_addr))
@@ -85,7 +88,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (cluster_map, bind_addr) = load_topology(&cluster_config, &cli.node_id)?;
 
-    tracing::info!("Topology loaded. {} peers found. Binding to {}", cluster_config.peers.len(), bind_addr);
+    tracing::info!(
+        "Topology loaded. {} peers found. Binding to {}",
+        cluster_config.peers.len(),
+        bind_addr
+    );
 
     // Isolate node state directories
     let base_dir = format!("/tmp/veinfs/{}", cli.node_id);
@@ -94,17 +101,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut storage_config_map = HashMap::new();
     storage_config_map.insert("bucket".to_string(), cluster_config.storage.bucket);
     storage_config_map.insert("endpoint".to_string(), cluster_config.storage.endpoint);
-    storage_config_map.insert("access_key_id".to_string(), cluster_config.storage.access_key_id);
-    storage_config_map.insert("secret_access_key".to_string(), cluster_config.storage.secret_access_key);
+    storage_config_map.insert(
+        "access_key_id".to_string(),
+        cluster_config.storage.access_key_id,
+    );
+    storage_config_map.insert(
+        "secret_access_key".to_string(),
+        cluster_config.storage.secret_access_key,
+    );
     storage_config_map.insert("region".to_string(), cluster_config.storage.region);
-    storage_config_map.insert("enable_virtual_host_style".to_string(), cluster_config.storage.enable_virtual_host_style.to_string());
+    storage_config_map.insert(
+        "enable_virtual_host_style".to_string(),
+        cluster_config.storage.enable_virtual_host_style.to_string(),
+    );
 
     let vfs_config = VfsConfig {
         local_cache_dir: std::path::PathBuf::from(format!("{}/blocks", base_dir)),
         metadata_db_path: std::path::PathBuf::from(format!("{}/metadata.redb", base_dir)),
         block_size_bytes: 16 * 1024 * 1024,
         max_ingestion_buffer_bytes: 1024 * 1024,
-        node_ip: bind_addr.split(':').next().unwrap_or("127.0.0.1").to_string(),
+        node_ip: bind_addr
+            .split(':')
+            .next()
+            .unwrap_or("127.0.0.1")
+            .to_string(),
         storage_backend: cluster_config.storage.backend,
         storage_config: storage_config_map,
         metadata_hash_algo: Default::default(),
@@ -119,9 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let total_nodes = cluster_config.peers.len();
-    let archipelago = Arc::new(tokio::sync::RwLock::new(
-        ArchipelagoState::new(total_nodes),
-    ));
+    let archipelago = Arc::new(tokio::sync::RwLock::new(ArchipelagoState::new(total_nodes)));
 
     let cert_path = format!("{}/cert.pem", cli.tls_dir);
     let key_path = format!("{}/key.pem", cli.tls_dir);
@@ -135,7 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.node_id.clone(),
         archipelago,
         ca_cert_path,
-    ).await?;
+    )
+    .await?;
 
     tracing::info!("Starting VFS RpcRouter on {}", bind_addr);
 
@@ -191,7 +210,9 @@ weight = 2.0
     fn test_node_id_not_found_error() {
         let cluster_config: ClusterConfig = toml::from_str(TEST_CONFIG_TOML).unwrap();
         let err = load_topology(&cluster_config, "node99").unwrap_err();
-        assert_eq!(err, "Node ID 'node99' not found in configuration peers list");
+        assert_eq!(
+            err,
+            "Node ID 'node99' not found in configuration peers list"
+        );
     }
 }
-

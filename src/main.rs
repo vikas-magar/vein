@@ -1,4 +1,3 @@
-
 use parser::Parser;
 use planner::binder::pipe::query::QueryBinder;
 use planner::testing::{InMemoryVcsCatalog, MockFunctionRegistry};

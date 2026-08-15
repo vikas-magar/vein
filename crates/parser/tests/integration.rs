@@ -23,7 +23,12 @@ fn parse_expr(input: &str) -> Result<parser::ast::expr::SpannedExpr<'_>, ParseEr
 #[test]
 fn test_object_store_source() {
     let q = parse_query("FROM 's3://bucket/data.csv' WITH (access_key = 'abc', region = 'us-east-1') AS t |> SELECT *").unwrap();
-    if let TableSource::ObjectStore { url, inline_options, alias } = &q.source {
+    if let TableSource::ObjectStore {
+        url,
+        inline_options,
+        alias,
+    } = &q.source
+    {
         assert_eq!(*url, "s3://bucket/data.csv");
         assert_eq!(inline_options.len(), 2);
         assert_eq!(inline_options[0], ("access_key".into(), "abc".into()));
@@ -100,7 +105,8 @@ fn test_window_frame_unbounded() {
 
 #[test]
 fn test_window_frame_current_row() {
-    let expr = parse_expr("sum(x) OVER (ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)").unwrap();
+    let expr =
+        parse_expr("sum(x) OVER (ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)").unwrap();
     assert!(matches!(expr.node, Expr::WindowFunction { .. }));
 }
 
@@ -165,7 +171,13 @@ fn test_typed_string() {
 #[test]
 fn test_interval_literal() {
     let expr = parse_expr("INTERVAL '1 day'").unwrap();
-    assert!(matches!(expr.node, Expr::TypedString { data_type: parser::ast::data_type::DataType::Interval { .. }, .. }));
+    assert!(matches!(
+        expr.node,
+        Expr::TypedString {
+            data_type: parser::ast::data_type::DataType::Interval { .. },
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -185,4 +197,3 @@ fn test_subquery_in_where() {
     let q = parse_query("FROM t |> WHERE EXISTS (FROM u |> SELECT 1)").unwrap();
     assert_eq!(q.pipes.len(), 1);
 }
-

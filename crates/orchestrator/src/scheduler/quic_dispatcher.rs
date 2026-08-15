@@ -1,7 +1,7 @@
-use async_trait::async_trait;
-use crate::traits::TaskDispatcher;
-use common::identifiers::{QueryId, TaskId};
 use crate::executor::NodeInfo;
+use crate::traits::TaskDispatcher;
+use async_trait::async_trait;
+use common::identifiers::{QueryId, TaskId};
 use common::protocol::ExecuteTask;
 use error::VeinError;
 
@@ -18,9 +18,15 @@ impl QuicTaskDispatcher {
 
 #[async_trait]
 impl TaskDispatcher for QuicTaskDispatcher {
-    async fn dispatch(&self, _executor: &NodeInfo, _task: ExecuteTask) -> std::result::Result<(), VeinError> {
+    async fn dispatch(
+        &self,
+        _executor: &NodeInfo,
+        _task: ExecuteTask,
+    ) -> std::result::Result<(), VeinError> {
         // TODO: Actually open a QUIC stream to the Executor node and serialize the ExecuteTask
-        Err(VeinError::internal("QuicTaskDispatcher::dispatch is not yet implemented"))
+        Err(VeinError::internal(
+            "QuicTaskDispatcher::dispatch is not yet implemented",
+        ))
     }
 
     async fn wait_for_completion(

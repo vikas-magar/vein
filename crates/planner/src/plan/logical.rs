@@ -1,7 +1,7 @@
-use crate::schema::{ColumnId, ResolvedColumn, VeinSchema};
-use crate::expr::LogicalExpr;
-use parser::ast::query::SetOpKind;
 use super::types::SortKey;
+use crate::expr::LogicalExpr;
+use crate::schema::{ColumnId, ResolvedColumn, VeinSchema};
+use parser::ast::query::SetOpKind;
 
 /// A node in the logical query plan tree
 #[derive(Debug, Clone, PartialEq)]

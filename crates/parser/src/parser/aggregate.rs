@@ -88,7 +88,7 @@ mod tests {
 
     fn parse_aggregate(input: &str) -> PipeOperator {
         let mut parser = Parser::new(input);
-        parser.parse_pipe_aggregate().unwrap()
+        parser.parse_pipe_aggregate().expect("test should succeed")
     }
 
     #[test]

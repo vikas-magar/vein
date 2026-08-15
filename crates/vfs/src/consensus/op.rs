@@ -12,7 +12,11 @@ use crate::VfsError;
 pub enum ConsensusOp {
     /// Append (or create) an extent at `offset` of `length` bytes within the
     /// file at `path`.
-    AppendExtent { path: String, offset: u64, length: u64 },
+    AppendExtent {
+        path: String,
+        offset: u64,
+        length: u64,
+    },
     /// Delete all extents for the file at `path`.
     DeleteFile { path: String },
 }
@@ -54,7 +58,9 @@ mod tests {
 
     #[test]
     fn round_trip_delete_file() {
-        let op = ConsensusOp::DeleteFile { path: "/data/old_file".to_string() };
+        let op = ConsensusOp::DeleteFile {
+            path: "/data/old_file".to_string(),
+        };
         let bytes = op.serialize().expect("serialize should not fail");
         let decoded = ConsensusOp::deserialize(&bytes).expect("deserialize should not fail");
         assert_eq!(op, decoded);

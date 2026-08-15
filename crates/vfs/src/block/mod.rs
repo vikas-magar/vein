@@ -10,8 +10,8 @@ pub trait BlockManager: Send + Sync {
     where
         Self: Sized;
 
-    /// Appends data to the virtual memory array. 
-    /// Returns a list of Extents. If the data crossed a block boundary, 
+    /// Appends data to the virtual memory array.
+    /// Returns a list of Extents. If the data crossed a block boundary,
     /// multiple extents will be returned seamlessly.
     async fn append(&self, data: &[u8]) -> Result<Vec<Extent>>;
 

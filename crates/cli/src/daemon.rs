@@ -1,7 +1,7 @@
+use crate::engine::QueryEngine;
 use common::Result;
 use s2n_quic::Server;
 use std::sync::Arc;
-use crate::engine::QueryEngine;
 
 /// The Master Daemon loop.
 /// It listens for incoming QUIC connections from clients, extracts the SQL query string,
@@ -23,7 +23,7 @@ impl MasterDaemon {
             .map_err(|e| error::VeinError::internal(e.to_string()))?
             .start()
             .map_err(|e| error::VeinError::internal(e.to_string()))?;
-            
+
         tracing::info!("Master QUIC Server listening for queries on {}", bind_addr);
 
         // Infinite event loop accepting connections
@@ -40,11 +40,11 @@ impl MasterDaemon {
                             let bytes_chunk: bytes::Bytes = chunk;
                             buf.extend_from_slice(&bytes_chunk);
                         }
-                        
+
                         // 2. Dispatch to the completely abstracted QueryEngine
                         if let Ok(query_string) = String::from_utf8(buf) {
                             tracing::info!("Received query: {}", query_string);
-                            
+
                             let mut parser = parser::Parser::new(&query_string);
                             match parser.parse_query() {
                                 Ok(query_ast) => {
@@ -52,21 +52,36 @@ impl MasterDaemon {
                                         Ok(result_bytes) => {
                                             // 3. Stream Arrow IPC result back to the client
                                             if let Err(err) = stream.send(result_bytes).await {
-                                                tracing::warn!("Failed to send query result to client: {}", err);
+                                                tracing::warn!(
+                                                    "Failed to send query result to client: {}",
+                                                    err
+                                                );
                                             }
                                         }
                                         Err(e) => {
                                             tracing::error!("Query failed: {}", e);
-                                            if let Err(err) = stream.send(bytes::Bytes::from(format!("ERROR: {}", e))).await {
-                                                tracing::warn!("Failed to send query error payload to client: {}", err);
+                                            if let Err(err) = stream
+                                                .send(bytes::Bytes::from(format!("ERROR: {}", e)))
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    "Failed to send query error payload to client: {}",
+                                                    err
+                                                );
                                             }
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     tracing::error!("Parse failed: {:?}", e);
-                                    if let Err(err) = stream.send(bytes::Bytes::from(format!("PARSE ERROR: {:?}", e))).await {
-                                        tracing::warn!("Failed to send parse error payload to client: {}", err);
+                                    if let Err(err) = stream
+                                        .send(bytes::Bytes::from(format!("PARSE ERROR: {:?}", e)))
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to send parse error payload to client: {}",
+                                            err
+                                        );
                                     }
                                 }
                             }

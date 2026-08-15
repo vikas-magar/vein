@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use error::Result;
 use crate::plan::LogicalPlan;
+use error::Result;
+use std::collections::HashMap;
 
 /// Statistical metadata for a column.
 #[derive(Debug, Clone, Default)]
@@ -27,8 +27,8 @@ pub struct Statistics {
 }
 
 /// A trait for models that predict the execution cost of a LogicalPlan.
-/// 
-/// This is heavily abstracted so that we can eventually plug in Machine Learning 
+///
+/// This is heavily abstracted so that we can eventually plug in Machine Learning
 /// (ML) models or Reinforcement Learning models that learn costs based on historical telemetry.
 pub trait CostModel: Send + Sync {
     /// Predicts the computational cost (e.g. CPU, I/O, memory) of a specific LogicalPlan node.

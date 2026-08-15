@@ -1,12 +1,12 @@
 //! Peer connection pool for Archipelago consensus.
 
-use common::transport::{build_quic_client, ConnectionManager, QuicClient};
+use common::transport::{ConnectionManager, QuicClient, build_quic_client};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::VfsError;
 use crate::consensus::archipelago::ProposalId;
 use crate::consensus::op::ConsensusOp;
 use crate::topology::crush::Node;
-use crate::VfsError;
 
 /// Outcome of a consensus vote request.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -54,10 +54,9 @@ impl PeerPool {
             .client
             .as_ref()
             .ok_or_else(|| VfsError::Internal("QuicClient not initialized".to_string()))?;
-        let mut stream = client
-            .open_stream(&node.addr())
-            .await
-            .map_err(|e| VfsError::Internal(format!("Failed to open stream to {}: {}", node.addr(), e)))?;
+        let mut stream = client.open_stream(&node.addr()).await.map_err(|e| {
+            VfsError::Internal(format!("Failed to open stream to {}: {}", node.addr(), e))
+        })?;
 
         // Send opcode 0x10
         stream
@@ -108,7 +107,10 @@ impl PeerPool {
         match status {
             0x00 => Ok(VoteReply::Accept),
             0x01 => Ok(VoteReply::Reject),
-            _ => Err(VfsError::Internal(format!("Unknown reply status: {}", status))),
+            _ => Err(VfsError::Internal(format!(
+                "Unknown reply status: {}",
+                status
+            ))),
         }
     }
 }
@@ -137,4 +139,3 @@ mod tests {
         assert_eq!(deserialized, VoteReply::Accept);
     }
 }
-

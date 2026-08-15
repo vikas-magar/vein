@@ -1,8 +1,8 @@
-use std::any::Any;
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use error::{Result, VeinError};
+use std::any::Any;
 
 use super::PhysicalExpr;
 
@@ -69,24 +69,22 @@ mod tests {
         ]));
         let array1 = Arc::new(Int64Array::from(vec![1, 2, 3]));
         let array2 = Arc::new(StringArray::from(vec!["x", "y", "z"]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![array1 as ArrayRef, array2 as ArrayRef],
-        ).unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![array1 as ArrayRef, array2 as ArrayRef])
+                .unwrap();
 
         let expr = ColumnExpr::new("b", 1);
-        
+
         // Test data_type
         assert_eq!(expr.data_type(&schema).unwrap(), DataType::Utf8);
-        
+
         // Test evaluate
         let result = expr.evaluate(&batch).unwrap();
         assert_eq!(result.data_type(), &DataType::Utf8);
         assert_eq!(result.len(), 3);
-        
+
         let result_str = result.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(result_str.value(0), "x");
         assert_eq!(result_str.value(2), "z");
     }
 }
-

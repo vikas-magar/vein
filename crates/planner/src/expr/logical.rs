@@ -1,7 +1,7 @@
-use crate::schema::{ResolvedColumn, VeinDataType};
-use crate::plan::LogicalPlan;
-use parser::ast::expr::BinaryOp;
 use crate::expr::literal::LogicalLiteral;
+use crate::plan::LogicalPlan;
+use crate::schema::{ResolvedColumn, VeinDataType};
+use parser::ast::expr::BinaryOp;
 
 /// A node in the logical expression tree
 #[derive(Debug, Clone, PartialEq)]
@@ -36,24 +36,24 @@ pub enum LogicalExpr {
 
     // ── Unary ─────────────────────────────────────────────
     /// Logical NOT
-    Not { 
-        /// The expression to negate 
-        expr: Box<LogicalExpr> 
+    Not {
+        /// The expression to negate
+        expr: Box<LogicalExpr>,
     },
     /// Mathematical negation
-    Negate { 
+    Negate {
         /// The expression to negate
-        expr: Box<LogicalExpr> 
+        expr: Box<LogicalExpr>,
     },
     /// IS NULL check
-    IsNull { 
+    IsNull {
         /// The expression to check
-        expr: Box<LogicalExpr> 
+        expr: Box<LogicalExpr>,
     },
     /// IS NOT NULL check
-    IsNotNull { 
+    IsNotNull {
         /// The expression to check
-        expr: Box<LogicalExpr> 
+        expr: Box<LogicalExpr>,
     },
 
     // ── Structured ────────────────────────────────────────
@@ -163,17 +163,26 @@ impl LogicalExpr {
     /// Returns a list of child expressions for traversal
     pub fn children(&self) -> Vec<&LogicalExpr> {
         match self {
-            LogicalExpr::Column(_) | LogicalExpr::OuterColumn(_) | LogicalExpr::Literal(_) | LogicalExpr::ScalarSubquery(_) | LogicalExpr::Exists { .. } => vec![],
+            LogicalExpr::Column(_)
+            | LogicalExpr::OuterColumn(_)
+            | LogicalExpr::Literal(_)
+            | LogicalExpr::ScalarSubquery(_)
+            | LogicalExpr::Exists { .. } => vec![],
             LogicalExpr::BinaryOp { left, right, .. } => vec![left.as_ref(), right.as_ref()],
             LogicalExpr::Cast { expr, .. } => vec![expr.as_ref()],
-            LogicalExpr::Not { expr } | LogicalExpr::Negate { expr } | LogicalExpr::IsNull { expr } | LogicalExpr::IsNotNull { expr } => vec![expr.as_ref()],
+            LogicalExpr::Not { expr }
+            | LogicalExpr::Negate { expr }
+            | LogicalExpr::IsNull { expr }
+            | LogicalExpr::IsNotNull { expr } => vec![expr.as_ref()],
             LogicalExpr::InList { expr, list, .. } => {
                 let mut v = vec![expr.as_ref()];
                 v.extend(list.iter());
                 v
             }
             LogicalExpr::Like { expr, pattern, .. } => vec![expr.as_ref(), pattern.as_ref()],
-            LogicalExpr::Case { when, then, else_, .. } => {
+            LogicalExpr::Case {
+                when, then, else_, ..
+            } => {
                 let mut v = Vec::new();
                 v.extend(when.iter());
                 v.extend(then.iter());
@@ -182,9 +191,11 @@ impl LogicalExpr {
                 }
                 v
             }
-            LogicalExpr::FunctionCall { args, .. } | LogicalExpr::AiOperator { args, .. } | LogicalExpr::WasmUdf { args, .. } | LogicalExpr::EbpfUdf { args, .. } | LogicalExpr::PythonUdf { args, .. } => {
-                args.iter().collect()
-            }
+            LogicalExpr::FunctionCall { args, .. }
+            | LogicalExpr::AiOperator { args, .. }
+            | LogicalExpr::WasmUdf { args, .. }
+            | LogicalExpr::EbpfUdf { args, .. }
+            | LogicalExpr::PythonUdf { args, .. } => args.iter().collect(),
             LogicalExpr::Lambda { body, .. } => vec![body.as_ref()],
         }
     }
@@ -195,61 +206,174 @@ impl LogicalExpr {
         F: FnMut(LogicalExpr) -> Result<LogicalExpr, error::VeinError>,
     {
         match self.clone() {
-            LogicalExpr::Column(_) | LogicalExpr::OuterColumn(_) | LogicalExpr::Literal(_) | LogicalExpr::ScalarSubquery(_) | LogicalExpr::Exists { .. } => Ok(self.clone()),
-            LogicalExpr::BinaryOp { left, op, right, return_type } => Ok(LogicalExpr::BinaryOp { left: Box::new(f(*left)?), op, right: Box::new(f(*right)?), return_type }),
-            LogicalExpr::Cast { expr, target_type } => Ok(LogicalExpr::Cast { expr: Box::new(f(*expr)?), target_type }),
-            LogicalExpr::Not { expr } => Ok(LogicalExpr::Not { expr: Box::new(f(*expr)?) }),
-            LogicalExpr::Negate { expr } => Ok(LogicalExpr::Negate { expr: Box::new(f(*expr)?) }),
-            LogicalExpr::IsNull { expr } => Ok(LogicalExpr::IsNull { expr: Box::new(f(*expr)?) }),
-            LogicalExpr::IsNotNull { expr } => Ok(LogicalExpr::IsNotNull { expr: Box::new(f(*expr)?) }),
-            LogicalExpr::InList { expr, list, negated } => {
+            LogicalExpr::Column(_)
+            | LogicalExpr::OuterColumn(_)
+            | LogicalExpr::Literal(_)
+            | LogicalExpr::ScalarSubquery(_)
+            | LogicalExpr::Exists { .. } => Ok(self.clone()),
+            LogicalExpr::BinaryOp {
+                left,
+                op,
+                right,
+                return_type,
+            } => Ok(LogicalExpr::BinaryOp {
+                left: Box::new(f(*left)?),
+                op,
+                right: Box::new(f(*right)?),
+                return_type,
+            }),
+            LogicalExpr::Cast { expr, target_type } => Ok(LogicalExpr::Cast {
+                expr: Box::new(f(*expr)?),
+                target_type,
+            }),
+            LogicalExpr::Not { expr } => Ok(LogicalExpr::Not {
+                expr: Box::new(f(*expr)?),
+            }),
+            LogicalExpr::Negate { expr } => Ok(LogicalExpr::Negate {
+                expr: Box::new(f(*expr)?),
+            }),
+            LogicalExpr::IsNull { expr } => Ok(LogicalExpr::IsNull {
+                expr: Box::new(f(*expr)?),
+            }),
+            LogicalExpr::IsNotNull { expr } => Ok(LogicalExpr::IsNotNull {
+                expr: Box::new(f(*expr)?),
+            }),
+            LogicalExpr::InList {
+                expr,
+                list,
+                negated,
+            } => {
                 let new_expr = Box::new(f(*expr)?);
                 let mut new_list = Vec::with_capacity(list.len());
                 for item in list {
                     new_list.push(f(item)?);
                 }
-                Ok(LogicalExpr::InList { expr: new_expr, list: new_list, negated })
+                Ok(LogicalExpr::InList {
+                    expr: new_expr,
+                    list: new_list,
+                    negated,
+                })
             }
-            LogicalExpr::Like { expr, pattern, negated } => Ok(LogicalExpr::Like { expr: Box::new(f(*expr)?), pattern: Box::new(f(*pattern)?), negated }),
-            LogicalExpr::Case { when, then, else_, return_type } => {
+            LogicalExpr::Like {
+                expr,
+                pattern,
+                negated,
+            } => Ok(LogicalExpr::Like {
+                expr: Box::new(f(*expr)?),
+                pattern: Box::new(f(*pattern)?),
+                negated,
+            }),
+            LogicalExpr::Case {
+                when,
+                then,
+                else_,
+                return_type,
+            } => {
                 let mut new_when = Vec::with_capacity(when.len());
-                for w in when { new_when.push(f(w)?); }
+                for w in when {
+                    new_when.push(f(w)?);
+                }
                 let mut new_then = Vec::with_capacity(then.len());
-                for t in then { new_then.push(f(t)?); }
+                for t in then {
+                    new_then.push(f(t)?);
+                }
                 let new_else = match else_ {
                     Some(e) => Some(Box::new(f(*e)?)),
                     None => None,
                 };
-                Ok(LogicalExpr::Case { when: new_when, then: new_then, else_: new_else, return_type })
+                Ok(LogicalExpr::Case {
+                    when: new_when,
+                    then: new_then,
+                    else_: new_else,
+                    return_type,
+                })
             }
-            LogicalExpr::FunctionCall { name, args, is_aggregate, return_type } => {
+            LogicalExpr::FunctionCall {
+                name,
+                args,
+                is_aggregate,
+                return_type,
+            } => {
                 let mut new_args = Vec::with_capacity(args.len());
-                for a in args { new_args.push(f(a)?); }
-                Ok(LogicalExpr::FunctionCall { name, args: new_args, is_aggregate, return_type })
+                for a in args {
+                    new_args.push(f(a)?);
+                }
+                Ok(LogicalExpr::FunctionCall {
+                    name,
+                    args: new_args,
+                    is_aggregate,
+                    return_type,
+                })
             }
-            LogicalExpr::AiOperator { name, args, return_type } => {
+            LogicalExpr::AiOperator {
+                name,
+                args,
+                return_type,
+            } => {
                 let mut new_args = Vec::with_capacity(args.len());
-                for a in args { new_args.push(f(a)?); }
-                Ok(LogicalExpr::AiOperator { name, args: new_args, return_type })
+                for a in args {
+                    new_args.push(f(a)?);
+                }
+                Ok(LogicalExpr::AiOperator {
+                    name,
+                    args: new_args,
+                    return_type,
+                })
             }
-            LogicalExpr::WasmUdf { bytecode_ref, args, return_type } => {
+            LogicalExpr::WasmUdf {
+                bytecode_ref,
+                args,
+                return_type,
+            } => {
                 let mut new_args = Vec::with_capacity(args.len());
-                for a in args { new_args.push(f(a)?); }
-                Ok(LogicalExpr::WasmUdf { bytecode_ref, args: new_args, return_type })
+                for a in args {
+                    new_args.push(f(a)?);
+                }
+                Ok(LogicalExpr::WasmUdf {
+                    bytecode_ref,
+                    args: new_args,
+                    return_type,
+                })
             }
-            LogicalExpr::EbpfUdf { bytecode_ref, args, return_type } => {
+            LogicalExpr::EbpfUdf {
+                bytecode_ref,
+                args,
+                return_type,
+            } => {
                 let mut new_args = Vec::with_capacity(args.len());
-                for a in args { new_args.push(f(a)?); }
-                Ok(LogicalExpr::EbpfUdf { bytecode_ref, args: new_args, return_type })
+                for a in args {
+                    new_args.push(f(a)?);
+                }
+                Ok(LogicalExpr::EbpfUdf {
+                    bytecode_ref,
+                    args: new_args,
+                    return_type,
+                })
             }
-            LogicalExpr::PythonUdf { bytecode_ref, args, return_type } => {
+            LogicalExpr::PythonUdf {
+                bytecode_ref,
+                args,
+                return_type,
+            } => {
                 let mut new_args = Vec::with_capacity(args.len());
-                for a in args { new_args.push(f(a)?); }
-                Ok(LogicalExpr::PythonUdf { bytecode_ref, args: new_args, return_type })
+                for a in args {
+                    new_args.push(f(a)?);
+                }
+                Ok(LogicalExpr::PythonUdf {
+                    bytecode_ref,
+                    args: new_args,
+                    return_type,
+                })
             }
-            LogicalExpr::Lambda { params, body, captures } => {
-                Ok(LogicalExpr::Lambda { params, body: Box::new(f(*body)?), captures })
-            }
+            LogicalExpr::Lambda {
+                params,
+                body,
+                captures,
+            } => Ok(LogicalExpr::Lambda {
+                params,
+                body: Box::new(f(*body)?),
+                captures,
+            }),
         }
     }
 
@@ -267,7 +391,9 @@ impl LogicalExpr {
     /// Checks if the expression can be pushed down to eBPF execution
     pub fn is_ebpf_safe(&self) -> bool {
         match self {
-            LogicalExpr::PythonUdf { .. } | LogicalExpr::AiOperator { .. } | LogicalExpr::WasmUdf { .. } => false,
+            LogicalExpr::PythonUdf { .. }
+            | LogicalExpr::AiOperator { .. }
+            | LogicalExpr::WasmUdf { .. } => false,
             LogicalExpr::ScalarSubquery(_) | LogicalExpr::Exists { .. } => false,
             _ => self.children().iter().all(|c| c.is_ebpf_safe()),
         }

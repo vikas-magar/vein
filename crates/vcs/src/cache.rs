@@ -49,7 +49,10 @@ impl TableCache {
 
         // Cache miss — fetch from Iceberg catalog (reads metadata.json from disk/S3)
         tracing::debug!(?ident, "table cache miss, loading from catalog");
-        let table = catalog.load_table(ident).await.map_err(VeinError::Iceberg)?;
+        let table = catalog
+            .load_table(ident)
+            .await
+            .map_err(VeinError::Iceberg)?;
         let table = Arc::new(table);
 
         self.inner.insert(ident.clone(), Arc::clone(&table)).await;

@@ -14,11 +14,8 @@ pub mod system;
 #[cfg(target_os = "linux")]
 pub mod xdp;
 
-
 /// Inter-node protocol types.
 pub mod protocol;
-
-
 
 /// Partition set for shuffle stage routing.
 pub mod partition;

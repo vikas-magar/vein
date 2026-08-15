@@ -17,12 +17,17 @@ impl EbpfLoader {
     /// For this prototype, simulates the load by validating the ELF magic bytes.
     pub fn load_filter(&mut self, filter_id: String, bytecode: &[u8]) -> Result<()> {
         if bytecode.len() < 4 {
-            return Err(error::VeinError::internal("Bytecode too short to be valid ELF"));
+            return Err(error::VeinError::internal(
+                "Bytecode too short to be valid ELF",
+            ));
         }
-        
+
         // Validate ELF magic bytes (0x7F 'E' 'L' 'F')
-        if bytecode[0] != 0x7f || bytecode[1] != 0x45 || bytecode[2] != 0x4c || bytecode[3] != 0x46 {
-            return Err(error::VeinError::internal("Invalid eBPF ELF bytecode format"));
+        if bytecode[0] != 0x7f || bytecode[1] != 0x45 || bytecode[2] != 0x4c || bytecode[3] != 0x46
+        {
+            return Err(error::VeinError::internal(
+                "Invalid eBPF ELF bytecode format",
+            ));
         }
 
         // Simulate successful load into kernel by tracking it
@@ -45,7 +50,11 @@ mod tests {
     fn test_load_filter_success() {
         let mut loader = EbpfLoader::new();
         let valid_elf = vec![0x7f, 0x45, 0x4c, 0x46, 0x01, 0x02];
-        assert!(loader.load_filter("test_filter".to_string(), &valid_elf).is_ok());
+        assert!(
+            loader
+                .load_filter("test_filter".to_string(), &valid_elf)
+                .is_ok()
+        );
         assert_eq!(loader.active_programs.get("test_filter"), Some(&6));
     }
 

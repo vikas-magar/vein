@@ -1,6 +1,6 @@
+use crate::config::HashAlgo;
 use crate::metadata::{Extent, MetadataEngine};
 use crate::{Result, VfsConfig, VfsError};
-use crate::config::HashAlgo;
 use async_trait::async_trait;
 use redb::{Database, ReadableTable, TableDefinition, TableHandle};
 
@@ -94,10 +94,9 @@ pub(crate) fn compound_key(path: &str, offset: u64, algo: &HashAlgo) -> Vec<u8> 
     }
 }
 
-
-
 const EXTENTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vfs_extents_v2");
-const CONSENSUS_TABLE: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("consensus_proposals");
+const CONSENSUS_TABLE: TableDefinition<[u8; 16], &[u8]> =
+    TableDefinition::new("consensus_proposals");
 const SEQUENCE_TABLE: TableDefinition<&str, u64> = TableDefinition::new("sequence_counters");
 
 /// Implementation of the MetadataEngine using `redb` for zero-copy, transactional storage.
@@ -112,7 +111,8 @@ impl MetadataEngine for RedbMetadataEngine {
         let db = Database::create(&config.metadata_db_path)
             .map_err(|e| VfsError::Metadata(format!("Failed to create redb: {e}")))?;
 
-        let write_txn = db.begin_write()
+        let write_txn = db
+            .begin_write()
             .map_err(|e| VfsError::Metadata(format!("Write txn failed: {e}")))?;
         {
             // Migration
@@ -126,40 +126,57 @@ impl MetadataEngine for RedbMetadataEngine {
                     }
                 }
             }
-            
+
             if table_exists {
                 let old_table_def = TableDefinition::<&str, &[u8]>::new(old_table_name);
-                let mut v2_table = write_txn.open_table(EXTENTS_TABLE)
+                let mut v2_table = write_txn
+                    .open_table(EXTENTS_TABLE)
                     .map_err(|e| VfsError::Metadata(format!("Table creation failed: {e}")))?;
-                let old_table = write_txn.open_table(old_table_def)
+                let old_table = write_txn
+                    .open_table(old_table_def)
                     .map_err(|e| VfsError::Metadata(e.to_string()))?;
-                let range = old_table.range::<&str>(..).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let range = old_table
+                    .range::<&str>(..)
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
                 for item in range {
                     let (k, v) = item.map_err(|e| VfsError::Metadata(e.to_string()))?;
                     let path = k.value();
-                    let extents: Vec<Extent> = bincode::deserialize(v.value()).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                    let extents: Vec<Extent> = bincode::deserialize(v.value())
+                        .map_err(|e| VfsError::Metadata(e.to_string()))?;
                     for ext in extents {
                         let new_key = compound_key(path, ext.offset, &config.metadata_hash_algo);
-                        let serialized = bincode::serialize(&ext).map_err(|e| VfsError::Metadata(e.to_string()))?;
-                        v2_table.insert(new_key.as_slice(), serialized.as_slice()).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                        let serialized = bincode::serialize(&ext)
+                            .map_err(|e| VfsError::Metadata(e.to_string()))?;
+                        v2_table
+                            .insert(new_key.as_slice(), serialized.as_slice())
+                            .map_err(|e| VfsError::Metadata(e.to_string()))?;
                     }
                 }
                 drop(old_table);
-                write_txn.delete_table(old_table_def).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                write_txn
+                    .delete_table(old_table_def)
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
             } else {
-                write_txn.open_table(EXTENTS_TABLE)
+                write_txn
+                    .open_table(EXTENTS_TABLE)
                     .map_err(|e| VfsError::Metadata(format!("Table creation failed: {e}")))?;
             }
 
-            write_txn.open_table(CONSENSUS_TABLE)
+            write_txn
+                .open_table(CONSENSUS_TABLE)
                 .map_err(|e| VfsError::Metadata(format!("Consensus table creation failed: {e}")))?;
-            write_txn.open_table(SEQUENCE_TABLE)
+            write_txn
+                .open_table(SEQUENCE_TABLE)
                 .map_err(|e| VfsError::Metadata(format!("Sequence table creation failed: {e}")))?;
         }
-        write_txn.commit()
+        write_txn
+            .commit()
             .map_err(|e| VfsError::Metadata(format!("Commit failed: {e}")))?;
 
-        Ok(Self { db: std::sync::Arc::new(db), hash_algo: config.metadata_hash_algo.clone() })
+        Ok(Self {
+            db: std::sync::Arc::new(db),
+            hash_algo: config.metadata_hash_algo.clone(),
+        })
     }
 
     async fn append_extent(&self, path: &str, extent: Extent) -> Result<()> {
@@ -168,14 +185,23 @@ impl MetadataEngine for RedbMetadataEngine {
         let hash_algo = self.hash_algo.clone();
 
         tokio::task::spawn_blocking(move || {
-            let write_txn = db.begin_write().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let write_txn = db
+                .begin_write()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
             {
-                let mut table = write_txn.open_table(EXTENTS_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let mut table = write_txn
+                    .open_table(EXTENTS_TABLE)
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
                 let key = compound_key(&path, extent.offset, &hash_algo);
-                let serialized = bincode::serialize(&extent).map_err(|e| VfsError::Metadata(e.to_string()))?;
-                table.insert(key.as_slice(), serialized.as_slice()).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let serialized =
+                    bincode::serialize(&extent).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                table
+                    .insert(key.as_slice(), serialized.as_slice())
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
             }
-            write_txn.commit().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            write_txn
+                .commit()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
             Ok(())
         })
         .await
@@ -188,17 +214,24 @@ impl MetadataEngine for RedbMetadataEngine {
         let hash_algo = self.hash_algo.clone();
 
         tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read().map_err(|e| VfsError::Metadata(e.to_string()))?;
-            let table = read_txn.open_table(EXTENTS_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
-            
+            let read_txn = db
+                .begin_read()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let table = read_txn
+                .open_table(EXTENTS_TABLE)
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
+
             let start_key = compound_key(&path, 0, &hash_algo);
             let end_key = compound_key(&path, u64::MAX, &hash_algo);
 
             let mut extents = Vec::new();
-            let range = table.range::<&[u8]>(start_key.as_slice()..=end_key.as_slice()).map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let range = table
+                .range::<&[u8]>(start_key.as_slice()..=end_key.as_slice())
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
             for item in range {
                 let (_, value) = item.map_err(|e| VfsError::Metadata(e.to_string()))?;
-                let ext: Extent = bincode::deserialize(value.value()).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let ext: Extent = bincode::deserialize(value.value())
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
                 extents.push(ext);
             }
 
@@ -217,44 +250,67 @@ impl MetadataEngine for RedbMetadataEngine {
         let hash_algo = self.hash_algo.clone();
 
         tokio::task::spawn_blocking(move || {
-            let write_txn = db.begin_write().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let write_txn = db
+                .begin_write()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
             {
-                let mut table = write_txn.open_table(EXTENTS_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let mut table = write_txn
+                    .open_table(EXTENTS_TABLE)
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
                 let start_key = compound_key(&path, 0, &hash_algo);
                 let end_key = compound_key(&path, u64::MAX, &hash_algo);
 
                 let mut keys_to_delete = Vec::new();
-                let range = table.range::<&[u8]>(start_key.as_slice()..=end_key.as_slice()).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let range = table
+                    .range::<&[u8]>(start_key.as_slice()..=end_key.as_slice())
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
                 for item in range {
                     let (key, _) = item.map_err(|e| VfsError::Metadata(e.to_string()))?;
                     keys_to_delete.push(key.value().to_vec());
                 }
 
                 for key in keys_to_delete {
-                    table.remove(key.as_slice()).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                    table
+                        .remove(key.as_slice())
+                        .map_err(|e| VfsError::Metadata(e.to_string()))?;
                 }
             }
-            write_txn.commit().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            write_txn
+                .commit()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
             Ok(())
         })
         .await
         .map_err(|e| VfsError::Internal(format!("Tokio spawn blocking failed: {}", e)))?
     }
 
-    async fn persist_proposal(&self, pid_bytes: [u8; 16], status: u8, op_bytes: &[u8]) -> Result<()> {
+    async fn persist_proposal(
+        &self,
+        pid_bytes: [u8; 16],
+        status: u8,
+        op_bytes: &[u8],
+    ) -> Result<()> {
         let db = self.db.clone();
         let op_bytes = op_bytes.to_vec();
 
         tokio::task::spawn_blocking(move || {
-            let write_txn = db.begin_write().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let write_txn = db
+                .begin_write()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
             {
-                let mut table = write_txn.open_table(CONSENSUS_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let mut table = write_txn
+                    .open_table(CONSENSUS_TABLE)
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
                 let mut val = Vec::with_capacity(1 + op_bytes.len());
                 val.push(status);
                 val.extend_from_slice(&op_bytes);
-                table.insert(pid_bytes, val.as_slice()).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                table
+                    .insert(pid_bytes, val.as_slice())
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
             }
-            write_txn.commit().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            write_txn
+                .commit()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
             Ok(())
         })
         .await
@@ -265,11 +321,17 @@ impl MetadataEngine for RedbMetadataEngine {
         let db = self.db.clone();
 
         tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read().map_err(|e| VfsError::Metadata(e.to_string()))?;
-            let table = read_txn.open_table(CONSENSUS_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let read_txn = db
+                .begin_read()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let table = read_txn
+                .open_table(CONSENSUS_TABLE)
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
 
             let mut entries = Vec::new();
-            let range = table.range::<[u8; 16]>(..).map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let range = table
+                .range::<[u8; 16]>(..)
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
             for item in range {
                 let (key, value) = item.map_err(|e| VfsError::Metadata(e.to_string()))?;
                 let pid_bytes: [u8; 16] = key.value();
@@ -291,9 +353,16 @@ impl MetadataEngine for RedbMetadataEngine {
         let db = self.db.clone();
 
         tokio::task::spawn_blocking(move || {
-            let read_txn = db.begin_read().map_err(|e| VfsError::Metadata(e.to_string()))?;
-            let table = read_txn.open_table(SEQUENCE_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
-            if let Some(access) = table.get("archipelago_seq").map_err(|e| VfsError::Metadata(e.to_string()))? {
+            let read_txn = db
+                .begin_read()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let table = read_txn
+                .open_table(SEQUENCE_TABLE)
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
+            if let Some(access) = table
+                .get("archipelago_seq")
+                .map_err(|e| VfsError::Metadata(e.to_string()))?
+            {
                 Ok(access.value())
             } else {
                 Ok(1)
@@ -307,12 +376,20 @@ impl MetadataEngine for RedbMetadataEngine {
         let db = self.db.clone();
 
         tokio::task::spawn_blocking(move || {
-            let write_txn = db.begin_write().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            let write_txn = db
+                .begin_write()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
             {
-                let mut table = write_txn.open_table(SEQUENCE_TABLE).map_err(|e| VfsError::Metadata(e.to_string()))?;
-                table.insert("archipelago_seq", seq).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                let mut table = write_txn
+                    .open_table(SEQUENCE_TABLE)
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
+                table
+                    .insert("archipelago_seq", seq)
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
             }
-            write_txn.commit().map_err(|e| VfsError::Metadata(e.to_string()))?;
+            write_txn
+                .commit()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
             Ok(())
         })
         .await
@@ -323,8 +400,8 @@ impl MetadataEngine for RedbMetadataEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::{Extent, MetadataEngine};
     use crate::VfsConfig;
+    use crate::metadata::{Extent, MetadataEngine};
 
     #[tokio::test]
     async fn test_table_initialization() {
@@ -354,8 +431,6 @@ mod tests {
         assert_eq!(&key1[8..16], &4096u64.to_be_bytes());
     }
 
-
-
     #[tokio::test]
     async fn test_append_extent_o1() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -371,7 +446,10 @@ mod tests {
             length: 1024,
             node_ip: "127.0.0.1".into(),
         };
-        engine.append_extent("/data.parquet", extent.clone()).await.unwrap();
+        engine
+            .append_extent("/data.parquet", extent.clone())
+            .await
+            .unwrap();
 
         let read_txn = engine.db.begin_read().unwrap();
         let table = read_txn.open_table(EXTENTS_TABLE).unwrap();
@@ -401,7 +479,10 @@ mod tests {
         // Write extent in session 1
         {
             let engine = RedbMetadataEngine::init(&config).await.unwrap();
-            engine.append_extent("/test/file.dat", extent.clone()).await.unwrap();
+            engine
+                .append_extent("/test/file.dat", extent.clone())
+                .await
+                .unwrap();
             let read_txn = engine.db.begin_read().unwrap();
             let table = read_txn.open_table(EXTENTS_TABLE).unwrap();
             let key = compound_key("/test/file.dat", extent.offset, &engine.hash_algo);
@@ -444,8 +525,14 @@ mod tests {
             node_ip: "127.0.0.1".into(),
         };
 
-        engine.append_extent("/test.txt", ext2.clone()).await.unwrap();
-        engine.append_extent("/test.txt", ext1.clone()).await.unwrap();
+        engine
+            .append_extent("/test.txt", ext2.clone())
+            .await
+            .unwrap();
+        engine
+            .append_extent("/test.txt", ext1.clone())
+            .await
+            .unwrap();
         let extents = engine.get_file("/test.txt").await.unwrap();
         assert_eq!(extents.len(), 2);
         assert_eq!(extents[1].length, 512);
@@ -499,7 +586,11 @@ mod tests {
         {
             let engine2 = RedbMetadataEngine::init(&config).await.unwrap();
             let loaded_seq = engine2.load_sequence().await.unwrap();
-            assert!(loaded_seq >= 42, "loaded_seq {} should be >= 42", loaded_seq);
+            assert!(
+                loaded_seq >= 42,
+                "loaded_seq {} should be >= 42",
+                loaded_seq
+            );
             assert_eq!(loaded_seq, 42);
         }
     }

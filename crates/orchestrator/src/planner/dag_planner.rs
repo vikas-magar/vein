@@ -1,7 +1,7 @@
-use common::Result;
-use crate::traits::PhysicalPlanner;
-use planner::plan::LogicalPlan;
 use crate::planner::dag::StageDag;
+use crate::traits::PhysicalPlanner;
+use common::Result;
+use planner::plan::LogicalPlan;
 
 /// The DAG Physical Planner.
 /// Responsible for lowering the optimized logical plan into a highly parallel `StageDag`
@@ -18,6 +18,8 @@ impl DagPhysicalPlanner {
 impl PhysicalPlanner for DagPhysicalPlanner {
     fn create_physical_plan(&self, _logical_plan: LogicalPlan) -> Result<StageDag> {
         // TODO: Implement translation from LogicalPlan to StageDag
-        Err(error::VeinError::internal("DagPhysicalPlanner::create_physical_plan is not yet implemented"))
+        Err(error::VeinError::internal(
+            "DagPhysicalPlanner::create_physical_plan is not yet implemented",
+        ))
     }
 }

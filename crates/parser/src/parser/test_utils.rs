@@ -11,7 +11,11 @@ pub mod utils {
     use crate::token::{Span, SpannedToken, TokenKind};
 
     pub fn spanned<'a>(kind: TokenKind, text: &'a str) -> SpannedToken<'a> {
-        SpannedToken { kind, text, span: Span::default() }
+        SpannedToken {
+            kind,
+            text,
+            span: Span::default(),
+        }
     }
 
     pub fn parse_expr(input: &str) -> Result<crate::ast::expr::SpannedExpr<'_>, ParseError> {

@@ -1,18 +1,18 @@
-use std::sync::Arc;
-use vfs::VfsConfig;
-use vfs::block::{BlockManager, MmapBlockManager};
-use vfs::metadata::{MetadataEngine, RedbMetadataEngine};
-use vfs::ingest::buffer::IngestionBuffer;
-use vfs::rpc::router::RpcRouter;
-use vfs::topology::crush::{ClusterMap, Node};
 use common::transport::build_quic_client;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use vfs::VfsConfig;
+use vfs::block::{BlockManager, MmapBlockManager};
+use vfs::ingest::buffer::IngestionBuffer;
+use vfs::metadata::{MetadataEngine, RedbMetadataEngine};
+use vfs::rpc::router::RpcRouter;
+use vfs::topology::crush::{ClusterMap, Node};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    
+
     tracing::info!("Initializing VeinFS Integration Test...");
 
     // 1. Setup VfsConfig
@@ -40,8 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tokio::fs::remove_dir_all(&config.local_cache_dir).await;
     let _ = tokio::fs::remove_file(&config.metadata_db_path).await;
     let _ = tokio::fs::create_dir_all("/tmp/veinfs").await;
-    
-    
+
     // 2. Start VFS Node
     let metadata = Arc::new(RedbMetadataEngine::init(&config).await?);
     let block_manager = Arc::new(MmapBlockManager::init(&config).await?);
@@ -50,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         block_manager.clone(),
         metadata.clone(),
     ));
-    
+
     let mut cluster_map = ClusterMap::new();
     cluster_map.add_node(Node {
         id: "node1".to_string(),
@@ -63,23 +62,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let archipelago = Arc::new(tokio::sync::RwLock::new(
         vfs::consensus::archipelago::ArchipelagoState::new(1),
     ));
-    
-    let router = RpcRouter::new(ingestion, metadata, block_manager, cluster_map, local_node_id, archipelago, "/Users/anvi/Next/vein/cert.pem".to_string()).await?;
-    
+
+    let router = RpcRouter::new(
+        ingestion,
+        metadata,
+        block_manager,
+        cluster_map,
+        local_node_id,
+        archipelago,
+        "/Users/anvi/Next/vein/cert.pem".to_string(),
+    )
+    .await?;
+
     let bind_addr = "127.0.0.1:4000".to_string();
     let bind_addr_clone = bind_addr.clone();
-    
+
     tokio::spawn(async move {
-        router.start(&bind_addr_clone, "/Users/anvi/Next/vein/cert.pem", "/Users/anvi/Next/vein/key.pem").await.unwrap();
+        router
+            .start(
+                &bind_addr_clone,
+                "/Users/anvi/Next/vein/cert.pem",
+                "/Users/anvi/Next/vein/key.pem",
+            )
+            .await
+            .unwrap();
     });
-    
+
     // Wait for server to boot
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     // 3. Connect Client
     tracing::info!("Connecting QUIC client to {}", bind_addr);
     let client = build_quic_client("/Users/anvi/Next/vein/cert.pem")?;
-    let connect_opts = s2n_quic::client::Connect::new(bind_addr.parse::<std::net::SocketAddr>()?).with_server_name("localhost");
+    let connect_opts = s2n_quic::client::Connect::new(bind_addr.parse::<std::net::SocketAddr>()?)
+        .with_server_name("localhost");
     let mut connection = client.connect(connect_opts).await?;
     connection.keep_alive(true)?;
 
@@ -96,17 +112,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.write_u8(1).await?; // Opcode 1: Push
     stream.write_u64(logical_path.len() as u64).await?;
     stream.write_all(logical_path.as_bytes()).await?;
-    
+
     let mut offset = 0;
     while offset < data_len {
         let end = std::cmp::min(offset + 65536, data_len);
         stream.write_all(&data[offset..end]).await?;
         offset = end;
     }
-    
+
     // Shut down the write half to signal EOF on the transport stream
     stream.shutdown().await?;
-    
+
     let status = stream.read_u8().await?;
     assert_eq!(status, 0, "Push failed");
     tracing::info!("Push success (35MB).");
@@ -136,7 +152,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut extents_bytes = vec![0u8; extents_len as usize];
     stream.read_exact(&mut extents_bytes).await?;
     let extents: Vec<vfs::metadata::Extent> = bincode::deserialize(&extents_bytes)?;
-    tracing::info!("Got {} physical extents for logical path {}", extents.len(), logical_path);
+    tracing::info!(
+        "Got {} physical extents for logical path {}",
+        extents.len(),
+        logical_path
+    );
 
     // 7. Pull Data
     let mut pulled_data = Vec::new();
@@ -146,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let extent_bytes = bincode::serialize(&extent)?;
         stream.write_all(&extent_bytes).await?;
         stream.shutdown().await?;
-        
+
         let status = stream.read_u8().await?;
         assert_eq!(status, 0, "Pull failed");
         let data_len = stream.read_u64().await?;
@@ -157,9 +177,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Verify perfect integrity
-    assert_eq!(data, pulled_data, "DATA CORRUPTION DETECTED: Pulled bytes do not match pushed bytes!");
+    assert_eq!(
+        data, pulled_data,
+        "DATA CORRUPTION DETECTED: Pulled bytes do not match pushed bytes!"
+    );
     tracing::info!("SUCCESS! Data integrity perfectly preserved across Memory, NVMe, and S3.");
-    
+
     // 8. Test Delete
     let mut stream = connection.open_bidirectional_stream().await?;
     stream.write_u8(5).await?; // Opcode 5: Delete

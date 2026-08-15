@@ -32,9 +32,9 @@ impl SharedScanState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::collections::HashSet;
 
     #[test]
     fn test_shared_scan_state_concurrent() {

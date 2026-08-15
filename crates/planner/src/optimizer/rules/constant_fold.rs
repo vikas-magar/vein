@@ -1,8 +1,8 @@
-use crate::plan::LogicalPlan;
 use crate::expr::{LogicalExpr, LogicalLiteral};
 use crate::optimizer::rule::{OptimizerRule, RuleType};
-use parser::ast::expr::BinaryOp;
+use crate::plan::LogicalPlan;
 use error::Result;
+use parser::ast::expr::BinaryOp;
 
 /// A heuristic optimizer rule that evaluates constant mathematical and logical
 /// expressions at compile time to save CPU cycles during execution.
@@ -21,8 +21,8 @@ impl OptimizerRule for ConstantFoldingRule {
 
     fn apply(&self, plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
         let optimized_plan = self.optimize_node(plan)?;
-        
-        // In a real framework, we would check if `optimized_plan` is structurally 
+
+        // In a real framework, we would check if `optimized_plan` is structurally
         // different from `plan`. If so, return `Some`, else `None`.
         // For simplicity, we assume we always return a new node if changes occurred.
         Ok(Some(optimized_plan))
@@ -40,9 +40,14 @@ impl ConstantFoldingRule {
                     predicate: new_predicate,
                 })
             }
-            LogicalPlan::Project { input, exprs, schema } => {
+            LogicalPlan::Project {
+                input,
+                exprs,
+                schema,
+            } => {
                 let new_input = self.optimize_node(input)?;
-                let new_exprs: Result<Vec<_>> = exprs.iter().map(|e| self.optimize_expr(e)).collect();
+                let new_exprs: Result<Vec<_>> =
+                    exprs.iter().map(|e| self.optimize_expr(e)).collect();
                 Ok(LogicalPlan::Project {
                     input: Box::new(new_input),
                     exprs: new_exprs?,
@@ -56,17 +61,24 @@ impl ConstantFoldingRule {
 
     fn optimize_expr(&self, expr: &LogicalExpr) -> Result<LogicalExpr> {
         match expr {
-            LogicalExpr::BinaryOp { left, op, right, return_type } => {
+            LogicalExpr::BinaryOp {
+                left,
+                op,
+                right,
+                return_type,
+            } => {
                 // Recursively optimize children first
                 let opt_left = self.optimize_expr(left)?;
                 let opt_right = self.optimize_expr(right)?;
 
                 // If both children are now literals, fold them!
-                if let (LogicalExpr::Literal(l_lit), LogicalExpr::Literal(r_lit)) = (&opt_left, &opt_right)
-                    && let Some(folded) = Self::fold_literals(l_lit, *op, r_lit) {
-                        return Ok(LogicalExpr::Literal(folded));
-                    }
-                
+                if let (LogicalExpr::Literal(l_lit), LogicalExpr::Literal(r_lit)) =
+                    (&opt_left, &opt_right)
+                    && let Some(folded) = Self::fold_literals(l_lit, *op, r_lit)
+                {
+                    return Ok(LogicalExpr::Literal(folded));
+                }
+
                 // Couldn't fold, return the operation with (potentially) optimized children
                 Ok(LogicalExpr::BinaryOp {
                     left: Box::new(opt_left),
@@ -79,7 +91,11 @@ impl ConstantFoldingRule {
         }
     }
 
-    fn fold_literals(left: &LogicalLiteral, op: BinaryOp, right: &LogicalLiteral) -> Option<LogicalLiteral> {
+    fn fold_literals(
+        left: &LogicalLiteral,
+        op: BinaryOp,
+        right: &LogicalLiteral,
+    ) -> Option<LogicalLiteral> {
         match (left, op, right) {
             (LogicalLiteral::Int64(l), BinaryOp::Plus, LogicalLiteral::Int64(r)) => {
                 Some(LogicalLiteral::Int64(l + r))
@@ -107,7 +123,7 @@ mod tests {
     #[test]
     fn test_constant_folding() {
         let rule = ConstantFoldingRule;
-        
+
         // Expression: (10 + 5) * 2
         let expr = LogicalExpr::BinaryOp {
             left: Box::new(LogicalExpr::BinaryOp {
@@ -122,7 +138,7 @@ mod tests {
         };
 
         let folded = rule.optimize_expr(&expr).unwrap();
-        
+
         assert_eq!(folded, LogicalExpr::Literal(LogicalLiteral::Int64(30)));
     }
 }

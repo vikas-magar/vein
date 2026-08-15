@@ -1,12 +1,12 @@
-use error::{Result, VeinError};
-use parser::ast::pipe_op::{SelectItem, AggregateExpr, JoinClause};
-use parser::ast::expr::SpannedExpr;
-use crate::plan::LogicalPlan;
-use crate::schema::VeinSchema;
 use crate::binder::context::BinderContext;
-use crate::binder::scope::ScopeStack;
-use crate::plan::traversal::PlanTraversal;
 use crate::binder::expr::ExprBinder;
+use crate::binder::scope::ScopeStack;
+use crate::plan::LogicalPlan;
+use crate::plan::traversal::PlanTraversal;
+use crate::schema::VeinSchema;
+use error::{Result, VeinError};
+use parser::ast::expr::SpannedExpr;
+use parser::ast::pipe_op::{AggregateExpr, JoinClause, SelectItem};
 
 /// Binds a PipeOperator::Where into a LogicalPlan::Filter
 pub async fn bind_where<'a>(
@@ -17,7 +17,7 @@ pub async fn bind_where<'a>(
 ) -> Result<LogicalPlan> {
     let mut expr_binder = ExprBinder::new(context, scopes);
     let bound_predicate = expr_binder.bind(predicate).await?;
-    
+
     Ok(LogicalPlan::Filter {
         input: Box::new(input),
         predicate: bound_predicate,
@@ -33,11 +33,14 @@ pub async fn bind_select<'a>(
 ) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = Vec::new();
-    
+
     for item in items {
         let bound_expr = ExprBinder::new(context, scopes).bind(&item.expr).await?;
-        let col_name = item.alias.map(|a| a.to_string()).unwrap_or_else(|| "unnamed_expr".to_string());
-        
+        let col_name = item
+            .alias
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unnamed_expr".to_string());
+
         new_fields.push(crate::schema::ResolvedColumn {
             id: context.next_id(),
             name: col_name,
@@ -47,13 +50,13 @@ pub async fn bind_select<'a>(
         });
         bound_exprs.push(bound_expr);
     }
-    
+
     // Select replaces the current scope with ONLY the selected columns
     scopes.push(crate::binder::scope::Scope {
         columns: new_fields.clone(),
         qualifier: None,
     });
-    
+
     Ok(LogicalPlan::Project {
         input: Box::new(input),
         exprs: bound_exprs,
@@ -71,7 +74,7 @@ pub async fn bind_aggregate<'a>(
 ) -> Result<LogicalPlan> {
     let mut bound_group_by = Vec::new();
     let mut new_fields = Vec::new();
-    
+
     for gb in group_by {
         let bound_expr = ExprBinder::new(context, scopes).bind(&gb.expr).await?;
         new_fields.push(crate::schema::ResolvedColumn {
@@ -87,8 +90,11 @@ pub async fn bind_aggregate<'a>(
     let mut bound_aggs = Vec::new();
     for agg in aggregates {
         let bound_expr = ExprBinder::new(context, scopes).bind(&agg.expr).await?;
-        let col_name = agg.alias.map(|a| a.to_string()).unwrap_or_else(|| "agg_col".to_string());
-        
+        let col_name = agg
+            .alias
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "agg_col".to_string());
+
         new_fields.push(crate::schema::ResolvedColumn {
             id: context.next_id(),
             name: col_name,
@@ -121,7 +127,9 @@ pub async fn bind_join<'a>(
     _scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
     // Requires recursive call to QueryBinder for the right side
-    Err(VeinError::internal("Join binding not fully implemented yet"))
+    Err(VeinError::internal(
+        "Join binding not fully implemented yet",
+    ))
 }
 
 /// Binds a PipeOperator::Distinct into a LogicalPlan::Distinct

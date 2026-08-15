@@ -72,7 +72,9 @@ impl PartitionSet {
     /// Returns an error if `n == 0`.
     pub fn split(&self, n: usize) -> Result<Vec<PartitionSet>> {
         if n == 0 {
-            return Err(VeinError::internal("cannot split PartitionSet into 0 subsets"));
+            return Err(VeinError::internal(
+                "cannot split PartitionSet into 0 subsets",
+            ));
         }
         let mut result: Vec<PartitionSet> = (0..n).map(|_| PartitionSet::empty()).collect();
         for (i, p) in self.partitions.iter().enumerate() {
@@ -174,10 +176,13 @@ mod tests {
         set.insert(PartitionId::from_raw(3));
         set.insert(PartitionId::from_raw(1));
         set.insert(PartitionId::from_raw(2));
-        assert_eq!(set.ids(), vec![
-            PartitionId::from_raw(1),
-            PartitionId::from_raw(2),
-            PartitionId::from_raw(3),
-        ]);
+        assert_eq!(
+            set.ids(),
+            vec![
+                PartitionId::from_raw(1),
+                PartitionId::from_raw(2),
+                PartitionId::from_raw(3),
+            ]
+        );
     }
 }

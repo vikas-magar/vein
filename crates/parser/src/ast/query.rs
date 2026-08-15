@@ -2,51 +2,73 @@ use crate::ast::pipe_op::{JoinClause, PipeOperator};
 use crate::token::Span;
 use std::borrow::Cow;
 
+/// A parsed query: a source, optional joins, and a pipe pipeline.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Query<'a> {
+    /// The table source.
+
     #[serde(borrow)]
     pub source: TableSource<'a>,
+    /// The joins attached to the source.
+
     #[serde(borrow)]
     pub joins: Vec<JoinClause<'a>>,
+    /// The pipeline operators.
+
     #[serde(borrow)]
     pub pipes: Vec<PipeOperator<'a>>,
 }
 
 impl<'a> Query<'a> {
+    /// Returns the span of the source table reference.
     pub fn source_span(&self) -> Span {
         Span::default()
     }
 }
 
+/// The left-hand side of a query: a table, object store, or subquery.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TableSource<'a> {
     /// A base table reference. The name is a borrow of the input for simple
     /// identifiers, or an owned join of the parts for qualified names (e.g. `a.b`).
     Table {
+        /// The table name.
         #[serde(borrow)]
         name: Cow<'a, str>,
+        /// The optional alias.
         #[serde(borrow)]
         alias: Option<&'a str>,
     },
+    /// An object store source referenced by URL, with inline options.
     ObjectStore {
+        /// The store URL.
         #[serde(borrow)]
         url: &'a str,
+        /// Inline options (e.g. format).
         #[serde(borrow)]
         inline_options: Vec<(&'a str, &'a str)>,
+        /// The optional alias.
         #[serde(borrow)]
         alias: Option<&'a str>,
     },
+    /// A subquery source.
     Subquery {
+        /// The inner query.
         #[serde(borrow)]
         query: Box<Query<'a>>,
+        /// The optional alias.
         #[serde(borrow)]
         alias: Option<&'a str>,
     },
 }
 
+/// The kind of a `UNION`/`INTERSECT`/`EXCEPT` set operation.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SetOpKind {
+    /// UNION
     Union,
+    /// INTERSECT
     Intersect,
+    /// EXCEPT
     Except,
 }

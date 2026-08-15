@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use error::{Result, VeinError};
-use iceberg::memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg::expr::Predicate;
+use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::cache::TableCache;
 use crate::plan_cache::{ScanPlan, ScanPlanCache};
@@ -82,10 +82,7 @@ impl VcsCatalog {
             .with_storage_factory(factory)
             .load(
                 catalog_name,
-                HashMap::from([(
-                    MEMORY_CATALOG_WAREHOUSE.to_string(),
-                    warehouse,
-                )]),
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
             )
             .await
             .map_err(VeinError::Iceberg)?;
@@ -112,12 +109,11 @@ impl VcsCatalog {
     }
 
     /// Register a new table in the catalog.
-    pub async fn create_table(
-        &self,
-        ns: &NamespaceIdent,
-        creation: TableCreation,
-    ) -> Result<()> {
-        self.catalog.create_table(ns, creation).await.map_err(VeinError::Iceberg)?;
+    pub async fn create_table(&self, ns: &NamespaceIdent, creation: TableCreation) -> Result<()> {
+        self.catalog
+            .create_table(ns, creation)
+            .await
+            .map_err(VeinError::Iceberg)?;
         Ok(())
     }
 

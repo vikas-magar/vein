@@ -1,5 +1,5 @@
-use std::fmt;
 use crate::token::TokenKind;
+use std::fmt;
 
 impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

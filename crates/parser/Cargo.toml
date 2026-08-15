@@ -7,7 +7,7 @@ license = "MIT"
 
 [lints.rust]
 unsafe_code = "deny"
-missing_docs = "warn"
+missing_docs = "deny"
 trivial_casts = "warn"
 trivial_numeric_casts = "warn"
 unused_imports = "warn"

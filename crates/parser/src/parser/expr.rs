@@ -1,5 +1,5 @@
 use crate::ast::data_type::DataType;
-use crate::ast::expr::{BinaryOp, Expr, Literal, UnaryOp, SpannedExpr};
+use crate::ast::expr::{BinaryOp, Expr, Literal, SpannedExpr, UnaryOp};
 use crate::ast::pipe_op::OrderByExpr;
 use crate::parser::{ParseError, Parser, TokenKind};
 use crate::token::Span;
@@ -10,7 +10,12 @@ fn infix_prec(kind: &TokenKind) -> Option<(u32, bool)> {
         TokenKind::Or => Some((0, true)),
         TokenKind::And => Some((1, true)),
         TokenKind::Is | TokenKind::In | TokenKind::Between | TokenKind::Like => Some((3, true)),
-        TokenKind::Eq | TokenKind::Neq | TokenKind::Lt | TokenKind::Gt | TokenKind::Leq | TokenKind::Geq => Some((4, true)),
+        TokenKind::Eq
+        | TokenKind::Neq
+        | TokenKind::Lt
+        | TokenKind::Gt
+        | TokenKind::Leq
+        | TokenKind::Geq => Some((4, true)),
         TokenKind::Concat => Some((5, true)),
         TokenKind::Plus | TokenKind::Minus => Some((6, true)),
         TokenKind::Star | TokenKind::Slash | TokenKind::Percent => Some((7, true)),
@@ -26,9 +31,14 @@ fn prefix_prec(kind: &TokenKind) -> Option<(u32, bool)> {
     }
 }
 
-type WindowSpec<'a> = (Vec<SpannedExpr<'a>>, Vec<OrderByExpr<'a>>, Option<crate::ast::pipe_op::WindowFrame>);
+type WindowSpec<'a> = (
+    Vec<SpannedExpr<'a>>,
+    Vec<OrderByExpr<'a>>,
+    Option<crate::ast::pipe_op::WindowFrame>,
+);
 
 impl<'a> Parser<'a> {
+    /// Parses a single (possibly parenthesized or operator-chained) expression.
     pub fn parse_expr(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
         self.enter_recursive()?;
         let result = self.parse_binary(0);
@@ -40,7 +50,6 @@ impl<'a> Parser<'a> {
         let mut left = self.parse_unary()?;
 
         while let Ok(peek_kind) = self.peek().map(|t| t.kind) {
-
             // Handle NOT as special prefix within infix operators
             let mut postfix_op = None;
             if peek_kind == TokenKind::Not {
@@ -75,11 +84,14 @@ impl<'a> Parser<'a> {
                     let right_prec = if left_assoc { prec + 1 } else { prec };
                     let right = self.parse_binary(right_prec)?;
                     let span = left.span.union(right.span);
-                    left = SpannedExpr { span, node: Expr::BinaryOp {
-                        left: Box::new(left),
-                        op: token_to_binary_op(&peek_kind),
-                        right: Box::new(right),
-                    } };
+                    left = SpannedExpr {
+                        span,
+                        node: Expr::BinaryOp {
+                            left: Box::new(left),
+                            op: token_to_binary_op(&peek_kind),
+                            right: Box::new(right),
+                        },
+                    };
                 }
                 Some((prec, _)) if prec < min_prec => break,
                 _ => break,
@@ -107,27 +119,48 @@ impl<'a> Parser<'a> {
                     let query = self.parse_pipe_query()?;
                     let rparen = self.expect(TokenKind::RParen)?;
                     let sub_span = lparen.span.union(rparen.span);
-                    vec![SpannedExpr { span: sub_span, node: Expr::Subquery(Box::new(query)) }]
+                    vec![SpannedExpr {
+                        span: sub_span,
+                        node: Expr::Subquery(Box::new(query)),
+                    }]
                 } else {
                     let items = self.parse_comma_separated(|p| p.parse_expr())?;
                     self.expect(TokenKind::RParen)?;
                     items
                 };
-                Ok(SpannedExpr { span, node: Expr::InList { expr: Box::new(left), list, negated: is_negated } })
+                Ok(SpannedExpr {
+                    span,
+                    node: Expr::InList {
+                        expr: Box::new(left),
+                        list,
+                        negated: is_negated,
+                    },
+                })
             }
             TokenKind::Between => {
                 let low = self.parse_binary(2)?;
                 self.expect(TokenKind::And)?;
                 let high = self.parse_binary(2)?;
-                Ok(SpannedExpr { span, node: Expr::Between { expr: Box::new(left), low: Box::new(low), high: Box::new(high), negated: is_negated } })
+                Ok(SpannedExpr {
+                    span,
+                    node: Expr::Between {
+                        expr: Box::new(left),
+                        low: Box::new(low),
+                        high: Box::new(high),
+                        negated: is_negated,
+                    },
+                })
             }
             TokenKind::Like => {
                 let pattern = self.parse_expr()?;
-                Ok(SpannedExpr { span, node: Expr::Like {
-                    expr: Box::new(left),
-                    pattern: Box::new(pattern),
-                    negated: is_negated,
-                } })
+                Ok(SpannedExpr {
+                    span,
+                    node: Expr::Like {
+                        expr: Box::new(left),
+                        pattern: Box::new(pattern),
+                        negated: is_negated,
+                    },
+                })
             }
             TokenKind::Is => {
                 let negated = if let Ok(TokenKind::Not) = self.peek().map(|t| &t.kind) {
@@ -137,12 +170,22 @@ impl<'a> Parser<'a> {
                     false
                 };
                 self.expect(TokenKind::Null)?;
-                Ok(SpannedExpr { span, node: Expr::UnaryOp {
-                    op: if negated { UnaryOp::IsNotNull } else { UnaryOp::IsNull },
-                    expr: Box::new(left),
-                } })
+                Ok(SpannedExpr {
+                    span,
+                    node: Expr::UnaryOp {
+                        op: if negated {
+                            UnaryOp::IsNotNull
+                        } else {
+                            UnaryOp::IsNull
+                        },
+                        expr: Box::new(left),
+                    },
+                })
             }
-            _ => Err(ParseError::Unsupported(format!("unexpected postfix op: {:?}", op))),
+            _ => Err(ParseError::Unsupported(format!(
+                "unexpected postfix op: {:?}",
+                op
+            ))),
         }
     }
 
@@ -157,20 +200,43 @@ impl<'a> Parser<'a> {
             let expr = self.parse_binary(prec)?;
             let span = op_token.span.union(expr.span);
             match peek_kind {
-                TokenKind::Not => {
-                    match expr {
-                        SpannedExpr { node: Expr::Exists { subquery, negated: false }, span: _ } => {
-                            Ok(SpannedExpr { span, node: Expr::Exists { subquery, negated: true } })
-                        }
-                        _ => Ok(SpannedExpr { span, node: Expr::UnaryOp { op: UnaryOp::Not, expr: Box::new(expr) } }),
-                    }
-                }
-                TokenKind::Minus => {
-                    Ok(SpannedExpr { span, node: Expr::UnaryOp { op: UnaryOp::Negate, expr: Box::new(expr) } })
-                }
-                TokenKind::Plus => {
-                    Ok(SpannedExpr { span, node: Expr::UnaryOp { op: UnaryOp::Plus, expr: Box::new(expr) } })
-                }
+                TokenKind::Not => match expr {
+                    SpannedExpr {
+                        node:
+                            Expr::Exists {
+                                subquery,
+                                negated: false,
+                            },
+                        span: _,
+                    } => Ok(SpannedExpr {
+                        span,
+                        node: Expr::Exists {
+                            subquery,
+                            negated: true,
+                        },
+                    }),
+                    _ => Ok(SpannedExpr {
+                        span,
+                        node: Expr::UnaryOp {
+                            op: UnaryOp::Not,
+                            expr: Box::new(expr),
+                        },
+                    }),
+                },
+                TokenKind::Minus => Ok(SpannedExpr {
+                    span,
+                    node: Expr::UnaryOp {
+                        op: UnaryOp::Negate,
+                        expr: Box::new(expr),
+                    },
+                }),
+                TokenKind::Plus => Ok(SpannedExpr {
+                    span,
+                    node: Expr::UnaryOp {
+                        op: UnaryOp::Plus,
+                        expr: Box::new(expr),
+                    },
+                }),
                 _ => unreachable!(),
             }
         } else {
@@ -224,12 +290,21 @@ impl<'a> Parser<'a> {
                     if let Ok(TokenKind::Dot) = self.peek().map(|t| &t.kind) {
                         self.next_token()?;
                         let col_token = self.next_token()?;
-                        Ok(SpannedExpr { span: span.union(col_token.span), node: Expr::Column {
-                            table: Some(name),
-                            column: col_token.text,
-                        } })
+                        Ok(SpannedExpr {
+                            span: span.union(col_token.span),
+                            node: Expr::Column {
+                                table: Some(name),
+                                column: col_token.text,
+                            },
+                        })
                     } else {
-                        Ok(SpannedExpr { span, node: Expr::Column { table: None, column: name } })
+                        Ok(SpannedExpr {
+                            span,
+                            node: Expr::Column {
+                                table: None,
+                                column: name,
+                            },
+                        })
                     }
                 }
             }
@@ -241,38 +316,65 @@ impl<'a> Parser<'a> {
                 // Determine if int or float
                 if text.contains('.') || text.contains('e') || text.contains('E') {
                     let val: f64 = text.parse().unwrap_or(0.0);
-                    Ok(SpannedExpr { span, node: Expr::Literal(Literal::Float(val.into())) })
+                    Ok(SpannedExpr {
+                        span,
+                        node: Expr::Literal(Literal::Float(val.into())),
+                    })
                 } else if text.starts_with("0x") || text.starts_with("0X") {
                     let val = i64::from_str_radix(&text[2..], 16).unwrap_or(0);
-                    Ok(SpannedExpr { span, node: Expr::Literal(Literal::Int(val)) })
+                    Ok(SpannedExpr {
+                        span,
+                        node: Expr::Literal(Literal::Int(val)),
+                    })
                 } else if text.starts_with("0b") || text.starts_with("0B") {
                     let val = i64::from_str_radix(&text[2..], 2).unwrap_or(0);
-                    Ok(SpannedExpr { span, node: Expr::Literal(Literal::Int(val)) })
+                    Ok(SpannedExpr {
+                        span,
+                        node: Expr::Literal(Literal::Int(val)),
+                    })
                 } else {
                     let val: i64 = text.parse().unwrap_or(0);
-                    Ok(SpannedExpr { span, node: Expr::Literal(Literal::Int(val)) })
+                    Ok(SpannedExpr {
+                        span,
+                        node: Expr::Literal(Literal::Int(val)),
+                    })
                 }
             }
             TokenKind::String => {
                 let token = self.next_token()?;
                 let value = &token.text[1..token.text.len() - 1];
-                Ok(SpannedExpr { span: token.span, node: Expr::Literal(Literal::String(value)) })
+                Ok(SpannedExpr {
+                    span: token.span,
+                    node: Expr::Literal(Literal::String(value)),
+                })
             }
             TokenKind::True => {
                 let token = self.next_token()?;
-                Ok(SpannedExpr { span: token.span, node: Expr::Literal(Literal::Boolean(true)) })
+                Ok(SpannedExpr {
+                    span: token.span,
+                    node: Expr::Literal(Literal::Boolean(true)),
+                })
             }
             TokenKind::False => {
                 let token = self.next_token()?;
-                Ok(SpannedExpr { span: token.span, node: Expr::Literal(Literal::Boolean(false)) })
+                Ok(SpannedExpr {
+                    span: token.span,
+                    node: Expr::Literal(Literal::Boolean(false)),
+                })
             }
             TokenKind::Null => {
                 let token = self.next_token()?;
-                Ok(SpannedExpr { span: token.span, node: Expr::Literal(Literal::Null) })
+                Ok(SpannedExpr {
+                    span: token.span,
+                    node: Expr::Literal(Literal::Null),
+                })
             }
             TokenKind::Star => {
                 let token = self.next_token()?;
-                Ok(SpannedExpr { span: token.span, node: Expr::Wildcard { table: None } })
+                Ok(SpannedExpr {
+                    span: token.span,
+                    node: Expr::Wildcard { table: None },
+                })
             }
             TokenKind::Minus | TokenKind::Plus => {
                 // Handled by parse_unary, but if we reach here it's an error
@@ -292,23 +394,39 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_subquery_in_parens(&mut self, lparen_span: Span) -> Result<SpannedExpr<'a>, ParseError> {
+    fn parse_subquery_in_parens(
+        &mut self,
+        lparen_span: Span,
+    ) -> Result<SpannedExpr<'a>, ParseError> {
         let query = self.parse_pipe_query()?;
         let rparen = self.expect(TokenKind::RParen)?;
         let span = lparen_span.union(rparen.span);
-        Ok(SpannedExpr { span, node: Expr::ScalarSubquery(Box::new(query)) })
+        Ok(SpannedExpr {
+            span,
+            node: Expr::ScalarSubquery(Box::new(query)),
+        })
     }
 
     fn parse_exists_subquery(&mut self, exists_span: Span) -> Result<SpannedExpr<'a>, ParseError> {
         self.parse_exists_body(exists_span, false)
     }
 
-    fn parse_exists_body(&mut self, start_span: Span, negated: bool) -> Result<SpannedExpr<'a>, ParseError> {
+    fn parse_exists_body(
+        &mut self,
+        start_span: Span,
+        negated: bool,
+    ) -> Result<SpannedExpr<'a>, ParseError> {
         self.expect(TokenKind::LParen)?;
         let query = self.parse_pipe_query()?;
         let rparen = self.expect(TokenKind::RParen)?;
         let span = start_span.union(rparen.span);
-        Ok(SpannedExpr { span, node: Expr::Exists { subquery: Box::new(query), negated } })
+        Ok(SpannedExpr {
+            span,
+            node: Expr::Exists {
+                subquery: Box::new(query),
+                negated,
+            },
+        })
     }
 
     fn parse_cast_expr(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
@@ -322,7 +440,13 @@ impl<'a> Parser<'a> {
         };
         self.expect(TokenKind::RParen)?;
         let span = expr.span;
-        Ok(SpannedExpr { span, node: Expr::Cast { expr: Box::new(expr), data_type } })
+        Ok(SpannedExpr {
+            span,
+            node: Expr::Cast {
+                expr: Box::new(expr),
+                data_type,
+            },
+        })
     }
 
     fn parse_case_expr(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
@@ -344,11 +468,14 @@ impl<'a> Parser<'a> {
                 Ok(TokenKind::When) => {
                     self.next_token()?;
                     if let Some(ref operand) = case_operand {
-                        operands.push(SpannedExpr { span: Default::default(), node: Expr::BinaryOp {
-                            left: Box::new(operand.clone()),
-                            op: BinaryOp::Eq,
-                            right: Box::new(self.parse_expr()?),
-                        } });
+                        operands.push(SpannedExpr {
+                            span: Default::default(),
+                            node: Expr::BinaryOp {
+                                left: Box::new(operand.clone()),
+                                op: BinaryOp::Eq,
+                                right: Box::new(self.parse_expr()?),
+                            },
+                        });
                     } else {
                         operands.push(self.parse_expr()?);
                     }
@@ -373,10 +500,21 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(SpannedExpr { span: Default::default(), node: Expr::Case { operands, results, else_result } })
+        Ok(SpannedExpr {
+            span: Default::default(),
+            node: Expr::Case {
+                operands,
+                results,
+                else_result,
+            },
+        })
     }
 
-    fn parse_function_call(&mut self, name: &'a str, span: crate::token::Span) -> Result<SpannedExpr<'a>, ParseError> {
+    fn parse_function_call(
+        &mut self,
+        name: &'a str,
+        span: crate::token::Span,
+    ) -> Result<SpannedExpr<'a>, ParseError> {
         self.next_token()?; // consume LParen
         let distinct = if let Ok(TokenKind::Distinct) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
@@ -390,9 +528,15 @@ impl<'a> Parser<'a> {
             // COUNT(*) or similar
             if name.eq_ignore_ascii_case("count") {
                 self.next_token()?;
-                args.push(SpannedExpr { span: Default::default(), node: Expr::Wildcard { table: None } });
+                args.push(SpannedExpr {
+                    span: Default::default(),
+                    node: Expr::Wildcard { table: None },
+                });
             } else {
-                return Err(ParseError::Unsupported(format!("* not allowed in {}", name)));
+                return Err(ParseError::Unsupported(format!(
+                    "* not allowed in {}",
+                    name
+                )));
             }
         } else if let Ok(TokenKind::RParen) = self.peek().map(|t| &t.kind) {
             // No args
@@ -406,17 +550,27 @@ impl<'a> Parser<'a> {
         if let Ok(TokenKind::Over) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
             let (partition_by, order_by, window_frame) = self.parse_window_spec()?;
-            return Ok(SpannedExpr { span, node: Expr::WindowFunction {
+            return Ok(SpannedExpr {
+                span,
+                node: Expr::WindowFunction {
+                    name,
+                    args,
+                    distinct,
+                    partition_by,
+                    order_by,
+                    window_frame,
+                },
+            });
+        }
+
+        Ok(SpannedExpr {
+            span,
+            node: Expr::Function {
                 name,
                 args,
                 distinct,
-                partition_by,
-                order_by,
-                window_frame,
-            } });
-        }
-
-        Ok(SpannedExpr { span, node: Expr::Function { name, args, distinct } })
+            },
+        })
     }
 
     fn parse_window_spec(&mut self) -> Result<WindowSpec<'a>, ParseError> {
@@ -443,11 +597,22 @@ impl<'a> Parser<'a> {
         Ok((partition_by, order_by, window_frame))
     }
 
-    fn parse_window_frame(&mut self) -> Result<Option<crate::ast::pipe_op::WindowFrame>, ParseError> {
+    fn parse_window_frame(
+        &mut self,
+    ) -> Result<Option<crate::ast::pipe_op::WindowFrame>, ParseError> {
         let kind = match self.peek().map(|t| &t.kind) {
-            Ok(TokenKind::Rows) => { self.next_token()?; crate::ast::pipe_op::WindowFrameKind::Rows }
-            Ok(TokenKind::Range) => { self.next_token()?; crate::ast::pipe_op::WindowFrameKind::Range }
-            Ok(TokenKind::Groups) => { self.next_token()?; crate::ast::pipe_op::WindowFrameKind::Groups }
+            Ok(TokenKind::Rows) => {
+                self.next_token()?;
+                crate::ast::pipe_op::WindowFrameKind::Rows
+            }
+            Ok(TokenKind::Range) => {
+                self.next_token()?;
+                crate::ast::pipe_op::WindowFrameKind::Range
+            }
+            Ok(TokenKind::Groups) => {
+                self.next_token()?;
+                crate::ast::pipe_op::WindowFrameKind::Groups
+            }
             _ => return Ok(None),
         };
 
@@ -469,13 +634,24 @@ impl<'a> Parser<'a> {
         if let Ok(TokenKind::Unbounded) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
             match self.peek().map(|t| &t.kind) {
-                Ok(TokenKind::Preceding) => { self.next_token()?; return Ok(crate::ast::pipe_op::WindowFrameBound::UnboundedPreceding); }
-                Ok(TokenKind::Following) => { self.next_token()?; return Ok(crate::ast::pipe_op::WindowFrameBound::UnboundedFollowing); }
-                _ => return Err(ParseError::Expected {
-                    expected: "PRECEDING or FOLLOWING".into(),
-                    found: format!("{:?}", self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)),
-                    span: self.peek_span().unwrap_or_default(),
-                }),
+                Ok(TokenKind::Preceding) => {
+                    self.next_token()?;
+                    return Ok(crate::ast::pipe_op::WindowFrameBound::UnboundedPreceding);
+                }
+                Ok(TokenKind::Following) => {
+                    self.next_token()?;
+                    return Ok(crate::ast::pipe_op::WindowFrameBound::UnboundedFollowing);
+                }
+                _ => {
+                    return Err(ParseError::Expected {
+                        expected: "PRECEDING or FOLLOWING".into(),
+                        found: format!(
+                            "{:?}",
+                            self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)
+                        ),
+                        span: self.peek_span().unwrap_or_default(),
+                    });
+                }
             }
         }
         if let Ok(TokenKind::Current) = self.peek().map(|t| &t.kind) {
@@ -487,10 +663,12 @@ impl<'a> Parser<'a> {
         let token = self.next_token()?;
         let offset: u64 = match token.text.parse() {
             Ok(n) => n,
-            Err(_) => return Err(ParseError::NumberParse {
-                message: format!("expected number for frame bound, got '{}'", token.text),
-                span: token.span,
-            }),
+            Err(_) => {
+                return Err(ParseError::NumberParse {
+                    message: format!("expected number for frame bound, got '{}'", token.text),
+                    span: token.span,
+                });
+            }
         };
         match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::Preceding) => {
@@ -503,23 +681,33 @@ impl<'a> Parser<'a> {
             }
             _ => Err(ParseError::Expected {
                 expected: "PRECEDING or FOLLOWING".into(),
-                found: format!("{:?}", self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)),
+                found: format!(
+                    "{:?}",
+                    self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)
+                ),
                 span: self.peek_span().unwrap_or_default(),
             }),
         }
     }
 
-    fn parse_typed_string(&mut self, type_name: &'a str, ident_span: Span) -> Result<Option<SpannedExpr<'a>>, ParseError> {
+    fn parse_typed_string(
+        &mut self,
+        type_name: &'a str,
+        ident_span: Span,
+    ) -> Result<Option<SpannedExpr<'a>>, ParseError> {
         match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::String) => {
                 let parsed: Result<DataType<'_>, _> = type_name.parse();
                 if let Ok(dt) = parsed {
                     let str_token = self.next_token()?;
                     let value = &str_token.text[1..str_token.text.len() - 1];
-                    return Ok(Some(SpannedExpr { span: ident_span.union(str_token.span), node: Expr::TypedString {
-                        data_type: dt,
-                        value,
-                    } }));
+                    return Ok(Some(SpannedExpr {
+                        span: ident_span.union(str_token.span),
+                        node: Expr::TypedString {
+                            data_type: dt,
+                            value,
+                        },
+                    }));
                 }
                 Ok(None)
             }
@@ -530,7 +718,10 @@ impl<'a> Parser<'a> {
     /// Parses the optional ASC/DESC and NULLS FIRST/LAST suffix shared by
     /// ORDER BY, window ORDER BY, and GROUP BY expressions.
     /// Defaults follow DuckDB: ASC -> NULLS LAST, DESC -> NULLS FIRST.
-    pub(crate) fn parse_order_suffix(&mut self, expr: SpannedExpr<'a>) -> Result<OrderByExpr<'a>, ParseError> {
+    pub(crate) fn parse_order_suffix(
+        &mut self,
+        expr: SpannedExpr<'a>,
+    ) -> Result<OrderByExpr<'a>, ParseError> {
         let mut asc = true;
         if let Ok(TokenKind::Asc) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
@@ -543,8 +734,14 @@ impl<'a> Parser<'a> {
         if let Ok(TokenKind::Nulls) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
             match self.peek().map(|t| &t.kind) {
-                Ok(TokenKind::First) => { self.next_token()?; nulls_first = true; }
-                Ok(TokenKind::Last) => { self.next_token()?; nulls_first = false; }
+                Ok(TokenKind::First) => {
+                    self.next_token()?;
+                    nulls_first = true;
+                }
+                Ok(TokenKind::Last) => {
+                    self.next_token()?;
+                    nulls_first = false;
+                }
                 _ => {
                     return Err(ParseError::Unsupported(
                         "Expected FIRST or LAST after NULLS".to_string(),
@@ -553,7 +750,11 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(OrderByExpr { expr, asc, nulls_first })
+        Ok(OrderByExpr {
+            expr,
+            asc,
+            nulls_first,
+        })
     }
 
     pub(crate) fn parse_order_by_expr(&mut self) -> Result<OrderByExpr<'a>, ParseError> {
@@ -569,7 +770,9 @@ impl<'a> Parser<'a> {
         loop {
             items.push(parse_one(self)?);
             match self.peek().map(|t| &t.kind) {
-                Ok(TokenKind::Comma) => { self.next_token()?; }
+                Ok(TokenKind::Comma) => {
+                    self.next_token()?;
+                }
                 _ => break,
             }
         }
@@ -625,103 +828,144 @@ fn token_to_binary_op(kind: &TokenKind) -> BinaryOp {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::test_utils::utils::*;
 
     #[test]
-        fn test_expr_binary_op() {
-            let expr = parse_expr("1 + 2").unwrap();
-            assert!(matches!(expr.node, Expr::BinaryOp { op: crate::ast::expr::BinaryOp::Plus, .. }));
-        }
+    fn test_expr_binary_op() {
+        let expr = parse_expr("1 + 2").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::BinaryOp {
+                op: crate::ast::expr::BinaryOp::Plus,
+                ..
+            }
+        ));
+    }
 
     #[test]
-        fn test_expr_mul_precedence() {
-            let expr = parse_expr("1 + 2 * 3").unwrap();
-            assert!(matches!(expr.node, Expr::BinaryOp { op: crate::ast::expr::BinaryOp::Plus, .. }));
-        }
+    fn test_expr_mul_precedence() {
+        let expr = parse_expr("1 + 2 * 3").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::BinaryOp {
+                op: crate::ast::expr::BinaryOp::Plus,
+                ..
+            }
+        ));
+    }
 
     #[test]
-        fn test_expr_parentheses() {
-            let expr = parse_expr("(1 + 2) * 3").unwrap();
-            assert!(matches!(expr.node, Expr::BinaryOp { op: crate::ast::expr::BinaryOp::Multiply, .. }));
-        }
+    fn test_expr_parentheses() {
+        let expr = parse_expr("(1 + 2) * 3").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::BinaryOp {
+                op: crate::ast::expr::BinaryOp::Multiply,
+                ..
+            }
+        ));
+    }
 
     #[test]
-        fn test_expr_is_null() {
-            let expr = parse_expr("name IS NULL").unwrap();
-            assert!(matches!(expr.node, Expr::UnaryOp { op: crate::ast::expr::UnaryOp::IsNull, .. }));
-        }
+    fn test_expr_is_null() {
+        let expr = parse_expr("name IS NULL").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::UnaryOp {
+                op: crate::ast::expr::UnaryOp::IsNull,
+                ..
+            }
+        ));
+    }
 
     #[test]
-        fn test_expr_in_list() {
-            let expr = parse_expr("x IN (1, 2, 3)").unwrap();
-            assert!(matches!(expr.node, Expr::InList { .. }));
-        }
+    fn test_expr_in_list() {
+        let expr = parse_expr("x IN (1, 2, 3)").expect("test should succeed");
+        assert!(matches!(expr.node, Expr::InList { .. }));
+    }
 
     #[test]
-        fn test_expr_between() {
-            let expr = parse_expr("x BETWEEN 1 AND 10").unwrap();
-            assert!(matches!(expr.node, Expr::Between { .. }));
-        }
+    fn test_expr_between() {
+        let expr = parse_expr("x BETWEEN 1 AND 10").expect("test should succeed");
+        assert!(matches!(expr.node, Expr::Between { .. }));
+    }
 
     #[test]
-        fn test_expr_like() {
-            let expr = parse_expr("name LIKE '%foo%'").unwrap();
-            assert!(matches!(expr.node, Expr::Like { negated: false, .. }));
-    
-            let expr_not = parse_expr("name NOT LIKE '%foo%'").unwrap();
-            assert!(matches!(expr_not.node, Expr::Like { negated: true, .. }));
-        }
+    fn test_expr_like() {
+        let expr = parse_expr("name LIKE '%foo%'").expect("test should succeed");
+        assert!(matches!(expr.node, Expr::Like { negated: false, .. }));
+
+        let expr_not = parse_expr("name NOT LIKE '%foo%'").expect("test should succeed");
+        assert!(matches!(expr_not.node, Expr::Like { negated: true, .. }));
+    }
 
     #[test]
-        fn test_expr_not() {
-            let expr = parse_expr("NOT active").unwrap();
-            assert!(matches!(expr.node, Expr::UnaryOp { op: crate::ast::expr::UnaryOp::Not, .. }));
-        }
+    fn test_expr_not() {
+        let expr = parse_expr("NOT active").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::UnaryOp {
+                op: crate::ast::expr::UnaryOp::Not,
+                ..
+            }
+        ));
+    }
 
     #[test]
-        fn test_expr_negate() {
-            let expr = parse_expr("-42").unwrap();
-            assert!(matches!(expr.node, Expr::UnaryOp { op: crate::ast::expr::UnaryOp::Negate, .. }));
-        }
+    fn test_expr_negate() {
+        let expr = parse_expr("-42").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::UnaryOp {
+                op: crate::ast::expr::UnaryOp::Negate,
+                ..
+            }
+        ));
+    }
 
     #[test]
-        fn test_expr_function() {
-            let expr = parse_expr("count(*)").unwrap();
-            assert!(matches!(expr.node, Expr::Function { .. }));
-        }
+    fn test_expr_function() {
+        let expr = parse_expr("count(*)").expect("test should succeed");
+        assert!(matches!(expr.node, Expr::Function { .. }));
+    }
 
     #[test]
-        fn test_expr_qualified_column() {
-            let expr = parse_expr("t.name").unwrap();
-            assert!(matches!(expr.node, Expr::Column { table: Some(_), .. }));
-        }
+    fn test_expr_qualified_column() {
+        let expr = parse_expr("t.name").expect("test should succeed");
+        assert!(matches!(expr.node, Expr::Column { table: Some(_), .. }));
+    }
 
     #[test]
-        fn test_expr_wildcard() {
-            let expr = parse_expr("*").unwrap();
-            assert!(matches!(expr.node, Expr::Wildcard { .. }));
-        }
+    fn test_expr_wildcard() {
+        let expr = parse_expr("*").expect("test should succeed");
+        assert!(matches!(expr.node, Expr::Wildcard { .. }));
+    }
 
     #[test]
-        fn test_expr_cast() {
-            let expr = parse_expr("CAST(age AS bigint)").unwrap();
-            assert!(matches!(expr.node, Expr::Cast { .. }));
-        }
+    fn test_expr_cast() {
+        let expr = parse_expr("CAST(age AS bigint)").expect("test should succeed");
+        assert!(matches!(expr.node, Expr::Cast { .. }));
+    }
 
     #[test]
-        fn test_expr_string_concat() {
-            let expr = parse_expr("a || ' ' || b").unwrap();
-            assert!(matches!(expr.node, Expr::BinaryOp { op: crate::ast::expr::BinaryOp::Concat, .. }));
-        }
+    fn test_expr_string_concat() {
+        let expr = parse_expr("a || ' ' || b").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::BinaryOp {
+                op: crate::ast::expr::BinaryOp::Concat,
+                ..
+            }
+        ));
+    }
 
     #[test]
-        fn test_expr_case() {
-            let expr = parse_expr("CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END").unwrap();
-            assert!(matches!(expr.node, Expr::Case { .. }));
-        }
-
+    fn test_expr_case() {
+        let expr =
+            parse_expr("CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END").expect("test should succeed");
+        assert!(matches!(expr.node, Expr::Case { .. }));
+    }
 }

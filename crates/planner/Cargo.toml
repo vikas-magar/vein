@@ -8,5 +8,4 @@ common = { path = "../common" }
 error = { path = "../error" }
 parser = { path = "../parser" }
 arrow = { workspace = true }
-rkyv.workspace = true
 async-trait.workspace = true

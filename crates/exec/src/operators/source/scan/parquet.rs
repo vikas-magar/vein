@@ -1,7 +1,7 @@
-use crate::daemon::pipeline::{PipelineNode, DataChunk, ValueVector, VeinBatch};
-use common::arrow::SelectionVector;
+use crate::daemon::pipeline::{DataChunk, PipelineNode, ValueVector, VeinBatch};
 use bytes::Bytes;
 use common::Result;
+use common::arrow::SelectionVector;
 use error::VeinError;
 use futures::StreamExt;
 use futures::future::BoxFuture;

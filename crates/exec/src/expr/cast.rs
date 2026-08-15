@@ -59,16 +59,15 @@ mod tests {
 
         let col_expr = Box::new(ColumnExpr::new("a", 0));
         let cast_expr = CastExpr::new(col_expr, DataType::Float64);
-        
+
         assert_eq!(cast_expr.data_type(&schema).unwrap(), DataType::Float64);
-        
+
         let result = cast_expr.evaluate(&batch).unwrap();
         assert_eq!(result.data_type(), &DataType::Float64);
-        
+
         let result_float = result.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(result_float.value(0), 1.0);
         assert_eq!(result_float.value(1), 2.0);
         assert_eq!(result_float.value(2), 3.0);
     }
 }
-

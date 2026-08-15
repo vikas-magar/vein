@@ -7,10 +7,10 @@ use crate::recovery::heal::HealDaemon;
 use crate::rpc::peer_pool::{PeerPool, VoteReply};
 use crate::topology::crush::{ClusterMap, Node};
 use crate::{Result, VfsError};
-use s2n_quic::{stream::BidirectionalStream, Server};
+use s2n_quic::{Server, stream::BidirectionalStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, PartialEq, Clone)]
@@ -81,7 +81,6 @@ impl RpcRouter {
 
         tracing::info!("VeinFS RPC Router listening on QUIC {}", bind_addr);
 
-
         while let Some(mut connection) = server.accept().await {
             let router = self.clone();
             tokio::spawn(async move {
@@ -104,7 +103,7 @@ impl RpcRouter {
             Ok(op) => op,
             Err(_) => return Ok(()),
         };
-        
+
         let result = match opcode {
             1 => self.handle_push(&mut stream).await,
             2 => self.handle_get_metadata(&mut stream).await,
@@ -123,7 +122,7 @@ impl RpcRouter {
             let _ = stream.write_all(msg.as_bytes()).await;
             tracing::error!("Request failed: {}", e);
         }
-        
+
         Ok(())
     }
 
@@ -139,10 +138,11 @@ impl RpcRouter {
         if path_len > 4096 {
             return Err(VfsError::Internal(format!("Path too long: {}", path_len)));
         }
-        
+
         let mut path_buf = vec![0u8; path_len as usize];
         stream.read_exact(&mut path_buf).await?;
-        let path = String::from_utf8(path_buf).map_err(|_| VfsError::Internal("Invalid UTF8 path".to_string()))?;
+        let path = String::from_utf8(path_buf)
+            .map_err(|_| VfsError::Internal("Invalid UTF8 path".to_string()))?;
 
         match self.routing_decision(&path)? {
             RoutingDecision::Forward(owner) => {
@@ -150,7 +150,11 @@ impl RpcRouter {
                 // then reply 0x01 (not-owner) so the client knows the write
                 // was NOT accepted and must be retried against the correct node.
                 // 0x00 (success) here would be silent data loss.
-                tracing::info!("Not owner for {}; owner is {}. Draining and rejecting.", path, owner.ip);
+                tracing::info!(
+                    "Not owner for {}; owner is {}. Draining and rejecting.",
+                    path,
+                    owner.ip
+                );
                 let mut buf = [0u8; 65536];
                 loop {
                     let n = stream.read(&mut buf).await?;
@@ -193,11 +197,14 @@ impl RpcRouter {
                     let pool = self.peer_pool.clone();
                     let arch = self.archipelago.clone();
                     tokio::spawn(async move {
-                        let timeout_res = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            async { pool.lock().await.send_vote_request(&peer, &pid2, &op2).await },
-                        )
-                        .await;
+                        let timeout_res =
+                            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                                pool.lock()
+                                    .await
+                                    .send_vote_request(&peer, &pid2, &op2)
+                                    .await
+                            })
+                            .await;
 
                         match timeout_res {
                             Ok(Ok(VoteReply::Accept)) => {
@@ -209,7 +216,9 @@ impl RpcRouter {
                             Ok(Ok(VoteReply::Reject)) => {
                                 tracing::warn!("peer {} rejected proposal {:?}", peer.id, pid2)
                             }
-                            Ok(Err(e)) => tracing::warn!("vote_request to {} failed: {}", peer.id, e),
+                            Ok(Err(e)) => {
+                                tracing::warn!("vote_request to {} failed: {}", peer.id, e)
+                            }
                             Err(_) => tracing::warn!("vote_request to {} timed out", peer.id),
                         }
                     });
@@ -218,11 +227,19 @@ impl RpcRouter {
                 // Wait for quorum (2s timeout)
                 tokio::time::timeout(std::time::Duration::from_secs(2), rx)
                     .await
-                    .map_err(|_| VfsError::Internal("consensus timeout: quorum not reached".into()))?
+                    .map_err(|_| {
+                        VfsError::Internal("consensus timeout: quorum not reached".into())
+                    })?
                     .map_err(|_| VfsError::Internal("consensus channel dropped".into()))?;
 
                 // Persist committed proposal
-                if let Err(e) = self.archipelago.read().await.persist_committed(&pid, &op, &self.metadata).await {
+                if let Err(e) = self
+                    .archipelago
+                    .read()
+                    .await
+                    .persist_committed(&pid, &op, &self.metadata)
+                    .await
+                {
                     tracing::warn!("Failed to persist consensus log: {}", e);
                 }
             }
@@ -246,14 +263,16 @@ impl RpcRouter {
         if path_len > 4096 {
             return Err(VfsError::Internal(format!("Path too long: {}", path_len)));
         }
-        
+
         let mut path_buf = vec![0u8; path_len as usize];
         stream.read_exact(&mut path_buf).await?;
-        let path = String::from_utf8(path_buf).map_err(|_| VfsError::Internal("Invalid UTF8 path".to_string()))?;
+        let path = String::from_utf8(path_buf)
+            .map_err(|_| VfsError::Internal("Invalid UTF8 path".to_string()))?;
 
         let extents = self.metadata.get_file(&path).await?;
-        let serialized = bincode::serialize(&extents).map_err(|_| VfsError::Internal("Serialize failed".to_string()))?;
-        
+        let serialized = bincode::serialize(&extents)
+            .map_err(|_| VfsError::Internal("Serialize failed".to_string()))?;
+
         stream.write_all(&[0x00]).await?;
         stream.write_u64(serialized.len() as u64).await?;
         stream.write_all(&serialized).await?;
@@ -262,17 +281,17 @@ impl RpcRouter {
     }
 
     async fn handle_pull(&self, stream: &mut BidirectionalStream) -> Result<()> {
-        let mut extent_buf = Vec::new(); 
+        let mut extent_buf = Vec::new();
         stream.read_to_end(&mut extent_buf).await?;
         let extent: Extent = bincode::deserialize(&extent_buf)
             .map_err(|_| VfsError::Internal("Invalid extent".to_string()))?;
 
         let data = self.block_manager.read_extent(&extent).await?;
-        
+
         stream.write_all(&[0x00]).await?;
         stream.write_u64(data.len() as u64).await?;
         stream.write_all(&data).await?;
-        
+
         Ok(())
     }
 
@@ -281,13 +300,14 @@ impl RpcRouter {
         if path_len > 4096 {
             return Err(VfsError::Internal(format!("Path too long: {}", path_len)));
         }
-        
+
         let mut path_buf = vec![0u8; path_len as usize];
         stream.read_exact(&mut path_buf).await?;
-        let path = String::from_utf8(path_buf).map_err(|_| VfsError::Internal("Invalid UTF8 path".to_string()))?;
+        let path = String::from_utf8(path_buf)
+            .map_err(|_| VfsError::Internal("Invalid UTF8 path".to_string()))?;
 
         self.ingestion.flush_file(&path).await?;
-        
+
         stream.write_all(&[0x00]).await?;
         Ok(())
     }
@@ -298,13 +318,14 @@ impl RpcRouter {
         if path_len > 4096 {
             return Err(VfsError::Internal(format!("Path too long: {}", path_len)));
         }
-        
+
         let mut path_buf = vec![0u8; path_len as usize];
         stream.read_exact(&mut path_buf).await?;
-        let path = String::from_utf8(path_buf).map_err(|_| VfsError::Internal("Invalid UTF8 path".to_string()))?;
+        let path = String::from_utf8(path_buf)
+            .map_err(|_| VfsError::Internal("Invalid UTF8 path".to_string()))?;
 
         self.metadata.delete_file(&path).await?;
-        
+
         stream.write_all(&[0x00]).await?;
         Ok(())
     }
@@ -396,7 +417,12 @@ mod tests {
         async fn delete_file(&self, _path: &str) -> Result<()> {
             Ok(())
         }
-        async fn persist_proposal(&self, _pid_bytes: [u8; 16], _status: u8, _op_bytes: &[u8]) -> Result<()> {
+        async fn persist_proposal(
+            &self,
+            _pid_bytes: [u8; 16],
+            _status: u8,
+            _op_bytes: &[u8],
+        ) -> Result<()> {
             Ok(())
         }
         async fn load_consensus_log(&self) -> Result<Vec<([u8; 16], u8, Vec<u8>)>> {
@@ -486,7 +512,11 @@ mod tests {
             assert_eq!(decision, RoutingDecision::Forward(owner.clone()));
         }
 
-        let other_node_id = if owner.id == "node1" { "node2" } else { "node1" };
+        let other_node_id = if owner.id == "node1" {
+            "node2"
+        } else {
+            "node1"
+        };
         let router_other = RpcRouter::new(
             router.ingestion.clone(),
             router.metadata.clone(),
@@ -563,7 +593,10 @@ mod tests {
 
         // Write VOTE_REQUEST wire payload into client stream
         client_stream.write_all(&pid.to_wire_bytes()).await.unwrap();
-        client_stream.write_u64(op_bytes.len() as u64).await.unwrap();
+        client_stream
+            .write_u64(op_bytes.len() as u64)
+            .await
+            .unwrap();
         client_stream.write_all(&op_bytes).await.unwrap();
 
         // Process request on server stream
@@ -575,7 +608,10 @@ mod tests {
         assert_eq!(reply_opcode, 0x11);
 
         let mut reply_pid_bytes = [0u8; 16];
-        client_stream.read_exact(&mut reply_pid_bytes).await.unwrap();
+        client_stream
+            .read_exact(&mut reply_pid_bytes)
+            .await
+            .unwrap();
         let reply_pid = ProposalId::from_wire_bytes(&reply_pid_bytes).unwrap();
         assert_eq!(reply_pid, pid);
 
@@ -635,7 +671,10 @@ mod tests {
         }
 
         client_stream.write_all(&pid.to_wire_bytes()).await.unwrap();
-        client_stream.write_u64(op_bytes.len() as u64).await.unwrap();
+        client_stream
+            .write_u64(op_bytes.len() as u64)
+            .await
+            .unwrap();
         client_stream.write_all(&op_bytes).await.unwrap();
 
         let res = router.process_vote_request(&mut server_stream).await;
@@ -645,7 +684,10 @@ mod tests {
         assert_eq!(reply_opcode, 0x11);
 
         let mut reply_pid_bytes = [0u8; 16];
-        client_stream.read_exact(&mut reply_pid_bytes).await.unwrap();
+        client_stream
+            .read_exact(&mut reply_pid_bytes)
+            .await
+            .unwrap();
         let reply_pid = ProposalId::from_wire_bytes(&reply_pid_bytes).unwrap();
         assert_eq!(reply_pid, pid);
 
@@ -733,7 +775,11 @@ mod tests {
             ..Default::default()
         };
 
-        let metadata = Arc::new(crate::metadata::RedbMetadataEngine::init(&config).await.unwrap());
+        let metadata = Arc::new(
+            crate::metadata::RedbMetadataEngine::init(&config)
+                .await
+                .unwrap(),
+        );
         let block_manager = Arc::new(DummyBlockManager);
         let archipelago = Arc::new(tokio::sync::RwLock::new(
             crate::consensus::archipelago::ArchipelagoState::new(1),
@@ -749,7 +795,11 @@ mod tests {
         let cluster_map = Arc::new(cluster_map);
 
         let router = RpcRouter::new(
-            Arc::new(IngestionBuffer::new(config, block_manager.clone(), metadata.clone())),
+            Arc::new(IngestionBuffer::new(
+                config,
+                block_manager.clone(),
+                metadata.clone(),
+            )),
             metadata.clone(),
             block_manager,
             cluster_map,
@@ -808,9 +858,17 @@ mod tests {
 
         // Instance 1: Initial sequence is loaded as 1. Push proposal will use seq 1 and advance counter to 2.
         {
-            let metadata = Arc::new(crate::metadata::RedbMetadataEngine::init(&config).await.unwrap());
+            let metadata = Arc::new(
+                crate::metadata::RedbMetadataEngine::init(&config)
+                    .await
+                    .unwrap(),
+            );
             let router = RpcRouter::new(
-                Arc::new(IngestionBuffer::new(config.clone(), block_manager.clone(), metadata.clone())),
+                Arc::new(IngestionBuffer::new(
+                    config.clone(),
+                    block_manager.clone(),
+                    metadata.clone(),
+                )),
                 metadata.clone(),
                 block_manager.clone(),
                 cluster_map.clone(),
@@ -837,9 +895,17 @@ mod tests {
 
         // Instance 2 (simulating restart): RpcRouter::new loads sequence from metadata engine
         {
-            let metadata2 = Arc::new(crate::metadata::RedbMetadataEngine::init(&config).await.unwrap());
+            let metadata2 = Arc::new(
+                crate::metadata::RedbMetadataEngine::init(&config)
+                    .await
+                    .unwrap(),
+            );
             let router2 = RpcRouter::new(
-                Arc::new(IngestionBuffer::new(config, block_manager.clone(), metadata2.clone())),
+                Arc::new(IngestionBuffer::new(
+                    config,
+                    block_manager.clone(),
+                    metadata2.clone(),
+                )),
                 metadata2.clone(),
                 block_manager,
                 cluster_map,
@@ -851,9 +917,12 @@ mod tests {
             .unwrap();
 
             let seq_loaded = router2.sequence.load(Ordering::SeqCst);
-            assert!(seq_loaded >= 2, "Loaded sequence {} should be >= 2 after 1 push", seq_loaded);
+            assert!(
+                seq_loaded >= 2,
+                "Loaded sequence {} should be >= 2 after 1 push",
+                seq_loaded
+            );
             assert_eq!(seq_loaded, 2);
         }
     }
 }
-

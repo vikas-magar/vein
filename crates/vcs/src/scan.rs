@@ -6,8 +6,8 @@ use iceberg::expr::Predicate;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 
-use error::{Result, VeinError};
 use crate::plan_cache::{ScanPlan, ScanPlanCache, ScanPlanKey};
+use error::{Result, VeinError};
 
 /// Compute a stable fingerprint for a predicate expression.
 /// We use std::hash on the Debug representation — not cryptographic,
@@ -93,7 +93,10 @@ pub async fn plan_scan(
     // Returns a stream of FileScanTask for surviving data files only.
     let task_stream = scan.plan_files().await.map_err(VeinError::Iceberg)?;
 
-    let tasks: Vec<FileScanTask> = task_stream.try_collect().await.map_err(VeinError::Iceberg)?;
+    let tasks: Vec<FileScanTask> = task_stream
+        .try_collect()
+        .await
+        .map_err(VeinError::Iceberg)?;
 
     tracing::info!(
         table = ?table.identifier(),

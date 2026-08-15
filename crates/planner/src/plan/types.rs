@@ -1,7 +1,5 @@
 use crate::expr::LogicalExpr;
 
-
-
 /// Defines sorting order for a specific key
 #[derive(Debug, Clone, PartialEq)]
 pub struct SortKey {

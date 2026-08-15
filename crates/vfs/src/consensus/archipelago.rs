@@ -1,10 +1,10 @@
 //! Archipelago leaderless SMR protocol state and types.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use crate::VfsError;
 use crate::consensus::op::ConsensusOp;
 use crate::metadata::MetadataEngine;
-use crate::VfsError;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Unique identifier for a proposal in Archipelago consensus.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -192,7 +192,11 @@ impl ArchipelagoState {
                     }
                 };
                 if let Err(e) = ConsensusOp::deserialize(&op_bytes) {
-                    tracing::warn!("Failed to deserialize ConsensusOp for proposal {:?}: {}", pid, e);
+                    tracing::warn!(
+                        "Failed to deserialize ConsensusOp for proposal {:?}: {}",
+                        pid,
+                        e
+                    );
                     continue;
                 }
 
@@ -220,9 +224,14 @@ mod tests {
     #[test]
     fn test_proposal_lifecycle() {
         let mut state = ArchipelagoState::new(3);
-        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 1,
+        };
 
-        state.propose(pid.clone(), b"metadata_payload".to_vec()).unwrap();
+        state
+            .propose(pid.clone(), b"metadata_payload".to_vec())
+            .unwrap();
         assert_eq!(state.get_status(&pid), Some(ProposalState::Proposed));
 
         state.vote(&pid, "node2").unwrap(); // 2nd vote (node1 implicitly voted when proposing)
@@ -232,7 +241,10 @@ mod tests {
     #[test]
     fn test_single_node_quorum_instant_commit() {
         let mut state = ArchipelagoState::new(1);
-        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 1,
+        };
 
         state.propose(pid.clone(), b"single_node".to_vec()).unwrap();
         assert_eq!(state.get_status(&pid), Some(ProposalState::Committed));
@@ -241,7 +253,10 @@ mod tests {
     #[test]
     fn test_vote_unknown_proposal_returns_not_found() {
         let mut state = ArchipelagoState::new(3);
-        let pid = ProposalId { node_id: "node1".into(), sequence: 999 };
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 999,
+        };
 
         let res = state.vote(&pid, "node2");
         assert!(matches!(res, Err(VfsError::NotFound(_))));
@@ -250,7 +265,10 @@ mod tests {
     #[test]
     fn test_duplicate_vote_does_not_double_count() {
         let mut state = ArchipelagoState::new(3);
-        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 1,
+        };
 
         state.propose(pid.clone(), b"test".to_vec()).unwrap();
         assert_eq!(state.get_status(&pid), Some(ProposalState::Proposed));
@@ -263,7 +281,10 @@ mod tests {
     #[test]
     fn test_duplicate_proposal_returns_error() {
         let mut state = ArchipelagoState::new(3);
-        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 1,
+        };
 
         state.propose(pid.clone(), b"payload1".to_vec()).unwrap();
         let res = state.propose(pid.clone(), b"payload2".to_vec());
@@ -272,7 +293,10 @@ mod tests {
 
     #[test]
     fn test_proposal_id_wire_bytes_roundtrip() {
-        let pid = ProposalId { node_id: "node1".into(), sequence: 42 };
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 42,
+        };
         let bytes = pid.to_wire_bytes();
         assert_eq!(bytes.len(), 16);
         let parsed = ProposalId::from_wire_bytes(&bytes).unwrap();
@@ -282,7 +306,10 @@ mod tests {
     #[test]
     fn test_propose_with_callback_fires_oneshot_on_quorum() {
         let mut state = ArchipelagoState::new(3);
-        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 1,
+        };
         let (tx, mut rx) = tokio::sync::oneshot::channel();
 
         state
@@ -290,7 +317,10 @@ mod tests {
             .unwrap();
 
         // 1 vote out of 3, quorum is 2 -> callback not fired yet
-        assert_eq!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
         assert_eq!(state.get_status(&pid), Some(ProposalState::Proposed));
 
         // 2nd vote reaches quorum -> callback fires
@@ -302,7 +332,10 @@ mod tests {
     #[test]
     fn test_propose_with_callback_does_not_fire_without_quorum() {
         let mut state = ArchipelagoState::new(3);
-        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 1,
+        };
         let (tx, mut rx) = tokio::sync::oneshot::channel();
 
         state
@@ -310,14 +343,20 @@ mod tests {
             .unwrap();
 
         // Quorum is 2, only 1 vote exists -> callback does not fire
-        assert_eq!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
         assert_eq!(state.get_status(&pid), Some(ProposalState::Proposed));
     }
 
     #[test]
     fn test_propose_with_callback_timed_out_receiver_no_panic() {
         let mut state = ArchipelagoState::new(3);
-        let pid = ProposalId { node_id: "node1".into(), sequence: 1 };
+        let pid = ProposalId {
+            node_id: "node1".into(),
+            sequence: 1,
+        };
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         state

@@ -1,16 +1,16 @@
-pub mod quic_dispatcher;
 pub mod elasticity;
+pub mod quic_dispatcher;
 
 use crate::executor::ExecutorRegistry;
 use crate::planner::dag::StageDag;
+use crate::traits::TaskDispatcher;
+use common::cancellation::CancellationToken;
 use common::identifiers::{QueryId, TaskId};
 use common::protocol::{ExecuteTask, ExecutionMode};
-use crate::traits::TaskDispatcher;
 use error::VeinError;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
-use common::cancellation::CancellationToken;
 
 /// Orchestrates the execution of a StageDag across the cluster.
 pub struct Scheduler {
@@ -45,7 +45,9 @@ impl Scheduler {
     ) -> Result<(), VeinError> {
         match dag.mode() {
             ExecutionMode::Batch => self.execute_batch_waves(query_id, dag, cancel).await,
-            ExecutionMode::Streaming => self.execute_streaming_topology(query_id, dag, cancel).await,
+            ExecutionMode::Streaming => {
+                self.execute_streaming_topology(query_id, dag, cancel).await
+            }
         }
     }
 

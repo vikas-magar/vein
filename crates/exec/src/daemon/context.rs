@@ -1,9 +1,9 @@
-use std::sync::Arc;
-use dashmap::DashMap;
-use common::cancellation::CancellationToken;
-use common::identifiers::{TaskId, NodeId};
-use s2n_quic::Client;
 use crate::daemon::pipeline::MorselTask;
+use common::cancellation::CancellationToken;
+use common::identifiers::{NodeId, TaskId};
+use dashmap::DashMap;
+use s2n_quic::Client;
+use std::sync::Arc;
 
 /// Shared state for the Executor Daemon.
 pub struct DaemonContext {

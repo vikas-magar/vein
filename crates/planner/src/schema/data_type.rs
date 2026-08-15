@@ -74,7 +74,7 @@ pub enum VeinDataType {
     Map(Box<VeinDataType>, Box<VeinDataType>),
 
     // ── Microservice & Ecosystem Extensions ───────────────
-    /// Semi-structured JSON payload. Vein will target eBPF extraction 
+    /// Semi-structured JSON payload. Vein will target eBPF extraction
     /// for this directly from the QUIC network socket into Arrow StringView.
     Variant,
     /// Custom User-Defined Type (UDT). Name + underlying physical fallback type.
@@ -84,7 +84,7 @@ pub enum VeinDataType {
 impl VeinDataType {
     /// Converts to Apache Arrow memory layouts exactly when the CPU is ready to process.
     pub fn to_arrow(&self) -> arrow::datatypes::DataType {
-        use arrow::datatypes::{DataType, Field, TimeUnit, IntervalUnit};
+        use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit};
         use std::sync::Arc;
 
         match self {
@@ -101,7 +101,7 @@ impl VeinDataType {
             VeinDataType::Float16 => DataType::Float16,
             VeinDataType::Float32 => DataType::Float32,
             VeinDataType::Float64 => DataType::Float64,
-            
+
             VeinDataType::Utf8 => DataType::Utf8,
             VeinDataType::LargeUtf8 => DataType::LargeUtf8,
             VeinDataType::StringView => DataType::Utf8View,
@@ -112,33 +112,43 @@ impl VeinDataType {
 
             VeinDataType::Date32 => DataType::Date32,
             VeinDataType::Time64 => DataType::Time64(TimeUnit::Microsecond),
-            VeinDataType::Timestamp(tz) => DataType::Timestamp(TimeUnit::Microsecond, tz.as_deref().map(|s| s.into())),
+            VeinDataType::Timestamp(tz) => {
+                DataType::Timestamp(TimeUnit::Microsecond, tz.as_deref().map(|s| s.into()))
+            }
             VeinDataType::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
-            
+
             VeinDataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
-            
-            VeinDataType::List(inner) => DataType::List(Arc::new(Field::new("item", inner.to_arrow(), true))),
-            VeinDataType::FixedSizeList(inner, size) => DataType::FixedSizeList(Arc::new(Field::new("item", inner.to_arrow(), true)), *size),
-            VeinDataType::Vector(dim) => DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), *dim as i32),
+
+            VeinDataType::List(inner) => {
+                DataType::List(Arc::new(Field::new("item", inner.to_arrow(), true)))
+            }
+            VeinDataType::FixedSizeList(inner, size) => {
+                DataType::FixedSizeList(Arc::new(Field::new("item", inner.to_arrow(), true)), *size)
+            }
+            VeinDataType::Vector(dim) => DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                *dim as i32,
+            ),
             VeinDataType::Struct(fields) => {
-                let arrow_fields = fields.iter()
+                let arrow_fields = fields
+                    .iter()
                     .map(|f| Field::new(&f.name, f.data_type.to_arrow(), true))
                     .collect();
                 DataType::Struct(arrow_fields)
-            },
+            }
             VeinDataType::Map(key, value) => {
                 let keys = Field::new("key", key.to_arrow(), false);
                 let values = Field::new("value", value.to_arrow(), true);
                 let struct_type = DataType::Struct(vec![keys, values].into());
                 DataType::Map(Arc::new(Field::new("entries", struct_type, false)), false)
-            },
+            }
 
             // Microservice Extensions
             // Variants are stored as StringView in memory for blazing fast eBPF JSON extractions
-            VeinDataType::Variant => DataType::Utf8View, 
-            
+            VeinDataType::Variant => DataType::Utf8View,
+
             VeinDataType::Extension(_name, fallback) => {
-                // In Arrow, extension types are represented by the fallback DataType 
+                // In Arrow, extension types are represented by the fallback DataType
                 // combined with Schema Field metadata (which is handled during schema generation, not here).
                 fallback.to_arrow()
             }

@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use aya::{
+    Ebpf,
     maps::{HashMap, MapData, XskMap},
-    programs, Ebpf,
+    programs,
 };
 use s2n_quic::provider::io::{
     self,
     xdp::{
-        bpf, encoder,
+        Provider, bpf, encoder,
         if_xdp::{self, XdpFlags},
         io::{
             self as xdp_io,
@@ -16,7 +17,7 @@ use s2n_quic::provider::io::{
         },
         ring, socket, syscall,
         tx::{self, TxExt as _},
-        umem, Provider,
+        umem,
     },
 };
 use s2n_quic_core::task::cooldown::Cooldown;

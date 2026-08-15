@@ -1,6 +1,6 @@
 use crate::daemon::pipeline::{PipelineBreaker, PipelineNode, VeinBatch};
-use common::transport::QuicClient;
 use common::Result;
+use common::transport::QuicClient;
 
 /// A pipeline sink that partitions data and writes to a virtual file system.
 pub struct VfsSink {
@@ -16,7 +16,11 @@ pub struct VfsSink {
 
 impl VfsSink {
     /// Create a new VfsSink instance
-    pub fn new(client: Option<QuicClient>, num_partitions: usize, flush_threshold_bytes: usize) -> Self {
+    pub fn new(
+        client: Option<QuicClient>,
+        num_partitions: usize,
+        flush_threshold_bytes: usize,
+    ) -> Self {
         let mut buffers = Vec::with_capacity(num_partitions);
         for _ in 0..num_partitions {
             buffers.push(Vec::new());
@@ -31,7 +35,7 @@ impl VfsSink {
 
     /// Mock flush function. In a real system, it would serialize the Arrow batch and push via QUIC.
     pub async fn flush_partition_to_vfs(&mut self, partition_id: usize) -> Result<()> {
-        // In a complete implementation, this would serialize `self.buffers[partition_id]` to Arrow IPC 
+        // In a complete implementation, this would serialize `self.buffers[partition_id]` to Arrow IPC
         // and send a custom RPC via `self.client.connection.open_bi()`.
         // For now, we clear the buffer to represent successful flushing.
         self.buffers[partition_id].clear();
@@ -45,9 +49,10 @@ impl PipelineNode for VfsSink {
         if !self.buffers.is_empty() {
             self.buffers[0].push(batch);
             // 2. We mock checking the threshold.
-            if self.buffers[0].len() > 100 { // mock threshold
+            if self.buffers[0].len() > 100 {
+                // mock threshold
                 // trigger async flush (which is tricky inside a sync trait, so we just clear for the stub)
-                self.buffers[0].clear(); 
+                self.buffers[0].clear();
             }
         }
         Ok(())
@@ -87,7 +92,8 @@ mod tests {
     #[test]
     fn test_vfs_sink_push() {
         let mut sink = dummy_vfs_sink();
-        let batch = VeinBatch::Factorized(crate::daemon::pipeline::FactorizedChunk { blocks: vec![] });
+        let batch =
+            VeinBatch::Factorized(crate::daemon::pipeline::FactorizedChunk { blocks: vec![] });
         sink.push(batch).unwrap();
         assert_eq!(sink.buffers[0].len(), 1);
     }

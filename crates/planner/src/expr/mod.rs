@@ -12,6 +12,6 @@ pub mod volatility;
 /// Module containing the type inference implementation for LogicalExpr.
 pub mod inference;
 
-pub use logical::LogicalExpr;
 pub use literal::LogicalLiteral;
+pub use logical::LogicalExpr;
 pub use volatility::Volatility;

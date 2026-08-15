@@ -3,8 +3,6 @@ use std::sync::Arc;
 use iceberg::scan::FileScanTask;
 use moka::future::Cache;
 
-
-
 /// Cache key: (table namespace + name, snapshot_id, predicate_fingerprint)
 /// predicate_fingerprint = 0 means "no predicate" (full scan).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

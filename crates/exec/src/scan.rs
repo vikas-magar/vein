@@ -9,7 +9,6 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use error::{Result, VeinError};
 
-
 /// A `SourceStage` that reads a local Parquet file and produces `RecordBatch`es.
 pub struct ParquetScanStage {
     file_path: String,
@@ -79,7 +78,8 @@ impl ParquetScanStage {
                             .map_err(|e| VeinError::internal(format!("re-wrap: {e}")))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Box::new(batches.into_iter().map(Ok)) as Box<dyn Iterator<Item = Result<RecordBatch>> + Send>
+                Box::new(batches.into_iter().map(Ok))
+                    as Box<dyn Iterator<Item = Result<RecordBatch>> + Send>
             } else {
                 let reader = builder
                     .build()
@@ -87,7 +87,8 @@ impl ParquetScanStage {
                 let batches: Vec<RecordBatch> = reader
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|e| VeinError::internal(format!("read batches: {e}")))?;
-                Box::new(batches.into_iter().map(Ok)) as Box<dyn Iterator<Item = Result<RecordBatch>> + Send>
+                Box::new(batches.into_iter().map(Ok))
+                    as Box<dyn Iterator<Item = Result<RecordBatch>> + Send>
             };
 
             Ok(reader)
@@ -119,8 +120,6 @@ impl ParquetScanStage {
             None => Ok(None),
         }
     }
-
-
 }
 
 #[cfg(test)]
@@ -192,9 +191,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.parquet");
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Int32, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let file = File::create(&path).unwrap();
         let writer = ArrowWriter::try_new(file, schema, None).unwrap();
         writer.close().unwrap();

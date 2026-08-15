@@ -14,4 +14,3 @@ pub enum LogicalLiteral {
     /// A string literal
     String(String),
 }
-

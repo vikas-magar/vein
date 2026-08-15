@@ -20,18 +20,33 @@ mod tests {
     //   AND l_quantity < 24
     #[test]
     fn test_tpch_q6() {
-        let q = parse_query("\
+        let q = parse_query(
+            "\
             FROM lineitem \
             |> WHERE l_shipdate >= DATE '1994-01-01' \
                AND l_shipdate < DATE '1995-01-01' \
                AND l_discount BETWEEN 0.05 AND 0.07 \
                AND l_quantity < 24 \
             |> AGGREGATE sum(l_extendedprice * l_discount) AS revenue \
-        ").unwrap();
-        assert_eq!(q.source, TableSource::Table { name: "lineitem".into(), alias: None });
+        ",
+        )
+        .expect("test should succeed");
+        assert_eq!(
+            q.source,
+            TableSource::Table {
+                name: "lineitem".into(),
+                alias: None
+            }
+        );
         assert_eq!(q.pipes.len(), 2);
-        assert!(matches!(q.pipes[0], PipeOperator::Where { .. }), "expected Where pipe");
-        assert!(matches!(q.pipes[1], PipeOperator::Aggregate { .. }), "expected Aggregate pipe");
+        assert!(
+            matches!(q.pipes[0], PipeOperator::Where { .. }),
+            "expected Where pipe"
+        );
+        assert!(
+            matches!(q.pipes[1], PipeOperator::Aggregate { .. }),
+            "expected Aggregate pipe"
+        );
 
         // Verify WHERE contains BETWEEN and typed string
         if let PipeOperator::Where { predicate } = &q.pipes[0] {
@@ -65,10 +80,19 @@ mod tests {
             |> WHERE o_orderdate >= DATE '1993-07-01' \
                AND o_orderdate < DATE '1993-10-01' \
                AND EXISTS (FROM lineitem |> WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate) \
-        ").unwrap();
-        assert_eq!(q.source, TableSource::Table { name: "orders".into(), alias: None });
+        ").expect("test should succeed");
+        assert_eq!(
+            q.source,
+            TableSource::Table {
+                name: "orders".into(),
+                alias: None
+            }
+        );
         assert_eq!(q.pipes.len(), 1);
-        assert!(matches!(q.pipes[0], PipeOperator::Where { .. }), "expected Where pipe");
+        assert!(
+            matches!(q.pipes[0], PipeOperator::Where { .. }),
+            "expected Where pipe"
+        );
 
         if let PipeOperator::Where { predicate } = &q.pipes[0] {
             assert!(
@@ -94,17 +118,32 @@ mod tests {
     // ORDER BY l_shipmode
     #[test]
     fn test_tpch_q12() {
-        let q = parse_query("\
+        let q = parse_query(
+            "\
             FROM orders \
             |> JOIN lineitem ON o_orderkey = l_orderkey \
             |> WHERE l_shipmode IN ('MAIL', 'SHIP') \
                AND l_commitdate < l_receiptdate \
                AND l_receiptdate >= DATE '1994-01-01' \
-        ").unwrap();
-        assert_eq!(q.source, TableSource::Table { name: "orders".into(), alias: None });
+        ",
+        )
+        .expect("test should succeed");
+        assert_eq!(
+            q.source,
+            TableSource::Table {
+                name: "orders".into(),
+                alias: None
+            }
+        );
         assert_eq!(q.pipes.len(), 2);
-        assert!(matches!(q.pipes[0], PipeOperator::Join { .. }), "expected Join pipe");
-        assert!(matches!(q.pipes[1], PipeOperator::Where { .. }), "expected Where pipe");
+        assert!(
+            matches!(q.pipes[0], PipeOperator::Join { .. }),
+            "expected Join pipe"
+        );
+        assert!(
+            matches!(q.pipes[1], PipeOperator::Where { .. }),
+            "expected Where pipe"
+        );
 
         if let PipeOperator::Where { predicate } = &q.pipes[1] {
             assert!(
@@ -130,7 +169,8 @@ mod tests {
     //   AND l_shipmode IN ('AIR', 'AIR REG'))
     #[test]
     fn test_tpch_q19() {
-        let q = parse_query("\
+        let q = parse_query(
+            "\
             FROM lineitem \
             |> JOIN part ON p_partkey = l_partkey \
             |> WHERE (p_brand = 'Brand#12' \
@@ -144,12 +184,29 @@ mod tests {
                AND p_size BETWEEN 1 AND 10 \
                AND l_shipmode IN ('AIR', 'AIR REG')) \
             |> AGGREGATE sum(l_extendedprice * (1 - l_discount)) AS revenue \
-        ").unwrap();
-        assert_eq!(q.source, TableSource::Table { name: "lineitem".into(), alias: None });
+        ",
+        )
+        .expect("test should succeed");
+        assert_eq!(
+            q.source,
+            TableSource::Table {
+                name: "lineitem".into(),
+                alias: None
+            }
+        );
         assert_eq!(q.pipes.len(), 3);
-        assert!(matches!(q.pipes[0], PipeOperator::Join { .. }), "expected Join pipe");
-        assert!(matches!(q.pipes[1], PipeOperator::Where { .. }), "expected Where pipe");
-        assert!(matches!(q.pipes[2], PipeOperator::Aggregate { .. }), "expected Aggregate pipe");
+        assert!(
+            matches!(q.pipes[0], PipeOperator::Join { .. }),
+            "expected Join pipe"
+        );
+        assert!(
+            matches!(q.pipes[1], PipeOperator::Where { .. }),
+            "expected Where pipe"
+        );
+        assert!(
+            matches!(q.pipes[2], PipeOperator::Aggregate { .. }),
+            "expected Aggregate pipe"
+        );
     }
 
     // --- helper functions ---
@@ -206,7 +263,8 @@ mod tests {
     // ORDER BY l_returnflag, l_linestatus
     #[test]
     fn test_tpch_q1() {
-        let q = parse_query("\
+        let q = parse_query(
+            "\
             FROM lineitem \
             |> WHERE l_shipdate <= DATE '1998-09-02' \
             |> AGGREGATE \
@@ -220,19 +278,39 @@ mod tests {
                 count(*) AS count_order \
                GROUP BY l_returnflag, l_linestatus \
             |> ORDER l_returnflag, l_linestatus \
-        ").unwrap();
-        
-        assert_eq!(q.source, TableSource::Table { name: "lineitem".into(), alias: None });
+        ",
+        )
+        .expect("test should succeed");
+
+        assert_eq!(
+            q.source,
+            TableSource::Table {
+                name: "lineitem".into(),
+                alias: None
+            }
+        );
         assert_eq!(q.pipes.len(), 3);
-        
+
         assert!(matches!(q.pipes[0], PipeOperator::Where { .. }));
         assert!(matches!(q.pipes[1], PipeOperator::Aggregate { .. }));
         assert!(matches!(q.pipes[2], PipeOperator::OrderBy { .. }));
-        
-        if let PipeOperator::Aggregate { group_by, aggregates } = &q.pipes[1] {
-            assert_eq!(group_by.len(), 2, "l_returnflag and l_linestatus should be in group_by");
-            assert_eq!(aggregates.len(), 8, "All 8 aggregate functions should be in aggregates");
-            
+
+        if let PipeOperator::Aggregate {
+            group_by,
+            aggregates,
+        } = &q.pipes[1]
+        {
+            assert_eq!(
+                group_by.len(),
+                2,
+                "l_returnflag and l_linestatus should be in group_by"
+            );
+            assert_eq!(
+                aggregates.len(),
+                8,
+                "All 8 aggregate functions should be in aggregates"
+            );
+
             assert_eq!(aggregates[0].alias.as_deref(), Some("sum_qty"));
             assert_eq!(aggregates[7].alias.as_deref(), Some("count_order"));
         }

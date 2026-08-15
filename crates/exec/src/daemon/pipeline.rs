@@ -1,10 +1,10 @@
 // Removed unused RecordBatch
-use common::identifiers::TaskId;
-use std::sync::Arc;
-use common::protocol::{DataSource, DataSink, Operator};
-use common::Result;
 use arrow::array::ArrayRef;
+use common::Result;
 use common::arrow::SelectionVector;
+use common::identifiers::TaskId;
+use common::protocol::{DataSink, DataSource, Operator};
+use std::sync::Arc;
 
 /// A physical column of data (wraps Arrow Arrays for now).
 #[derive(Debug, Clone)]
@@ -65,7 +65,7 @@ pub struct MorselTask {
 pub trait PipelineNode: Send + Sync {
     /// Pushes a chunk of data into the operator.
     fn push(&mut self, batch: VeinBatch) -> Result<()>;
-    
+
     /// Signals that no more data will be pushed.
     fn flush(&mut self) -> Result<()>;
 }

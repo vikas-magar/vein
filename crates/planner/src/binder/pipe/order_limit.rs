@@ -1,10 +1,10 @@
+use crate::binder::context::BinderContext;
+use crate::binder::expr::ExprBinder;
+use crate::binder::scope::ScopeStack;
+use crate::plan::traversal::PlanTraversal;
+use crate::plan::{LogicalPlan, SortKey};
 use error::Result;
 use parser::ast::pipe_op::OrderByExpr;
-use crate::plan::{LogicalPlan, SortKey};
-use crate::plan::traversal::PlanTraversal;
-use crate::binder::context::BinderContext;
-use crate::binder::scope::ScopeStack;
-use crate::binder::expr::ExprBinder;
 
 /// Binds a PipeOperator::OrderBy into a LogicalPlan::Sort
 pub async fn bind_order_by<'a>(
@@ -15,7 +15,7 @@ pub async fn bind_order_by<'a>(
 ) -> Result<LogicalPlan> {
     let mut expr_binder = ExprBinder::new(context, scopes);
     let mut sort_keys = Vec::new();
-    
+
     for ob in order_bys {
         let expr = expr_binder.bind(&ob.expr).await?;
         sort_keys.push(SortKey {

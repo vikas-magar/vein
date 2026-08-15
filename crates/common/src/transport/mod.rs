@@ -7,14 +7,14 @@ pub mod connection;
 pub mod quic_client;
 
 // Re-export core types for easier access
+use crate::{Result, VeinError};
 pub use connection::ConnectionManager;
 pub use quic_client::QuicClient;
-use s2n_quic::{Client, Server};
 use s2n_quic::provider::tls;
-use std::path::Path;
-use std::net::SocketAddr;
-use crate::{VeinError, Result};
+use s2n_quic::{Client, Server};
 use std::fs;
+use std::net::SocketAddr;
+use std::path::Path;
 
 /// Builds an s2n-quic Server using certificates from disk.
 pub fn build_quic_server<P: AsRef<Path>>(
@@ -45,9 +45,7 @@ pub fn build_quic_server<P: AsRef<Path>>(
 }
 
 /// Builds an s2n-quic Client trusting the provided CA certificate.
-pub fn build_quic_client<P: AsRef<Path>>(
-    ca_cert_path: P,
-) -> Result<Client> {
+pub fn build_quic_client<P: AsRef<Path>>(ca_cert_path: P) -> Result<Client> {
     let ca_pem = fs::read_to_string(ca_cert_path.as_ref())
         .map_err(|e| VeinError::internal(format!("Failed to read CA cert file: {}", e)))?;
 

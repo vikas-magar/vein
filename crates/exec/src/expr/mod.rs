@@ -23,19 +23,19 @@ pub trait PhysicalExpr: Debug + Send + Sync {
     fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef>;
 }
 
+/// Binary expression implementations.
+pub mod binary;
+/// Cast expression implementations.
+pub mod cast;
 /// Column expression implementations.
 pub mod column;
 /// Literal expression implementations.
 pub mod literal;
-/// Cast expression implementations.
-pub mod cast;
-/// Binary expression implementations.
-pub mod binary;
 /// Function registry and Scalar UDF implementations.
 pub mod registry;
 
+pub use binary::{BinaryExpr, BinaryOperator};
+pub use cast::CastExpr;
 pub use column::ColumnExpr;
 pub use literal::{LiteralExpr, LiteralValue};
-pub use cast::CastExpr;
-pub use binary::{BinaryExpr, BinaryOperator};
-pub use registry::{FunctionRegistry, ScalarUDFImpl, ScalarFunctionExpr};
+pub use registry::{FunctionRegistry, ScalarFunctionExpr, ScalarUDFImpl};

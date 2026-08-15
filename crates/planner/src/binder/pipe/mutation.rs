@@ -1,12 +1,12 @@
-use error::{Result, VeinError};
-use parser::ast::pipe_op::SelectItem;
-use parser::ast::expr::SpannedExpr;
-use crate::plan::LogicalPlan;
-use crate::schema::VeinSchema;
 use crate::binder::context::BinderContext;
-use crate::binder::scope::ScopeStack;
-use crate::plan::traversal::PlanTraversal;
 use crate::binder::expr::ExprBinder;
+use crate::binder::scope::ScopeStack;
+use crate::plan::LogicalPlan;
+use crate::plan::traversal::PlanTraversal;
+use crate::schema::VeinSchema;
+use error::{Result, VeinError};
+use parser::ast::expr::SpannedExpr;
+use parser::ast::pipe_op::SelectItem;
 
 /// Binds a PipeOperator::Extend (Adds columns without dropping existing ones)
 pub async fn bind_extend<'a>(
@@ -17,17 +17,20 @@ pub async fn bind_extend<'a>(
 ) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = input.schema().fields.clone();
-    
+
     // 1. Push all existing columns from the input schema
     for col in &input.schema().fields {
         bound_exprs.push(crate::expr::LogicalExpr::Column(col.clone()));
     }
-    
+
     // 2. Push the new extended columns
     for item in items {
         let bound_expr = ExprBinder::new(context, scopes).bind(&item.expr).await?;
-        let col_name = item.alias.map(|a| a.to_string()).unwrap_or_else(|| "unnamed_expr".to_string());
-        
+        let col_name = item
+            .alias
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unnamed_expr".to_string());
+
         let new_col = crate::schema::ResolvedColumn {
             id: context.next_id(),
             name: col_name,
@@ -35,17 +38,17 @@ pub async fn bind_extend<'a>(
             data_type: bound_expr.data_type(),
             is_factorized: false,
         };
-        
+
         new_fields.push(new_col);
         bound_exprs.push(bound_expr);
     }
-    
+
     // 3. Make the new extended schema available to downstream pipe operators
     scopes.push(crate::binder::scope::Scope {
         columns: new_fields.clone(),
         qualifier: None,
     });
-    
+
     Ok(LogicalPlan::Project {
         input: Box::new(input),
         exprs: bound_exprs,
@@ -62,12 +65,15 @@ pub async fn bind_set<'a>(
 ) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = input.schema().fields.clone();
-    
+
     // Pass through or overwrite existing columns
     for col in &input.schema().fields {
-        if let Some((_, expr)) = assignments.iter().find(|(name, _)| *name == col.name.as_str()) {
+        if let Some((_, expr)) = assignments
+            .iter()
+            .find(|(name, _)| *name == col.name.as_str())
+        {
             let bound_expr = ExprBinder::new(context, scopes).bind(expr).await?;
-            
+
             let new_col = crate::schema::ResolvedColumn {
                 id: context.next_id(),
                 name: col.name.clone(),
@@ -75,7 +81,7 @@ pub async fn bind_set<'a>(
                 data_type: bound_expr.data_type(),
                 is_factorized: false,
             };
-            
+
             if let Some(pos) = new_fields.iter().position(|f| f.name == col.name) {
                 new_fields[pos] = new_col;
             }
@@ -84,11 +90,19 @@ pub async fn bind_set<'a>(
             bound_exprs.push(crate::expr::LogicalExpr::Column(col.clone()));
         }
     }
-    
+
     // Check if any assignment targeted a non-existent column
     for (name, _) in assignments {
-        if !input.schema().fields.iter().any(|f| f.name.as_str() == *name) {
-            return Err(VeinError::internal(format!("SET operator cannot find column '{}'", name)));
+        if !input
+            .schema()
+            .fields
+            .iter()
+            .any(|f| f.name.as_str() == *name)
+        {
+            return Err(VeinError::internal(format!(
+                "SET operator cannot find column '{}'",
+                name
+            )));
         }
     }
 
@@ -96,7 +110,7 @@ pub async fn bind_set<'a>(
         columns: new_fields.clone(),
         qualifier: None,
     });
-    
+
     // Translates to a projection that overwrites specific columns
     Ok(LogicalPlan::Project {
         input: Box::new(input),
@@ -113,7 +127,7 @@ pub fn bind_drop<'a>(
 ) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = Vec::new();
-    
+
     for col in &input.schema().fields {
         if !columns.contains(&col.name.as_str()) {
             bound_exprs.push(crate::expr::LogicalExpr::Column(col.clone()));
@@ -142,7 +156,7 @@ pub fn bind_rename<'a>(
 ) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = input.schema().fields.clone();
-    
+
     for col in &mut new_fields {
         if let Some((_, new_name)) = renames.iter().find(|(old, _)| *old == col.name.as_str()) {
             col.name = (*new_name).to_string();

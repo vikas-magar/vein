@@ -1,5 +1,5 @@
 //! Daemon architecture for the Executor node.
-//! 
+//!
 //! Uses Asynchronous Morsel-Driven LocalSets to perfectly balance
 //! network IO (QUIC) and CPU cache-local push pipelines.
 

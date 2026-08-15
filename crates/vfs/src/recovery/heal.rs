@@ -102,7 +102,6 @@ impl Default for HealDaemon {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,4 +180,3 @@ mod tests {
         first.unwrap().abort();
     }
 }
-

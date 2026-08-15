@@ -1,7 +1,7 @@
 use common::identifiers::StageId;
 use common::protocol::{DataSink, DataSource, ExecutionMode, Operator};
-use std::collections::{HashMap, HashSet};
 use error::VeinError;
+use std::collections::{HashMap, HashSet};
 
 /// A physical execution stage that can be run on a compute node.
 #[derive(Debug, Clone)]
@@ -13,7 +13,7 @@ pub struct Stage {
 }
 
 impl Stage {
-    /// Generates physical morsels for this stage based on the underlying data source 
+    /// Generates physical morsels for this stage based on the underlying data source
     /// (e.g., Parquet row groups, VFS blocks).
     /// This abstracts the Hybrid Elastic Morsel Splitting away from the dispatch loop.
     pub fn generate_morsels(&self) -> Vec<common::protocol::MorselTask> {
@@ -21,7 +21,7 @@ impl Stage {
         // into balanced `MorselTask`s to prevent skew.
         // For now, we return a dynamic number of chunks as a placeholder.
         let mut morsels = Vec::new();
-        let chunk_count = 10; 
+        let chunk_count = 10;
         for _ in 0..chunk_count {
             morsels.push(common::protocol::MorselTask {
                 task_id: common::identifiers::TaskId::new(),
@@ -74,7 +74,7 @@ impl StageDag {
         }
 
         // TODO: Full cycle detection validation.
-        
+
         Ok(Self {
             stages,
             edges,
@@ -98,7 +98,7 @@ impl StageDag {
     pub fn topological_order(&self) -> Vec<StageId> {
         let mut order = Vec::new();
         let mut visited = HashSet::new();
-        
+
         fn visit(
             node: StageId,
             adj: &HashMap<StageId, Vec<StageId>>,
@@ -119,7 +119,7 @@ impl StageDag {
 
         // We want leaves first, so we actually want reverse topological order from the output node.
         visit(self.output_stage, &self.adjacency, &mut visited, &mut order);
-        
+
         // order now has output_stage last, and leaves first.
         order
     }

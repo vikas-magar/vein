@@ -1,9 +1,14 @@
 use std::sync::Arc;
 
 use iceberg::io::{
-    FileIO, FileIOBuilder,
+    FileIO,
+    FileIOBuilder,
     // Exact property key constants from iceberg-rust s3.rs config
-    S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
+    S3_ACCESS_KEY_ID,
+    S3_ENDPOINT,
+    S3_PATH_STYLE_ACCESS,
+    S3_REGION,
+    S3_SECRET_ACCESS_KEY,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 

@@ -94,8 +94,8 @@ mod tests {
     use super::*;
     use crate::expr::column::ColumnExpr;
     use arrow::array::Int64Array;
-    use arrow::datatypes::Field;
     use arrow::compute::kernels::numeric;
+    use arrow::datatypes::Field;
     use error::VeinError;
 
     /// A dummy UDF that simply adds 1 to an Int64 column.
@@ -120,8 +120,7 @@ mod tests {
         fn invoke(&self, args: &[ArrayRef]) -> Result<ArrayRef> {
             let input = &args[0];
             let ones = Arc::new(Int64Array::from(vec![1; input.len()])) as ArrayRef;
-            numeric::add(input, &ones)
-                .map_err(|e| VeinError::internal(format!("UDF error: {}", e)))
+            numeric::add(input, &ones).map_err(|e| VeinError::internal(format!("UDF error: {}", e)))
         }
     }
 
@@ -142,10 +141,10 @@ mod tests {
 
         let arg = Box::new(ColumnExpr::new("a", 0));
         let func_expr = ScalarFunctionExpr::new(retrieved, vec![arg]);
-        
+
         let result = func_expr.evaluate(&batch).unwrap();
         let result_int = result.as_any().downcast_ref::<Int64Array>().unwrap();
-        
+
         assert_eq!(result_int.value(0), 11);
         assert_eq!(result_int.value(1), 21);
         assert_eq!(result_int.value(2), 31);

@@ -1,8 +1,8 @@
-use crate::traits::JoinOptimizer;
 use crate::plan::LogicalPlan;
+use crate::traits::JoinOptimizer;
 
 /// The ADOPT (RL-Based Adaptive Join Optimizer).
-/// Uses Reinforcement Learning telemetry from the cluster to dynamically reorder 
+/// Uses Reinforcement Learning telemetry from the cluster to dynamically reorder
 /// join trees at runtime, preventing the Cartesian explosion problem.
 pub struct AdoptJoinOptimizer;
 

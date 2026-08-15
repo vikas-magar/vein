@@ -1,9 +1,9 @@
+use crate::expr::Volatility;
 use crate::plan::LogicalPlan;
 use crate::schema::{VeinDataType, VeinSchema};
-use crate::expr::Volatility;
+use async_trait::async_trait;
 use parser::ast::query::Query;
 use std::sync::Arc;
-use async_trait::async_trait;
 
 /// Supported runtimes for User-Defined Functions
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,5 +69,7 @@ pub trait JoinOptimizer: Send + Sync {
     /// Optimizes the join ordering for a given plan
     fn optimize_join(&self, plan: &LogicalPlan) -> common::Result<LogicalPlan>;
     /// Reports runtime telemetry for RL agent training
-    fn report_telemetry(&self) { todo!() }
+    fn report_telemetry(&self) {
+        todo!()
+    }
 }

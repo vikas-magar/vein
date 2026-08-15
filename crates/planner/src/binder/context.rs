@@ -1,8 +1,7 @@
-
-use std::collections::HashMap;
 use crate::plan::LogicalPlan;
-use crate::traits::{SchemaProvider, FunctionRegistry};
-use crate::schema::{VeinSchemaRef, ColumnId};
+use crate::schema::{ColumnId, VeinSchemaRef};
+use crate::traits::{FunctionRegistry, SchemaProvider};
+use std::collections::HashMap;
 
 /// Context for the binder, holding references to external catalogs and functions.
 pub struct BinderContext<'a> {

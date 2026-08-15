@@ -5,7 +5,7 @@ use common::Result;
 /// This acts as the payload storage for Hash Joins.
 pub struct FactorizedTable {
     /// The raw data blocks stored in this table.
-    /// In a real implementation, these would be laid out contiguously in memory 
+    /// In a real implementation, these would be laid out contiguously in memory
     /// pages, but we use a Vec of DataBlocks for this prototype.
     pub blocks: Vec<DataBlock>,
     /// Total number of rows stored across all blocks.
@@ -27,7 +27,7 @@ impl FactorizedTable {
         self.blocks.push(block);
         Ok(())
     }
-    
+
     /// Simulates looking up a match and appending it to an incoming chunk
     /// to produce a zero-copy factorized join result.
     pub fn lookup_and_append(&self, chunk: &mut FactorizedChunk, match_idx: usize) -> Result<()> {
@@ -69,18 +69,20 @@ mod tests {
     #[test]
     fn test_lookup_and_append() {
         let mut table = FactorizedTable::new();
-        table.append(DataBlock {
-            vectors: vec![],
-            selection: SelectionVector::new_dense(10),
-        }).unwrap();
-        table.append(DataBlock {
-            vectors: vec![],
-            selection: SelectionVector::new_dense(5),
-        }).unwrap();
+        table
+            .append(DataBlock {
+                vectors: vec![],
+                selection: SelectionVector::new_dense(10),
+            })
+            .unwrap();
+        table
+            .append(DataBlock {
+                vectors: vec![],
+                selection: SelectionVector::new_dense(5),
+            })
+            .unwrap();
 
-        let mut chunk = FactorizedChunk {
-            blocks: Vec::new(),
-        };
+        let mut chunk = FactorizedChunk { blocks: Vec::new() };
 
         // valid match
         table.lookup_and_append(&mut chunk, 1).unwrap();

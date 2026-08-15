@@ -1,4 +1,6 @@
+/// Expression parsing.
 pub mod expr;
+/// Statement parsing (DDL placeholder).
 pub mod stmt;
 
 mod aggregate;
@@ -34,6 +36,10 @@ pub(crate) mod test_utils;
 /// worker stacks while allowing legitimate deep expressions.
 const DEFAULT_RECURSION_LIMIT: usize = 512;
 
+/// A recursive-descent parser for pipe-syntax SQL queries.
+///
+/// Lazily lexes the input, produces an AST, and verifies the whole input was
+/// consumed. Reusable across queries.
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
     tokens: Vec<SpannedToken<'a>>,
@@ -45,6 +51,7 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
+    /// Creates a parser over the given source text.
     pub fn new(input: &'a str) -> Self {
         Self {
             lexer: Lexer::new(input),
@@ -57,6 +64,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Creates a parser over a pre-tokenized stream (test support).
     pub fn from_tokens(tokens: Vec<SpannedToken<'a>>) -> Self {
         Self {
             lexer: Lexer::new(""),
@@ -69,6 +77,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Sets the maximum recursion depth for expression nesting.
     pub fn with_recursion_limit(mut self, limit: usize) -> Self {
         self.recursion_limit = limit;
         self
@@ -77,7 +86,9 @@ impl<'a> Parser<'a> {
     fn enter_recursive(&mut self) -> Result<(), ParseError> {
         self.recursion_depth += 1;
         if self.recursion_depth > self.recursion_limit {
-            Err(ParseError::RecursionLimitExceeded { limit: self.recursion_limit })
+            Err(ParseError::RecursionLimitExceeded {
+                limit: self.recursion_limit,
+            })
         } else {
             Ok(())
         }
@@ -114,11 +125,23 @@ impl<'a> Parser<'a> {
         if self.peeked.is_none() {
             self.peeked = Some(self.next_token());
         }
-        self.peeked.as_ref().unwrap().as_ref()
+        match self.peeked.as_ref() {
+            Some(result) => result.as_ref(),
+            None => unreachable!("peeked token was just populated"),
+        }
     }
 
     fn peek_span(&mut self) -> Result<Span, &ParseError> {
         Ok(self.peek()?.span)
+    }
+
+    /// Consumes a peeked error (if any), so a subsequent `peek()` advances to
+    /// the next token instead of surfacing the same error again.
+    fn take_peek_error(&mut self) -> Option<ParseError> {
+        match self.next_token() {
+            Err(e) => Some(e),
+            Ok(_) => None,
+        }
     }
 
     fn expect(&mut self, kind: TokenKind) -> Result<SpannedToken<'a>, ParseError> {
@@ -152,12 +175,17 @@ impl<'a> Parser<'a> {
         self.lexer.source()
     }
 
+    /// Parses a full query, failing if any input remains after the pipeline.
     pub fn parse_query(&mut self) -> Result<Query<'a>, ParseError> {
         let result = match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::From) => self.parse_pipe_query(),
+            Err(_) => Err(self.take_peek_error().expect("peeked error")),
             _ => {
                 let span = self.peek_span().unwrap_or_default();
-                let found = self.peek().map(|t| format!("{:?}", t.kind)).unwrap_or_else(|_| "EOF".into());
+                let found = self
+                    .peek()
+                    .map(|t| format!("{:?}", t.kind))
+                    .unwrap_or_else(|_| "EOF".into());
                 Err(ParseError::Expected {
                     expected: "FROM".into(),
                     found,
@@ -180,7 +208,7 @@ impl<'a> Parser<'a> {
                 found: format!("{:?}", other),
                 span: self.peek_span().unwrap_or_default(),
             }),
-            Err(_) => Ok(query),
+            Err(_) => Err(self.take_peek_error().expect("peeked error")),
         }
     }
 
@@ -207,7 +235,10 @@ impl<'a> Parser<'a> {
             }
             _ => Err(ParseError::Expected {
                 expected: "|>".into(),
-                found: format!("{:?}", self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)),
+                found: format!(
+                    "{:?}",
+                    self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)
+                ),
                 span: self.peek_span().unwrap_or_default(),
             }),
         }
@@ -220,12 +251,15 @@ impl<'a> Parser<'a> {
                 self.next_token()?; // consume '('
                 let query = self.parse_pipe_query()?;
                 self.expect(TokenKind::RParen)?;
-                crate::ast::query::TableSource::Subquery { query: Box::new(query), alias: None }
+                crate::ast::query::TableSource::Subquery {
+                    query: Box::new(query),
+                    alias: None,
+                }
             }
             TokenKind::String => {
                 let token = self.next_token()?;
                 let url = if token.text.starts_with('\'') || token.text.starts_with('"') {
-                    &token.text[1..token.text.len()-1]
+                    &token.text[1..token.text.len() - 1]
                 } else {
                     token.text
                 };
@@ -238,19 +272,32 @@ impl<'a> Parser<'a> {
                         self.expect(TokenKind::Eq)?;
                         let val_tok = self.next_token()?;
                         let val = match val_tok.kind {
-                            TokenKind::String | TokenKind::DoubleQuotedIdent => &val_tok.text[1..val_tok.text.len()-1],
+                            TokenKind::String | TokenKind::DoubleQuotedIdent => {
+                                &val_tok.text[1..val_tok.text.len() - 1]
+                            }
                             TokenKind::Ident | TokenKind::Number => val_tok.text,
-                            _ => return Err(ParseError::Unexpected { token: format!("{:?}", val_tok.kind), span: val_tok.span }),
+                            _ => {
+                                return Err(ParseError::Unexpected {
+                                    token: format!("{:?}", val_tok.kind),
+                                    span: val_tok.span,
+                                });
+                            }
                         };
                         inline_options.push((key, val));
                         match self.peek().map(|t| &t.kind) {
-                            Ok(TokenKind::Comma) => { self.next_token()?; }
+                            Ok(TokenKind::Comma) => {
+                                self.next_token()?;
+                            }
                             _ => break,
                         }
                     }
                     self.expect(TokenKind::RParen)?;
                 }
-                crate::ast::query::TableSource::ObjectStore { url, inline_options, alias: None }
+                crate::ast::query::TableSource::ObjectStore {
+                    url,
+                    inline_options,
+                    alias: None,
+                }
             }
             _ => {
                 let first = self.expect_ident()?;
@@ -267,9 +314,15 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    crate::ast::query::TableSource::Table { name: Cow::Owned(name), alias: None }
+                    crate::ast::query::TableSource::Table {
+                        name: Cow::Owned(name),
+                        alias: None,
+                    }
                 } else {
-                    crate::ast::query::TableSource::Table { name: Cow::Borrowed(first), alias: None }
+                    crate::ast::query::TableSource::Table {
+                        name: Cow::Borrowed(first),
+                        alias: None,
+                    }
                 }
             }
         };
@@ -289,7 +342,9 @@ impl<'a> Parser<'a> {
                 crate::ast::query::TableSource::ObjectStore { alias: a, .. } => *a = Some(alias),
                 crate::ast::query::TableSource::Subquery { alias: a, .. } => *a = Some(alias),
             }
-        } else if let Ok(TokenKind::Ident | TokenKind::DoubleQuotedIdent) = self.peek().map(|t| &t.kind) {
+        } else if let Ok(TokenKind::Ident | TokenKind::DoubleQuotedIdent) =
+            self.peek().map(|t| &t.kind)
+        {
             let alias = self.expect_ident()?;
             match &mut source {
                 crate::ast::query::TableSource::Table { alias: a, .. } => *a = Some(alias),
@@ -302,89 +357,131 @@ impl<'a> Parser<'a> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::ast::pipe_op::PipeOperator;
     use crate::ast::query::TableSource;
-    use super::*;
     use crate::parser::test_utils::utils::*;
 
     #[test]
-        fn test_from_tokens_simple_query() {
-            let tokens = vec![
-                spanned(TokenKind::From, "FROM"),
-                spanned(TokenKind::Ident, "users"),
-                spanned(TokenKind::Pipe, "|>"),
-                spanned(TokenKind::Select, "SELECT"),
-                spanned(TokenKind::Ident, "name"),
-            ];
-            let mut parser = Parser::from_tokens(tokens);
-            let q = parser.parse_query().unwrap();
-            assert_eq!(q.source, TableSource::Table { name: "users".into(), alias: None });
-            assert_eq!(q.pipes.len(), 1);
-        }
+    fn test_from_tokens_simple_query() {
+        let tokens = vec![
+            spanned(TokenKind::From, "FROM"),
+            spanned(TokenKind::Ident, "users"),
+            spanned(TokenKind::Pipe, "|>"),
+            spanned(TokenKind::Select, "SELECT"),
+            spanned(TokenKind::Ident, "name"),
+        ];
+        let mut parser = Parser::from_tokens(tokens);
+        let q = parser.parse_query().expect("test should succeed");
+        assert_eq!(
+            q.source,
+            TableSource::Table {
+                name: "users".into(),
+                alias: None
+            }
+        );
+        assert_eq!(q.pipes.len(), 1);
+    }
 
     #[test]
-        fn test_from_tokens_not_in() {
-            let tokens = vec![
-                spanned(TokenKind::From, "FROM"),
-                spanned(TokenKind::Ident, "t"),
-                spanned(TokenKind::Pipe, "|>"),
-                spanned(TokenKind::Select, "SELECT"),
-                spanned(TokenKind::Ident, "x"),
-                spanned(TokenKind::Comma, ","),
-                spanned(TokenKind::Ident, "y"),
-                spanned(TokenKind::Pipe, "|>"),
-                spanned(TokenKind::Where, "WHERE"),
-                spanned(TokenKind::Ident, "x"),
-                spanned(TokenKind::Not, "NOT"),
-                spanned(TokenKind::In, "IN"),
-                spanned(TokenKind::LParen, "("),
-                spanned(TokenKind::Number, "1"),
-                spanned(TokenKind::Comma, ","),
-                spanned(TokenKind::Number, "2"),
-                spanned(TokenKind::RParen, ")"),
-            ];
-            let mut parser = Parser::from_tokens(tokens);
-            let q = parser.parse_query().unwrap();
-            assert_eq!(q.pipes.len(), 2);
-            assert!(matches!(q.pipes[1], PipeOperator::Where { .. }));
-        }
+    fn test_from_tokens_not_in() {
+        let tokens = vec![
+            spanned(TokenKind::From, "FROM"),
+            spanned(TokenKind::Ident, "t"),
+            spanned(TokenKind::Pipe, "|>"),
+            spanned(TokenKind::Select, "SELECT"),
+            spanned(TokenKind::Ident, "x"),
+            spanned(TokenKind::Comma, ","),
+            spanned(TokenKind::Ident, "y"),
+            spanned(TokenKind::Pipe, "|>"),
+            spanned(TokenKind::Where, "WHERE"),
+            spanned(TokenKind::Ident, "x"),
+            spanned(TokenKind::Not, "NOT"),
+            spanned(TokenKind::In, "IN"),
+            spanned(TokenKind::LParen, "("),
+            spanned(TokenKind::Number, "1"),
+            spanned(TokenKind::Comma, ","),
+            spanned(TokenKind::Number, "2"),
+            spanned(TokenKind::RParen, ")"),
+        ];
+        let mut parser = Parser::from_tokens(tokens);
+        let q = parser.parse_query().expect("test should succeed");
+        assert_eq!(q.pipes.len(), 2);
+        assert!(matches!(q.pipes[1], PipeOperator::Where { .. }));
+    }
 
     #[test]
-        fn test_from_tokens_not_exists() {
-            let tokens = vec![
-                spanned(TokenKind::From, "FROM"),
-                spanned(TokenKind::Ident, "t"),
-                spanned(TokenKind::Pipe, "|>"),
-                spanned(TokenKind::Where, "WHERE"),
-                spanned(TokenKind::Not, "NOT"),
-                spanned(TokenKind::Exists, "EXISTS"),
-                spanned(TokenKind::LParen, "("),
-                spanned(TokenKind::From, "FROM"),
-                spanned(TokenKind::Ident, "u"),
-                spanned(TokenKind::Pipe, "|>"),
-                spanned(TokenKind::Select, "SELECT"),
-                spanned(TokenKind::Number, "1"),
-                spanned(TokenKind::RParen, ")"),
-            ];
-            let mut parser = Parser::from_tokens(tokens);
-            let q = parser.parse_query().unwrap();
-            assert_eq!(q.pipes.len(), 1);
-        }
+    fn test_from_tokens_not_exists() {
+        let tokens = vec![
+            spanned(TokenKind::From, "FROM"),
+            spanned(TokenKind::Ident, "t"),
+            spanned(TokenKind::Pipe, "|>"),
+            spanned(TokenKind::Where, "WHERE"),
+            spanned(TokenKind::Not, "NOT"),
+            spanned(TokenKind::Exists, "EXISTS"),
+            spanned(TokenKind::LParen, "("),
+            spanned(TokenKind::From, "FROM"),
+            spanned(TokenKind::Ident, "u"),
+            spanned(TokenKind::Pipe, "|>"),
+            spanned(TokenKind::Select, "SELECT"),
+            spanned(TokenKind::Number, "1"),
+            spanned(TokenKind::RParen, ")"),
+        ];
+        let mut parser = Parser::from_tokens(tokens);
+        let q = parser.parse_query().expect("test should succeed");
+        assert_eq!(q.pipes.len(), 1);
+    }
 
     #[test]
-        fn test_rejects_trailing_tokens() {
-            let mut parser = Parser::new("FROM t |> SELECT name garbage");
-            let err = parser.parse_query().unwrap_err();
-            assert!(matches!(err, ParseError::Expected { .. }));
-        }
+    fn test_rejects_trailing_tokens() {
+        let mut parser = Parser::new("FROM t |> SELECT name garbage");
+        let err = parser.parse_query().expect_err("test should fail");
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
 
     #[test]
-        fn test_accepts_trailing_semicolon() {
-            let q = parse_query("FROM t |> SELECT name;").unwrap();
-            assert_eq!(q.pipes.len(), 1);
-        }
+    fn test_accepts_trailing_semicolon() {
+        let q = parse_query("FROM t |> SELECT name;").expect("test should succeed");
+        assert_eq!(q.pipes.len(), 1);
+    }
 
+    #[test]
+    fn test_reports_lexical_error_at_start() {
+        let err = parse_query("@ FROM t").expect_err("test should fail");
+        assert!(matches!(err, ParseError::Lexical(_)));
+    }
+
+    #[test]
+    fn test_reports_lexical_error_at_end() {
+        let err = parse_query("FROM t |> SELECT name @").expect_err("test should fail");
+        assert!(matches!(err, ParseError::Lexical(_)));
+    }
+
+    #[test]
+    fn test_reports_lexical_error_after_trailing_semicolon() {
+        let err = parse_query("FROM t |> SELECT name; @").expect_err("test should fail");
+        assert!(matches!(err, ParseError::Lexical(_)));
+    }
+
+    #[test]
+    fn test_unterminated_double_quoted_ident_is_lexical_error_not_panic() {
+        let err = parse_query("FROM \"").expect_err("test should fail");
+        assert!(matches!(err, ParseError::Lexical(_)));
+        let err = parse_query("FROM t |> SELECT x AS \"").expect_err("test should fail");
+        assert!(matches!(err, ParseError::Lexical(_)));
+    }
+
+    #[test]
+    fn test_double_quoted_ident_slices_correctly() {
+        let q = parse_query("FROM \"my table\" |> SELECT x").expect("test should succeed");
+        assert_eq!(
+            q.source,
+            TableSource::Table {
+                name: "my table".into(),
+                alias: None
+            }
+        );
+    }
 }

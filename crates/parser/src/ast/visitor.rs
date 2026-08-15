@@ -1,17 +1,22 @@
 use crate::ast::expr::Expr;
 use crate::parser::ParseError;
 
+/// A visitor that walks every node of an [`Expr`] tree.
 pub trait ExprVisitor<'a>: Sized {
+    /// Visits the expression itself.
     fn visit_expr(&mut self, expr: &Expr<'a>) -> Result<(), ParseError>;
+    /// Visits the expression itself, with mutable access.
     fn visit_expr_mut(&mut self, expr: &mut Expr<'a>) -> Result<(), ParseError>;
 }
 
 impl<'a> Expr<'a> {
+    /// Visits this expression and then its children.
     pub fn accept<V: ExprVisitor<'a>>(&self, visitor: &mut V) -> Result<(), ParseError> {
         visitor.visit_expr(self)?;
         self.accept_children(visitor)
     }
 
+    /// Visits this expression and then its children, with mutable access.
     pub fn accept_mut<V: ExprVisitor<'a>>(&mut self, visitor: &mut V) -> Result<(), ParseError> {
         visitor.visit_expr_mut(self)?;
         self.accept_children_mut(visitor)
@@ -30,7 +35,12 @@ impl<'a> Expr<'a> {
                 }
                 Ok(())
             }
-            Expr::WindowFunction { args, partition_by, order_by, .. } => {
+            Expr::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
                 for arg in args {
                     arg.node.accept(visitor)?;
                 }
@@ -42,7 +52,12 @@ impl<'a> Expr<'a> {
                 }
                 Ok(())
             }
-            Expr::Case { operands, results, else_result, .. } => {
+            Expr::Case {
+                operands,
+                results,
+                else_result,
+                ..
+            } => {
                 for op in operands {
                     op.node.accept(visitor)?;
                 }
@@ -56,7 +71,9 @@ impl<'a> Expr<'a> {
             }
             Expr::Cast { expr, .. } => expr.node.accept(visitor),
             Expr::Alias { expr, .. } => expr.node.accept(visitor),
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 expr.node.accept(visitor)?;
                 low.node.accept(visitor)?;
                 high.node.accept(visitor)
@@ -76,7 +93,10 @@ impl<'a> Expr<'a> {
         }
     }
 
-    fn accept_children_mut<V: ExprVisitor<'a>>(&mut self, visitor: &mut V) -> Result<(), ParseError> {
+    fn accept_children_mut<V: ExprVisitor<'a>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Result<(), ParseError> {
         match self {
             Expr::BinaryOp { left, right, .. } => {
                 left.node.accept_mut(visitor)?;
@@ -89,7 +109,12 @@ impl<'a> Expr<'a> {
                 }
                 Ok(())
             }
-            Expr::WindowFunction { args, partition_by, order_by, .. } => {
+            Expr::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
                 for arg in args {
                     arg.node.accept_mut(visitor)?;
                 }
@@ -101,7 +126,12 @@ impl<'a> Expr<'a> {
                 }
                 Ok(())
             }
-            Expr::Case { operands, results, else_result, .. } => {
+            Expr::Case {
+                operands,
+                results,
+                else_result,
+                ..
+            } => {
                 for op in operands {
                     op.node.accept_mut(visitor)?;
                 }
@@ -115,7 +145,9 @@ impl<'a> Expr<'a> {
             }
             Expr::Cast { expr, .. } => expr.node.accept_mut(visitor),
             Expr::Alias { expr, .. } => expr.node.accept_mut(visitor),
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 expr.node.accept_mut(visitor)?;
                 low.node.accept_mut(visitor)?;
                 high.node.accept_mut(visitor)
@@ -136,7 +168,10 @@ impl<'a> Expr<'a> {
     }
 }
 
+/// A test visitor that collects every column reference it walks.
+
 pub struct ColumnCollector<'a> {
+    /// The collected `(table, column)` references.
     pub columns: Vec<(Option<&'a str>, &'a str)>,
 }
 
@@ -161,22 +196,48 @@ mod tests {
     #[test]
     fn test_column_collector_recursive() {
         use crate::ast::expr::SpannedExpr;
-        let c = SpannedExpr { span: Default::default(), node: Expr::Column { table: None, column: "c".into() } };
-        let b = SpannedExpr { span: Default::default(), node: Expr::Column { table: None, column: "b".into() } };
-        let a = SpannedExpr { span: Default::default(), node: Expr::Column { table: None, column: "a".into() } };
-        let ab = SpannedExpr { span: Default::default(), node: Expr::BinaryOp {
-            left: Box::new(a),
-            op: BinaryOp::Plus,
-            right: Box::new(b),
-        }};
-        let abc = SpannedExpr { span: Default::default(), node: Expr::BinaryOp {
-            left: Box::new(ab),
-            op: BinaryOp::Plus,
-            right: Box::new(c),
-        }};
+        let c = SpannedExpr {
+            span: Default::default(),
+            node: Expr::Column {
+                table: None,
+                column: "c".into(),
+            },
+        };
+        let b = SpannedExpr {
+            span: Default::default(),
+            node: Expr::Column {
+                table: None,
+                column: "b".into(),
+            },
+        };
+        let a = SpannedExpr {
+            span: Default::default(),
+            node: Expr::Column {
+                table: None,
+                column: "a".into(),
+            },
+        };
+        let ab = SpannedExpr {
+            span: Default::default(),
+            node: Expr::BinaryOp {
+                left: Box::new(a),
+                op: BinaryOp::Plus,
+                right: Box::new(b),
+            },
+        };
+        let abc = SpannedExpr {
+            span: Default::default(),
+            node: Expr::BinaryOp {
+                left: Box::new(ab),
+                op: BinaryOp::Plus,
+                right: Box::new(c),
+            },
+        };
 
         let mut collector = ColumnCollector { columns: vec![] };
-        abc.node.accept(&mut collector).unwrap();
+        abc.node
+            .accept(&mut collector)
+            .expect("test should succeed");
 
         assert_eq!(collector.columns.len(), 3);
         assert_eq!(collector.columns[0].1, "a");
@@ -187,17 +248,38 @@ mod tests {
     #[test]
     fn test_inlist_visits_children() {
         use crate::ast::expr::SpannedExpr;
-        let x = SpannedExpr { span: Default::default(), node: Expr::Column { table: None, column: "x".into() } };
-        let y = SpannedExpr { span: Default::default(), node: Expr::Column { table: None, column: "y".into() } };
-        let one = SpannedExpr { span: Default::default(), node: Expr::Literal(Literal::Int(1)) };
-        let inlist = SpannedExpr { span: Default::default(), node: Expr::InList {
-            expr: Box::new(x),
-            list: vec![one, y],
-            negated: false,
-        }};
+        let x = SpannedExpr {
+            span: Default::default(),
+            node: Expr::Column {
+                table: None,
+                column: "x".into(),
+            },
+        };
+        let y = SpannedExpr {
+            span: Default::default(),
+            node: Expr::Column {
+                table: None,
+                column: "y".into(),
+            },
+        };
+        let one = SpannedExpr {
+            span: Default::default(),
+            node: Expr::Literal(Literal::Int(1)),
+        };
+        let inlist = SpannedExpr {
+            span: Default::default(),
+            node: Expr::InList {
+                expr: Box::new(x),
+                list: vec![one, y],
+                negated: false,
+            },
+        };
 
         let mut collector = ColumnCollector { columns: vec![] };
-        inlist.node.accept(&mut collector).unwrap();
+        inlist
+            .node
+            .accept(&mut collector)
+            .expect("test should succeed");
 
         assert_eq!(collector.columns.len(), 2);
         assert_eq!(collector.columns[0].1, "x");

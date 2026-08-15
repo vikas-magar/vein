@@ -232,4 +232,26 @@ mod tests {
         let results: Vec<_> = lexer.collect();
         assert!(results[0].is_err());
     }
+
+    #[test]
+    fn test_unterminated_double_quoted_ident_error() {
+        let lexer = Lexer::new("\"");
+        let results: Vec<_> = lexer.collect();
+        assert!(matches!(results[0], Err(ref e) if e.message.contains("unterminated")));
+    }
+
+    #[test]
+    fn test_unterminated_double_quoted_ident_error_with_text() {
+        let lexer = Lexer::new("\"abc");
+        let results: Vec<_> = lexer.collect();
+        assert!(matches!(results[0], Err(ref e) if e.message.contains("unterminated")));
+    }
+
+    #[test]
+    fn test_escaped_quote_in_double_quoted_ident() {
+        let tokens = tokenize("\"a\"\"b\"");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].0, TokenKind::DoubleQuotedIdent);
+        assert_eq!(tokens[0].1, "\"a\"\"b\"");
+    }
 }

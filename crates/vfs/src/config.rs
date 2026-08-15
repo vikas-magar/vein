@@ -13,22 +13,22 @@ pub enum HashAlgo {
 pub struct VfsConfig {
     /// Local directory where NVMe memory-mapped blocks are stored
     pub local_cache_dir: PathBuf,
-    
+
     /// Path to the local redb metadata database
     pub metadata_db_path: PathBuf,
-    
+
     /// The size of a single block in bytes. Configurable for testing.
     pub block_size_bytes: u64,
-    
+
     /// Maximum size the in-memory ingestion buffer can grow before flushing
     pub max_ingestion_buffer_bytes: usize,
-    
+
     /// IP address of this node (to record data locality)
     pub node_ip: String,
 
     /// The OpenDAL storage scheme (e.g., "s3", "gcs", "azblob", "fs")
     pub storage_backend: String,
-    
+
     /// Generic key-value pairs for the OpenDAL builder
     pub storage_config: HashMap<String, String>,
 
@@ -40,7 +40,10 @@ impl Default for VfsConfig {
     fn default() -> Self {
         let mut storage_config = HashMap::new();
         // Default to a local FS mock for out-of-the-box local testing
-        storage_config.insert("root".to_string(), "/tmp/veinfs/infinite_blocks".to_string());
+        storage_config.insert(
+            "root".to_string(),
+            "/tmp/veinfs/infinite_blocks".to_string(),
+        );
 
         Self {
             local_cache_dir: PathBuf::from("/tmp/veinfs/blocks"),
