@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 error = { path = "../error" }
-planner = { path = "../planner" }
+plan = { path = "../plan" }
 vcs = { path = "../vcs" }
 
 tokio = { workspace = true, features = ["full"] }

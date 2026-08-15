@@ -1,8 +1,32 @@
+#![deny(missing_docs)]
+
+//! Vein Catalog Service: versioned metadata, scan planning, and the
+//! planner-facing catalog seam.
+
+/// The planner-facing catalog seam and its in-memory implementation.
+pub mod catalog;
+
+/// Hot table metadata cache.
 pub mod cache;
+
+/// Broadcast events sent to Master nodes (snapshot changes, heartbeats).
+///
+/// `missing_docs` is relaxed on this module only: `rkyv`'s `Archive` derive
+/// generates public archived structs/functions that cannot carry source
+/// documentation, while the hand-written surface is fully documented.
+#[allow(missing_docs)]
 pub mod event;
+
+/// Cache of pre-computed scan plans for warm query replays.
 pub mod plan_cache;
+
+/// Scan planning: translates predicates into file scan tasks.
 pub mod scan;
+
+/// Storage backend configuration and file IO construction.
 pub mod storage;
+
+pub use catalog::{InMemoryCatalog, TableCatalog};
 
 use std::collections::HashMap;
 use std::sync::Arc;

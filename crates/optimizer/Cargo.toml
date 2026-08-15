@@ -1,0 +1,12 @@
+[package]
+name = "optimizer"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+missing_docs = "deny"
+
+[dependencies]
+plan = { path = "../plan" }
+parser = { path = "../parser" }
+error = { path = "../error" }

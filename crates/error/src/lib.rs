@@ -45,6 +45,27 @@ pub enum VeinError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    // ── Planning ─────────────────────────────────────────────
+    /// A semantic violation detected during query binding (unknown column,
+    /// ambiguous reference, type mismatch, invalid aggregate, ...).
+    #[error("Semantic error: {message}")]
+    Semantic {
+        /// Description of the semantic violation.
+        message: String,
+        /// The source span of the offending syntax, if known.
+        span: Option<parser::token::Span>,
+    },
+
+    /// A planning error: the query is syntactically valid but a requested
+    /// feature is not yet supported by the planner.
+    #[error("Planning error: {message}")]
+    Planning {
+        /// Description of the unsupported feature.
+        message: String,
+        /// The source span of the offending syntax, if known.
+        span: Option<parser::token::Span>,
+    },
+
     // ── Execution ────────────────────────────────────────────
     /// An error during pipeline stage execution.
     #[error("Stage error in {stage}: {message}")]
@@ -141,6 +162,23 @@ impl VeinError {
         Self::NotFound(entity.into())
     }
 
+    /// Create a semantic error with an optional source span.
+    pub fn semantic(message: impl Into<String>, span: Option<parser::token::Span>) -> Self {
+        Self::Semantic {
+            message: message.into(),
+            span,
+        }
+    }
+
+    /// Create a planning error (valid syntax, unsupported feature) with an
+    /// optional source span.
+    pub fn planning(message: impl Into<String>, span: Option<parser::token::Span>) -> Self {
+        Self::Planning {
+            message: message.into(),
+            span,
+        }
+    }
+
     /// Create an internal error with a message.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal {
@@ -212,6 +250,34 @@ mod tests {
     fn test_display_not_found() {
         let err = VeinError::NotFound("orders".into());
         assert_eq!(err.to_string(), "Not found: orders");
+    }
+
+    #[test]
+    fn test_semantic_with_and_without_span() {
+        let err = VeinError::semantic("unknown column", None);
+        assert_eq!(err.to_string(), "Semantic error: unknown column");
+        assert!(matches!(err, VeinError::Semantic { span: None, .. }));
+
+        let span = parser::token::Span::new(4, 9, 1, 5);
+        let err = VeinError::semantic("unknown column", Some(span));
+        let VeinError::Semantic { span: Some(s), .. } = err else {
+            panic!("expected span to be preserved");
+        };
+        assert_eq!(s, span);
+    }
+
+    #[test]
+    fn test_planning_renders_and_carries_span() {
+        let span = parser::token::Span::new(0, 5, 1, 1);
+        let err = VeinError::planning("WITH is not supported yet", Some(span));
+        assert_eq!(err.to_string(), "Planning error: WITH is not supported yet");
+        assert!(matches!(
+            err,
+            VeinError::Planning {
+                span: Some(ref s),
+                ..
+            } if *s == span
+        ));
     }
 
     #[test]

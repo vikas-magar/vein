@@ -73,13 +73,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let coordinator = Arc::new(
                 engine::DistributedCoordinator::builder()
-                    .with_binder(Arc::new(planner::binder::pipe::query::QueryBinder::new(
-                        Arc::new(planner::testing::InMemoryVcsCatalog::new()),
-                        Arc::new(planner::testing::MockFunctionRegistry),
-                    )))
-                    .with_optimizer(Arc::new(
-                        planner::optimizer::adopt_optimizer::AdoptJoinOptimizer::new(),
+                    .with_binder(Arc::new(
+                        binder::QueryBinder::new(
+                            Arc::new(vcs::InMemoryCatalog::new()),
+                            Arc::new(binder::testing::MockFunctionRegistry::new()),
+                        ),
                     ))
+                    .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
                     .with_planner(Arc::new(
                         orchestrator::planner::dag_planner::DagPhysicalPlanner::new(),
                     ))

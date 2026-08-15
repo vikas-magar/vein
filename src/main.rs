@@ -1,8 +1,8 @@
+use binder::testing::MockFunctionRegistry;
+use binder::{LogicalBinder, QueryBinder};
 use parser::Parser;
-use planner::binder::pipe::query::QueryBinder;
-use planner::testing::{InMemoryVcsCatalog, MockFunctionRegistry};
-use planner::traits::LogicalBinder;
 use std::sync::Arc;
+use vcs::InMemoryCatalog;
 
 #[tokio::main]
 async fn main() {
@@ -17,8 +17,8 @@ async fn main() {
             println!("{:#?}", ast);
 
             // 1. Setup the dummy catalog & functions (so the binder has something to validate against)
-            let catalog = Arc::new(InMemoryVcsCatalog::new());
-            let functions = Arc::new(MockFunctionRegistry);
+            let catalog = Arc::new(InMemoryCatalog::new());
+            let functions = Arc::new(MockFunctionRegistry::new());
 
             // 2. Instantiate the Binder
             let binder = QueryBinder::new(catalog, functions);

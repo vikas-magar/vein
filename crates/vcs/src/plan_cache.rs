@@ -7,8 +7,11 @@ use moka::future::Cache;
 /// predicate_fingerprint = 0 means "no predicate" (full scan).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScanPlanKey {
+    /// Namespace path of the table.
     pub namespace: Vec<String>,
+    /// Name of the table.
     pub table_name: String,
+    /// The snapshot id the plan was computed against.
     pub snapshot_id: i64,
     /// A stable hash of the serialized predicate expression.
     /// We use 0 when there is no predicate.
@@ -32,6 +35,7 @@ pub struct ScanPlanCache {
 }
 
 impl ScanPlanCache {
+    /// Creates an empty scan plan cache (capacity 256 plans).
     pub fn new() -> Self {
         // Cache up to 256 active scan plans.
         // Each plan is typically a Vec<FileScanTask> with a few hundred entries.
@@ -39,10 +43,12 @@ impl ScanPlanCache {
         Self { inner }
     }
 
+    /// Looks up a cached scan plan for the given key.
     pub async fn get(&self, key: &ScanPlanKey) -> Option<ScanPlan> {
         self.inner.get(key).await
     }
 
+    /// Stores a computed scan plan under the given key.
     pub async fn insert(&self, key: ScanPlanKey, plan: ScanPlan) {
         self.inner.insert(key, plan).await;
     }

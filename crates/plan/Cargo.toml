@@ -1,0 +1,12 @@
+[package]
+name = "plan"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+missing_docs = "deny"
+
+[dependencies]
+error = { path = "../error" }
+parser = { path = "../parser" }
+arrow = { workspace = true }

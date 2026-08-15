@@ -222,7 +222,11 @@ impl<'a> Parser<'a> {
         }
 
         let operand_prec = match ops.last() {
-            Some((op, _)) => prefix_prec(op).expect("prefix op always has a precedence").0,
+            Some((op, _)) => {
+                prefix_prec(op)
+                    .expect("prefix op always has a precedence")
+                    .0
+            }
             None => return self.parse_primary(),
         };
         let mut expr = self.parse_binary(operand_prec)?;
@@ -364,18 +368,22 @@ impl<'a> Parser<'a> {
                 let span = token.span;
 
                 if text.starts_with("0x") || text.starts_with("0X") {
-                    let val = i64::from_str_radix(&text[2..], 16).map_err(|_| ParseError::NumberParse {
-                        message: format!("invalid hex literal: {}", text),
-                        span,
+                    let val = i64::from_str_radix(&text[2..], 16).map_err(|_| {
+                        ParseError::NumberParse {
+                            message: format!("invalid hex literal: {}", text),
+                            span,
+                        }
                     })?;
                     Ok(SpannedExpr {
                         span,
                         node: Expr::Literal(Literal::Int(val)),
                     })
                 } else if text.starts_with("0b") || text.starts_with("0B") {
-                    let val = i64::from_str_radix(&text[2..], 2).map_err(|_| ParseError::NumberParse {
-                        message: format!("invalid binary literal: {}", text),
-                        span,
+                    let val = i64::from_str_radix(&text[2..], 2).map_err(|_| {
+                        ParseError::NumberParse {
+                            message: format!("invalid binary literal: {}", text),
+                            span,
+                        }
                     })?;
                     Ok(SpannedExpr {
                         span,
@@ -575,7 +583,8 @@ impl<'a> Parser<'a> {
         }
 
         Ok(SpannedExpr {
-            span: case_span.union(end_span.expect("END token must be consumed before leaving the loop")),
+            span: case_span
+                .union(end_span.expect("END token must be consumed before leaving the loop")),
             node: Expr::Case {
                 operands,
                 results,
@@ -968,7 +977,11 @@ mod tests {
     fn test_in_binds_like_comparison() {
         let expr = parse_expr("x = 1 IN (2)").expect("test should succeed");
         match expr.node {
-            Expr::InList { expr, list, negated } => {
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
                 assert!(!negated);
                 assert_eq!(list.len(), 1);
                 assert!(matches!(
@@ -1030,7 +1043,13 @@ mod tests {
     fn test_moderately_deep_unary_chain_succeeds() {
         let input = format!("{}1", "- ".repeat(100));
         let expr = parse_expr(&input).expect("test should succeed");
-        assert!(matches!(expr.node, Expr::UnaryOp { op: UnaryOp::Negate, .. }));
+        assert!(matches!(
+            expr.node,
+            Expr::UnaryOp {
+                op: UnaryOp::Negate,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1054,7 +1073,8 @@ mod tests {
 
     #[test]
     fn test_case_searched_has_real_spans() {
-        let expr = parse_expr("CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END").expect("test should succeed");
+        let expr =
+            parse_expr("CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END").expect("test should succeed");
         match expr.node {
             Expr::Case {
                 ref operands,
@@ -1075,7 +1095,10 @@ mod tests {
         let expr = parse_expr("CASE x WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END")
             .expect("test should succeed");
         assert!(expr.span.start < expr.span.end);
-        if let Expr::Case { operands, results, .. } = expr.node {
+        if let Expr::Case {
+            operands, results, ..
+        } = expr.node
+        {
             assert_eq!(operands.len(), 2);
             assert!(operands.iter().all(|o| o.span.start < o.span.end));
             assert!(results.iter().all(|r| r.span.start < r.span.end));

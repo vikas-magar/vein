@@ -3,12 +3,10 @@ use bytes::Bytes;
 use common::Result;
 use std::sync::Arc;
 
-use common::identifiers::TaskId;
-use common::protocol::MorselTask;
-use orchestrator::executor::registry::ExecutorRegistry;
-use orchestrator::traits::{PhysicalPlanner, TaskDispatcher};
+use optimizer::Optimizer;
+use orchestrator::traits::PhysicalPlanner;
 use parser::ast::query::Query;
-use planner::traits::{JoinOptimizer, LogicalBinder};
+use binder::LogicalBinder;
 
 /// The absolute highest-level abstraction for the Database Engine.
 /// Represents the complete end-to-end lifecycle from query submission to result retrieval.
@@ -23,8 +21,8 @@ pub trait QueryEngine: Send + Sync {
 pub struct DistributedCoordinator {
     /// Abstract layer for binding ASTs to semantic schemas
     pub binder: Arc<dyn LogicalBinder>,
-    /// Abstract layer for dynamic Join ordering (ADOPT/CBO)
-    pub optimizer: Arc<dyn JoinOptimizer>,
+    /// Abstract layer for all logical plan optimization
+    pub optimizer: Arc<dyn Optimizer>,
     /// Abstract layer for lowering Logical Plans to Physical DAGs
     pub planner: Arc<dyn PhysicalPlanner>,
     /// The cluster scheduler responsible for dispatching tasks
@@ -46,7 +44,7 @@ impl DistributedCoordinator {
 /// A builder for constructing a `DistributedCoordinator` with fluent DI configuration.
 pub struct DistributedCoordinatorBuilder {
     binder: Option<Arc<dyn LogicalBinder>>,
-    optimizer: Option<Arc<dyn JoinOptimizer>>,
+    optimizer: Option<Arc<dyn Optimizer>>,
     planner: Option<Arc<dyn PhysicalPlanner>>,
     scheduler: Option<Arc<orchestrator::scheduler::Scheduler>>,
 }
@@ -58,8 +56,8 @@ impl DistributedCoordinatorBuilder {
         self
     }
 
-    /// Injects the JoinOptimizer strategy.
-    pub fn with_optimizer(mut self, optimizer: Arc<dyn JoinOptimizer>) -> Self {
+    /// Injects the Optimizer strategy.
+    pub fn with_optimizer(mut self, optimizer: Arc<dyn Optimizer>) -> Self {
         self.optimizer = Some(optimizer);
         self
     }
@@ -83,7 +81,7 @@ impl DistributedCoordinatorBuilder {
             .ok_or_else(|| error::VeinError::internal("Missing LogicalBinder configuration"))?;
         let optimizer = self
             .optimizer
-            .ok_or_else(|| error::VeinError::internal("Missing JoinOptimizer configuration"))?;
+            .ok_or_else(|| error::VeinError::internal("Missing Optimizer configuration"))?;
         let planner = self
             .planner
             .ok_or_else(|| error::VeinError::internal("Missing PhysicalPlanner configuration"))?;
@@ -104,13 +102,13 @@ impl DistributedCoordinatorBuilder {
 impl QueryEngine for DistributedCoordinator {
     async fn submit_query<'a>(&self, query: Query<'a>) -> Result<Bytes> {
         // 1. BIND: Convert raw SQL AST to a Semantic Logical Plan
-        let query_id_str = format!("{:?}", query); // Simplified for telemetry
+        let _query_id_str = format!("{:?}", query); // Simplified for telemetry
         let start_time = std::time::Instant::now();
 
         let logical_plan = self.binder.bind(&query).await?;
 
         // 2. OPTIMIZE: Apply cost-based or RL-based Join reordering
-        let optimized_plan = self.optimizer.optimize_join(&logical_plan)?;
+        let optimized_plan = self.optimizer.optimize(logical_plan)?;
 
         // 3. PLAN: Lower the optimized logical plan into a distributed Physical DAG
         let physical_dag = self.planner.create_physical_plan(optimized_plan)?;
@@ -136,7 +134,7 @@ impl QueryEngine for DistributedCoordinator {
             execution_time_ms: start_time.elapsed().as_millis() as u64,
             rows_produced: final_rows_produced,
         };
-        let _ = self.optimizer.report_telemetry();
+        tracing::debug!(?telemetry, "query execution telemetry");
 
         Ok(Bytes::new())
     }

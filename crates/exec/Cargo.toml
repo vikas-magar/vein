@@ -7,7 +7,6 @@ edition = "2024"
 common = { path = "../common" }
 error = { path = "../error" }
 parser = { path = "../parser" }
-planner = { path = "../planner" }
 tokio = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }

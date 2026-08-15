@@ -758,6 +758,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "binder"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "error",
+ "parser",
+ "plan",
+ "tokio",
+ "vcs",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1035,20 +1047,23 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "binder",
  "bytes",
  "clap",
  "common",
  "error",
  "exec",
  "flume",
+ "optimizer",
  "orchestrator",
  "parser",
- "planner",
+ "plan",
  "rkyv",
  "s2n-quic",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vcs",
 ]
 
 [[package]]
@@ -1632,6 +1647,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "iceberg",
+ "parser",
  "serde_json",
  "thiserror 2.0.19",
 ]
@@ -1672,7 +1688,6 @@ dependencies = [
  "opendal 0.45.1",
  "parquet 59.1.0",
  "parser",
- "planner",
  "rkyv",
  "s2n-quic",
  "tempfile",
@@ -3239,6 +3254,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "optimizer"
+version = "0.1.0"
+dependencies = [
+ "error",
+ "parser",
+ "plan",
+]
+
+[[package]]
 name = "orchestrator"
 version = "0.1.0"
 dependencies = [
@@ -3246,7 +3270,7 @@ dependencies = [
  "common",
  "error",
  "futures",
- "planner",
+ "plan",
  "s2n-quic",
  "serde",
  "tokio",
@@ -3514,12 +3538,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "planner"
+name = "plan"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "async-trait",
- "common",
  "error",
  "parser",
 ]
@@ -5666,11 +5688,13 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 name = "vcs"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "error",
  "futures",
  "iceberg",
  "iceberg-storage-opendal",
  "moka",
+ "plan",
  "rkyv",
  "tracing",
 ]
@@ -5679,9 +5703,10 @@ dependencies = [
 name = "vein"
 version = "0.1.0"
 dependencies = [
+ "binder",
  "parser",
- "planner",
  "tokio",
+ "vcs",
 ]
 
 [[package]]

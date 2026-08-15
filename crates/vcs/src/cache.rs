@@ -28,6 +28,7 @@ impl Default for TableCache {
 }
 
 impl TableCache {
+    /// Creates an empty table cache with the configured maximum capacity.
     pub fn new() -> Self {
         let inner = Cache::builder()
             .max_capacity(MAX_TABLE_CACHE_ENTRIES)

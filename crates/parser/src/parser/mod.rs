@@ -213,10 +213,7 @@ impl<'a> Parser<'a> {
             let op = self.parse_pipe_operator()?;
             pipes.push(op);
         }
-        Ok(Query {
-            source,
-            pipes,
-        })
+        Ok(Query { source, pipes })
     }
 
     fn expect_pipe(&mut self) -> Result<(), ParseError> {

@@ -1,7 +1,7 @@
 use crate::planner::dag::StageDag;
 use crate::traits::PhysicalPlanner;
 use common::Result;
-use planner::plan::LogicalPlan;
+use plan::LogicalPlan;
 
 /// The DAG Physical Planner.
 /// Responsible for lowering the optimized logical plan into a highly parallel `StageDag`

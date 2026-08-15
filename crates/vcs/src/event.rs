@@ -6,13 +6,21 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///
 /// rkyv is used for serialization: archived bytes can be read directly
 /// from UMEM ring buffer memory with zero allocation on the receive path.
+///
+/// Doc attributes on the derive-generated archived structs would be
+/// impossible to attach from source, so `missing_docs` is relaxed for this
+/// type's macro expansion only.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub enum VeinEvent {
     /// A table's current snapshot has changed. Masters should invalidate
     /// any in-flight scan plans that reference the old snapshot_id.
     TableInvalidated {
+        /// Namespace path of the invalidated table.
         namespace: Vec<String>,
+        /// Name of the invalidated table.
         table_name: String,
+        /// The newly committed snapshot id.
         new_snapshot_id: i64,
     },
 
@@ -20,7 +28,10 @@ pub enum VeinEvent {
     CatalogReady,
 
     /// Heartbeat from VCS. Masters use this to detect VCS restarts.
-    Heartbeat { timestamp_ms: u64 },
+    Heartbeat {
+        /// Milliseconds since some fixed epoch; used for liveness checks.
+        timestamp_ms: u64,
+    },
 }
 
 impl VeinEvent {

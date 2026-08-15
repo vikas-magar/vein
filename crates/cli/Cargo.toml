@@ -8,7 +8,10 @@ common = { path = "../common" }
 orchestrator = { path = "../orchestrator" }
 exec = { path = "../exec" }
 error = { path = "../error" }
-planner = { path = "../planner" }
+binder = { path = "../binder" }
+plan = { path = "../plan" }
+vcs = { path = "../vcs" }
+optimizer = { path = "../optimizer" }
 parser = { path = "../parser" }
 
 tokio = { workspace = true, features = ["full", "rt-multi-thread"] }

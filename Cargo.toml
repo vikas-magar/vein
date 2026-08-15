@@ -5,7 +5,7 @@ edition = "2024"
 
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/vcs", "crates/exec", "crates/error", "crates/parser", "crates/planner", "crates/orchestrator", "crates/cli", "crates/vfs", "crates/ebpf"]
+members = ["crates/common", "crates/vcs", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/orchestrator", "crates/cli", "crates/vfs", "crates/ebpf", "crates/plan", "crates/optimizer"]
 
 [workspace.dependencies]
 async-trait = "0.1.89"
@@ -30,7 +30,8 @@ ordered-float = "5.3.0"
 
 [dependencies]
 parser = { path = "crates/parser" }
-planner = { path = "crates/planner" }
+binder = { path = "crates/binder" }
+vcs = { path = "crates/vcs" }
 tokio = "1.52.3"
 
 [profile.release]

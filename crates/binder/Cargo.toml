@@ -1,0 +1,17 @@
+[package]
+name = "binder"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+missing_docs = "deny"
+
+[dependencies]
+plan = { path = "../plan" }
+vcs = { path = "../vcs" }
+error = { path = "../error" }
+parser = { path = "../parser" }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

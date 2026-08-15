@@ -1,7 +1,7 @@
 use crate::planner::dag::StageDag;
 use async_trait::async_trait;
 use common::Result;
-use planner::plan::LogicalPlan;
+use plan::LogicalPlan;
 
 /// Abstraction for the Physical Planner.
 /// Responsible for lowering a bound Logical Plan into a distributed physical Execution DAG.
