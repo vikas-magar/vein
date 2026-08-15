@@ -1,7 +1,5 @@
 /// Expression parsing.
 pub mod expr;
-/// Statement parsing (DDL placeholder).
-pub mod stmt;
 
 mod aggregate;
 mod alias;
@@ -170,11 +168,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Returns the full source text being parsed (used to slice condition spans).
-    pub(crate) fn source(&self) -> &'a str {
-        self.lexer.source()
-    }
-
     /// Parses a full query, failing if any input remains after the pipeline.
     pub fn parse_query(&mut self) -> Result<Query<'a>, ParseError> {
         let result = match self.peek().map(|t| &t.kind) {
@@ -222,7 +215,6 @@ impl<'a> Parser<'a> {
         }
         Ok(Query {
             source,
-            joins: vec![],
             pipes,
         })
     }

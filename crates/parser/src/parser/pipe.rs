@@ -216,4 +216,26 @@ mod tests {
         assert!(matches!(q.pipes[0], PipeOperator::Tee { .. }));
         assert!(matches!(q.pipes[1], PipeOperator::Limit { .. }));
     }
+
+    #[test]
+    fn test_fork_empty_pipeline_is_legal_noop() {
+        let q = parse_query("FROM t |> FORK ()").expect("test should succeed");
+        if let PipeOperator::Fork { pipelines } = &q.pipes[0] {
+            assert_eq!(pipelines.len(), 1);
+            assert!(pipelines[0].is_empty());
+        } else {
+            panic!("expected Fork");
+        }
+    }
+
+    #[test]
+    fn test_tee_empty_pipeline_is_legal_noop() {
+        let q = parse_query("FROM t |> TEE ()").expect("test should succeed");
+        if let PipeOperator::Tee { pipelines } = &q.pipes[0] {
+            assert_eq!(pipelines.len(), 1);
+            assert!(pipelines[0].is_empty());
+        } else {
+            panic!("expected Tee");
+        }
+    }
 }

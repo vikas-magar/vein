@@ -242,11 +242,6 @@ impl<'a> Lexer<'a> {
         &self.input[start..self.pos]
     }
 
-    /// Returns the full input text the lexer was constructed with.
-    pub(crate) fn source(&self) -> &'a str {
-        self.input
-    }
-
     fn make_token(&self, start: usize, kind: TokenKind) -> SpannedToken<'a> {
         let text = self.current_text(start);
         let span = Span::new(start, self.pos, self.line, self.column);

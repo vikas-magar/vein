@@ -155,7 +155,9 @@ pub async fn bind_pipeline<'a>(
             PipeOperator::TableSample { method, percent } => {
                 bind_table_sample(plan, method, *percent)?
             }
-            PipeOperator::Assert { condition, message } => bind_assert(plan, condition, message)?,
+            PipeOperator::Assert { condition, message } => {
+                bind_assert(plan, condition, message, &mut *context, &mut *scopes).await?
+            }
             PipeOperator::Call { name, args } => {
                 bind_call(plan, name, args, &mut *context, &mut *scopes).await?
             }

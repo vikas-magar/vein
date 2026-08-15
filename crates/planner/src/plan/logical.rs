@@ -117,7 +117,7 @@ pub enum LogicalPlan {
         /// The input plan
         input: Box<LogicalPlan>,
         /// The condition expression
-        condition: String,
+        condition: LogicalExpr,
         /// The assertion message
         message: Option<String>,
         /// The resulting schema

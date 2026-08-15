@@ -49,61 +49,6 @@ impl<'a> Parser<'a> {
 
         let right = self.parse_table_source()?;
 
-        let right = if let Ok(TokenKind::As) = self.peek().map(|t| &t.kind) {
-            self.next_token()?;
-            let alias = self.expect_ident()?;
-            match right {
-                crate::ast::query::TableSource::Table { name, alias: _ } => {
-                    crate::ast::query::TableSource::Table {
-                        name,
-                        alias: Some(alias),
-                    }
-                }
-                crate::ast::query::TableSource::ObjectStore {
-                    url,
-                    inline_options,
-                    alias: _,
-                } => crate::ast::query::TableSource::ObjectStore {
-                    url,
-                    inline_options,
-                    alias: Some(alias),
-                },
-                crate::ast::query::TableSource::Subquery { query, alias: _ } => {
-                    crate::ast::query::TableSource::Subquery {
-                        query,
-                        alias: Some(alias),
-                    }
-                }
-            }
-        } else if matches!(self.peek().map(|t| &t.kind), Ok(TokenKind::Ident)) {
-            let alias = self.expect_ident()?;
-            match right {
-                crate::ast::query::TableSource::Table { name, alias: _ } => {
-                    crate::ast::query::TableSource::Table {
-                        name,
-                        alias: Some(alias),
-                    }
-                }
-                crate::ast::query::TableSource::ObjectStore {
-                    url,
-                    inline_options,
-                    alias: _,
-                } => crate::ast::query::TableSource::ObjectStore {
-                    url,
-                    inline_options,
-                    alias: Some(alias),
-                },
-                crate::ast::query::TableSource::Subquery { query, alias: _ } => {
-                    crate::ast::query::TableSource::Subquery {
-                        query,
-                        alias: Some(alias),
-                    }
-                }
-            }
-        } else {
-            right
-        };
-
         let (predicate, using) = if let Ok(TokenKind::On) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
             let predicate = self.parse_expr()?;
@@ -132,7 +77,6 @@ impl<'a> Parser<'a> {
                 join_type,
                 right: Box::new(crate::ast::query::Query {
                     source: right,
-                    joins: vec![],
                     pipes: vec![],
                 }),
                 predicate,

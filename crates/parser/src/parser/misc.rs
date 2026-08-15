@@ -16,6 +16,12 @@ impl<'a> Parser<'a> {
                 message: format!("invalid number: {}", token.text),
                 span: token.span,
             })?;
+        if !percent.is_finite() {
+            return Err(super::ParseError::NumberParse {
+                message: format!("tablesample percent overflows f64: {}", token.text),
+                span: token.span,
+            });
+        }
         self.expect(TokenKind::RParen)?;
         Ok(crate::ast::pipe_op::PipeOperator::TableSample { method, percent })
     }
@@ -34,5 +40,28 @@ impl<'a> Parser<'a> {
         Err(super::ParseError::Unsupported(
             "UNPIVOT pipe operator not yet implemented".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parser::test_utils::utils::*;
+
+    #[test]
+    fn test_tablesample_accepts_valid_percent() {
+        let query = parse_query("FROM t |> TABLESAMPLE r(10)").expect("test should succeed");
+        assert!(matches!(
+            query.pipes[0],
+            crate::ast::pipe_op::PipeOperator::TableSample {
+                method: "r",
+                percent: 10.0,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_tablesample_rejects_overflowing_percent() {
+        let err = parse_query("FROM t |> TABLESAMPLE r(1e999)").expect_err("test should fail");
+        assert!(matches!(err, crate::parser::ParseError::NumberParse { .. }));
     }
 }

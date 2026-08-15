@@ -1,29 +1,18 @@
-use crate::ast::pipe_op::{JoinClause, PipeOperator};
+use crate::ast::pipe_op::PipeOperator;
 use crate::token::Span;
 use std::borrow::Cow;
 
-/// A parsed query: a source, optional joins, and a pipe pipeline.
+/// A parsed query: a source and a pipe pipeline.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Query<'a> {
     /// The table source.
 
     #[serde(borrow)]
     pub source: TableSource<'a>,
-    /// The joins attached to the source.
-
-    #[serde(borrow)]
-    pub joins: Vec<JoinClause<'a>>,
     /// The pipeline operators.
 
     #[serde(borrow)]
     pub pipes: Vec<PipeOperator<'a>>,
-}
-
-impl<'a> Query<'a> {
-    /// Returns the span of the source table reference.
-    pub fn source_span(&self) -> Span {
-        Span::default()
-    }
 }
 
 /// The left-hand side of a query: a table, object store, or subquery.

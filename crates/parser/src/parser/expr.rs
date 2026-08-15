@@ -58,8 +58,6 @@ impl<'a> Parser<'a> {
                     Err(_) => break,
                 };
                 if next == TokenKind::In || next == TokenKind::Between || next == TokenKind::Like {
-                    self.next_token()?; // consume NOT from peeked
-                    self.next_token()?; // consume operator from lookahead
                     postfix_op = Some((next, true));
                 }
             } else if peek_kind == TokenKind::In
@@ -67,14 +65,29 @@ impl<'a> Parser<'a> {
                 || peek_kind == TokenKind::Like
                 || peek_kind == TokenKind::Is
             {
-                self.next_token()?;
                 postfix_op = Some((peek_kind, false));
             }
 
             if let Some((op, negated)) = postfix_op {
-                // IN, BETWEEN, LIKE, IS are special postfix operators: apply them
-                // and CONTINUE the loop so trailing AND/OR terms are still parsed.
-                left = self.parse_postfix_binary(left, op, min_prec, Some(negated))?;
+                // Postfix operators (IN, BETWEEN, LIKE, IS) are only consumed at
+                // this recursion level when their precedence allows it. Otherwise
+                // they are left for an enclosing loop, e.g. `x = 1 IN (2)` parses
+                // as `(x = 1) IN (2)` (IN binds like `=` in GoogleSQL).
+                let prec = infix_prec(&op)
+                    .expect("IN, BETWEEN, LIKE, IS always have a precedence")
+                    .0;
+                if prec < min_prec {
+                    break;
+                }
+                if peek_kind == TokenKind::Not {
+                    self.next_token()?; // consume NOT from peeked
+                    self.next_token()?; // consume operator from lookahead
+                } else {
+                    self.next_token()?; // consume operator from peeked
+                }
+                // Postfix operators are applied and skipped so trailing AND/OR
+                // terms are still parsed.
+                left = self.parse_postfix_binary(left, op, Some(negated))?;
                 continue;
             }
 
@@ -83,12 +96,13 @@ impl<'a> Parser<'a> {
                     self.next_token()?;
                     let right_prec = if left_assoc { prec + 1 } else { prec };
                     let right = self.parse_binary(right_prec)?;
+                    let op = token_to_binary_op(&peek_kind)?;
                     let span = left.span.union(right.span);
                     left = SpannedExpr {
                         span,
                         node: Expr::BinaryOp {
                             left: Box::new(left),
-                            op: token_to_binary_op(&peek_kind),
+                            op,
                             right: Box::new(right),
                         },
                     };
@@ -106,13 +120,13 @@ impl<'a> Parser<'a> {
         &mut self,
         left: SpannedExpr<'a>,
         op: TokenKind,
-        _min_prec: u32,
         negated: Option<bool>,
     ) -> Result<SpannedExpr<'a>, ParseError> {
         let is_negated = negated.unwrap_or(false);
         let span = left.span;
 
-        match op {
+        self.enter_recursive()?;
+        let result = match op {
             TokenKind::In => {
                 let lparen = self.expect(TokenKind::LParen)?;
                 let list = if let Ok(TokenKind::From) = self.peek().map(|t| &t.kind) {
@@ -186,20 +200,37 @@ impl<'a> Parser<'a> {
                 "unexpected postfix op: {:?}",
                 op
             ))),
-        }
+        };
+        self.exit_recursive();
+        result
     }
 
     fn parse_unary(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
-        let peek_kind = match self.peek() {
-            Ok(t) => t.kind,
-            Err(_) => return self.parse_primary(),
-        };
+        let mut ops: Vec<(TokenKind, Span)> = Vec::new();
+        loop {
+            let peek_kind = match self.peek() {
+                Ok(t) => t.kind,
+                Err(_) => break,
+            };
+            if prefix_prec(&peek_kind).is_some() {
+                let op_token = self.next_token()?;
+                self.enter_recursive()?;
+                ops.push((peek_kind, op_token.span));
+            } else {
+                break;
+            }
+        }
 
-        if let Some((prec, _)) = prefix_prec(&peek_kind) {
-            let op_token = self.next_token()?;
-            let expr = self.parse_binary(prec)?;
-            let span = op_token.span.union(expr.span);
-            match peek_kind {
+        let operand_prec = match ops.last() {
+            Some((op, _)) => prefix_prec(op).expect("prefix op always has a precedence").0,
+            None => return self.parse_primary(),
+        };
+        let mut expr = self.parse_binary(operand_prec)?;
+
+        for (op, op_span) in ops.iter().rev() {
+            self.exit_recursive();
+            let span = op_span.union(expr.span);
+            expr = match op {
                 TokenKind::Not => match expr {
                     SpannedExpr {
                         node:
@@ -208,40 +239,40 @@ impl<'a> Parser<'a> {
                                 negated: false,
                             },
                         span: _,
-                    } => Ok(SpannedExpr {
+                    } => SpannedExpr {
                         span,
                         node: Expr::Exists {
                             subquery,
                             negated: true,
                         },
-                    }),
-                    _ => Ok(SpannedExpr {
+                    },
+                    _ => SpannedExpr {
                         span,
                         node: Expr::UnaryOp {
                             op: UnaryOp::Not,
                             expr: Box::new(expr),
                         },
-                    }),
+                    },
                 },
-                TokenKind::Minus => Ok(SpannedExpr {
+                TokenKind::Minus => SpannedExpr {
                     span,
                     node: Expr::UnaryOp {
                         op: UnaryOp::Negate,
                         expr: Box::new(expr),
                     },
-                }),
-                TokenKind::Plus => Ok(SpannedExpr {
+                },
+                TokenKind::Plus => SpannedExpr {
                     span,
                     node: Expr::UnaryOp {
                         op: UnaryOp::Plus,
                         expr: Box::new(expr),
                     },
-                }),
+                },
                 _ => unreachable!(),
-            }
-        } else {
-            self.parse_primary()
+            };
         }
+
+        Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
@@ -270,8 +301,8 @@ impl<'a> Parser<'a> {
                 self.parse_cast_expr()
             }
             TokenKind::Case => {
-                self.next_token()?;
-                self.parse_case_expr()
+                let token = self.next_token()?;
+                self.parse_case_expr(token.span)
             }
             TokenKind::Ident => {
                 let token = self.next_token()?;
@@ -290,11 +321,30 @@ impl<'a> Parser<'a> {
                     if let Ok(TokenKind::Dot) = self.peek().map(|t| &t.kind) {
                         self.next_token()?;
                         let col_token = self.next_token()?;
+                        let column = match col_token.kind {
+                            TokenKind::Ident => col_token.text,
+                            TokenKind::DoubleQuotedIdent => {
+                                &col_token.text[1..col_token.text.len() - 1]
+                            }
+                            TokenKind::Star => {
+                                return Ok(SpannedExpr {
+                                    span: span.union(col_token.span),
+                                    node: Expr::Wildcard { table: Some(name) },
+                                });
+                            }
+                            _ => {
+                                return Err(ParseError::Expected {
+                                    expected: "identifier after '.'".into(),
+                                    found: format!("{:?}", col_token.kind),
+                                    span: col_token.span,
+                                });
+                            }
+                        };
                         Ok(SpannedExpr {
                             span: span.union(col_token.span),
                             node: Expr::Column {
                                 table: Some(name),
-                                column: col_token.text,
+                                column,
                             },
                         })
                     } else {
@@ -313,27 +363,44 @@ impl<'a> Parser<'a> {
                 let text = &token.text;
                 let span = token.span;
 
-                // Determine if int or float
-                if text.contains('.') || text.contains('e') || text.contains('E') {
-                    let val: f64 = text.parse().unwrap_or(0.0);
-                    Ok(SpannedExpr {
+                if text.starts_with("0x") || text.starts_with("0X") {
+                    let val = i64::from_str_radix(&text[2..], 16).map_err(|_| ParseError::NumberParse {
+                        message: format!("invalid hex literal: {}", text),
                         span,
-                        node: Expr::Literal(Literal::Float(val.into())),
-                    })
-                } else if text.starts_with("0x") || text.starts_with("0X") {
-                    let val = i64::from_str_radix(&text[2..], 16).unwrap_or(0);
+                    })?;
                     Ok(SpannedExpr {
                         span,
                         node: Expr::Literal(Literal::Int(val)),
                     })
                 } else if text.starts_with("0b") || text.starts_with("0B") {
-                    let val = i64::from_str_radix(&text[2..], 2).unwrap_or(0);
+                    let val = i64::from_str_radix(&text[2..], 2).map_err(|_| ParseError::NumberParse {
+                        message: format!("invalid binary literal: {}", text),
+                        span,
+                    })?;
                     Ok(SpannedExpr {
                         span,
                         node: Expr::Literal(Literal::Int(val)),
                     })
+                } else if text.contains('.') || text.contains('e') || text.contains('E') {
+                    let val: f64 = text.parse().map_err(|_| ParseError::NumberParse {
+                        message: format!("invalid float literal: {}", text),
+                        span,
+                    })?;
+                    if !val.is_finite() {
+                        return Err(ParseError::NumberParse {
+                            message: format!("float literal overflows f64: {}", text),
+                            span,
+                        });
+                    }
+                    Ok(SpannedExpr {
+                        span,
+                        node: Expr::Literal(Literal::Float(val.into())),
+                    })
                 } else {
-                    let val: i64 = text.parse().unwrap_or(0);
+                    let val: i64 = text.parse().map_err(|_| ParseError::NumberParse {
+                        message: format!("invalid integer literal: {}", text),
+                        span,
+                    })?;
                     Ok(SpannedExpr {
                         span,
                         node: Expr::Literal(Literal::Int(val)),
@@ -378,10 +445,10 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Minus | TokenKind::Plus => {
                 // Handled by parse_unary, but if we reach here it's an error
-                self.next_token()?;
+                let token = self.next_token()?;
                 Err(ParseError::Unexpected {
                     token: format!("{:?}", peek_kind),
-                    span: Default::default(),
+                    span: token.span,
                 })
             }
             _ => {
@@ -449,10 +516,14 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_case_expr(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
+    fn parse_case_expr(
+        &mut self,
+        case_span: crate::token::Span,
+    ) -> Result<SpannedExpr<'a>, ParseError> {
         let mut operands = Vec::new();
         let mut results = Vec::new();
         let mut else_result = None;
+        let mut end_span = None;
 
         // Simple CASE: CASE expr WHEN ... THEN ... ELSE ... END
         // Searched CASE: CASE WHEN ... THEN ... ELSE ... END
@@ -468,12 +539,13 @@ impl<'a> Parser<'a> {
                 Ok(TokenKind::When) => {
                     self.next_token()?;
                     if let Some(ref operand) = case_operand {
+                        let when_expr = self.parse_expr()?;
                         operands.push(SpannedExpr {
-                            span: Default::default(),
+                            span: operand.span.union(when_expr.span),
                             node: Expr::BinaryOp {
                                 left: Box::new(operand.clone()),
                                 op: BinaryOp::Eq,
-                                right: Box::new(self.parse_expr()?),
+                                right: Box::new(when_expr),
                             },
                         });
                     } else {
@@ -487,21 +559,23 @@ impl<'a> Parser<'a> {
                     else_result = Some(Box::new(self.parse_expr()?));
                 }
                 Ok(TokenKind::End) => {
-                    self.next_token()?;
+                    let token = self.next_token()?;
+                    end_span = Some(token.span);
                     break;
                 }
                 _ => {
+                    let token = self.peek().map_err(|e| e.clone())?;
                     return Err(ParseError::Expected {
                         expected: "WHEN, ELSE, or END".into(),
-                        found: "???".into(),
-                        span: Default::default(),
+                        found: token.text.into(),
+                        span: token.span,
                     });
                 }
             }
         }
 
         Ok(SpannedExpr {
-            span: Default::default(),
+            span: case_span.union(end_span.expect("END token must be consumed before leaving the loop")),
             node: Expr::Case {
                 operands,
                 results,
@@ -808,23 +882,26 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn token_to_binary_op(kind: &TokenKind) -> BinaryOp {
+fn token_to_binary_op(kind: &TokenKind) -> Result<BinaryOp, ParseError> {
     match kind {
-        TokenKind::Plus => BinaryOp::Plus,
-        TokenKind::Minus => BinaryOp::Minus,
-        TokenKind::Star => BinaryOp::Multiply,
-        TokenKind::Slash => BinaryOp::Divide,
-        TokenKind::Percent => BinaryOp::Modulo,
-        TokenKind::Concat => BinaryOp::Concat,
-        TokenKind::Eq => BinaryOp::Eq,
-        TokenKind::Neq => BinaryOp::Neq,
-        TokenKind::Lt => BinaryOp::Lt,
-        TokenKind::Gt => BinaryOp::Gt,
-        TokenKind::Leq => BinaryOp::Leq,
-        TokenKind::Geq => BinaryOp::Geq,
-        TokenKind::And => BinaryOp::And,
-        TokenKind::Or => BinaryOp::Or,
-        _ => BinaryOp::Eq, // fallback
+        TokenKind::Plus => Ok(BinaryOp::Plus),
+        TokenKind::Minus => Ok(BinaryOp::Minus),
+        TokenKind::Star => Ok(BinaryOp::Multiply),
+        TokenKind::Slash => Ok(BinaryOp::Divide),
+        TokenKind::Percent => Ok(BinaryOp::Modulo),
+        TokenKind::Concat => Ok(BinaryOp::Concat),
+        TokenKind::Eq => Ok(BinaryOp::Eq),
+        TokenKind::Neq => Ok(BinaryOp::Neq),
+        TokenKind::Lt => Ok(BinaryOp::Lt),
+        TokenKind::Gt => Ok(BinaryOp::Gt),
+        TokenKind::Leq => Ok(BinaryOp::Leq),
+        TokenKind::Geq => Ok(BinaryOp::Geq),
+        TokenKind::And => Ok(BinaryOp::And),
+        TokenKind::Or => Ok(BinaryOp::Or),
+        _ => Err(ParseError::Unsupported(format!(
+            "unsupported binary operator: {:?}",
+            kind
+        ))),
     }
 }
 
@@ -885,6 +962,165 @@ mod tests {
     fn test_expr_in_list() {
         let expr = parse_expr("x IN (1, 2, 3)").expect("test should succeed");
         assert!(matches!(expr.node, Expr::InList { .. }));
+    }
+
+    #[test]
+    fn test_in_binds_like_comparison() {
+        let expr = parse_expr("x = 1 IN (2)").expect("test should succeed");
+        match expr.node {
+            Expr::InList { expr, list, negated } => {
+                assert!(!negated);
+                assert_eq!(list.len(), 1);
+                assert!(matches!(
+                    expr.node,
+                    Expr::BinaryOp {
+                        op: crate::ast::expr::BinaryOp::Eq,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected InList, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hex_literal_with_e_digit_parses_as_hex() {
+        let expr = parse_expr("0x1e").expect("test should succeed");
+        assert_eq!(expr.node, Expr::Literal(Literal::Int(30)));
+    }
+
+    #[test]
+    fn test_large_hex_literal_overflow_is_error() {
+        let err = parse_expr("0xFFFFFFFFFFFFFFFF").expect_err("test should fail");
+        assert!(matches!(err, ParseError::NumberParse { .. }));
+    }
+
+    #[test]
+    fn test_overflowing_int_literal_is_error() {
+        let err = parse_expr("18446744073709551615").expect_err("test should fail");
+        assert!(matches!(err, ParseError::NumberParse { .. }));
+    }
+
+    #[test]
+    fn test_overflowing_float_literal_is_error() {
+        let err = parse_expr("1e999").expect_err("test should fail");
+        assert!(matches!(err, ParseError::NumberParse { .. }));
+    }
+
+    #[test]
+    fn test_unary_op_chain_nests_outward() {
+        let expr = parse_expr("NOT - + 5").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::UnaryOp {
+                op: crate::ast::expr::UnaryOp::Not,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_deep_unary_chain_does_not_overflow() {
+        let input = format!("{}1", "- ".repeat(100_000));
+        let err = parse_expr(&input).expect_err("test should fail");
+        assert!(matches!(err, ParseError::RecursionLimitExceeded { .. }));
+    }
+
+    #[test]
+    fn test_moderately_deep_unary_chain_succeeds() {
+        let input = format!("{}1", "- ".repeat(100));
+        let expr = parse_expr(&input).expect("test should succeed");
+        assert!(matches!(expr.node, Expr::UnaryOp { op: UnaryOp::Negate, .. }));
+    }
+
+    #[test]
+    fn test_between_chain_nests() {
+        let expr = parse_expr("1 BETWEEN 2 BETWEEN 3 AND 4 AND 5").expect("test should succeed");
+        assert!(matches!(expr.node, Expr::Between { .. }));
+    }
+
+    #[test]
+    fn test_deep_between_chain_hits_recursion_limit() {
+        let mut input = String::from("1");
+        for i in 2..=600 {
+            input.push_str(&format!(" BETWEEN {}", i));
+        }
+        for i in 2..=600 {
+            input.push_str(&format!(" AND {}", i));
+        }
+        let err = parse_expr(&input).expect_err("test should fail");
+        assert!(matches!(err, ParseError::RecursionLimitExceeded { .. }));
+    }
+
+    #[test]
+    fn test_case_searched_has_real_spans() {
+        let expr = parse_expr("CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END").expect("test should succeed");
+        match expr.node {
+            Expr::Case {
+                ref operands,
+                ref results,
+                ref else_result,
+            } => {
+                assert!(expr.span.start < expr.span.end);
+                assert!(operands.iter().all(|o| o.span.start < o.span.end));
+                assert!(results.iter().all(|r| r.span.start < r.span.end));
+                assert!(else_result.is_some());
+            }
+            other => panic!("expected Case, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_case_simple_has_real_spans() {
+        let expr = parse_expr("CASE x WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END")
+            .expect("test should succeed");
+        assert!(expr.span.start < expr.span.end);
+        if let Expr::Case { operands, results, .. } = expr.node {
+            assert_eq!(operands.len(), 2);
+            assert!(operands.iter().all(|o| o.span.start < o.span.end));
+            assert!(results.iter().all(|r| r.span.start < r.span.end));
+        } else {
+            panic!("expected Case");
+        }
+    }
+
+    #[test]
+    fn test_case_error_reports_offending_token() {
+        let err = parse_expr("CASE WHEN x THEN y BLAH").expect_err("test should fail");
+        match err {
+            ParseError::Expected { found, .. } => assert_eq!(found, "BLAH"),
+            other => panic!("expected Expected, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_column_ref_quoted_part_is_stripped() {
+        let expr = parse_expr("a.\"my col\"").expect("test should succeed");
+        assert_eq!(
+            expr.node,
+            Expr::Column {
+                table: Some("a"),
+                column: "my col",
+            }
+        );
+    }
+
+    #[test]
+    fn test_column_ref_missing_part_is_error() {
+        let err = parse_expr("a.").expect_err("test should fail");
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    #[test]
+    fn test_column_ref_number_part_is_error() {
+        let err = parse_expr("a.5").expect_err("test should fail");
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    #[test]
+    fn test_table_wildcard() {
+        let expr = parse_expr("t.*").expect("test should succeed");
+        assert_eq!(expr.node, Expr::Wildcard { table: Some("t") });
     }
 
     #[test]

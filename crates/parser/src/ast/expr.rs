@@ -246,9 +246,20 @@ impl<'a> PartialEq for Literal<'a> {
             (Literal::Null, Literal::Null) => true,
             (Literal::Boolean(a), Literal::Boolean(b)) => a == b,
             (Literal::Int(a), Literal::Int(b)) => a == b,
-            (Literal::Float(a), Literal::Float(b)) => a.0.is_nan() && b.0.is_nan() || a.0 == b.0,
+            (Literal::Float(a), Literal::Float(b)) => a.0 == b.0,
             (Literal::String(a), Literal::String(b)) => a == b,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_literal_nan_is_not_equal_to_itself() {
+        let nan = Literal::Float(OrderedFloat::from(f64::NAN));
+        assert!(nan != nan.clone());
     }
 }

@@ -1,4 +1,5 @@
 use crate::binder::context::BinderContext;
+use crate::binder::expr::ExprBinder;
 use crate::binder::scope::ScopeStack;
 use crate::plan::LogicalPlan;
 use crate::plan::traversal::PlanTraversal;
@@ -32,15 +33,19 @@ pub fn bind_table_sample(input: LogicalPlan, method: &str, percent: f64) -> Resu
 }
 
 /// Binds a PipeOperator::Assert (Data Quality Validation)
-pub fn bind_assert(
+pub async fn bind_assert<'a>(
     input: LogicalPlan,
-    condition: &str,
+    condition: &SpannedExpr<'_>,
     message: &Option<&str>,
+    context: &mut BinderContext<'a>,
+    scopes: &mut ScopeStack<'a>,
 ) -> Result<LogicalPlan> {
     let schema = input.schema().clone();
+    let mut expr_binder = ExprBinder::new(context, scopes);
+    let condition = expr_binder.bind(condition).await?;
     Ok(LogicalPlan::Assert {
         input: Box::new(input),
-        condition: condition.to_string(),
+        condition,
         message: message.map(|m| m.to_string()),
         schema: Box::new(schema),
     })

@@ -124,10 +124,10 @@ pub enum PipeOperator<'a> {
     },
     /// `|> ASSERT condition MESSAGE '...'?`
     Assert {
-        /// The condition text to check.
+        /// The condition expression to check.
 
         #[serde(borrow)]
-        condition: &'a str,
+        condition: SpannedExpr<'a>,
         /// An optional human-readable failure message.
 
         #[serde(borrow)]

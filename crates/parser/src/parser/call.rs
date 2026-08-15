@@ -22,13 +22,7 @@ impl<'a> Parser<'a> {
         &mut self,
     ) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         self.expect(TokenKind::Assert)?;
-        let expr = self.parse_expr()?;
-        let src = self.source();
-        let condition = if expr.span.start <= expr.span.end && expr.span.end <= src.len() {
-            &src[expr.span.start..expr.span.end]
-        } else {
-            ""
-        };
+        let condition = self.parse_expr()?;
         let message = if let Ok(TokenKind::String) = self.peek().map(|t| &t.kind) {
             let tok = self.next_token()?;
             Some(&tok.text[1..tok.text.len() - 1])
