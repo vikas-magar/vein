@@ -127,15 +127,15 @@ impl FunctionRegistry for MockFunctionRegistry {
 /// the pre-populated mock registry. Returns a fully-typed logical plan or a
 /// typed `VeinError`; never panics on user input.
 pub async fn plan(sql: &str) -> error::Result<LogicalPlan> {
-    let query = Parser::new(sql)
-        .parse_query()
+    let node = Parser::new(sql)
+        .parse_statement()
         .map_err(|e| VeinError::semantic(format!("parse error: {e}"), parse_error_span(&e)))?;
 
     QueryBinder::new(
         Arc::new(InMemoryCatalog::new()),
         Arc::new(MockFunctionRegistry::new()),
     )
-    .bind(&query)
+    .bind(&node)
     .await
 }
 

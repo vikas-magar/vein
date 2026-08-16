@@ -2,6 +2,24 @@ use crate::ast::pipe_op::PipeOperator;
 use crate::token::Span;
 use std::borrow::Cow;
 
+/// A parsed top-level statement: either a plain query or an `EXPLAIN`-wrapped
+/// query that should be planned but not executed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum QueryNode<'a> {
+    /// A plain query to execute.
+    Plain {
+        /// The wrapped query.
+        #[serde(borrow)]
+        query: Query<'a>,
+    },
+    /// An `EXPLAIN <query>` statement: bind and display the plan only.
+    Explain {
+        /// The wrapped query.
+        #[serde(borrow)]
+        query: Box<Query<'a>>,
+    },
+}
+
 /// A parsed query: a source and a pipe pipeline.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Query<'a> {

@@ -32,6 +32,7 @@ ordered-float = "5.3.0"
 parser = { path = "crates/parser" }
 binder = { path = "crates/binder" }
 vcs = { path = "crates/vcs" }
+plan = { path = "crates/plan" }
 tokio = "1.52.3"
 
 [profile.release]

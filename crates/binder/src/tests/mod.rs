@@ -58,6 +58,7 @@ pub fn node_kind(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Limit { .. } => "Limit",
         LogicalPlan::Distinct { .. } => "Distinct",
         LogicalPlan::SubqueryAlias { .. } => "SubqueryAlias",
+        LogicalPlan::Explain { .. } => "Explain",
         LogicalPlan::SetOp { .. } => "SetOp",
         LogicalPlan::Sample { .. } => "Sample",
         LogicalPlan::Assert { .. } => "Assert",
@@ -233,5 +234,27 @@ mod window {
         )
         .await;
         assert!(err.to_string().contains("same PARTITION BY"), "got {err}");
+    }
+}
+
+#[cfg(test)]
+mod explain {
+    use super::*;
+
+    /// EXPLAIN wraps the fully-bound inner plan in an `Explain` node whose
+    /// schema mirrors the inner plan's.
+    #[tokio::test]
+    async fn explain_wraps_bound_plan() {
+        let plan = bind("EXPLAIN FROM users |> SELECT id, name").await;
+        assert_chain(&plan, &["Explain", "Project", "Scan"]);
+        assert_schema(&plan, &[("id", None, false), ("name", None, false)]);
+    }
+
+    /// EXPLAIN of a semantically invalid query still fails: the inner query
+    /// is fully bound before wrapping.
+    #[tokio::test]
+    async fn explain_propagates_bind_errors() {
+        let err = bind_err("EXPLAIN FROM missing_table |> SELECT *").await;
+        assert!(matches!(err, error::VeinError::NotFound(_)), "got {err}");
     }
 }

@@ -23,6 +23,8 @@ pub enum TokenKind {
     Select,
     /// `FROM`
     From,
+    /// `EXPLAIN`
+    Explain,
     /// `WHERE`
     Where,
     /// `AND`

@@ -27,6 +27,7 @@ impl PlanTraversal for LogicalPlan {
             | LogicalPlan::Limit { schema, .. }
             | LogicalPlan::Distinct { schema, .. }
             | LogicalPlan::SubqueryAlias { schema, .. }
+            | LogicalPlan::Explain { schema, .. }
             | LogicalPlan::SetOp { schema, .. }
             | LogicalPlan::Sample { schema, .. }
             | LogicalPlan::Assert { schema, .. }
@@ -51,6 +52,7 @@ impl PlanTraversal for LogicalPlan {
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::SubqueryAlias { input, .. }
+            | LogicalPlan::Explain { input, .. }
             | LogicalPlan::Sample { input, .. }
             | LogicalPlan::Assert { input, .. }
             | LogicalPlan::SemanticFilter { input, .. }
@@ -143,6 +145,10 @@ impl PlanTraversal for LogicalPlan {
             } => Ok(LogicalPlan::SubqueryAlias {
                 input: f(input)?,
                 alias,
+                schema,
+            }),
+            LogicalPlan::Explain { input, schema } => Ok(LogicalPlan::Explain {
+                input: f(input)?,
                 schema,
             }),
             LogicalPlan::SetOp {

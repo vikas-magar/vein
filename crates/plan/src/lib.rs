@@ -18,5 +18,6 @@ pub mod plan;
 pub mod schema;
 
 pub use expr::{LogicalExpr, LogicalLiteral, Volatility};
+pub use plan::display;
 pub use plan::{LogicalPlan, PlanTraversal, SortKey, WindowExpr};
 pub use schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema, VeinSchemaRef};

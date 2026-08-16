@@ -17,7 +17,7 @@ mod with;
 #[cfg(test)]
 mod tpch;
 
-use crate::ast::query::Query;
+use crate::ast::query::{Query, QueryNode};
 use crate::token::{Lexer, Span, SpannedToken, TokenKind};
 use std::borrow::Cow;
 
@@ -164,6 +164,26 @@ impl<'a> Parser<'a> {
                 expected: "identifier".into(),
                 found: format!("{:?}", token.kind),
                 span: token.span,
+            }),
+        }
+    }
+
+    /// Parses a single statement from the input.
+    ///
+    /// Supports `EXPLAIN <query>` (returning [`QueryNode::Explain`]) and
+    /// plain pipe queries (returning [`QueryNode::Plain`]). An `EXPLAIN`
+    /// query is planned but must not be executed.
+    pub fn parse_statement(&mut self) -> Result<QueryNode<'a>, ParseError> {
+        match self.peek().map(|t| &t.kind) {
+            Ok(TokenKind::Explain) => {
+                self.next_token().ok();
+                let query = self.parse_query()?;
+                Ok(QueryNode::Explain {
+                    query: Box::new(query),
+                })
+            }
+            _ => Ok(QueryNode::Plain {
+                query: self.parse_query()?,
             }),
         }
     }
@@ -472,5 +492,57 @@ mod tests {
                 alias: None
             }
         );
+    }
+
+    #[test]
+    fn test_explain_wraps_query() {
+        let mut parser = Parser::new("EXPLAIN FROM t |> SELECT name");
+        let node = parser.parse_statement().expect("test should succeed");
+        let QueryNode::Explain { query } = node else {
+            panic!("expected an Explain node")
+        };
+        assert_eq!(
+            query.source,
+            TableSource::Table {
+                name: "t".into(),
+                alias: None
+            }
+        );
+        assert_eq!(query.pipes.len(), 1);
+    }
+
+    #[test]
+    fn test_plain_statement() {
+        let mut parser = Parser::new("FROM t |> SELECT name");
+        let node = parser.parse_statement().expect("test should succeed");
+        assert!(matches!(node, QueryNode::Plain { .. }));
+    }
+
+    #[test]
+    fn test_explain_requires_from() {
+        let mut parser = Parser::new("EXPLAIN SELECT name");
+        let err = parser.parse_statement().expect_err("test should fail");
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    #[test]
+    fn test_explain_accepts_trailing_semicolon() {
+        let mut parser = Parser::new("EXPLAIN FROM t |> SELECT name;");
+        let node = parser.parse_statement().expect("test should succeed");
+        assert!(matches!(node, QueryNode::Explain { .. }));
+    }
+
+    #[test]
+    fn test_explain_rejects_trailing_tokens() {
+        let mut parser = Parser::new("EXPLAIN FROM t |> SELECT name garbage");
+        let err = parser.parse_statement().expect_err("test should fail");
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    #[test]
+    fn test_parse_query_rejects_explain() {
+        let mut parser = Parser::new("EXPLAIN FROM t |> SELECT name");
+        let err = parser.parse_query().expect_err("test should fail");
+        assert!(matches!(err, ParseError::Expected { .. }));
     }
 }

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use error::Result;
-use parser::ast::query::Query;
+use parser::ast::query::QueryNode;
 use plan::{LogicalPlan, VeinDataType, Volatility};
 
 /// Supported runtimes for User-Defined Functions.
@@ -50,11 +50,13 @@ pub trait FunctionRegistry: Send + Sync {
 
 /// The core logical binder trait.
 ///
-/// Binds an AST [`Query`] into a validated, type-coerced [`LogicalPlan`]. The
-/// binder is a semantic frontend only: it resolves columns, types, scopes and
-/// functions; plan optimization happens in a later pipeline stage.
+/// Binds an AST [`QueryNode`] into a validated, type-coerced [`LogicalPlan`].
+/// The binder is a semantic frontend only: it resolves columns, types, scopes
+/// and functions; plan optimization happens in a later pipeline stage.
 #[async_trait]
 pub trait LogicalBinder: Send + Sync {
-    /// Binds an AST Query into a validated, type-coerced LogicalPlan.
-    async fn bind<'a>(&self, query: &'a Query<'a>) -> Result<LogicalPlan>;
+    /// Binds a parsed statement into a validated, type-coerced LogicalPlan.
+    /// `EXPLAIN` statements yield a [`LogicalPlan::Explain`] wrapper over the
+    /// bound inner query.
+    async fn bind<'a>(&self, node: &'a QueryNode<'a>) -> Result<LogicalPlan>;
 }

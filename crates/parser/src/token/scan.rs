@@ -6,6 +6,7 @@ pub fn keyword(text: &str) -> Option<TokenKind> {
     match text.to_ascii_lowercase().as_str() {
         "select" => Some(TokenKind::Select),
         "from" => Some(TokenKind::From),
+        "explain" => Some(TokenKind::Explain),
         "where" => Some(TokenKind::Where),
         "and" => Some(TokenKind::And),
         "or" => Some(TokenKind::Or),

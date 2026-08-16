@@ -1,8 +1,8 @@
 use crate::context::BinderContext;
 use crate::scope::ScopeStack;
-use plan::LogicalPlan;
+use plan::{LogicalPlan, PlanTraversal};
 use error::{Result, VeinError};
-use parser::ast::query::Query;
+use parser::ast::query::{Query, QueryNode};
 
 use crate::scope::Scope;
 use plan::VeinSchema;
@@ -38,15 +38,28 @@ impl QueryBinder {
 
 #[async_trait]
 impl LogicalBinder for QueryBinder {
-    /// Recursively binds a parsed SQL Query into a LogicalPlan tree
-    async fn bind<'a>(&self, query: &'a Query<'a>) -> Result<LogicalPlan> {
+    /// Recursively binds a parsed SQL statement into a LogicalPlan tree.
+    /// `EXPLAIN` statements bind the inner query and wrap it in a
+    /// [`LogicalPlan::Explain`] node so downstream stages can render the
+    /// plan instead of executing it.
+    async fn bind<'a>(&self, node: &'a QueryNode<'a>) -> Result<LogicalPlan> {
         let catalog_ref = self.catalog.as_ref();
         let functions_ref = self.functions.as_ref();
 
         let mut context = BinderContext::new(catalog_ref, functions_ref);
         let mut scopes = ScopeStack::new(None);
 
-        bind_query_internal(query, &mut context, &mut scopes).await
+        match node {
+            QueryNode::Plain { query } => bind_query_internal(query, &mut context, &mut scopes).await,
+            QueryNode::Explain { query } => {
+                let inner = bind_query_internal(query, &mut context, &mut scopes).await?;
+                let schema = inner.schema().clone();
+                Ok(LogicalPlan::Explain {
+                    input: Box::new(inner),
+                    schema: Box::new(schema),
+                })
+            }
+        }
     }
 }
 

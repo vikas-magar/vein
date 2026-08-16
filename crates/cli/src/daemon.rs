@@ -46,9 +46,9 @@ impl MasterDaemon {
                             tracing::info!("Received query: {}", query_string);
 
                             let mut parser = parser::Parser::new(&query_string);
-                            match parser.parse_query() {
-                                Ok(query_ast) => {
-                                    match engine.submit_query(query_ast).await {
+                            match parser.parse_statement() {
+                                Ok(statement) => {
+                                    match engine.submit_query(statement).await {
                                         Ok(result_bytes) => {
                                             // 3. Stream Arrow IPC result back to the client
                                             if let Err(err) = stream.send(result_bytes).await {

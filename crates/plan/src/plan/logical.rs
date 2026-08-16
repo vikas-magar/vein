@@ -118,6 +118,14 @@ pub enum LogicalPlan {
         /// The resulting schema
         schema: Box<VeinSchema>,
     },
+    /// A plan-requested-by-`EXPLAIN`: bind and display the inner plan
+    /// without executing it. The schema mirrors the inner plan's schema.
+    Explain {
+        /// The inner plan to display
+        input: Box<LogicalPlan>,
+        /// The resulting schema (identical to the input's)
+        schema: Box<VeinSchema>,
+    },
     /// A set operation (Union/Intersect/Except)
     SetOp {
         /// The kind of set operation

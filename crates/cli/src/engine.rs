@@ -5,15 +5,19 @@ use std::sync::Arc;
 
 use optimizer::Optimizer;
 use orchestrator::traits::PhysicalPlanner;
-use parser::ast::query::Query;
+use parser::ast::query::QueryNode;
+use plan::display;
+use plan::LogicalPlan;
 use binder::LogicalBinder;
 
 /// The absolute highest-level abstraction for the Database Engine.
 /// Represents the complete end-to-end lifecycle from query submission to result retrieval.
 #[async_trait]
 pub trait QueryEngine: Send + Sync {
-    /// Submits a query AST and returns the final result as Arrow IPC bytes.
-    async fn submit_query<'a>(&self, query: Query<'a>) -> Result<Bytes>;
+    /// Submits a parsed statement and returns the result bytes. Executed
+    /// queries return Arrow IPC; `EXPLAIN` statements short-circuit and
+    /// return the rendered (optimized) plan text as UTF-8.
+    async fn submit_query<'a>(&self, node: QueryNode<'a>) -> Result<Bytes>;
 }
 
 /// The concrete Coordinator that wires all the abstract traits together.
@@ -100,15 +104,24 @@ impl DistributedCoordinatorBuilder {
 
 #[async_trait]
 impl QueryEngine for DistributedCoordinator {
-    async fn submit_query<'a>(&self, query: Query<'a>) -> Result<Bytes> {
+    async fn submit_query<'a>(&self, node: QueryNode<'a>) -> Result<Bytes> {
         // 1. BIND: Convert raw SQL AST to a Semantic Logical Plan
-        let _query_id_str = format!("{:?}", query); // Simplified for telemetry
+        let _query_id_str = format!("{:?}", node); // Simplified for telemetry
         let start_time = std::time::Instant::now();
 
-        let logical_plan = self.binder.bind(&query).await?;
+        let logical_plan = self.binder.bind(&node).await?;
 
-        // 2. OPTIMIZE: Apply cost-based or RL-based Join reordering
+        // 2. OPTIMIZE: Apply rule-based rewrites (constant folding, ...)
         let optimized_plan = self.optimizer.optimize(logical_plan)?;
+
+        // 2.5 EXPLAIN: render the optimized plan and return it directly —
+        //             EXPLAIN never executes. `format_plan` already emits a
+        //             trailing newline.
+        if let LogicalPlan::Explain { .. } = &optimized_plan {
+            let text = display::format_plan(&optimized_plan);
+            tracing::debug!("EXPLAIN rendered plan:\n{text}");
+            return Ok(Bytes::from(text));
+        }
 
         // 3. PLAN: Lower the optimized logical plan into a distributed Physical DAG
         let physical_dag = self.planner.create_physical_plan(optimized_plan)?;
@@ -143,6 +156,34 @@ impl QueryEngine for DistributedCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use binder::QueryBinder;
+    use binder::testing::MockFunctionRegistry;
+    use orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher;
+    use orchestrator::ExecutorRegistry;
+    use orchestrator::planner::dag_planner::DagPhysicalPlanner;
+    use orchestrator::Scheduler;
+    use parser::Parser;
+    use std::time::Duration;
+    use vcs::InMemoryCatalog;
+
+    /// Builds a fully-wired coordinator over the in-memory catalog.
+    fn coordinator() -> DistributedCoordinator {
+        DistributedCoordinator::builder()
+            .with_binder(Arc::new(QueryBinder::new(
+                Arc::new(InMemoryCatalog::new()),
+                Arc::new(MockFunctionRegistry::new()),
+            )))
+            .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
+            .with_planner(Arc::new(DagPhysicalPlanner::new()))
+            .with_scheduler(Arc::new(Scheduler::new(
+                Arc::new(ExecutorRegistry::new()),
+                Arc::new(QuicTaskDispatcher::new()),
+                3,
+                Duration::from_secs(10),
+            )))
+            .build()
+            .expect("coordinator should build")
+    }
 
     #[test]
     fn test_builder_fails_without_dependencies() {
@@ -151,6 +192,48 @@ mod tests {
         assert!(
             result.is_err(),
             "Builder should fail if dependencies are not injected"
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_returns_plan_text_without_executing() {
+        let engine = coordinator();
+        let node = Parser::new("EXPLAIN FROM users |> SELECT id, name")
+            .parse_statement()
+            .expect("query should parse");
+        let bytes = engine.submit_query(node).await.expect("explain should succeed");
+        let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
+        assert!(text.contains("Explain"), "got:\n{text}");
+        assert!(text.contains("Scan [table: users"), "got:\n{text}");
+        assert!(text.contains("Project"), "got:\n{text}");
+    }
+
+    /// EXPLAIN returns the *optimized* plan: constant folding must have run
+    /// inside the wrapped query by the time it is rendered.
+    #[tokio::test]
+    async fn explain_renders_optimized_plan() {
+        let engine = coordinator();
+        let node = Parser::new("EXPLAIN FROM users |> WHERE age > 18 + 2 |> SELECT id")
+            .parse_statement()
+            .expect("query should parse");
+        let bytes = engine.submit_query(node).await.expect("explain should succeed");
+        let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
+        assert!(text.contains("> 20"), "expected folded literal, got:\n{text}");
+        assert!(!text.contains("18 + 2"), "expected folding, got:\n{text}");
+    }
+
+    /// Non-EXPLAIN queries proceed into physical planning; that stage is a
+    /// stub today, which is what the error pins here.
+    #[tokio::test]
+    async fn plain_query_reaches_physical_planning() {
+        let engine = coordinator();
+        let node = Parser::new("FROM users |> SELECT id, name")
+            .parse_statement()
+            .expect("query should parse");
+        let err = engine.submit_query(node).await.expect_err("physical planning is stubbed");
+        assert!(
+            err.to_string().contains("create_physical_plan"),
+            "got {err}"
         );
     }
 }
