@@ -1,5 +1,5 @@
 use crate::traits::FunctionRegistry;
-use plan::{ColumnId, LogicalPlan, VeinSchemaRef};
+use plan::{ColumnId, LogicalPlan};
 use std::collections::HashMap;
 use vcs::TableCatalog;
 
@@ -11,10 +11,6 @@ pub struct BinderContext<'a> {
     pub functions: &'a dyn FunctionRegistry,
     /// Common Table Expressions (CTEs) bound in the current query scope
     pub ctes: HashMap<String, Box<LogicalPlan>>,
-    /// Optional lineage schema for auditing
-    pub lineage_schema: Option<VeinSchemaRef>,
-    /// Optional calibration schema for conformal prediction
-    pub calibration_schema: Option<VeinSchemaRef>,
     /// Global column ID generator for the query
     pub next_col_id: ColumnId,
 }
@@ -26,8 +22,6 @@ impl<'a> BinderContext<'a> {
             catalog,
             functions,
             ctes: HashMap::new(),
-            lineage_schema: None,
-            calibration_schema: None,
             next_col_id: ColumnId(1),
         }
     }

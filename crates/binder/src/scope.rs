@@ -27,21 +27,47 @@ impl Scope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ScopeIndex(pub usize);
 
-/// Stack of lexical scopes for resolving column references and correlated subqueries
+/// Stack of lexical scopes for resolving column references and correlated subqueries.
+///
+/// Scope data is fully owned. Correlated subqueries capture a *snapshot* of the
+/// enclosing scopes in [`ScopeStack::correlation_scopes`] (see `bind_subquery`);
+/// [`ScopeStack::resolve_correlated`] marks columns found there as correlated
+/// (`OuterColumn`). Storing the enclosing scopes by value instead of as a
+/// parent *reference* avoids a self-referential lifetime (`&'a ScopeStack<'a>`),
+/// which Rust's borrow checker cannot express safely without `unsafe`.
 #[derive(Clone)]
-pub struct ScopeStack<'a> {
-    /// Pointer to outer scope to enable Correlated Subquery resolution
-    pub parent: Option<&'a ScopeStack<'a>>,
+pub struct ScopeStack {
     scopes: Vec<Scope>,
+    /// Snapshot of the enclosing query's scopes, used to resolve correlated
+    /// references inside a subquery. For a nested subquery this includes the
+    /// immediate parent's scopes plus any outer snapshot, so resolution walks
+    /// the full enclosing chain outward.
+    correlation_scopes: Vec<Scope>,
 }
 
-impl<'a> ScopeStack<'a> {
-    /// Creates a new ScopeStack with an optional outer (correlation) scope.
-    pub fn new(parent: Option<&'a ScopeStack<'a>>) -> Self {
+impl Default for ScopeStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScopeStack {
+    /// Creates a new, empty ScopeStack.
+    pub fn new() -> Self {
         Self {
-            parent,
             scopes: Vec::new(),
+            correlation_scopes: Vec::new(),
         }
+    }
+
+    /// Captures `parent`'s scopes (and any outer correlation snapshot) so a
+    /// child subquery can resolve correlated references against the enclosing
+    /// query. Called on the child before binding it.
+    pub fn capture_correlation(&mut self, parent: &ScopeStack) {
+        self.correlation_scopes.clear();
+        self.correlation_scopes.extend(parent.scopes.iter().cloned());
+        self.correlation_scopes
+            .extend(parent.correlation_scopes.iter().cloned());
     }
 
     /// Pushes a new scope onto the stack
@@ -60,49 +86,48 @@ impl<'a> ScopeStack<'a> {
     }
 
     /// Resolves a column reference, returning the column with a marker for
-    /// whether it was found in a parent scope (a correlated reference).
+    /// whether it was found in a correlated (enclosing) scope.
     ///
-    /// Resolution order is innermost-to-outermost. An unqualified reference
-    /// matches any column name; a qualified one only inside scopes that carry
-    /// the qualifier as an alias. Two different columns with the same name in
-    /// the same scope make an unqualified reference ambiguous.
+    /// Resolution order is innermost-to-outermost: a query's own scopes first,
+    /// then the captured correlation scopes. An unqualified reference matches
+    /// any column name; a qualified one only inside scopes that carry the
+    /// qualifier as an alias. Two different columns with the same name in the
+    /// same scope make an unqualified reference ambiguous.
     pub fn resolve_correlated(
         &self,
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<(ResolvedColumn, bool), VeinError> {
-        for scope in self.scopes.iter().rev() {
-            let scope_matches_qualifier = match qualifier {
-                Some(q) => scope.aliases.iter().any(|a| a == q),
-                None => true,
-            };
-            if !scope_matches_qualifier {
-                continue;
-            }
-
-            let mut matches = scope.columns.iter().filter(|c| c.name == name).peekable();
-            if let Some(first) = matches.next() {
-                if let Some(second) = matches.next()
-                    && first.id != second.id
-                    && qualifier.is_none()
-                {
-                    return Err(VeinError::semantic(
-                        format!(
-                            "ambiguous column reference: '{name}' matches {} and {}",
-                            first.qualifier.as_deref().unwrap_or("?"),
-                            second.qualifier.as_deref().unwrap_or("?")
-                        ),
-                        None,
-                    ));
-                }
-                return Ok((first.clone(), false));
-            }
-        }
-
-        if let Some(parent) = self.parent
-            && let Ok((col, _)) = parent.resolve_correlated(qualifier, name)
+        for (correlated, scopes) in
+            [(false, &self.scopes[..]), (true, &self.correlation_scopes[..])]
         {
-            return Ok((col, true));
+            for scope in scopes.iter().rev() {
+                let scope_matches_qualifier = match qualifier {
+                    Some(q) => scope.aliases.iter().any(|a| a == q),
+                    None => true,
+                };
+                if !scope_matches_qualifier {
+                    continue;
+                }
+
+                let mut matches = scope.columns.iter().filter(|c| c.name == name).peekable();
+                if let Some(first) = matches.next() {
+                    if let Some(second) = matches.next()
+                        && first.id != second.id
+                        && qualifier.is_none()
+                    {
+                        return Err(VeinError::semantic(
+                            format!(
+                                "ambiguous column reference: '{name}' matches {} and {}",
+                                first.qualifier.as_deref().unwrap_or("?"),
+                                second.qualifier.as_deref().unwrap_or("?")
+                            ),
+                            None,
+                        ));
+                    }
+                    return Ok((first.clone(), correlated));
+                }
+            }
         }
 
         let display = match qualifier {

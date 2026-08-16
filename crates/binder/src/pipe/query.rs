@@ -1,7 +1,7 @@
 use crate::context::BinderContext;
 use crate::scope::ScopeStack;
 use plan::{LogicalPlan, PlanTraversal};
-use error::{Result, VeinError};
+use error::Result;
 use parser::ast::query::{Query, QueryNode};
 
 use crate::scope::Scope;
@@ -16,7 +16,7 @@ use crate::pipe::dataflow::{bind_fork, bind_set_op, bind_tee};
 use crate::pipe::mutation::{bind_as, bind_drop, bind_extend, bind_rename, bind_set};
 use crate::pipe::order_limit::{bind_limit, bind_order_by};
 use crate::pipe::relational::{
-    bind_aggregate, bind_distinct, bind_join, bind_select, bind_where,
+    bind_aggregate, bind_distinct, bind_join, bind_qualify, bind_select, bind_where,
 };
 
 use crate::traits::{FunctionRegistry, LogicalBinder};
@@ -47,7 +47,7 @@ impl LogicalBinder for QueryBinder {
         let functions_ref = self.functions.as_ref();
 
         let mut context = BinderContext::new(catalog_ref, functions_ref);
-        let mut scopes = ScopeStack::new(None);
+        let mut scopes = ScopeStack::new();
 
         match node {
             QueryNode::Plain { query } => bind_query_internal(query, &mut context, &mut scopes).await,
@@ -67,11 +67,53 @@ impl LogicalBinder for QueryBinder {
 pub async fn bind_query_internal<'a>(
     query: &Query<'_>,
     context: &mut BinderContext<'a>,
-    scopes: &mut ScopeStack<'a>,
+    scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
     // 1. Bind the Source (FROM clause equivalent)
-    let plan = match &query.source {
+    let plan = bind_source(&query.source, context, scopes).await?;
+
+    // 2. Process Pipe Operators sequentially using the standalone helper
+    Box::pin(bind_pipeline(plan, &query.pipes, context, scopes)).await
+}
+
+/// Binds a query `FROM` source (base table, subquery, or object store) into a
+/// `LogicalPlan`, pushing the resulting columns into the current scope.
+///
+/// A `Subquery` source is bound in a fresh, non-correlated `ScopeStack`
+/// (mirroring set operations) and wrapped in a [`LogicalPlan::SubqueryAlias`]
+/// so its columns answer to the given alias.
+pub async fn bind_source<'a>(
+    source: &TableSource<'_>,
+    context: &mut BinderContext<'a>,
+    scopes: &mut ScopeStack,
+) -> Result<LogicalPlan> {
+    match source {
         TableSource::Table { name, alias } => {
+            // A registered CTE takes precedence over a catalog table lookup.
+            if let Some(cte) = context.ctes.get(name.as_ref()) {
+                let qualifier = alias.map(|a| a.to_string()).unwrap_or_else(|| name.to_string());
+                let fields = cte
+                    .schema()
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let mut b = f.clone();
+                        b.qualifier = alias.map(|a| a.to_string());
+                        b
+                    })
+                    .collect::<Vec<_>>();
+                let plan = LogicalPlan::SubqueryAlias {
+                    input: cte.clone(),
+                    alias: name.to_string(),
+                    schema: Box::new(VeinSchema { fields: fields.clone() }),
+                };
+                scopes.push(Scope {
+                    columns: fields,
+                    aliases: vec![qualifier],
+                });
+                return Ok(plan);
+            }
+
             let schema = context.catalog.get_table_schema(name).await?;
 
             let mut columns = Vec::new();
@@ -92,23 +134,59 @@ pub async fn bind_query_internal<'a>(
                 aliases: vec![qualifier.clone().unwrap_or_default()],
             });
 
-            LogicalPlan::Scan {
+            Ok(LogicalPlan::Scan {
                 table_name: name.to_string(),
                 projection: None,
                 filters: vec![],
                 schema: Box::new(VeinSchema { fields: columns }),
-            }
+            })
         }
-_ => {
-                return Err(VeinError::planning(
-                    "Only Base Tables are supported right now in the binder",
-                    None,
-                ));
-            }
-    };
+        TableSource::Subquery { query, alias } => {
+            let mut subquery_scopes = ScopeStack::new();
+            let inner = Box::pin(bind_query_internal(query, context, &mut subquery_scopes)).await?;
 
-    // 2. Process Pipe Operators sequentially using the standalone helper
-    Box::pin(bind_pipeline(plan, &query.pipes, context, scopes)).await
+            // Rebind the inner fields with fresh IDs owned by the outer query,
+            // then expose them under the subquery's alias.
+            let mut fields = Vec::with_capacity(inner.schema().fields.len());
+            for field in &inner.schema().fields {
+                let mut bound = field.clone();
+                bound.id = context.next_id();
+                bound.qualifier = alias.map(|a| a.to_string());
+                fields.push(bound);
+            }
+
+            let qualifier = alias.map(|a| a.to_string()).unwrap_or_default();
+            scopes.push(Scope {
+                columns: fields.clone(),
+                aliases: vec![qualifier.clone()],
+            });
+
+            Ok(LogicalPlan::SubqueryAlias {
+                input: Box::new(inner),
+                alias: qualifier,
+                schema: Box::new(VeinSchema { fields }),
+            })
+        }
+        TableSource::ObjectStore {
+            url,
+            inline_options,
+            alias,
+        } => {
+            let qualifier = alias.map(|a| a.to_string());
+            scopes.push(Scope {
+                columns: vec![],
+                aliases: vec![qualifier.clone().unwrap_or_default()],
+            });
+            Ok(LogicalPlan::ExternalScan {
+                url: url.to_string(),
+                options: inline_options
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                schema: Box::new(VeinSchema { fields: vec![] }),
+            })
+        }
+    }
 }
 
 /// Binds a sequence of PipeOperators against an existing LogicalPlan
@@ -116,13 +194,16 @@ pub async fn bind_pipeline<'a>(
     mut plan: LogicalPlan,
     pipes: &[PipeOperator<'_>],
     context: &mut BinderContext<'a>,
-    scopes: &mut ScopeStack<'a>,
+    scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
     for pipe in pipes {
         plan = match pipe {
             // Relational Core
             PipeOperator::Where { predicate } => {
                 bind_where(plan, predicate, &mut *context, &mut *scopes).await?
+            }
+            PipeOperator::Qualify { predicate } => {
+                bind_qualify(plan, predicate, &mut *context, &mut *scopes).await?
             }
             PipeOperator::Select { items } => {
                 bind_select(plan, items, &mut *context, &mut *scopes).await?
@@ -165,8 +246,36 @@ pub async fn bind_pipeline<'a>(
             PipeOperator::As { alias } => bind_as(plan, alias)?,
 
             // Advanced Analytical
-            PipeOperator::Pivot => bind_pivot(plan)?,
-            PipeOperator::Unpivot => bind_unpivot(plan)?,
+            PipeOperator::Pivot {
+                aggregate,
+                alias,
+                value_column,
+                values,
+            } => bind_pivot(
+                plan,
+                aggregate,
+                alias.as_deref(),
+                value_column,
+                values,
+                &mut *context,
+                &mut *scopes,
+            )
+            .await?,
+            PipeOperator::Unpivot {
+                value_name,
+                name_name,
+                columns,
+                include_nulls,
+            } => bind_unpivot(
+                plan,
+                value_name,
+                name_name,
+                columns,
+                *include_nulls,
+                &mut *context,
+                &mut *scopes,
+            )
+            .await?,
             PipeOperator::TableSample { method, percent } => {
                 bind_table_sample(plan, method, *percent)?
             }
@@ -176,7 +285,9 @@ pub async fn bind_pipeline<'a>(
             PipeOperator::Call { name, args } => {
                 bind_call(plan, name, args, &mut *context, &mut *scopes).await?
             }
-            PipeOperator::With { ctes } => bind_with(plan, ctes)?,
+            PipeOperator::With { ctes } => {
+                bind_with(plan, ctes, &mut *context, &mut *scopes).await?
+            }
             PipeOperator::Write { target } => bind_write(plan, target)?,
         };
     }

@@ -1,6 +1,7 @@
 use super::types::SortKey;
 use crate::expr::logical::LogicalExpr;
 use crate::schema::{ColumnId, ResolvedColumn, VeinSchema};
+use parser::ast::pipe_op::JoinType;
 use parser::ast::query::SetOpKind;
 
 /// A computed window expression: the resolved call together with the output
@@ -26,6 +27,15 @@ pub enum LogicalPlan {
         /// The filters to push down
         filters: Vec<LogicalExpr>,
         /// The resulting schema
+        schema: Box<VeinSchema>,
+    },
+    /// A scan of an external object store (`FROM 'url' WITH (...)`).
+    ExternalScan {
+        /// The object store URL.
+        url: String,
+        /// Inline options (e.g. format).
+        options: Vec<(String, String)>,
+        /// The resulting schema.
         schema: Box<VeinSchema>,
     },
 
@@ -76,6 +86,23 @@ pub enum LogicalPlan {
         /// The computed window expressions with their output columns
         exprs: Vec<WindowExpr>,
         /// The resulting schema (input columns + new window columns)
+        schema: Box<VeinSchema>,
+    },
+
+    // ── Relational Core ─────────────────────────────────────
+    /// A relational join combining two input plans.
+    Join {
+        /// The join flavor (INNER/LEFT/RIGHT/FULL/CROSS).
+        join_type: JoinType,
+        /// The left input plan.
+        left: Box<LogicalPlan>,
+        /// The right input plan.
+        right: Box<LogicalPlan>,
+        /// The join predicate (`None` for a CROSS join).
+        on: Option<LogicalExpr>,
+        /// The `USING` columns, kept for schema de-duplication and display.
+        using: Vec<ResolvedColumn>,
+        /// The resulting schema (left ++ right; `USING` merges the join column).
         schema: Box<VeinSchema>,
     },
 
@@ -161,6 +188,36 @@ pub enum LogicalPlan {
         /// The resulting schema
         schema: Box<VeinSchema>,
     },
+    /// A pivot: reshapes a column's distinct values into new columns.
+    Pivot {
+        /// The input plan
+        input: Box<LogicalPlan>,
+        /// The bound aggregate expression.
+        aggregate: LogicalExpr,
+        /// The optional output alias for the pivoted column(s).
+        alias: Option<String>,
+        /// The column whose distinct values become new columns.
+        value_column: ResolvedColumn,
+        /// The explicit pivot values.
+        values: Vec<LogicalExpr>,
+        /// The resulting schema.
+        schema: Box<VeinSchema>,
+    },
+    /// An unpivot: turns multiple columns into two columns (`name`, `value`).
+    Unpivot {
+        /// The input plan
+        input: Box<LogicalPlan>,
+        /// The generated value column name.
+        value_name: String,
+        /// The generated name column name.
+        name_name: String,
+        /// The columns to unpivot.
+        columns: Vec<ResolvedColumn>,
+        /// Whether nulls are retained (`ALL`).
+        include_nulls: bool,
+        /// The resulting schema.
+        schema: Box<VeinSchema>,
+    },
     /// A fork operation splitting a plan into branches
     Fork {
         /// The branch plans
@@ -231,6 +288,17 @@ pub enum LogicalPlan {
         /// Additional options
         options: Vec<(String, String)>,
         /// The resulting schema (usually identical to input)
+        schema: Box<VeinSchema>,
+    },
+    /// Evaluates a function call over the input stream (`|> CALL name(args)`).
+    Call {
+        /// The input plan
+        input: Box<LogicalPlan>,
+        /// The called function name
+        name: String,
+        /// The bound function arguments
+        args: Vec<LogicalExpr>,
+        /// The resulting schema (mirrors the input)
         schema: Box<VeinSchema>,
     },
 }

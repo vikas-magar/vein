@@ -42,6 +42,7 @@ pub fn keyword(text: &str) -> Option<TokenKind> {
         "except" => Some(TokenKind::Except),
         "aggregate" => Some(TokenKind::Aggregate),
         "extend" => Some(TokenKind::Extend),
+        "qualify" => Some(TokenKind::Qualify),
         "set" => Some(TokenKind::Set),
         "drop" => Some(TokenKind::Drop),
         "rename" => Some(TokenKind::Rename),

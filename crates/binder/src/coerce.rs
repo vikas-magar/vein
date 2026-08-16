@@ -19,7 +19,9 @@ use error::{Result, VeinError};
 /// - numeric widening follows the integer family `Int8 → Int16 → Int32 →
 ///   Int64` and then `→ Float32 → Float64`;
 /// - `Utf8`/`StringView` unify with `Null` (returning the string type);
-/// - `Date32` unifies with `Timestamp` (returning `Timestamp`).
+/// - string-family members unify symmetrically to the widest member;
+/// - `Date32` unifies with `Timestamp` (returning `Timestamp`, preserving
+///   the other side's timezone).
 ///
 /// Anything else is a `Semantic` error: there is no silent fallback.
 pub fn coerce_types(
@@ -28,60 +30,70 @@ pub fn coerce_types(
 ) -> Result<(LogicalExpr, LogicalExpr, VeinDataType)> {
     let left_type = left.data_type();
     let right_type = right.data_type();
+    let common = unify_types(&left_type, &right_type)?;
 
-    if left_type == right_type {
-        return Ok((left, right, left_type));
+    // A `Null` operand is never wrapped in a cast; it simply adopts the other
+    // side's type. Any other differing operand is coerced to the common type.
+    let left = if left_type == VeinDataType::Null {
+        left
+    } else {
+        cast_to(left, common.clone())
+    };
+    let right = if right_type == VeinDataType::Null {
+        right
+    } else {
+        cast_to(right, common.clone())
+    };
+
+    Ok((left, right, common))
+}
+
+/// Resolves the common supertype of two types, or errors if none exists.
+///
+/// This is the type-level core shared by [`coerce_types`] and by column-level
+/// checks (e.g. `SetOp` branch schemas) where no expression values are at hand.
+/// The rules mirror [`coerce_types`]: identical types pass through, `Null`
+/// unifies with anything, numeric/string widening is symmetric, and `Date32`
+/// promotes to `Timestamp` (preserving the other side's timezone).
+pub fn unify_types(
+    left: &VeinDataType,
+    right: &VeinDataType,
+) -> Result<VeinDataType> {
+    if left == right {
+        return Ok(left.clone());
     }
 
-    // Null unifies with any other type without injection.
-    if left_type == VeinDataType::Null {
-        return Ok((left, right, right_type));
+    // Null unifies with any other type.
+    if *left == VeinDataType::Null {
+        return Ok(right.clone());
     }
-    if right_type == VeinDataType::Null {
-        return Ok((left, right, left_type));
-    }
-
-    if let Some(common) = common_numeric(&left_type, &right_type) {
-        return Ok((
-            cast_to(left, common.clone()),
-            cast_to(right, common.clone()),
-            common,
-        ));
+    if *right == VeinDataType::Null {
+        return Ok(left.clone());
     }
 
-    // String family unifies with itself (only Null flows in above).
-    if is_string_type(&left_type) && is_string_type(&right_type) {
-        let common = if left_type == VeinDataType::StringView {
-            VeinDataType::StringView
-        } else {
-            VeinDataType::Utf8
-        };
-        return Ok((
-            cast_to(left, common.clone()),
-            cast_to(right, common.clone()),
-            common,
-        ));
+    if let Some(common) = common_numeric(left, right) {
+        return Ok(common);
     }
 
-    if matches!(left_type, VeinDataType::Date32) && matches!(right_type, VeinDataType::Timestamp(_))
+    // String family unifies to the widest member, symmetrically.
+    if is_string_type(left) && is_string_type(right) {
+        return Ok(common_string(left, right));
+    }
+
+    // Date32 promotes to a Timestamp, preserving the other side's timezone.
+    if let VeinDataType::Timestamp(tz) = right
+        && matches!(left, VeinDataType::Date32)
     {
-        return Ok((
-            cast_to(left, VeinDataType::Timestamp(None)),
-            right,
-            VeinDataType::Timestamp(None),
-        ));
+        return Ok(VeinDataType::Timestamp(tz.clone()));
     }
-    if matches!(left_type, VeinDataType::Timestamp(_)) && matches!(right_type, VeinDataType::Date32)
+    if let VeinDataType::Timestamp(tz) = left
+        && matches!(right, VeinDataType::Date32)
     {
-        return Ok((
-            left,
-            cast_to(right, VeinDataType::Timestamp(None)),
-            VeinDataType::Timestamp(None),
-        ));
+        return Ok(VeinDataType::Timestamp(tz.clone()));
     }
 
     Err(VeinError::semantic(
-        format!("no implicit coercion between types {left_type:?} and {right_type:?}"),
+        format!("no implicit coercion between types {left:?} and {right:?}"),
         None,
     ))
 }
@@ -104,6 +116,24 @@ fn is_string_type(t: &VeinDataType) -> bool {
         t,
         VeinDataType::Utf8 | VeinDataType::LargeUtf8 | VeinDataType::StringView
     )
+}
+
+/// The widest string type able to hold both operands without loss. Ranks the
+/// family `Utf8 → StringView → LargeUtf8`, so the result is symmetric.
+fn common_string(left: &VeinDataType, right: &VeinDataType) -> VeinDataType {
+    let rank = |t: &VeinDataType| -> u8 {
+        match t {
+            VeinDataType::Utf8 => 0,
+            VeinDataType::StringView => 1,
+            VeinDataType::LargeUtf8 => 2,
+            _ => unreachable!("common_string called with non-string type {t:?}"),
+        }
+    };
+    if rank(left) >= rank(right) {
+        left.clone()
+    } else {
+        right.clone()
+    }
 }
 
 /// The common supertype of two numeric types, if one exists.
@@ -181,8 +211,103 @@ mod tests {
     }
 
     #[test]
+    fn date_promotes_preserving_timezone() {
+        let (l, _, t) = coerce_types(
+            lit(VeinDataType::Date32),
+            lit(VeinDataType::Timestamp(Some("UTC".to_string()))),
+        )
+        .unwrap();
+        assert_eq!(t, VeinDataType::Timestamp(Some("UTC".to_string())));
+        assert!(matches!(
+            l,
+            LogicalExpr::Cast {
+                target_type: VeinDataType::Timestamp(Some(ref tz)),
+                ..
+            } if tz == "UTC"
+        ));
+    }
+
+    #[test]
+    fn timestamp_promotes_date_to_its_timezone() {
+        let (_, r, t) = coerce_types(
+            lit(VeinDataType::Timestamp(Some("America/New_York".to_string()))),
+            lit(VeinDataType::Date32),
+        )
+        .unwrap();
+        assert_eq!(
+            t,
+            VeinDataType::Timestamp(Some("America/New_York".to_string()))
+        );
+        assert!(matches!(
+            r,
+            LogicalExpr::Cast {
+                target_type: VeinDataType::Timestamp(Some(ref tz)),
+                ..
+            } if tz == "America/New_York"
+        ));
+    }
+
+    #[test]
+    fn string_family_is_order_independent() {
+        let (l, r, t) =
+            coerce_types(lit(VeinDataType::Utf8), lit(VeinDataType::StringView)).unwrap();
+        assert_eq!(t, VeinDataType::StringView);
+        assert!(matches!(
+            l,
+            LogicalExpr::Cast {
+                target_type: VeinDataType::StringView,
+                ..
+            }
+        ));
+        assert!(matches!(r, LogicalExpr::Literal(_)));
+
+        // Same pair, reversed arguments, must yield the same common type.
+        let (_, _, t) =
+            coerce_types(lit(VeinDataType::StringView), lit(VeinDataType::Utf8)).unwrap();
+        assert_eq!(t, VeinDataType::StringView);
+    }
+
+    #[test]
+    fn large_utf8_is_widest_string() {
+        let (l, _, t) =
+            coerce_types(lit(VeinDataType::Utf8), lit(VeinDataType::LargeUtf8)).unwrap();
+        assert_eq!(t, VeinDataType::LargeUtf8);
+        assert!(matches!(
+            l,
+            LogicalExpr::Cast {
+                target_type: VeinDataType::LargeUtf8,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn conflicting_types_are_semantic_errors() {
         let err = coerce_types(lit(VeinDataType::Boolean), lit(VeinDataType::Int64)).unwrap_err();
+        assert!(matches!(err, VeinError::Semantic { .. }), "got {err}");
+    }
+
+    #[test]
+    fn unify_types_is_type_level_and_symmetric() {
+        assert_eq!(
+            unify_types(&VeinDataType::Int32, &VeinDataType::Int64).unwrap(),
+            VeinDataType::Int64
+        );
+        // Reversed arguments yield the same common type.
+        assert_eq!(
+            unify_types(&VeinDataType::Int64, &VeinDataType::Int32).unwrap(),
+            VeinDataType::Int64
+        );
+        assert_eq!(
+            unify_types(&VeinDataType::Utf8, &VeinDataType::Null).unwrap(),
+            VeinDataType::Utf8
+        );
+        assert_eq!(
+            unify_types(&VeinDataType::Date32, &VeinDataType::Timestamp(Some("UTC".into())))
+                .unwrap(),
+            VeinDataType::Timestamp(Some("UTC".into()))
+        );
+        let err = unify_types(&VeinDataType::Boolean, &VeinDataType::Int64).unwrap_err();
         assert!(matches!(err, VeinError::Semantic { .. }), "got {err}");
     }
 }

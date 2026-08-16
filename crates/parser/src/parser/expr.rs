@@ -4,6 +4,32 @@ use crate::ast::pipe_op::OrderByExpr;
 use crate::parser::{ParseError, Parser, TokenKind};
 use crate::token::Span;
 
+/// Resolves the escapes inside a string literal body (the text between the
+/// surrounding quotes): a doubled quote `''` becomes `'`, and a backslash
+/// escape `\X` becomes `X`. Mirrors how the lexer scans these forms.
+fn unescape_string(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                // SQL `''` escape; the lexer guarantees a second quote follows.
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                }
+                out.push('\'');
+            }
+            '\\' => {
+                // Backslash escape: take the next char verbatim (a lone
+                // trailing backslash is preserved as-is).
+                out.push(chars.next().unwrap_or('\\'));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Precedence table. Higher = tighter binding.
 fn infix_prec(kind: &TokenKind) -> Option<(u32, bool)> {
     match kind {
@@ -229,7 +255,18 @@ impl<'a> Parser<'a> {
             }
             None => return self.parse_primary(),
         };
-        let mut expr = self.parse_binary(operand_prec)?;
+        let mut expr = match self.parse_binary(operand_prec) {
+            Ok(e) => e,
+            Err(e) => {
+                // Drain every entered recursion level before returning, so the
+                // budget isn't leaked on the error path (the Parser is reusable
+                // across queries and a stale count would spuriously fail later).
+                for _ in ops.iter() {
+                    self.exit_recursive();
+                }
+                return Err(e);
+            }
+        };
 
         for (op, op_span) in ops.iter().rev() {
             self.exit_recursive();
@@ -417,7 +454,9 @@ impl<'a> Parser<'a> {
             }
             TokenKind::String => {
                 let token = self.next_token()?;
-                let value = &token.text[1..token.text.len() - 1];
+                // Strip the surrounding quotes and resolve escapes (`''` → `'`,
+                // `\X` → `X`) so the literal carries the intended value.
+                let value = unescape_string(&token.text[1..token.text.len() - 1]);
                 Ok(SpannedExpr {
                     span: token.span,
                     node: Expr::Literal(Literal::String(value)),
@@ -1226,5 +1265,29 @@ mod tests {
         let expr =
             parse_expr("CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END").expect("test should succeed");
         assert!(matches!(expr.node, Expr::Case { .. }));
+    }
+
+    #[test]
+    fn test_string_literal_unescapes() {
+        // Doubled-quote escape `''` must collapse to a single `'`.
+        let expr = parse_expr("'it''s'").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::Literal(Literal::String(ref s)) if s == "it's"
+        ));
+
+        // Backslash escapes take the next character verbatim.
+        let expr = parse_expr("'a\\nb'").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::Literal(Literal::String(ref s)) if s == "anb"
+        ));
+
+        // A plain string is left untouched.
+        let expr = parse_expr("'hello'").expect("test should succeed");
+        assert!(matches!(
+            expr.node,
+            Expr::Literal(Literal::String(ref s)) if s == "hello"
+        ));
     }
 }

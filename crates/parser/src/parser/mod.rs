@@ -226,6 +226,21 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn parse_pipe_query(&mut self) -> Result<Query<'a>, ParseError> {
+        self.enter_recursive()?;
+        let result = self.parse_pipe_query_inner();
+        self.exit_recursive();
+        result
+    }
+
+    /// Inner body of [`Parser::parse_pipe_query`].
+    ///
+    /// Kept separate so the recursion-depth guard in [`Parser::parse_pipe_query`]
+    /// balances on every path, including the early-return `?` sites. Every query
+    /// nesting point (subquery table sources, scalar/IN/EXISTS subqueries, WITH
+    /// CTEs, and the right side of set operations) funnels through
+    /// [`Parser::parse_pipe_query`], so this single guard bounds the total
+    /// nesting depth of any query tree.
+    fn parse_pipe_query_inner(&mut self) -> Result<Query<'a>, ParseError> {
         self.expect(TokenKind::From)?;
         let source = self.parse_table_source()?;
         let mut pipes = Vec::new();
@@ -448,6 +463,49 @@ mod tests {
         let mut parser = Parser::new("FROM t |> SELECT name garbage");
         let err = parser.parse_query().expect_err("test should fail");
         assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    #[test]
+    fn test_moderate_subquery_nesting_succeeds() {
+        let mut q = String::from("FROM t |> SELECT 1");
+        for _ in 0..50 {
+            q = format!("FROM ({}) |> SELECT 1", q);
+        }
+        parse_query(&q).expect("test should succeed");
+    }
+
+    #[test]
+    fn test_deep_subquery_nesting_hits_recursion_limit() {
+        let mut q = String::from("FROM t |> SELECT 1");
+        for _ in 0..100_000 {
+            q = format!("FROM ({}) |> SELECT 1", q);
+        }
+        let err = parse_query(&q).expect_err("test should fail");
+        assert!(matches!(err, ParseError::RecursionLimitExceeded { .. }));
+    }
+
+    #[test]
+    fn test_deep_fork_nesting_hits_recursion_limit() {
+        // FORK/TEE recurse through parse_pipe_operator; without the guard this
+        // would overflow the stack instead of returning a typed error. Wrap so
+        // each FORK nests inside the previous one.
+        let mut inner = String::from("|> WHERE x = 1");
+        for _ in 0..100_000 {
+            inner = format!("|> FORK ( {} )", inner);
+        }
+        let q = format!("FROM t {}", inner);
+        let err = parse_query(&q).expect_err("test should fail");
+        assert!(matches!(err, ParseError::RecursionLimitExceeded { .. }));
+    }
+
+    #[test]
+    fn test_moderate_fork_nesting_succeeds() {
+        let mut inner = String::from("|> WHERE x = 1");
+        for _ in 0..50 {
+            inner = format!("|> FORK ( {} )", inner);
+        }
+        let q = format!("FROM t {}", inner);
+        parse_query(&q).expect("test should succeed");
     }
 
     #[test]

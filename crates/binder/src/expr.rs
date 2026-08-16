@@ -1,6 +1,6 @@
-use crate::coerce::coerce_types;
+use crate::coerce::{coerce_types, unify_types};
 use crate::context::BinderContext;
-use crate::date_time::{parse_date, parse_timestamp};
+use crate::date_time::{parse_date, parse_interval, parse_time, parse_timestamp};
 use crate::pipe::query::bind_query_internal;
 use crate::scope::ScopeStack;
 use plan::{LogicalExpr, LogicalLiteral};
@@ -29,12 +29,12 @@ pub fn derive_column_name(expr: &Expr<'_>) -> String {
 /// Responsible for translating AST expressions into Logical Expressions
 pub struct ExprBinder<'a, 'b> {
     context: &'a mut BinderContext<'b>,
-    scopes: &'a mut ScopeStack<'b>,
+    scopes: &'a mut ScopeStack,
 }
 
 impl<'a, 'b> ExprBinder<'a, 'b> {
     /// Creates a new ExprBinder using the current context and scope stack
-    pub fn new(context: &'a mut BinderContext<'b>, scopes: &'a mut ScopeStack<'b>) -> Self {
+    pub fn new(context: &'a mut BinderContext<'b>, scopes: &'a mut ScopeStack) -> Self {
         Self { context, scopes }
     }
 
@@ -188,14 +188,28 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 list,
                 negated,
             } => {
+                let bound = Box::pin(self.bind(expr)).await?;
                 let mut bound_list = Vec::with_capacity(list.len());
                 for item in list {
                     bound_list.push(Box::pin(self.bind(item)).await?);
                 }
-                let bound = Box::pin(self.bind(expr)).await?;
+
+                // Establish one common type across the probe and every list item,
+                // then coerce each side to it so the IN comparison is consistent
+                // (rejecting e.g. an Int probe against a mixed Int/String list).
+                let mut common = bound.data_type();
+                for item in &bound_list {
+                    common = unify_types(&common, &item.data_type())?;
+                }
+                let bound = cast_to_common(bound, &common);
+                let list = bound_list
+                    .into_iter()
+                    .map(|it| cast_to_common(it, &common))
+                    .collect::<Vec<_>>();
+
                 Ok(LogicalExpr::InList {
                     expr: Box::new(bound),
-                    list: bound_list,
+                    list,
                     negated: *negated,
                 })
             }
@@ -234,12 +248,12 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
     }
 
     /// Binds a literal node into a typed logical literal.
-    fn bind_literal(&self, lit: &AstLiteral<'_>) -> Result<LogicalExpr> {
+    fn bind_literal(&self, lit: &AstLiteral) -> Result<LogicalExpr> {
         let logical_lit = match lit {
             AstLiteral::Boolean(b) => LogicalLiteral::Boolean(*b),
             AstLiteral::Int(i) => LogicalLiteral::Int64(*i),
             AstLiteral::Float(f) => LogicalLiteral::Float64(f.0),
-            AstLiteral::String(s) => LogicalLiteral::String(s.to_string()),
+            AstLiteral::String(s) => LogicalLiteral::String(s.clone()),
             AstLiteral::Null => LogicalLiteral::Null(VeinDataType::Null),
         };
         Ok(LogicalExpr::Literal(logical_lit))
@@ -254,12 +268,6 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         distinct: bool,
         span: parser::token::Span,
     ) -> Result<LogicalExpr> {
-        if distinct {
-            return Err(VeinError::semantic(
-                format!("DISTINCT inside function call '{name}' is not supported yet"),
-                Some(span),
-            ));
-        }
         let signature = self.context.functions.resolve(name)?;
 
         let mut bound_args = Vec::with_capacity(args.len());
@@ -297,6 +305,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 name: name.to_string(),
                 args: bound_args,
                 is_aggregate: signature.kind == FunctionKind::Aggregate,
+                distinct,
                 return_type: signature.return_type,
             }),
         }
@@ -321,8 +330,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 format!("DISTINCT inside window function '{name}' is not supported yet"),
                 Some(span),
             ));
-        }
-        let signature = self.context.functions.resolve(name)?;
+        }        let signature = self.context.functions.resolve(name)?;
 
         let mut bound_args = Vec::with_capacity(args.len());
         for arg in args {
@@ -353,6 +361,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
             name: name.to_string(),
             args: bound_args,
             is_aggregate: signature.kind == FunctionKind::Aggregate,
+            distinct,
             partition_by: bound_partition,
             order_by: bound_order,
             frame: frame.cloned(),
@@ -378,7 +387,6 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
 
         let mut when = Vec::with_capacity(operands.len());
         let mut then = Vec::with_capacity(results.len());
-        let mut common_type = VeinDataType::Null;
 
         for (operand, result) in operands.iter().zip(results) {
             when.push(Box::pin(self.bind(operand)).await?);
@@ -390,6 +398,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         };
 
         // Unify every THEN/ELSE branch into a single return type.
+        let mut common_type = VeinDataType::Null;
         for result in &then {
             common_type = unify_with(result.data_type(), common_type)?;
         }
@@ -397,10 +406,18 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
             common_type = unify_with(else_expr.data_type(), common_type)?;
         }
 
+        // Coerce every non-Null branch to the unified return type so downstream
+        // consumers observe consistent types instead of a silent type lie.
+        let then = then
+            .into_iter()
+            .map(|r| cast_to_common(r, &common_type))
+            .collect::<Vec<_>>();
+        let else_ = else_expr.map(|e| Box::new(cast_to_common(e, &common_type)));
+
         Ok(LogicalExpr::Case {
             when,
             then,
-            else_: else_expr.map(Box::new),
+            else_,
             return_type: common_type,
         })
     }
@@ -416,6 +433,17 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
             DataType::Date => parse_date(value)
                 .map(LogicalLiteral::Date)
                 .map(LogicalExpr::Literal),
+            DataType::Time => parse_time(value)
+                .map(LogicalLiteral::Time)
+                .map(LogicalExpr::Literal),
+            DataType::Interval { .. } => parse_interval(value)
+                .map(|(months, days, nanos)| {
+                    LogicalExpr::Literal(LogicalLiteral::Interval {
+                        months,
+                        days,
+                        nanos,
+                    })
+                }),
             DataType::Timestamp { .. } => parse_timestamp(value)
                 .map(LogicalLiteral::Timestamp)
                 .map(LogicalExpr::Literal),
@@ -432,22 +460,14 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         &mut self,
         query: &parser::ast::query::Query<'_>,
     ) -> Result<plan::LogicalPlan> {
-        // Reborrow `context`/`scopes` through raw pointers: `bind_query_internal`
-        // ties both to one lifetime, and regular reborrows through `&mut self`
-        // are region-bounded by `'a`, which can never outlive the fields'
-        // interior `'b`. The fresh `&mut` references from the raw derefs get an
-        // unconstrained region instead.
-        //
-        // SAFETY: `bind_query_internal` and its callees mutably use only the
-        // two references passed in and never touch `self` again; the raw
-        // reborrows are confined to this one call, so no aliasing `&mut`
-        // exists for their duration. Subqueries rebind through this same path
-        // sequentially, never concurrently.
-        let context = self.context as *mut BinderContext<'_>;
-        let scopes = self.scopes as *mut ScopeStack<'_>;
-        let (context_ref, scopes_ref) = unsafe { (&mut *context, &mut *scopes) };
-        let mut child_scopes = ScopeStack::new(Some(scopes_ref));
-        bind_query_internal(query, context_ref, &mut child_scopes).await
+        // The child captures the enclosing scopes *by value* into its
+        // `correlation_scopes`, so `resolve_correlated` marks references found
+        // there as correlated (`OuterColumn`). This is fully owned and avoids
+        // the self-referential parent reference that Rust cannot express
+        // safely (previously worked around with raw pointers).
+        let mut child_scopes = ScopeStack::new();
+        child_scopes.capture_correlation(self.scopes);
+        bind_query_internal(query, self.context, &mut child_scopes).await
     }
 
     /// FinOps Guardrail: Validates that the estimated token cost of an AI Operator does not exceed the budget.
@@ -467,6 +487,11 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
 }
 
 /// Unifies a branch type with the running common type (Null seeded start).
+///
+/// Delegates to the shared [`unify_types`] so every branch pair benefits from
+/// the same rules as binary/set-op coercion (numeric widening, symmetric string
+/// unification, `Date32 → Timestamp` promotion), while surfacing a CASE-specific
+/// error message on incompatibility.
 fn unify_with(branch: VeinDataType, common: VeinDataType) -> Result<VeinDataType> {
     if common == VeinDataType::Null {
         return Ok(branch);
@@ -477,29 +502,25 @@ fn unify_with(branch: VeinDataType, common: VeinDataType) -> Result<VeinDataType
     if branch == common {
         return Ok(common);
     }
-    // Numeric widening between branches (e.g. Int32 vs Int64).
-    Ok(match (&common, &branch) {
-        _ if numeric_rank(&common) < numeric_rank(&branch) => branch,
-        _ if numeric_rank(&common) > numeric_rank(&branch) => common,
-        _ => {
-            return Err(VeinError::semantic(
-                format!("CASE branches have incompatible types {common:?} and {branch:?}"),
-                None,
-            ));
-        }
+    unify_types(&common, &branch).map_err(|_| {
+        VeinError::semantic(
+            format!("CASE branches have incompatible types {common:?} and {branch:?}"),
+            None,
+        )
     })
 }
 
-/// Order of the numeric coercion ladder (low → high); 0 means "not numeric".
-fn numeric_rank(t: &VeinDataType) -> u8 {
-    match t {
-        VeinDataType::Int8 => 1,
-        VeinDataType::Int16 => 2,
-        VeinDataType::Int32 => 3,
-        VeinDataType::Int64 => 4,
-        VeinDataType::Float32 => 5,
-        VeinDataType::Float64 => 6,
-        _ => 0,
+/// Wraps `expr` in a `Cast` to `common` when its type differs and it isn't a
+/// `Null` literal (Null adopts any type without an explicit cast). No-op
+/// otherwise, so a branch already at the target type is left untouched.
+fn cast_to_common(expr: LogicalExpr, common: &VeinDataType) -> LogicalExpr {
+    if expr.data_type() == *common || expr.data_type() == VeinDataType::Null {
+        expr
+    } else {
+        LogicalExpr::Cast {
+            expr: Box::new(expr),
+            target_type: common.clone(),
+        }
     }
 }
 

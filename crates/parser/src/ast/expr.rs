@@ -34,8 +34,7 @@ pub enum Expr<'a> {
         table: Option<&'a str>,
     },
     /// A literal value.
-    #[serde(borrow)]
-    Literal(Literal<'a>),
+    Literal(Literal),
     /// A binary operation.
     BinaryOp {
         /// The left operand.
@@ -226,7 +225,7 @@ pub enum UnaryOp {
 
 /// A literal value.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum Literal<'a> {
+pub enum Literal {
     /// `NULL`
     Null,
     /// `TRUE` / `FALSE`
@@ -235,12 +234,11 @@ pub enum Literal<'a> {
     Int(i64),
     /// A floating-point literal.
     Float(OrderedFloat<f64>),
-    /// A string literal.
-    #[serde(borrow)]
-    String(&'a str),
+    /// A string literal, with escapes already resolved.
+    String(String),
 }
 
-impl<'a> PartialEq for Literal<'a> {
+impl PartialEq for Literal {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Literal::Null, Literal::Null) => true,

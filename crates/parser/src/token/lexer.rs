@@ -10,6 +10,10 @@ pub struct Lexer<'a> {
     pos: usize,
     line: usize,
     column: usize,
+    /// Line/column at the start of the token currently being scanned, so spans
+    /// report the token's start position rather than where scanning ended.
+    start_line: usize,
+    start_column: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -20,6 +24,8 @@ impl<'a> Lexer<'a> {
             pos: 0,
             line: 1,
             column: 1,
+            start_line: 1,
+            start_column: 1,
         }
     }
 
@@ -87,9 +93,9 @@ impl<'a> Lexer<'a> {
                 (None, _) => {
                     return Err(LexicalError {
                         message: "unterminated block comment".into(),
-                        span: Span::new(start, self.pos, self.line, self.column),
-                        line: self.line,
-                        column: self.column,
+                        span: Span::new(start, self.pos, self.start_line, self.start_column),
+                        line: self.start_line,
+                        column: self.start_column,
                     });
                 }
             }
@@ -114,9 +120,9 @@ impl<'a> Lexer<'a> {
             if !has_digit {
                 return Err(LexicalError {
                     message: "incomplete hex number".into(),
-                    span: Span::new(start, self.pos, self.line, self.column),
-                    line: self.line,
-                    column: self.column,
+                    span: Span::new(start, self.pos, self.start_line, self.start_column),
+                    line: self.start_line,
+                    column: self.start_column,
                 });
             }
             return Ok(TokenKind::Number);
@@ -136,9 +142,9 @@ impl<'a> Lexer<'a> {
             if !has_digit {
                 return Err(LexicalError {
                     message: "incomplete binary number".into(),
-                    span: Span::new(start, self.pos, self.line, self.column),
-                    line: self.line,
-                    column: self.column,
+                    span: Span::new(start, self.pos, self.start_line, self.start_column),
+                    line: self.start_line,
+                    column: self.start_column,
                 });
             }
             return Ok(TokenKind::Number);
@@ -161,9 +167,9 @@ impl<'a> Lexer<'a> {
                 if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
                     return Err(LexicalError {
                         message: "incomplete scientific notation".into(),
-                        span: Span::new(start, self.pos, self.line, self.column),
-                        line: self.line,
-                        column: self.column,
+                        span: Span::new(start, self.pos, self.start_line, self.start_column),
+                        line: self.start_line,
+                        column: self.start_column,
                     });
                 }
                 while self.peek().is_some_and(|c| c.is_ascii_digit()) {
@@ -194,9 +200,9 @@ impl<'a> Lexer<'a> {
                 Some('\n') | None => {
                     return Err(LexicalError {
                         message: "unterminated string literal".into(),
-                        span: Span::new(start, self.pos, self.line, self.column),
-                        line: self.line,
-                        column: self.column,
+                        span: Span::new(start, self.pos, self.start_line, self.start_column),
+                        line: self.start_line,
+                        column: self.start_column,
                     });
                 }
                 Some(_) => {}
@@ -218,9 +224,9 @@ impl<'a> Lexer<'a> {
                 Some('\n') | None => {
                     return Err(LexicalError {
                         message: "unterminated double-quoted identifier".into(),
-                        span: Span::new(start, self.pos, self.line, self.column),
-                        line: self.line,
-                        column: self.column,
+                        span: Span::new(start, self.pos, self.start_line, self.start_column),
+                        line: self.start_line,
+                        column: self.start_column,
                     });
                 }
                 Some(_) => {}
@@ -244,16 +250,16 @@ impl<'a> Lexer<'a> {
 
     fn make_token(&self, start: usize, kind: TokenKind) -> SpannedToken<'a> {
         let text = self.current_text(start);
-        let span = Span::new(start, self.pos, self.line, self.column);
+        let span = Span::new(start, self.pos, self.start_line, self.start_column);
         SpannedToken { kind, text, span }
     }
 
     fn make_error(&self, start: usize, message: String) -> LexicalError {
         LexicalError {
             message,
-            span: Span::new(start, self.pos, self.line, self.column),
-            line: self.line,
-            column: self.column,
+            span: Span::new(start, self.pos, self.start_line, self.start_column),
+            line: self.start_line,
+            column: self.start_column,
         }
     }
 }
@@ -273,6 +279,10 @@ impl<'a> Iterator for Lexer<'a> {
 
             let ch = self.input[self.pos..].chars().next()?;
             let start = self.pos;
+            // Record the token's start position for span reporting before any
+            // `advance` mutates `line`/`column` to the end position.
+            self.start_line = self.line;
+            self.start_column = self.column;
 
             return Some(match ch {
                 '/' if self.peek_next() == Some('/') => {

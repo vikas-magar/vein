@@ -35,7 +35,7 @@ pub type BoundItem = (LogicalExpr, Option<String>);
 pub fn split_window_items(
     bound_items: Vec<BoundItem>,
     context: &mut BinderContext<'_>,
-    _scopes: &mut ScopeStack<'_>,
+    _scopes: &mut ScopeStack,
 ) -> Result<(Vec<BoundItem>, Vec<WindowExpr>)> {
     let mut window_exprs = Vec::new();
     let mut partition_by: Option<Vec<LogicalExpr>> = None;
@@ -207,6 +207,7 @@ mod tests {
             name: "sum".to_string(),
             args: vec![LogicalExpr::Literal(LogicalLiteral::Int64(1))],
             is_aggregate: true,
+            distinct: false,
             partition_by: vec![],
             order_by: vec![],
             frame: None,
@@ -228,7 +229,7 @@ mod tests {
         let catalog = vcs::InMemoryCatalog::new();
         let registry = crate::testing::MockFunctionRegistry::new();
         let mut ctx = crate::context::BinderContext::new(&catalog, &registry);
-        let mut scopes = ScopeStack::new(None);
+        let mut scopes = ScopeStack::new();
         let items = vec![(call(), Some("total".to_string()))];
         let (plain, windows) = split_window_items(items, &mut ctx, &mut scopes).unwrap();
 
@@ -245,7 +246,7 @@ mod tests {
         let catalog = vcs::InMemoryCatalog::new();
         let registry = crate::testing::MockFunctionRegistry::new();
         let mut ctx = crate::context::BinderContext::new(&catalog, &registry);
-        let mut scopes = ScopeStack::new(None);
+        let mut scopes = ScopeStack::new();
         let items = vec![(col(7), None), (call(), None), (col(8), None)];
         let (plain, windows) = split_window_items(items, &mut ctx, &mut scopes).unwrap();
 

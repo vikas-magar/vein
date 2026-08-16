@@ -118,6 +118,9 @@ impl Scheduler {
                         return Err(VeinError::Cancelled);
                     }
                     _ = tokio::time::sleep(self.timeout) => {
+                        // The task is still running on the executor; cancel it so
+                        // it stops consuming resources before we (maybe) retry.
+                        let _ = self.dispatcher.cancel_task(&executor, query_id, tid).await;
                         Err(VeinError::TaskFailed { task_id: tid.to_string(), message: "Task timeout".to_string() })
                     }
                 };
@@ -155,7 +158,9 @@ impl Scheduler {
         let mut join_set = JoinSet::new();
 
         for (i, stage_id) in order.into_iter().enumerate() {
-            let stage = dag.get_stage(stage_id).unwrap();
+            let stage = dag
+                .get_stage(stage_id)
+                .ok_or_else(|| VeinError::internal("Invalid StageId in topological order"))?;
             let executor = &executors[i % executors.len()]; // Round-robin assign
 
             let task = ExecuteTask {

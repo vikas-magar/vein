@@ -9,6 +9,14 @@ impl<'a> Parser<'a> {
         let predicate = self.parse_expr()?;
         Ok(crate::ast::pipe_op::PipeOperator::Where { predicate })
     }
+
+    pub(crate) fn parse_pipe_qualify(
+        &mut self,
+    ) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
+        self.expect(TokenKind::Qualify)?;
+        let predicate = self.parse_expr()?;
+        Ok(crate::ast::pipe_op::PipeOperator::Qualify { predicate })
+    }
 }
 
 #[cfg(test)]
@@ -21,5 +29,13 @@ mod tests {
         let q = parse_query("FROM t |> WHERE age > 18").expect("test should succeed");
         assert_eq!(q.pipes.len(), 1);
         assert!(matches!(q.pipes[0], PipeOperator::Where { .. }));
+    }
+
+    #[test]
+    fn test_qualify_clause() {
+        let q = parse_query("FROM t |> QUALIFY row_number() OVER () = 1")
+            .expect("test should succeed");
+        assert_eq!(q.pipes.len(), 1);
+        assert!(matches!(q.pipes[0], PipeOperator::Qualify { .. }));
     }
 }

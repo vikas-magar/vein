@@ -11,7 +11,7 @@ pub async fn bind_order_by<'a>(
     input: LogicalPlan,
     order_bys: &[OrderByExpr<'_>],
     context: &mut BinderContext<'a>,
-    scopes: &mut ScopeStack<'a>,
+    scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
     let mut expr_binder = ExprBinder::new(context, scopes);
     let mut sort_keys = Vec::new();

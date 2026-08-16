@@ -1,25 +1,99 @@
 use crate::context::BinderContext;
 use crate::expr::ExprBinder;
-use crate::scope::ScopeStack;
+use crate::pipe::query::bind_query_internal;
+use crate::scope::{Scope, ScopeStack};
 use crate::window::expr_contains_window_call;
 use plan::LogicalPlan;
 use plan::PlanTraversal;
+use plan::{ResolvedColumn, VeinDataType, VeinSchema};
 use error::{Result, VeinError};
 use parser::ast::expr::SpannedExpr;
 use parser::ast::pipe_op::{CommonTableExpr, WriteTarget};
 
 /// Binds a PipeOperator::Pivot
-pub fn bind_pivot(_input: LogicalPlan) -> Result<LogicalPlan> {
-    Err(VeinError::planning(
-        "Pivot operator not yet fully implemented", None,
-    ))
+pub async fn bind_pivot<'a>(
+    input: LogicalPlan,
+    aggregate: &SpannedExpr<'_>,
+    alias: Option<&str>,
+    value_column: &str,
+    values: &[SpannedExpr<'_>],
+    context: &mut BinderContext<'a>,
+    scopes: &mut ScopeStack,
+) -> Result<LogicalPlan> {
+    let value_col = scopes.resolve(None, value_column)?;
+    let mut expr_binder = ExprBinder::new(context, scopes);
+    let aggregate_expr = expr_binder.bind(aggregate).await?;
+    let mut bound_values = Vec::new();
+    for v in values {
+        bound_values.push(expr_binder.bind(v).await?);
+    }
+    let pivot_type = aggregate_expr.data_type();
+    let mut fields = input.schema().fields.clone();
+    for (i, _) in values.iter().enumerate() {
+        fields.push(ResolvedColumn::new(
+            context.next_id(),
+            format!("{}_{}", alias.unwrap_or("pivot"), i),
+            None,
+            pivot_type.clone(),
+        ));
+    }
+    scopes.push(Scope::unqualified(fields.clone()));
+    Ok(LogicalPlan::Pivot {
+        input: Box::new(input),
+        aggregate: aggregate_expr,
+        alias: alias.map(|a| a.to_string()),
+        value_column: value_col,
+        values: bound_values,
+        schema: Box::new(VeinSchema { fields }),
+    })
 }
 
 /// Binds a PipeOperator::Unpivot
-pub fn bind_unpivot(_input: LogicalPlan) -> Result<LogicalPlan> {
-    Err(VeinError::planning(
-        "Unpivot operator not yet fully implemented", None,
-    ))
+pub async fn bind_unpivot<'a>(
+    input: LogicalPlan,
+    value_name: &str,
+    name_name: &str,
+    columns: &[&str],
+    include_nulls: bool,
+    context: &mut BinderContext<'a>,
+    scopes: &mut ScopeStack,
+) -> Result<LogicalPlan> {
+    let mut col_refs = Vec::new();
+    for c in columns {
+        col_refs.push(scopes.resolve(None, c)?);
+    }
+    let value_type = col_refs
+        .first()
+        .map(|c| c.data_type.clone())
+        .unwrap_or(VeinDataType::Utf8);
+    let mut fields: Vec<ResolvedColumn> = input
+        .schema()
+        .fields
+        .iter()
+        .filter(|f| !columns.contains(&f.name.as_str()))
+        .cloned()
+        .collect();
+    fields.push(ResolvedColumn::new(
+        context.next_id(),
+        name_name.to_string(),
+        None,
+        VeinDataType::Utf8,
+    ));
+    fields.push(ResolvedColumn::new(
+        context.next_id(),
+        value_name.to_string(),
+        None,
+        value_type,
+    ));
+    scopes.push(Scope::unqualified(fields.clone()));
+    Ok(LogicalPlan::Unpivot {
+        input: Box::new(input),
+        value_name: value_name.to_string(),
+        name_name: name_name.to_string(),
+        columns: col_refs,
+        include_nulls,
+        schema: Box::new(VeinSchema { fields }),
+    })
 }
 
 /// Binds a PipeOperator::TableSample
@@ -39,7 +113,7 @@ pub async fn bind_assert<'a>(
     condition: &SpannedExpr<'_>,
     message: &Option<&str>,
     context: &mut BinderContext<'a>,
-    scopes: &mut ScopeStack<'a>,
+    scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
     let schema = input.schema().clone();
     let span = condition.span;
@@ -65,22 +139,72 @@ pub async fn bind_assert<'a>(
 
 /// Binds a PipeOperator::Call (Executes a function directly on the stream)
 pub async fn bind_call<'a>(
-    _input: LogicalPlan,
-    _name: &str,
-    _args: &[SpannedExpr<'_>],
-    _context: &mut BinderContext<'a>,
-    _scopes: &mut ScopeStack<'a>,
+    input: LogicalPlan,
+    name: &str,
+    args: &[SpannedExpr<'_>],
+    context: &mut BinderContext<'a>,
+    scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
-    Err(VeinError::planning(
-        "Call operator not yet fully implemented", None,
-    ))
+    let mut bound_args = Vec::with_capacity(args.len());
+    for arg in args {
+        bound_args.push(Box::pin(ExprBinder::new(context, scopes).bind(arg)).await?);
+    }
+    let schema = input.schema().clone();
+    Ok(LogicalPlan::Call {
+        input: Box::new(input),
+        name: name.to_string(),
+        args: bound_args,
+        schema: Box::new(schema),
+    })
 }
 
 /// Binds a PipeOperator::With (Common Table Expressions)
-pub fn bind_with(_input: LogicalPlan, _ctes: &[CommonTableExpr<'_>]) -> Result<LogicalPlan> {
-    Err(VeinError::planning(
-        "CTE (With) operator not yet fully implemented in pipe scope", None,
-    ))
+///
+/// Each CTE body is bound in a fresh, non-correlated scope and registered in
+/// `context.ctes` under its alias, so a later (nested) source can resolve it.
+/// The `WITH` pipe itself is transparent: the input stream passes through
+/// unchanged, and only the registered CTEs are the side effect.
+pub async fn bind_with<'a>(
+    input: LogicalPlan,
+    ctes: &[CommonTableExpr<'_>],
+    context: &mut BinderContext<'a>,
+    _scopes: &mut ScopeStack,
+) -> Result<LogicalPlan> {
+    for cte in ctes {
+        let mut cte_scopes = ScopeStack::new();
+        let mut plan = Box::pin(bind_query_internal(&cte.query, context, &mut cte_scopes)).await?;
+
+        // Apply explicit column names, if declared, renaming the output and
+        // qualifying it under the CTE alias.
+        if let Some(cols) = &cte.columns {
+            let fields = plan.schema().fields.clone();
+            if fields.len() != cols.len() {
+                return Err(VeinError::semantic(
+                    format!(
+                        "CTE '{}' declares {} columns but its query returns {}",
+                        cte.alias,
+                        cols.len(),
+                        fields.len()
+                    ),
+                    None,
+                ));
+            }
+            let mut new_fields = fields;
+            for (field, name) in new_fields.iter_mut().zip(cols.iter()) {
+                field.name = (*name).to_string();
+                field.qualifier = Some(cte.alias.to_string());
+            }
+            plan = LogicalPlan::SubqueryAlias {
+                input: Box::new(plan),
+                alias: cte.alias.to_string(),
+                schema: Box::new(VeinSchema { fields: new_fields }),
+            };
+        }
+
+        context.ctes.insert(cte.alias.to_string(), Box::new(plan));
+    }
+
+    Ok(input)
 }
 
 /// Binds a PipeOperator::Write (Outputs stream to storage)

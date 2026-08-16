@@ -254,4 +254,25 @@ mod tests {
         assert_eq!(tokens[0].0, TokenKind::DoubleQuotedIdent);
         assert_eq!(tokens[0].1, "\"a\"\"b\"");
     }
+
+    #[test]
+    fn test_span_reports_token_start_position() {
+        // `x` sits on line 2, column 4; the token's span line/column must point
+        // at that start, not at the end of the token.
+        let lexer = Lexer::new("-- c\n  xyz\n");
+        let tok = lexer.filter_map(|r| r.ok()).next().expect("one token");
+        assert_eq!(tok.text, "xyz");
+        assert_eq!(tok.span.line, 2);
+        assert_eq!(tok.span.column, 3, "column of first char of `xyz`");
+        assert_eq!(tok.span.start, "-- c\n  ".len());
+    }
+
+    #[test]
+    fn test_error_span_reports_token_start_position() {
+        // Unterminated string starts on line 2 at column 3.
+        let lexer = Lexer::new("a\n  'unterminated");
+        let err = lexer.into_iter().find_map(|r| r.err()).expect("error");
+        assert_eq!(err.span.line, 2);
+        assert_eq!(err.span.column, 3, "column of the opening quote");
+    }
 }

@@ -33,6 +33,13 @@ pub enum PipeOperator<'a> {
         #[serde(borrow)]
         predicate: SpannedExpr<'a>,
     },
+    /// `|> QUALIFY <window predicate>`
+    Qualify {
+        /// The window-function predicate.
+
+        #[serde(borrow)]
+        predicate: SpannedExpr<'a>,
+    },
     /// `|> AGGREGATE BY ... [SUM(...)]`
     Aggregate {
         /// The `GROUP BY`-style grouping expressions.
@@ -144,10 +151,35 @@ pub enum PipeOperator<'a> {
         /// Whether `ALL` was specified.
         all: bool,
     },
-    /// `|> PIVOT` (parsed only; not yet implemented)
-    Pivot,
-    /// `|> UNPIVOT` (parsed only; not yet implemented)
-    Unpivot,
+    /// `|> PIVOT SUM(amount) AS total BY category IN ('a', 'b')`
+    Pivot {
+        /// The aggregate expression to pivot (e.g. `SUM(amount)`).
+        #[serde(borrow)]
+        aggregate: SpannedExpr<'a>,
+        /// The optional output alias for the pivoted column(s).
+        #[serde(borrow)]
+        alias: Option<&'a str>,
+        /// The column whose distinct values become new columns.
+        #[serde(borrow)]
+        value_column: &'a str,
+        /// The explicit pivot values.
+        #[serde(borrow)]
+        values: Vec<SpannedExpr<'a>>,
+    },
+    /// `|> UNPIVOT [ALL] amount BY category IN (a, b)`
+    Unpivot {
+        /// The generated value column name.
+        #[serde(borrow)]
+        value_name: &'a str,
+        /// The generated name column name.
+        #[serde(borrow)]
+        name_name: &'a str,
+        /// The columns to unpivot.
+        #[serde(borrow)]
+        columns: Vec<&'a str>,
+        /// Whether `ALL` (include nulls) was specified.
+        include_nulls: bool,
+    },
     /// `|> WITH ...` (commonly used to add a CTE prior to a query)
     With {
         /// The common table expressions.

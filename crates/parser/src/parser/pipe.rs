@@ -2,12 +2,28 @@ use crate::parser::Parser;
 use crate::token::TokenKind;
 
 impl<'a> Parser<'a> {
+    /// Parses one pipe operator, guarded against unbounded nesting.
+    ///
+    /// FORK/TEE recurse back into this function for each sub-pipeline, so a
+    /// pathologically nested input (e.g. `FORK ( |> FORK ( |> ...)`) would
+    /// otherwise overflow the stack. Wrapping the dispatch in the recursion
+    /// budget bounds that nesting; flat pipe chains stay at depth 1.
     pub(crate) fn parse_pipe_operator(
+        &mut self,
+    ) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
+        self.enter_recursive()?;
+        let result = self.parse_pipe_operator_inner();
+        self.exit_recursive();
+        result
+    }
+
+    fn parse_pipe_operator_inner(
         &mut self,
     ) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
         match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::Select) => self.parse_pipe_select(),
             Ok(TokenKind::Where) => self.parse_pipe_where(),
+            Ok(TokenKind::Qualify) => self.parse_pipe_qualify(),
             Ok(TokenKind::Aggregate) => self.parse_pipe_aggregate(),
             Ok(TokenKind::Order) => self.parse_pipe_order_by(),
             Ok(TokenKind::Limit) => self.parse_pipe_limit(),
@@ -178,15 +194,43 @@ mod tests {
     }
 
     #[test]
-    fn test_pivot_unsupported() {
-        let err = parse_query("FROM t |> PIVOT ...").expect_err("test should fail");
-        assert!(err.to_string().contains("Unsupported"));
+    fn test_pivot() {
+        let q = parse_query("FROM t |> PIVOT SUM(amount) AS total BY category IN ('a', 'b')")
+            .expect("test should succeed");
+        if let PipeOperator::Pivot {
+            aggregate,
+            alias,
+            value_column,
+            values,
+        } = &q.pipes[0]
+        {
+            assert_eq!(*alias, Some("total"));
+            assert_eq!(*value_column, "category");
+            assert_eq!(values.len(), 2);
+            let _ = aggregate;
+        } else {
+            panic!("expected Pivot");
+        }
     }
 
     #[test]
-    fn test_unpivot_unsupported() {
-        let err = parse_query("FROM t |> UNPIVOT ...").expect_err("test should fail");
-        assert!(err.to_string().contains("Unsupported"));
+    fn test_unpivot() {
+        let q = parse_query("FROM t |> UNPIVOT ALL amount BY category IN (a, b)")
+            .expect("test should succeed");
+        if let PipeOperator::Unpivot {
+            value_name,
+            name_name,
+            columns,
+            include_nulls,
+        } = &q.pipes[0]
+        {
+            assert_eq!(*value_name, "amount");
+            assert_eq!(*name_name, "category");
+            assert_eq!(columns, &["a", "b"]);
+            assert!(*include_nulls);
+        } else {
+            panic!("expected Unpivot");
+        }
     }
 
     #[test]

@@ -45,6 +45,94 @@ pub fn parse_timestamp(value: &str) -> Result<i64> {
     Ok(total_us)
 }
 
+/// Converts a `HH:MM:SS[.ffffff]` string into microseconds since midnight
+/// (`Time64`).
+pub fn parse_time(value: &str) -> Result<i64> {
+    parse_hms_us(value)
+}
+
+/// Parses an interval string of the form `N unit [N unit ...]` (GoogleSQL
+/// style), e.g. `INTERVAL '1 year 2 months 3 days 04:05:06'`, into a
+/// `(months, days, nanos)` triple for [`plan::LogicalLiteral::Interval`].
+pub fn parse_interval(value: &str) -> Result<(i32, i32, i64)> {
+    let mut months = 0i32;
+    let mut days = 0i32;
+    let mut nanos = 0i64;
+
+    // Split off an optional trailing `HH:MM:SS[.ffffff]` time-of-day part.
+    let (tokens, tod) = match value.rsplit_once(' ') {
+        Some((head, part)) if part.contains(':') => (head.split_whitespace(), Some(part)),
+        _ => (value.split_whitespace(), None),
+    };
+
+    let mut toks = tokens.peekable();
+    while let Some(num) = toks.next() {
+        let amount: i64 = num.parse().map_err(|_| {
+            VeinError::semantic(format!("invalid INTERVAL literal '{value}'"), None)
+        })?;
+        let unit = toks.next().ok_or_else(|| {
+            VeinError::semantic(format!("invalid INTERVAL literal '{value}'"), None)
+        })?;
+        match unit.to_ascii_lowercase().as_str() {
+            "year" | "years" => months = months.checked_add(amount as i32 * 12).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?,
+            "month" | "months" => months = months.checked_add(amount as i32).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?,
+            "day" | "days" => days = days.checked_add(amount as i32).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?,
+            "hour" | "hours" => nanos = nanos.checked_add(amount.checked_mul(3_600_000_000_000).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?,
+            "minute" | "minutes" => nanos = nanos.checked_add(amount.checked_mul(60_000_000_000).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?,
+            "second" | "seconds" => nanos = nanos.checked_add(amount.checked_mul(1_000_000_000).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?,
+            "millisecond" | "milliseconds" => nanos = nanos.checked_add(amount.checked_mul(1_000_000).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?,
+            "microsecond" | "microseconds" => nanos = nanos.checked_add(amount.checked_mul(1_000).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?,
+            "nanosecond" | "nanoseconds" => nanos = nanos.checked_add(amount).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?,
+            _ => {
+                return Err(VeinError::semantic(
+                    format!("unknown INTERVAL unit '{unit}'"),
+                    None,
+                ))
+            }
+        }
+    }
+
+    if let Some(tod) = tod {
+        nanos = nanos
+            .checked_add(parse_hms_us(tod)?.checked_mul(1_000).ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?)
+            .ok_or_else(|| {
+                VeinError::semantic(format!("INTERVAL literal '{value}' out of range"), None)
+            })?;
+    }
+
+    Ok((months, days, nanos))
+}
+
 /// Splits a `YYYY-MM-DD` component into `(year, month, day)`.
 fn split_ymd(date: &str) -> std::result::Result<(i32, i32, i32), String> {
     let mut parts = date.split('-');
@@ -157,5 +245,31 @@ mod tests {
         assert!(parse_timestamp("2024-01-01 24:00:00").is_err());
         assert!(parse_timestamp("2024-01-01 12:00:60").is_err());
         assert!(parse_timestamp("2024-01-01 12:00:00.1234567").is_err());
+    }
+
+    #[test]
+    fn parses_times_as_microseconds() {
+        assert_eq!(parse_time("00:00:00").unwrap(), 0);
+        assert_eq!(parse_time("00:00:01").unwrap(), 1_000_000);
+        assert_eq!(parse_time("00:00:00.000001").unwrap(), 1);
+        assert_eq!(
+            parse_time("12:30:45").unwrap(),
+            (12 * 3600 + 30 * 60 + 45) * 1_000_000
+        );
+        assert!(parse_time("24:00:00").is_err());
+    }
+
+    #[test]
+    fn parses_intervals() {
+        assert_eq!(parse_interval("0 seconds").unwrap(), (0, 0, 0));
+        assert_eq!(parse_interval("1 month").unwrap(), (1, 0, 0));
+        assert_eq!(parse_interval("2 years 3 days").unwrap(), (24, 3, 0));
+        assert_eq!(
+            parse_interval("1 hour 30 minutes").unwrap(),
+            (0, 0, (3600 + 1800) * 1_000_000_000)
+        );
+        assert_eq!(parse_interval("1 day 12:00:00").unwrap(), (0, 1, 12 * 3_600_000_000_000));
+        assert!(parse_interval("1 fortnight").is_err());
+        assert!(parse_interval("soon").is_err());
     }
 }

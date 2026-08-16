@@ -98,6 +98,8 @@ pub enum LogicalExpr {
         args: Vec<LogicalExpr>,
         /// Whether the function acts as an aggregate
         is_aggregate: bool,
+        /// Whether `DISTINCT` was applied to the arguments (aggregates only)
+        distinct: bool,
         /// Return type of the function
         return_type: VeinDataType,
     },
@@ -112,6 +114,8 @@ pub enum LogicalExpr {
         /// Whether the function acts as an aggregate (SUM/AVG/... vs.
         /// navigation functions like ROW_NUMBER)
         is_aggregate: bool,
+        /// Whether `DISTINCT` was applied to the arguments (aggregates only)
+        distinct: bool,
         /// The PARTITION BY expressions
         partition_by: Vec<LogicalExpr>,
         /// The ORDER BY keys inside OVER
@@ -179,6 +183,25 @@ pub enum LogicalExpr {
         /// Whether the check is negated (NOT EXISTS)
         negated: bool,
     },
+}
+
+/// Maximum expression-nesting depth for recursive analysis (volatility, eBPF
+/// safety, etc.). Beyond this the safe default is assumed so a deep tree cannot
+/// overflow the stack.
+const MAX_VOLATILITY_DEPTH: usize = 100;
+
+/// True for built-in functions that are volatile (may differ between
+/// evaluations) or stable (depend on the current transaction/clock).
+fn is_volatile_builtin(name: &str) -> bool {
+    match name.to_uppercase().as_str() {
+        // Volatile: genuinely non-deterministic per evaluation.
+        "RANDOM" | "RAND" | "UUID" | "GEN_RANDOM_UUID" | "GENERATE_UUID" | "SETVAL"
+        | "PG_TYPEOF" => true,
+        // Stable: fixed within a query/transaction, not foldable to a constant.
+        "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIMESTAMP"
+        | "LOCALTIME" | "CURDATE" | "CURRENT_USER" | "SESSION_USER" | "USER" => true,
+        _ => false,
+    }
 }
 
 impl LogicalExpr {
@@ -327,6 +350,7 @@ impl LogicalExpr {
                 name,
                 args,
                 is_aggregate,
+                distinct,
                 return_type,
             } => {
                 let mut new_args = Vec::with_capacity(args.len());
@@ -337,6 +361,7 @@ impl LogicalExpr {
                     name,
                     args: new_args,
                     is_aggregate,
+                    distinct,
                     return_type,
                 })
             }
@@ -344,6 +369,7 @@ impl LogicalExpr {
                 name,
                 args,
                 is_aggregate,
+                distinct,
                 partition_by,
                 order_by,
                 frame,
@@ -369,6 +395,7 @@ impl LogicalExpr {
                     name,
                     args: new_args,
                     is_aggregate,
+                    distinct,
                     partition_by: new_partition,
                     order_by: new_order,
                     frame,
@@ -447,25 +474,184 @@ impl LogicalExpr {
         }
     }
 
-    /// Checks if the expression is volatile (prevents constant folding)
-    pub fn is_volatile(&self) -> bool {
-        if let LogicalExpr::FunctionCall { name, .. } = self {
-            let n = name.to_uppercase();
-            if n == "RANDOM" || n == "NOW" {
-                return true;
-            }
-        }
-        self.children().iter().any(|c| c.is_volatile())
+    /// Collects the `LogicalPlan`s embedded in subquery expressions
+    /// (`ScalarSubquery`/`Exists`) anywhere inside this expression tree.
+    ///
+    /// Subquery bodies are plans, not expressions, so they are deliberately
+    /// opaque to [`children`]/[`map_children`]. This is the narrow, explicit
+    /// accessor for reaching them (mirroring how DataFusion/RisingWave inspect
+    /// `Subquery` plans from rules rather than descending through generic
+    /// expression traversal).
+    ///
+    /// [`children`]: LogicalExpr::children
+    /// [`map_children`]: LogicalExpr::map_children
+    pub fn subquery_plans(&self) -> Vec<&LogicalPlan> {
+        let mut out = Vec::new();
+        self.collect_subquery_plans(&mut out);
+        out
     }
 
-    /// Checks if the expression can be pushed down to eBPF execution
-    pub fn is_ebpf_safe(&self) -> bool {
+    fn collect_subquery_plans<'a>(&'a self, out: &mut Vec<&'a LogicalPlan>) {
         match self {
+            LogicalExpr::ScalarSubquery(plan) => out.push(plan.as_ref()),
+            LogicalExpr::Exists { subquery, .. } => out.push(subquery.as_ref()),
+            _ => {
+                for child in self.children() {
+                    child.collect_subquery_plans(out);
+                }
+            }
+        }
+    }
+
+    /// Checks if the expression is volatile (prevents constant folding).
+    ///
+    /// Volatility is decided conservatively: anything that cannot be *proven*
+    /// deterministic is treated as volatile so the optimizer never folds a
+    /// value that may differ between evaluations. This covers the standard
+    /// time/random builtins, window calls, AI operators, and user-defined
+    /// functions (whose volatility is only known to the binder's registry).
+    pub fn is_volatile(&self) -> bool {
+        Self::is_volatile_depth(self, 0)
+    }
+
+    /// Depth-limited recursion so a pathologically deep expression tree cannot
+    /// overflow the stack while checking volatility.
+    fn is_volatile_depth(expr: &LogicalExpr, depth: usize) -> bool {
+        if depth >= MAX_VOLATILITY_DEPTH {
+            // Assume volatile past the limit: the safe default.
+            return true;
+        }
+        match expr {
+            LogicalExpr::FunctionCall { name, .. } => is_volatile_builtin(name),
+            // Window calls span a frame/partition and are not constant-foldable.
+            LogicalExpr::WindowCall { .. } => true,
+            // AI operators and UDFs have unknown volatility without a registry.
+            LogicalExpr::AiOperator { .. }
+            | LogicalExpr::WasmUdf { .. }
+            | LogicalExpr::EbpfUdf { .. }
+            | LogicalExpr::PythonUdf { .. } => true,
+            // Subquery bodies may themselves be volatile; be safe.
+            LogicalExpr::ScalarSubquery(_) | LogicalExpr::Exists { .. } => true,
+            _ => expr
+                .children()
+                .iter()
+                .any(|c| Self::is_volatile_depth(c, depth + 1)),
+        }
+    }
+
+    /// Checks if the expression can be pushed down to eBPF execution.
+    pub fn is_ebpf_safe(&self) -> bool {
+        Self::is_ebpf_safe_depth(self, 0)
+    }
+
+    /// Depth-limited recursion for eBPF safety checks.
+    fn is_ebpf_safe_depth(expr: &LogicalExpr, depth: usize) -> bool {
+        if depth >= MAX_VOLATILITY_DEPTH {
+            return false;
+        }
+        match expr {
             LogicalExpr::PythonUdf { .. }
             | LogicalExpr::AiOperator { .. }
             | LogicalExpr::WasmUdf { .. } => false,
             LogicalExpr::ScalarSubquery(_) | LogicalExpr::Exists { .. } => false,
-            _ => self.children().iter().all(|c| c.is_ebpf_safe()),
+            _ => expr
+                .children()
+                .iter()
+                .all(|c| Self::is_ebpf_safe_depth(c, depth + 1)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::LogicalLiteral;
+    use crate::schema::VeinDataType;
+
+    fn func(name: &str) -> LogicalExpr {
+        LogicalExpr::FunctionCall {
+            name: name.to_string(),
+            args: vec![],
+            is_aggregate: false,
+            distinct: false,
+            return_type: VeinDataType::Float64,
+        }
+    }
+
+    #[test]
+    fn volatile_and_stable_builtins_are_detected() {
+        assert!(func("random").is_volatile());
+        assert!(func("RAND").is_volatile());
+        assert!(func("uuid").is_volatile());
+        assert!(func("NOW").is_volatile());
+        assert!(func("CURRENT_TIMESTAMP").is_volatile());
+        assert!(func("curdate").is_volatile());
+    }
+
+    #[test]
+    fn immutable_function_is_not_volatile() {
+        assert!(!func("ABS").is_volatile());
+        assert!(!func("length").is_volatile());
+    }
+
+    #[test]
+    fn volatility_recurses_into_children() {
+        // A volatile call buried inside a binary expression must be found.
+        let inner = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(1))),
+            op: BinaryOp::Plus,
+            right: Box::new(func("random")),
+            return_type: VeinDataType::Float64,
+        };
+        assert!(inner.is_volatile());
+    }
+
+    #[test]
+    fn udfs_window_and_ai_ops_are_conservatively_volatile() {
+        assert!(LogicalExpr::WindowCall {
+            name: "row_number".to_string(),
+            args: vec![],
+            is_aggregate: false,
+            distinct: false,
+            partition_by: vec![],
+            order_by: vec![],
+            frame: None,
+            return_type: VeinDataType::Int64,
+        }
+        .is_volatile());
+        assert!(LogicalExpr::AiOperator {
+            name: "llm_classify".to_string(),
+            args: vec![],
+            return_type: VeinDataType::Utf8,
+        }
+        .is_volatile());
+        assert!(LogicalExpr::WasmUdf {
+            bytecode_ref: None,
+            args: vec![],
+            return_type: VeinDataType::Int64,
+        }
+        .is_volatile());
+    }
+
+    /// A pathologically deep expression must not overflow the stack while
+    /// checking volatility; past MAX_VOLATILITY_DEPTH it assumes volatile.
+    #[test]
+    fn deep_expression_volatility_does_not_overflow() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let mut e = LogicalExpr::Literal(LogicalLiteral::Int64(1));
+                for _ in 0..200_000 {
+                    e = LogicalExpr::Not {
+                        expr: Box::new(e),
+                    };
+                }
+                // Not is not volatile itself, so the only way this returns true
+                // without recursing 200k deep is the depth guard's safe default.
+                assert!(e.is_volatile());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

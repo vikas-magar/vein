@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let addr: std::net::SocketAddr = bind.parse()?;
 
             let (tx, rx) = flume::unbounded();
-            let master_client = Arc::new(common::transport::build_quic_client(&cert).unwrap());
+            let master_client = Arc::new(common::transport::build_quic_client(&cert)?);
             let ctx =
                 DaemonContext::new(common::identifiers::NodeId::from_raw(1), tx, master_client);
 

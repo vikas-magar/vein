@@ -29,17 +29,51 @@ impl<'a> Parser<'a> {
     pub(crate) fn parse_pipe_pivot(
         &mut self,
     ) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
-        Err(super::ParseError::Unsupported(
-            "PIVOT pipe operator not yet implemented".into(),
-        ))
+        self.expect(TokenKind::Pivot)?;
+        let aggregate = self.parse_expr()?;
+        let alias = if let Ok(TokenKind::As) = self.peek().map(|t| &t.kind) {
+            self.next_token()?;
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::By)?;
+        let value_column = self.expect_ident()?;
+        self.expect(TokenKind::In)?;
+        self.expect(TokenKind::LParen)?;
+        let values = self.parse_comma_separated(|p| p.parse_expr())?;
+        self.expect(TokenKind::RParen)?;
+        Ok(crate::ast::pipe_op::PipeOperator::Pivot {
+            aggregate,
+            alias,
+            value_column,
+            values,
+        })
     }
 
     pub(crate) fn parse_pipe_unpivot(
         &mut self,
     ) -> Result<crate::ast::pipe_op::PipeOperator<'a>, super::ParseError> {
-        Err(super::ParseError::Unsupported(
-            "UNPIVOT pipe operator not yet implemented".into(),
-        ))
+        self.expect(TokenKind::Unpivot)?;
+        let include_nulls = if let Ok(TokenKind::All) = self.peek().map(|t| &t.kind) {
+            self.next_token()?;
+            true
+        } else {
+            false
+        };
+        let value_name = self.expect_ident()?;
+        self.expect(TokenKind::By)?;
+        let name_name = self.expect_ident()?;
+        self.expect(TokenKind::In)?;
+        self.expect(TokenKind::LParen)?;
+        let columns = self.parse_comma_separated(|p| p.expect_ident())?;
+        self.expect(TokenKind::RParen)?;
+        Ok(crate::ast::pipe_op::PipeOperator::Unpivot {
+            value_name,
+            name_name,
+            columns,
+            include_nulls,
+        })
     }
 }
 

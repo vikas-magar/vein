@@ -95,6 +95,8 @@ pub enum TokenKind {
     Aggregate,
     /// `EXTEND`
     Extend,
+    /// `QUALIFY` (filters on window-function results)
+    Qualify,
     /// `SET`
     Set,
     /// `DROP`

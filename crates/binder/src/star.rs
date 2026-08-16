@@ -17,7 +17,7 @@ use parser::ast::pipe_op::SelectItem;
 /// unqualified `*` with no visible columns (e.g. after a full DROP) is a
 /// `Semantic` error.
 pub fn expand_wildcard(
-    scopes: &ScopeStack<'_>,
+    scopes: &ScopeStack,
     table: Option<&str>,
 ) -> Result<Vec<ResolvedColumn>> {
     let Some(scope) = scopes.scopes_top() else {
@@ -35,7 +35,21 @@ pub fn expand_wildcard(
                     None,
                 ));
             }
-            Ok(scope.columns.clone())
+            // Only the columns belonging to `t` (its columns carry the table
+            // name or alias as their qualifier), not every visible column.
+            let matched: Vec<ResolvedColumn> = scope
+                .columns
+                .iter()
+                .filter(|c| c.qualifier.as_deref() == Some(t))
+                .cloned()
+                .collect();
+            if matched.is_empty() {
+                return Err(VeinError::semantic(
+                    format!("no columns from table '{t}' in scope for '*' reference"),
+                    None,
+                ));
+            }
+            Ok(matched)
         }
         None => {
             if scope.columns.is_empty() {
@@ -59,7 +73,7 @@ pub fn expand_wildcard(
 pub async fn expand_projection_items<'a>(
     items: &[SelectItem<'_>],
     context: &mut BinderContext<'a>,
-    scopes: &mut ScopeStack<'a>,
+    scopes: &mut ScopeStack,
 ) -> Result<Vec<(LogicalExpr, Option<String>)>> {
     let mut bound = Vec::new();
     for item in items {

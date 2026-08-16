@@ -16,7 +16,7 @@ pub async fn bind_extend<'a>(
     input: LogicalPlan,
     items: &[SelectItem<'_>],
     context: &mut BinderContext<'a>,
-    scopes: &mut ScopeStack<'a>,
+    scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
     // 1. Expand items like SELECT, keeping the input columns as passthroughs.
     let bound_items = expand_projection_items(items, context, scopes).await?;
@@ -38,9 +38,22 @@ pub async fn bind_extend<'a>(
 
     for (expr, name) in plain_items {
         // Window placeholder columns ARE the Window node's output columns;
-        // reuse them so the extended schema references stay consistent.
+        // reuse them so the extended schema references stay consistent. A
+        // bare column passthrough keeps its identity; an aliased item keeps
+        // its underlying column id (same value) but applies the alias and
+        // resets the qualifier, matching projection semantics.
         let field = match &expr {
-            LogicalExpr::Column(col) => col.clone(),
+            LogicalExpr::Column(col) => match name {
+                Some(alias) => ResolvedColumn {
+                    id: col.id,
+                    name: alias.to_string(),
+                    qualifier: None,
+                    data_type: col.data_type.clone(),
+                    is_factorized: col.is_factorized,
+                    nullable: col.nullable,
+                },
+                None => col.clone(),
+            },
             _ => ResolvedColumn::new(
                 context.next_id(),
                 name.unwrap_or_else(|| "_col".to_string()),
@@ -67,7 +80,7 @@ pub async fn bind_set<'a>(
     input: LogicalPlan,
     assignments: &[(&str, SpannedExpr<'_>)],
     context: &mut BinderContext<'a>,
-    scopes: &mut ScopeStack<'a>,
+    scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = input.schema().fields.clone();
@@ -132,11 +145,22 @@ pub async fn bind_set<'a>(
 }
 
 /// Binds a PipeOperator::Drop (Removes columns from the stream)
-pub fn bind_drop<'a>(
+pub fn bind_drop(
     input: LogicalPlan,
     columns: &[&str],
-    scopes: &mut ScopeStack<'a>,
+    scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
+    // Reject unknown columns, mirroring SET: silently dropping nothing for a
+    // misspelled name would mask a user error.
+    for name in columns {
+        if !input.schema().fields.iter().any(|f| f.name.as_str() == *name) {
+            return Err(VeinError::semantic(
+                format!("DROP operator cannot find column '{name}'"),
+                None,
+            ));
+        }
+    }
+
     let mut bound_exprs = Vec::new();
     let mut new_fields = Vec::new();
 
@@ -158,10 +182,10 @@ pub fn bind_drop<'a>(
 }
 
 /// Binds a PipeOperator::Rename (Renames columns in the stream)
-pub fn bind_rename<'a>(
+pub fn bind_rename(
     input: LogicalPlan,
     renames: &[(&str, &str)],
-    scopes: &mut ScopeStack<'a>,
+    scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
     let mut new_fields = input.schema().fields.clone();
