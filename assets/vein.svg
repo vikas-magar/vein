@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="vein" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff2d55"/>
+      <stop offset="100%" stop-color="#ff6b81"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="#0d1117"/>
+  <!-- Main vein / pipe trunk -->
+  <path d="M48 128 L92 128 L108 88 L136 176 L160 128 L208 128"
+        fill="none" stroke="url(#vein)" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Branching vessels (pipe-syntax forks) -->
+  <path d="M108 88 L84 58" fill="none" stroke="url(#vein)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M108 88 L132 70" fill="none" stroke="url(#vein)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M136 176 L112 206" fill="none" stroke="url(#vein)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M136 176 L160 196" fill="none" stroke="url(#vein)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M160 128 L186 108" fill="none" stroke="url(#vein)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M160 128 L186 148" fill="none" stroke="url(#vein)" stroke-width="10" stroke-linecap="round"/>
+  <!-- Flow nodes -->
+  <circle cx="108" cy="88" r="7" fill="#ff2d55"/>
+  <circle cx="136" cy="176" r="7" fill="#ff2d55"/>
+  <circle cx="160" cy="128" r="7" fill="#ff2d55"/>
+</svg>

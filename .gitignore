@@ -4,3 +4,4 @@ target/
 *.spill
 docs
 .DS_Store.worktrees/
+.agents
