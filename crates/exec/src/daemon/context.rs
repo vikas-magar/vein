@@ -1,6 +1,6 @@
-use crate::daemon::pipeline::MorselTask;
 use common::cancellation::CancellationToken;
 use common::identifiers::{NodeId, TaskId};
+use common::protocol::ExecuteTask;
 use dashmap::DashMap;
 use s2n_quic::Client;
 use std::sync::Arc;
@@ -11,8 +11,8 @@ pub struct DaemonContext {
     pub node_id: NodeId,
     /// Active tasks that can be cancelled in O(1) time.
     pub active_tasks: DashMap<TaskId, CancellationToken>,
-    /// Global queue for unassigned Morsels (Work-Stealing).
-    pub morsel_queue: flume::Sender<MorselTask>,
+    /// Global queue for unassigned tasks (Work-Stealing).
+    pub task_queue: flume::Sender<ExecuteTask>,
     /// Outbound QUIC client to talk to the Master.
     pub master_client: Arc<Client>,
 }
@@ -21,13 +21,13 @@ impl DaemonContext {
     /// Create a new DaemonContext.
     pub fn new(
         node_id: NodeId,
-        morsel_queue: flume::Sender<MorselTask>,
+        task_queue: flume::Sender<ExecuteTask>,
         master_client: Arc<Client>,
     ) -> Arc<Self> {
         Arc::new(Self {
             node_id,
             active_tasks: DashMap::new(),
-            morsel_queue,
+            task_queue,
             master_client,
         })
     }

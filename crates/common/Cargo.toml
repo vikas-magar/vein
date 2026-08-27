@@ -10,9 +10,6 @@ s2n-quic-core = "0.83.0"
 bytes   = { workspace = true }
 tokio   = { workspace = true }
 arrow   = { workspace = true }
-parquet = { workspace = true }
-chrono  = "0.4"
-rcgen   = "0.11"
 tracing = { workspace = true }
 error   = { path = "../error" }
 async-trait = { workspace = true }

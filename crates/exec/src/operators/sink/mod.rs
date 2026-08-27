@@ -1,4 +1,4 @@
-/// Discard sink that throws away all data
+/// Discard executor that throws away all data
 pub mod discard;
-/// VFS Sink that spills data to storage
-pub mod vfs_sink;
+/// Collect executor that captures output for the caller
+pub mod client;

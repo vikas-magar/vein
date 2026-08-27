@@ -1,7 +1,7 @@
 pub mod daemon;
 pub mod engine;
 use clap::{Parser, Subcommand};
-use exec::daemon::{DaemonContext, ExecutorDaemon};
+use exec::ExecutorNode;
 use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -107,32 +107,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cert,
             key,
         } => {
-            tracing::info!(
-                "Starting Vein Executor node on {} (Master: {})",
-                bind,
-                master
-            );
             let addr: std::net::SocketAddr = bind.parse()?;
-
-            let (tx, rx) = flume::unbounded();
-            let master_client = Arc::new(common::transport::build_quic_client(&cert)?);
-            let ctx =
-                DaemonContext::new(common::identifiers::NodeId::from_raw(1), tx, master_client);
-
-            // Start the CPU Worker Pool (e.g., 4 threads) to process MorselTasks
-            let _worker_pool = exec::daemon::WorkerPool::start(4, rx);
-
-            let daemon = ExecutorDaemon::new(ctx);
-
-            tokio::spawn(async move {
-                tracing::info!("Initializing Control Plane on {}", addr);
-                if let Err(e) = daemon.run_control_plane(addr, &cert, &key).await {
-                    tracing::error!("Executor control plane failed: {}", e);
-                }
-            });
-
-            tokio::signal::ctrl_c().await?;
-            tracing::info!("Shutting down Executor node");
+            ExecutorNode::builder()
+                .bind(addr)
+                .certificates(&cert, &key)
+                .workers(4)
+                .master(&master)
+                .build()?
+                .start()
+                .await?;
         }
         Commands::Local => {
             tracing::info!("Starting Vein Local Cluster (Master + Executor)");
@@ -152,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             let addr: std::net::SocketAddr = executor.parse()?;
 
-            let mut client = common::transport::build_quic_client(&cert)?;
+            let client = common::transport::build_quic_client(&cert)?;
             let mut conn = client
                 .connect(
                     s2n_quic::client::Connect::new(addr).with_server_name(server_name.as_str()),
@@ -168,9 +151,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 query_id: common::identifiers::QueryId::new(),
                 stage_id: common::identifiers::StageId::new(),
                 source: common::protocol::DataSource::Memory,
-                operators: vec![common::protocol::Operator::Filter {
-                    expr: "ignored".into(),
-                }],
+                operators: vec![common::protocol::Operator::Filter(
+                    common::protocol::FilterPredicate {
+                        column: 0,
+                        op: common::protocol::FilterOp::Gt,
+                        literal: common::protocol::FilterValue::Int(0),
+                    },
+                )],
                 sink: common::protocol::DataSink::Discard,
             };
 

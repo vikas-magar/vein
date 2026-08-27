@@ -1,0 +1,265 @@
+//! The executor's execution seam: the traits that decouple pipeline
+//! construction and task execution from the wire protocol and the concrete
+//! stage implementations.
+//!
+//! These are the abstractions the rest of the engine programs against:
+//! a [`ExecutorBuilder`] selects concrete [`Source`]/[`Transform`]/[`Sink`]
+//! implementations from a wire task, and a [`TaskExecutor`] runs a single
+//! task end-to-end (see `daemon::pipeline`).
+
+use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
+use bytes::Bytes;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use crate::daemon::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
+use crate::expr::PhysicalExpr;
+use common::cancellation::CancellationToken;
+use common::protocol::{DataSink, DataSource, ExecuteTask, FilterPredicate, Operator, VeinControlEvent};
+use common::Result;
+use error::VeinError;
+
+/// Per-task execution metrics, reported to the master on completion.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TaskMetrics {
+    /// Bytes read from the source.
+    pub bytes_read: u64,
+    /// Wall-clock execution time in nanoseconds.
+    pub duration_ns: u64,
+}
+
+/// The outcome of running a single task to completion.
+#[derive(Debug, Clone, Default)]
+pub struct TaskResult {
+    /// Number of rows produced by the pipeline.
+    pub row_count: u64,
+    /// Captured output batches (populated by a [`Sink`] that retains results).
+    pub output: Vec<RecordBatch>,
+    /// Execution metrics (bytes read, duration).
+    pub metrics: TaskMetrics,
+}
+
+/// Builds pipeline stages for a task from the wire protocol.
+///
+/// Decouples `exec` from `common::protocol`: the executor's own
+/// [`Source`], [`Transform`], and [`Sink`] implementations are selected here
+/// from the self-contained task description a worker receives.
+pub trait ExecutorBuilder: Send + Sync {
+    /// Build a source from the task's [`DataSource`].
+    fn build_source(&self, source: &DataSource) -> Result<Box<dyn Source<DataChunk>>>;
+
+    /// Build a transform for a single wire [`Operator`], wiring it to the
+    /// downstream `next` node. Transforms push their output into `next`, so
+    /// callers build the chain from the sink backwards.
+    fn build_transform(
+        &self,
+        op: &Operator,
+        next: Box<dyn PipelineNode<DataChunk>>,
+    ) -> Result<Box<dyn Transform<DataChunk>>>;
+
+    /// Build a sink from the task's [`DataSink`]. The sink is the terminal
+    /// stage; a sink that returns data (e.g. `DataSink::Client`) exposes it via
+    /// [`Sink::collect`].
+    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>>;
+}
+
+/// Executes a single task (`source -> transforms -> sink`) end-to-end.
+///
+/// This is the unit of work the distributed master schedules: the executor
+/// receives a self-contained [`ExecuteTask`] and runs it, returning its result.
+///
+/// Marked `?Send` because driving a [`Source`] awaits `Source::execute`, whose
+/// future is `!Send`; the executor runs these on a Tokio `LocalSet`, which
+/// supports `!Send` tasks.
+#[async_trait(?Send)]
+pub trait TaskExecutor: Send + Sync {
+    /// Run one task, driving its source through the operator chain.
+    async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult>;
+}
+
+/// Builds a [`PhysicalExpr`] predicate from a structured [`FilterPredicate`].
+///
+/// `Operator::Filter` carries a planner-resolved, index-based predicate
+/// (`column <op> literal`); this factory turns it into an evaluable expression
+/// so the filter can be applied to Arrow batches without any name parsing.
+pub trait PhysicalExprFactory: Send + Sync {
+    /// Build a predicate expression from a wire filter.
+    fn build(&self, filter: &FilterPredicate) -> Result<Box<dyn PhysicalExpr>>;
+}
+
+/// Serializes produced [`RecordBatch`]es into wire bytes for the data plane
+/// (e.g. Arrow IPC). Backs `DataSink::Client` when results cross the network.
+pub trait OutputEncoder: Send + Sync {
+    /// Encode a slice of batches into a single byte payload.
+    fn encode(&self, batches: &[RecordBatch]) -> Result<Bytes>;
+}
+
+/// Sends control-plane events (completion, failure, cancel) to the master.
+#[async_trait]
+pub trait ControlTransport: Send + Sync {
+    /// Send one control event to the master.
+    async fn send(&self, event: VeinControlEvent) -> Result<()>;
+}
+
+/// A [`PipelineNode`] wrapper that aborts the pipeline if cancellation has been
+/// requested. Placed just above the sink, it is invoked once per batch that
+/// reaches the end of the chain, letting a long-running source stop promptly.
+struct CancelGuard<B> {
+    inner: Box<dyn PipelineNode<B>>,
+    cancel: CancellationToken,
+}
+
+impl<B> CancelGuard<B> {
+    fn new(inner: Box<dyn PipelineNode<B>>, cancel: CancellationToken) -> Self {
+        Self { inner, cancel }
+    }
+}
+
+impl<B> PipelineNode<B> for CancelGuard<B> {
+    fn push(&mut self, batch: B) -> Result<()> {
+        if self.cancel.is_cancelled() {
+            return Err(VeinError::cancelled());
+        }
+        self.inner.push(batch)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A [`PipelineNode`] adapter that forwards pushes into a shared sink, so the
+/// runner can retrieve the sink's result via [`Sink::collect`] after execution.
+struct SinkHandle<B>(Arc<Mutex<Box<dyn Sink<B>>>>);
+
+impl<B> PipelineNode<B> for SinkHandle<B> {
+    fn push(&mut self, batch: B) -> Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| VeinError::internal("sink mutex poisoned"))?
+            .push(batch)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| VeinError::internal("sink mutex poisoned"))?
+            .flush()
+    }
+}
+
+/// The default [`TaskExecutor`]: builds a task's pipeline via an injected
+/// [`ExecutorBuilder`] and drives the source through the operator chain.
+///
+/// The chain is constructed sink-first so each transform knows its downstream
+/// `next`; a [`CancelGuard`] is inserted just above the sink to abort on
+/// cancellation. On success, the output collected by the sink is returned as a
+/// [`TaskResult`].
+pub struct DefaultTaskExecutor {
+    builder: Arc<dyn ExecutorBuilder>,
+}
+
+impl DefaultTaskExecutor {
+    /// Create a task executor that builds pipelines with `builder`.
+    pub fn new(builder: Arc<dyn ExecutorBuilder>) -> Self {
+        Self { builder }
+    }
+}
+
+#[async_trait(?Send)]
+impl TaskExecutor for DefaultTaskExecutor {
+    async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult> {
+        let start = Instant::now();
+        if cancel.is_cancelled() {
+            return Err(VeinError::cancelled());
+        }
+
+        // 1. Terminal node: build the sink and share it so the runner can call
+        //    `Sink::collect` after execution. Wrapped in a cancellation guard.
+        let sink: Arc<Mutex<Box<dyn Sink<DataChunk>>>> =
+            Arc::new(Mutex::new(self.builder.build_sink(&task.sink)?));
+        let mut head: Box<dyn PipelineNode<DataChunk>> = Box::new(CancelGuard::new(
+            Box::new(SinkHandle(sink.clone())),
+            cancel,
+        ));
+
+        // 2. Build transforms backwards, threading `next` from sink to source.
+        for op in task.operators.iter().rev() {
+            head = self.builder.build_transform(op, head)?;
+        }
+
+        // 3. Build the source and drive the whole chain.
+        let mut source: Box<dyn Source<DataChunk>> = self.builder.build_source(&task.source)?;
+        source.execute(&mut *head).await?;
+
+        // 4. Assemble the result from the sink (Spark `collect`-style).
+        let output = sink
+            .lock()
+            .map_err(|_| VeinError::internal("sink mutex poisoned"))?
+            .collect();
+        let row_count = output.iter().map(|b| b.num_rows() as u64).sum();
+        let duration_ns = start.elapsed().as_nanos() as u64;
+
+        Ok(TaskResult {
+            row_count,
+            output,
+            metrics: TaskMetrics {
+                bytes_read: source.bytes_read(),
+                duration_ns,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::factory::TaskExecutorBuilder;
+    use common::identifiers::{QueryId, StageId, TaskId};
+    use common::protocol::{ExecutionMode, FilterOp, FilterPredicate, FilterValue};
+
+    fn runner() -> DefaultTaskExecutor {
+        TaskExecutorBuilder::new().build()
+    }
+
+    fn task() -> ExecuteTask {
+        ExecuteTask {
+            mode: ExecutionMode::Batch,
+            task_id: TaskId::new(),
+            query_id: QueryId::new(),
+            stage_id: StageId::new(),
+            source: DataSource::Memory, // dummy: Int64 [1,2,3,4,5]
+            operators: vec![Operator::Filter(FilterPredicate {
+                column: 0,
+                op: FilterOp::Gt,
+                literal: FilterValue::Int(2),
+            })],
+            sink: DataSink::Client,
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_memory_filter_to_client() {
+        let result = runner().execute(&task(), CancellationToken::new()).await.unwrap();
+        assert_eq!(result.row_count, 3);
+        assert_eq!(result.output.len(), 1);
+        let col = result.output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(col.values(), &[3, 4, 5]);
+        assert!(result.metrics.duration_ns > 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts() {
+        let mut task = task();
+        task.operators = Vec::new();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = runner().execute(&task, cancel).await.unwrap_err();
+        assert!(matches!(err, VeinError::Cancelled));
+    }
+}

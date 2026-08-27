@@ -6,10 +6,12 @@ use std::any::Any;
 
 use super::PhysicalExpr;
 
-/// A physical expression that references a column by its index in the RecordBatch.
+/// A physical expression that references a column by its physical index in the
+/// RecordBatch. Indices are resolved by the planner during logical-to-physical
+/// lowering; the executor stays name-free.
 #[derive(Debug, Clone)]
 pub struct ColumnExpr {
-    /// The name of the column (primarily for debugging).
+    /// The column name (for debugging only).
     #[allow(dead_code)]
     name: String,
     /// The physical index in the RecordBatch.
@@ -17,7 +19,7 @@ pub struct ColumnExpr {
 }
 
 impl ColumnExpr {
-    /// Creates a new ColumnExpr.
+    /// Creates a ColumnExpr referencing column `index`.
     pub fn new(name: impl Into<String>, index: usize) -> Self {
         Self {
             name: name.into(),

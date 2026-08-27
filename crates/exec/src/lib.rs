@@ -5,9 +5,6 @@
 
 #![deny(missing_docs)]
 
-/// Parquet scan stage — reads a file and streams RecordBatches.
-pub mod scan;
-
 /// Physical Expression Evaluator
 pub mod expr;
 
@@ -16,5 +13,11 @@ pub mod operators;
 
 /// Executor daemon entrypoints and runtime environment.
 pub mod daemon;
-/// Abstract traits defining the system architecture.
-pub mod traits;
+/// Execution seam: stage-factory, task-executor, and expression traits.
+pub mod runtime;
+/// Default stage factory mapping the wire protocol onto executor stages.
+pub mod factory;
+/// Ready-to-run executor node (worker pool + control plane + task executor).
+pub mod executor_node;
+
+pub use executor_node::ExecutorNode;

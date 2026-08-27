@@ -1,4 +1,4 @@
-use crate::daemon::pipeline::{PipelineNode, Source};
+use crate::daemon::pipeline::{DataChunk, PipelineNode, Source};
 use common::Result;
 use common::protocol::FileFormat;
 use error::VeinError;
@@ -7,19 +7,15 @@ use opendal::Operator;
 /// Parquet format decoding logic using OpenDAL
 pub mod parquet;
 
-/// Lock-free morsel dispatcher state
-pub mod state;
-pub use state::SharedScanState;
-
 /// A generic Source operator that scans files using OpenDAL and dispatches based on format.
-pub struct ScanSource {
+pub struct ScanExecutor {
     operator: Operator,
     paths: Vec<String>,
     format: FileFormat,
 }
 
-impl ScanSource {
-    /// Create a new ScanSource
+impl ScanExecutor {
+    /// Create a new ScanExecutor
     pub fn new(operator: Operator, paths: Vec<String>, format: FileFormat) -> Self {
         Self {
             operator,
@@ -30,9 +26,9 @@ impl ScanSource {
 }
 
 #[async_trait::async_trait(?Send)]
-impl Source for ScanSource {
+impl Source<DataChunk> for ScanExecutor {
     #[tracing::instrument(skip_all)]
-    async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()> {
+    async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunk>) -> Result<()> {
         match self.format {
             FileFormat::Parquet => {
                 parquet::execute_parquet_scan(&self.operator, &self.paths, next).await?;

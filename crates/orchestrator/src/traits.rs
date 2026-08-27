@@ -6,7 +6,7 @@ use plan::LogicalPlan;
 /// Abstraction for the Physical Planner.
 /// Responsible for lowering a bound Logical Plan into a distributed physical Execution DAG.
 pub trait PhysicalPlanner: Send + Sync {
-    /// Takes a Logical Plan and generates a distributed StageDag of MorselTasks.
+    /// Takes a Logical Plan and generates a distributed StageDag of tasks.
     fn create_physical_plan(&self, logical_plan: LogicalPlan) -> Result<StageDag>;
 }
 

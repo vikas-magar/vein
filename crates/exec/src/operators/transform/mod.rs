@@ -1,4 +1,4 @@
-/// Filter transform for applying predicates
+/// Filter executor for applying predicates
 pub mod filter;
-/// Project transform for computing new columns
+/// Project executor for computing new columns
 pub mod project;

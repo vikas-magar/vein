@@ -126,7 +126,7 @@ impl QueryEngine for DistributedCoordinator {
         // 3. PLAN: Lower the optimized logical plan into a distributed Physical DAG
         let physical_dag = self.planner.create_physical_plan(optimized_plan)?;
 
-        // 4. DISPATCH: The Scheduler breaks the DAG into MorselTasks and dispatches them efficiently.
+        // 4. DISPATCH: The Scheduler breaks the DAG into tasks and dispatches them efficiently.
         let output_stage = physical_dag.output_stage_id();
         tracing::info!("Dispatched DAG with output stage {:?}", output_stage);
 

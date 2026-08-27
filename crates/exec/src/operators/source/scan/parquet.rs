@@ -1,4 +1,4 @@
-use crate::daemon::pipeline::{DataChunk, PipelineNode, ValueVector, VeinBatch};
+use crate::daemon::pipeline::{DataChunk, PipelineNode};
 use bytes::Bytes;
 use common::Result;
 use common::arrow::SelectionVector;
@@ -88,7 +88,7 @@ impl AsyncFileReader for OpendalParquetReader {
 pub async fn execute_parquet_scan(
     operator: &Operator,
     paths: &[String],
-    next: &mut dyn PipelineNode,
+    next: &mut dyn PipelineNode<DataChunk>,
 ) -> Result<()> {
     for path in paths {
         tracing::info!(path = %path, format = "parquet", "Starting Parquet file scan");
@@ -111,16 +111,12 @@ pub async fn execute_parquet_scan(
 
             tracing::trace!(rows = batch.num_rows(), "Pushing batch down pipeline");
             let num_rows = batch.num_rows();
-            let vectors = batch
-                .columns()
-                .iter()
-                .map(|col| ValueVector { data: col.clone() })
-                .collect();
+            let vectors = batch.columns().to_vec();
             let chunk = DataChunk {
                 vectors,
                 selection: SelectionVector::new_dense(num_rows),
             };
-            next.push(VeinBatch::Flat(chunk))?;
+            next.push(chunk)?;
         }
 
         tracing::info!(path = %path, rows_processed = total_rows, "Finished scanning Parquet file");

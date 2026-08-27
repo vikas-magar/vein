@@ -172,6 +172,56 @@ pub struct FieldSchema {
     pub data_type: String,
 }
 
+/// A comparison operator for a filter predicate.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum FilterOp {
+    /// Equal (`=`)
+    Eq,
+    /// Not equal (`<>`)
+    Neq,
+    /// Less than (`<`)
+    Lt,
+    /// Greater than (`>`)
+    Gt,
+    /// Less than or equal (`<=`)
+    Leq,
+    /// Greater than or equal (`>=`)
+    Geq,
+}
+
+/// The literal side of a filter predicate.
+#[derive(
+    Debug, Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum FilterValue {
+    /// A boolean literal.
+    Boolean(bool),
+    /// A 64-bit integer literal.
+    Int(i64),
+    /// A 64-bit float literal.
+    Float(f64),
+    /// A string literal.
+    String(String),
+}
+
+/// A structured, index-based filter predicate: `column <op> literal`.
+///
+/// The planner resolves column names to physical indices before sending this
+/// to the executor, keeping the executor name-free and fast.
+#[derive(
+    Debug, Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct FilterPredicate {
+    /// The physical column index being tested.
+    pub column: i32,
+    /// The comparison operator.
+    pub op: FilterOp,
+    /// The literal to compare against.
+    pub literal: FilterValue,
+}
+
 /// Operator applied by an Executor to a data stream.
 
 #[derive(
@@ -179,11 +229,10 @@ pub struct FieldSchema {
 )]
 
 pub enum Operator {
-    /// Row-level filter predicate.
-    Filter {
-        /// Expression string in the engine's expression language.
-        expr: String,
-    },
+    /// Row-level filter predicate. Column references are **physical indices**
+    /// resolved by the planner during logical-to-physical lowering, so the
+    /// executor never parses names.
+    Filter(FilterPredicate),
     /// Column projection.
     Project {
         /// Column IDs to keep.
@@ -457,10 +506,10 @@ pub enum ProtocolResponse {
 pub struct TaskTelemetry {
     /// The task this telemetry is for.
     pub task_id: TaskId,
-    /// Total morsels assigned to this task.
-    pub total_morsels_assigned: usize,
-    /// Morsels completed so far.
-    pub morsels_completed: usize,
+    /// Total sub-tasks assigned to this task.
+    pub total_subtasks_assigned: usize,
+    /// Sub-tasks completed so far.
+    pub subtasks_completed: usize,
     /// Current processing speed.
     pub rows_processed_per_sec: f64,
 }
@@ -472,25 +521,10 @@ pub struct TaskTelemetry {
 pub struct PreemptResponse {
     /// The task that was preempted.
     pub task_id: TaskId,
-    /// Morsels completed before preemption.
-    pub morsels_completed: usize,
+    /// Sub-tasks completed before preemption.
+    pub subtasks_completed: usize,
     /// The boundary of work that the worker yielded back to the orchestrator
-    pub morsels_yielded: usize,
-}
-
-/// A macro-morsel task dispatched from Master to Worker.
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-pub struct MorselTask {
-    /// Task identifier.
-    pub task_id: TaskId,
-    /// Upstream source.
-    pub source: DataSource,
-    /// Physical execution plan.
-    pub plan: Vec<Operator>,
-    /// Downstream sink.
-    pub sink: DataSink,
+    pub subtasks_yielded: usize,
 }
 
 /// A command sent from the Master to a Compute Node for elasticity and scheduling.
@@ -498,9 +532,9 @@ pub struct MorselTask {
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub enum MasterCommand {
-    /// Dispatches a new Macro-Morsel to the worker
-    DispatchTask(Box<MorselTask>),
-    /// Forces the worker to pause and relinquish un-claimed Micro-Morsels
+    /// Dispatches a new task to the worker
+    DispatchTask(Box<ExecuteTask>),
+    /// Forces the worker to pause and relinquish un-claimed sub-tasks
     PreemptTask {
         /// The task to preempt.
         task_id: TaskId,
@@ -542,9 +576,11 @@ mod tests {
             stage_id: StageId::new(),
             source: DataSource::Memory,
             operators: vec![
-                Operator::Filter {
-                    expr: "col > 10".into(),
-                },
+                Operator::Filter(FilterPredicate {
+                    column: 0,
+                    op: FilterOp::Gt,
+                    literal: FilterValue::Int(10),
+                }),
                 Operator::Project {
                     columns: vec![0, 1, 2],
                 },

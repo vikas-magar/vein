@@ -1,22 +1,22 @@
-use crate::daemon::pipeline::{PipelineNode, Transform, VeinBatch};
+use crate::daemon::pipeline::{DataChunk, PipelineNode, Transform};
 use crate::expr::PhysicalExpr;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use error::{Result, VeinError};
 
 /// A synchronous Transform that evaluates expressions to produce new columns.
-pub struct ProjectTransform {
+pub struct ProjectExecutor {
     exprs: Vec<Box<dyn PhysicalExpr>>,
     schema: SchemaRef,
-    next: Box<dyn PipelineNode>,
+    next: Box<dyn PipelineNode<DataChunk>>,
 }
 
-impl ProjectTransform {
-    /// Create a new ProjectTransform.
+impl ProjectExecutor {
+    /// Create a new ProjectExecutor.
     pub fn new(
         exprs: Vec<Box<dyn PhysicalExpr>>,
         schema: SchemaRef,
-        next: Box<dyn PipelineNode>,
+        next: Box<dyn PipelineNode<DataChunk>>,
     ) -> Self {
         Self {
             exprs,
@@ -26,42 +26,34 @@ impl ProjectTransform {
     }
 }
 
-impl PipelineNode for ProjectTransform {
-    fn push(&mut self, batch: VeinBatch) -> Result<()> {
-        match batch {
-            VeinBatch::Flat(chunk) => {
-                let mut fields = Vec::with_capacity(chunk.vectors.len());
-                let mut arrays = Vec::with_capacity(chunk.vectors.len());
-                for (i, vec) in chunk.vectors.iter().enumerate() {
-                    fields.push(arrow::datatypes::Field::new(
-                        &format!("col_{}", i),
-                        vec.data.data_type().clone(),
-                        true,
-                    ));
-                    arrays.push(vec.data.clone());
-                }
-                let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-                let record_batch = RecordBatch::try_new(schema, arrays).map_err(|e| {
-                    VeinError::internal(format!("Failed to create RecordBatch: {}", e))
-                })?;
-
-                let mut new_vectors = Vec::with_capacity(self.exprs.len());
-                for expr in &self.exprs {
-                    let array = expr.evaluate(&record_batch)?;
-                    new_vectors.push(crate::daemon::pipeline::ValueVector { data: array });
-                }
-
-                let new_chunk = crate::daemon::pipeline::DataChunk {
-                    vectors: new_vectors,
-                    selection: chunk.selection,
-                };
-
-                self.next.push(VeinBatch::Flat(new_chunk))
-            }
-            VeinBatch::Factorized(_) => {
-                Err(VeinError::internal("Epic 3: project on factorized chunks"))
-            }
+impl PipelineNode<DataChunk> for ProjectExecutor {
+    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+        let mut fields = Vec::with_capacity(chunk.vectors.len());
+        let mut arrays = Vec::with_capacity(chunk.vectors.len());
+        for (i, vec) in chunk.vectors.iter().enumerate() {
+            fields.push(arrow::datatypes::Field::new(
+                &format!("col_{}", i),
+                vec.data_type().clone(),
+                true,
+            ));
+            arrays.push(vec.clone());
         }
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+        let record_batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| VeinError::internal(format!("Failed to create RecordBatch: {e}")))?;
+
+        let mut new_vectors = Vec::with_capacity(self.exprs.len());
+        for expr in &self.exprs {
+            let array = expr.evaluate(&record_batch)?;
+            new_vectors.push(array);
+        }
+
+        let new_chunk = DataChunk {
+            vectors: new_vectors,
+            selection: chunk.selection,
+        };
+
+        self.next.push(new_chunk)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -69,7 +61,7 @@ impl PipelineNode for ProjectTransform {
     }
 }
 
-impl Transform for ProjectTransform {}
+impl Transform<DataChunk> for ProjectExecutor {}
 
 #[cfg(test)]
 mod tests {
@@ -111,8 +103,8 @@ mod tests {
         struct MockSink {
             rows: usize,
         }
-        impl PipelineNode for MockSink {
-            fn push(&mut self, _batch: VeinBatch) -> Result<()> {
+        impl PipelineNode<DataChunk> for MockSink {
+            fn push(&mut self, _batch: DataChunk) -> Result<()> {
                 Ok(())
             }
             fn flush(&mut self) -> Result<()> {
@@ -123,7 +115,6 @@ mod tests {
         let sink = Box::new(MockSink { rows: 0 });
 
         // Execute Pipeline
-        let mut _project = ProjectTransform::new(exprs, out_schema, sink);
-        // _project.push(batch).unwrap();
+        let mut _project = ProjectExecutor::new(exprs, out_schema, sink);
     }
 }

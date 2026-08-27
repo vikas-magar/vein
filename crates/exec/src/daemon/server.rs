@@ -1,5 +1,4 @@
 use crate::daemon::DaemonContext;
-use crate::daemon::pipeline::MorselTask;
 use common::Result;
 use common::protocol::VeinControlEvent;
 use common::transport::build_quic_server;
@@ -66,15 +65,8 @@ impl ExecutorDaemon {
                                     task.task_id, task.query_id
                                 );
 
-                                let morsel = MorselTask {
-                                    task_id: task.task_id,
-                                    source: task.source,
-                                    plan: std::sync::Arc::new(task.operators),
-                                    sink: task.sink,
-                                };
-
-                                if let Err(e) = ctx.morsel_queue.send_async(morsel).await {
-                                    error!("Failed to push morsel to worker queue: {}", e);
+                                if let Err(e) = ctx.task_queue.send_async(task).await {
+                                    error!("Failed to push task to worker queue: {}", e);
                                 }
                             }
                             VeinControlEvent::CancelTask { task_id, query_id } => {

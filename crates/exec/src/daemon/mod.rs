@@ -1,11 +1,11 @@
 //! Daemon architecture for the Executor node.
 //!
-//! Uses Asynchronous Morsel-Driven LocalSets to perfectly balance
-//! network IO (QUIC) and CPU cache-local push pipelines.
+//! Uses asynchronous worker-pool LocalSets to balance network IO (QUIC) with
+//! CPU cache-local push pipelines.
 
 /// Daemon context and shared state.
 pub mod context;
-/// Pipeline abstractions for morsel push execution.
+/// Pipeline abstractions for push execution.
 pub mod pipeline;
 /// QUIC network listener logic.
 pub mod server;
@@ -13,6 +13,6 @@ pub mod server;
 pub mod worker;
 
 pub use context::DaemonContext;
-pub use pipeline::{MorselTask, PipelineNode};
+pub use pipeline::{PipelineNode, Sink, Source, Transform};
 pub use server::ExecutorDaemon;
 pub use worker::WorkerPool;
