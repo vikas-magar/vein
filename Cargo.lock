@@ -1056,6 +1056,7 @@ dependencies = [
  "optimizer",
  "orchestrator",
  "parser",
+ "physical",
  "plan",
  "rkyv",
  "s2n-quic",
@@ -3245,7 +3246,7 @@ dependencies = [
  "common",
  "error",
  "futures",
- "plan",
+ "physical",
  "s2n-quic",
  "serde",
  "tokio",
@@ -3441,6 +3442,15 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "physical"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "error",
+ "plan",
+]
 
 [[package]]
 name = "pin-project"

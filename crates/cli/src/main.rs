@@ -80,9 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                     ))
                     .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
-                    .with_planner(Arc::new(
-                        orchestrator::planner::dag_planner::DagPhysicalPlanner::new(),
-                    ))
+                    .with_planner(Arc::new(physical::DagPhysicalPlanner::new()))
                     .with_scheduler(scheduler)
                     .build()
                     .unwrap(),

@@ -1,0 +1,12 @@
+[package]
+name = "physical"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+missing_docs = "deny"
+
+[dependencies]
+common = { path = "../common" }
+error = { path = "../error" }
+plan = { path = "../plan" }

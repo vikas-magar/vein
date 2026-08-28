@@ -1,6 +1,5 @@
 pub mod config;
 pub mod executor;
-pub mod planner;
 pub mod scheduler;
 
 pub use config::MasterConfig;

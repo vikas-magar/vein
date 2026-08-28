@@ -1,61 +1,71 @@
-use common::identifiers::StageId;
-use common::protocol::{DataSink, DataSource, ExecutionMode, Operator};
+//! The job graph: stages and the shuffle edges between them.
+
+use crate::stage::Stage;
+use common::identifiers::{QueryId, StageId};
+use common::protocol::ExecutionMode;
 use error::VeinError;
 use std::collections::{HashMap, HashSet};
 
-/// A physical execution stage that can be run on a compute node.
-#[derive(Debug, Clone)]
-pub struct Stage {
-    pub stage_id: StageId,
-    pub source: DataSource,
-    pub operators: Vec<Operator>,
-    pub sink: DataSink,
-}
-
-/// A directed edge representing data flow between stages.
+/// A directed edge representing a shuffle dependency between stages.
 #[derive(Debug, Clone)]
 pub struct StageEdge {
+    /// The producing (upstream) stage.
     pub from_stage: StageId,
+    /// The consuming (downstream) stage.
     pub to_stage: StageId,
 }
 
-/// A validated, topologically-ordered execution DAG.
+/// One query's complete physical plan: a validated, topologically-ordered DAG
+/// of [`Stage`]s.
+///
+/// A [`Job`] is the output of the [`PhysicalPlanner`](crate::PhysicalPlanner)
+/// for a single query, and is what the scheduler consumes to drive execution.
 #[derive(Debug, Clone)]
-pub struct StageDag {
+pub struct Job {
+    /// The query this job answers.
+    pub query_id: QueryId,
+    /// The execution mode for all stages in this job.
+    mode: ExecutionMode,
+    /// The stages of the job, keyed by stage id.
     stages: HashMap<StageId, Stage>,
-    /// Predecessor adjacency: StageId -> Vec<StageId> that feed into it.
+    /// Predecessor adjacency: `StageId -> Vec<StageId>` that feed into it.
     /// `topological_order` walks backwards from the sink over producers so it
     /// emits leaves (sources) first.
     predecessors: HashMap<StageId, Vec<StageId>>,
+    /// The stage that produces the job's final output.
     output_stage: StageId,
-    mode: ExecutionMode,
 }
 
-impl StageDag {
-    /// Create a new StageDag. Builds the adjacency list and validates acyclicity.
+impl Job {
+    /// Create a new [`Job`], validating the stage graph.
+    ///
+    /// Rejects unknown edge endpoints, cycles, a missing output stage, and
+    /// stages unreachable from the output stage, so that later infallible
+    /// accessors ([`Job::get_stage`], [`Job::topological_order`]) are safe.
     pub fn new(
-        stages_vec: Vec<Stage>,
+        query_id: QueryId,
+        stages: Vec<Stage>,
         edges: Vec<StageEdge>,
         output_stage: StageId,
         mode: ExecutionMode,
     ) -> Result<Self, VeinError> {
-        let mut stages = HashMap::new();
-        for stage in stages_vec {
-            stages.insert(stage.stage_id, stage);
+        let mut stages_map = HashMap::new();
+        for stage in stages {
+            stages_map.insert(stage.stage_id, stage);
         }
 
         // Validate every edge endpoint exists so downstream `get_stage().unwrap()`
         // sites can never panic on a dangling reference.
         for edge in &edges {
-            if !stages.contains_key(&edge.from_stage) {
+            if !stages_map.contains_key(&edge.from_stage) {
                 return Err(VeinError::internal(format!(
-                    "DAG edge references unknown producer stage {:?}",
+                    "edge references unknown producer stage {:?}",
                     edge.from_stage
                 )));
             }
-            if !stages.contains_key(&edge.to_stage) {
+            if !stages_map.contains_key(&edge.to_stage) {
                 return Err(VeinError::internal(format!(
-                    "DAG edge references unknown consumer stage {:?}",
+                    "edge references unknown consumer stage {:?}",
                     edge.to_stage
                 )));
             }
@@ -78,9 +88,12 @@ impl StageDag {
 
         // Kahn's algorithm: reject any cycle up front so `topological_order`
         // (which returns an infallible Vec) is guaranteed a valid ordering.
-        let mut in_degree: HashMap<StageId, usize> = stages.keys().map(|&id| (id, 0)).collect();
+        let mut in_degree: HashMap<StageId, usize> =
+            stages_map.keys().map(|&id| (id, 0)).collect();
         for edge in &edges {
-            *in_degree.get_mut(&edge.to_stage).expect("endpoint validated") += 1;
+            *in_degree
+                .get_mut(&edge.to_stage)
+                .expect("endpoint validated") += 1;
         }
         let mut queue: std::collections::VecDeque<StageId> = in_degree
             .iter()
@@ -102,16 +115,16 @@ impl StageDag {
                 }
             }
         }
-        if processed != stages.len() {
-            return Err(VeinError::internal("DAG contains a cycle"));
+        if processed != stages_map.len() {
+            return Err(VeinError::internal("job contains a cycle"));
         }
 
         // The sink must itself be a stage: `topological_order` starts from the
         // output stage, so a missing sink would yield an ordering containing a
         // nonexistent StageId and later `get_stage().unwrap()` sites would panic.
-        if !stages.contains_key(&output_stage) {
+        if !stages_map.contains_key(&output_stage) {
             return Err(VeinError::internal(format!(
-                "DAG output stage {:?} is not in the stage set",
+                "output stage {:?} is not in the stage set",
                 output_stage
             )));
         }
@@ -132,22 +145,23 @@ impl StageDag {
                 }
             }
         }
-        if reachable.len() != stages.len() {
+        if reachable.len() != stages_map.len() {
             return Err(VeinError::internal(format!(
                 "{} stage(s) are unreachable from the output stage",
-                stages.len() - reachable.len()
+                stages_map.len() - reachable.len()
             )));
         }
 
         Ok(Self {
-            stages,
+            query_id,
+            mode,
+            stages: stages_map,
             predecessors,
             output_stage,
-            mode,
         })
     }
 
-    /// Return the execution mode for this DAG.
+    /// Return the execution mode for this job.
     pub fn mode(&self) -> &ExecutionMode {
         &self.mode
     }
@@ -160,7 +174,7 @@ impl StageDag {
     /// Returns the stages in topological order (leaves first).
     ///
     /// Walks the predecessor edges backwards from the output (sink) stage in
-    /// post-order, so every producer appears before its consumers. `new()`
+    /// post-order, so every producer appears before its consumers. [`Job::new`]
     /// guarantees the graph is acyclic and every edge endpoint exists, so this
     /// cannot panic and cannot omit a reachable stage.
     pub fn topological_order(&self) -> Vec<StageId> {
@@ -181,13 +195,15 @@ impl StageDag {
                     visit(producer, pred, visited, order);
                 }
             }
-            // Add node after visiting all producers (post-order).
             order.push(node);
         }
 
-        visit(self.output_stage, &self.predecessors, &mut visited, &mut order);
-
-        // order now has producers first and output_stage last.
+        visit(
+            self.output_stage,
+            &self.predecessors,
+            &mut visited,
+            &mut order,
+        );
         order
     }
 
@@ -200,15 +216,9 @@ impl StageDag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::protocol::{DataSink, DataSource, Operator};
 
     fn stage(id: u64) -> Stage {
-        Stage {
-            stage_id: StageId::from_raw(id),
-            source: DataSource::Memory,
-            operators: Vec::<Operator>::new(),
-            sink: DataSink::Discard,
-        }
+        Stage::new(StageId::from_raw(id))
     }
 
     fn edge(from: u64, to: u64) -> StageEdge {
@@ -228,15 +238,16 @@ mod tests {
     /// A→B→D, A→C→D: all four stages present, producers before consumers.
     #[test]
     fn test_dogleg_order_is_leaves_first() {
-        let dag = StageDag::new(
+        let job = Job::new(
+            QueryId::new(),
             vec![stage(1), stage(2), stage(3), stage(4)],
             vec![edge(1, 2), edge(2, 4), edge(1, 3), edge(3, 4)],
             StageId::from_raw(4),
             ExecutionMode::Batch,
         )
-        .expect("valid DAG");
+        .expect("valid job");
 
-        let order = dag.topological_order();
+        let order = job.topological_order();
         assert_eq!(order.len(), 4, "all stages present: {order:?}");
         for e in [edge(1, 2), edge(2, 4), edge(1, 3), edge(3, 4)] {
             let (f, t) = (
@@ -250,13 +261,13 @@ mod tests {
                 e.to_stage.into_raw()
             );
         }
-        // The sink is emitted last.
         assert_eq!(order.last(), Some(&StageId::from_raw(4)));
     }
 
     #[test]
     fn test_cycle_rejected() {
-        let err = StageDag::new(
+        let err = Job::new(
+            QueryId::new(),
             vec![stage(1), stage(2)],
             vec![edge(1, 2), edge(2, 1)],
             StageId::from_raw(2),
@@ -269,19 +280,21 @@ mod tests {
 
     #[test]
     fn test_single_stage() {
-        let dag = StageDag::new(
+        let job = Job::new(
+            QueryId::new(),
             vec![stage(1)],
             vec![],
             StageId::from_raw(1),
             ExecutionMode::Batch,
         )
-        .expect("valid DAG");
-        assert_eq!(dag.topological_order(), vec![StageId::from_raw(1)]);
+        .expect("valid job");
+        assert_eq!(job.topological_order(), vec![StageId::from_raw(1)]);
     }
 
     #[test]
     fn test_dangling_edge_rejected() {
-        let err = StageDag::new(
+        let err = Job::new(
+            QueryId::new(),
             vec![stage(1)],
             vec![edge(1, 99)],
             StageId::from_raw(1),
@@ -294,21 +307,24 @@ mod tests {
 
     #[test]
     fn test_missing_output_stage_rejected() {
-        let err = StageDag::new(
+        let err = Job::new(
+            QueryId::new(),
             vec![stage(1)],
             vec![],
-            StageId::from_raw(99), // sink not present in `stages`
+            StageId::from_raw(99),
             ExecutionMode::Batch,
         )
         .expect_err("output stage not in stage set must be rejected");
-        assert!(err.to_string().contains("not in the stage set"), "got {err}");
+        assert!(
+            err.to_string().contains("not in the stage set"),
+            "got {err}"
+        );
     }
 
     #[test]
     fn test_unreachable_stage_rejected() {
-        // Stage 3 is disconnected from the sink (2): it would be silently
-        // omitted by `topological_order`, so it must be rejected up front.
-        let err = StageDag::new(
+        let err = Job::new(
+            QueryId::new(),
             vec![stage(1), stage(2), stage(3)],
             vec![edge(1, 2)],
             StageId::from_raw(2),

@@ -10,6 +10,7 @@ exec = { path = "../exec" }
 error = { path = "../error" }
 binder = { path = "../binder" }
 plan = { path = "../plan" }
+physical = { path = "../physical" }
 vcs = { path = "../vcs" }
 optimizer = { path = "../optimizer" }
 parser = { path = "../parser" }

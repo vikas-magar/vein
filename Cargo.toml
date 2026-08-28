@@ -5,7 +5,7 @@ edition = "2024"
 
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/vcs", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/orchestrator", "crates/cli", "crates/vfs", "crates/ebpf", "crates/plan", "crates/optimizer"]
+members = ["crates/common", "crates/vcs", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/orchestrator", "crates/cli", "crates/vfs", "crates/ebpf", "crates/plan", "crates/physical", "crates/optimizer"]
 
 [workspace.dependencies]
 async-trait = "0.1.89"

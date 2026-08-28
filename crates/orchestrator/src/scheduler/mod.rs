@@ -2,17 +2,20 @@ pub mod elasticity;
 pub mod quic_dispatcher;
 
 use crate::executor::ExecutorRegistry;
-use crate::planner::dag::StageDag;
 use crate::traits::TaskDispatcher;
 use common::cancellation::CancellationToken;
-use common::identifiers::{QueryId, TaskId};
-use common::protocol::{ExecuteTask, ExecutionMode};
+use common::protocol::ExecutionMode;
 use error::VeinError;
+use physical::Job;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
 
-/// Orchestrates the execution of a StageDag across the cluster.
+/// Orchestrates the execution of a [`Job`] across the cluster.
+///
+/// The scheduler consumes a physical [`Job`], walks its stages in topological
+/// order, and dispatches every task in a stage before advancing to the next
+/// stage.
 pub struct Scheduler {
     registry: Arc<ExecutorRegistry>,
     dispatcher: Arc<dyn TaskDispatcher>,
@@ -36,31 +39,25 @@ impl Scheduler {
         }
     }
 
-    /// Execute the StageDag, choosing the strategy based on ExecutionMode.
-    pub async fn execute(
-        &self,
-        query_id: QueryId,
-        dag: StageDag,
-        cancel: CancellationToken,
-    ) -> Result<(), VeinError> {
-        match dag.mode() {
-            ExecutionMode::Batch => self.execute_batch_waves(query_id, dag, cancel).await,
-            ExecutionMode::Streaming => {
-                self.execute_streaming_topology(query_id, dag, cancel).await
-            }
+    /// Execute the [`Job`], choosing the strategy based on its execution mode.
+    pub async fn execute(&self, job: Job, cancel: CancellationToken) -> Result<(), VeinError> {
+        match job.mode() {
+            ExecutionMode::Batch => self.execute_batch_waves(job, cancel).await,
+            ExecutionMode::Streaming => self.execute_streaming_topology(job, cancel).await,
         }
     }
 
     /// Schedule a Batch query using wave (bottom-up) execution.
-    /// It traverses the DAG topologically, waiting for each wave to complete
-    /// before starting the next wave.
+    ///
+    /// It traverses the job topologically, dispatching all tasks of each stage
+    /// concurrently and waiting for the whole stage to complete before starting
+    /// the next wave.
     async fn execute_batch_waves(
         &self,
-        query_id: QueryId,
-        dag: StageDag,
+        job: Job,
         cancel: CancellationToken,
     ) -> Result<(), VeinError> {
-        let order = dag.topological_order();
+        let order = job.topological_order();
 
         for stage_id in order {
             // Check cancellation before each wave
@@ -68,7 +65,7 @@ impl Scheduler {
                 return Err(VeinError::Cancelled);
             }
 
-            let stage = dag
+            let stage = job
                 .get_stage(stage_id)
                 .ok_or_else(|| VeinError::internal("Invalid StageId in topological order"))?;
 
@@ -78,61 +75,85 @@ impl Scheduler {
                 return Err(VeinError::NoExecutorsAvailable);
             }
 
-            // In a real query, a stage might be split into multiple parallel tasks (e.g. 10 files = 10 tasks).
-            // For scaffolding, we dispatch 1 task representing the entire stage.
-            let task = ExecuteTask {
-                mode: ExecutionMode::Batch,
-                task_id: TaskId::new(),
-                query_id,
-                stage_id: stage.stage_id,
-                source: stage.source.clone(),
-                operators: stage.operators.clone(),
-                sink: stage.sink.clone(),
-            };
+            let mut join_set = JoinSet::new();
+            for (i, task) in stage.tasks().iter().enumerate() {
+                let query_id = job.query_id;
+                let mode = job.mode().clone();
+                let execute_task = task
+                    .clone()
+                    .into_execute_task(query_id, stage.stage_id, mode);
 
-            // Pick the least-loaded executor (executors are already sorted by load)
-            let executor = executors[0].clone();
+                // Pick the least-loaded executor (executors are already sorted by load).
+                let executor = executors[i % executors.len()].clone();
+                let dispatcher = self.dispatcher.clone();
+                let cancel = cancel.clone();
+                let timeout = self.timeout;
+                let max_retries = self.max_retries;
 
-            let mut attempts = 0;
-            loop {
-                // 1. Dispatch
-                if let Err(e) = self.dispatcher.dispatch(&executor, task.clone()).await {
-                    tracing::warn!("Dispatch failed to node {}: {}", executor.node_id, e);
-                    attempts += 1;
-                    if attempts > self.max_retries {
+                join_set.spawn(async move {
+                    let task_id = execute_task.task_id;
+                    let mut attempts = 0;
+                    loop {
+                        // 1. Dispatch
+                        if let Err(e) = dispatcher.dispatch(&executor, execute_task.clone()).await {
+                            tracing::warn!("Dispatch failed to node {}: {}", executor.node_id, e);
+                            attempts += 1;
+                            if attempts > max_retries {
+                                return Err(e);
+                            }
+                            continue; // Retry dispatch
+                        }
+
+                        // 2. Wait for completion
+                        let d = dispatcher.clone();
+                        let c = cancel.clone();
+                        let wait_result = tokio::select! {
+                            res = d.wait_for_completion(query_id, task_id) => res,
+                            _ = c.cancelled() => {
+                                let _ = d.cancel_task(&executor, query_id, task_id).await;
+                                return Err(VeinError::Cancelled);
+                            }
+                            _ = tokio::time::sleep(timeout) => {
+                                let _ = d.cancel_task(&executor, query_id, task_id).await;
+                                return Err(VeinError::TaskFailed {
+                                    task_id: task_id.to_string(),
+                                    message: "Task timeout".to_string(),
+                                })
+                            }
+                        };
+
+                        match wait_result {
+                            Ok(_) => return Ok(()), // Success, move to next task in the wave
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Task {} failed on node {}: {}",
+                                    task_id,
+                                    executor.node_id,
+                                    e
+                                );
+                                attempts += 1;
+                                if attempts > max_retries {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Wait for every task of the stage before advancing the wave.
+            while let Some(res) = join_set.join_next().await {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        cancel.cancel();
                         return Err(e);
                     }
-                    continue; // Retry dispatch
-                }
-
-                // 2. Wait for completion
-                let dispatcher = self.dispatcher.clone();
-                let tid = task.task_id;
-                let c = cancel.clone();
-
-                let wait_result = tokio::select! {
-                    res = dispatcher.wait_for_completion(query_id, tid) => res,
-                    _ = c.cancelled() => {
-                        // Attempt graceful cancel
-                        let _ = self.dispatcher.cancel_task(&executor, query_id, tid).await;
-                        return Err(VeinError::Cancelled);
-                    }
-                    _ = tokio::time::sleep(self.timeout) => {
-                        // The task is still running on the executor; cancel it so
-                        // it stops consuming resources before we (maybe) retry.
-                        let _ = self.dispatcher.cancel_task(&executor, query_id, tid).await;
-                        Err(VeinError::TaskFailed { task_id: tid.to_string(), message: "Task timeout".to_string() })
-                    }
-                };
-
-                match wait_result {
-                    Ok(_) => break, // Success, move to next stage in wave
                     Err(e) => {
-                        tracing::warn!("Task {} failed on node {}: {}", tid, executor.node_id, e);
-                        attempts += 1;
-                        if attempts > self.max_retries {
-                            return Err(e);
-                        }
+                        cancel.cancel();
+                        return Err(VeinError::internal(format!(
+                            "stage task panicked: {e}"
+                        )));
                     }
                 }
             }
@@ -144,11 +165,10 @@ impl Scheduler {
     /// Schedule a Streaming query by dispatching all stages simultaneously.
     async fn execute_streaming_topology(
         &self,
-        query_id: QueryId,
-        dag: StageDag,
+        job: Job,
         cancel: CancellationToken,
     ) -> Result<(), VeinError> {
-        let order = dag.topological_order();
+        let order = job.topological_order();
 
         let executors = self.registry.available(Duration::from_secs(15)).await;
         if executors.is_empty() {
@@ -158,35 +178,31 @@ impl Scheduler {
         let mut join_set = JoinSet::new();
 
         for (i, stage_id) in order.into_iter().enumerate() {
-            let stage = dag
+            let stage = job
                 .get_stage(stage_id)
                 .ok_or_else(|| VeinError::internal("Invalid StageId in topological order"))?;
             let executor = &executors[i % executors.len()]; // Round-robin assign
 
-            let task = ExecuteTask {
-                mode: ExecutionMode::Streaming,
-                task_id: TaskId::new(),
-                query_id,
-                stage_id: stage.stage_id,
-                source: stage.source.clone(),
-                operators: stage.operators.clone(),
-                sink: stage.sink.clone(),
-            };
+            for task in stage.tasks() {
+                let execute_task = task
+                    .clone()
+                    .into_execute_task(job.query_id, stage.stage_id, ExecutionMode::Streaming);
 
-            // Dispatch task
-            self.dispatcher.dispatch(executor, task.clone()).await?;
+                // Dispatch task
+                self.dispatcher.dispatch(executor, execute_task.clone()).await?;
 
-            // Spawn a monitoring task for this continuous fragment
-            let dispatcher = self.dispatcher.clone();
-            let tid = task.task_id;
-            let c = cancel.clone();
+                // Spawn a monitoring task for this continuous fragment
+                let dispatcher = self.dispatcher.clone();
+                let tid = execute_task.task_id;
+                let c = cancel.clone();
 
-            join_set.spawn(async move {
-                tokio::select! {
-                    res = dispatcher.wait_for_completion(query_id, tid) => res,
-                    _ = c.cancelled() => Err(VeinError::Cancelled),
-                }
-            });
+                join_set.spawn(async move {
+                    tokio::select! {
+                        res = dispatcher.wait_for_completion(job.query_id, tid) => res,
+                        _ = c.cancelled() => Err(VeinError::Cancelled),
+                    }
+                });
+            }
         }
 
         // Wait for all fragments to either fail or get canceled

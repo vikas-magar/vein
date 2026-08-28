@@ -4,7 +4,7 @@ use common::Result;
 use std::sync::Arc;
 
 use optimizer::Optimizer;
-use orchestrator::traits::PhysicalPlanner;
+use physical::PhysicalPlanner;
 use parser::ast::query::QueryNode;
 use plan::display;
 use plan::LogicalPlan;
@@ -123,19 +123,16 @@ impl QueryEngine for DistributedCoordinator {
             return Ok(Bytes::from(text));
         }
 
-        // 3. PLAN: Lower the optimized logical plan into a distributed Physical DAG
-        let physical_dag = self.planner.create_physical_plan(optimized_plan)?;
+        // 3. PLAN: Lower the optimized logical plan into a distributed physical Job.
+        let job = self.planner.create_physical_plan(optimized_plan)?;
 
-        // 4. DISPATCH: The Scheduler breaks the DAG into tasks and dispatches them efficiently.
-        let output_stage = physical_dag.output_stage_id();
-        tracing::info!("Dispatched DAG with output stage {:?}", output_stage);
+        // 4. DISPATCH: The Scheduler breaks the Job into stages/tasks and dispatches them.
+        let output_stage = job.output_stage_id();
+        tracing::info!("Dispatched job with output stage {:?}", output_stage);
 
-        let query_id = common::identifiers::QueryId::new();
         let cancel_token = common::cancellation::CancellationToken::new();
 
-        self.scheduler
-            .execute(query_id, physical_dag, cancel_token)
-            .await?;
+        self.scheduler.execute(job, cancel_token).await?;
 
         // 5. RECEIVE: The Master node waits for the final DataTransport stream from the Executors.
         // TODO: Actually open the Arrow IPC stream receiver.
@@ -160,9 +157,9 @@ mod tests {
     use binder::testing::MockFunctionRegistry;
     use orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher;
     use orchestrator::ExecutorRegistry;
-    use orchestrator::planner::dag_planner::DagPhysicalPlanner;
     use orchestrator::Scheduler;
     use parser::Parser;
+    use physical::DagPhysicalPlanner;
     use std::time::Duration;
     use vcs::InMemoryCatalog;
 

@@ -1,14 +1,4 @@
-use crate::planner::dag::StageDag;
 use async_trait::async_trait;
-use common::Result;
-use plan::LogicalPlan;
-
-/// Abstraction for the Physical Planner.
-/// Responsible for lowering a bound Logical Plan into a distributed physical Execution DAG.
-pub trait PhysicalPlanner: Send + Sync {
-    /// Takes a Logical Plan and generates a distributed StageDag of tasks.
-    fn create_physical_plan(&self, logical_plan: LogicalPlan) -> Result<StageDag>;
-}
 
 use crate::executor::NodeInfo;
 use common::identifiers::{QueryId, TaskId};
