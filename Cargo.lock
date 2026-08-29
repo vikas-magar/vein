@@ -5655,11 +5655,12 @@ dependencies = [
 name = "vein"
 version = "0.1.0"
 dependencies = [
- "binder",
- "parser",
- "plan",
+ "bytes",
+ "common",
+ "s2n-quic",
  "tokio",
- "vcs",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

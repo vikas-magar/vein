@@ -1,44 +1,78 @@
-use binder::testing::MockFunctionRegistry;
-use binder::{LogicalBinder, QueryBinder};
-use parser::Parser;
-use plan::display;
-use std::sync::Arc;
-use vcs::InMemoryCatalog;
+use common::transport::build_quic_client;
+use s2n_quic::client::Connect;
+use std::net::SocketAddr;
+use tracing::{debug, info, warn};
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
+const MASTER_ADDR: &str = "127.0.0.1:8080";
+const CERT_PATH: &str = "certs/server.crt";
+const SERVER_NAME: &str = "localhost";
+const DEFAULT_QUERY: &str = "EXPLAIN FROM users |> WHERE age > 18 + 2 |> SELECT id, name, age";
 
 #[tokio::main]
-async fn main() {
-    let default_query = "FROM users |> SELECT id, name, age".to_string();
-    let query = std::env::args().nth(1).unwrap_or(default_query);
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
 
-    println!("Parsing query: {}", query);
+    let query = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_QUERY.to_string());
 
-    let mut parser = Parser::new(&query);
+    let master_addr: SocketAddr = MASTER_ADDR
+        .parse()
+        .map_err(|e| format!("Failed to parse Master address '{MASTER_ADDR}': {e}"))?;
 
-    match parser.parse_statement() {
-        Ok(statement) => {
-            println!("--- AST ---");
-            println!("{:#?}", statement);
+    info!(target: "vein_client", %master_addr, tls_sni = SERVER_NAME, "Connecting to Vein Master over QUIC");
+    debug!(target: "vein_client", cert_path = CERT_PATH, "Loading TLS certificate");
 
-            // 1. Setup the dummy catalog & functions (so the binder has something to validate against)
-            let catalog = Arc::new(InMemoryCatalog::new());
-            let functions = Arc::new(MockFunctionRegistry::new());
+    let client = build_quic_client(CERT_PATH)?;
+    let connect = Connect::new(master_addr).with_server_name(SERVER_NAME);
+    let mut connection = client
+        .connect(connect)
+        .await
+        .map_err(|e| format!("Failed to establish QUIC connection to Master at {master_addr}: {e}"))?;
 
-            // 2. Instantiate the Binder
-            let binder = QueryBinder::new(catalog, functions);
+    connection
+        .keep_alive(true)
+        .map_err(|e| format!("Failed to enable keep_alive on QUIC connection: {e}"))?;
 
-            // 3. Bind the AST into a LogicalPlan
-            match binder.bind(&statement).await {
-                Ok(logical_plan) => {
-                    println!("--- LOGICAL PLAN ---");
-                    println!("{}", display::format_plan(&logical_plan));
-                }
-                Err(e) => {
-                    println!("Binder Error: {:?}", e);
-                }
-            }
-        }
-        Err(e) => {
-            println!("Parser Error: {:?}", e);
-        }
+    debug!(target: "vein_client", "Opening bidirectional QUIC stream");
+    let stream = connection
+        .open_bidirectional_stream()
+        .await
+        .map_err(|e| format!("Failed to open bidirectional stream: {e}"))?;
+
+    let (mut recv, mut send) = stream.split();
+
+    info!(target: "vein_client", query = %query, bytes_len = query.len(), "Submitting query payload");
+    send.send(bytes::Bytes::copy_from_slice(query.as_bytes()))
+        .await
+        .map_err(|e| format!("Failed to send query bytes over QUIC: {e}"))?;
+
+    send.finish()
+        .map_err(|e| format!("Failed to finish send stream: {e}"))?;
+
+    debug!(target: "vein_client", "Awaiting response from Master");
+    let mut response_bytes = Vec::new();
+    while let Some(chunk) = recv
+        .receive()
+        .await
+        .map_err(|e| format!("Error receiving response chunk from Master: {e}"))?
+    {
+        debug!(target: "vein_client", chunk_size = chunk.len(), "Received chunk from Master");
+        response_bytes.extend_from_slice(&chunk);
     }
+
+    if response_bytes.is_empty() {
+        warn!(target: "vein_client", "Received empty response from Master");
+    } else {
+        let response_str = String::from_utf8_lossy(&response_bytes);
+        info!(target: "vein_client", total_bytes = response_bytes.len(), "Query response received successfully");
+        println!("{response_str}");
+    }
+
+    Ok(())
 }
