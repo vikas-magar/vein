@@ -43,7 +43,7 @@ impl PipelineNode<DataChunk> for CollectExecutor {
         let mut columns = Vec::with_capacity(chunk.vectors.len());
         for (i, vec) in chunk.vectors.iter().enumerate() {
             fields.push(Field::new(
-                &format!("col_{i}"),
+                format!("col_{i}"),
                 vec.data_type().clone(),
                 true,
             ));

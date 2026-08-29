@@ -49,7 +49,7 @@ impl IngestionBuffer {
         let mut entry = self
             .buffers
             .entry(path.to_string())
-            .or_insert_with(BytesMut::new);
+            .or_default();
         entry.extend_from_slice(chunk);
 
         self.total_memory_usage
@@ -77,7 +77,7 @@ impl IngestionBuffer {
                     let mut recovery_entry = self
                         .buffers
                         .entry(path.to_string())
-                        .or_insert_with(BytesMut::new);
+                        .or_default();
                     let mut new_buf =
                         BytesMut::with_capacity(data_to_flush.len() + recovery_entry.len());
                     new_buf.extend_from_slice(&data_to_flush);
@@ -135,7 +135,7 @@ impl IngestionBuffer {
                 let mut recovery_entry = self
                     .buffers
                     .entry(path.to_string())
-                    .or_insert_with(BytesMut::new);
+                    .or_default();
                 let mut new_buf =
                     BytesMut::with_capacity(data_to_flush.len() + recovery_entry.len());
                 new_buf.extend_from_slice(&data_to_flush);

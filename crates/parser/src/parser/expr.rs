@@ -164,7 +164,7 @@ impl<'a> Parser<'a> {
                         node: Expr::Subquery(Box::new(query)),
                     }]
                 } else {
-                    let items = self.parse_comma_separated(|p| p.parse_expr())?;
+                    let items = self.parse_comma_separated(super::Parser::parse_expr)?;
                     self.expect(TokenKind::RParen)?;
                     items
                 };
@@ -223,8 +223,7 @@ impl<'a> Parser<'a> {
                 })
             }
             _ => Err(ParseError::Unsupported(format!(
-                "unexpected postfix op: {:?}",
-                op
+                "unexpected postfix op: {op:?}"
             ))),
         };
         self.exit_recursive();
@@ -261,7 +260,7 @@ impl<'a> Parser<'a> {
                 // Drain every entered recursion level before returning, so the
                 // budget isn't leaked on the error path (the Parser is reusable
                 // across queries and a stale count would spuriously fail later).
-                for _ in ops.iter() {
+                for _ in &ops {
                     self.exit_recursive();
                 }
                 return Err(e);
@@ -407,7 +406,7 @@ impl<'a> Parser<'a> {
                 if text.starts_with("0x") || text.starts_with("0X") {
                     let val = i64::from_str_radix(&text[2..], 16).map_err(|_| {
                         ParseError::NumberParse {
-                            message: format!("invalid hex literal: {}", text),
+                            message: format!("invalid hex literal: {text}"),
                             span,
                         }
                     })?;
@@ -418,7 +417,7 @@ impl<'a> Parser<'a> {
                 } else if text.starts_with("0b") || text.starts_with("0B") {
                     let val = i64::from_str_radix(&text[2..], 2).map_err(|_| {
                         ParseError::NumberParse {
-                            message: format!("invalid binary literal: {}", text),
+                            message: format!("invalid binary literal: {text}"),
                             span,
                         }
                     })?;
@@ -428,12 +427,12 @@ impl<'a> Parser<'a> {
                     })
                 } else if text.contains('.') || text.contains('e') || text.contains('E') {
                     let val: f64 = text.parse().map_err(|_| ParseError::NumberParse {
-                        message: format!("invalid float literal: {}", text),
+                        message: format!("invalid float literal: {text}"),
                         span,
                     })?;
                     if !val.is_finite() {
                         return Err(ParseError::NumberParse {
-                            message: format!("float literal overflows f64: {}", text),
+                            message: format!("float literal overflows f64: {text}"),
                             span,
                         });
                     }
@@ -443,7 +442,7 @@ impl<'a> Parser<'a> {
                     })
                 } else {
                     let val: i64 = text.parse().map_err(|_| ParseError::NumberParse {
-                        message: format!("invalid integer literal: {}", text),
+                        message: format!("invalid integer literal: {text}"),
                         span,
                     })?;
                     Ok(SpannedExpr {
@@ -494,7 +493,7 @@ impl<'a> Parser<'a> {
                 // Handled by parse_unary, but if we reach here it's an error
                 let token = self.next_token()?;
                 Err(ParseError::Unexpected {
-                    token: format!("{:?}", peek_kind),
+                    token: format!("{peek_kind:?}"),
                     span: token.span,
                 })
             }
@@ -550,7 +549,7 @@ impl<'a> Parser<'a> {
         let token = self.expect_ident()?;
         let data_type: DataType<'_> = match token.parse() {
             Ok(dt) => dt,
-            Err(_) => return Err(ParseError::Unsupported(format!("unknown type: {}", token))),
+            Err(_) => return Err(ParseError::Unsupported(format!("unknown type: {token}"))),
         };
         self.expect(TokenKind::RParen)?;
         let span = expr.span;
@@ -570,7 +569,7 @@ impl<'a> Parser<'a> {
         let mut operands = Vec::new();
         let mut results = Vec::new();
         let mut else_result = None;
-        let mut end_span = None;
+        let end_span ;
 
         // Simple CASE: CASE expr WHEN ... THEN ... ELSE ... END
         // Searched CASE: CASE WHEN ... THEN ... ELSE ... END
@@ -611,7 +610,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 _ => {
-                    let token = self.peek().map_err(|e| e.clone())?;
+                    let token = self.peek().map_err(std::clone::Clone::clone)?;
                     return Err(ParseError::Expected {
                         expected: "WHEN, ELSE, or END".into(),
                         found: token.text.into(),
@@ -656,14 +655,13 @@ impl<'a> Parser<'a> {
                 });
             } else {
                 return Err(ParseError::Unsupported(format!(
-                    "* not allowed in {}",
-                    name
+                    "* not allowed in {name}"
                 )));
             }
         } else if let Ok(TokenKind::RParen) = self.peek().map(|t| &t.kind) {
             // No args
         } else {
-            args = self.parse_comma_separated(|p| p.parse_expr())?;
+            args = self.parse_comma_separated(super::Parser::parse_expr)?;
         }
 
         self.expect(TokenKind::RParen)?;
@@ -704,13 +702,13 @@ impl<'a> Parser<'a> {
         if let Ok(TokenKind::Partition) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
             self.expect(TokenKind::By)?;
-            partition_by = self.parse_comma_separated(|p| p.parse_expr())?;
+            partition_by = self.parse_comma_separated(super::Parser::parse_expr)?;
         }
 
         if let Ok(TokenKind::Order) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
             self.expect(TokenKind::By)?;
-            order_by = self.parse_comma_separated(|p| p.parse_order_by_expr())?;
+            order_by = self.parse_comma_separated(super::Parser::parse_order_by_expr)?;
         }
 
         let window_frame = self.parse_window_frame()?;
@@ -769,7 +767,7 @@ impl<'a> Parser<'a> {
                         expected: "PRECEDING or FOLLOWING".into(),
                         found: format!(
                             "{:?}",
-                            self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)
+                            self.peek().map_or(&TokenKind::EOF, |t| &t.kind)
                         ),
                         span: self.peek_span().unwrap_or_default(),
                     });
@@ -805,7 +803,7 @@ impl<'a> Parser<'a> {
                 expected: "PRECEDING or FOLLOWING".into(),
                 found: format!(
                     "{:?}",
-                    self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)
+                    self.peek().map_or(&TokenKind::EOF, |t| &t.kind)
                 ),
                 span: self.peek_span().unwrap_or_default(),
             }),
@@ -839,7 +837,7 @@ impl<'a> Parser<'a> {
 
     /// Parses the optional ASC/DESC and NULLS FIRST/LAST suffix shared by
     /// ORDER BY, window ORDER BY, and GROUP BY expressions.
-    /// Defaults follow DuckDB: ASC -> NULLS LAST, DESC -> NULLS FIRST.
+    /// Defaults follow `DuckDB`: ASC -> NULLS LAST, DESC -> NULLS FIRST.
     pub(crate) fn parse_order_suffix(
         &mut self,
         expr: SpannedExpr<'a>,
@@ -947,8 +945,7 @@ fn token_to_binary_op(kind: &TokenKind) -> Result<BinaryOp, ParseError> {
         TokenKind::And => Ok(BinaryOp::And),
         TokenKind::Or => Ok(BinaryOp::Or),
         _ => Err(ParseError::Unsupported(format!(
-            "unsupported binary operator: {:?}",
-            kind
+            "unsupported binary operator: {kind:?}"
         ))),
     }
 }
@@ -1031,7 +1028,7 @@ mod tests {
                     }
                 ));
             }
-            other => panic!("expected InList, got {:?}", other),
+            other => panic!("expected InList, got {other:?}"),
         }
     }
 
@@ -1101,10 +1098,10 @@ mod tests {
     fn test_deep_between_chain_hits_recursion_limit() {
         let mut input = String::from("1");
         for i in 2..=600 {
-            input.push_str(&format!(" BETWEEN {}", i));
+            input.push_str(&format!(" BETWEEN {i}"));
         }
         for i in 2..=600 {
-            input.push_str(&format!(" AND {}", i));
+            input.push_str(&format!(" AND {i}"));
         }
         let err = parse_expr(&input).expect_err("test should fail");
         assert!(matches!(err, ParseError::RecursionLimitExceeded { .. }));
@@ -1125,7 +1122,7 @@ mod tests {
                 assert!(results.iter().all(|r| r.span.start < r.span.end));
                 assert!(else_result.is_some());
             }
-            other => panic!("expected Case, got {:?}", other),
+            other => panic!("expected Case, got {other:?}"),
         }
     }
 
@@ -1151,7 +1148,7 @@ mod tests {
         let err = parse_expr("CASE WHEN x THEN y BLAH").expect_err("test should fail");
         match err {
             ParseError::Expected { found, .. } => assert_eq!(found, "BLAH"),
-            other => panic!("expected Expected, got {:?}", other),
+            other => panic!("expected Expected, got {other:?}"),
         }
     }
 

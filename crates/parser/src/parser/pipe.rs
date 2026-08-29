@@ -36,8 +36,8 @@ impl<'a> Parser<'a> {
             Ok(TokenKind::Call) => self.parse_pipe_call(),
             Ok(TokenKind::Assert) => self.parse_pipe_assert(),
             Ok(TokenKind::Write) => self.parse_pipe_write(),
-            Ok(TokenKind::Join) | Ok(TokenKind::Left) | Ok(TokenKind::Right)
-            | Ok(TokenKind::Inner) | Ok(TokenKind::Full) | Ok(TokenKind::Cross) => {
+            Ok(TokenKind::Join | TokenKind::Left | TokenKind::Right | TokenKind::Inner |
+TokenKind::Full | TokenKind::Cross) => {
                 self.parse_pipe_join()
             }
             Ok(TokenKind::TableSample) => self.parse_pipe_tablesample(),
@@ -46,14 +46,14 @@ impl<'a> Parser<'a> {
             Ok(TokenKind::With) => self.parse_pipe_with(),
             Ok(TokenKind::Fork) => self.parse_pipe_fork(),
             Ok(TokenKind::Tee) => self.parse_pipe_tee(),
-            Ok(TokenKind::Union) | Ok(TokenKind::Intersect) | Ok(TokenKind::Except) => {
+            Ok(TokenKind::Union | TokenKind::Intersect | TokenKind::Except) => {
                 self.parse_pipe_set_op()
             }
             _ => Err(super::ParseError::Expected {
                 expected: "pipe operator (SELECT, WHERE, AGGREGATE, etc.)".into(),
                 found: format!(
                     "{:?}",
-                    self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)
+                    self.peek().map_or(&TokenKind::EOF, |t| &t.kind)
                 ),
                 span: self.peek_span().unwrap_or_default(),
             }),
@@ -164,7 +164,7 @@ mod tests {
         let q = parse_query("FROM t |> RENAME old_name AS new_name").expect("test should succeed");
         if let PipeOperator::Rename { renames } = &q.pipes[0] {
             assert_eq!(renames.len(), 1);
-            assert_eq!(renames[0], ("old_name".into(), "new_name".into()));
+            assert_eq!(renames[0], ("old_name", "new_name"));
         } else {
             panic!("expected Rename");
         }

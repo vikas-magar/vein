@@ -9,6 +9,7 @@ use vcs::InMemoryCatalog;
 async fn main() {
     let default_query = "FROM users |> SELECT id, name, age".to_string();
     let query = std::env::args().nth(1).unwrap_or(default_query);
+
     println!("Parsing query: {}", query);
 
     let mut parser = Parser::new(&query);

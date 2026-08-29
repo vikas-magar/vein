@@ -63,7 +63,7 @@ mod tests {
         let q = parse_query("FROM t |> SELECT name AS full_name").expect("test should succeed");
         if let PipeOperator::Select { items } = &q.pipes[0] {
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].alias, Some("full_name".into()));
+            assert_eq!(items[0].alias, Some("full_name"));
         } else {
             panic!("expected Select");
         }

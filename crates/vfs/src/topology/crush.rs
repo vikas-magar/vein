@@ -96,7 +96,7 @@ mod tests {
         let h1 = hash_node_block("node1", "blockA");
         let h2 = hash_node_block("node1", "blockA");
         assert_eq!(h1, h2);
-        assert!(h1 >= 0.0 && h1 <= 1.0);
+        assert!((0.0..=1.0).contains(&h1));
     }
 
     #[test]

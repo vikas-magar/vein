@@ -94,7 +94,7 @@ mod tests {
         let q = parse_query("FROM t |> EXTEND salary * 2 AS bonus").expect("test should succeed");
         if let PipeOperator::Extend { items } = &q.pipes[0] {
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].alias, Some("bonus".into()));
+            assert_eq!(items[0].alias, Some("bonus"));
         } else {
             panic!("expected Extend");
         }

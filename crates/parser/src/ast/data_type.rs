@@ -88,7 +88,7 @@ pub enum IntervalField {
     DayToSecond,
 }
 
-impl<'a> std::str::FromStr for DataType<'a> {
+impl std::str::FromStr for DataType<'_> {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -110,7 +110,7 @@ impl<'a> std::str::FromStr for DataType<'a> {
                 fields: IntervalField::DayToSecond,
             }),
             "vector" => Ok(Self::Vector(0)), // Default 0 dimensions if parsed blindly from a raw string
-            _ => Err(format!("unknown data type: {}", s)),
+            _ => Err(format!("unknown data type: {s}")),
         }
     }
 }

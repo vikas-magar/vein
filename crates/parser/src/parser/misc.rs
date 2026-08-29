@@ -41,7 +41,7 @@ impl<'a> Parser<'a> {
         let value_column = self.expect_ident()?;
         self.expect(TokenKind::In)?;
         self.expect(TokenKind::LParen)?;
-        let values = self.parse_comma_separated(|p| p.parse_expr())?;
+        let values = self.parse_comma_separated(super::Parser::parse_expr)?;
         self.expect(TokenKind::RParen)?;
         Ok(crate::ast::pipe_op::PipeOperator::Pivot {
             aggregate,
@@ -66,7 +66,7 @@ impl<'a> Parser<'a> {
         let name_name = self.expect_ident()?;
         self.expect(TokenKind::In)?;
         self.expect(TokenKind::LParen)?;
-        let columns = self.parse_comma_separated(|p| p.expect_ident())?;
+        let columns = self.parse_comma_separated(super::Parser::expect_ident)?;
         self.expect(TokenKind::RParen)?;
         Ok(crate::ast::pipe_op::PipeOperator::Unpivot {
             value_name,

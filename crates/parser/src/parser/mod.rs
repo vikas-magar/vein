@@ -50,6 +50,7 @@ pub struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     /// Creates a parser over the given source text.
+    #[must_use]
     pub fn new(input: &'a str) -> Self {
         Self {
             lexer: Lexer::new(input),
@@ -63,6 +64,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Creates a parser over a pre-tokenized stream (test support).
+    #[must_use]
     pub fn from_tokens(tokens: Vec<SpannedToken<'a>>) -> Self {
         Self {
             lexer: Lexer::new(""),
@@ -76,6 +78,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Sets the maximum recursion depth for expression nesting.
+    #[must_use]
     pub fn with_recursion_limit(mut self, limit: usize) -> Self {
         self.recursion_limit = limit;
         self
@@ -136,10 +139,7 @@ impl<'a> Parser<'a> {
     /// Consumes a peeked error (if any), so a subsequent `peek()` advances to
     /// the next token instead of surfacing the same error again.
     fn take_peek_error(&mut self) -> Option<ParseError> {
-        match self.next_token() {
-            Err(e) => Some(e),
-            Ok(_) => None,
-        }
+        self.next_token().err()
     }
 
     fn expect(&mut self, kind: TokenKind) -> Result<SpannedToken<'a>, ParseError> {
@@ -148,7 +148,7 @@ impl<'a> Parser<'a> {
             Ok(token)
         } else {
             Err(ParseError::Expected {
-                expected: format!("{:?}", kind),
+                expected: format!("{kind:?}"),
                 found: format!("{:?}", token.kind),
                 span: token.span,
             })
@@ -196,9 +196,7 @@ impl<'a> Parser<'a> {
             _ => {
                 let span = self.peek_span().unwrap_or_default();
                 let found = self
-                    .peek()
-                    .map(|t| format!("{:?}", t.kind))
-                    .unwrap_or_else(|_| "EOF".into());
+                    .peek().map_or_else(|_| "EOF".into(), |t| format!("{:?}", t.kind));
                 Err(ParseError::Expected {
                     expected: "FROM".into(),
                     found,
@@ -218,7 +216,7 @@ impl<'a> Parser<'a> {
             Ok(TokenKind::EOF) => Ok(query),
             Ok(other) => Err(ParseError::Expected {
                 expected: "end of query".into(),
-                found: format!("{:?}", other),
+                found: format!("{other:?}"),
                 span: self.peek_span().unwrap_or_default(),
             }),
             Err(_) => Err(self.take_peek_error().expect("peeked error")),
@@ -261,7 +259,7 @@ impl<'a> Parser<'a> {
                 expected: "|>".into(),
                 found: format!(
                     "{:?}",
-                    self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)
+                    self.peek().map_or(&TokenKind::EOF, |t| &t.kind)
                 ),
                 span: self.peek_span().unwrap_or_default(),
             }),
@@ -269,7 +267,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_table_source(&mut self) -> Result<crate::ast::query::TableSource<'a>, ParseError> {
-        let peek_kind = self.peek().map(|t| t.kind).unwrap_or(TokenKind::EOF);
+        let peek_kind = self.peek().map_or(TokenKind::EOF, |t| t.kind);
         let mut source = match peek_kind {
             TokenKind::LParen => {
                 self.next_token()?; // consume '('
@@ -469,7 +467,7 @@ mod tests {
     fn test_moderate_subquery_nesting_succeeds() {
         let mut q = String::from("FROM t |> SELECT 1");
         for _ in 0..50 {
-            q = format!("FROM ({}) |> SELECT 1", q);
+            q = format!("FROM ({q}) |> SELECT 1");
         }
         parse_query(&q).expect("test should succeed");
     }
@@ -478,7 +476,7 @@ mod tests {
     fn test_deep_subquery_nesting_hits_recursion_limit() {
         let mut q = String::from("FROM t |> SELECT 1");
         for _ in 0..100_000 {
-            q = format!("FROM ({}) |> SELECT 1", q);
+            q = format!("FROM ({q}) |> SELECT 1");
         }
         let err = parse_query(&q).expect_err("test should fail");
         assert!(matches!(err, ParseError::RecursionLimitExceeded { .. }));
@@ -491,9 +489,9 @@ mod tests {
         // each FORK nests inside the previous one.
         let mut inner = String::from("|> WHERE x = 1");
         for _ in 0..100_000 {
-            inner = format!("|> FORK ( {} )", inner);
+            inner = format!("|> FORK ( {inner} )");
         }
-        let q = format!("FROM t {}", inner);
+        let q = format!("FROM t {inner}");
         let err = parse_query(&q).expect_err("test should fail");
         assert!(matches!(err, ParseError::RecursionLimitExceeded { .. }));
     }
@@ -502,9 +500,9 @@ mod tests {
     fn test_moderate_fork_nesting_succeeds() {
         let mut inner = String::from("|> WHERE x = 1");
         for _ in 0..50 {
-            inner = format!("|> FORK ( {} )", inner);
+            inner = format!("|> FORK ( {inner} )");
         }
-        let q = format!("FROM t {}", inner);
+        let q = format!("FROM t {inner}");
         parse_query(&q).expect("test should succeed");
     }
 

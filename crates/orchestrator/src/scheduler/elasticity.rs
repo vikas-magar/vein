@@ -28,7 +28,7 @@ impl ElasticityController {
     /// Updates the internal state when telemetry is received
     pub fn update_telemetry(&mut self, t: TaskTelemetry, now: u64) {
         self.active_tasks.insert(
-            t.task_id.clone(),
+            t.task_id,
             TaskStatus {
                 telemetry: t,
                 last_updated_at: now,
@@ -42,7 +42,7 @@ impl ElasticityController {
         self.active_tasks
             .iter()
             .filter(|(_, status)| status.telemetry.rows_processed_per_sec < 1000.0)
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect()
     }
 
@@ -65,13 +65,13 @@ mod tests {
         let slow_task = TaskId::new();
 
         let fast_telemetry = TaskTelemetry {
-            task_id: fast_task.clone(),
+            task_id: fast_task,
             total_subtasks_assigned: 100,
             subtasks_completed: 100,
             rows_processed_per_sec: 2000.0,
         };
         let slow_telemetry = TaskTelemetry {
-            task_id: slow_task.clone(),
+            task_id: slow_task,
             total_subtasks_assigned: 100,
             subtasks_completed: 10,
             rows_processed_per_sec: 500.0,

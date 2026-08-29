@@ -26,7 +26,7 @@ impl PipelineNode<DataChunk> for FilterExecutor {
         let mut arrays = Vec::with_capacity(chunk.vectors.len());
         for (i, vec) in chunk.vectors.iter().enumerate() {
             fields.push(arrow::datatypes::Field::new(
-                &format!("col_{}", i),
+                format!("col_{}", i),
                 vec.data_type().clone(),
                 true,
             ));
@@ -65,7 +65,7 @@ impl Transform<DataChunk> for FilterExecutor {}
 mod tests {
     use super::*;
     use crate::expr::{BinaryExpr, BinaryOperator, ColumnExpr, LiteralExpr, LiteralValue};
-    use arrow::array::{BooleanArray, Int64Array};
+    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -75,7 +75,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
 
         // Build Data: a = [10, 20, 30]
-        let batch = RecordBatch::try_new(
+        let _batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
         )

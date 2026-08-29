@@ -200,21 +200,21 @@ mod tests {
             span: Default::default(),
             node: Expr::Column {
                 table: None,
-                column: "c".into(),
+                column: "c",
             },
         };
         let b = SpannedExpr {
             span: Default::default(),
             node: Expr::Column {
                 table: None,
-                column: "b".into(),
+                column: "b",
             },
         };
         let a = SpannedExpr {
             span: Default::default(),
             node: Expr::Column {
                 table: None,
-                column: "a".into(),
+                column: "a",
             },
         };
         let ab = SpannedExpr {
@@ -252,14 +252,14 @@ mod tests {
             span: Default::default(),
             node: Expr::Column {
                 table: None,
-                column: "x".into(),
+                column: "x",
             },
         };
         let y = SpannedExpr {
             span: Default::default(),
             node: Expr::Column {
                 table: None,
-                column: "y".into(),
+                column: "y",
             },
         };
         let one = SpannedExpr {

@@ -28,7 +28,7 @@ impl fmt::Display for TokenKind {
             Self::Gt => write!(f, ">"),
             Self::Leq => write!(f, "<="),
             Self::Geq => write!(f, ">="),
-            other => write!(f, "{:?}", other),
+            other => write!(f, "{other:?}"),
         }
     }
 }

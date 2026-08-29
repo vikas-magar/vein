@@ -157,8 +157,8 @@ mod tests {
         let missing = tree1.diff(&tree2);
         assert_eq!(missing.len(), 2);
         // diff() makes no ordering guarantee — use set-membership assertions.
-        assert!(missing.contains(&*blake3::hash(b"block2").as_bytes()));
-        assert!(missing.contains(&*blake3::hash(b"block3").as_bytes()));
+        assert!(missing.contains(blake3::hash(b"block2").as_bytes()));
+        assert!(missing.contains(blake3::hash(b"block3").as_bytes()));
     }
 
     #[tokio::test]

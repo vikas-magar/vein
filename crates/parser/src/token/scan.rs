@@ -2,6 +2,7 @@ use crate::token::TokenKind;
 
 /// Maps a lexed identifier to a keyword token kind, or `None` if it is not a
 /// reserved word (in which case the identifier is a plain `Ident`).
+#[must_use]
 pub fn keyword(text: &str) -> Option<TokenKind> {
     match text.to_ascii_lowercase().as_str() {
         "select" => Some(TokenKind::Select),

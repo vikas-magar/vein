@@ -187,9 +187,9 @@ impl BlockManager for MmapBlockManager {
         let mut read_dir = tokio::fs::read_dir(&config.local_cache_dir).await?;
         while let Ok(Some(entry)) = read_dir.next_entry().await {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("bin") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Ok(block_id) = stem.parse::<u64>() {
+            if path.extension().and_then(|s| s.to_str()) == Some("bin")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && let Ok(block_id) = stem.parse::<u64>() {
                         // Skip the initial block we just created
                         if block_id != initial_block_id {
                             tracing::info!("Re-queuing orphaned block {} for upload", block_id);
@@ -200,8 +200,6 @@ impl BlockManager for MmapBlockManager {
                             let _ = upload_tx.send(sealed).await;
                         }
                     }
-                }
-            }
         }
 
         let uploader = Arc::new(ZeroCopySinglePutUploader::new(storage.clone()));
@@ -327,11 +325,9 @@ impl BlockManager for MmapBlockManager {
                 .seek(std::io::SeekFrom::Start(extent.offset))
                 .await
                 .is_ok()
-            {
-                if file.read_exact(&mut buf).await.is_ok() {
+                && file.read_exact(&mut buf).await.is_ok() {
                     return Ok(buf);
                 }
-            }
         }
 
         // Cache Miss: Fetch from infinite cloud backend

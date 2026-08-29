@@ -98,14 +98,13 @@ impl ArchipelagoState {
 
     /// Internal helper to check quorum and fire oneshot callback upon commit.
     fn check_quorum(&mut self, pid: &ProposalId) {
-        if let Some(votes) = self.votes.get(pid) {
-            if votes.len() >= self.fast_path_quorum() {
+        if let Some(votes) = self.votes.get(pid)
+            && votes.len() >= self.fast_path_quorum() {
                 self.status.insert(pid.clone(), ProposalState::Committed);
                 if let Some(tx) = self.callbacks.remove(pid) {
                     let _ = tx.send(()); // best-effort; receiver may have timed out
                 }
             }
-        }
     }
 
     /// Proposes a new payload for consensus.

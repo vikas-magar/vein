@@ -273,8 +273,7 @@ mod tests {
             StageId::from_raw(2),
             ExecutionMode::Batch,
         )
-        .err()
-        .expect("cycle must be rejected");
+        .expect_err("cycle must be rejected");
         assert!(err.to_string().contains("cycle"), "got {err}");
     }
 
@@ -300,8 +299,7 @@ mod tests {
             StageId::from_raw(1),
             ExecutionMode::Batch,
         )
-        .err()
-        .expect("dangling edge must be rejected");
+        .expect_err("dangling edge must be rejected");
         assert!(err.to_string().contains("unknown"), "got {err}");
     }
 

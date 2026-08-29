@@ -10,6 +10,12 @@ use error::VeinError;
 /// Executor node via a highly concurrent, multiplexed s2n-quic stream.
 pub struct QuicTaskDispatcher;
 
+impl Default for QuicTaskDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl QuicTaskDispatcher {
     pub fn new() -> Self {
         Self {}

@@ -12,7 +12,7 @@ impl<'a> Parser<'a> {
         if let Ok(TokenKind::RParen) = self.peek().map(|t| &t.kind) {
             // no args
         } else {
-            args = self.parse_comma_separated(|p| p.parse_expr())?;
+            args = self.parse_comma_separated(super::Parser::parse_expr)?;
         }
         self.expect(TokenKind::RParen)?;
         Ok(crate::ast::pipe_op::PipeOperator::Call { name, args })
@@ -112,8 +112,8 @@ mod tests {
         if let PipeOperator::Write { target } = &q.pipes[0] {
             assert_eq!(target.table, "s3://bucket");
             assert_eq!(target.options.len(), 2);
-            assert_eq!(target.options[0], ("mode".into(), "append".into()));
-            assert_eq!(target.options[1], ("format".into(), "parquet".into()));
+            assert_eq!(target.options[0], ("mode", "append"));
+            assert_eq!(target.options[1], ("format", "parquet"));
         } else {
             panic!("expected Write");
         }

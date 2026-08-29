@@ -19,9 +19,9 @@ enum Commands {
     Master {
         #[arg(short, long, default_value = "0.0.0.0:8080")]
         bind: String,
-        #[arg(short, long, default_value = "/certs/server.crt")]
+        #[arg(short, long, default_value = "/Users/anvi/Next/vein/certs/server.crt")]
         cert: String,
-        #[arg(short, long, default_value = "/certs/server.key")]
+        #[arg(short, long, default_value = "/Users/anvi/Next/vein/certs/server.key")]
         key: String,
     },
     /// Start an Executor node (Compute Daemon)
@@ -30,9 +30,9 @@ enum Commands {
         bind: String,
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         master: String,
-        #[arg(short, long, default_value = "/certs/server.crt")]
+        #[arg(short, long, default_value = "/Users/anvi/Next/vein/certs/server.crt")]
         cert: String,
-        #[arg(short, long, default_value = "/certs/server.key")]
+        #[arg(short, long, default_value = "/Users/anvi/Next/vein/certs/server.key")]
         key: String,
     },
     /// Run a full local cluster (Master + Executor) in a single process
@@ -73,12 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let coordinator = Arc::new(
                 engine::DistributedCoordinator::builder()
-                    .with_binder(Arc::new(
-                        binder::QueryBinder::new(
-                            Arc::new(vcs::InMemoryCatalog::new()),
-                            Arc::new(binder::testing::MockFunctionRegistry::new()),
-                        ),
-                    ))
+                    .with_binder(Arc::new(binder::QueryBinder::new(
+                        Arc::new(vcs::InMemoryCatalog::new()),
+                        Arc::new(binder::testing::MockFunctionRegistry::new()),
+                    )))
                     .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
                     .with_planner(Arc::new(physical::DagPhysicalPlanner::new()))
                     .with_scheduler(scheduler)

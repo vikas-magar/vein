@@ -266,7 +266,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         name: &str,
         args: &[SpannedExpr<'_>],
         distinct: bool,
-        span: parser::token::Span,
+        _span: parser::token::Span,
     ) -> Result<LogicalExpr> {
         let signature = self.context.functions.resolve(name)?;
 

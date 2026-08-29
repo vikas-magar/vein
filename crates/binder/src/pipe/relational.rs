@@ -262,7 +262,7 @@ pub async fn bind_join<'a>(
             }
             let on = match pred_parts.len() {
                 1 => pred_parts.pop(),
-                n => Some(pred_parts.into_iter().reduce(|l, r| LogicalExpr::BinaryOp {
+                _n => Some(pred_parts.into_iter().reduce(|l, r| LogicalExpr::BinaryOp {
                     left: Box::new(l),
                     op: BinaryOp::And,
                     right: Box::new(r),

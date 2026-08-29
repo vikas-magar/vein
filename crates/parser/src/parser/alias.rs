@@ -29,7 +29,7 @@ mod tests {
         assert_eq!(
             q.pipes[0],
             PipeOperator::As {
-                alias: "my_view".into()
+                alias: "my_view"
             }
         );
     }

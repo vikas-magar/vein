@@ -189,8 +189,8 @@ mod tests {
         let result = expr.evaluate(&batch).unwrap();
         let result_bool = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(result_bool.value(0), false);
-        assert_eq!(result_bool.value(1), false);
-        assert_eq!(result_bool.value(2), true);
+        assert!(!result_bool.value(0));
+        assert!(!result_bool.value(1));
+        assert!(result_bool.value(2));
     }
 }

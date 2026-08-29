@@ -40,7 +40,7 @@ impl<'a> Parser<'a> {
                     expected: "JOIN or join type (LEFT, RIGHT, INNER, FULL, CROSS)".into(),
                     found: format!(
                         "{:?}",
-                        self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)
+                        self.peek().map_or(&TokenKind::EOF, |t| &t.kind)
                     ),
                     span: self.peek_span().unwrap_or_default(),
                 });
@@ -56,7 +56,7 @@ impl<'a> Parser<'a> {
         } else if let Ok(TokenKind::Using) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
             self.expect(TokenKind::LParen)?;
-            let using = self.parse_comma_separated(|p| p.expect_ident())?;
+            let using = self.parse_comma_separated(super::Parser::expect_ident)?;
             self.expect(TokenKind::RParen)?;
             (None, using)
         } else if join_type == crate::ast::pipe_op::JoinType::Cross {
@@ -66,7 +66,7 @@ impl<'a> Parser<'a> {
                 expected: "ON or USING".into(),
                 found: format!(
                     "{:?}",
-                    self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)
+                    self.peek().map_or(&TokenKind::EOF, |t| &t.kind)
                 ),
                 span: self.peek_span().unwrap_or_default(),
             });

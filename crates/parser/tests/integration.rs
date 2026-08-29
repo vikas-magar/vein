@@ -11,11 +11,11 @@ fn parse_query(input: &str) -> Result<Query<'_>, ParseError> {
 }
 
 fn parse_expr(input: &str) -> Result<parser::ast::expr::SpannedExpr<'_>, ParseError> {
-    let wrapped = Box::leak(format!("FROM t |> SELECT {}", input).into_boxed_str());
+    let wrapped = Box::leak(format!("FROM t |> SELECT {input}").into_boxed_str());
     let query = parse_query(wrapped)?;
     match query.pipes.into_iter().next() {
         Some(PipeOperator::Select { mut items }) => Ok(items.remove(0).expr),
-        Some(other) => panic!("expected Select, got {:?}", other),
+        Some(other) => panic!("expected Select, got {other:?}"),
         None => panic!("expected at least one pipe operator"),
     }
 }
@@ -31,8 +31,8 @@ fn test_object_store_source() {
     {
         assert_eq!(*url, "s3://bucket/data.csv");
         assert_eq!(inline_options.len(), 2);
-        assert_eq!(inline_options[0], ("access_key".into(), "abc".into()));
-        assert_eq!(inline_options[1], ("region".into(), "us-east-1".into()));
+        assert_eq!(inline_options[0], ("access_key", "abc"));
+        assert_eq!(inline_options[1], ("region", "us-east-1"));
         assert_eq!(alias.as_deref(), Some("t"));
     } else {
         panic!("expected ObjectStore");
@@ -84,7 +84,7 @@ fn test_aggregate() {
     let q = parse_query("FROM t |> AGGREGATE count(*) AS cnt, sum(salary)").unwrap();
     if let PipeOperator::Aggregate { aggregates, .. } = &q.pipes[0] {
         assert_eq!(aggregates.len(), 2);
-        assert_eq!(aggregates[0].alias, Some("cnt".into()));
+        assert_eq!(aggregates[0].alias, Some("cnt"));
         assert!(aggregates[1].alias.is_none());
     } else {
         panic!("expected Aggregate");

@@ -1,5 +1,4 @@
 use crate::ast::pipe_op::PipeOperator;
-use crate::token::Span;
 use std::borrow::Cow;
 
 /// A parsed top-level statement: either a plain query or an `EXPLAIN`-wrapped

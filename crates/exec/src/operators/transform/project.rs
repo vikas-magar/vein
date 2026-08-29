@@ -32,7 +32,7 @@ impl PipelineNode<DataChunk> for ProjectExecutor {
         let mut arrays = Vec::with_capacity(chunk.vectors.len());
         for (i, vec) in chunk.vectors.iter().enumerate() {
             fields.push(arrow::datatypes::Field::new(
-                &format!("col_{}", i),
+                format!("col_{}", i),
                 vec.data_type().clone(),
                 true,
             ));
@@ -77,7 +77,7 @@ mod tests {
         let in_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
 
         // Data: a = [10, 20]
-        let batch = RecordBatch::try_new(
+        let _batch = RecordBatch::try_new(
             in_schema.clone(),
             vec![Arc::new(Int64Array::from(vec![10, 20]))],
         )

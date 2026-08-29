@@ -23,7 +23,7 @@ impl<'a> Parser<'a> {
                     expected: "UNION, INTERSECT, or EXCEPT".into(),
                     found: format!(
                         "{:?}",
-                        self.peek().map(|t| &t.kind).unwrap_or(&TokenKind::EOF)
+                        self.peek().map_or(&TokenKind::EOF, |t| &t.kind)
                     ),
                     span: self.peek_span().unwrap_or_default(),
                 });

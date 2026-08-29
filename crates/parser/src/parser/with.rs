@@ -11,7 +11,7 @@ impl<'a> Parser<'a> {
             let alias = self.expect_ident()?;
             let columns = if let Ok(TokenKind::LParen) = self.peek().map(|t| &t.kind) {
                 self.next_token()?;
-                let cols = self.parse_comma_separated(|p| p.expect_ident())?;
+                let cols = self.parse_comma_separated(super::Parser::expect_ident)?;
                 self.expect(TokenKind::RParen)?;
                 Some(cols)
             } else {

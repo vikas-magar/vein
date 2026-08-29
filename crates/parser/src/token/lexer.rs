@@ -18,6 +18,7 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     /// Creates a lexer over the given source text.
+    #[must_use]
     pub fn new(input: &'a str) -> Self {
         Self {
             input,
@@ -446,7 +447,7 @@ impl<'a> Iterator for Lexer<'a> {
                 }
                 _ => {
                     self.advance();
-                    Err(self.make_error(start, format!("unexpected character '{}'", ch)))
+                    Err(self.make_error(start, format!("unexpected character '{ch}'")))
                 }
             });
         }

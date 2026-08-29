@@ -95,7 +95,7 @@ impl ExecutorRegistry {
             .collect();
 
         // Sort by load (least loaded first). Simple heuristic based on active tasks.
-        nodes.sort_by(|a, b| a.load.active_tasks.cmp(&b.load.active_tasks));
+        nodes.sort_by_key(|a| a.load.active_tasks);
         nodes
     }
 }

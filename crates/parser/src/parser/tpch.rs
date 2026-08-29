@@ -311,8 +311,8 @@ mod tests {
                 "All 8 aggregate functions should be in aggregates"
             );
 
-            assert_eq!(aggregates[0].alias.as_deref(), Some("sum_qty"));
-            assert_eq!(aggregates[7].alias.as_deref(), Some("count_order"));
+            assert_eq!(aggregates[0].alias, Some("sum_qty"));
+            assert_eq!(aggregates[7].alias, Some("count_order"));
         }
     }
 }

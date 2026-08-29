@@ -86,7 +86,7 @@ mod tests {
     use crate::ast::pipe_op::PipeOperator;
     use crate::parser::Parser;
 
-    fn parse_aggregate(input: &str) -> PipeOperator {
+    fn parse_aggregate(input: &str) -> PipeOperator<'_> {
         let mut parser = Parser::new(input);
         parser.parse_pipe_aggregate().expect("test should succeed")
     }
@@ -101,8 +101,8 @@ mod tests {
         {
             assert!(group_by.is_empty(), "group_by should be empty");
             assert_eq!(aggregates.len(), 2);
-            assert_eq!(aggregates[0].alias.as_deref(), Some("s"));
-            assert_eq!(aggregates[1].alias.as_deref(), None);
+            assert_eq!(aggregates[0].alias, Some("s"));
+            assert_eq!(aggregates[1].alias, None);
         } else {
             panic!("Expected Aggregate");
         }
@@ -117,12 +117,12 @@ mod tests {
         } = op
         {
             assert_eq!(aggregates.len(), 1);
-            assert_eq!(aggregates[0].alias.as_deref(), Some("s"));
+            assert_eq!(aggregates[0].alias, Some("s"));
 
             assert_eq!(group_by.len(), 2, "Should have 2 group_by expressions");
             // y AS year is an alias expression
             assert!(
-                matches!(group_by[0].expr.node, crate::ast::expr::Expr::Alias { ref alias, .. } if *alias == "year")
+                matches!(group_by[0].expr.node, crate::ast::expr::Expr::Alias { alias, .. } if alias == "year")
             );
         } else {
             panic!("Expected Aggregate");

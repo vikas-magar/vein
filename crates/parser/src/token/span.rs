@@ -16,6 +16,7 @@ pub struct Span {
 
 impl Span {
     /// Creates a span covering `[start, end)` at the given position.
+    #[must_use]
     pub fn new(start: usize, end: usize, line: usize, column: usize) -> Self {
         Self {
             start,
@@ -26,6 +27,7 @@ impl Span {
     }
 
     /// Returns the smallest span containing both `self` and `other`.
+    #[must_use]
     pub fn union(self, other: Self) -> Self {
         let start = self.start.min(other.start);
         let end = self.end.max(other.end);
