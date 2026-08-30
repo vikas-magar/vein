@@ -5657,6 +5657,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "common",
+ "rkyv",
  "s2n-quic",
  "tokio",
  "tracing",

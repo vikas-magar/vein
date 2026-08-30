@@ -1,13 +1,14 @@
+use common::protocol::{ArchivedProtocolResponse, ProtocolRequest};
 use common::transport::build_quic_client;
 use s2n_quic::client::Connect;
 use std::net::SocketAddr;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 const MASTER_ADDR: &str = "127.0.0.1:8080";
 const CERT_PATH: &str = "certs/server.crt";
 const SERVER_NAME: &str = "localhost";
-const DEFAULT_QUERY: &str = "EXPLAIN FROM users |> WHERE age > 18 + 2 |> SELECT id, name, age";
+const DEFAULT_QUERY: &str = "FROM users |> WHERE age > 18 + 2 |> SELECT id, name, age";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,15 +48,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (mut recv, mut send) = stream.split();
 
-    info!(target: "vein_client", query = %query, bytes_len = query.len(), "Submitting query payload");
-    send.send(bytes::Bytes::copy_from_slice(query.as_bytes()))
+    let request = ProtocolRequest::ExecuteSql { sql: query.clone() };
+    debug!(target: "vein_client", "Serializing ProtocolRequest via rkyv");
+    let req_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request)
+        .map_err(|e| format!("Failed to serialize ProtocolRequest via rkyv: {e}"))?;
+
+    info!(target: "vein_client", query = %query, bytes_len = req_bytes.len(), "Submitting rkyv query payload");
+    send.send(bytes::Bytes::from(req_bytes.into_vec()))
         .await
         .map_err(|e| format!("Failed to send query bytes over QUIC: {e}"))?;
 
     send.finish()
         .map_err(|e| format!("Failed to finish send stream: {e}"))?;
 
-    debug!(target: "vein_client", "Awaiting response from Master");
+    debug!(target: "vein_client", "Awaiting ProtocolResponse from Master");
     let mut response_bytes = Vec::new();
     while let Some(chunk) = recv
         .receive()
@@ -68,10 +74,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if response_bytes.is_empty() {
         warn!(target: "vein_client", "Received empty response from Master");
-    } else {
-        let response_str = String::from_utf8_lossy(&response_bytes);
-        info!(target: "vein_client", total_bytes = response_bytes.len(), "Query response received successfully");
-        println!("{response_str}");
+        return Ok(());
+    }
+
+    debug!(target: "vein_client", total_bytes = response_bytes.len(), "Accessing ProtocolResponse zero-copy via rkyv");
+    let response = rkyv::access::<ArchivedProtocolResponse, rkyv::rancor::Error>(&response_bytes)
+        .map_err(|e| format!("Failed to access ProtocolResponse via rkyv: {e}"))?;
+
+    match response {
+        ArchivedProtocolResponse::Plan { text } => {
+            info!(target: "vein_client", "Query plan response received successfully");
+            println!("{text}");
+        }
+        ArchivedProtocolResponse::Data { batch } => {
+            info!(target: "vein_client", batch_bytes = batch.len(), "Data batch response received successfully");
+        }
+        ArchivedProtocolResponse::QueryCompleted { row_count } => {
+            info!(target: "vein_client", row_count = row_count.to_native(), "Query execution finished successfully");
+        }
+        ArchivedProtocolResponse::QuerySubmitted { query_id } => {
+            info!(target: "vein_client", %query_id, "Query submitted successfully");
+        }
+        ArchivedProtocolResponse::QueryCancelled { query_id } => {
+            info!(target: "vein_client", %query_id, "Query cancelled successfully");
+        }
+        ArchivedProtocolResponse::Error { message } => {
+            error!(target: "vein_client", %message, "Master returned an error");
+            eprintln!("Error: {message}");
+        }
     }
 
     Ok(())

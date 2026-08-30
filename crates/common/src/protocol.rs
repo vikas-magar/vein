@@ -477,6 +477,11 @@ pub enum ProtocolResponse {
         /// The assigned query ID.
         query_id: QueryId,
     },
+    /// A text plan response (e.g. from EXPLAIN).
+    Plan {
+        /// Rendered execution plan text.
+        text: String,
+    },
     /// A chunk of result data (Arrow IPC).
     Data {
         /// Serialized Arrow IPC batch.
@@ -613,5 +618,15 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: ProtocolResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, ProtocolResponse::QuerySubmitted { .. }));
+
+        let plan_resp = ProtocolResponse::Plan {
+            text: "Explain Plan".to_string(),
+        };
+        let json_plan = serde_json::to_string(&plan_resp).unwrap();
+        let back_plan: ProtocolResponse = serde_json::from_str(&json_plan).unwrap();
+        match back_plan {
+            ProtocolResponse::Plan { text } => assert_eq!(text, "Explain Plan"),
+            _ => panic!("wrong variant"),
+        }
     }
 }

@@ -75,7 +75,7 @@ impl MasterDaemon {
                             }
                         };
 
-                        // 1. Read query string from client stream, capping the
+                        // 1. Read rkyv payload from client stream, capping the
                         //    total payload size to avoid unbounded buffering.
                         let mut buf = Vec::new();
                         while let Ok(Some(chunk)) = stream.receive().await {
@@ -89,76 +89,89 @@ impl MasterDaemon {
                                     payload_bytes = buf.len(),
                                     "Query payload exceeds maximum allowed size; rejecting"
                                 );
-                                let _ = stream
-                                    .send(bytes::Bytes::from("ERROR: query payload too large"))
-                                    .await;
+                                let err_resp = common::protocol::ProtocolResponse::Error {
+                                    message: "Query payload exceeds maximum allowed size".to_string(),
+                                };
+                                if let Ok(err_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&err_resp) {
+                                    let _ = stream.send(bytes::Bytes::from(err_bytes.into_vec())).await;
+                                }
                                 return;
                             }
                         }
 
-                        // 2. Decode the payload; on invalid UTF-8 respond with an
-                        //    explicit error instead of silently dropping the request.
-                        let query_string = match String::from_utf8(buf) {
-                            Ok(qs) => qs,
-                            Err(_) => {
-                                warn!(target: "vein_master", "Received query payload is not valid UTF-8");
-                                let _ = stream
-                                    .send(bytes::Bytes::from(
-                                        "ERROR: query payload was not valid UTF-8",
-                                    ))
-                                    .await;
+                        // 2. Zero-copy access the typed ProtocolRequest via rkyv
+                        let request = match rkyv::access::<common::protocol::ArchivedProtocolRequest, rkyv::rancor::Error>(&buf) {
+                            Ok(req) => req,
+                            Err(e) => {
+                                warn!(target: "vein_master", error = %e, "Failed to decode ProtocolRequest from client");
+                                let err_resp = common::protocol::ProtocolResponse::Error {
+                                    message: format!("Malformed ProtocolRequest payload: {e}"),
+                                };
+                                if let Ok(err_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&err_resp) {
+                                    let _ = stream.send(bytes::Bytes::from(err_bytes.into_vec())).await;
+                                }
                                 return;
                             }
                         };
 
-                        // 3. Dispatch to the completely abstracted QueryEngine
-                        info!(target: "vein_master", query = %query_string, "Processing query statement");
-                        let mut parser = parser::Parser::new(&query_string);
-                        match parser.parse_statement() {
-                            Ok(statement) => {
-                                match engine.submit_query(statement).await {
-                                    Ok(result_bytes) => {
-                                        info!(
-                                            target: "vein_master",
-                                            result_bytes = result_bytes.len(),
-                                            "Query completed successfully; streaming result to client"
-                                        );
-                                        // 4. Stream Arrow IPC / text result back to the client
-                                        if let Err(err) = stream.send(result_bytes).await {
-                                            warn!(
-                                                target: "vein_master",
-                                                error = %err,
-                                                "Failed to send query result to client"
-                                            );
+                        // 3. Process the typed request & produce a typed ProtocolResponse
+                        let response = match request {
+                            common::protocol::ArchivedProtocolRequest::ExecuteSql { sql } => {
+                                let sql_str = sql.as_str();
+                                info!(target: "vein_master", query = %sql_str, "Processing ExecuteSql request");
+                                let mut parser = parser::Parser::new(sql_str);
+                                match parser.parse_statement() {
+                                    Ok(statement) => match engine.submit_query(statement).await {
+                                        Ok(result_bytes) => {
+                                            if let Ok(text) = String::from_utf8(result_bytes.to_vec()) {
+                                                common::protocol::ProtocolResponse::Plan { text }
+                                            } else {
+                                                common::protocol::ProtocolResponse::Data {
+                                                    batch: result_bytes.to_vec(),
+                                                }
+                                            }
                                         }
-                                    }
+                                        Err(e) => {
+                                            error!(target: "vein_master", error = %e, "Query execution failed");
+                                            common::protocol::ProtocolResponse::Error {
+                                                message: e.to_string(),
+                                            }
+                                        }
+                                    },
                                     Err(e) => {
-                                        error!(target: "vein_master", error = %e, "Query execution failed");
-                                        if let Err(err) = stream
-                                            .send(bytes::Bytes::from(format!("ERROR: {}", e)))
-                                            .await
-                                        {
-                                            warn!(
-                                                target: "vein_master",
-                                                error = %err,
-                                                "Failed to send query error payload to client"
-                                            );
+                                        error!(target: "vein_master", error = ?e, "Query parsing failed");
+                                        common::protocol::ProtocolResponse::Error {
+                                            message: format!("Parse error: {e:?}"),
                                         }
                                     }
                                 }
                             }
-                            Err(e) => {
-                                error!(target: "vein_master", error = ?e, "Query parsing failed");
-                                if let Err(err) = stream
-                                    .send(bytes::Bytes::from(format!("PARSE ERROR: {:?}", e)))
-                                    .await
-                                {
+                            common::protocol::ArchivedProtocolRequest::CancelQuery { query_id } => {
+                                info!(target: "vein_master", %query_id, "Received CancelQuery request");
+                                common::protocol::ProtocolResponse::QueryCancelled {
+                                    query_id: common::identifiers::QueryId::from_raw(query_id.0.to_native()),
+                                }
+                            }
+                        };
+
+                        // 4. Serialize response via rkyv and stream back to client
+                        match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
+                            Ok(response_bytes) => {
+                                info!(
+                                    target: "vein_master",
+                                    bytes_len = response_bytes.len(),
+                                    "Streaming rkyv ProtocolResponse back to client"
+                                );
+                                if let Err(err) = stream.send(bytes::Bytes::from(response_bytes.into_vec())).await {
                                     warn!(
                                         target: "vein_master",
                                         error = %err,
-                                        "Failed to send parse error payload to client"
+                                        "Failed to send ProtocolResponse to client"
                                     );
                                 }
+                            }
+                            Err(e) => {
+                                error!(target: "vein_master", error = %e, "Failed to serialize ProtocolResponse via rkyv");
                             }
                         }
                     });
