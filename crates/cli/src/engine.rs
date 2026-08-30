@@ -105,13 +105,14 @@ impl DistributedCoordinatorBuilder {
 #[async_trait]
 impl QueryEngine for DistributedCoordinator {
     async fn submit_query<'a>(&self, node: QueryNode<'a>) -> Result<Bytes> {
-        // 1. BIND: Convert raw SQL AST to a Semantic Logical Plan
-        let _query_id_str = format!("{:?}", node); // Simplified for telemetry
         let start_time = std::time::Instant::now();
 
+        // 1. BIND: Convert raw SQL AST to a Semantic Logical Plan
+        tracing::debug!(target: "vein_coordinator", "Binding SQL AST to semantic logical plan");
         let logical_plan = self.binder.bind(&node).await?;
 
         // 2. OPTIMIZE: Apply rule-based rewrites (constant folding, ...)
+        tracing::debug!(target: "vein_coordinator", "Applying rule-based plan optimizations");
         let optimized_plan = self.optimizer.optimize(logical_plan)?;
 
         // 2.5 EXPLAIN: render the optimized plan and return it directly —
@@ -119,16 +120,18 @@ impl QueryEngine for DistributedCoordinator {
         //             trailing newline.
         if let LogicalPlan::Explain { .. } = &optimized_plan {
             let text = display::format_plan(&optimized_plan);
-            tracing::debug!("EXPLAIN rendered plan:\n{text}");
+            tracing::info!(target: "vein_coordinator", "EXPLAIN statement evaluated; returning rendered plan");
+            tracing::debug!(target: "vein_coordinator", "Rendered plan:\n{text}");
             return Ok(Bytes::from(text));
         }
 
         // 3. PLAN: Lower the optimized logical plan into a distributed physical Job.
+        tracing::debug!(target: "vein_coordinator", "Lowering optimized logical plan to physical DAG");
         let job = self.planner.create_physical_plan(optimized_plan)?;
 
         // 4. DISPATCH: The Scheduler breaks the Job into stages/tasks and dispatches them.
         let output_stage = job.output_stage_id();
-        tracing::info!("Dispatched job with output stage {:?}", output_stage);
+        tracing::info!(target: "vein_coordinator", ?output_stage, "Dispatching physical job to cluster scheduler");
 
         let cancel_token = common::cancellation::CancellationToken::new();
 
@@ -140,11 +143,17 @@ impl QueryEngine for DistributedCoordinator {
 
         // 6. FEEDBACK: Report execution telemetry back to the Reinforcement Learning Optimizer
         let telemetry = common::protocol::QueryTelemetry {
-            query_id: common::identifiers::QueryId::new(), // In reality we'd parse or generate this
+            query_id: common::identifiers::QueryId::new(),
             execution_time_ms: start_time.elapsed().as_millis() as u64,
             rows_produced: final_rows_produced,
         };
-        tracing::debug!(?telemetry, "query execution telemetry");
+        tracing::debug!(
+            target: "vein_coordinator",
+            query_id = %telemetry.query_id,
+            elapsed_ms = telemetry.execution_time_ms,
+            rows = telemetry.rows_produced,
+            "Query execution telemetry recorded"
+        );
 
         Ok(Bytes::new())
     }
