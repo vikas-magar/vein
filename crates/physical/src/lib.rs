@@ -14,6 +14,9 @@
 //! The [`PhysicalPlanner`] trait is the seam between the logical optimizer and
 //! this model: it lowers an optimized [`plan::LogicalPlan`] into a [`Job`].
 
+/// The physical plan builder subsystem.
+pub mod builder;
+
 /// The job graph: stages and the shuffle edges between them.
 pub mod job;
 
