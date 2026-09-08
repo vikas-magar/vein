@@ -20,6 +20,10 @@ use common::protocol::{DataSink, DataSource, ExecuteTask, FilterPredicate, Opera
 use common::Result;
 use error::VeinError;
 
+/// Operator telemetry and profiling.
+pub mod profile;
+pub use profile::{OperatorMetrics, OperatorProfile, OperatorSnapshot, ProfileNode};
+
 /// Per-task execution metrics, reported to the master on completion.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TaskMetrics {
@@ -93,6 +97,31 @@ pub trait PhysicalExprFactory: Send + Sync {
 pub trait OutputEncoder: Send + Sync {
     /// Encode a slice of batches into a single byte payload.
     fn encode(&self, batches: &[RecordBatch]) -> Result<Bytes>;
+}
+
+/// Default [`OutputEncoder`] backed by the Arrow IPC streaming format.
+#[derive(Debug, Default, Clone)]
+pub struct ArrowIpcOutputEncoder;
+
+impl ArrowIpcOutputEncoder {
+    /// Create a new [`ArrowIpcOutputEncoder`].
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl OutputEncoder for ArrowIpcOutputEncoder {
+    fn encode(&self, batches: &[RecordBatch]) -> Result<Bytes> {
+        if batches.is_empty() {
+            return Ok(Bytes::new());
+        }
+        let mut encoder = common::arrow::IpcStreamEncoder::new();
+        for batch in batches {
+            encoder.encode(batch)?;
+        }
+        let bytes = encoder.finalize()?;
+        Ok(Bytes::from(bytes))
+    }
 }
 
 /// Sends control-plane events (completion, failure, cancel) to the master.

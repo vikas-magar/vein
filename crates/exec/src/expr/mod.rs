@@ -3,10 +3,10 @@ use std::fmt::Debug;
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Schema};
-use arrow::record_batch::RecordBatch;
+use crate::daemon::pipeline::DataChunk;
 use error::Result;
 
-/// A physical expression that can be evaluated against a RecordBatch.
+/// A physical expression that can be evaluated against a [`DataChunk`].
 pub trait PhysicalExpr: Debug + Send + Sync {
     /// Returns the expression as `Any` so it can be downcast for matching.
     fn as_any(&self) -> &dyn Any;
@@ -19,8 +19,8 @@ pub trait PhysicalExpr: Debug + Send + Sync {
         true
     }
 
-    /// Evaluate the expression against a RecordBatch.
-    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef>;
+    /// Evaluate the expression directly against an in-flight [`DataChunk`].
+    fn evaluate(&self, chunk: &DataChunk) -> Result<ArrayRef>;
 }
 
 /// Binary expression implementations.

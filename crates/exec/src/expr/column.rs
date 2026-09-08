@@ -1,6 +1,5 @@
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Schema};
-use arrow::record_batch::RecordBatch;
 use error::{Result, VeinError};
 use std::any::Any;
 
@@ -43,16 +42,15 @@ impl PhysicalExpr for ColumnExpr {
         Ok(input_schema.field(self.index).data_type().clone())
     }
 
-    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        if self.index >= batch.num_columns() {
+    fn evaluate(&self, chunk: &crate::daemon::pipeline::DataChunk) -> Result<ArrayRef> {
+        if self.index >= chunk.num_columns() {
             return Err(VeinError::internal(format!(
-                "Column index {} out of bounds for batch with {} columns",
+                "Column index {} out of bounds for chunk with {} columns",
                 self.index,
-                batch.num_columns()
+                chunk.num_columns()
             )));
         }
-        // Zero-copy clone of the Arc pointer
-        Ok(batch.column(self.index).clone())
+        Ok(chunk.column(self.index).clone())
     }
 }
 
@@ -61,6 +59,8 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::Field;
+    use arrow::record_batch::RecordBatch;
+    use crate::daemon::pipeline::DataChunk;
     use std::sync::Arc;
 
     #[test]
@@ -80,8 +80,9 @@ mod tests {
         // Test data_type
         assert_eq!(expr.data_type(&schema).unwrap(), DataType::Utf8);
 
-        // Test evaluate
-        let result = expr.evaluate(&batch).unwrap();
+        // Test evaluate with zero-copy DataChunk
+        let chunk = DataChunk::from_record_batch(batch);
+        let result = expr.evaluate(&chunk).unwrap();
         assert_eq!(result.data_type(), &DataType::Utf8);
         assert_eq!(result.len(), 3);
 

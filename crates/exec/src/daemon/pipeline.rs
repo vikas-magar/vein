@@ -3,6 +3,8 @@ use arrow::record_batch::RecordBatch;
 use common::Result;
 use common::arrow::SelectionVector;
 
+use error::VeinError;
+
 /// A horizontal slice of data processed in a pipeline.
 ///
 /// The single in-flight unit flowing through a pipeline: a set of Arrow
@@ -15,6 +17,73 @@ pub struct DataChunk {
     pub vectors: Vec<ArrayRef>,
     /// The selection vector indicating active rows.
     pub selection: SelectionVector,
+}
+
+impl DataChunk {
+    /// Creates a new [`DataChunk`] from column arrays and an explicit selection vector.
+    pub fn new(vectors: Vec<ArrayRef>, selection: SelectionVector) -> Self {
+        Self { vectors, selection }
+    }
+
+    /// Creates a [`DataChunk`] from column arrays with an all-valid (dense) selection vector.
+    pub fn from_vectors(vectors: Vec<ArrayRef>) -> Self {
+        let num_rows = vectors.first().map(|v| v.len()).unwrap_or(0);
+        Self {
+            vectors,
+            selection: SelectionVector::new_dense(num_rows),
+        }
+    }
+
+    /// Creates a [`DataChunk`] from an Arrow [`RecordBatch`] with an initially dense selection.
+    pub fn from_record_batch(batch: RecordBatch) -> Self {
+        let num_rows = batch.num_rows();
+        let vectors = batch.columns().to_vec();
+        Self {
+            vectors,
+            selection: SelectionVector::new_dense(num_rows),
+        }
+    }
+
+    /// Constructs an ephemeral Arrow [`RecordBatch`] from chunk vectors.
+    /// Used for interoperability with Arrow compute kernels that require schema metadata.
+    pub fn to_record_batch(&self) -> Result<RecordBatch> {
+        let fields: Vec<arrow::datatypes::Field> = self
+            .vectors
+            .iter()
+            .enumerate()
+            .map(|(i, vec)| {
+                arrow::datatypes::Field::new(format!("col_{i}"), vec.data_type().clone(), true)
+            })
+            .collect();
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+        RecordBatch::try_new(schema, self.vectors.clone())
+            .map_err(|e| VeinError::internal(format!("Failed to create RecordBatch from DataChunk: {e}")))
+    }
+
+    /// Total surviving rows in this chunk.
+    pub fn num_rows(&self) -> usize {
+        self.selection.size()
+    }
+
+    /// The physical length of the underlying column vectors in this chunk.
+    pub fn physical_len(&self) -> usize {
+        self.vectors.first().map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Number of column vectors in this chunk.
+    pub fn num_columns(&self) -> usize {
+        self.vectors.len()
+    }
+
+    /// Whether this chunk has zero surviving rows.
+    pub fn is_empty(&self) -> bool {
+        self.selection.is_empty()
+    }
+
+    /// Borrow the column array at `index`.
+    pub fn column(&self, index: usize) -> &ArrayRef {
+        &self.vectors[index]
+    }
 }
 
 /// The synchronous trait implemented by all CPU-bound operators (Transforms

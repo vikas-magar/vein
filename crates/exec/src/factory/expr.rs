@@ -82,8 +82,8 @@ mod tests {
                 literal: FilterValue::Int(100),
             })
             .unwrap();
-
-        let result = expr.evaluate(&batch).unwrap();
+        let chunk = crate::daemon::pipeline::DataChunk::from_record_batch(batch);
+        let result = expr.evaluate(&chunk).unwrap();
         let bools = result.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert_eq!(
             bools.iter().collect::<Vec<_>>(),

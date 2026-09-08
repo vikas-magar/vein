@@ -1,8 +1,7 @@
 use crate::daemon::pipeline::{DataChunk, PipelineNode, Transform};
 use crate::expr::PhysicalExpr;
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
-use error::{Result, VeinError};
+use error::Result;
 
 /// A synchronous Transform that evaluates expressions to produce new columns.
 pub struct ProjectExecutor {
@@ -24,28 +23,18 @@ impl ProjectExecutor {
             next,
         }
     }
+
+    /// Returns a reference to the output schema.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
 }
 
 impl PipelineNode<DataChunk> for ProjectExecutor {
     fn push(&mut self, chunk: DataChunk) -> Result<()> {
-        let mut fields = Vec::with_capacity(chunk.vectors.len());
-        let mut arrays = Vec::with_capacity(chunk.vectors.len());
-        for (i, vec) in chunk.vectors.iter().enumerate() {
-            fields.push(arrow::datatypes::Field::new(
-                format!("col_{}", i),
-                vec.data_type().clone(),
-                true,
-            ));
-            arrays.push(vec.clone());
-        }
-        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-        let record_batch = RecordBatch::try_new(schema, arrays)
-            .map_err(|e| VeinError::internal(format!("Failed to create RecordBatch: {e}")))?;
-
         let mut new_vectors = Vec::with_capacity(self.exprs.len());
         for expr in &self.exprs {
-            let array = expr.evaluate(&record_batch)?;
-            new_vectors.push(array);
+            new_vectors.push(expr.evaluate(&chunk)?);
         }
 
         let new_chunk = DataChunk {
@@ -73,16 +62,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_project_stage() {
-        // Input Schema: a (Int64)
-        let in_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-
-        // Data: a = [10, 20]
-        let _batch = RecordBatch::try_new(
-            in_schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![10, 20]))],
-        )
-        .unwrap();
-
         // Output Schema: a (Int64), a_plus_5 (Int64)
         let out_schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
@@ -100,9 +79,7 @@ mod tests {
         let exprs: Vec<Box<dyn PhysicalExpr>> = vec![col_a, plus_5];
 
         // Mock sink
-        struct MockSink {
-            rows: usize,
-        }
+        struct MockSink;
         impl PipelineNode<DataChunk> for MockSink {
             fn push(&mut self, _batch: DataChunk) -> Result<()> {
                 Ok(())
@@ -112,9 +89,12 @@ mod tests {
             }
         }
 
-        let sink = Box::new(MockSink { rows: 0 });
+        let sink = Box::new(MockSink);
 
         // Execute Pipeline
-        let mut _project = ProjectExecutor::new(exprs, out_schema, sink);
+        let mut project = ProjectExecutor::new(exprs, out_schema, sink);
+        let array = Arc::new(Int64Array::from(vec![10, 20])) as arrow::array::ArrayRef;
+        let chunk = DataChunk::from_vectors(vec![array]);
+        project.push(chunk).unwrap();
     }
 }

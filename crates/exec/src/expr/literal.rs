@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
-use arrow::record_batch::RecordBatch;
 use error::Result;
 
 use super::PhysicalExpr;
@@ -65,8 +64,9 @@ impl PhysicalExpr for LiteralExpr {
         Ok(self.value.data_type())
     }
 
-    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        Ok(self.value.to_array(batch.num_rows()))
+    fn evaluate(&self, chunk: &crate::daemon::pipeline::DataChunk) -> Result<ArrayRef> {
+        let len = chunk.physical_len();
+        Ok(self.value.to_array(if len > 0 { len } else { chunk.num_rows() }))
     }
 }
 
@@ -74,6 +74,8 @@ impl PhysicalExpr for LiteralExpr {
 mod tests {
     use super::*;
     use arrow::datatypes::Field;
+    use arrow::record_batch::RecordBatch;
+    use crate::daemon::pipeline::DataChunk;
 
     #[test]
     fn test_literal_expr() {
@@ -84,7 +86,8 @@ mod tests {
         let int_expr = LiteralExpr::new(LiteralValue::Int64(42));
         assert_eq!(int_expr.data_type(&schema).unwrap(), DataType::Int64);
 
-        let result = int_expr.evaluate(&batch).unwrap();
+        let chunk = DataChunk::from_record_batch(batch);
+        let result = int_expr.evaluate(&chunk).unwrap();
         let result_int = result.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(result_int.len(), 3);
         assert_eq!(result_int.value(0), 42);

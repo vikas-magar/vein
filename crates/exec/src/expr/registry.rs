@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Schema};
-use arrow::record_batch::RecordBatch;
 use error::Result;
 
 use super::PhysicalExpr;
@@ -52,11 +51,11 @@ impl PhysicalExpr for ScalarFunctionExpr {
         self.udf.return_type(&arg_types)
     }
 
-    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+    fn evaluate(&self, chunk: &crate::daemon::pipeline::DataChunk) -> Result<ArrayRef> {
         // 1. Evaluate all child expressions to get the argument arrays
         let mut arg_arrays = Vec::with_capacity(self.args.len());
         for arg in &self.args {
-            arg_arrays.push(arg.evaluate(batch)?);
+            arg_arrays.push(arg.evaluate(chunk)?);
         }
 
         // 2. Invoke the UDF implementation with the materialized arrays
@@ -95,7 +94,6 @@ mod tests {
     use crate::expr::column::ColumnExpr;
     use arrow::array::Int64Array;
     use arrow::compute::kernels::numeric;
-    use arrow::datatypes::Field;
     use error::VeinError;
 
     /// A dummy UDF that simply adds 1 to an Int64 column.
@@ -135,14 +133,12 @@ mod tests {
         assert_eq!(retrieved.name(), "add_one");
 
         // Test PhysicalExpr execution
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let array1 = Arc::new(Int64Array::from(vec![10, 20, 30]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![array1 as ArrayRef]).unwrap();
-
         let arg = Box::new(ColumnExpr::new("a", 0));
         let func_expr = ScalarFunctionExpr::new(retrieved, vec![arg]);
 
-        let result = func_expr.evaluate(&batch).unwrap();
+        let chunk = crate::daemon::pipeline::DataChunk::from_vectors(vec![array1 as ArrayRef]);
+        let result = func_expr.evaluate(&chunk).unwrap();
         let result_int = result.as_any().downcast_ref::<Int64Array>().unwrap();
 
         assert_eq!(result_int.value(0), 11);

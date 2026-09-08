@@ -3,7 +3,6 @@ use std::any::Any;
 use arrow::array::ArrayRef;
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Schema};
-use arrow::record_batch::RecordBatch;
 use error::{Result, VeinError};
 
 use super::PhysicalExpr;
@@ -35,8 +34,8 @@ impl PhysicalExpr for CastExpr {
         self.expr.is_deterministic()
     }
 
-    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let array = self.expr.evaluate(batch)?;
+    fn evaluate(&self, chunk: &crate::daemon::pipeline::DataChunk) -> Result<ArrayRef> {
+        let array = self.expr.evaluate(chunk)?;
         let casted = cast(&array, &self.cast_type)
             .map_err(|e| VeinError::internal(format!("Cast failed: {}", e)))?;
         Ok(casted)
@@ -46,6 +45,7 @@ impl PhysicalExpr for CastExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::pipeline::DataChunk;
     use crate::expr::column::ColumnExpr;
     use arrow::array::{Float64Array, Int64Array};
     use arrow::datatypes::Field;
@@ -54,15 +54,14 @@ mod tests {
     #[test]
     fn test_cast_expr() {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let array1 = Arc::new(Int64Array::from(vec![1, 2, 3]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![array1 as ArrayRef]).unwrap();
-
         let col_expr = Box::new(ColumnExpr::new("a", 0));
         let cast_expr = CastExpr::new(col_expr, DataType::Float64);
 
         assert_eq!(cast_expr.data_type(&schema).unwrap(), DataType::Float64);
 
-        let result = cast_expr.evaluate(&batch).unwrap();
+        let array1 = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let chunk = DataChunk::from_vectors(vec![array1 as ArrayRef]);
+        let result = cast_expr.evaluate(&chunk).unwrap();
         assert_eq!(result.data_type(), &DataType::Float64);
 
         let result_float = result.as_any().downcast_ref::<Float64Array>().unwrap();

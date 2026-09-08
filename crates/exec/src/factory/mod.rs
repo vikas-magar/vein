@@ -70,17 +70,42 @@ impl Default for TaskExecutorBuilder {
     }
 }
 
+use crate::operators::transform::limit::LimitExecutor;
+
+/// Pluggable trait for extending operator translation in [`DefaultExecutorBuilder`].
+pub trait TransformBuilder: Send + Sync {
+    /// Returns true if this builder can handle translating `op`.
+    fn can_build(&self, op: &Operator) -> bool;
+
+    /// Builds a [`Transform`] for `op`, consuming `next`.
+    fn build(
+        &self,
+        op: &Operator,
+        next: Box<dyn PipelineNode<DataChunk>>,
+    ) -> Result<Box<dyn Transform<DataChunk>>>;
+}
+
 /// The default executor builder: builds the concrete stages that implement
 /// the seam traits from a wire task description.
 pub struct DefaultExecutorBuilder {
     expr_factory: Arc<dyn PhysicalExprFactory>,
+    custom_builders: Vec<Arc<dyn TransformBuilder>>,
 }
 
 impl DefaultExecutorBuilder {
     /// Create a builder that uses `expr_factory` to turn filter predicates
     /// (`Operator::Filter{expr}`) into [`PhysicalExpr`]s.
     pub fn new(expr_factory: Arc<dyn PhysicalExprFactory>) -> Self {
-        Self { expr_factory }
+        Self {
+            expr_factory,
+            custom_builders: Vec::new(),
+        }
+    }
+
+    /// Register a custom transform builder for operator translation.
+    pub fn with_transform_builder(mut self, builder: Arc<dyn TransformBuilder>) -> Self {
+        self.custom_builders.push(builder);
+        self
     }
 }
 
@@ -113,6 +138,12 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         op: &Operator,
         next: Box<dyn PipelineNode<DataChunk>>,
     ) -> Result<Box<dyn Transform<DataChunk>>> {
+        for builder in &self.custom_builders {
+            if builder.can_build(op) {
+                return builder.build(op, next);
+            }
+        }
+
         match op {
             Operator::Filter(pred) => {
                 let predicate = self.expr_factory.build(pred)?;
@@ -130,6 +161,9 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                     })
                     .collect();
                 Ok(Box::new(ProjectExecutor::new(exprs, schema, next)))
+            }
+            Operator::Limit { offset, count } => {
+                Ok(Box::new(LimitExecutor::new(*offset, *count, next)))
             }
             other => Err(VeinError::internal(format!(
                 "operator not yet implemented: {other:?}"

@@ -3,7 +3,6 @@ use std::any::Any;
 use arrow::array::ArrayRef;
 use arrow::compute::kernels::{boolean, cmp, numeric};
 use arrow::datatypes::{DataType, Schema};
-use arrow::record_batch::RecordBatch;
 use error::{Result, VeinError};
 
 use super::PhysicalExpr;
@@ -54,6 +53,55 @@ impl BinaryExpr {
     ) -> Self {
         Self { left, op, right }
     }
+    fn evaluate_arrays(&self, left_array: &ArrayRef, right_array: &ArrayRef) -> Result<ArrayRef> {
+        let result = match self.op {
+            BinaryOperator::Plus => numeric::add(left_array, right_array),
+            BinaryOperator::Minus => numeric::sub(left_array, right_array),
+            BinaryOperator::Multiply => numeric::mul(left_array, right_array),
+            BinaryOperator::Divide => numeric::div(left_array, right_array),
+            BinaryOperator::Eq => {
+                cmp::eq(left_array, right_array).map(|a| std::sync::Arc::new(a) as ArrayRef)
+            }
+            BinaryOperator::Neq => {
+                cmp::neq(left_array, right_array).map(|a| std::sync::Arc::new(a) as ArrayRef)
+            }
+            BinaryOperator::Lt => {
+                cmp::lt(left_array, right_array).map(|a| std::sync::Arc::new(a) as ArrayRef)
+            }
+            BinaryOperator::Gt => {
+                cmp::gt(left_array, right_array).map(|a| std::sync::Arc::new(a) as ArrayRef)
+            }
+            BinaryOperator::Leq => cmp::lt_eq(left_array, right_array)
+                .map(|a| std::sync::Arc::new(a) as ArrayRef),
+            BinaryOperator::Geq => cmp::gt_eq(left_array, right_array)
+                .map(|a| std::sync::Arc::new(a) as ArrayRef),
+            BinaryOperator::And => {
+                let left_bool = left_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .ok_or_else(|| VeinError::internal("AND requires boolean arrays"))?;
+                let right_bool = right_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .ok_or_else(|| VeinError::internal("AND requires boolean arrays"))?;
+                boolean::and(left_bool, right_bool).map(|a| std::sync::Arc::new(a) as ArrayRef)
+            }
+            BinaryOperator::Or => {
+                let left_bool = left_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .ok_or_else(|| VeinError::internal("OR requires boolean arrays"))?;
+                let right_bool = right_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .ok_or_else(|| VeinError::internal("OR requires boolean arrays"))?;
+                boolean::or(left_bool, right_bool).map(|a| std::sync::Arc::new(a) as ArrayRef)
+            }
+        };
+
+        result
+            .map_err(|e| VeinError::internal(format!("Binary expression evaluation failed: {}", e)))
+    }
 }
 
 impl PhysicalExpr for BinaryExpr {
@@ -94,81 +142,32 @@ impl PhysicalExpr for BinaryExpr {
         self.left.is_deterministic() && self.right.is_deterministic()
     }
 
-    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let left_array = self.left.evaluate(batch)?;
-        let right_array = self.right.evaluate(batch)?;
-
-        let result =
-            match self.op {
-                BinaryOperator::Plus => numeric::add(&left_array, &right_array),
-                BinaryOperator::Minus => numeric::sub(&left_array, &right_array),
-                BinaryOperator::Multiply => numeric::mul(&left_array, &right_array),
-                BinaryOperator::Divide => numeric::div(&left_array, &right_array),
-                BinaryOperator::Eq => {
-                    cmp::eq(&left_array, &right_array).map(|a| std::sync::Arc::new(a) as ArrayRef)
-                }
-                BinaryOperator::Neq => {
-                    cmp::neq(&left_array, &right_array).map(|a| std::sync::Arc::new(a) as ArrayRef)
-                }
-                BinaryOperator::Lt => {
-                    cmp::lt(&left_array, &right_array).map(|a| std::sync::Arc::new(a) as ArrayRef)
-                }
-                BinaryOperator::Gt => {
-                    cmp::gt(&left_array, &right_array).map(|a| std::sync::Arc::new(a) as ArrayRef)
-                }
-                BinaryOperator::Leq => cmp::lt_eq(&left_array, &right_array)
-                    .map(|a| std::sync::Arc::new(a) as ArrayRef),
-                BinaryOperator::Geq => cmp::gt_eq(&left_array, &right_array)
-                    .map(|a| std::sync::Arc::new(a) as ArrayRef),
-                BinaryOperator::And => {
-                    let left_bool = left_array
-                        .as_any()
-                        .downcast_ref::<arrow::array::BooleanArray>()
-                        .ok_or_else(|| VeinError::internal("AND requires boolean arrays"))?;
-                    let right_bool = right_array
-                        .as_any()
-                        .downcast_ref::<arrow::array::BooleanArray>()
-                        .ok_or_else(|| VeinError::internal("AND requires boolean arrays"))?;
-                    boolean::and(left_bool, right_bool).map(|a| std::sync::Arc::new(a) as ArrayRef)
-                }
-                BinaryOperator::Or => {
-                    let left_bool = left_array
-                        .as_any()
-                        .downcast_ref::<arrow::array::BooleanArray>()
-                        .ok_or_else(|| VeinError::internal("OR requires boolean arrays"))?;
-                    let right_bool = right_array
-                        .as_any()
-                        .downcast_ref::<arrow::array::BooleanArray>()
-                        .ok_or_else(|| VeinError::internal("OR requires boolean arrays"))?;
-                    boolean::or(left_bool, right_bool).map(|a| std::sync::Arc::new(a) as ArrayRef)
-                }
-            };
-
-        result
-            .map_err(|e| VeinError::internal(format!("Binary expression evaluation failed: {}", e)))
+    fn evaluate(&self, chunk: &crate::daemon::pipeline::DataChunk) -> Result<ArrayRef> {
+        let left_array = self.left.evaluate(chunk)?;
+        let right_array = self.right.evaluate(chunk)?;
+        self.evaluate_arrays(&left_array, &right_array)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::pipeline::DataChunk;
     use crate::expr::column::ColumnExpr;
     use crate::expr::literal::{LiteralExpr, LiteralValue};
     use arrow::array::{BooleanArray, Int64Array};
-    use arrow::datatypes::Field;
     use std::sync::Arc;
 
     #[test]
     fn test_binary_expr_plus() {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let array1 = Arc::new(Int64Array::from(vec![1, 2, 3]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![array1 as ArrayRef]).unwrap();
+        let chunk = DataChunk::from_vectors(vec![array1 as ArrayRef]);
 
         let left = Box::new(ColumnExpr::new("a", 0));
         let right = Box::new(LiteralExpr::new(LiteralValue::Int64(10)));
         let expr = BinaryExpr::new(left, BinaryOperator::Plus, right);
 
-        let result = expr.evaluate(&batch).unwrap();
+        let result = expr.evaluate(&chunk).unwrap();
         let result_int = result.as_any().downcast_ref::<Int64Array>().unwrap();
 
         assert_eq!(result_int.value(0), 11);
@@ -178,15 +177,14 @@ mod tests {
 
     #[test]
     fn test_binary_expr_gt() {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let array1 = Arc::new(Int64Array::from(vec![1, 2, 3]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![array1 as ArrayRef]).unwrap();
+        let chunk = DataChunk::from_vectors(vec![array1 as ArrayRef]);
 
         let left = Box::new(ColumnExpr::new("a", 0));
         let right = Box::new(LiteralExpr::new(LiteralValue::Int64(2)));
         let expr = BinaryExpr::new(left, BinaryOperator::Gt, right);
 
-        let result = expr.evaluate(&batch).unwrap();
+        let result = expr.evaluate(&chunk).unwrap();
         let result_bool = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
         assert!(!result_bool.value(0));

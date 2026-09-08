@@ -49,6 +49,39 @@ impl SelectionVector {
     pub fn size(&self) -> usize {
         self.size
     }
+
+    /// Whether this selection vector has zero valid rows.
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Returns a new sparse [`SelectionVector`] by testing each currently selected
+    /// physical row index against `predicate`.
+    ///
+    /// Preserves prior filter decisions: only previously surviving rows are evaluated.
+    pub fn filter(&self, mut predicate: impl FnMut(usize) -> bool) -> Self {
+        let mut surviving = Vec::with_capacity(self.size);
+        for i in 0..self.size {
+            let row_idx = self.get_index(i);
+            if predicate(row_idx) {
+                surviving.push(row_idx as u32);
+            }
+        }
+        Self::new_sparse(surviving)
+    }
+
+    /// Returns a new [`SelectionVector`] sliced by `offset` and taking up to `limit` rows.
+    pub fn slice(&self, offset: usize, limit: usize) -> Self {
+        if offset >= self.size || limit == 0 {
+            return Self::new_sparse(Vec::new());
+        }
+        let count = limit.min(self.size - offset);
+        let mut sliced = Vec::with_capacity(count);
+        for i in offset..(offset + count) {
+            sliced.push(self.get_index(i) as u32);
+        }
+        Self::new_sparse(sliced)
+    }
 }
 
 /// A pinned, boxed, sendable stream of `Result<RecordBatch>`.
@@ -235,5 +268,40 @@ mod tests {
         assert_eq!(sv.get_index(0), 2);
         assert_eq!(sv.get_index(1), 4);
         assert_eq!(sv.get_index(2), 7);
+    }
+
+    #[test]
+    fn test_selection_vector_filter() {
+        let sv = SelectionVector::new_dense(10);
+        // Keep even indices
+        let evens = sv.filter(|idx| idx % 2 == 0);
+        assert_eq!(evens.size(), 5);
+        assert_eq!(evens.get_index(0), 0);
+        assert_eq!(evens.get_index(1), 2);
+        assert_eq!(evens.get_index(2), 4);
+        assert_eq!(evens.get_index(3), 6);
+        assert_eq!(evens.get_index(4), 8);
+
+        // Chain another filter: keep > 3
+        let chained = evens.filter(|idx| idx > 3);
+        assert_eq!(chained.size(), 3);
+        assert_eq!(chained.get_index(0), 4);
+        assert_eq!(chained.get_index(1), 6);
+        assert_eq!(chained.get_index(2), 8);
+    }
+
+    #[test]
+    fn test_selection_vector_slice() {
+        let sv = SelectionVector::new_dense(10);
+        let sliced = sv.slice(3, 4);
+        assert_eq!(sliced.size(), 4);
+        assert_eq!(sliced.get_index(0), 3);
+        assert_eq!(sliced.get_index(1), 4);
+        assert_eq!(sliced.get_index(2), 5);
+        assert_eq!(sliced.get_index(3), 6);
+
+        // Slice beyond bounds
+        let empty = sv.slice(15, 5);
+        assert!(empty.is_empty());
     }
 }
