@@ -341,6 +341,36 @@ mod subquery {
         .await;
         assert!(matches!(err, error::VeinError::Semantic { .. }), "got {err}");
     }
+
+    /// Guard against accidental identifier capture: an unqualified column in a
+    /// subquery cannot silently resolve to an outer column. It must be explicitly
+    /// qualified (e.g. `users.age`), otherwise it fails with a diagnostic hint.
+    #[tokio::test]
+    async fn unqualified_outer_column_capture_is_rejected() {
+        // `users` has `age`, but `orders` does NOT have `age`.
+        // In legacy SQL, `age > 18` inside the subquery would silently capture `users.age`.
+        // In Vein, this is rejected with a helpful diagnostic hint.
+        let err = bind_err(
+            "FROM users |> WHERE EXISTS (FROM orders |> WHERE age > 18 |> SELECT id)",
+        )
+        .await;
+        assert!(matches!(err, error::VeinError::Semantic { .. }), "got {err}");
+        assert!(
+            err.to_string().contains("Hint: 'age' exists in outer scope 'users'"),
+            "expected diagnostic hint, got: {err}"
+        );
+    }
+
+    /// When explicitly qualified (`users.age`), outer column references resolve
+    /// cleanly to `OuterColumn`.
+    #[tokio::test]
+    async fn qualified_outer_column_resolves_successfully() {
+        let plan = bind(
+            "FROM users |> WHERE EXISTS (FROM orders |> WHERE users.age > 18 |> SELECT id)",
+        )
+        .await;
+        assert_chain(&plan, &["Filter", "Scan"]);
+    }
 }
 
 #[cfg(test)]

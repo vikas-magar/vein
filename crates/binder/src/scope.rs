@@ -104,7 +104,10 @@ impl ScopeStack {
             for scope in scopes.iter().rev() {
                 let scope_matches_qualifier = match qualifier {
                     Some(q) => scope.aliases.iter().any(|a| a == q),
-                    None => true,
+                    // Strict Scoping: Unqualified identifiers can only match local scopes.
+                    // Reaching into outer correlation scopes requires an explicit qualifier
+                    // (e.g. `outer_table.col`) to prevent accidental identifier capture bugs.
+                    None => !correlated,
                 };
                 if !scope_matches_qualifier {
                     continue;
@@ -127,6 +130,27 @@ impl ScopeStack {
                     }
                     return Ok((first.clone(), correlated));
                 }
+            }
+        }
+
+        // If an unqualified lookup missed locally, check if it exists in an outer scope
+        // and provide an actionable hint to prevent silent scoping errors.
+        if qualifier.is_none() {
+            let outer_match = self.correlation_scopes.iter().rev().find_map(|s| {
+                s.columns.iter().find(|c| c.name == name).map(|c| {
+                    c.qualifier.as_deref().unwrap_or("outer query")
+                })
+            });
+
+            if let Some(parent_alias) = outer_match {
+                return Err(VeinError::semantic(
+                    format!(
+                        "column '{name}' was not found in the local subquery scope.\n\
+                         Hint: '{name}' exists in outer scope '{parent_alias}'. \
+                         In Vein, references to outer query columns must be explicitly qualified (e.g. '{parent_alias}.{name}') to prevent accidental identifier capture.",
+                    ),
+                    None,
+                ));
             }
         }
 
