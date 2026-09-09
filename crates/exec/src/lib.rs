@@ -5,10 +5,13 @@
 
 #![deny(missing_docs)]
 
-/// Physical Expression Evaluator
-pub mod expr;
+/// Streaming pipeline abstractions and DataChunk primitives.
+pub mod pipeline;
 
-/// Operators for physical execution
+/// User-Defined Function (UDF) extensibility and registry.
+pub mod udf;
+
+/// Operators for physical execution.
 pub mod operators;
 
 /// Executor daemon entrypoints and runtime environment.
@@ -17,7 +20,9 @@ pub mod daemon;
 pub mod runtime;
 /// Default stage factory mapping the wire protocol onto executor stages.
 pub mod factory;
-/// Ready-to-run executor node (worker pool + control plane + task executor).
-pub mod executor_node;
+/// Vector VM execution engine interpreting Micro-IR programs.
+pub mod vm;
 
-pub use executor_node::ExecutorNode;
+pub use daemon::{ExecutorDaemon, ExecutorDaemonBuilder};
+pub use pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
+

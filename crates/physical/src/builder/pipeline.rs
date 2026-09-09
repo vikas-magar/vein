@@ -1,10 +1,11 @@
 //! Linear pipeline builder abstraction: translates unbroken operator sequences into a single [`Stage`].
 
+use crate::compiler::PipelineCompiler;
 use crate::stage::Stage;
-use common::identifiers::{QueryId, StageId};
-use common::protocol::{DataSource, Operator};
+use crate::task::Task;
+use common::identifiers::{PartitionId, QueryId, StageId, TaskId};
+use common::protocol::{DataSink, DataSource, MicroProgram};
 use common::Result;
-use error::VeinError;
 use plan::schema::VeinSchema;
 use plan::LogicalPlan;
 
@@ -18,15 +19,14 @@ pub trait PipelineStageBuilder: Send + Sync {
         stages: &mut Vec<Stage>,
     ) -> Result<StageId>;
 
-    /// Recursively collects the leaf data source and intermediate operators in execution order.
-    fn collect_pipeline(
+    /// Compiles the linear pipeline into a leaf data source, a [`MicroProgram`], and an output schema.
+    fn compile_pipeline(
         &self,
         plan: &LogicalPlan,
-        operators: &mut Vec<Operator>,
-    ) -> Result<(DataSource, VeinSchema)>;
+    ) -> Result<(DataSource, MicroProgram, VeinSchema)>;
 }
 
-/// Default linear pipeline stage builder abstraction.
+/// Default linear pipeline stage builder.
 #[derive(Debug, Default, Clone)]
 pub struct DefaultPipelineStageBuilder;
 
@@ -41,17 +41,27 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
     fn build(
         &self,
         _query_id: QueryId,
-        _plan: &LogicalPlan,
-        _stages: &mut Vec<Stage>,
+        plan: &LogicalPlan,
+        stages: &mut Vec<Stage>,
     ) -> Result<StageId> {
-        Err(VeinError::internal("DefaultPipelineStageBuilder::build is not yet implemented"))
+        let (source, program, _out_schema) = self.compile_pipeline(plan)?;
+        let stage_id = StageId::new();
+        let task = Task::new(
+            TaskId::new(),
+            PartitionId::new(),
+            source,
+            program,
+            DataSink::Client,
+        );
+        let stage = Stage::new(stage_id).with_task(task);
+        stages.push(stage);
+        Ok(stage_id)
     }
 
-    fn collect_pipeline(
+    fn compile_pipeline(
         &self,
-        _plan: &LogicalPlan,
-        _operators: &mut Vec<Operator>,
-    ) -> Result<(DataSource, VeinSchema)> {
-        Err(VeinError::internal("DefaultPipelineStageBuilder::collect_pipeline is not yet implemented"))
+        plan: &LogicalPlan,
+    ) -> Result<(DataSource, MicroProgram, VeinSchema)> {
+        PipelineCompiler::compile(plan)
     }
 }

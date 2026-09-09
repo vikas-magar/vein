@@ -1,4 +1,9 @@
-/// Discard executor that throws away all data
+//! Terminal pipeline sink operators.
+
+/// Discard sink that drops all data
 pub mod discard;
-/// Collect executor that captures output for the caller
+/// Collect sink that captures output for the caller
 pub mod client;
+
+pub use client::CollectSink;
+pub use discard::DiscardSink;

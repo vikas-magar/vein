@@ -1,0 +1,252 @@
+//! Recursive expression-to-bytecode compiler.
+//!
+//! Lowers arbitrary [`LogicalExpr`] AST trees into a linear sequence of [`MicroOp`]
+//! virtual machine instructions using a [`RegisterAllocator`].
+
+use common::protocol::{MicroOp, MicroProgram, RegId, ScalarConstant};
+use common::Result;
+use error::VeinError;
+use parser::ast::expr::BinaryOp;
+use plan::expr::literal::LogicalLiteral;
+use plan::expr::logical::LogicalExpr;
+use plan::schema::VeinSchema;
+
+use super::allocator::RegisterAllocator;
+
+/// Converts a planning [`LogicalLiteral`] into a wire [`ScalarConstant`].
+pub fn literal_to_constant(literal: &LogicalLiteral) -> Result<ScalarConstant> {
+    match literal {
+        LogicalLiteral::Null(_) => Ok(ScalarConstant::Null),
+        LogicalLiteral::Boolean(b) => Ok(ScalarConstant::Boolean(*b)),
+        LogicalLiteral::Int64(i) => Ok(ScalarConstant::Int64(*i)),
+        LogicalLiteral::Float64(f) => Ok(ScalarConstant::Float64(*f)),
+        LogicalLiteral::String(s) => Ok(ScalarConstant::Utf8(s.clone())),
+        LogicalLiteral::Date(d) => Ok(ScalarConstant::Int32(*d)),
+        LogicalLiteral::Timestamp(ts) => Ok(ScalarConstant::Int64(*ts)),
+        LogicalLiteral::Time(t) => Ok(ScalarConstant::Int64(*t)),
+        LogicalLiteral::Vector(v) => Ok(ScalarConstant::Vector(v.clone())),
+        other => Err(VeinError::planning(
+            format!("Literal type not yet supported in scalar constant: {other:?}"),
+            None,
+        )),
+    }
+}
+
+/// Recursive AST-to-bytecode compiler.
+pub struct BytecodeCompiler {
+    allocator: RegisterAllocator,
+    instructions: Vec<MicroOp>,
+}
+
+impl BytecodeCompiler {
+    /// Creates a new bytecode compiler for an input chunk with `input_columns`.
+    pub fn new(input_columns: u8) -> Self {
+        Self {
+            allocator: RegisterAllocator::new(input_columns),
+            instructions: Vec::new(),
+        }
+    }
+
+    /// Recursively compiles a [`LogicalExpr`] AST into register instructions,
+    /// returning the [`RegId`] holding the evaluated result.
+    pub fn compile_expr(&mut self, expr: &LogicalExpr, schema: &VeinSchema) -> Result<RegId> {
+        match expr {
+            LogicalExpr::Column(col) => {
+                let idx = schema
+                    .position_of_id(col.id)
+                    .or_else(|| schema.fields.iter().position(|f| f.name == col.name))
+                    .ok_or_else(|| {
+                        VeinError::planning(
+                            format!("Column not found in schema: {:?}", col.name),
+                            None,
+                        )
+                    })?;
+                if idx > u8::MAX as usize {
+                    return Err(VeinError::planning(
+                        "Column index exceeds maximum register capacity (255)",
+                        None,
+                    ));
+                }
+                Ok(idx as RegId)
+            }
+            LogicalExpr::OuterColumn(col) => {
+                let idx = schema
+                    .position_of_id(col.id)
+                    .or_else(|| schema.fields.iter().position(|f| f.name == col.name))
+                    .ok_or_else(|| {
+                        VeinError::planning(
+                            format!("Outer column not found in schema: {:?}", col.name),
+                            None,
+                        )
+                    })?;
+                Ok(idx as RegId)
+            }
+            LogicalExpr::Literal(lit) => {
+                let dst = self.allocator.allocate()?;
+                let val = literal_to_constant(lit)?;
+                self.instructions.push(MicroOp::LoadConstant {
+                    dst,
+                    value: val,
+                });
+                Ok(dst)
+            }
+            LogicalExpr::BinaryOp {
+                left, op, right, ..
+            } => {
+                let src1 = self.compile_expr(left, schema)?;
+                let src2 = self.compile_expr(right, schema)?;
+                let dst = self.allocator.allocate()?;
+
+                let micro_op = match op {
+                    BinaryOp::Plus => MicroOp::Add { dst, src1, src2 },
+                    BinaryOp::Minus => MicroOp::Sub { dst, src1, src2 },
+                    BinaryOp::Multiply => MicroOp::Mul { dst, src1, src2 },
+                    BinaryOp::Divide => MicroOp::Div { dst, src1, src2 },
+                    BinaryOp::Modulo => MicroOp::Mod { dst, src1, src2 },
+                    BinaryOp::Eq => MicroOp::CmpEq { dst, src1, src2 },
+                    BinaryOp::Neq => MicroOp::CmpNeq { dst, src1, src2 },
+                    BinaryOp::Lt => MicroOp::CmpLt { dst, src1, src2 },
+                    BinaryOp::Leq => MicroOp::CmpLte { dst, src1, src2 },
+                    BinaryOp::Gt => MicroOp::CmpGt { dst, src1, src2 },
+                    BinaryOp::Geq => MicroOp::CmpGte { dst, src1, src2 },
+                    BinaryOp::And => MicroOp::And { dst, src1, src2 },
+                    BinaryOp::Or => MicroOp::Or { dst, src1, src2 },
+                    BinaryOp::Concat => MicroOp::CallUdf {
+                        name: "concat".to_string(),
+                        arg_regs: vec![src1, src2],
+                        dst,
+                    },
+                };
+                self.instructions.push(micro_op);
+                Ok(dst)
+            }
+            LogicalExpr::Not { expr } => {
+                let src = self.compile_expr(expr, schema)?;
+                let dst = self.allocator.allocate()?;
+                self.instructions.push(MicroOp::Not { dst, src });
+                Ok(dst)
+            }
+            LogicalExpr::Negate { expr } => {
+                let src = self.compile_expr(expr, schema)?;
+                let dst = self.allocator.allocate()?;
+                self.instructions.push(MicroOp::Neg { dst, src });
+                Ok(dst)
+            }
+            LogicalExpr::IsNull { expr } => {
+                let src = self.compile_expr(expr, schema)?;
+                let dst = self.allocator.allocate()?;
+                self.instructions.push(MicroOp::IsNull { dst, src });
+                Ok(dst)
+            }
+            LogicalExpr::IsNotNull { expr } => {
+                let src = self.compile_expr(expr, schema)?;
+                let dst = self.allocator.allocate()?;
+                self.instructions.push(MicroOp::IsNotNull { dst, src });
+                Ok(dst)
+            }
+            LogicalExpr::FunctionCall { name, args, .. }
+            | LogicalExpr::AiOperator { name, args, .. } => {
+                let mut arg_regs = Vec::with_capacity(args.len());
+                for arg in args {
+                    arg_regs.push(self.compile_expr(arg, schema)?);
+                }
+                let dst = self.allocator.allocate()?;
+                self.instructions.push(MicroOp::CallUdf {
+                    name: name.clone(),
+                    arg_regs,
+                    dst,
+                });
+                Ok(dst)
+            }
+            LogicalExpr::Cast { expr, .. } => {
+                // Cast passes through underlying expression for zero-copy register representation
+                self.compile_expr(expr, schema)
+            }
+            other => Err(VeinError::planning(
+                format!("Logical expression lowering not yet implemented: {other:?}"),
+                None,
+            )),
+        }
+    }
+
+    /// Compiles a filter condition expression, emitting a [`MicroOp::FilterMask`] instruction.
+    pub fn compile_filter(&mut self, predicate: &LogicalExpr, schema: &VeinSchema) -> Result<()> {
+        let bool_reg = self.compile_expr(predicate, schema)?;
+        self.instructions.push(MicroOp::FilterMask { bool_reg });
+        Ok(())
+    }
+
+    /// Compiles a projection list, emitting a [`MicroOp::ProjectRegisters`] instruction.
+    pub fn compile_projection(
+        &mut self,
+        exprs: &[LogicalExpr],
+        schema: &VeinSchema,
+    ) -> Result<()> {
+        let mut out_regs = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            out_regs.push(self.compile_expr(expr, schema)?);
+        }
+        self.instructions.push(MicroOp::ProjectRegisters { out_regs });
+        Ok(())
+    }
+
+    /// Finalizes compilation into a self-contained [`MicroProgram`].
+    pub fn finish(self) -> MicroProgram {
+        MicroProgram {
+            register_count: self.allocator.total_registers(),
+            instructions: self.instructions,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plan::schema::{ColumnId, ResolvedColumn, VeinDataType};
+
+    fn test_schema() -> VeinSchema {
+        VeinSchema::new(vec![
+            ResolvedColumn::new(ColumnId(1), "age", None, VeinDataType::Int64),
+            ResolvedColumn::new(ColumnId(2), "salary", None, VeinDataType::Int64),
+        ])
+    }
+
+    #[test]
+    fn test_compile_complex_filter_and_projection() {
+        let schema = test_schema();
+        let mut compiler = BytecodeCompiler::new(2);
+
+        // Filter: age > 30 AND salary > 50000
+        let age_col = LogicalExpr::Column(ResolvedColumn::new(
+            ColumnId(1),
+            "age",
+            None,
+            VeinDataType::Int64,
+        ));
+        let age_lit = LogicalExpr::Literal(LogicalLiteral::Int64(30));
+        let age_cmp = LogicalExpr::BinaryOp {
+            left: Box::new(age_col),
+            op: BinaryOp::Gt,
+            right: Box::new(age_lit),
+            return_type: VeinDataType::Boolean,
+        };
+
+        compiler.compile_filter(&age_cmp, &schema).unwrap();
+        let program = compiler.finish();
+
+        assert_eq!(program.instructions.len(), 3);
+        assert!(matches!(
+            program.instructions[0],
+            MicroOp::LoadConstant { dst: 2, .. }
+        ));
+        assert!(matches!(
+            program.instructions[1],
+            MicroOp::CmpGt { dst: 3, src1: 0, src2: 2 }
+        ));
+        assert!(matches!(
+            program.instructions[2],
+            MicroOp::FilterMask { bool_reg: 3 }
+        ));
+        assert_eq!(program.register_count, 4);
+    }
+}

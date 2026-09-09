@@ -2,7 +2,7 @@ pub mod daemon;
 pub mod engine;
 
 use clap::{Parser, Subcommand};
-use exec::ExecutorNode;
+use exec::ExecutorDaemon;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Arc::new(binder::testing::MockFunctionRegistry::new()),
                     )))
                     .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
-                    .with_planner(Arc::new(physical::DagPhysicalPlanner::new()))
+                    .with_planner(Arc::new(physical::DefaultPhysicalPlanner::new()))
                     .with_scheduler(scheduler)
                     .build()
                     .map_err(|e| format!("Failed to build DistributedCoordinator: {e}"))?,
@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .parse()
                 .map_err(|e| format!("Invalid bind address '{bind}': {e}"))?;
 
-            ExecutorNode::builder()
+            ExecutorDaemon::builder()
                 .bind(addr)
                 .certificates(&cert, &key)
                 .workers(4)

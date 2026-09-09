@@ -5,7 +5,7 @@
 //! These are the abstractions the rest of the engine programs against:
 //! a [`ExecutorBuilder`] selects concrete [`Source`]/[`Transform`]/[`Sink`]
 //! implementations from a wire task, and a [`TaskExecutor`] runs a single
-//! task end-to-end (see `daemon::pipeline`).
+//! task end-to-end (see `crate::pipeline`).
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -13,10 +13,9 @@ use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::daemon::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
-use crate::expr::PhysicalExpr;
+use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use common::cancellation::CancellationToken;
-use common::protocol::{DataSink, DataSource, ExecuteTask, FilterPredicate, Operator, VeinControlEvent};
+use common::protocol::{DataSink, DataSource, ExecuteTask, MicroProgram, VeinControlEvent};
 use common::Result;
 use error::VeinError;
 
@@ -53,12 +52,10 @@ pub trait ExecutorBuilder: Send + Sync {
     /// Build a source from the task's [`DataSource`].
     fn build_source(&self, source: &DataSource) -> Result<Box<dyn Source<DataChunk>>>;
 
-    /// Build a transform for a single wire [`Operator`], wiring it to the
-    /// downstream `next` node. Transforms push their output into `next`, so
-    /// callers build the chain from the sink backwards.
-    fn build_transform(
+    /// Build a Vector VM transform interpreting the task's [`MicroProgram`].
+    fn build_vm(
         &self,
-        op: &Operator,
+        program: &MicroProgram,
         next: Box<dyn PipelineNode<DataChunk>>,
     ) -> Result<Box<dyn Transform<DataChunk>>>;
 
@@ -80,16 +77,6 @@ pub trait ExecutorBuilder: Send + Sync {
 pub trait TaskExecutor: Send + Sync {
     /// Run one task, driving its source through the operator chain.
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult>;
-}
-
-/// Builds a [`PhysicalExpr`] predicate from a structured [`FilterPredicate`].
-///
-/// `Operator::Filter` carries a planner-resolved, index-based predicate
-/// (`column <op> literal`); this factory turns it into an evaluable expression
-/// so the filter can be applied to Arrow batches without any name parsing.
-pub trait PhysicalExprFactory: Send + Sync {
-    /// Build a predicate expression from a wire filter.
-    fn build(&self, filter: &FilterPredicate) -> Result<Box<dyn PhysicalExpr>>;
 }
 
 /// Serializes produced [`RecordBatch`]es into wire bytes for the data plane
@@ -208,19 +195,17 @@ impl TaskExecutor for DefaultTaskExecutor {
         //    `Sink::collect` after execution. Wrapped in a cancellation guard.
         let sink: Arc<Mutex<Box<dyn Sink<DataChunk>>>> =
             Arc::new(Mutex::new(self.builder.build_sink(&task.sink)?));
-        let mut head: Box<dyn PipelineNode<DataChunk>> = Box::new(CancelGuard::new(
+        let head: Box<dyn PipelineNode<DataChunk>> = Box::new(CancelGuard::new(
             Box::new(SinkHandle(sink.clone())),
             cancel,
         ));
 
-        // 2. Build transforms backwards, threading `next` from sink to source.
-        for op in task.operators.iter().rev() {
-            head = self.builder.build_transform(op, head)?;
-        }
+        // 2. Build the Vector VM transform from the task's MicroProgram.
+        let mut vm = self.builder.build_vm(&task.program, head)?;
 
         // 3. Build the source and drive the whole chain.
         let mut source: Box<dyn Source<DataChunk>> = self.builder.build_source(&task.source)?;
-        source.execute(&mut *head).await?;
+        source.execute(&mut *vm).await?;
 
         // 4. Assemble the result from the sink (Spark `collect`-style).
         let output = sink
@@ -246,7 +231,7 @@ mod tests {
     use super::*;
     use crate::factory::TaskExecutorBuilder;
     use common::identifiers::{QueryId, StageId, TaskId};
-    use common::protocol::{ExecutionMode, FilterOp, FilterPredicate, FilterValue};
+    use common::protocol::{ExecutionMode, MicroOp, ScalarConstant};
 
     fn runner() -> DefaultTaskExecutor {
         TaskExecutorBuilder::new().build()
@@ -259,11 +244,22 @@ mod tests {
             query_id: QueryId::new(),
             stage_id: StageId::new(),
             source: DataSource::Memory, // dummy: Int64 [1,2,3,4,5]
-            operators: vec![Operator::Filter(FilterPredicate {
-                column: 0,
-                op: FilterOp::Gt,
-                literal: FilterValue::Int(2),
-            })],
+            program: MicroProgram {
+                register_count: 3,
+                instructions: vec![
+                    MicroOp::LoadConstant {
+                        dst: 1,
+                        value: ScalarConstant::Int64(2),
+                    },
+                    MicroOp::CmpGt {
+                        dst: 2,
+                        src1: 0,
+                        src2: 1,
+                    },
+                    MicroOp::FilterMask { bool_reg: 2 },
+                    MicroOp::ProjectRegisters { out_regs: vec![0] },
+                ],
+            },
             sink: DataSink::Client,
         }
     }
@@ -285,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_aborts() {
         let mut task = task();
-        task.operators = Vec::new();
+        task.program = MicroProgram::empty();
         let cancel = CancellationToken::new();
         cancel.cancel();
         let err = runner().execute(&task, cancel).await.unwrap_err();

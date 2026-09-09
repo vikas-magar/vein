@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::daemon::pipeline::{DataChunk, PipelineNode, Transform};
+use crate::pipeline::{DataChunk, PipelineNode, Transform};
 use error::Result;
 
 /// Telemetry metrics collected for a pipeline operator during execution.
 pub trait OperatorProfile: Send + Sync {
-    /// The canonical name of the operator (e.g. "FilterExecutor", "ProjectExecutor").
+    /// The canonical name of the operator (e.g. "VectorVmExecutor", "LimitTransform").
     fn name(&self) -> &'static str;
 
     /// Total number of logical rows received by this operator.

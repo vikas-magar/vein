@@ -1,10 +1,10 @@
 //! Limit transform operator: truncates and offsets in-flight rows.
 
-use crate::daemon::pipeline::{DataChunk, PipelineNode, Transform};
+use crate::pipeline::{DataChunk, PipelineNode, Transform};
 use common::Result;
 
 /// A synchronous [`Transform`] that limits the number of rows produced by a pipeline.
-pub struct LimitExecutor {
+pub struct LimitTransform {
     offset: u64,
     count: u64,
     rows_seen: u64,
@@ -12,8 +12,8 @@ pub struct LimitExecutor {
     next: Box<dyn PipelineNode<DataChunk>>,
 }
 
-impl LimitExecutor {
-    /// Create a new [`LimitExecutor`] with the given offset and count.
+impl LimitTransform {
+    /// Create a new [`LimitTransform`] with the given offset and count.
     pub fn new(offset: u64, count: u64, next: Box<dyn PipelineNode<DataChunk>>) -> Self {
         Self {
             offset,
@@ -25,7 +25,7 @@ impl LimitExecutor {
     }
 }
 
-impl PipelineNode<DataChunk> for LimitExecutor {
+impl PipelineNode<DataChunk> for LimitTransform {
     fn push(&mut self, chunk: DataChunk) -> Result<()> {
         if self.rows_emitted >= self.count {
             // Maximum rows already reached; drop further pushes
@@ -71,7 +71,7 @@ impl PipelineNode<DataChunk> for LimitExecutor {
     }
 }
 
-impl Transform<DataChunk> for LimitExecutor {}
+impl Transform<DataChunk> for LimitTransform {}
 
 #[cfg(test)]
 mod tests {
@@ -98,7 +98,7 @@ mod tests {
     fn test_limit_single_chunk() {
         let collected = Arc::new(Mutex::new(Vec::new()));
         let sink = Box::new(TestCollector(collected.clone()));
-        let mut limit = LimitExecutor::new(2, 3, sink);
+        let mut limit = LimitTransform::new(2, 3, sink);
 
         let array = Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60, 70])) as arrow::array::ArrayRef;
         let chunk = DataChunk::new(vec![array], SelectionVector::new_dense(7));
@@ -115,7 +115,7 @@ mod tests {
         let collected = Arc::new(Mutex::new(Vec::new()));
         let sink = Box::new(TestCollector(collected.clone()));
         // Offset 3, Count 4 across chunks of size 3
-        let mut limit = LimitExecutor::new(3, 4, sink);
+        let mut limit = LimitTransform::new(3, 4, sink);
 
         // Chunk 1: indices [0, 1, 2] (all skipped because offset is 3)
         let c1 = DataChunk::new(

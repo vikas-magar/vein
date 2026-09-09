@@ -168,7 +168,7 @@ mod tests {
     use orchestrator::ExecutorRegistry;
     use orchestrator::Scheduler;
     use parser::Parser;
-    use physical::DagPhysicalPlanner;
+    use physical::DefaultPhysicalPlanner;
     use std::time::Duration;
     use vcs::InMemoryCatalog;
 
@@ -180,7 +180,7 @@ mod tests {
                 Arc::new(MockFunctionRegistry::new()),
             )))
             .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
-            .with_planner(Arc::new(DagPhysicalPlanner::new()))
+            .with_planner(Arc::new(DefaultPhysicalPlanner::new()))
             .with_scheduler(Arc::new(Scheduler::new(
                 Arc::new(ExecutorRegistry::new()),
                 Arc::new(QuicTaskDispatcher::new()),
@@ -228,17 +228,18 @@ mod tests {
         assert!(!text.contains("18 + 2"), "expected folding, got:\n{text}");
     }
 
-    /// Non-EXPLAIN queries proceed into physical planning; that stage is a
-    /// stub today, which is what the error pins here.
+    /// Non-EXPLAIN queries proceed through physical planning into the scheduler.
+    /// In an isolated test harness without remote executor daemons registered,
+    /// scheduling fails with `No executors available`.
     #[tokio::test]
     async fn plain_query_reaches_physical_planning() {
         let engine = coordinator();
         let node = Parser::new("FROM users |> SELECT id, name")
             .parse_statement()
             .expect("query should parse");
-        let err = engine.submit_query(node).await.expect_err("physical planning is stubbed");
+        let err = engine.submit_query(node).await.expect_err("no executors registered");
         assert!(
-            err.to_string().contains("create_physical_plan"),
+            err.to_string().contains("No executors available"),
             "got {err}"
         );
     }

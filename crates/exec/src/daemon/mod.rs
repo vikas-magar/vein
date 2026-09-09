@@ -5,14 +5,16 @@
 
 /// Daemon context and shared state.
 pub mod context;
-/// Pipeline abstractions for push execution.
-pub mod pipeline;
 /// QUIC network listener logic.
 pub mod server;
 /// LocalSet worker pool implementation.
 pub mod worker;
 
 pub use context::DaemonContext;
-pub use pipeline::{PipelineNode, Sink, Source, Transform};
-pub use server::ExecutorDaemon;
+pub use server::{ExecutorDaemon, ExecutorDaemonBuilder, ExecutorDaemonConfig};
 pub use worker::WorkerPool;
+
+/// Pipeline abstractions re-exported from crate root.
+pub use crate::pipeline;
+pub use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
+

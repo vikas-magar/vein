@@ -1,20 +1,20 @@
-use crate::daemon::pipeline::{DataChunk, PipelineNode, Source};
+use crate::pipeline::{DataChunk, PipelineNode, Source};
 use arrow::record_batch::RecordBatch;
-use common::Result;
 use common::arrow::SelectionVector;
+use common::Result;
 
 /// An in-memory data source for testing.
-pub struct MemoryExecutor {
+pub struct MemorySource {
     batch: Option<RecordBatch>,
 }
 
-impl MemoryExecutor {
+impl MemorySource {
     /// Create a memory source from a single RecordBatch.
     pub fn new(batch: RecordBatch) -> Self {
         Self { batch: Some(batch) }
     }
 
-    /// Create a dummy MemoryExecutor source for quick testing.
+    /// Create a dummy [`MemorySource`] for quick testing.
     pub fn dummy() -> Self {
         let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("dummy", arrow::datatypes::DataType::Int64, false),
@@ -26,7 +26,7 @@ impl MemoryExecutor {
 }
 
 #[async_trait::async_trait(?Send)]
-impl Source<DataChunk> for MemoryExecutor {
+impl Source<DataChunk> for MemorySource {
     async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunk>) -> Result<()> {
         if let Some(batch) = self.batch.take() {
             let num_rows = batch.num_rows();
@@ -41,3 +41,4 @@ impl Source<DataChunk> for MemoryExecutor {
         Ok(())
     }
 }
+

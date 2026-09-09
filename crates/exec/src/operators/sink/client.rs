@@ -1,4 +1,6 @@
-use crate::daemon::pipeline::{DataChunk, PipelineNode, Sink};
+//! Client collect sink materializing surviving rows into Arrow record batches.
+
+use crate::pipeline::{DataChunk, PipelineNode, Sink};
 use arrow::array::UInt32Array;
 use arrow::compute::take;
 use arrow::datatypes::{Field, Schema};
@@ -14,18 +16,24 @@ use std::sync::Arc;
 /// rather than compacting the underlying arrays, so this sink materializes the
 /// selected rows via `arrow::compute::take` so the captured batches contain
 /// exactly the surviving rows.
-pub struct CollectExecutor {
+pub struct CollectSink {
     output: Vec<RecordBatch>,
 }
 
-impl CollectExecutor {
-    /// Create a new CollectExecutor.
+impl CollectSink {
+    /// Create a new [`CollectSink`].
     pub fn new() -> Self {
         Self { output: Vec::new() }
     }
 }
 
-impl PipelineNode<DataChunk> for CollectExecutor {
+impl Default for CollectSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PipelineNode<DataChunk> for CollectSink {
     fn push(&mut self, chunk: DataChunk) -> Result<()> {
         let selected = chunk.selection.size();
         if selected == 0 {
@@ -64,7 +72,7 @@ impl PipelineNode<DataChunk> for CollectExecutor {
     }
 }
 
-impl Sink<DataChunk> for CollectExecutor {
+impl Sink<DataChunk> for CollectSink {
     fn collect(&mut self) -> Vec<RecordBatch> {
         std::mem::take(&mut self.output)
     }

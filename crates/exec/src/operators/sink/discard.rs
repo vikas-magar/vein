@@ -1,21 +1,29 @@
-use crate::daemon::pipeline::{DataChunk, PipelineNode, Sink};
+//! Discard sink for benchmarking and development.
+
+use crate::pipeline::{DataChunk, PipelineNode, Sink};
 use common::Result;
 use tracing::info;
 
 /// A simple sink that discards all data.
 /// Useful for benchmarking, testing, or development.
-pub struct DiscardExecutor {
+pub struct DiscardSink {
     rows_seen: usize,
 }
 
-impl DiscardExecutor {
-    /// Create a new DiscardExecutor sink.
+impl DiscardSink {
+    /// Create a new [`DiscardSink`].
     pub fn new() -> Self {
         Self { rows_seen: 0 }
     }
 }
 
-impl PipelineNode<DataChunk> for DiscardExecutor {
+impl Default for DiscardSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PipelineNode<DataChunk> for DiscardSink {
     fn push(&mut self, batch: DataChunk) -> Result<()> {
         self.rows_seen += batch.selection.size();
         Ok(())
@@ -23,11 +31,11 @@ impl PipelineNode<DataChunk> for DiscardExecutor {
 
     fn flush(&mut self) -> Result<()> {
         info!(
-            "DiscardExecutor Sink finished, discarded {} total rows",
+            "DiscardSink finished, discarded {} total rows",
             self.rows_seen
         );
         Ok(())
     }
 }
 
-impl Sink<DataChunk> for DiscardExecutor {}
+impl Sink<DataChunk> for DiscardSink {}

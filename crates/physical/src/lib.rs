@@ -17,6 +17,9 @@
 /// The physical plan builder subsystem.
 pub mod builder;
 
+/// The physical bytecode compiler and lowering engine.
+pub mod compiler;
+
 /// The job graph: stages and the shuffle edges between them.
 pub mod job;
 
@@ -30,6 +33,6 @@ pub mod stage;
 pub mod task;
 
 pub use job::{Job, StageEdge};
-pub use planner::{DagPhysicalPlanner, PhysicalPlanner};
+pub use planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 pub use stage::Stage;
 pub use task::Task;

@@ -1,6 +1,6 @@
-use crate::daemon::pipeline::{DataChunk, PipelineNode, Source};
-use common::Result;
+use crate::pipeline::{DataChunk, PipelineNode, Source};
 use common::protocol::FileFormat;
+use common::Result;
 use error::VeinError;
 use opendal::Operator;
 
@@ -8,14 +8,14 @@ use opendal::Operator;
 pub mod parquet;
 
 /// A generic Source operator that scans files using OpenDAL and dispatches based on format.
-pub struct ScanExecutor {
+pub struct ScanSource {
     operator: Operator,
     paths: Vec<String>,
     format: FileFormat,
 }
 
-impl ScanExecutor {
-    /// Create a new ScanExecutor
+impl ScanSource {
+    /// Create a new [`ScanSource`].
     pub fn new(operator: Operator, paths: Vec<String>, format: FileFormat) -> Self {
         Self {
             operator,
@@ -26,7 +26,7 @@ impl ScanExecutor {
 }
 
 #[async_trait::async_trait(?Send)]
-impl Source<DataChunk> for ScanExecutor {
+impl Source<DataChunk> for ScanSource {
     #[tracing::instrument(skip_all)]
     async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunk>) -> Result<()> {
         match self.format {
@@ -45,3 +45,4 @@ impl Source<DataChunk> for ScanExecutor {
         Ok(())
     }
 }
+

@@ -1,13 +1,10 @@
-use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::DataType;
 use error::Result;
-
-use super::PhysicalExpr;
-use std::fmt::Debug;
 
 /// Trait defining a User-Defined Scalar Function (UDF).
 ///
@@ -22,45 +19,6 @@ pub trait ScalarUDFImpl: Debug + Send + Sync {
 
     /// Execute the function in a vectorized manner against batches of data.
     fn invoke(&self, args: &[ArrayRef]) -> Result<ArrayRef>;
-}
-
-/// A physical expression that invokes a `ScalarUDFImpl` over a set of child argument expressions.
-#[derive(Debug)]
-pub struct ScalarFunctionExpr {
-    udf: Arc<dyn ScalarUDFImpl>,
-    args: Vec<Box<dyn PhysicalExpr>>,
-}
-
-impl ScalarFunctionExpr {
-    /// Creates a new `ScalarFunctionExpr`.
-    pub fn new(udf: Arc<dyn ScalarUDFImpl>, args: Vec<Box<dyn PhysicalExpr>>) -> Self {
-        Self { udf, args }
-    }
-}
-
-impl PhysicalExpr for ScalarFunctionExpr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
-        let mut arg_types = Vec::with_capacity(self.args.len());
-        for arg in &self.args {
-            arg_types.push(arg.data_type(input_schema)?);
-        }
-        self.udf.return_type(&arg_types)
-    }
-
-    fn evaluate(&self, chunk: &crate::daemon::pipeline::DataChunk) -> Result<ArrayRef> {
-        // 1. Evaluate all child expressions to get the argument arrays
-        let mut arg_arrays = Vec::with_capacity(self.args.len());
-        for arg in &self.args {
-            arg_arrays.push(arg.evaluate(chunk)?);
-        }
-
-        // 2. Invoke the UDF implementation with the materialized arrays
-        self.udf.invoke(&arg_arrays)
-    }
 }
 
 /// A central registry of all available scalar and aggregate functions.
@@ -91,7 +49,6 @@ impl FunctionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expr::column::ColumnExpr;
     use arrow::array::Int64Array;
     use arrow::compute::kernels::numeric;
     use error::VeinError;
@@ -132,13 +89,9 @@ mod tests {
         let retrieved = registry.get_scalar("ADD_ONE").unwrap();
         assert_eq!(retrieved.name(), "add_one");
 
-        // Test PhysicalExpr execution
-        let array1 = Arc::new(Int64Array::from(vec![10, 20, 30]));
-        let arg = Box::new(ColumnExpr::new("a", 0));
-        let func_expr = ScalarFunctionExpr::new(retrieved, vec![arg]);
-
-        let chunk = crate::daemon::pipeline::DataChunk::from_vectors(vec![array1 as ArrayRef]);
-        let result = func_expr.evaluate(&chunk).unwrap();
+        // Test direct UDF invocation with array batches
+        let array1 = Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef;
+        let result = retrieved.invoke(&[array1]).unwrap();
         let result_int = result.as_any().downcast_ref::<Int64Array>().unwrap();
 
         assert_eq!(result_int.value(0), 11);

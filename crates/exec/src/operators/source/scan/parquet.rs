@@ -1,4 +1,4 @@
-use crate::daemon::pipeline::{DataChunk, PipelineNode};
+use crate::pipeline::{DataChunk, PipelineNode};
 use bytes::Bytes;
 use common::Result;
 use common::arrow::SelectionVector;
@@ -13,7 +13,7 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 struct OpendalParquetReader {
     operator: Operator,
     path: String,
-    size: u64,
+    _size: u64,
 }
 
 impl OpendalParquetReader {
@@ -23,12 +23,12 @@ impl OpendalParquetReader {
             .await
             .map_err(|e| VeinError::internal(format!("Failed to stat file {}: {}", path, e)))?;
 
-        let size = meta.content_length();
+        let _size = meta.content_length();
 
         Ok(Self {
             operator: operator.clone(),
             path: path.to_string(),
-            size,
+            _size,
         })
     }
 }
