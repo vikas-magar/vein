@@ -265,6 +265,7 @@ impl From<&ArchivedFileFormat> for FileFormat {
             ArchivedFileFormat::Parquet => FileFormat::Parquet,
             ArchivedFileFormat::Csv => FileFormat::Csv,
             ArchivedFileFormat::Json => FileFormat::Json,
+            ArchivedFileFormat::Exo => FileFormat::Exo,
         }
     }
 }

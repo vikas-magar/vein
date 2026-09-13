@@ -55,9 +55,15 @@ impl PipelineCompiler {
                     })
                     .collect();
 
+                let (files, format) = if table_name.ends_with(".exo") || table_name.contains("part_") {
+                    (vec![table_name.clone()], FileFormat::Exo)
+                } else {
+                    (vec![format!("{table_name}.parquet")], FileFormat::Parquet)
+                };
+
                 let scan_task = FileScanTask {
-                    files: vec![format!("{table_name}.parquet")],
-                    format: FileFormat::Parquet,
+                    files,
+                    format,
                     byte_range: None,
                     column_ids: column_ids.into_iter().map(|id| id.0 as i32).collect(),
                     projected_schema,
@@ -66,10 +72,31 @@ impl PipelineCompiler {
                 };
                 Ok((DataSource::File(scan_task), (**schema).clone()))
             }
-            LogicalPlan::ExternalScan { url, schema, .. } => {
+            LogicalPlan::ExternalScan {
+                url,
+                options,
+                schema,
+            } => {
+                let format = options
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("format"))
+                    .map(|(_, v)| match v.to_lowercase().as_str() {
+                        "exo" => FileFormat::Exo,
+                        "csv" => FileFormat::Csv,
+                        "json" => FileFormat::Json,
+                        _ => FileFormat::Parquet,
+                    })
+                    .unwrap_or_else(|| {
+                        if url.ends_with(".exo") || url.contains("part_") {
+                            FileFormat::Exo
+                        } else {
+                            FileFormat::Parquet
+                        }
+                    });
+
                 let scan_task = FileScanTask {
                     files: vec![url.clone()],
-                    format: FileFormat::Parquet,
+                    format,
                     byte_range: None,
                     column_ids: schema.fields.iter().map(|f| f.id.0 as i32).collect(),
                     projected_schema: schema
@@ -172,5 +199,43 @@ mod tests {
         assert!(matches!(source, DataSource::File(_)));
         assert_eq!(program.instructions.len(), 3);
         assert_eq!(out_schema.fields.len(), 2);
+    }
+
+    #[test]
+    fn test_compile_exo_scan_format() {
+        let schema = Box::new(VeinSchema::new(vec![
+            ResolvedColumn::new(ColumnId(1), "col_a", None, VeinDataType::Utf8),
+        ]));
+
+        // 1. Table with part_ prefix should select FileFormat::Exo
+        let scan_exo = LogicalPlan::Scan {
+            table_name: "tbl_10/part_000002".to_string(),
+            projection: None,
+            filters: Vec::new(),
+            schema: schema.clone(),
+        };
+        let (source_exo, _, _) = PipelineCompiler::compile(&scan_exo).unwrap();
+        match source_exo {
+            DataSource::File(task) => {
+                assert_eq!(task.format, FileFormat::Exo);
+                assert_eq!(task.files, vec!["tbl_10/part_000002"]);
+            }
+            _ => panic!("Expected DataSource::File"),
+        }
+
+        // 2. ExternalScan with format option "exo"
+        let ext_scan = LogicalPlan::ExternalScan {
+            url: "s3://bucket/data/orders.exo".to_string(),
+            options: vec![("format".to_string(), "exo".to_string())],
+            schema: schema.clone(),
+        };
+        let (source_ext, _, _) = PipelineCompiler::compile(&ext_scan).unwrap();
+        match source_ext {
+            DataSource::File(task) => {
+                assert_eq!(task.format, FileFormat::Exo);
+                assert_eq!(task.files, vec!["s3://bucket/data/orders.exo"]);
+            }
+            _ => panic!("Expected DataSource::File"),
+        }
     }
 }

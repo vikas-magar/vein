@@ -8,7 +8,7 @@ use super::ir::MicroProgram;
 
 /// Supported file formats for storage scans.
 #[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub enum FileFormat {
     /// Apache Parquet
@@ -17,6 +17,8 @@ pub enum FileFormat {
     Csv,
     /// JavaScript Object Notation
     Json,
+    /// Vein Dual-Plane Columnar Storage Format (.exo)
+    Exo,
 }
 
 /// Minimal field schema for protocol serialization.

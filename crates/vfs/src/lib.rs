@@ -11,6 +11,7 @@ pub mod recovery;
 pub mod rpc;
 pub mod topology;
 
+pub use block::{BlockKey, PlaneType, SegmentKey};
 pub use config::VfsConfig;
 pub use error::{Result, VfsError};
 /// Abstract traits defining the system architecture.

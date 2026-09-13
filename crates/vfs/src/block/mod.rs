@@ -20,5 +20,8 @@ pub trait BlockManager: Send + Sync {
     async fn read_extent(&self, extent: &Extent) -> Result<Vec<u8>>;
 }
 
+pub mod key;
 pub mod mmap_manager;
+
+pub use key::{BlockKey, PlaneType, SegmentKey};
 pub use mmap_manager::MmapBlockManager;

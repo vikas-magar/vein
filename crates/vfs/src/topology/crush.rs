@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::block::{BlockKey, SegmentKey};
+
 /// Represents a node in the CRUSH cluster map.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
@@ -38,8 +40,57 @@ impl ClusterMap {
         self.nodes.push(node);
     }
 
-    /// Determines the target `Node` for a given `block_id` using the Straw2 algorithm.
+    /// Determines the target `Node` for a given `block_id` or canonical path using Straw2.
+    ///
+    /// If the `block_id` is a canonical `.exo` block path (e.g. `tbl_1/part_000002/col.exo.addr`),
+    /// this automatically extracts its segment affinity token (`seg:1:000002`) so that all planes
+    /// and columns for that segment are strictly co-located on the same node.
     pub fn get_owner(&self, block_id: &str) -> crate::Result<Node> {
+        let token = Self::resolve_affinity_token(block_id);
+        self.get_owner_by_token(&token)
+    }
+
+    /// Determines the primary target `Node` for a `SegmentKey` using Straw2 segment affinity.
+    ///
+    /// Guarantees that Address Plane (`.exo.addr`), Payload Vault (`.exo.vault`),
+    /// and Tombstone mask (`.exo.tomb`) for the segment land on the exact same physical node.
+    pub fn get_segment_owner(&self, segment: &SegmentKey) -> crate::Result<Node> {
+        self.get_owner_by_token(&segment.affinity_token())
+    }
+
+    /// Determines the target `Node` for a typed `BlockKey` using Straw2 segment affinity.
+    ///
+    /// Delegates to `get_segment_owner(&key.segment)`, guaranteeing physical co-location
+    /// across all columns and planes within the partition.
+    pub fn get_block_owner(&self, key: &BlockKey) -> crate::Result<Node> {
+        self.get_segment_owner(&key.segment)
+    }
+
+    /// Selects `count` distinct replica nodes for a `SegmentKey` ranked by Straw2 score.
+    ///
+    /// The primary owner is at index 0. All planes for this segment share identical replica placement.
+    pub fn get_segment_replicas(&self, segment: &SegmentKey, count: usize) -> crate::Result<Vec<Node>> {
+        self.get_replicas_by_token(&segment.affinity_token(), count)
+    }
+
+    /// Selects `count` distinct replica nodes for a `BlockKey` ranked by Straw2 score.
+    pub fn get_block_replicas(&self, key: &BlockKey, count: usize) -> crate::Result<Vec<Node>> {
+        self.get_segment_replicas(&key.segment, count)
+    }
+
+    /// Resolves an affinity token from an arbitrary path or block identifier.
+    /// If the path is a canonical block path, extracts the segment affinity token.
+    fn resolve_affinity_token(block_id: &str) -> String {
+        let trimmed = block_id.strip_prefix('/').unwrap_or(block_id);
+        if let Ok(key) = BlockKey::parse_canonical_path(trimmed) {
+            key.segment.affinity_token()
+        } else {
+            block_id.to_string()
+        }
+    }
+
+    /// Internal Straw2 placement calculation for a resolved affinity token.
+    fn get_owner_by_token(&self, token: &str) -> crate::Result<Node> {
         if self.nodes.is_empty() {
             return Err(crate::VfsError::Internal("No nodes in cluster map".into()));
         }
@@ -52,7 +103,7 @@ impl ClusterMap {
                 continue;
             }
 
-            let h = hash_node_block(&node.id, block_id);
+            let h = hash_node_block(&node.id, token);
             let one_minus_h = (1.0_f64 - h).max(f64::EPSILON);
             // Standard Ceph Straw2 score calculation: draw = ln(r) / weight where r = (1 - h) in (0, 1].
             // Since ln(r) <= 0, dividing by a larger node weight produces a score closer to 0 (i.e. higher score),
@@ -68,6 +119,37 @@ impl ClusterMap {
         best_node
             .cloned()
             .ok_or_else(|| crate::VfsError::Internal("No valid nodes in cluster map".into()))
+    }
+
+    /// Selects `count` distinct nodes ranked by Straw2 score for the given affinity token.
+    fn get_replicas_by_token(&self, token: &str, count: usize) -> crate::Result<Vec<Node>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if self.nodes.is_empty() {
+            return Err(crate::VfsError::Internal("No nodes in cluster map".into()));
+        }
+
+        let mut scored: Vec<(f64, &Node)> = Vec::new();
+        for node in &self.nodes {
+            if node.weight <= 0.0 {
+                continue;
+            }
+            let h = hash_node_block(&node.id, token);
+            let one_minus_h = (1.0_f64 - h).max(f64::EPSILON);
+            let score = one_minus_h.ln() / node.weight;
+            scored.push((score, node));
+        }
+
+        if scored.is_empty() {
+            return Err(crate::VfsError::Internal("No valid nodes in cluster map".into()));
+        }
+
+        // Sort descending by score (highest score first)
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let take_count = count.min(scored.len());
+        Ok(scored.iter().take(take_count).map(|(_, n)| (*n).clone()).collect())
     }
 
     /// Returns all nodes whose `id` differs from `node_id`.
@@ -316,5 +398,82 @@ mod tests {
             port: 4433,
         };
         assert_eq!(node.addr(), "192.168.1.10:4433");
+    }
+
+    #[test]
+    fn test_straw2_dual_plane_co_location() -> crate::Result<()> {
+        let mut map = ClusterMap::new();
+        for i in 1..=5 {
+            map.add_node(Node {
+                id: format!("node_{}", i),
+                weight: 1.0,
+                ip: format!("10.0.0.{}", i),
+                port: 8000 + i as u16,
+            });
+        }
+
+        // For partition 42/7, test Address Plane, Payload Vault, and Tombstone
+        let seg = SegmentKey::new(42, 7);
+        let seg_owner = map.get_segment_owner(&seg)?;
+
+        let addr_key1 = BlockKey::address(42, 7, "click_id");
+        let addr_key2 = BlockKey::address(42, 7, "user_id");
+        let vault_key1 = BlockKey::vault(42, 7, "url");
+        let vault_key2 = BlockKey::vault(42, 7, "payload");
+        let tomb_key = BlockKey::tombstone(42, 7);
+
+        // Typed block owner must match segment owner
+        assert_eq!(map.get_block_owner(&addr_key1)?.id, seg_owner.id);
+        assert_eq!(map.get_block_owner(&addr_key2)?.id, seg_owner.id);
+        assert_eq!(map.get_block_owner(&vault_key1)?.id, seg_owner.id);
+        assert_eq!(map.get_block_owner(&vault_key2)?.id, seg_owner.id);
+        assert_eq!(map.get_block_owner(&tomb_key)?.id, seg_owner.id);
+
+        // Path resolution via get_owner must also match segment owner
+        assert_eq!(map.get_owner(&addr_key1.to_canonical_path())?.id, seg_owner.id);
+        assert_eq!(map.get_owner(&vault_key1.to_canonical_path())?.id, seg_owner.id);
+        assert_eq!(map.get_owner(&tomb_key.to_canonical_path())?.id, seg_owner.id);
+        assert_eq!(map.get_owner(&format!("/{}", addr_key2.to_canonical_path()))?.id, seg_owner.id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_straw2_segment_replicas_co_location() -> crate::Result<()> {
+        let mut map = ClusterMap::new();
+        for i in 1..=6 {
+            map.add_node(Node {
+                id: format!("node_{}", i),
+                weight: 1.0,
+                ip: format!("10.0.0.{}", i),
+                port: 9000 + i as u16,
+            });
+        }
+
+        let seg = SegmentKey::new(100, 3);
+        let replicas = map.get_segment_replicas(&seg, 3)?;
+        assert_eq!(replicas.len(), 3);
+        // Ensure all 3 replicas are distinct
+        assert_ne!(replicas[0].id, replicas[1].id);
+        assert_ne!(replicas[1].id, replicas[2].id);
+        assert_ne!(replicas[0].id, replicas[2].id);
+
+        // Primary owner must match the first replica
+        assert_eq!(map.get_segment_owner(&seg)?.id, replicas[0].id);
+
+        // All block replicas must match segment replicas exactly
+        let addr_key = BlockKey::address(100, 3, "score");
+        let vault_key = BlockKey::vault(100, 3, "blob");
+        let addr_reps = map.get_block_replicas(&addr_key, 3)?;
+        let vault_reps = map.get_block_replicas(&vault_key, 3)?;
+
+        assert_eq!(addr_reps, replicas);
+        assert_eq!(vault_reps, replicas);
+
+        // Edge cases
+        assert_eq!(map.get_segment_replicas(&seg, 0)?.len(), 0);
+        assert_eq!(map.get_segment_replicas(&seg, 10)?.len(), 6);
+
+        Ok(())
     }
 }

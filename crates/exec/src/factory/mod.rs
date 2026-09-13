@@ -84,7 +84,15 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                 let op = opendal::Operator::new(builder)
                     .map_err(|e| VeinError::internal(format!("build fs operator: {e}")))?
                     .finish();
-                Ok(Box::new(ScanSource::new(op, scan.files.clone(), scan.format.clone())))
+                let projection = if scan.projected_schema.is_empty() {
+                    None
+                } else {
+                    Some(scan.projected_schema.iter().map(|f| f.name.clone()).collect())
+                };
+                Ok(Box::new(
+                    ScanSource::new(op, scan.files.clone(), scan.format.clone())
+                        .with_projection(projection),
+                ))
             }
             DataSource::Exchange(_) => Err(VeinError::internal(
                 "Exchange source is not yet implemented",

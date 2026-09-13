@@ -128,11 +128,39 @@ impl MmapBlockManager {
 
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let seq = BLOCK_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         ((ts & 0xFFFFFFFF) << 32) | ((node_hash & 0xFFFF) << 16) | (seq & 0xFFFF)
+    }
+
+    /// Advises the OS kernel on the paging behavior for a memory-mapped plane.
+    ///
+    /// - `AddressPlane`: Sequential (dense fixed-width 16-byte address scan)
+    /// - `PayloadVault`: Random (disables speculative OS readahead thrashing on late materialization)
+    /// - `Tombstone`: WillNeed (pins roaring bitmap mask in RAM)
+    pub fn advise_mmap(mmap: &memmap2::Mmap, plane: crate::block::PlaneType) -> Result<()> {
+        let advice = match plane {
+            crate::block::PlaneType::AddressPlane => memmap2::Advice::Sequential,
+            crate::block::PlaneType::PayloadVault => memmap2::Advice::Random,
+            crate::block::PlaneType::Tombstone => memmap2::Advice::WillNeed,
+        };
+        mmap.advise(advice).map_err(|e| {
+            crate::VfsError::Internal(format!("Failed to advise OS page cache for plane {:?}: {}", plane, e))
+        })
+    }
+
+    /// Advises the OS kernel on the paging behavior for a mutable memory-mapped plane.
+    pub fn advise_mmap_mut(mmap: &memmap2::MmapMut, plane: crate::block::PlaneType) -> Result<()> {
+        let advice = match plane {
+            crate::block::PlaneType::AddressPlane => memmap2::Advice::Sequential,
+            crate::block::PlaneType::PayloadVault => memmap2::Advice::Random,
+            crate::block::PlaneType::Tombstone => memmap2::Advice::WillNeed,
+        };
+        mmap.advise(advice).map_err(|e| {
+            crate::VfsError::Internal(format!("Failed to advise OS page cache for plane {:?}: {}", plane, e))
+        })
     }
 
     /// Helper to allocate a physical 5GB file on disk and memory map it
@@ -342,5 +370,43 @@ impl BlockManager for MmapBlockManager {
             .map_err(|e| crate::VfsError::Internal(e.to_string()))?;
 
         Ok(data.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use crate::block::PlaneType;
+
+    #[test]
+    fn test_advise_mmap_planes() -> Result<()> {
+        let dir = tempdir().map_err(|e| crate::VfsError::Internal(e.to_string()))?;
+        let file_path = dir.path().join("test_advise.bin");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&file_path)
+            .map_err(|e| crate::VfsError::Internal(e.to_string()))?;
+
+        file.set_len(4096).map_err(|e| crate::VfsError::Internal(e.to_string()))?;
+
+        // Test MmapMut advice
+        let mmap_mut = unsafe { MmapMut::map_mut(&file) }
+            .map_err(|e| crate::VfsError::Internal(e.to_string()))?;
+        MmapBlockManager::advise_mmap_mut(&mmap_mut, PlaneType::AddressPlane)?;
+        MmapBlockManager::advise_mmap_mut(&mmap_mut, PlaneType::PayloadVault)?;
+        MmapBlockManager::advise_mmap_mut(&mmap_mut, PlaneType::Tombstone)?;
+        drop(mmap_mut);
+
+        // Test Mmap advice
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| crate::VfsError::Internal(e.to_string()))?;
+        MmapBlockManager::advise_mmap(&mmap, PlaneType::AddressPlane)?;
+        MmapBlockManager::advise_mmap(&mmap, PlaneType::PayloadVault)?;
+        MmapBlockManager::advise_mmap(&mmap, PlaneType::Tombstone)?;
+
+        Ok(())
     }
 }
