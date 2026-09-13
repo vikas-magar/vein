@@ -1,6 +1,5 @@
+use crate::daemon::QueuedTask;
 use crate::runtime::TaskExecutor;
-use common::cancellation::CancellationToken;
-use common::protocol::ExecuteTask;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use tokio::task::LocalSet;
@@ -8,7 +7,7 @@ use tracing::{error, info};
 
 /// A pool of OS threads pinning Tokio LocalSets for cache-local execution.
 ///
-/// Each worker pulls [`ExecuteTask`]s off a shared queue and runs them through
+/// Each worker pulls [`QueuedTask`]s off a shared queue and runs them through
 /// the injected [`TaskExecutor`] — the abstraction that builds and drives the
 /// pipeline — so the pool itself stays free of any execution logic.
 pub struct WorkerPool {
@@ -21,7 +20,7 @@ impl WorkerPool {
     /// each through `executor`.
     pub fn start(
         cores: usize,
-        queue: flume::Receiver<ExecuteTask>,
+        queue: flume::Receiver<QueuedTask>,
         executor: Arc<dyn TaskExecutor>,
     ) -> Self {
         let mut cpu_handles = Vec::with_capacity(cores);
@@ -32,6 +31,7 @@ impl WorkerPool {
 
             let handle = thread::Builder::new()
                 .name(format!("vein-worker-{}", core_id))
+                .stack_size(8 * 1024 * 1024)
                 .spawn(move || {
                     info!("Started worker thread {} pinned to CPU core", core_id);
 
@@ -45,20 +45,22 @@ impl WorkerPool {
 
                     local.block_on(&rt, async move {
                         // Work-stealing loop: pull tasks asynchronously
-                        while let Ok(task) = queue_clone.recv_async().await {
+                        while let Ok(queued_task) = queue_clone.recv_async().await {
                             let executor = executor.clone();
                             tokio::task::spawn_local(async move {
-                                let cancel = CancellationToken::new();
-                                match executor.execute(&task, cancel).await {
-                                    Ok(result) => info!(
+                                let task_id = queued_task.task.task_id;
+                                let result = executor.execute(&queued_task.task, queued_task.cancel).await;
+                                match &result {
+                                    Ok(res) => info!(
                                         "Worker {} finished task {}: {} rows",
-                                        core_id, task.task_id, result.row_count
+                                        core_id, task_id, res.row_count
                                     ),
                                     Err(e) => error!(
                                         "Worker {} task {} failed: {}",
-                                        core_id, task.task_id, e
+                                        core_id, task_id, e
                                     ),
                                 }
+                                let _ = queued_task.responder.send(result);
                             });
                         }
                         info!("Worker {} shutting down", core_id);

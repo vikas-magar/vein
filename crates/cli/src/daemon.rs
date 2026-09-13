@@ -1,4 +1,5 @@
 use crate::engine::QueryEngine;
+use common::transport::{extract_control_payload, frame_control_message};
 use common::Result;
 use s2n_quic::Server;
 use std::sync::Arc;
@@ -99,8 +100,61 @@ impl MasterDaemon {
                             }
                         }
 
+                        if buf.is_empty() {
+                            return;
+                        }
+
+                        // Check if this is an inter-node control event (0x02 opcode)
+                        if let Some(payload) = extract_control_payload(&buf) {
+                            let mut aligned = rkyv::util::AlignedVec::<16>::new();
+                            aligned.extend_from_slice(payload);
+
+                            if let Ok(archived) = rkyv::access::<common::protocol::ArchivedVeinControlEvent, rkyv::rancor::Error>(&aligned) {
+                                match archived {
+                                    common::protocol::ArchivedVeinControlEvent::Heartbeat {
+                                        node_id,
+                                        node_kind,
+                                        load,
+                                        advertise_addr,
+                                        ..
+                                    } => {
+                                        let nid = common::identifiers::NodeId::from_raw(node_id.0.to_native());
+                                        let kind = common::protocol::NodeKind::from(node_kind);
+                                        let load = common::protocol::NodeLoad::from(load);
+                                        let addr_str = advertise_addr.as_str();
+                                        debug!(target: "vein_master", %nid, %addr_str, "Received heartbeat from node");
+                                        if let (Ok(addr), Some(registry)) = (addr_str.parse::<std::net::SocketAddr>(), engine.registry()) {
+                                            registry.record_heartbeat(nid, addr, kind, load).await;
+                                        }
+                                        let ack = common::protocol::VeinControlEvent::HeartbeatAck;
+                                        if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&ack) {
+                                            let wire = frame_control_message(&bytes);
+                                            let _ = stream.send(wire).await;
+                                            let _ = stream.finish();
+                                        }
+                                        return;
+                                    }
+                                    _ => {
+                                        debug!(target: "vein_master", "Received other control event on master");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
                         // 2. Zero-copy access the typed ProtocolRequest via rkyv
-                        let request = match rkyv::access::<common::protocol::ArchivedProtocolRequest, rkyv::rancor::Error>(&buf) {
+                        let client_payload = if buf.len() >= 5 && buf[0] == 0x01 {
+                            let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                            if buf.len() >= 5 + len {
+                                &buf[5..5 + len]
+                            } else {
+                                &buf[5..]
+                            }
+                        } else {
+                            &buf[..]
+                        };
+
+                        let request = match rkyv::access::<common::protocol::ArchivedProtocolRequest, rkyv::rancor::Error>(client_payload) {
                             Ok(req) => req,
                             Err(e) => {
                                 warn!(target: "vein_master", error = %e, "Failed to decode ProtocolRequest from client");

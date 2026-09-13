@@ -80,7 +80,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                 // (e.g. s3://, fs://) instead of always mounting local filesystem.
                 use opendal::services::Fs;
                 let mut builder = Fs::default();
-                builder.root("/");
+                builder.root("./");
                 let op = opendal::Operator::new(builder)
                     .map_err(|e| VeinError::internal(format!("build fs operator: {e}")))?
                     .finish();
@@ -110,7 +110,10 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
     fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>> {
         match sink {
             DataSink::Discard => Ok(Box::new(DiscardSink::new())),
-            DataSink::Client => Ok(Box::new(CollectSink::new())),
+            DataSink::Client { schema } => {
+                let field_names = schema.iter().map(|f| f.name.clone()).collect();
+                Ok(Box::new(CollectSink::with_field_names(field_names)))
+            }
             DataSink::Shuffle(_) => Err(VeinError::internal(
                 "Shuffle sink is not yet implemented",
             )),

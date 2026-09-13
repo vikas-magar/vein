@@ -14,14 +14,14 @@ pub trait TaskDispatcher: Send + Sync {
         &self,
         executor: &NodeInfo,
         task: ExecuteTask,
-    ) -> std::result::Result<(), VeinError>;
+    ) -> Result<(), VeinError>;
 
     /// Block until the task completes (Wait for TaskCompleted or TaskFailed event).
     async fn wait_for_completion(
         &self,
         query_id: QueryId,
         task_id: TaskId,
-    ) -> std::result::Result<(), VeinError>;
+    ) -> Result<(), VeinError>;
 
     /// Cancel a running task on the executor.
     async fn cancel_task(
@@ -30,4 +30,7 @@ pub trait TaskDispatcher: Send + Sync {
         query_id: QueryId,
         task_id: TaskId,
     ) -> std::result::Result<(), VeinError>;
+
+    /// Retrieve the collected output bytes for a query (from DataSink::Client tasks).
+    fn take_query_output(&self, query_id: QueryId) -> Option<bytes::Bytes>;
 }

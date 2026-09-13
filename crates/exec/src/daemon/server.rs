@@ -8,12 +8,17 @@ use std::sync::Arc;
 
 use tracing::{error, info};
 
-use crate::daemon::{DaemonContext, WorkerPool};
+use crate::daemon::{DaemonContext, QueuedTask, WorkerPool};
 use crate::factory::TaskExecutorBuilder;
-use crate::runtime::TaskExecutor;
+use crate::runtime::{ArrowIpcOutputEncoder, OutputEncoder, TaskExecutor};
+use common::cancellation::CancellationToken;
 use common::identifiers::{NodeId, QueryId, TaskId};
-use common::protocol::{ArchivedVeinControlEvent, ExecuteTask};
-use common::transport::{build_quic_client, build_quic_server};
+use common::protocol::{
+    ArchivedVeinControlEvent, DataSink, ExecuteTask, NodeKind, NodeLoad, VeinControlEvent,
+};
+use common::transport::{
+    build_quic_client, build_quic_server, extract_control_payload, frame_control_message,
+};
 use common::Result;
 use error::VeinError;
 
@@ -80,6 +85,71 @@ impl ExecutorDaemon {
             }
         });
 
+        // Spawn periodic heartbeat ticker to Master
+        let hb_ctx = self.ctx.clone();
+        let master_addr = config.master_addr.clone();
+        let node_id = config.node_id;
+        let advertise_addr = config.bind_addr.to_string();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                let target_addr: std::result::Result<SocketAddr, _> = master_addr.parse();
+                let target_addr = match target_addr {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        tracing::debug!("Invalid master address for heartbeat: {e}");
+                        continue;
+                    }
+                };
+
+                let connect =
+                    s2n_quic::client::Connect::new(target_addr).with_server_name("localhost");
+                let mut conn = match hb_ctx.master_client.connect(connect).await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        tracing::trace!("Heartbeat connect to master {target_addr} failed: {e}");
+                        continue;
+                    }
+                };
+
+                let mut stream = match conn.open_bidirectional_stream().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::trace!("Heartbeat open stream to master {target_addr} failed: {e}");
+                        continue;
+                    }
+                };
+
+                let hb = VeinControlEvent::Heartbeat {
+                    node_id,
+                    node_kind: NodeKind::Executor,
+                    timestamp_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    load: NodeLoad {
+                        active_tasks: hb_ctx.active_tasks.len() as u16,
+                        cpu_percent: 0.0,
+                        memory_bytes: 0,
+                    },
+                    advertise_addr: advertise_addr.clone(),
+                };
+
+                if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&hb) {
+                    let wire = frame_control_message(&bytes);
+                    if stream.send(wire).await.is_ok() {
+                        let _ = stream.finish();
+                        let mut resp = Vec::new();
+                        while let Ok(Some(chunk)) = stream.receive().await {
+                            resp.extend_from_slice(&chunk);
+                        }
+                    }
+                }
+            }
+        });
+
         tokio::signal::ctrl_c().await?;
         info!("Shutting down Executor daemon");
         Ok(())
@@ -105,7 +175,7 @@ impl ExecutorDaemon {
                 while let Ok(Some(mut stream)) = connection.accept_bidirectional_stream().await {
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
-                        let mut buffer = rkyv::util::AlignedVec::<16>::new();
+                        let mut buffer = Vec::new();
                         while let Ok(Some(chunk)) = stream.receive().await {
                             buffer.extend_from_slice(&chunk);
                         }
@@ -114,10 +184,18 @@ impl ExecutorDaemon {
                             return;
                         }
 
+                        let payload = match extract_control_payload(&buffer) {
+                            Some(p) => p,
+                            None => return,
+                        };
+
+                        let mut aligned = rkyv::util::AlignedVec::<16>::new();
+                        aligned.extend_from_slice(payload);
+
                         let archived = match rkyv::access::<
                             ArchivedVeinControlEvent,
                             rkyv::rancor::Error,
-                        >(&buffer)
+                        >(&aligned)
                         {
                             Ok(e) => e,
                             Err(e) => {
@@ -129,13 +207,92 @@ impl ExecutorDaemon {
                         match archived {
                             ArchivedVeinControlEvent::DispatchTask(archived_task) => {
                                 let task = ExecuteTask::from(archived_task);
+                                let task_id = task.task_id;
+                                let query_id = task.query_id;
                                 info!(
                                     "Received DispatchTask for Task {:?} (Query {:?})",
-                                    task.task_id, task.query_id
+                                    task_id, query_id
                                 );
 
-                                if let Err(e) = ctx.task_queue.send_async(task).await {
+                                let cancel = CancellationToken::new();
+                                ctx.register_task(task_id, cancel.clone());
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let queued = QueuedTask {
+                                    task: task.clone(),
+                                    cancel,
+                                    responder: tx,
+                                };
+
+                                if let Err(e) = ctx.task_queue.send_async(queued).await {
                                     error!("Failed to push task to worker queue: {}", e);
+                                    ctx.active_tasks.remove(&task_id);
+                                    let fail_event = VeinControlEvent::TaskFailed {
+                                        task_id,
+                                        query_id,
+                                        error: format!("Worker queue error: {e}"),
+                                    };
+                                    if let Ok(bytes) =
+                                        rkyv::to_bytes::<rkyv::rancor::Error>(&fail_event)
+                                    {
+                                        let wire = frame_control_message(&bytes);
+                                        let _ = stream.send(wire).await;
+                                        let _ = stream.finish();
+                                    }
+                                    return;
+                                }
+
+                                // Await task execution completion from worker
+                                let exec_result = rx.await;
+                                ctx.active_tasks.remove(&task_id);
+
+                                let event = match exec_result {
+                                    Ok(Ok(res)) => {
+                                        let result_bytes = if matches!(task.sink, DataSink::Client { .. }) {
+                                            let encoder = ArrowIpcOutputEncoder::new();
+                                            match encoder.encode(&res.output) {
+                                                Ok(b) => Some(b.to_vec()),
+                                                Err(e) => {
+                                                    error!("Failed to encode output batches into Arrow IPC: {}", e);
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            None
+                                        };
+
+                                        VeinControlEvent::TaskCompleted {
+                                            task_id,
+                                            query_id,
+                                            row_count: res.row_count,
+                                            bytes_read: res.metrics.bytes_read,
+                                            duration_ns: res.metrics.duration_ns,
+                                            result_bytes,
+                                        }
+                                    }
+                                    Ok(Err(err)) => VeinControlEvent::TaskFailed {
+                                        task_id,
+                                        query_id,
+                                        error: err.to_string(),
+                                    },
+                                    Err(_) => VeinControlEvent::TaskFailed {
+                                        task_id,
+                                        query_id,
+                                        error: "Worker dropped task channel without responding"
+                                            .to_string(),
+                                    },
+                                };
+
+                                match rkyv::to_bytes::<rkyv::rancor::Error>(&event) {
+                                    Ok(bytes) => {
+                                        let wire = frame_control_message(&bytes);
+                                        if let Err(e) = stream.send(wire).await {
+                                            error!("Failed to stream task response to master: {}", e);
+                                        }
+                                        let _ = stream.finish();
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to serialize TaskCompleted event: {}", e);
+                                    }
                                 }
                             }
                             ArchivedVeinControlEvent::CancelTask { task_id, query_id } => {
@@ -399,6 +556,7 @@ mod tests {
                 cpu_percent: 12.5,
                 memory_bytes: 1024,
             },
+            advertise_addr: "127.0.0.1:8081".to_string(),
         };
         let hb_bytes = rkyv::to_bytes::<Error>(&hb).expect("serialization succeeds");
         let mut hb_aligned = rkyv::util::AlignedVec::<16>::new();

@@ -157,6 +157,7 @@ mod tests {
                 cpu_percent: 25.0,
                 memory_bytes: 8192,
             },
+            advertise_addr: "127.0.0.1:8081".to_string(),
         };
         let hb_bytes = rkyv::to_bytes::<Error>(&hb).expect("Heartbeat serialization failed");
         let mut hb_aligned = rkyv::util::AlignedVec::<16>::new();
@@ -169,12 +170,27 @@ mod tests {
             control::ArchivedVeinControlEvent::Heartbeat {
                 node_id: archived_nid,
                 timestamp_ms,
+                advertise_addr,
                 ..
             } => {
                 assert_eq!(NodeId::from_raw(archived_nid.0.to_native()), node_id);
                 assert_eq!(timestamp_ms.to_native(), 999888777);
+                assert_eq!(advertise_addr.as_str(), "127.0.0.1:8081");
             }
             _ => panic!("expected Heartbeat"),
+        }
+
+        let from_archived = VeinControlEvent::from(archived_hb);
+        if let VeinControlEvent::Heartbeat {
+            node_id: nid,
+            advertise_addr: addr,
+            ..
+        } = from_archived
+        {
+            assert_eq!(nid, node_id);
+            assert_eq!(addr, "127.0.0.1:8081");
+        } else {
+            panic!("expected Heartbeat");
         }
     }
 }

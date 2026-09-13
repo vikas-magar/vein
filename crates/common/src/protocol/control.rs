@@ -62,12 +62,16 @@ pub enum VeinControlEvent {
     TaskCompleted {
         /// The completed task.
         task_id: TaskId,
+        /// Query the task belongs to.
+        query_id: QueryId,
         /// Number of rows produced.
         row_count: u64,
         /// Bytes read from storage.
         bytes_read: u64,
         /// Wall-clock duration in nanoseconds.
         duration_ns: u64,
+        /// Serialized Arrow IPC stream for DataSink::Client tasks.
+        result_bytes: Option<Vec<u8>>,
     },
     /// A new task assigned to this Executor.
     DispatchTask(ExecuteTask),
@@ -75,6 +79,8 @@ pub enum VeinControlEvent {
     TaskFailed {
         /// The failed task.
         task_id: TaskId,
+        /// Query the task belongs to.
+        query_id: QueryId,
         /// Error message.
         error: String,
     },
@@ -102,7 +108,11 @@ pub enum VeinControlEvent {
         timestamp_ms: u64,
         /// Current load.
         load: NodeLoad,
+        /// Listening address for incoming task dispatch (e.g. "127.0.0.1:8081").
+        advertise_addr: String,
     },
+    /// Master acknowledgment of a heartbeat.
+    HeartbeatAck,
     /// A map-stage has finished producing all data; partitions are ready in VFS.
     StageReady {
         /// Query the stage belongs to.

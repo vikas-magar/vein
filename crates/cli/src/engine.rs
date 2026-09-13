@@ -18,6 +18,11 @@ pub trait QueryEngine: Send + Sync {
     /// queries return Arrow IPC; `EXPLAIN` statements short-circuit and
     /// return the rendered (optimized) plan text as UTF-8.
     async fn submit_query<'a>(&self, node: QueryNode<'a>) -> Result<Bytes>;
+
+    /// Optional access to the executor registry (used by Master daemon to record heartbeats).
+    fn registry(&self) -> Option<Arc<orchestrator::executor::ExecutorRegistry>> {
+        None
+    }
 }
 
 /// The concrete Coordinator that wires all the abstract traits together.
@@ -78,20 +83,20 @@ impl DistributedCoordinatorBuilder {
         self
     }
 
-    /// Validates and constructs the final DistributedCoordinator.
+    /// Validates dependencies and constructs the `DistributedCoordinator`.
     pub fn build(self) -> Result<DistributedCoordinator> {
         let binder = self
             .binder
-            .ok_or_else(|| error::VeinError::internal("Missing LogicalBinder configuration"))?;
+            .ok_or_else(|| error::VeinError::internal("LogicalBinder must be injected"))?;
         let optimizer = self
             .optimizer
-            .ok_or_else(|| error::VeinError::internal("Missing Optimizer configuration"))?;
+            .ok_or_else(|| error::VeinError::internal("Optimizer must be injected"))?;
         let planner = self
             .planner
-            .ok_or_else(|| error::VeinError::internal("Missing PhysicalPlanner configuration"))?;
+            .ok_or_else(|| error::VeinError::internal("PhysicalPlanner must be injected"))?;
         let scheduler = self
             .scheduler
-            .ok_or_else(|| error::VeinError::internal("Missing Scheduler configuration"))?;
+            .ok_or_else(|| error::VeinError::internal("Scheduler must be injected"))?;
 
         Ok(DistributedCoordinator {
             binder,
@@ -104,6 +109,10 @@ impl DistributedCoordinatorBuilder {
 
 #[async_trait]
 impl QueryEngine for DistributedCoordinator {
+    fn registry(&self) -> Option<Arc<orchestrator::executor::ExecutorRegistry>> {
+        Some(self.scheduler.registry().clone())
+    }
+
     async fn submit_query<'a>(&self, node: QueryNode<'a>) -> Result<Bytes> {
         let start_time = std::time::Instant::now();
 
@@ -128,6 +137,7 @@ impl QueryEngine for DistributedCoordinator {
         // 3. PLAN: Lower the optimized logical plan into a distributed physical Job.
         tracing::debug!(target: "vein_coordinator", "Lowering optimized logical plan to physical DAG");
         let job = self.planner.create_physical_plan(optimized_plan)?;
+        let query_id = job.query_id;
 
         // 4. DISPATCH: The Scheduler breaks the Job into stages/tasks and dispatches them.
         let output_stage = job.output_stage_id();
@@ -137,25 +147,27 @@ impl QueryEngine for DistributedCoordinator {
 
         self.scheduler.execute(job, cancel_token).await?;
 
-        // 5. RECEIVE: The Master node waits for the final DataTransport stream from the Executors.
-        // TODO: Actually open the Arrow IPC stream receiver.
-        let final_rows_produced = 0; // Mocked for now until data transport is complete
+        // 5. RECEIVE: Extract the collected Arrow IPC bytes from the dispatcher.
+        let output_bytes = self
+            .scheduler
+            .dispatcher()
+            .take_query_output(query_id)
+            .unwrap_or_default();
 
         // 6. FEEDBACK: Report execution telemetry back to the Reinforcement Learning Optimizer
         let telemetry = common::protocol::QueryTelemetry {
-            query_id: common::identifiers::QueryId::new(),
+            query_id,
             execution_time_ms: start_time.elapsed().as_millis() as u64,
-            rows_produced: final_rows_produced,
+            rows_produced: 0,
         };
         tracing::debug!(
             target: "vein_coordinator",
             query_id = %telemetry.query_id,
             elapsed_ms = telemetry.execution_time_ms,
-            rows = telemetry.rows_produced,
             "Query execution telemetry recorded"
         );
 
-        Ok(Bytes::new())
+        Ok(output_bytes)
     }
 }
 
@@ -242,5 +254,181 @@ mod tests {
             err.to_string().contains("No executors available"),
             "got {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_end_to_end_quic_task_dispatch_and_stream_return() {
+        use common::identifiers::{NodeId, QueryId, StageId, TaskId};
+        use common::protocol::{DataSink, DataSource, ExecuteTask, ExecutionMode, MicroProgram, NodeKind, NodeLoad};
+        use orchestrator::executor::NodeInfo;
+        use orchestrator::traits::TaskDispatcher;
+        use exec::ExecutorDaemon;
+        use std::net::SocketAddr;
+
+        let cert = format!("{}/../../certs/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key = format!("{}/../../certs/server.key", env!("CARGO_MANIFEST_DIR"));
+
+        let exec_addr: SocketAddr = "127.0.0.1:9185".parse().unwrap();
+        let daemon = ExecutorDaemon::builder()
+            .bind(exec_addr)
+            .certificates(&cert, &key)
+            .workers(2)
+            .master("127.0.0.1:9180")
+            .build()
+            .expect("executor daemon should build");
+
+        let cert_c = cert.clone();
+        let key_c = key.clone();
+        tokio::spawn(async move {
+            let _ = daemon.run_control_plane(exec_addr, &cert_c, &key_c).await;
+        });
+
+        // Give the listener a moment to bind
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let dispatcher = QuicTaskDispatcher::with_cert(&cert);
+        let node_id = NodeId::new();
+        let executor_info = NodeInfo {
+            node_id,
+            addr: exec_addr,
+            kind: NodeKind::Executor,
+            load: NodeLoad {
+                active_tasks: 0,
+                cpu_percent: 0.0,
+                memory_bytes: 0,
+            },
+        };
+
+        let query_id = QueryId::new();
+        let task_id = TaskId::new();
+        let task = ExecuteTask {
+            mode: ExecutionMode::Batch,
+            task_id,
+            query_id,
+            stage_id: StageId::new(),
+            source: DataSource::Memory,
+            program: MicroProgram {
+                register_count: 1,
+                instructions: vec![],
+            },
+            sink: DataSink::Client { schema: vec![] },
+        };
+
+        // 1. Dispatch over real QUIC
+        dispatcher
+            .dispatch(&executor_info, task)
+            .await
+            .expect("dispatch over QUIC should succeed");
+
+        // 2. Wait for completion over real QUIC
+        dispatcher
+            .wait_for_completion(query_id, task_id)
+            .await
+            .expect("wait for completion over QUIC should succeed");
+
+        // 3. Take query output
+        let output = dispatcher
+            .take_query_output(query_id)
+            .expect("should have query output");
+
+        // 4. Verify Arrow IPC stream
+        assert!(!output.is_empty(), "output bytes should not be empty");
+        let cursor = std::io::Cursor::new(output.as_ref());
+        let reader = arrow::ipc::reader::StreamReader::try_new(cursor, None)
+            .expect("valid arrow ipc stream");
+        let mut total_rows = 0;
+        for batch in reader {
+            let b = batch.expect("valid batch");
+            total_rows += b.num_rows();
+        }
+        assert_eq!(total_rows, 5, "MemorySource produces 5 rows");
+    }
+
+    #[tokio::test]
+    async fn test_master_daemon_records_heartbeat_and_acks() {
+        use common::identifiers::NodeId;
+        use common::protocol::{ArchivedVeinControlEvent, NodeKind, NodeLoad, VeinControlEvent};
+        use common::transport::build_quic_client;
+        use std::net::SocketAddr;
+
+        let cert = format!("{}/../../certs/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key = format!("{}/../../certs/server.key", env!("CARGO_MANIFEST_DIR"));
+
+        let master_addr: SocketAddr = "127.0.0.1:9190".parse().unwrap();
+        let registry = Arc::new(orchestrator::executor::registry::ExecutorRegistry::new());
+        let dispatcher = Arc::new(orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::with_cert(&cert));
+        let scheduler = Arc::new(orchestrator::scheduler::Scheduler::new(
+            registry.clone(),
+            dispatcher,
+            3,
+            Duration::from_secs(10),
+        ));
+
+        let coordinator = Arc::new(
+            DistributedCoordinator::builder()
+                .with_binder(Arc::new(QueryBinder::new(
+                    Arc::new(InMemoryCatalog::new()),
+                    Arc::new(MockFunctionRegistry::new()),
+                )))
+                .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
+                .with_planner(Arc::new(DefaultPhysicalPlanner::new()))
+                .with_scheduler(scheduler)
+                .build()
+                .expect("coordinator should build"),
+        );
+
+        let master = crate::daemon::MasterDaemon::new(coordinator);
+        let cert_m = cert.clone();
+        let key_m = key.clone();
+        tokio::spawn(async move {
+            let _ = master.run(master_addr, &cert_m, &key_m).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let client = build_quic_client(&cert).expect("client should build");
+        let connect = s2n_quic::client::Connect::new(master_addr).with_server_name("localhost");
+        let mut conn = client.connect(connect).await.expect("connect to master");
+        let mut stream = conn.open_bidirectional_stream().await.expect("open stream");
+
+        let node_id = NodeId::new();
+        let hb = VeinControlEvent::Heartbeat {
+            node_id,
+            node_kind: NodeKind::Executor,
+            timestamp_ms: 1000,
+            load: NodeLoad {
+                active_tasks: 1,
+                cpu_percent: 5.0,
+                memory_bytes: 0,
+            },
+            advertise_addr: "127.0.0.1:9191".to_string(),
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&hb).expect("serialize hb");
+        let wire = common::transport::frame_control_message(&bytes);
+        stream.send(wire).await.expect("send hb");
+        stream.finish().expect("finish send");
+
+        let mut resp = Vec::new();
+        while let Ok(Some(chunk)) = stream.receive().await {
+            resp.extend_from_slice(&chunk);
+        }
+
+        assert!(!resp.is_empty(), "master should send back ack");
+        assert_eq!(resp[0], common::transport::CONTROL_STREAM_OPCODE, "ack should have control opcode");
+
+        let payload = common::transport::extract_control_payload(&resp).expect("extract ack payload");
+
+        let mut aligned = rkyv::util::AlignedVec::<16>::new();
+        aligned.extend_from_slice(payload);
+        let archived = rkyv::access::<ArchivedVeinControlEvent, rkyv::rancor::Error>(&aligned)
+            .expect("archived ack");
+        assert!(matches!(archived, ArchivedVeinControlEvent::HeartbeatAck));
+
+        // Verify registry received heartbeat
+        let nodes = registry.available(Duration::from_secs(5)).await;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, node_id);
+        assert_eq!(nodes[0].addr, "127.0.0.1:9191".parse::<SocketAddr>().unwrap());
     }
 }

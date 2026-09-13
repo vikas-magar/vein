@@ -75,11 +75,11 @@ impl AsyncFileReader for OpendalParquetReader {
         'a,
         parquet::errors::Result<std::sync::Arc<parquet::file::metadata::ParquetMetaData>>,
     > {
-        let options = _options.cloned().unwrap_or_default();
         Box::pin(async move {
-            let meta = parquet::arrow::arrow_reader::ArrowReaderMetadata::load_async(self, options)
-                .await?;
-            Ok(meta.metadata().clone())
+            let size = self._size;
+            let reader = parquet::file::metadata::ParquetMetaDataReader::new();
+            let meta = reader.load_and_finish(self, size).await?;
+            Ok(std::sync::Arc::new(meta))
         })
     }
 }

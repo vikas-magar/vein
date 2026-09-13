@@ -18,12 +18,24 @@ use std::sync::Arc;
 /// exactly the surviving rows.
 pub struct CollectSink {
     output: Vec<RecordBatch>,
+    field_names: Vec<String>,
 }
 
 impl CollectSink {
     /// Create a new [`CollectSink`].
     pub fn new() -> Self {
-        Self { output: Vec::new() }
+        Self {
+            output: Vec::new(),
+            field_names: Vec::new(),
+        }
+    }
+
+    /// Create a new [`CollectSink`] with predefined field names.
+    pub fn with_field_names(field_names: Vec<String>) -> Self {
+        Self {
+            output: Vec::new(),
+            field_names,
+        }
     }
 }
 
@@ -50,8 +62,13 @@ impl PipelineNode<DataChunk> for CollectSink {
         let mut fields = Vec::with_capacity(chunk.vectors.len());
         let mut columns = Vec::with_capacity(chunk.vectors.len());
         for (i, vec) in chunk.vectors.iter().enumerate() {
+            let col_name = self
+                .field_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("col_{i}"));
             fields.push(Field::new(
-                format!("col_{i}"),
+                col_name,
                 vec.data_type().clone(),
                 true,
             ));

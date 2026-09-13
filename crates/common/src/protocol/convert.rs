@@ -3,7 +3,11 @@
 //! Provides fast O(1) in-place extraction from validated rkyv buffers without
 //! lifetime infection or rkyv::Deserialize Pool strategy mismatches.
 
-use crate::identifiers::{QueryId, StageId, TaskId};
+use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
+use super::control::{
+    ArchivedNodeKind, ArchivedNodeLoad, ArchivedVeinControlEvent, NodeKind, NodeLoad,
+    VeinControlEvent,
+};
 use super::ir::constant::{ArchivedScalarConstant, ScalarConstant};
 use super::ir::op::{ArchivedMicroOp, MicroOp};
 use super::ir::program::{ArchivedMicroProgram, MicroProgram};
@@ -330,7 +334,9 @@ impl From<&ArchivedDataSource> for DataSource {
 impl From<&ArchivedDataSink> for DataSink {
     fn from(archived: &ArchivedDataSink) -> Self {
         match archived {
-            ArchivedDataSink::Client => DataSink::Client,
+            ArchivedDataSink::Client { schema } => DataSink::Client {
+                schema: schema.iter().map(FieldSchema::from).collect(),
+            },
             ArchivedDataSink::Discard => DataSink::Discard,
             ArchivedDataSink::Shuffle(s) => DataSink::Shuffle(ShuffleTarget {
                 vfs_path_prefix: s.vfs_path_prefix.as_str().to_string(),
@@ -353,6 +359,115 @@ impl From<&ArchivedExecuteTask> for ExecuteTask {
             source: DataSource::from(&archived.source),
             program: MicroProgram::from(&archived.program),
             sink: DataSink::from(&archived.sink),
+        }
+    }
+}
+
+// ── Control-Plane Conversions ──────────────────────────────────────
+
+impl From<&ArchivedNodeKind> for NodeKind {
+    fn from(archived: &ArchivedNodeKind) -> Self {
+        match archived {
+            ArchivedNodeKind::Master => NodeKind::Master,
+            ArchivedNodeKind::Executor => NodeKind::Executor,
+            ArchivedNodeKind::Vcs => NodeKind::Vcs,
+        }
+    }
+}
+
+impl From<&ArchivedNodeLoad> for NodeLoad {
+    fn from(archived: &ArchivedNodeLoad) -> Self {
+        Self {
+            active_tasks: archived.active_tasks.to_native(),
+            cpu_percent: archived.cpu_percent.to_native(),
+            memory_bytes: archived.memory_bytes.to_native(),
+        }
+    }
+}
+
+impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
+    fn from(archived: &ArchivedVeinControlEvent) -> Self {
+        match archived {
+            ArchivedVeinControlEvent::TableInvalidated {
+                namespace,
+                table_name,
+                new_snapshot_id,
+            } => VeinControlEvent::TableInvalidated {
+                namespace: namespace.iter().map(|s| s.as_str().to_string()).collect(),
+                table_name: table_name.as_str().to_string(),
+                new_snapshot_id: new_snapshot_id.to_native(),
+            },
+            ArchivedVeinControlEvent::CatalogReady => VeinControlEvent::CatalogReady,
+            ArchivedVeinControlEvent::TaskCompleted {
+                task_id,
+                query_id,
+                row_count,
+                bytes_read,
+                duration_ns,
+                result_bytes,
+            } => VeinControlEvent::TaskCompleted {
+                task_id: TaskId::from_raw(task_id.0.to_native()),
+                query_id: QueryId::from_raw(query_id.0.to_native()),
+                row_count: row_count.to_native(),
+                bytes_read: bytes_read.to_native(),
+                duration_ns: duration_ns.to_native(),
+                result_bytes: result_bytes.as_ref().map(|b| b.as_slice().to_vec()),
+            },
+            ArchivedVeinControlEvent::DispatchTask(task) => {
+                VeinControlEvent::DispatchTask(ExecuteTask::from(task))
+            }
+            ArchivedVeinControlEvent::TaskFailed {
+                task_id,
+                query_id,
+                error,
+            } => VeinControlEvent::TaskFailed {
+                task_id: TaskId::from_raw(task_id.0.to_native()),
+                query_id: QueryId::from_raw(query_id.0.to_native()),
+                error: error.as_str().to_string(),
+            },
+            ArchivedVeinControlEvent::CancelTask { task_id, query_id } => {
+                VeinControlEvent::CancelTask {
+                    task_id: TaskId::from_raw(task_id.0.to_native()),
+                    query_id: QueryId::from_raw(query_id.0.to_native()),
+                }
+            }
+            ArchivedVeinControlEvent::ExplicitDrain {
+                query_id,
+                stage_id,
+            } => VeinControlEvent::ExplicitDrain {
+                query_id: QueryId::from_raw(query_id.0.to_native()),
+                stage_id: StageId::from_raw(stage_id.0.to_native()),
+            },
+            ArchivedVeinControlEvent::Heartbeat {
+                node_id,
+                node_kind,
+                timestamp_ms,
+                load,
+                advertise_addr,
+            } => VeinControlEvent::Heartbeat {
+                node_id: NodeId::from_raw(node_id.0.to_native()),
+                node_kind: NodeKind::from(node_kind),
+                timestamp_ms: timestamp_ms.to_native(),
+                load: NodeLoad::from(load),
+                advertise_addr: advertise_addr.as_str().to_string(),
+            },
+            ArchivedVeinControlEvent::HeartbeatAck => VeinControlEvent::HeartbeatAck,
+            ArchivedVeinControlEvent::StageReady {
+                query_id,
+                stage_id,
+                num_partitions,
+            } => VeinControlEvent::StageReady {
+                query_id: QueryId::from_raw(query_id.0.to_native()),
+                stage_id: StageId::from_raw(stage_id.0.to_native()),
+                num_partitions: num_partitions.to_native(),
+            },
+            ArchivedVeinControlEvent::DrainCompleted {
+                query_id,
+                stage_id,
+            } => VeinControlEvent::DrainCompleted {
+                query_id: QueryId::from_raw(query_id.0.to_native()),
+                stage_id: StageId::from_raw(stage_id.0.to_native()),
+            },
         }
     }
 }

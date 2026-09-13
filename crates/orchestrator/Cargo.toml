@@ -15,3 +15,5 @@ tracing = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
 s2n-quic = { workspace = true }
+bytes = { workspace = true }
+rkyv = { workspace = true }

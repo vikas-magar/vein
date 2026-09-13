@@ -114,7 +114,10 @@ pub enum DataSink {
     /// Push data to VFS for the next stage.
     Shuffle(ShuffleTarget),
     /// Stream data directly back to the Query Coordinator/Client.
-    Client,
+    Client {
+        /// Schema of the columns expected at the client.
+        schema: Vec<FieldSchema>,
+    },
     /// Write data out to storage (e.g., Iceberg commit).
     Storage(StorageTarget),
     /// Discard the data (useful for some benchmarks or tests).

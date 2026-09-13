@@ -39,6 +39,16 @@ impl Scheduler {
         }
     }
 
+    /// Borrows the active executor registry.
+    pub fn registry(&self) -> &Arc<ExecutorRegistry> {
+        &self.registry
+    }
+
+    /// Borrows the task dispatcher.
+    pub fn dispatcher(&self) -> &Arc<dyn TaskDispatcher> {
+        &self.dispatcher
+    }
+
     /// Execute the [`Job`], choosing the strategy based on its execution mode.
     pub async fn execute(&self, job: Job, cancel: CancellationToken) -> Result<(), VeinError> {
         match job.mode() {
@@ -78,7 +88,7 @@ impl Scheduler {
             let mut join_set = JoinSet::new();
             for (i, task) in stage.tasks().iter().enumerate() {
                 let query_id = job.query_id;
-                let mode = job.mode().clone();
+                let mode = *job.mode();
                 let execute_task = task
                     .clone()
                     .into_execute_task(query_id, stage.stage_id, mode);

@@ -68,3 +68,34 @@ pub fn build_quic_client<P: AsRef<Path>>(ca_cert_path: P) -> Result<Client> {
 
     Ok(client)
 }
+
+/// Opcode identifying inter-node control plane events over QUIC streams.
+pub const CONTROL_STREAM_OPCODE: u8 = 0x02;
+
+/// Frames a serialized control message with opcode 0x02 and a 4-byte little-endian length prefix.
+pub fn frame_control_message(payload: &[u8]) -> bytes::Bytes {
+    let mut wire = Vec::with_capacity(5 + payload.len());
+    wire.push(CONTROL_STREAM_OPCODE);
+    wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    wire.extend_from_slice(payload);
+    wire.into()
+}
+
+/// Extracts the inner payload from a wire buffer, stripping the 0x02 opcode and length header.
+pub fn extract_control_payload(buffer: &[u8]) -> Option<&[u8]> {
+    if buffer.is_empty() {
+        return None;
+    }
+    if buffer.len() >= 5 && buffer[0] == CONTROL_STREAM_OPCODE {
+        let len = u32::from_le_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
+        if buffer.len() >= 5 + len {
+            Some(&buffer[5..5 + len])
+        } else {
+            Some(&buffer[5..])
+        }
+    } else if buffer[0] == CONTROL_STREAM_OPCODE {
+        Some(&buffer[1..])
+    } else {
+        Some(buffer)
+    }
+}

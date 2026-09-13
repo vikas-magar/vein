@@ -10,7 +10,7 @@ pub mod server;
 /// LocalSet worker pool implementation.
 pub mod worker;
 
-pub use context::DaemonContext;
+pub use context::{DaemonContext, QueuedTask};
 pub use server::{ExecutorDaemon, ExecutorDaemonBuilder, ExecutorDaemonConfig};
 pub use worker::WorkerPool;
 

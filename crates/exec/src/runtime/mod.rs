@@ -260,7 +260,7 @@ mod tests {
                     MicroOp::ProjectRegisters { out_regs: vec![0] },
                 ],
             },
-            sink: DataSink::Client,
+            sink: DataSink::Client { schema: vec![] },
         }
     }
 

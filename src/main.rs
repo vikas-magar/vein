@@ -88,6 +88,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         ArchivedProtocolResponse::Data { batch } => {
             info!(target: "vein_client", batch_bytes = batch.len(), "Data batch response received successfully");
+            if !batch.is_empty() {
+                let cursor = std::io::Cursor::new(batch.as_slice());
+                match arrow::ipc::reader::StreamReader::try_new(cursor, None) {
+                    Ok(reader) => {
+                        let mut batches = Vec::new();
+                        for b in reader {
+                            match b {
+                                Ok(record_batch) => batches.push(record_batch),
+                                Err(e) => error!(target: "vein_client", error = %e, "Failed to decode RecordBatch from stream"),
+                            }
+                        }
+                        if !batches.is_empty() {
+                            if let Err(e) = arrow::util::pretty::print_batches(&batches) {
+                                error!(target: "vein_client", error = %e, "Failed to print batches");
+                            }
+                        } else {
+                            println!("Query returned 0 rows.");
+                        }
+                    }
+                    Err(e) => {
+                        error!(target: "vein_client", error = %e, "Failed to initialize Arrow IPC StreamReader");
+                    }
+                }
+            } else {
+                println!("Query returned 0 rows.");
+            }
         }
         ArchivedProtocolResponse::QueryCompleted { row_count } => {
             info!(target: "vein_client", row_count = row_count.to_native(), "Query execution finished successfully");

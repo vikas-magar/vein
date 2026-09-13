@@ -36,6 +36,7 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rkyv = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint"] }
 
 [profile.release]
 opt-level = 3
