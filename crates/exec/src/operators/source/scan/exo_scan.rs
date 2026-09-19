@@ -19,8 +19,8 @@ use error::VeinError;
 use exo::traits::{AddressReader, VaultReader};
 use exo::{
     f32_from_canonical_native, f64_from_canonical, i8_from_canonical_native,
-    i16_from_canonical_native, i32_from_canonical_native, i64_from_canonical, AddressFilter,
-    AddressGranuleMark, AddressHeader, AddressPredicateEvaluator, ExoAddressReader,
+    i16_from_canonical_native, i32_from_canonical_native, i64_from_canonical,
+    AddressBatch, AddressFilter, AddressGranuleMark, AddressHeader, AddressPredicateEvaluator, ExoAddressReader,
     ExoVaultReader, PartReader, VaultGranuleMark, VaultHeader,
 };
 use exo::addr::{ADDR_FORMAT_VERSION, ADDR_HEADER_MAGIC, ADDR_TRAILER_MAGIC, HEADER_SIZE, MARK_SIZE};
@@ -592,22 +592,14 @@ fn filter_address_reader_slots(
     slots: &[u32],
     predicate: &exo::AddressPredicate,
 ) -> Result<Vec<u32>> {
-    let mut filtered = Vec::with_capacity(slots.len());
-    for &slot in slots {
-        let valid = reader
-            .is_valid(slot as u64)
-            .map_err(|e| VeinError::internal(e.to_string()))?;
-        let value = if valid {
-            reader
-                .read_vaddr(slot as u64)
-                .map_err(|e| VeinError::internal(e.to_string()))?
-        } else {
-            0
-        };
-        if predicate.matches(value, valid) {
-            filtered.push(slot);
-        }
-    }
+    let batch = AddressBatch::from_reader(reader, slots)
+        .map_err(|e| VeinError::internal(e.to_string()))?;
+    let filtered = slots
+        .iter()
+        .copied()
+        .zip(batch.iter())
+        .filter_map(|(slot, (value, valid))| predicate.matches(value, valid).then_some(slot))
+        .collect();
     Ok(filtered)
 }
 

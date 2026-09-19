@@ -7,6 +7,7 @@
 //! - Strict zero-unwrap policy: all fallible operations return [`ExoResult`].
 
 pub mod addr;
+pub mod address_batch;
 pub mod codec;
 pub mod compactor;
 pub mod coord;
@@ -20,6 +21,7 @@ pub mod vault;
 pub use addr::{
     AddressGranuleMark, AddressHeader, ExoAddressReader, ExoAddressWriter, CODEC_FOR, CODEC_RAW,
 };
+pub use address_batch::AddressBatch;
 pub use codec::ForCodec;
 pub use compactor::{CompactionStats, PartCompactor};
 pub use coord::{

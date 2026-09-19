@@ -9,6 +9,7 @@
 use std::path::Path;
 use std::time::Instant;
 
+use crate::address_batch::AddressBatch;
 use crate::error::{ExoError, ExoResult};
 use crate::part::{PartDescriptor, PartReader, PartWriter};
 use crate::traits::{AddressReader, VaultReader};
@@ -81,7 +82,7 @@ impl PartCompactor {
         for col_name in canonical_columns {
             let has_vault = source_parts[0].has_vault(col_name);
             let slot_width = source_parts[0].open_address_reader(col_name)?.slot_width();
-            let mut active_vaddrs = Vec::with_capacity(expected_output_rows as usize);
+            let mut active_addresses = AddressBatch::with_capacity(expected_output_rows as usize);
             let mut active_payloads = if has_vault {
                 Some(Vec::with_capacity(expected_output_rows as usize))
             } else {
@@ -115,7 +116,7 @@ impl PartCompactor {
                         }
 
                         let vaddr = granule_buf[local_idx];
-                        active_vaddrs.push(vaddr);
+                        active_addresses.push(vaddr);
 
                         if let (Some(vr), Some(payloads)) = (&mut vault_reader, &mut active_payloads) {
                             let payload = vr.read_opt_bytes_slot(slot)?.map(|b| b.to_vec());
@@ -126,9 +127,13 @@ impl PartCompactor {
             }
 
             if let Some(ref payloads) = active_payloads {
-                writer.write_raw_column(col_name, &active_vaddrs, payloads)?;
+                writer.write_raw_column(col_name, active_addresses.addresses(), payloads)?;
             } else {
-                writer.write_raw_address_column_with_slot_width(col_name, &active_vaddrs, slot_width)?;
+                writer.write_raw_address_column_with_slot_width(
+                    col_name,
+                    active_addresses.addresses(),
+                    slot_width,
+                )?;
             }
         }
 
