@@ -17,6 +17,17 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Start the VCS metadata authority
+    Vcs {
+        #[arg(short, long, default_value = "0.0.0.0:9090")]
+        bind: String,
+        #[arg(long, default_value = "file:///tmp/vein-warehouse")]
+        warehouse: String,
+        #[arg(short, long, default_value = "certs/server.crt")]
+        cert: String,
+        #[arg(short, long, default_value = "certs/server.key")]
+        key: String,
+    },
     /// Start a Master node (Query Coordinator)
     Master {
         #[arg(short, long, default_value = "0.0.0.0:8080")]
@@ -36,6 +47,9 @@ enum Commands {
         cert: String,
         #[arg(short, long, default_value = "certs/server.key")]
         key: String,
+        /// Optional VCS exchange metadata endpoint, for example 127.0.0.1:9090.
+        #[arg(long)]
+        vcs: Option<String>,
     },
     /// Run a full local cluster (Master + Executor) in a single process
     Local {
@@ -90,6 +104,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Vcs {
+            bind,
+            warehouse,
+            cert,
+            key,
+        } => {
+            info!(target: "vein_server", %bind, %warehouse, "Starting Vein VCS authority");
+            let catalog = Arc::new(
+                vcs::VcsCatalog::new("vein", warehouse, vcs::storage::StorageConfig::LocalFs)
+                    .await?,
+            );
+            let addr: std::net::SocketAddr = bind
+                .parse()
+                .map_err(|e| format!("Invalid VCS bind address '{bind}': {e}"))?;
+            vcs::VcsExchangeServer::new(catalog.shared_exchange_catalog())
+                .run(addr, &cert, &key)
+                .await?;
+        }
         Commands::Master { bind, cert, key } => {
             info!(target: "vein_server", %bind, %cert, "Starting Vein Master node");
 
@@ -117,20 +149,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             master,
             cert,
             key,
+            vcs,
         } => {
             info!(target: "vein_server", %bind, %master, %cert, "Starting Vein Executor node");
             let addr: std::net::SocketAddr = bind
                 .parse()
                 .map_err(|e| format!("Invalid bind address '{bind}': {e}"))?;
 
-            ExecutorDaemon::builder()
+            let mut builder = ExecutorDaemon::builder()
                 .bind(addr)
                 .certificates(&cert, &key)
                 .workers(4)
-                .master(&master)
-                .build()?
-                .start()
-                .await?;
+                .master(&master);
+            if let Some(vcs) = vcs {
+                builder = builder.vcs_exchange(&vcs, &cert);
+            }
+            builder.build()?.start().await?;
         }
         Commands::Local {
             master_bind,

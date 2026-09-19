@@ -744,6 +744,97 @@ impl VfsTableStore {
         .await
     }
 
+    /// Appends one self-describing Arrow IPC frame to an exchange partition.
+    ///
+    /// Exchange partitions are append-only VFS logical files. Each frame carries
+    /// its length so independent upstream tasks can append complete IPC streams
+    /// without attempting to concatenate Arrow stream headers.
+    pub async fn append_exchange_frame(&self, path: &str, payload: &[u8]) -> Result<()> {
+        let payload_len = u64::try_from(payload.len())
+            .map_err(|_| VfsError::Internal("Exchange frame is too large".to_string()))?;
+        let mut frame = Vec::with_capacity(16usize.saturating_add(payload.len()));
+        frame.extend_from_slice(b"VEXF");
+        frame.extend_from_slice(&1u32.to_le_bytes());
+        frame.extend_from_slice(&payload_len.to_le_bytes());
+        frame.extend_from_slice(payload);
+
+        let extents = self.block_manager.append(&frame).await?;
+        for extent in extents {
+            self.metadata_engine.append_extent(path, extent).await?;
+        }
+        Ok(())
+    }
+
+    /// Reads and validates all complete frames from an exchange partition.
+    pub async fn read_exchange_frames(&self, path: &str) -> Result<Vec<Vec<u8>>> {
+        let extents = match self.metadata_engine.get_file(path).await {
+            Ok(extents) => extents,
+            Err(VfsError::NotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        if extents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let total_len: u64 = extents.iter().map(|extent| extent.length).sum();
+        let bytes = self.read_file_range(&extents, 0, total_len).await?;
+        let mut cursor = 0usize;
+        let mut frames = Vec::new();
+        while cursor < bytes.len() {
+            let header_end = cursor
+                .checked_add(16)
+                .ok_or_else(|| VfsError::Internal("Exchange frame offset overflow".to_string()))?;
+            if header_end > bytes.len() || &bytes[cursor..cursor + 4] != b"VEXF" {
+                return Err(VfsError::Internal(format!(
+                    "Invalid exchange frame header at offset {cursor}"
+                )));
+            }
+            let version = u32::from_le_bytes(
+                bytes[cursor + 4..cursor + 8]
+                    .try_into()
+                    .map_err(|_| VfsError::Internal("Invalid exchange frame version".to_string()))?,
+            );
+            if version != 1 {
+                return Err(VfsError::Internal(format!(
+                    "Unsupported exchange frame version {version}"
+                )));
+            }
+            let payload_len = u64::from_le_bytes(
+                bytes[cursor + 8..cursor + 16]
+                    .try_into()
+                    .map_err(|_| VfsError::Internal("Invalid exchange frame length".to_string()))?,
+            );
+            let payload_len = usize::try_from(payload_len)
+                .map_err(|_| VfsError::Internal("Exchange frame length overflows usize".to_string()))?;
+            let payload_start = header_end;
+            let payload_end = payload_start
+                .checked_add(payload_len)
+                .ok_or_else(|| VfsError::Internal("Exchange frame payload overflow".to_string()))?;
+            if payload_end > bytes.len() {
+                return Err(VfsError::Internal(format!(
+                    "Truncated exchange frame at offset {cursor}"
+                )));
+            }
+            frames.push(bytes[payload_start..payload_end].to_vec());
+            cursor = payload_end;
+        }
+        Ok(frames)
+    }
+
+    /// Synchronous wrapper for the exchange frame writer.
+    pub fn append_exchange_frame_sync(&self, path: &str, payload: &[u8]) -> Result<()> {
+        let store = self.clone();
+        let path = path.to_string();
+        let payload = payload.to_vec();
+        Self::run_async(async move { store.append_exchange_frame(&path, &payload).await })
+    }
+
+    /// Synchronous wrapper for the exchange frame reader.
+    pub fn read_exchange_frames_sync(&self, path: &str) -> Result<Vec<Vec<u8>>> {
+        let store = self.clone();
+        let path = path.to_string();
+        Self::run_async(async move { store.read_exchange_frames(&path).await })
+    }
+
     /// Reads a logical byte range from one partition plane.
     pub async fn read_partition_plane_range(
         &self,
@@ -1103,6 +1194,21 @@ mod tests {
         assert_eq!(payload_reader.read_opt_bytes_slot(1)?, None);
         assert_eq!(payload_reader.read_opt_bytes_slot(2)?, Some(&b"three"[..]));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exchange_frames_roundtrip() -> Result<()> {
+        let dir = tempdir()?;
+        let config = create_test_config(dir.path());
+        let store = VfsTableStore::init(&config).await?;
+        let path = "shuffle/test/partition_00000";
+
+        store.append_exchange_frame(path, b"first-frame").await?;
+        store.append_exchange_frame(path, b"second-frame").await?;
+
+        let frames = store.read_exchange_frames(path).await?;
+        assert_eq!(frames, vec![b"first-frame".to_vec(), b"second-frame".to_vec()]);
         Ok(())
     }
 }

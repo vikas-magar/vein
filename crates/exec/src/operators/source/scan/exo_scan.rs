@@ -195,6 +195,8 @@ enum VfsColumnIndex {
     Vault {
         header: VaultHeader,
         marks: Vec<VaultGranuleMark>,
+        address_header: AddressHeader,
+        address_marks: Vec<AddressGranuleMark>,
     },
 }
 
@@ -215,7 +217,7 @@ fn vfs_index_shape(index: &VfsColumnIndex) -> (u64, usize, usize) {
         VfsColumnIndex::Address { header, marks } => {
             (header.total_rows, header.granule_size as usize, marks.len())
         }
-        VfsColumnIndex::Vault { header, marks } => {
+        VfsColumnIndex::Vault { header, marks, .. } => {
             (header.total_rows, header.granule_size as usize, marks.len())
         }
     }
@@ -265,7 +267,16 @@ async fn scan_vfs_mixed_partition(
                 .read_vault_index(table_id, part_id, column_name)
                 .await
                 .map_err(|e| VeinError::internal(e.to_string()))?;
-            VfsColumnIndex::Vault { header, marks }
+            let (address_header, address_marks) = store
+                .read_address_index(table_id, part_id, column_name)
+                .await
+                .map_err(|e| VeinError::internal(e.to_string()))?;
+            VfsColumnIndex::Vault {
+                header,
+                marks,
+                address_header,
+                address_marks,
+            }
         } else {
             let (header, marks) = store
                 .read_address_index(table_id, part_id, column_name)
@@ -370,8 +381,9 @@ async fn scan_vfs_mixed_partition(
         }
 
         let mut vectors = Vec::with_capacity(indexes.len());
+        let mut address_columns = Vec::with_capacity(indexes.len());
         for (column_name, data_type, index) in &indexes {
-            let mut scanner = match index {
+            let (mut scanner, address_batch) = match index {
                 VfsColumnIndex::Address { header, marks } => {
                     let mark = &marks[granule_idx];
                     let bytes = store
@@ -379,22 +391,42 @@ async fn scan_vfs_mixed_partition(
                         .await
                         .map_err(|e| VeinError::internal(e.to_string()))?;
                     let reader_bytes = build_single_granule_reader_bytes(header, mark, &bytes, row_count)?;
-                    ColumnScanner::Address(
-                        ExoAddressReader::from_bytes(reader_bytes)
-                            .map_err(|e| VeinError::internal(e.to_string()))?,
-                    )
+                    let reader = ExoAddressReader::from_bytes(reader_bytes)
+                        .map_err(|e| VeinError::internal(e.to_string()))?;
+                    let address_batch = AddressBatch::from_reader(&reader, &filtered_slots)
+                        .map_err(|e| VeinError::internal(format!("failed to read address sidecar: {e}")))?;
+                    (ColumnScanner::Address(reader), Some(address_batch))
                 }
-                VfsColumnIndex::Vault { header, marks } => {
+                VfsColumnIndex::Vault {
+                    header,
+                    marks,
+                    address_header,
+                    address_marks,
+                } => {
                     let mark = &marks[granule_idx];
                     let bytes = store
                         .read_vault_granule(table_id, part_id, column_name, mark)
                         .await
                         .map_err(|e| VeinError::internal(e.to_string()))?;
                     let reader_bytes = build_single_vault_reader_bytes(header, mark, &bytes, row_count)?;
-                    ColumnScanner::Vault(
-                        ExoVaultReader::from_bytes(reader_bytes)
-                            .map_err(|e| VeinError::internal(e.to_string()))?,
-                    )
+                    let address_mark = &address_marks[granule_idx];
+                    let address_bytes = store
+                        .read_address_granule(table_id, part_id, column_name, address_mark)
+                        .await
+                        .map_err(|e| VeinError::internal(e.to_string()))?;
+                    let address_reader_bytes = build_single_granule_reader_bytes(
+                        address_header,
+                        address_mark,
+                        &address_bytes,
+                        row_count,
+                    )?;
+                    let address_reader = ExoAddressReader::from_bytes(address_reader_bytes)
+                        .map_err(|e| VeinError::internal(e.to_string()))?;
+                    let address_batch = AddressBatch::from_reader(&address_reader, &filtered_slots)
+                        .map_err(|e| VeinError::internal(format!("failed to read address sidecar: {e}")))?;
+                    let vault_reader = ExoVaultReader::from_bytes(reader_bytes)
+                        .map_err(|e| VeinError::internal(e.to_string()))?;
+                    (ColumnScanner::Vault(vault_reader), Some(address_batch))
                 }
             };
             vectors.push(materialize_scanner_array(
@@ -403,9 +435,10 @@ async fn scan_vfs_mixed_partition(
                 column_name,
                 data_type.as_deref(),
             )?);
+            address_columns.push(address_batch);
         }
         stats.rows_emitted += filtered_slots.len() as u64;
-        next.push(DataChunk::from_vectors(vectors))?;
+        next.push(DataChunk::from_vectors_with_addresses(vectors, address_columns)?)?;
     }
 
     Ok(true)
@@ -550,6 +583,7 @@ async fn scan_vfs_address_partition(
         }
 
         let mut vectors = Vec::with_capacity(indexes.len());
+        let mut address_columns = Vec::with_capacity(indexes.len());
         for (column_name, data_type, header, marks) in &indexes {
             let mark = &marks[granule_idx];
             let bytes = store
@@ -561,20 +595,43 @@ async fn scan_vfs_address_partition(
                 ExoAddressReader::from_bytes(reader_bytes)
                     .map_err(|e| VeinError::internal(e.to_string()))?,
             );
+            let address_batch = match &mut scanner {
+                ColumnScanner::Address(reader) => AddressBatch::from_reader(reader, &filtered_slots)
+                    .map_err(|e| VeinError::internal(e.to_string()))?,
+                ColumnScanner::Vault(_) => {
+                    return Err(VeinError::internal("address-only scan created a vault scanner"));
+                }
+            };
             vectors.push(materialize_scanner_array(
                 &mut scanner,
                 &filtered_slots,
                 column_name,
                 data_type.as_deref(),
             )?);
+            address_columns.push(Some(address_batch));
         }
         stats.rows_emitted += filtered_slots.len() as u64;
-        next.push(DataChunk::from_vectors(vectors))?;
+        next.push(DataChunk::from_vectors_with_addresses(vectors, address_columns)?)?;
     }
 
     Ok(true)
 }
 
+
+
+fn read_address_sidecars(
+    readers: &mut [ExoAddressReader],
+    slots: &[u32],
+) -> Result<Vec<Option<AddressBatch>>> {
+    readers
+        .iter_mut()
+        .map(|reader| {
+            AddressBatch::from_reader(reader, slots)
+                .map(Some)
+                .map_err(|e| VeinError::internal(format!("failed to read address sidecar: {e}")))
+        })
+        .collect()
+}
 
 fn filter_address_slots(
     scanner: &mut ColumnScanner,
@@ -736,7 +793,13 @@ pub fn scan_part_reader_with_filter_and_stats(
 
     // 3. Pre-open column Scanners (Vault or Address) once per partition
     let mut column_scanners: Vec<(String, Option<String>, ColumnScanner)> = Vec::with_capacity(target_fields.len());
+    let mut address_readers = Vec::with_capacity(target_fields.len());
     for (col_name, data_type) in &target_fields {
+        let address_reader = part_reader
+            .open_address_reader(col_name)
+            .map_err(|e| VeinError::internal(format!("Failed to open address reader for column '{}': {}", col_name, e)))?;
+        address_readers.push(address_reader);
+
         if part_reader.has_vault(col_name) {
             let reader = part_reader
                 .open_vault_reader(col_name)
@@ -820,7 +883,8 @@ pub fn scan_part_reader_with_filter_and_stats(
                     }
                     rows_processed += filtered_slots.len();
                     stats.rows_emitted += filtered_slots.len() as u64;
-                    let chunk = DataChunk::from_vectors(vectors);
+                    let address_columns = read_address_sidecars(&mut address_readers, &filtered_slots)?;
+                    let chunk = DataChunk::from_vectors_with_addresses(vectors, address_columns)?;
                     next.push(chunk)?;
                 }
                 chunk_slots.clear();
@@ -840,7 +904,8 @@ pub fn scan_part_reader_with_filter_and_stats(
             }
             rows_processed += filtered_slots.len();
             stats.rows_emitted += filtered_slots.len() as u64;
-            let chunk = DataChunk::from_vectors(vectors);
+            let address_columns = read_address_sidecars(&mut address_readers, &filtered_slots)?;
+            let chunk = DataChunk::from_vectors_with_addresses(vectors, address_columns)?;
             next.push(chunk)?;
         }
         chunk_slots.clear();

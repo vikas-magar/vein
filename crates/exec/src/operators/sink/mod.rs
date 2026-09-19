@@ -6,7 +6,10 @@ pub mod discard;
 pub mod client;
 /// Storage sink that persists data to .exo or Parquet
 pub mod storage;
+/// Hash-partitioned VFS exchange sink
+pub mod shuffle;
 
 pub use client::CollectSink;
 pub use discard::DiscardSink;
+pub use shuffle::ShuffleSink;
 pub use storage::StorageSink;

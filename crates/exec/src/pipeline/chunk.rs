@@ -3,6 +3,7 @@
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use common::arrow::SelectionVector;
+use exo::AddressBatch;
 use common::Result;
 use error::VeinError;
 
@@ -18,18 +19,51 @@ pub struct DataChunk {
     pub vectors: Vec<ArrayRef>,
     /// The selection vector indicating active rows.
     pub selection: SelectionVector,
+    /// Optional canonical-address sidecars aligned with the physical vectors.
+    /// `None` means the source is value-native or the column has no address plane.
+    pub address_columns: Vec<Option<AddressBatch>>,
 }
 
 impl DataChunk {
     /// Creates a new [`DataChunk`] from column arrays and an explicit selection vector.
     pub fn new(vectors: Vec<ArrayRef>, selection: SelectionVector) -> Self {
-        Self { vectors, selection }
+        Self {
+            address_columns: vec![None; vectors.len()],
+            vectors,
+            selection,
+        }
+    }
+
+    /// Creates a chunk with canonical address sidecars aligned to its columns.
+    pub fn from_vectors_with_addresses(
+        vectors: Vec<ArrayRef>,
+        address_columns: Vec<Option<AddressBatch>>,
+    ) -> Result<Self> {
+        if vectors.len() != address_columns.len() {
+            return Err(VeinError::internal(format!(
+                "data chunk address sidecars {} do not match vectors {}",
+                address_columns.len(),
+                vectors.len()
+            )));
+        }
+        let physical_len = vectors.first().map(|vector| vector.len()).unwrap_or(0);
+        if address_columns.iter().flatten().any(|batch| batch.len() != physical_len) {
+            return Err(VeinError::internal(
+                "data chunk address sidecar length does not match vectors",
+            ));
+        }
+        Ok(Self {
+            vectors,
+            selection: SelectionVector::new_dense(physical_len),
+            address_columns,
+        })
     }
 
     /// Creates a [`DataChunk`] from column arrays with an all-valid (dense) selection vector.
     pub fn from_vectors(vectors: Vec<ArrayRef>) -> Self {
         let num_rows = vectors.first().map(|v| v.len()).unwrap_or(0);
         Self {
+            address_columns: vec![None; vectors.len()],
             vectors,
             selection: SelectionVector::new_dense(num_rows),
         }
@@ -40,6 +74,7 @@ impl DataChunk {
         let num_rows = batch.num_rows();
         let vectors = batch.columns().to_vec();
         Self {
+            address_columns: vec![None; vectors.len()],
             vectors,
             selection: SelectionVector::new_dense(num_rows),
         }

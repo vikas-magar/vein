@@ -11,6 +11,7 @@ use plan::LogicalPlan;
 use super::PhysicalPlanner;
 use crate::builder::aggregate::{AggregateStageBuilder, DefaultAggregateStageBuilder};
 use crate::builder::pipeline::{DefaultPipelineStageBuilder, PipelineStageBuilder};
+use crate::builder::join::{DefaultJoinStageBuilder, JoinStageBuilder};
 use crate::job::Job;
 
 /// The default distributed physical planner lowering [`LogicalPlan`] into a [`Job`].
@@ -18,6 +19,7 @@ use crate::job::Job;
 pub struct DefaultPhysicalPlanner {
     pipeline_builder: Arc<dyn PipelineStageBuilder>,
     aggregate_builder: Arc<dyn AggregateStageBuilder>,
+    join_builder: Arc<dyn JoinStageBuilder>,
 }
 
 impl DefaultPhysicalPlanner {
@@ -26,6 +28,7 @@ impl DefaultPhysicalPlanner {
         Self {
             pipeline_builder: Arc::new(DefaultPipelineStageBuilder::new()),
             aggregate_builder: Arc::new(DefaultAggregateStageBuilder::new()),
+            join_builder: Arc::new(DefaultJoinStageBuilder::new()),
         }
     }
 
@@ -41,6 +44,12 @@ impl DefaultPhysicalPlanner {
         self
     }
 
+    /// Override the distributed join stage builder.
+    pub fn with_join_builder(mut self, builder: Arc<dyn JoinStageBuilder>) -> Self {
+        self.join_builder = builder;
+        self
+    }
+
     /// Borrows the linear pipeline stage builder.
     pub fn pipeline_builder(&self) -> &Arc<dyn PipelineStageBuilder> {
         &self.pipeline_builder
@@ -49,6 +58,11 @@ impl DefaultPhysicalPlanner {
     /// Borrows the aggregation stage builder.
     pub fn aggregate_builder(&self) -> &Arc<dyn AggregateStageBuilder> {
         &self.aggregate_builder
+    }
+
+    /// Borrows the distributed join stage builder.
+    pub fn join_builder(&self) -> &Arc<dyn JoinStageBuilder> {
+        &self.join_builder
     }
 }
 
@@ -64,9 +78,32 @@ impl std::fmt::Debug for DefaultPhysicalPlanner {
     }
 }
 
+fn contains_linear_join(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Join { .. } => true,
+        LogicalPlan::Project { input, .. } | LogicalPlan::Filter { input, .. } => {
+            contains_linear_join(input)
+        }
+        _ => false,
+    }
+}
+
 impl PhysicalPlanner for DefaultPhysicalPlanner {
     fn create_physical_plan(&self, logical_plan: LogicalPlan) -> Result<Job> {
         let query_id = QueryId::new();
+
+        if contains_linear_join(&logical_plan) {
+            let mut stages = Vec::new();
+            let mut edges = Vec::new();
+            let output_stage = self.join_builder.build(
+                query_id,
+                &logical_plan,
+                &mut stages,
+                &mut edges,
+            )?;
+            return Job::new(query_id, stages, edges, output_stage, ExecutionMode::Batch);
+        }
+
         match &logical_plan {
             LogicalPlan::Scan { .. }
             | LogicalPlan::ExternalScan { .. }
@@ -83,6 +120,17 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 let mut stages = Vec::new();
                 let mut edges = Vec::new();
                 let output_stage = self.aggregate_builder.build(
+                    query_id,
+                    &logical_plan,
+                    &mut stages,
+                    &mut edges,
+                )?;
+                Job::new(query_id, stages, edges, output_stage, ExecutionMode::Batch)
+            }
+            LogicalPlan::Join { .. } => {
+                let mut stages = Vec::new();
+                let mut edges = Vec::new();
+                let output_stage = self.join_builder.build(
                     query_id,
                     &logical_plan,
                     &mut stages,

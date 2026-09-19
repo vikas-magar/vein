@@ -6,10 +6,14 @@ pub mod connection;
 /// QUIC-specific client implementation with pooling.
 pub mod quic_client;
 
+/// Client for the VCS exchange metadata service.
+pub mod vcs_client;
+
 // Re-export core types for easier access
 use crate::{Result, VeinError};
 pub use connection::ConnectionManager;
 pub use quic_client::QuicClient;
+pub use vcs_client::VcsExchangeClient;
 use s2n_quic::provider::tls;
 use s2n_quic::{Client, Server};
 use std::fs;

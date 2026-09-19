@@ -219,6 +219,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["alice", "bob", "charlie"])),
             ],
             selection: SelectionVector::new_dense(3),
+            address_columns: vec![None, None],
         }).unwrap();
         sink.flush().unwrap();
 
@@ -230,6 +231,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["dave", "eve"])),
             ],
             selection: SelectionVector::new_dense(2),
+            address_columns: vec![None, None],
         }).unwrap();
         sink2.flush().unwrap();
 

@@ -112,9 +112,11 @@ pub async fn execute_parquet_scan(
             tracing::trace!(rows = batch.num_rows(), "Pushing batch down pipeline");
             let num_rows = batch.num_rows();
             let vectors = batch.columns().to_vec();
+            let address_columns = vec![None; vectors.len()];
             let chunk = DataChunk {
                 vectors,
                 selection: SelectionVector::new_dense(num_rows),
+                address_columns,
             };
             next.push(chunk)?;
         }

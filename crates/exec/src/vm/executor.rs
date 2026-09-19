@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use common::protocol::{MicroOp, MicroProgram};
+use exo::AddressBatch;
 use common::Result;
 use crate::pipeline::{DataChunk, PipelineNode, Transform};
 use crate::udf::FunctionRegistry;
@@ -18,6 +19,7 @@ use super::register::RegisterFile;
 pub struct VectorVmExecutor {
     program: MicroProgram,
     registers: RegisterFile,
+    address_registers: Vec<Option<AddressBatch>>,
     registry: Arc<FunctionRegistry>,
     next: Box<dyn PipelineNode<DataChunk>>,
 }
@@ -29,9 +31,11 @@ impl VectorVmExecutor {
         registry: Arc<FunctionRegistry>,
         next: Box<dyn PipelineNode<DataChunk>>,
     ) -> Self {
-        let registers = RegisterFile::new(program.register_count);
+        let register_count = program.register_count;
+        let registers = RegisterFile::new(register_count);
         Self {
             program,
+            address_registers: vec![None; register_count as usize],
             registers,
             registry,
             next,
@@ -49,6 +53,16 @@ impl VectorVmExecutor {
     }
 }
 
+fn set_computed(
+    registers: &mut RegisterFile,
+    address_registers: &mut [Option<AddressBatch>],
+    dst: u8,
+    array: arrow::array::ArrayRef,
+) -> Result<()> {
+    address_registers[dst as usize] = None;
+    registers.set(dst, array)
+}
+
 impl PipelineNode<DataChunk> for VectorVmExecutor {
     fn push(&mut self, mut chunk: DataChunk) -> Result<()> {
         if chunk.selection.is_empty() {
@@ -57,123 +71,131 @@ impl PipelineNode<DataChunk> for VectorVmExecutor {
 
         let physical_rows = chunk.physical_len();
         self.registers.mount_chunk(&chunk)?;
+        self.address_registers.fill(None);
+        for (index, address_batch) in chunk.address_columns.iter().enumerate() {
+            if let Some(register) = self.address_registers.get_mut(index) {
+                *register = address_batch.clone();
+            }
+        }
 
         for op in &self.program.instructions {
             match op {
                 MicroOp::LoadConstant { dst, value } => {
                     let arr = ops::scalar_constant_to_array(value, physical_rows)?;
-                    self.registers.set(*dst, arr)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, arr)?;
                 }
                 MicroOp::CopyRegister { dst, src } => {
                     let arr = self.registers.get(*src)?.clone();
+                    let address_batch = self.address_registers[*src as usize].clone();
                     self.registers.set(*dst, arr)?;
+                    self.address_registers[*dst as usize] = address_batch;
                 }
                 MicroOp::Add { dst, src1, src2 } => {
                     let res = ops::eval_add(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::Sub { dst, src1, src2 } => {
                     let res = ops::eval_sub(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::Mul { dst, src1, src2 } => {
                     let res = ops::eval_mul(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::Div { dst, src1, src2 } => {
                     let res = ops::eval_div(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::Mod { dst, src1, src2 } => {
                     let res = ops::eval_mod(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::Neg { dst, src } => {
                     let res = ops::eval_neg(self.registers.get(*src)?)?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::CmpEq { dst, src1, src2 } => {
                     let res = ops::eval_cmp_eq(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::CmpNeq { dst, src1, src2 } => {
                     let res = ops::eval_cmp_neq(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::CmpGt { dst, src1, src2 } => {
                     let res = ops::eval_cmp_gt(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::CmpGte { dst, src1, src2 } => {
                     let res = ops::eval_cmp_gte(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::CmpLt { dst, src1, src2 } => {
                     let res = ops::eval_cmp_lt(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::CmpLte { dst, src1, src2 } => {
                     let res = ops::eval_cmp_lte(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::And { dst, src1, src2 } => {
                     let res = ops::eval_and(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::Or { dst, src1, src2 } => {
                     let res = ops::eval_or(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::Not { dst, src } => {
                     let res = ops::eval_not(self.registers.get(*src)?)?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::IsNull { dst, src } => {
                     let res = ops::eval_is_null(self.registers.get(*src)?)?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::IsNotNull { dst, src } => {
                     let res = ops::eval_is_not_null(self.registers.get(*src)?)?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::FilterMask { bool_reg } => {
                     let mask = self.registers.get(*bool_reg)?;
@@ -184,6 +206,10 @@ impl PipelineNode<DataChunk> for VectorVmExecutor {
                 }
                 MicroOp::ProjectRegisters { out_regs } => {
                     chunk.vectors = self.registers.project(out_regs)?;
+                    chunk.address_columns = out_regs
+                        .iter()
+                        .map(|register| self.address_registers.get(*register as usize).cloned().unwrap_or(None))
+                        .collect();
                 }
                 MicroOp::CallUdf { name, arg_regs, dst } => {
                     let mut args = Vec::with_capacity(arg_regs.len());
@@ -191,28 +217,28 @@ impl PipelineNode<DataChunk> for VectorVmExecutor {
                         args.push(self.registers.get(reg)?.clone());
                     }
                     let res = ops::eval_call_udf(&self.registry, name, &args)?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::VectorCosineDistance { dst, src1, src2 } => {
                     let res = ops::eval_cosine_distance(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::VectorL2Distance { dst, src1, src2 } => {
                     let res = ops::eval_l2_distance(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::VectorDotProduct { dst, src1, src2 } => {
                     let res = ops::eval_dot_product(
                         self.registers.get(*src1)?,
                         self.registers.get(*src2)?,
                     )?;
-                    self.registers.set(*dst, res)?;
+                    set_computed(&mut self.registers, &mut self.address_registers, *dst, res)?;
                 }
                 MicroOp::StateBuild { .. }
                 | MicroOp::StateProbe { .. }

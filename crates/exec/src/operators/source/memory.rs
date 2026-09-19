@@ -32,6 +32,7 @@ impl Source<DataChunk> for MemorySource {
             let num_rows = batch.num_rows();
             let vectors = batch.columns().to_vec();
             let chunk = DataChunk {
+                address_columns: vec![None; vectors.len()],
                 vectors,
                 selection: SelectionVector::new_dense(num_rows),
             };

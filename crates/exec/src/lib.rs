@@ -5,6 +5,8 @@
 
 #![deny(missing_docs)]
 
+/// Executor-side exchange metadata contracts.
+pub mod exchange;
 /// Streaming pipeline abstractions and DataChunk primitives.
 pub mod pipeline;
 
@@ -24,5 +26,9 @@ pub mod factory;
 pub mod vm;
 
 pub use daemon::{ExecutorDaemon, ExecutorDaemonBuilder};
+pub use operators::{
+    ArrowJoinKeyExtractor, HashJoinTable, JoinKey, JoinKeyBatch, JoinKeyExtractor, JoinKeyPart,
+    JoinKeyRow, JoinMatch, JoinPartitioner, JoinRowRef,
+};
 pub use pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 

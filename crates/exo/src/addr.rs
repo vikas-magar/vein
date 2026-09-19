@@ -27,6 +27,16 @@ pub const TRAILER_SIZE: usize = 8;
 pub const CODEC_RAW: u16 = 0;
 pub const CODEC_FOR: u16 = 1;
 
+const ADDRESS_VALUE_ALIGNMENT: usize = std::mem::align_of::<u64>();
+
+fn aligned_value_offset(bitmap_len: usize) -> ExoResult<usize> {
+    let alignment_mask = ADDRESS_VALUE_ALIGNMENT - 1;
+    bitmap_len
+        .checked_add(alignment_mask)
+        .map(|len| len & !alignment_mask)
+        .ok_or_else(|| ExoError::CodecError("Address validity bitmap length overflow".to_string()))
+}
+
 /// Fixed 64-byte file header for `.exo.addr` files.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,7 +133,10 @@ pub struct AddressGranuleMark {
     pub min_vaddr: u64,
     /// Maximum non-null vAddr in this granule (used for range skipping).
     pub max_vaddr: u64,
-    /// Number of bytes occupied by the validity bitmap at the granule start.
+    /// Number of bytes from the granule start to the value payload.
+    ///
+    /// This includes zero padding after the validity bitmap so raw `u64` payloads
+    /// begin at an 8-byte aligned address for zero-copy reads.
     pub validity_len: u32,
     /// Granule flags, including whether at least one value is non-null.
     pub flags: u32,
@@ -289,9 +302,15 @@ impl<W: Write + Seek> ExoAddressWriter<W> {
         let byte_offset = self.writer.stream_position()?;
         let min_vaddr = self.min_vaddr;
         let max_vaddr = self.max_vaddr;
-        let validity_len = self.validity.len() as u32;
+        let bitmap_len = self.validity.len();
+        let value_offset = aligned_value_offset(bitmap_len)?;
+        let validity_len = u32::try_from(value_offset)
+            .map_err(|_| ExoError::CodecError("Address validity bitmap is too large".to_string()))?;
         let uncompressed_len = self.buffer.len() as u32;
         self.writer.write_all(&self.validity)?;
+        if value_offset > bitmap_len {
+            self.writer.write_all(&[0u8; ADDRESS_VALUE_ALIGNMENT][..value_offset - bitmap_len])?;
+        }
 
         let encoded_values_len = if self.codec_flags == CODEC_FOR && self.slot_width == 8 {
             let mut u64_buf = Vec::with_capacity(self.rows_in_granule);
@@ -307,9 +326,12 @@ impl<W: Write + Seek> ExoAddressWriter<W> {
             uncompressed_len
         };
 
+        let compressed_len = validity_len
+            .checked_add(encoded_values_len)
+            .ok_or_else(|| ExoError::CodecError("Address granule length overflow".to_string()))?;
         self.marks.push(AddressGranuleMark {
             byte_offset,
-            compressed_len: validity_len + encoded_values_len,
+            compressed_len,
             uncompressed_len,
             min_vaddr,
             max_vaddr,

@@ -1,0 +1,269 @@
+//! Cluster-visible exchange metadata shared by planners, VCS, and executors.
+use serde::{Deserialize, Serialize};
+
+use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
+
+/// One optional canonical-address column transported with an exchange batch.
+///
+/// The bitmap uses the same packed row order as the Arrow payload. Keeping this
+/// wire type independent from EXO lets value-native sources participate in the
+/// same exchange protocol without taking a dependency on the storage crate.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct ExchangeAddressColumn {
+    /// Canonical address for every physical row in the Arrow payload.
+    pub addresses: Vec<u64>,
+    /// Packed validity bitmap aligned with the addresses.
+    pub validity: Vec<u8>,
+}
+
+/// One self-contained exchange payload.
+///
+/// The VFS layer frames this encoded value. The Arrow bytes remain opaque to the
+/// metadata/control plane, while address sidecars remain available to reducers.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct ExchangeBatch {
+    /// One independently decodable Arrow IPC stream.
+    pub arrow_ipc: Vec<u8>,
+    /// Address sidecars aligned with Arrow columns.
+    pub address_columns: Vec<Option<ExchangeAddressColumn>>,
+}
+
+impl ExchangeBatch {
+    const MAGIC: &'static [u8; 4] = b"VEXB";
+    const VERSION: u32 = 1;
+
+    /// Encodes this batch for storage in one VFS exchange frame.
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        let arrow_len = u64::try_from(self.arrow_ipc.len())
+            .map_err(|_| "exchange Arrow payload is too large".to_string())?;
+        let column_count = u32::try_from(self.address_columns.len())
+            .map_err(|_| "exchange has too many columns".to_string())?;
+
+        let mut output = Vec::with_capacity(
+            4usize
+                .saturating_add(4)
+                .saturating_add(8)
+                .saturating_add(self.arrow_ipc.len()),
+        );
+        output.extend_from_slice(Self::MAGIC);
+        output.extend_from_slice(&Self::VERSION.to_le_bytes());
+        output.extend_from_slice(&arrow_len.to_le_bytes());
+        output.extend_from_slice(&self.arrow_ipc);
+        output.extend_from_slice(&column_count.to_le_bytes());
+
+        for column in &self.address_columns {
+            match column {
+                None => output.push(0),
+                Some(column) => {
+                    output.push(1);
+                    let row_count = u64::try_from(column.addresses.len())
+                        .map_err(|_| "exchange address column is too large".to_string())?;
+                    let validity_len = u64::try_from(column.validity.len())
+                        .map_err(|_| "exchange validity bitmap is too large".to_string())?;
+                    output.extend_from_slice(&row_count.to_le_bytes());
+                    output.extend_from_slice(&validity_len.to_le_bytes());
+                    for address in &column.addresses {
+                        output.extend_from_slice(&address.to_le_bytes());
+                    }
+                    output.extend_from_slice(&column.validity);
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    /// Decodes and validates one stored exchange payload.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let mut cursor = 0usize;
+        let magic = read_bytes(bytes, &mut cursor, 4)?;
+        if magic != Self::MAGIC {
+            return Err("invalid exchange batch magic".to_string());
+        }
+        if read_u32(bytes, &mut cursor)? != Self::VERSION {
+            return Err("unsupported exchange batch version".to_string());
+        }
+
+        let arrow_len = usize::try_from(read_u64(bytes, &mut cursor)?)
+            .map_err(|_| "exchange Arrow payload length overflows usize".to_string())?;
+        let arrow_ipc = read_bytes(bytes, &mut cursor, arrow_len)?.to_vec();
+        let column_count = usize::try_from(read_u32(bytes, &mut cursor)?)
+            .map_err(|_| "exchange column count overflows usize".to_string())?;
+        let mut address_columns = Vec::with_capacity(column_count);
+
+        for _ in 0..column_count {
+            match read_u8(bytes, &mut cursor)? {
+                0 => address_columns.push(None),
+                1 => {
+                    let row_count = usize::try_from(read_u64(bytes, &mut cursor)?)
+                        .map_err(|_| "exchange row count overflows usize".to_string())?;
+                    let validity_len = usize::try_from(read_u64(bytes, &mut cursor)?)
+                        .map_err(|_| "exchange validity length overflows usize".to_string())?;
+                    let address_bytes = row_count
+                        .checked_mul(8)
+                        .ok_or_else(|| "exchange address byte length overflows usize".to_string())?;
+                    let address_bytes = read_bytes(bytes, &mut cursor, address_bytes)?;
+                    let addresses = address_bytes
+                        .chunks_exact(8)
+                        .map(|value| u64::from_le_bytes(value.try_into().expect("8-byte chunk")))
+                        .collect();
+                    let validity = read_bytes(bytes, &mut cursor, validity_len)?.to_vec();
+                    address_columns.push(Some(ExchangeAddressColumn { addresses, validity }));
+                }
+                marker => {
+                    return Err(format!("invalid exchange address column marker {marker}"));
+                }
+            }
+        }
+
+        if cursor != bytes.len() {
+            return Err("trailing bytes in exchange batch payload".to_string());
+        }
+        Ok(Self {
+            arrow_ipc,
+            address_columns,
+        })
+    }
+}
+
+fn read_bytes<'a>(bytes: &'a [u8], cursor: &mut usize, length: usize) -> Result<&'a [u8], String> {
+    let end = cursor
+        .checked_add(length)
+        .ok_or_else(|| "exchange payload offset overflows usize".to_string())?;
+    if end > bytes.len() {
+        return Err("truncated exchange batch payload".to_string());
+    }
+    let value = &bytes[*cursor..end];
+    *cursor = end;
+    Ok(value)
+}
+
+fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, String> {
+    read_bytes(bytes, cursor, 1).map(|value| value[0])
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, String> {
+    read_bytes(bytes, cursor, 4).map(|value| u32::from_le_bytes(value.try_into().expect("4-byte slice")))
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    read_bytes(bytes, cursor, 8).map(|value| u64::from_le_bytes(value.try_into().expect("8-byte slice")))
+}
+
+/// Identity of one shuffle exchange.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct ExchangeKey {
+    /// Query owning the exchange.
+    pub query_id: QueryId,
+    /// Stage producing the exchange.
+    pub stage_id: StageId,
+}
+
+/// Lifecycle state of a shuffle exchange.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum ExchangeState {
+    /// Producers may publish fragments.
+    Open,
+    /// All producer output is visible to reducers.
+    Sealed,
+    /// The exchange is invalid and should be removed.
+    Aborted,
+}
+
+/// One immutable persisted shuffle fragment.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct ExchangeFragment {
+    /// Exchange partition containing this fragment.
+    pub partition_id: u32,
+    /// Producer task that created the fragment.
+    pub task_id: TaskId,
+    /// Retry attempt for the producer task.
+    pub attempt: u32,
+    /// VFS or object-store path for the immutable fragment.
+    pub storage_path: String,
+    /// VFS node that owns or cached the fragment, when known.
+    pub node_id: Option<NodeId>,
+    /// Fragment byte length.
+    pub byte_len: u64,
+    /// Rows contained in the fragment.
+    pub row_count: u64,
+    /// Content checksum used for validation.
+    pub checksum: u64,
+}
+
+/// Authoritative metadata for one exchange stage.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct ExchangeManifest {
+    /// Exchange identity.
+    pub key: ExchangeKey,
+    /// Number of reducer partitions.
+    pub partition_count: u16,
+    /// Producer tasks expected to publish output.
+    pub expected_tasks: Vec<TaskId>,
+    /// Fingerprint of the exchanged schema and key contract.
+    pub schema_fingerprint: String,
+    /// Published immutable fragments.
+    pub fragments: Vec<ExchangeFragment>,
+    /// Current exchange lifecycle state.
+    pub state: ExchangeState,
+}
+
+impl ExchangeManifest {
+    /// Creates an open exchange manifest.
+    pub fn new(
+        key: ExchangeKey,
+        partition_count: u16,
+        expected_tasks: Vec<TaskId>,
+        schema_fingerprint: impl Into<String>,
+    ) -> Self {
+        Self {
+            key,
+            partition_count,
+            expected_tasks,
+            schema_fingerprint: schema_fingerprint.into(),
+            fragments: Vec::new(),
+            state: ExchangeState::Open,
+        }
+    }
+
+    /// Returns fragments for one reducer partition.
+    pub fn fragments_for_partition(
+        &self,
+        partition_id: u32,
+    ) -> impl Iterator<Item = &ExchangeFragment> {
+        self.fragments
+            .iter()
+            .filter(move |fragment| fragment.partition_id == partition_id)
+    }
+
+    /// Returns whether every expected producer has a published attempt.
+    pub fn all_tasks_published(&self) -> bool {
+        self.expected_tasks.iter().all(|task_id| {
+            self.fragments
+                .iter()
+                .any(|fragment| fragment.task_id == *task_id)
+        })
+    }
+
+    /// Returns whether every expected producer published every partition.
+    pub fn all_fragments_published(&self) -> bool {
+        self.expected_tasks.iter().all(|task_id| {
+            (0..self.partition_count as u32).all(|partition_id| {
+                self.fragments.iter().any(|fragment| {
+                    fragment.task_id == *task_id && fragment.partition_id == partition_id
+                })
+            })
+        })
+    }
+}

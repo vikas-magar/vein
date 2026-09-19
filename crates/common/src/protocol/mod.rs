@@ -5,15 +5,23 @@
 
 pub mod control;
 pub mod convert;
+pub mod exchange;
 pub mod ir;
+pub mod join;
 pub mod rpc;
 pub mod task;
+pub mod vcs_exchange;
 
 // Re-export Micro-IR definitions
 pub use ir::constant::ScalarConstant;
 pub use ir::op::MicroOp;
 pub use ir::program::{MicroProgram, RegId};
 pub use ir::state::{AggOpCode, JoinKind, StateMode};
+pub use exchange::{
+    ExchangeAddressColumn, ExchangeBatch, ExchangeFragment, ExchangeKey, ExchangeManifest, ExchangeState,
+};
+pub use vcs_exchange::{VcsExchangeRequest, VcsExchangeResponse};
+pub use join::{ExchangeInput, JoinKeyMode, JoinKeySpec, JoinSource, PhysicalJoinType};
 
 // Re-export task & pipeline definitions
 pub use task::{

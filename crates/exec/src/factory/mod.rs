@@ -5,8 +5,10 @@
 
 use std::sync::Arc;
 
-use crate::operators::sink::{CollectSink, DiscardSink, StorageSink};
-use crate::operators::source::{MemorySource, ScanSource};
+use crate::exchange::SharedExchangeMetadata;
+use crate::operators::sink::{CollectSink, DiscardSink, ShuffleSink, StorageSink};
+use crate::operators::source::{MemorySource, ScanSource, VfsExchangeSource};
+use crate::operators::join::HashJoinSource;
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use crate::runtime::ExecutorBuilder;
 use crate::udf::FunctionRegistry;
@@ -23,6 +25,8 @@ use error::VeinError;
 /// for customization.
 pub struct TaskExecutorBuilder {
     builder: Arc<dyn ExecutorBuilder>,
+    registry: Arc<FunctionRegistry>,
+    metadata: Option<SharedExchangeMetadata>,
 }
 
 impl TaskExecutorBuilder {
@@ -30,14 +34,31 @@ impl TaskExecutorBuilder {
     pub fn new() -> Self {
         let registry = Arc::new(FunctionRegistry::new());
         Self {
-            builder: Arc::new(DefaultExecutorBuilder::new(registry)),
+            builder: Arc::new(DefaultExecutorBuilder::new(registry.clone())),
+            registry,
+            metadata: None,
         }
     }
 
     /// Override the UDF function registry used by the Vector VM.
     pub fn with_registry(mut self, registry: Arc<FunctionRegistry>) -> Self {
-        self.builder = Arc::new(DefaultExecutorBuilder::new(registry));
+        self.registry = registry;
+        self.rebuild_default();
         self
+    }
+
+    /// Configure VCS-backed exchange metadata for shuffle and join stages.
+    pub fn with_exchange_metadata(mut self, metadata: SharedExchangeMetadata) -> Self {
+        self.metadata = Some(metadata);
+        self.rebuild_default();
+        self
+    }
+
+    fn rebuild_default(&mut self) {
+        self.builder = Arc::new(DefaultExecutorBuilder::with_exchange_metadata(
+            self.registry.clone(),
+            self.metadata.clone(),
+        ));
     }
 
     /// Override the executor builder (which maps the wire protocol to stages) entirely.
@@ -62,12 +83,21 @@ impl Default for TaskExecutorBuilder {
 /// [`VectorVmExecutor`] from a wire task description.
 pub struct DefaultExecutorBuilder {
     registry: Arc<FunctionRegistry>,
+    metadata: Option<SharedExchangeMetadata>,
 }
 
 impl DefaultExecutorBuilder {
     /// Create a builder with the given UDF function registry for the Vector VM.
     pub fn new(registry: Arc<FunctionRegistry>) -> Self {
-        Self { registry }
+        Self::with_exchange_metadata(registry, None)
+    }
+
+    /// Creates a builder with optional VCS-backed exchange metadata.
+    pub fn with_exchange_metadata(
+        registry: Arc<FunctionRegistry>,
+        metadata: Option<SharedExchangeMetadata>,
+    ) -> Self {
+        Self { registry, metadata }
     }
 }
 
@@ -95,9 +125,42 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                         .with_scan_predicates(&scan.scan_predicates),
                 ))
             }
-            DataSource::Exchange(_) => Err(VeinError::internal(
-                "Exchange source is not yet implemented",
-            )),
+            DataSource::Exchange(exchange) => {
+                if exchange.partition_count == 0
+                    || exchange.partition_id >= exchange.partition_count as u32
+                {
+                    return Err(VeinError::internal("exchange partition is out of range"));
+                }
+                let store = vfs::VfsTableStore::shared_or_default()
+                    .map_err(|e| VeinError::internal(format!("open VFS exchange store: {e}")))?;
+                let path = format!(
+                    "{}/partition_{:05}",
+                    exchange.path_prefix, exchange.partition_id
+                );
+                let source = VfsExchangeSource::new(store, path, exchange.schema.clone());
+                let source = match &self.metadata {
+                    Some(metadata) => source.with_exchange_metadata(
+                        exchange.exchange_key,
+                        common::identifiers::PartitionId::from_raw(exchange.partition_id as u16),
+                        metadata.clone(),
+                    ),
+                    None => source,
+                };
+                Ok(Box::new(source))
+            },
+            DataSource::Join(join) => {
+                let store = vfs::VfsTableStore::shared_or_default()
+                    .map_err(|e| VeinError::internal(format!("open VFS join store: {e}")))?;
+                let source = match &self.metadata {
+                    Some(metadata) => HashJoinSource::with_store_and_metadata(
+                        join.clone(),
+                        store,
+                        metadata.clone(),
+                    ),
+                    None => HashJoinSource::with_store(join.clone(), store),
+                };
+                Ok(Box::new(source))
+            },
             DataSource::Stream(_) => Err(VeinError::internal(
                 "Stream source is not yet implemented",
             )),
@@ -123,9 +186,11 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                 let field_names = schema.iter().map(|f| f.name.clone()).collect();
                 Ok(Box::new(CollectSink::with_field_names(field_names)))
             }
-            DataSink::Shuffle(_) => Err(VeinError::internal(
-                "Shuffle sink is not yet implemented",
-            )),
+            DataSink::Shuffle(target) => Ok(Box::new(ShuffleSink::with_vfs_store_and_metadata(
+                target.clone(),
+                None,
+                self.metadata.clone(),
+            ))),
             DataSink::Storage(target) => Ok(Box::new(StorageSink::new(target.clone()))),
         }
     }

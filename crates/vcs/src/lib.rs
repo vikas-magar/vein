@@ -17,6 +17,12 @@ pub mod cache;
 #[allow(missing_docs)]
 pub mod event;
 
+/// Authoritative shuffle exchange metadata.
+pub mod exchange;
+
+/// QUIC exchange metadata service.
+pub mod rpc;
+
 /// Cache of pre-computed scan plans for warm query replays.
 pub mod plan_cache;
 
@@ -31,6 +37,8 @@ pub mod discovery;
 
 pub use catalog::{InMemoryCatalog, TableCatalog, TableEntry};
 pub use discovery::{DiscoveredSource, resolve_source};
+pub use exchange::{ExchangeCatalog, InMemoryExchangeCatalog, PersistentExchangeCatalog};
+pub use rpc::VcsExchangeServer;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,8 +74,13 @@ pub struct VcsCatalog {
     catalog: Arc<dyn Catalog>,
     table_cache: TableCache,
     plan_cache: ScanPlanCache,
+    exchange_catalog: Arc<dyn ExchangeCatalog>,
     #[allow(dead_code)]
     file_io: iceberg::io::FileIO,
+}
+
+fn exchange_manifest_path(warehouse: &str) -> String {
+    format!("{}/_vein/exchanges/manifests.json", warehouse.trim_end_matches('/'))
 }
 
 impl VcsCatalog {
@@ -84,6 +97,12 @@ impl VcsCatalog {
     ) -> Result<Self> {
         let file_io = build_file_io(&storage)?;
         let warehouse = warehouse_location.into();
+        let exchange_manifest_path = exchange_manifest_path(&warehouse);
+        let exchange_catalog = PersistentExchangeCatalog::open(
+            file_io.clone(),
+            exchange_manifest_path,
+        )
+        .await?;
 
         // Derive the StorageFactory from the StorageConfig for the MemoryCatalog.
         // The MemoryCatalog needs its own factory to read/write metadata.json files.
@@ -110,7 +129,7 @@ impl VcsCatalog {
             .with_storage_factory(factory)
             .load(
                 catalog_name,
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
             )
             .await
             .map_err(VeinError::Iceberg)?;
@@ -119,8 +138,62 @@ impl VcsCatalog {
             catalog: Arc::new(catalog),
             table_cache: TableCache::new(),
             plan_cache: ScanPlanCache::new(),
+            exchange_catalog: Arc::new(exchange_catalog),
             file_io,
         })
+    }
+
+    /// Returns the VCS-owned exchange catalog.
+    pub fn exchange_catalog(&self) -> &dyn ExchangeCatalog {
+        self.exchange_catalog.as_ref()
+    }
+
+    /// Returns a shareable handle for the VCS exchange RPC service.
+    pub fn shared_exchange_catalog(&self) -> Arc<dyn ExchangeCatalog> {
+        self.exchange_catalog.clone()
+    }
+
+    /// Creates or reopens an exchange through VCS.
+    pub async fn create_exchange(
+        &self,
+        key: common::protocol::ExchangeKey,
+        partition_count: u16,
+        expected_tasks: Vec<common::identifiers::TaskId>,
+        schema_fingerprint: impl Into<String>,
+    ) -> Result<common::protocol::ExchangeManifest> {
+        self.exchange_catalog
+            .create_exchange(
+                key,
+                partition_count,
+                expected_tasks,
+                schema_fingerprint.into(),
+            )
+            .await
+    }
+
+    /// Publishes one durable exchange fragment through VCS.
+    pub async fn publish_exchange_fragment(
+        &self,
+        key: common::protocol::ExchangeKey,
+        fragment: common::protocol::ExchangeFragment,
+    ) -> Result<()> {
+        self.exchange_catalog.publish_fragment(key, fragment).await
+    }
+
+    /// Seals an exchange after all registered producers publish output.
+    pub async fn seal_exchange(
+        &self,
+        key: common::protocol::ExchangeKey,
+    ) -> Result<common::protocol::ExchangeManifest> {
+        self.exchange_catalog.seal_exchange(key).await
+    }
+
+    /// Reads a sealed exchange manifest through VCS.
+    pub async fn get_exchange_manifest(
+        &self,
+        key: common::protocol::ExchangeKey,
+    ) -> Result<common::protocol::ExchangeManifest> {
+        self.exchange_catalog.get_manifest(key).await
     }
 
     // -------------------------------------------------------------------------

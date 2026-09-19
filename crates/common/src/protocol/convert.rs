@@ -4,6 +4,7 @@
 //! lifetime infection or rkyv::Deserialize Pool strategy mismatches.
 
 use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
+use super::exchange::{ArchivedExchangeKey, ExchangeKey};
 use super::control::{
     ArchivedNodeKind, ArchivedNodeLoad, ArchivedVeinControlEvent, NodeKind, NodeLoad,
     VeinControlEvent,
@@ -13,6 +14,11 @@ use super::ir::op::{ArchivedMicroOp, MicroOp};
 use super::ir::program::{ArchivedMicroProgram, MicroProgram};
 use super::ir::state::{
     ArchivedAggOpCode, ArchivedJoinKind, ArchivedStateMode, AggOpCode, JoinKind, StateMode,
+};
+use super::join::{
+    ArchivedExchangeInput, ArchivedJoinKeyMode, ArchivedJoinKeySpec, ArchivedJoinSource,
+    ArchivedPhysicalJoinType, ExchangeInput, JoinKeyMode, JoinKeySpec, JoinSource,
+    PhysicalJoinType,
 };
 use super::task::{
     ArchivedDataSink, ArchivedDataSource, ArchivedExecuteTask, ArchivedExecutionMode,
@@ -356,14 +362,88 @@ impl From<&ArchivedExecutionMode> for ExecutionMode {
     }
 }
 
+impl From<&ArchivedPhysicalJoinType> for PhysicalJoinType {
+    fn from(archived: &ArchivedPhysicalJoinType) -> Self {
+        match archived {
+            ArchivedPhysicalJoinType::Inner => Self::Inner,
+            ArchivedPhysicalJoinType::Left => Self::Left,
+            ArchivedPhysicalJoinType::Right => Self::Right,
+            ArchivedPhysicalJoinType::Full => Self::Full,
+            ArchivedPhysicalJoinType::Cross => Self::Cross,
+        }
+    }
+}
+
+impl From<&ArchivedJoinKeyMode> for JoinKeyMode {
+    fn from(archived: &ArchivedJoinKeyMode) -> Self {
+        match archived {
+            ArchivedJoinKeyMode::Auto => Self::Auto,
+            ArchivedJoinKeyMode::AddressNative => Self::AddressNative,
+            ArchivedJoinKeyMode::ValueNative => Self::ValueNative,
+        }
+    }
+}
+
+impl From<&ArchivedJoinKeySpec> for JoinKeySpec {
+    fn from(archived: &ArchivedJoinKeySpec) -> Self {
+        Self {
+            field_id: archived.field_id.to_native(),
+            column_name: archived.column_name.as_str().to_string(),
+            mode: JoinKeyMode::from(&archived.mode),
+        }
+    }
+}
+
+impl From<&ArchivedExchangeKey> for ExchangeKey {
+    fn from(archived: &ArchivedExchangeKey) -> Self {
+        Self {
+            query_id: QueryId::from_raw(archived.query_id.0.to_native()),
+            stage_id: StageId::from_raw(archived.stage_id.0.to_native()),
+        }
+    }
+}
+
+impl From<&ArchivedExchangeInput> for ExchangeInput {
+    fn from(archived: &ArchivedExchangeInput) -> Self {
+        Self {
+            exchange_key: ExchangeKey::from(&archived.exchange_key),
+            upstream_stage_id: StageId::from_raw(archived.upstream_stage_id.0.to_native()),
+            path_prefix: archived.path_prefix.as_str().to_string(),
+            partition_id: archived.partition_id.to_native(),
+            partition_count: archived.partition_count.to_native(),
+        }
+    }
+}
+
+impl From<&ArchivedJoinSource> for JoinSource {
+    fn from(archived: &ArchivedJoinSource) -> Self {
+        Self {
+            left: ExchangeInput::from(&archived.left),
+            right: ExchangeInput::from(&archived.right),
+            join_type: PhysicalJoinType::from(&archived.join_type),
+            left_keys: archived.left_keys.iter().map(JoinKeySpec::from).collect(),
+            right_keys: archived.right_keys.iter().map(JoinKeySpec::from).collect(),
+            requires_exact_verification: archived.requires_exact_verification,
+            left_schema: archived.left_schema.iter().map(FieldSchema::from).collect(),
+            right_schema: archived.right_schema.iter().map(FieldSchema::from).collect(),
+        }
+    }
+}
+
 impl From<&ArchivedDataSource> for DataSource {
     fn from(archived: &ArchivedDataSource) -> Self {
         match archived {
             ArchivedDataSource::Memory => DataSource::Memory,
             ArchivedDataSource::File(scan) => DataSource::File(FileScanTask::from(scan)),
             ArchivedDataSource::Exchange(e) => DataSource::Exchange(ExchangeSource {
+                exchange_key: ExchangeKey::from(&e.exchange_key),
                 upstream_stage_id: StageId::from_raw(e.upstream_stage_id.0.to_native()),
+                path_prefix: e.path_prefix.as_str().to_string(),
+                partition_id: e.partition_id.to_native(),
+                partition_count: e.partition_count.to_native(),
+                schema: e.schema.iter().map(FieldSchema::from).collect(),
             }),
+            ArchivedDataSource::Join(join) => DataSource::Join(JoinSource::from(join)),
             ArchivedDataSource::Stream(s) => DataSource::Stream(StreamSource {
                 topic: s.topic.as_str().to_string(),
             }),
@@ -379,8 +459,19 @@ impl From<&ArchivedDataSink> for DataSink {
             },
             ArchivedDataSink::Discard => DataSink::Discard,
             ArchivedDataSink::Shuffle(s) => DataSink::Shuffle(ShuffleTarget {
+                exchange_key: ExchangeKey::from(&s.exchange_key),
                 vfs_path_prefix: s.vfs_path_prefix.as_str().to_string(),
+                producer_task_id: TaskId::from_raw(s.producer_task_id.0.to_native()),
+                attempt: s.attempt.to_native(),
+                expected_tasks: s
+                    .expected_tasks
+                    .iter()
+                    .map(|task| TaskId::from_raw(task.0.to_native()))
+                    .collect(),
+                schema_fingerprint: s.schema_fingerprint.as_str().to_string(),
                 num_partitions: s.num_partitions.to_native(),
+                partition_keys: s.partition_keys.iter().map(JoinKeySpec::from).collect(),
+                schema: s.schema.iter().map(FieldSchema::from).collect(),
             }),
             ArchivedDataSink::Storage(s) => DataSink::Storage(StorageTarget {
                 destination_uri: s.destination_uri.as_str().to_string(),

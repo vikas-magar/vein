@@ -113,11 +113,19 @@ impl ScopeStack {
                     continue;
                 }
 
-                let mut matches = scope.columns.iter().filter(|c| c.name == name).peekable();
+                let mut matches = scope
+                    .columns
+                    .iter()
+                    .filter(|column| {
+                        column.name == name
+                            && qualifier
+                                .map(|q| column.qualifier.as_deref() == Some(q))
+                                .unwrap_or(true)
+                    })
+                    .peekable();
                 if let Some(first) = matches.next() {
                     if let Some(second) = matches.next()
                         && first.id != second.id
-                        && qualifier.is_none()
                     {
                         return Err(VeinError::semantic(
                             format!(

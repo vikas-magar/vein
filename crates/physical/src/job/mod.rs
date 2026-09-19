@@ -4,7 +4,7 @@ pub mod edge;
 pub mod order;
 pub mod validate;
 
-pub use edge::StageEdge;
+pub use edge::{StageEdge, StageInputPort};
 
 use crate::stage::Stage;
 use common::identifiers::{QueryId, StageId};
@@ -27,6 +27,8 @@ pub struct Job {
     stages: HashMap<StageId, Stage>,
     /// Predecessor adjacency: `StageId -> Vec<StageId>` that feed into it.
     predecessors: HashMap<StageId, Vec<StageId>>,
+    /// Routing contracts for every stage dependency.
+    edges: Vec<StageEdge>,
     /// The stage that produces the job's final output.
     output_stage: StageId,
 }
@@ -77,6 +79,7 @@ impl Job {
             mode,
             stages: stages_map,
             predecessors,
+            edges,
             output_stage,
         })
     }
@@ -94,6 +97,16 @@ impl Job {
     /// Returns the stages in topological order (leaves first).
     pub fn topological_order(&self) -> Vec<StageId> {
         order::compute_topological_order(self.output_stage, &self.predecessors)
+    }
+
+    /// Returns all validated stage routing contracts.
+    pub fn edges(&self) -> &[StageEdge] {
+        &self.edges
+    }
+
+    /// Returns the validated edges entering a stage.
+    pub fn input_edges(&self, stage_id: StageId) -> impl Iterator<Item = &StageEdge> {
+        self.edges.iter().filter(move |edge| edge.to_stage == stage_id)
     }
 
     /// Return the ID of the final output stage.

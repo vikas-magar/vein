@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::daemon::{DaemonContext, QueuedTask, WorkerPool};
+use crate::exchange::VcsExchangeMetadata;
 use crate::factory::TaskExecutorBuilder;
 use crate::runtime::{ArrowIpcOutputEncoder, OutputEncoder, TaskExecutor};
 use common::cancellation::CancellationToken;
@@ -18,6 +19,7 @@ use common::protocol::{
 };
 use common::transport::{
     build_quic_client, build_quic_server, extract_control_payload, frame_control_message,
+    VcsExchangeClient,
 };
 use common::Result;
 use error::VeinError;
@@ -361,6 +363,8 @@ pub struct ExecutorDaemonBuilder {
     master_addr: Option<String>,
     node_id: NodeId,
     workers: usize,
+    vcs_endpoint: Option<String>,
+    vcs_ca_cert: Option<String>,
 }
 
 impl ExecutorDaemonBuilder {
@@ -373,6 +377,8 @@ impl ExecutorDaemonBuilder {
             master_addr: None,
             node_id: NodeId::new(),
             workers: 4,
+            vcs_endpoint: None,
+            vcs_ca_cert: None,
         }
     }
 
@@ -407,6 +413,13 @@ impl ExecutorDaemonBuilder {
         self
     }
 
+    /// Configure the VCS exchange metadata endpoint and its CA certificate.
+    pub fn vcs_exchange(mut self, endpoint: &str, ca_cert: &str) -> Self {
+        self.vcs_endpoint = Some(endpoint.to_string());
+        self.vcs_ca_cert = Some(ca_cert.to_string());
+        self
+    }
+
     /// Assemble the daemon, wiring the task queue, executor abstraction, worker
     /// pool, and control plane together.
     pub fn build(self) -> Result<ExecutorDaemon> {
@@ -436,7 +449,17 @@ impl ExecutorDaemonBuilder {
         let ctx = DaemonContext::new(config.node_id, tx, master_client);
 
         // The task executor (default stages + expressions) that runs tasks.
-        let executor: Arc<dyn TaskExecutor> = Arc::new(TaskExecutorBuilder::new().build());
+        let mut task_builder = TaskExecutorBuilder::new();
+        if let Some(endpoint) = self.vcs_endpoint {
+            let ca_cert = self
+                .vcs_ca_cert
+                .unwrap_or_else(|| config.cert_path.clone());
+            let client = VcsExchangeClient::connect(endpoint, ca_cert)?;
+            task_builder = task_builder.with_exchange_metadata(Arc::new(
+                VcsExchangeMetadata::new(client),
+            ));
+        }
+        let executor: Arc<dyn TaskExecutor> = Arc::new(task_builder.build());
         let workers = WorkerPool::start(config.workers, rx, executor);
 
         Ok(ExecutorDaemon {

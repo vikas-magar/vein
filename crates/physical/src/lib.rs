@@ -14,6 +14,9 @@
 //! The [`PhysicalPlanner`] trait is the seam between the logical optimizer and
 //! this model: it lowers an optimized [`plan::LogicalPlan`] into a [`Job`].
 
+/// Physical distribution and partitioning contracts.
+pub mod distribution;
+
 /// The physical plan builder subsystem.
 pub mod builder;
 
@@ -32,7 +35,8 @@ pub mod stage;
 /// The atomic, executor-bound unit of work.
 pub mod task;
 
-pub use job::{Job, StageEdge};
+pub use distribution::{Distribution, DistributionRequirement, HashPartitioning};
+pub use job::{Job, StageEdge, StageInputPort};
 pub use planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 pub use stage::Stage;
 pub use task::Task;

@@ -5,7 +5,7 @@
 //! the in-memory catalog and mock registry, so tests read like executable
 //! specs: `bind(sql).await` then shape/schema assertions.
 
-use plan::{LogicalPlan, PlanTraversal};
+use plan::{LogicalExpr, LogicalPlan, PlanTraversal};
 use plan::ResolvedColumn;
 use crate::testing;
 
@@ -444,6 +444,28 @@ mod join_and_sources {
         } else {
             panic!("expected a Join plan, got {:?}", node_kind(&plan));
         }
+    }
+
+    /// Qualified self-join references must resolve to their respective input scopes.
+    #[tokio::test]
+    async fn qualified_self_join_columns_resolve_to_each_side() {
+        let plan = bind("FROM users AS a |> JOIN users AS b ON a.id = b.id").await;
+        let LogicalPlan::Join {
+            on:
+                Some(LogicalExpr::BinaryOp { left, right, .. }),
+            ..
+        } = plan
+        else {
+            panic!("expected an equality predicate on the self-join");
+        };
+
+        let (LogicalExpr::Column(left), LogicalExpr::Column(right)) = (*left, *right) else {
+            panic!("expected column references in the self-join predicate");
+        };
+
+        assert_eq!(left.qualifier.as_deref(), Some("a"));
+        assert_eq!(right.qualifier.as_deref(), Some("b"));
+        assert_ne!(left.id, right.id);
     }
 
     /// `USING (col)` synthesizes an equality predicate and de-duplicates the

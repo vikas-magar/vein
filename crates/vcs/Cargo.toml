@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+common = { path = "../common" }
 error = { path = "../error" }
 plan = { path = "../plan" }
 types = { path = "../types" }
@@ -19,6 +20,9 @@ moka = { workspace = true }
 rkyv = { workspace = true }
 tracing   = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+s2n-quic = { workspace = true }
 
 [lints.rust]
 missing_docs = "deny"
