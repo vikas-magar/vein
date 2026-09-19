@@ -16,8 +16,9 @@ use super::ir::state::{
 };
 use super::task::{
     ArchivedDataSink, ArchivedDataSource, ArchivedExecuteTask, ArchivedExecutionMode,
-    ArchivedFieldSchema, ArchivedFileFormat, ArchivedFileScanTask, DataSink, DataSource,
-    ExchangeSource, ExecuteTask, ExecutionMode, FieldSchema, FileFormat, FileScanTask, KeyValue,
+    ArchivedFieldSchema, ArchivedFileFormat, ArchivedFileScanTask, ArchivedScanPredicate,
+    ArchivedScanPredicateValue, DataSink, DataSource, ExchangeSource, ExecuteTask, ExecutionMode,
+    FieldSchema, FileFormat, FileScanTask, KeyValue, ScanPredicate, ScanPredicateValue,
     ShuffleTarget, StorageTarget, StreamSource,
 };
 
@@ -280,6 +281,39 @@ impl From<&ArchivedFieldSchema> for FieldSchema {
     }
 }
 
+impl From<&ArchivedScanPredicateValue> for ScanPredicateValue {
+    fn from(archived: &ArchivedScanPredicateValue) -> Self {
+        match archived {
+            ArchivedScanPredicateValue::Boolean(value) => Self::Boolean(*value),
+            ArchivedScanPredicateValue::Int64(value) => Self::Int64(value.to_native()),
+            ArchivedScanPredicateValue::Float64(value) => Self::Float64(value.to_native()),
+            ArchivedScanPredicateValue::String(value) => Self::String(value.as_str().to_string()),
+            ArchivedScanPredicateValue::Date(value) => Self::Date(value.to_native()),
+            ArchivedScanPredicateValue::Timestamp(value) => Self::Timestamp(value.to_native()),
+        }
+    }
+}
+
+impl From<&ArchivedScanPredicate> for ScanPredicate {
+    fn from(archived: &ArchivedScanPredicate) -> Self {
+        match archived {
+            ArchivedScanPredicate::Address { column, operator, value } => Self::Address {
+                column: column.as_str().to_string(),
+                operator: operator.as_str().to_string(),
+                value: ScanPredicateValue::from(value),
+            },
+            ArchivedScanPredicate::AddressNull { column, is_null } => Self::AddressNull {
+                column: column.as_str().to_string(),
+                is_null: *is_null,
+            },
+            ArchivedScanPredicate::AddressIn { column, values } => Self::AddressIn {
+                column: column.as_str().to_string(),
+                values: values.iter().map(ScanPredicateValue::from).collect(),
+            },
+        }
+    }
+}
+
 impl From<&ArchivedFileScanTask> for FileScanTask {
     fn from(archived: &ArchivedFileScanTask) -> Self {
         Self {
@@ -298,6 +332,11 @@ impl From<&ArchivedFileScanTask> for FileScanTask {
                 .projected_schema
                 .iter()
                 .map(FieldSchema::from)
+                .collect(),
+            scan_predicates: archived
+                .scan_predicates
+                .iter()
+                .map(ScanPredicate::from)
                 .collect(),
             task_id: TaskId::from_raw(archived.task_id.0.to_native()),
             shuffle_target_path: archived

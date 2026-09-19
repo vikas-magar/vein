@@ -5,10 +5,15 @@
 //! and compiles them into a unified [`DataSource`] and [`MicroProgram`].
 
 use common::identifiers::TaskId;
-use common::protocol::{DataSource, FieldSchema, FileFormat, FileScanTask, MicroProgram};
+use common::protocol::{
+    DataSource, FieldSchema, FileFormat, FileScanTask, MicroProgram, ScanPredicate, ScanPredicateValue,
+};
 use common::Result;
 use error::VeinError;
+use plan::expr::literal::LogicalLiteral;
+use plan::expr::logical::LogicalExpr;
 use plan::schema::VeinSchema;
+use parser::ast::expr::BinaryOp;
 use plan::LogicalPlan;
 
 use super::expr::BytecodeCompiler;
@@ -20,7 +25,10 @@ impl PipelineCompiler {
     /// Compiles a linear [`LogicalPlan`] pipeline starting from `plan`.
     pub fn compile(plan: &LogicalPlan) -> Result<(DataSource, MicroProgram, VeinSchema)> {
         // 1. Traverse down to the leaf to determine the input schema and DataSource
-        let (source, leaf_schema) = Self::collect_leaf_source(plan)?;
+        let (mut source, leaf_schema) = Self::collect_leaf_source(plan)?;
+        if let DataSource::File(scan) = &mut source {
+            scan.scan_predicates = Self::extract_scan_predicates(plan);
+        }
         let input_cols = leaf_schema.fields.len() as u8;
 
         // 2. Initialize bytecode compiler with the leaf's physical column count
@@ -31,6 +39,155 @@ impl PipelineCompiler {
 
         let program = compiler.finish();
         Ok((source, program, out_schema))
+    }
+
+    /// Extracts conservative storage predicates from the scan/filter chain.
+    ///
+    /// Only predicates directly attached to a scan are eligible. Filters above a
+    /// projection or expression are left to the Micro-IR residual filter.
+    fn extract_scan_predicates(plan: &LogicalPlan) -> Vec<ScanPredicate> {
+        match plan {
+            LogicalPlan::Scan { filters, .. } => {
+                let mut predicates = Vec::new();
+                for filter in filters {
+                    Self::collect_scan_predicates(filter, &mut predicates);
+                }
+                predicates
+            }
+            LogicalPlan::Filter { input, predicate } => {
+                let mut predicates = Self::extract_scan_predicates(input);
+                if Self::is_scan_filter_chain(input) {
+                    Self::collect_scan_predicates(predicate, &mut predicates);
+                }
+                predicates
+            }
+            LogicalPlan::Project { input, .. } | LogicalPlan::Write { input, .. } => {
+                Self::extract_scan_predicates(input)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn is_scan_filter_chain(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::Scan { .. } | LogicalPlan::Filter { .. })
+    }
+
+    fn collect_scan_predicates(expr: &LogicalExpr, output: &mut Vec<ScanPredicate>) {
+        if let LogicalExpr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+            ..
+        } = expr
+        {
+            Self::collect_scan_predicates(left, output);
+            Self::collect_scan_predicates(right, output);
+        } else if let Some(predicate) = Self::compile_scan_predicate(expr) {
+            output.push(predicate);
+        }
+    }
+
+    fn compile_scan_predicate(expr: &LogicalExpr) -> Option<ScanPredicate> {
+        match expr {
+            LogicalExpr::IsNull { expr } => Self::column_name(expr).map(|column| {
+                ScanPredicate::AddressNull {
+                    column,
+                    is_null: true,
+                }
+            }),
+            LogicalExpr::IsNotNull { expr } => Self::column_name(expr).map(|column| {
+                ScanPredicate::AddressNull {
+                    column,
+                    is_null: false,
+                }
+            }),
+            LogicalExpr::InList {
+                expr,
+                list,
+                negated: false,
+            } => {
+                let column = Self::column_name(expr)?;
+                let values = list
+                    .iter()
+                    .map(Self::literal_to_scan_value)
+                    .collect::<Option<Vec<_>>>()?;
+                Some(ScanPredicate::AddressIn { column, values })
+            }
+            LogicalExpr::BinaryOp {
+                left, op, right, ..
+            } => {
+                let (column, operator, literal) = match (Self::column_name(left), Self::literal_to_scan_value(right)) {
+                    (Some(column), Some(value)) => (column, Self::operator_name(op)?, value),
+                    (None, _) => {
+                        let column = Self::column_name(right)?;
+                        let value = Self::literal_to_scan_value(left)?;
+                        (column, Self::reverse_operator_name(op)?, value)
+                    }
+                    _ => return None,
+                };
+                Some(ScanPredicate::Address {
+                    column,
+                    operator: operator.to_string(),
+                    value: literal,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn column_name(expr: &LogicalExpr) -> Option<String> {
+        match expr {
+            LogicalExpr::Column(column) => Some(column.name.clone()),
+            _ => None,
+        }
+    }
+
+    fn literal_to_scan_value(expr: &LogicalExpr) -> Option<ScanPredicateValue> {
+        match expr {
+            LogicalExpr::Literal(LogicalLiteral::Boolean(value)) => {
+                Some(ScanPredicateValue::Boolean(*value))
+            }
+            LogicalExpr::Literal(LogicalLiteral::Int64(value)) => {
+                Some(ScanPredicateValue::Int64(*value))
+            }
+            LogicalExpr::Literal(LogicalLiteral::Float64(value)) => {
+                Some(ScanPredicateValue::Float64(*value))
+            }
+            LogicalExpr::Literal(LogicalLiteral::String(value)) => {
+                Some(ScanPredicateValue::String(value.clone()))
+            }
+            LogicalExpr::Literal(LogicalLiteral::Date(value)) => {
+                Some(ScanPredicateValue::Date(*value))
+            }
+            LogicalExpr::Literal(LogicalLiteral::Timestamp(value)) => {
+                Some(ScanPredicateValue::Timestamp(*value))
+            }
+            _ => None,
+        }
+    }
+
+    fn operator_name(op: &BinaryOp) -> Option<&'static str> {
+        match op {
+            BinaryOp::Eq => Some("eq"),
+            BinaryOp::Neq => Some("neq"),
+            BinaryOp::Lt => Some("lt"),
+            BinaryOp::Leq => Some("lte"),
+            BinaryOp::Gt => Some("gt"),
+            BinaryOp::Geq => Some("gte"),
+            _ => None,
+        }
+    }
+
+    fn reverse_operator_name(op: &BinaryOp) -> Option<&'static str> {
+        match op {
+            BinaryOp::Eq => Some("eq"),
+            BinaryOp::Neq => Some("neq"),
+            BinaryOp::Lt => Some("gt"),
+            BinaryOp::Leq => Some("gte"),
+            BinaryOp::Gt => Some("lt"),
+            BinaryOp::Geq => Some("lte"),
+            _ => None,
+        }
     }
 
     /// Recursively locates the leaf data source and schema.
@@ -93,6 +250,7 @@ impl PipelineCompiler {
                     byte_range: None,
                     column_ids: column_ids.into_iter().map(|id| id.0 as i32).collect(),
                     projected_schema,
+                    scan_predicates: Vec::new(),
                     task_id: TaskId::new(),
                     shuffle_target_path: None,
                 };
@@ -141,6 +299,7 @@ impl PipelineCompiler {
                             data_type: format!("{:?}", f.data_type),
                         })
                         .collect(),
+                    scan_predicates: Vec::new(),
                     task_id: TaskId::new(),
                     shuffle_target_path: None,
                 };
@@ -240,6 +399,72 @@ mod tests {
         assert!(matches!(source, DataSource::File(_)));
         assert_eq!(program.instructions.len(), 3);
         assert_eq!(out_schema.fields.len(), 2);
+    }
+
+    #[test]
+    fn test_compile_extracts_conjunctive_scan_predicates() {
+        let schema = Box::new(VeinSchema::new(vec![
+            ResolvedColumn::new(ColumnId(1), "id", None, VeinDataType::Int64),
+            ResolvedColumn::new(ColumnId(2), "tenant_id", None, VeinDataType::Int64),
+        ]));
+        let table = std::sync::Arc::new(
+            plan::TableMetadata::new("events", std::sync::Arc::new(*schema.clone()))
+                .with_format(plan::TableFormat::Exo),
+        );
+        let scan = LogicalPlan::Scan {
+            table,
+            projection: None,
+            filters: Vec::new(),
+            schema: schema.clone(),
+        };
+        let predicate = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(ResolvedColumn::new(
+                    ColumnId(1),
+                    "id",
+                    None,
+                    VeinDataType::Int64,
+                ))),
+                op: BinaryOp::Gt,
+                right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(100))),
+                return_type: VeinDataType::Boolean,
+            }),
+            op: BinaryOp::And,
+            right: Box::new(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(ResolvedColumn::new(
+                    ColumnId(2),
+                    "tenant_id",
+                    None,
+                    VeinDataType::Int64,
+                ))),
+                op: BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(5))),
+                return_type: VeinDataType::Boolean,
+            }),
+            return_type: VeinDataType::Boolean,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate,
+        };
+
+        let (source, _, _) = PipelineCompiler::compile(&plan).unwrap();
+        match source {
+            DataSource::File(task) => {
+                assert_eq!(task.scan_predicates.len(), 2);
+                assert!(matches!(
+                    &task.scan_predicates[0],
+                    ScanPredicate::Address { column, operator, .. }
+                        if column == "id" && operator == "gt"
+                ));
+                assert!(matches!(
+                    &task.scan_predicates[1],
+                    ScanPredicate::Address { column, operator, .. }
+                        if column == "tenant_id" && operator == "eq"
+                ));
+            }
+            _ => panic!("Expected DataSource::File"),
+        }
     }
 
     #[test]

@@ -373,6 +373,51 @@ impl BlockManager for MmapBlockManager {
 
         Ok(data.to_vec())
     }
+
+    async fn read_extent_range(
+        &self,
+        extent: &Extent,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        if offset.checked_add(length).is_none() || offset + length > extent.length {
+            return Err(crate::VfsError::Internal(format!(
+                "Extent range out of bounds: offset={offset}, length={length}, extent_length={}",
+                extent.length
+            )));
+        }
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
+        let absolute_offset = extent.offset + offset;
+        let local_path = self
+            .config
+            .local_cache_dir
+            .join(format!("{}.bin", extent.block_id));
+        if let Ok(mut file) = tokio::fs::File::open(&local_path).await {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let mut buf = vec![0u8; length as usize];
+            if file
+                .seek(std::io::SeekFrom::Start(absolute_offset))
+                .await
+                .is_ok()
+                && file.read_exact(&mut buf).await.is_ok()
+            {
+                return Ok(buf);
+            }
+        }
+
+        let s3_path = format!("blocks/{}.bin", extent.block_id);
+        let end = absolute_offset + length - 1;
+        let data = self
+            .storage
+            .read_with(&s3_path)
+            .range(absolute_offset..=end)
+            .await
+            .map_err(|e| crate::VfsError::Internal(e.to_string()))?;
+        Ok(data.to_vec())
+    }
 }
 
 #[cfg(test)]

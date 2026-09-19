@@ -34,6 +34,55 @@ pub struct FieldSchema {
     pub data_type: String,
 }
 
+/// A typed scalar value used by storage-level predicate pushdown.
+#[derive(
+    Debug, Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum ScanPredicateValue {
+    /// Boolean value.
+    Boolean(bool),
+    /// Signed 64-bit integer value.
+    Int64(i64),
+    /// IEEE-754 floating-point value.
+    Float64(f64),
+    /// UTF-8 string value.
+    String(String),
+    /// Date32 value represented as days from the Unix epoch.
+    Date(i32),
+    /// Timestamp value represented as microseconds from the Unix epoch.
+    Timestamp(i64),
+}
+
+/// A predicate that can be evaluated by a storage format without materializing rows.
+#[derive(
+    Debug, Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub enum ScanPredicate {
+    /// A comparison against a canonical-address-backed column.
+    Address {
+        /// Column name to evaluate.
+        column: String,
+        /// Comparison operator (`eq`, `neq`, `lt`, `lte`, `gt`, or `gte`).
+        operator: String,
+        /// Right-hand scalar value.
+        value: ScanPredicateValue,
+    },
+    /// A nullability check against a canonical-address-backed column.
+    AddressNull {
+        /// Column name to evaluate.
+        column: String,
+        /// Whether the predicate checks for null (`true`) or non-null (`false`).
+        is_null: bool,
+    },
+    /// An `IN` predicate against a canonical-address-backed column.
+    AddressIn {
+        /// Column name to evaluate.
+        column: String,
+        /// Candidate values.
+        values: Vec<ScanPredicateValue>,
+    },
+}
+
 /// Self-contained file scan instruction for an Executor.
 #[derive(
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
@@ -49,6 +98,8 @@ pub struct FileScanTask {
     pub column_ids: Vec<i32>,
     /// Schema of the projected columns.
     pub projected_schema: Vec<FieldSchema>,
+    /// Optional storage-level predicate extracted by the physical planner.
+    pub scan_predicates: Vec<ScanPredicate>,
     /// Task identifier for reporting.
     pub task_id: TaskId,
     /// VFS path prefix to send output to, if applicable.

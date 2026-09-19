@@ -91,7 +91,8 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                 };
                 Ok(Box::new(
                     ScanSource::new(op, scan.files.clone(), scan.format.clone())
-                        .with_projection(projection),
+                        .with_projection(projection)
+                        .with_scan_predicates(&scan.scan_predicates),
                 ))
             }
             DataSource::Exchange(_) => Err(VeinError::internal(

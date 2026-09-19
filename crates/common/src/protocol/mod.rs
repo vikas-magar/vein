@@ -18,7 +18,8 @@ pub use ir::state::{AggOpCode, JoinKind, StateMode};
 // Re-export task & pipeline definitions
 pub use task::{
     ArchivedExecuteTask, DataSink, DataSource, ExchangeSource, ExecuteTask, ExecutionMode,
-    FieldSchema, FileFormat, FileScanTask, KeyValue, ShuffleTarget, StorageTarget, StreamSource,
+    FieldSchema, FileFormat, FileScanTask, KeyValue, ScanPredicate, ScanPredicateValue,
+    ShuffleTarget, StorageTarget, StreamSource,
 };
 
 // Re-export control-plane events and telemetry
@@ -90,6 +91,7 @@ mod tests {
                 byte_range: None,
                 column_ids: vec![0, 1],
                 projected_schema: vec![],
+                scan_predicates: Vec::new(),
                 task_id: TaskId::new(),
                 shuffle_target_path: None,
             }),

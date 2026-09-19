@@ -18,6 +18,24 @@ pub trait BlockManager: Send + Sync {
     /// Reads exactly the bytes requested in the extent.
     /// Uses NVMe Cache if present, otherwise pulls specific byte-range from S3.
     async fn read_extent(&self, extent: &Extent) -> Result<Vec<u8>>;
+
+    /// Reads a byte range inside an extent. The default implementation preserves
+    /// compatibility for block managers that only support whole-extent reads.
+    async fn read_extent_range(
+        &self,
+        extent: &Extent,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        if offset.checked_add(length).is_none() || offset + length > extent.length {
+            return Err(crate::VfsError::Internal(format!(
+                "Extent range out of bounds: offset={offset}, length={length}, extent_length={}",
+                extent.length
+            )));
+        }
+        let bytes = self.read_extent(extent).await?;
+        Ok(bytes[offset as usize..(offset + length) as usize].to_vec())
+    }
 }
 
 pub mod key;

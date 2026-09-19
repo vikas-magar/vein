@@ -94,6 +94,18 @@ pub(crate) fn compound_key(path: &str, offset: u64, algo: &HashAlgo) -> Vec<u8> 
     }
 }
 
+fn logical_offset_from_compound_key(key: &[u8]) -> Result<u64> {
+    let offset_bytes = key
+        .get(key.len().saturating_sub(8)..)
+        .ok_or_else(|| VfsError::Metadata("Malformed extent key: missing logical offset".to_string()))?;
+    let offset = u64::from_be_bytes(
+        offset_bytes
+            .try_into()
+            .map_err(|_| VfsError::Metadata("Malformed extent key: invalid logical offset".to_string()))?,
+    );
+    Ok(offset)
+}
+
 const EXTENTS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vfs_extents_v2");
 const CONSENSUS_TABLE: TableDefinition<[u8; 16], &[u8]> =
     TableDefinition::new("consensus_proposals");
@@ -147,13 +159,15 @@ impl MetadataEngine for RedbMetadataEngine {
                     let path = k.value();
                     let extents: Vec<Extent> = bincode::deserialize(v.value())
                         .map_err(|e| VfsError::Metadata(e.to_string()))?;
+                    let mut logical_offset = 0u64;
                     for ext in extents {
-                        let new_key = compound_key(path, ext.offset, &config.metadata_hash_algo);
+                        let new_key = compound_key(path, logical_offset, &config.metadata_hash_algo);
                         let serialized = bincode::serialize(&ext)
                             .map_err(|e| VfsError::Metadata(e.to_string()))?;
                         v2_table
                             .insert(new_key.as_slice(), serialized.as_slice())
                             .map_err(|e| VfsError::Metadata(e.to_string()))?;
+                        logical_offset = logical_offset.saturating_add(ext.length);
                     }
                 }
                 drop(old_table);
@@ -196,7 +210,21 @@ impl MetadataEngine for RedbMetadataEngine {
                 let mut table = write_txn
                     .open_table(EXTENTS_TABLE)
                     .map_err(|e| VfsError::Metadata(e.to_string()))?;
-                let key = compound_key(&path, extent.offset, &hash_algo);
+                let start_key = compound_key(&path, 0, &hash_algo);
+                let end_key = compound_key(&path, u64::MAX, &hash_algo);
+                let mut logical_offset = 0u64;
+                let range = table
+                    .range::<&[u8]>(start_key.as_slice()..=end_key.as_slice())
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
+                for item in range {
+                    let (key, value) = item.map_err(|e| VfsError::Metadata(e.to_string()))?;
+                    let existing: Extent = bincode::deserialize(value.value())
+                        .map_err(|e| VfsError::Metadata(e.to_string()))?;
+                    let existing_offset = logical_offset_from_compound_key(key.value())?;
+                    logical_offset = logical_offset.max(existing_offset.saturating_add(existing.length));
+                }
+
+                let key = compound_key(&path, logical_offset, &hash_algo);
                 let serialized =
                     bincode::serialize(&extent).map_err(|e| VfsError::Metadata(e.to_string()))?;
                 table
@@ -457,7 +485,7 @@ mod tests {
 
         let read_txn = engine.db.begin_read().unwrap();
         let table = read_txn.open_table(EXTENTS_TABLE).unwrap();
-        let key = compound_key("/data.parquet", extent.offset, &engine.hash_algo);
+        let key = compound_key("/data.parquet", 0, &engine.hash_algo);
         let access = table.get(key.as_slice()).unwrap().unwrap();
         let read_extent: Extent = bincode::deserialize(access.value()).unwrap();
         assert_eq!(read_extent, extent);
@@ -489,7 +517,7 @@ mod tests {
                 .unwrap();
             let read_txn = engine.db.begin_read().unwrap();
             let table = read_txn.open_table(EXTENTS_TABLE).unwrap();
-            let key = compound_key("/test/file.dat", extent.offset, &engine.hash_algo);
+            let key = compound_key("/test/file.dat", 0, &engine.hash_algo);
             let access = table.get(key.as_slice()).unwrap().unwrap();
             let read_extent: Extent = bincode::deserialize(access.value()).unwrap();
             assert_eq!(read_extent, extent);
@@ -500,7 +528,7 @@ mod tests {
             let engine2 = RedbMetadataEngine::init(&config).await.unwrap();
             let read_txn = engine2.db.begin_read().unwrap();
             let table = read_txn.open_table(EXTENTS_TABLE).unwrap();
-            let key = compound_key("/test/file.dat", extent.offset, &engine2.hash_algo);
+            let key = compound_key("/test/file.dat", 0, &engine2.hash_algo);
             let access = table.get(key.as_slice()).unwrap().unwrap();
             let read_extent: Extent = bincode::deserialize(access.value()).unwrap();
             assert_eq!(read_extent, extent);
@@ -539,11 +567,53 @@ mod tests {
             .unwrap();
         let extents = engine.get_file("/test.txt").await.unwrap();
         assert_eq!(extents.len(), 2);
-        assert_eq!(extents[1].length, 512);
+        assert_eq!(extents, vec![ext2, ext1]);
 
         engine.delete_file("/test.txt").await.unwrap();
         let err = engine.get_file("/test.txt").await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_append_extent_keys_by_logical_offset_not_physical_offset() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = VfsConfig {
+            metadata_db_path: temp_dir.path().join("meta_logical_offsets.db"),
+            ..Default::default()
+        };
+        let engine = RedbMetadataEngine::init(&config).await.unwrap();
+
+        let first_block_extent = Extent {
+            block_id: 10,
+            offset: 0,
+            length: 1024,
+            node_ip: "127.0.0.1".into(),
+        };
+        let second_block_extent = Extent {
+            block_id: 11,
+            offset: 0,
+            length: 512,
+            node_ip: "127.0.0.1".into(),
+        };
+
+        engine
+            .append_extent("/spans-blocks.bin", first_block_extent.clone())
+            .await
+            .unwrap();
+        engine
+            .append_extent("/spans-blocks.bin", second_block_extent.clone())
+            .await
+            .unwrap();
+
+        let extents = engine.get_file("/spans-blocks.bin").await.unwrap();
+        assert_eq!(extents, vec![first_block_extent, second_block_extent]);
+
+        let read_txn = engine.db.begin_read().unwrap();
+        let table = read_txn.open_table(EXTENTS_TABLE).unwrap();
+        let logical_zero = compound_key("/spans-blocks.bin", 0, &engine.hash_algo);
+        let logical_next = compound_key("/spans-blocks.bin", 1024, &engine.hash_algo);
+        assert!(table.get(logical_zero.as_slice()).unwrap().is_some());
+        assert!(table.get(logical_next.as_slice()).unwrap().is_some());
     }
 
     #[tokio::test]

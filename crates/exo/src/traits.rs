@@ -29,8 +29,14 @@ pub trait AddressWriter {
     /// Appends a single 64-bit canonical address.
     fn append_vaddr(&mut self, vaddr: u64) -> ExoResult<()>;
 
+    /// Appends one canonical value with an explicit validity bit.
+    fn append_nullable_vaddr(&mut self, vaddr: u64, valid: bool) -> ExoResult<()>;
+
     /// Appends a batch of canonical addresses without copying.
     fn append_batch(&mut self, vaddrs: &[u64]) -> ExoResult<()>;
+
+    /// Appends canonical values together with one validity bit per row.
+    fn append_nullable_batch(&mut self, vaddrs: &[u64], validity: &[bool]) -> ExoResult<()>;
 
     /// Flushes any pending granule buffers and writes tail marks table.
     /// Returns total rows written to the column.
@@ -62,6 +68,9 @@ pub trait AddressReader: Send + Sync {
 
     /// Reads a single canonical address at the specified row index.
     fn read_vaddr(&self, row_idx: u64) -> ExoResult<u64>;
+
+    /// Returns whether the specified row contains a non-null value.
+    fn is_valid(&self, row_idx: u64) -> ExoResult<bool>;
 }
 
 /// Chunk-oriented writer for the Payload Vault (`.exo.vault`).

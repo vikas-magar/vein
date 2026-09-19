@@ -324,6 +324,7 @@ mod tests {
                     data_type: "Float64".to_string(),
                 },
             ],
+            scan_predicates: Vec::new(),
             task_id: TaskId::new(),
             shuffle_target_path: None,
         };

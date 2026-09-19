@@ -19,8 +19,14 @@ use error::VeinError;
 use exo::traits::{AddressReader, VaultReader};
 use exo::{
     f32_from_canonical_native, f64_from_canonical, i8_from_canonical_native,
-    i16_from_canonical_native, i32_from_canonical_native, i64_from_canonical, ExoAddressReader,
-    ExoVaultReader, PartReader,
+    i16_from_canonical_native, i32_from_canonical_native, i64_from_canonical, AddressFilter,
+    AddressGranuleMark, AddressHeader, AddressPredicateEvaluator, ExoAddressReader,
+    ExoVaultReader, PartReader, VaultGranuleMark, VaultHeader,
+};
+use exo::addr::{ADDR_FORMAT_VERSION, ADDR_HEADER_MAGIC, ADDR_TRAILER_MAGIC, HEADER_SIZE, MARK_SIZE};
+use exo::vault::{
+    VAULT_FORMAT_VERSION, VAULT_HEADER_MAGIC, VAULT_TRAILER_MAGIC, HEADER_SIZE as VAULT_HEADER_SIZE,
+    MARK_SIZE as VAULT_MARK_SIZE, TRAILER_SIZE as VAULT_TRAILER_SIZE,
 };
 
 use crate::pipeline::{DataChunk, PipelineNode};
@@ -36,12 +42,53 @@ pub enum ColumnScanner {
 /// Default batch size for vectorized pipeline execution (rows per DataChunk).
 pub const DEFAULT_EXO_VECTOR_SIZE: usize = 2048;
 
+/// Counters collected during an EXO scan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExoScanStats {
+    /// Number of partitions visited.
+    pub partitions_scanned: u64,
+    /// Number of address granules inspected.
+    pub granules_considered: u64,
+    /// Number of granules rejected by min/max or nullability metadata.
+    pub granules_pruned: u64,
+    /// Number of active rows examined by the scan.
+    pub rows_examined: u64,
+    /// Number of rows rejected by address predicates.
+    pub rows_filtered: u64,
+    /// Number of rows emitted downstream.
+    pub rows_emitted: u64,
+}
+
 /// Executes a vectorized scan over a list of .exo partition paths.
 #[tracing::instrument(skip_all)]
 pub async fn execute_exo_scan(
     paths: &[String],
     projection: Option<&[FieldSchema]>,
     next: &mut dyn PipelineNode<DataChunk>,
+) -> Result<()> {
+    execute_exo_scan_with_filter(paths, projection, None, next).await
+}
+
+/// Executes an Exo scan with an optional address-native filter.
+#[tracing::instrument(skip_all)]
+pub async fn execute_exo_scan_with_filter(
+    paths: &[String],
+    projection: Option<&[FieldSchema]>,
+    filter: Option<&[AddressFilter]>,
+    next: &mut dyn PipelineNode<DataChunk>,
+) -> Result<()> {
+    let mut stats = ExoScanStats::default();
+    execute_exo_scan_with_filter_and_stats(paths, projection, filter, next, &mut stats).await
+}
+
+/// Executes an Exo scan and writes detailed counters into `stats`.
+#[tracing::instrument(skip_all)]
+pub async fn execute_exo_scan_with_filter_and_stats(
+    paths: &[String],
+    projection: Option<&[FieldSchema]>,
+    filter: Option<&[AddressFilter]>,
+    next: &mut dyn PipelineNode<DataChunk>,
+    stats: &mut ExoScanStats,
 ) -> Result<()> {
     let vfs_store = vfs::VfsTableStore::shared_or_default().ok();
 
@@ -66,6 +113,10 @@ pub async fn execute_exo_scan(
 
                 let mut scanned_any = false;
                 for part_id in part_ids {
+                    if scan_vfs_address_partition(store, table_id, part_id, projection, filter, next, stats).await? {
+                        scanned_any = true;
+                        continue;
+                    }
                     if let Ok(part_reader) = store.open_partition_reader(table_id, part_id).await {
                         tracing::info!(
                             table_id = table_id,
@@ -73,7 +124,7 @@ pub async fn execute_exo_scan(
                             rows = part_reader.total_rows(),
                             "Scanning native VFS memory-mapped block partition"
                         );
-                        scan_part_reader(&part_reader, projection, next)?;
+                        scan_part_reader_with_filter_and_stats(&part_reader, projection, filter, next, stats)?;
                         scanned_any = true;
                     }
                 }
@@ -119,11 +170,515 @@ pub async fn execute_exo_scan(
             let part_reader = PartReader::open(&part_dir, part_id)
                 .map_err(|e| VeinError::internal(format!("Failed to open .exo part at {:?}: {}", part_dir, e)))?;
 
-            scan_part_reader(&part_reader, projection, next)?;
+            scan_part_reader_with_filter_and_stats(&part_reader, projection, filter, next, stats)?;
         }
     }
 
+    tracing::info!(
+        partitions_scanned = stats.partitions_scanned,
+        granules_considered = stats.granules_considered,
+        granules_pruned = stats.granules_pruned,
+        rows_examined = stats.rows_examined,
+        rows_filtered = stats.rows_filtered,
+        rows_emitted = stats.rows_emitted,
+        "Completed EXO scan"
+    );
     Ok(())
+}
+
+
+enum VfsColumnIndex {
+    Address {
+        header: AddressHeader,
+        marks: Vec<AddressGranuleMark>,
+    },
+    Vault {
+        header: VaultHeader,
+        marks: Vec<VaultGranuleMark>,
+    },
+}
+
+fn data_type_uses_vault(data_type: Option<&str>) -> bool {
+    matches!(
+        data_type,
+        Some("Utf8")
+            | Some("LargeUtf8")
+            | Some("Binary")
+            | Some("LargeBinary")
+            | Some("Utf8View")
+            | Some("BinaryView")
+    )
+}
+
+fn vfs_index_shape(index: &VfsColumnIndex) -> (u64, usize, usize) {
+    match index {
+        VfsColumnIndex::Address { header, marks } => {
+            (header.total_rows, header.granule_size as usize, marks.len())
+        }
+        VfsColumnIndex::Vault { header, marks } => {
+            (header.total_rows, header.granule_size as usize, marks.len())
+        }
+    }
+}
+
+async fn scan_vfs_mixed_partition(
+    store: &vfs::VfsTableStore,
+    table_id: u32,
+    part_id: u32,
+    projection: Option<&[FieldSchema]>,
+    filter: Option<&[AddressFilter]>,
+    next: &mut dyn PipelineNode<DataChunk>,
+    stats: &mut ExoScanStats,
+) -> Result<bool> {
+    let schema = store
+        .read_table_schema(table_id)
+        .await
+        .map_err(|e| VeinError::internal(e.to_string()))?;
+    let target_fields: Vec<(String, Option<String>)> = match projection {
+        Some(fields) => fields
+            .iter()
+            .map(|field| (field.name.clone(), Some(field.data_type.clone())))
+            .collect(),
+        None => schema
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), Some(format!("{:?}", field.data_type.to_arrow()))))
+            .collect(),
+    };
+    if target_fields.is_empty() {
+        return Ok(false);
+    }
+
+    let mut indexes = Vec::with_capacity(target_fields.len());
+    for (column_name, data_type) in &target_fields {
+        let has_vault = data_type_uses_vault(data_type.as_deref()) && store
+            .partition_plane_exists(
+                table_id,
+                part_id,
+                column_name,
+                vfs::PlaneType::PayloadVault,
+            )
+            .await
+            .map_err(|e| VeinError::internal(e.to_string()))?;
+        let index = if has_vault {
+            let (header, marks) = store
+                .read_vault_index(table_id, part_id, column_name)
+                .await
+                .map_err(|e| VeinError::internal(e.to_string()))?;
+            VfsColumnIndex::Vault { header, marks }
+        } else {
+            let (header, marks) = store
+                .read_address_index(table_id, part_id, column_name)
+                .await
+                .map_err(|e| VeinError::internal(e.to_string()))?;
+            VfsColumnIndex::Address { header, marks }
+        };
+        indexes.push((column_name.clone(), data_type.clone(), index));
+    }
+
+    let mut predicate_indexes = Vec::new();
+    if let Some(filters) = filter {
+        for address_filter in filters {
+            if predicate_indexes
+                .iter()
+                .any(|(column_name, _, _): &(String, AddressHeader, Vec<AddressGranuleMark>)| {
+                    column_name == &address_filter.column
+                })
+            {
+                continue;
+            }
+            let (header, marks) = store
+                .read_address_index(table_id, part_id, &address_filter.column)
+                .await
+                .map_err(|e| VeinError::internal(e.to_string()))?;
+            predicate_indexes.push((address_filter.column.clone(), header, marks));
+        }
+    }
+
+    let tombstones = match store
+        .read_partition_plane_all(
+            table_id,
+            part_id,
+            "tombstones",
+            vfs::PlaneType::Tombstone,
+        )
+        .await
+    {
+        Ok(bytes) if !bytes.is_empty() => exo::TombstoneMask::from_bytes(&bytes).unwrap_or_default(),
+        _ => exo::TombstoneMask::new(),
+    };
+
+    let (total_rows, granule_size, total_granules) = vfs_index_shape(&indexes[0].2);
+    for (_, _, index) in indexes.iter().skip(1) {
+        let (rows, size, granules) = vfs_index_shape(index);
+        if rows != total_rows || size != granule_size || granules != total_granules {
+            return Err(VeinError::internal("VFS columns have inconsistent vault/address shapes"));
+        }
+    }
+    stats.partitions_scanned += 1;
+    stats.granules_considered += total_granules as u64;
+
+    'mixed_granules: for granule_idx in 0..total_granules {
+        if let Some(filters) = filter {
+            for address_filter in filters {
+                if let Some((_, _, marks)) = predicate_indexes
+                    .iter()
+                    .find(|(column_name, _, _)| column_name == &address_filter.column)
+                {
+                    if !address_filter.predicate.may_match(&marks[granule_idx]) {
+                        stats.granules_pruned += 1;
+                        continue 'mixed_granules;
+                    }
+                }
+            }
+        }
+
+        let granule_start = granule_idx * granule_size;
+        let row_count = ((total_rows as usize).saturating_sub(granule_start)).min(granule_size);
+        let mut filtered_slots: Vec<u32> = (0..row_count as u32)
+            .filter(|slot| {
+                !tombstones.is_deleted(granule_start.saturating_add(*slot as usize) as u32)
+            })
+            .collect();
+        stats.rows_examined += filtered_slots.len() as u64;
+
+        if let Some(filters) = filter {
+            for address_filter in filters {
+                if let Some((_, header, marks)) = predicate_indexes
+                    .iter()
+                    .find(|(column_name, _, _)| column_name == &address_filter.column)
+                {
+                    let mark = &marks[granule_idx];
+                    let bytes = store
+                        .read_address_granule(table_id, part_id, &address_filter.column, mark)
+                        .await
+                        .map_err(|e| VeinError::internal(e.to_string()))?;
+                    let reader_bytes = build_single_granule_reader_bytes(header, mark, &bytes, row_count)?;
+                    let reader = ExoAddressReader::from_bytes(reader_bytes)
+                        .map_err(|e| VeinError::internal(e.to_string()))?;
+                    let mut scanner = ColumnScanner::Address(reader);
+                    let before = filtered_slots.len();
+                    filtered_slots =
+                        filter_address_slots(&mut scanner, &filtered_slots, &address_filter.predicate)?;
+                    stats.rows_filtered += (before - filtered_slots.len()) as u64;
+                    if filtered_slots.is_empty() {
+                        stats.granules_pruned += 1;
+                        continue 'mixed_granules;
+                    }
+                }
+            }
+        }
+
+        let mut vectors = Vec::with_capacity(indexes.len());
+        for (column_name, data_type, index) in &indexes {
+            let mut scanner = match index {
+                VfsColumnIndex::Address { header, marks } => {
+                    let mark = &marks[granule_idx];
+                    let bytes = store
+                        .read_address_granule(table_id, part_id, column_name, mark)
+                        .await
+                        .map_err(|e| VeinError::internal(e.to_string()))?;
+                    let reader_bytes = build_single_granule_reader_bytes(header, mark, &bytes, row_count)?;
+                    ColumnScanner::Address(
+                        ExoAddressReader::from_bytes(reader_bytes)
+                            .map_err(|e| VeinError::internal(e.to_string()))?,
+                    )
+                }
+                VfsColumnIndex::Vault { header, marks } => {
+                    let mark = &marks[granule_idx];
+                    let bytes = store
+                        .read_vault_granule(table_id, part_id, column_name, mark)
+                        .await
+                        .map_err(|e| VeinError::internal(e.to_string()))?;
+                    let reader_bytes = build_single_vault_reader_bytes(header, mark, &bytes, row_count)?;
+                    ColumnScanner::Vault(
+                        ExoVaultReader::from_bytes(reader_bytes)
+                            .map_err(|e| VeinError::internal(e.to_string()))?,
+                    )
+                }
+            };
+            vectors.push(materialize_scanner_array(
+                &mut scanner,
+                &filtered_slots,
+                column_name,
+                data_type.as_deref(),
+            )?);
+        }
+        stats.rows_emitted += filtered_slots.len() as u64;
+        next.push(DataChunk::from_vectors(vectors))?;
+    }
+
+    Ok(true)
+}
+
+/// Scans a VFS partition using address indexes and selected granule reads when
+/// every projected column is address-only. Returns false when vault materialization
+/// is required and the established full-buffer path should be used.
+async fn scan_vfs_address_partition(
+    store: &vfs::VfsTableStore,
+    table_id: u32,
+    part_id: u32,
+    projection: Option<&[FieldSchema]>,
+    filter: Option<&[AddressFilter]>,
+    next: &mut dyn PipelineNode<DataChunk>,
+    stats: &mut ExoScanStats,
+) -> Result<bool> {
+    let schema = store
+        .read_table_schema(table_id)
+        .await
+        .map_err(|e| VeinError::internal(e.to_string()))?;
+    let target_fields: Vec<(String, Option<String>)> = match projection {
+        Some(fields) => fields
+            .iter()
+            .map(|field| (field.name.clone(), Some(field.data_type.clone())))
+            .collect(),
+        None => schema
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), Some(format!("{:?}", field.data_type.to_arrow()))))
+            .collect(),
+    };
+    if target_fields.is_empty() {
+        return Ok(false);
+    }
+
+    for (column_name, data_type) in &target_fields {
+        if data_type_uses_vault(data_type.as_deref()) && store
+            .partition_plane_exists(
+                table_id,
+                part_id,
+                column_name,
+                vfs::PlaneType::PayloadVault,
+            )
+            .await
+            .map_err(|e| VeinError::internal(e.to_string()))?
+        {
+            return scan_vfs_mixed_partition(store, table_id, part_id, projection, filter, next, stats)
+                .await;
+        }
+    }
+
+    let mut indexes = Vec::with_capacity(target_fields.len());
+    for (column_name, data_type) in &target_fields {
+        let (header, marks) = store
+            .read_address_index(table_id, part_id, column_name)
+            .await
+            .map_err(|e| VeinError::internal(e.to_string()))?;
+        indexes.push((column_name.clone(), data_type.clone(), header, marks));
+    }
+
+    let tombstones = match store
+        .read_partition_plane_all(
+            table_id,
+            part_id,
+            "tombstones",
+            vfs::PlaneType::Tombstone,
+        )
+        .await
+    {
+        Ok(bytes) if !bytes.is_empty() => exo::TombstoneMask::from_bytes(&bytes).unwrap_or_default(),
+        _ => exo::TombstoneMask::new(),
+    };
+
+    let total_granules = indexes[0].3.len();
+    stats.partitions_scanned += 1;
+    stats.granules_considered += total_granules as u64;
+    for (_, _, _, marks) in indexes.iter().skip(1) {
+        if marks.len() != total_granules {
+            return Err(VeinError::internal("Address columns have different granule counts"));
+        }
+    }
+
+    'granules: for granule_idx in 0..total_granules {
+        let first_header = &indexes[0].2;
+        let first_mark = &indexes[0].3[granule_idx];
+        let row_count = (first_mark.uncompressed_len as usize) / first_header.slot_width as usize;
+
+        if let Some(filters) = filter {
+            for address_filter in filters {
+                if let Some((_, _, _, marks)) = indexes
+                    .iter()
+                    .find(|(column_name, _, _, _)| column_name == &address_filter.column)
+                {
+                    if !address_filter.predicate.may_match(&marks[granule_idx]) {
+                        stats.granules_pruned += 1;
+                        continue 'granules;
+                    }
+                }
+            }
+        }
+
+        let slots: Vec<u32> = (0..row_count as u32)
+            .filter(|slot| {
+                let global_slot = granule_idx
+                    .saturating_mul(first_header.granule_size as usize)
+                    .saturating_add(*slot as usize) as u32;
+                !tombstones.is_deleted(global_slot)
+            })
+            .collect();
+        if slots.is_empty() {
+            continue;
+        }
+        stats.rows_examined += slots.len() as u64;
+
+        let mut filtered_slots = slots;
+        if let Some(filters) = filter {
+            for address_filter in filters {
+                if let Some((column_name, _, header, marks)) = indexes
+                    .iter()
+                    .find(|(column_name, _, _, _)| column_name == &address_filter.column)
+                {
+                    let mark = &marks[granule_idx];
+                    let bytes = store
+                        .read_address_granule(table_id, part_id, column_name, mark)
+                        .await
+                        .map_err(|e| VeinError::internal(e.to_string()))?;
+                    let reader_bytes = build_single_granule_reader_bytes(header, mark, &bytes, row_count)?;
+                    let reader = ExoAddressReader::from_bytes(reader_bytes)
+                        .map_err(|e| VeinError::internal(e.to_string()))?;
+                    let mut scanner = ColumnScanner::Address(reader);
+                    let before_filter = filtered_slots.len();
+                    filtered_slots =
+                        filter_address_slots(&mut scanner, &filtered_slots, &address_filter.predicate)?;
+                    stats.rows_filtered += (before_filter - filtered_slots.len()) as u64;
+                    if filtered_slots.is_empty() {
+                        stats.granules_pruned += 1;
+                        continue 'granules;
+                    }
+                }
+            }
+        }
+
+        let mut vectors = Vec::with_capacity(indexes.len());
+        for (column_name, data_type, header, marks) in &indexes {
+            let mark = &marks[granule_idx];
+            let bytes = store
+                .read_address_granule(table_id, part_id, column_name, mark)
+                .await
+                .map_err(|e| VeinError::internal(e.to_string()))?;
+            let reader_bytes = build_single_granule_reader_bytes(header, mark, &bytes, row_count)?;
+            let mut scanner = ColumnScanner::Address(
+                ExoAddressReader::from_bytes(reader_bytes)
+                    .map_err(|e| VeinError::internal(e.to_string()))?,
+            );
+            vectors.push(materialize_scanner_array(
+                &mut scanner,
+                &filtered_slots,
+                column_name,
+                data_type.as_deref(),
+            )?);
+        }
+        stats.rows_emitted += filtered_slots.len() as u64;
+        next.push(DataChunk::from_vectors(vectors))?;
+    }
+
+    Ok(true)
+}
+
+
+fn filter_address_slots(
+    scanner: &mut ColumnScanner,
+    slots: &[u32],
+    predicate: &exo::AddressPredicate,
+) -> Result<Vec<u32>> {
+    let ColumnScanner::Address(reader) = scanner else {
+        return Ok(slots.to_vec());
+    };
+    filter_address_reader_slots(reader, slots, predicate)
+}
+
+fn filter_address_reader_slots(
+    reader: &mut ExoAddressReader,
+    slots: &[u32],
+    predicate: &exo::AddressPredicate,
+) -> Result<Vec<u32>> {
+    let mut filtered = Vec::with_capacity(slots.len());
+    for &slot in slots {
+        let valid = reader
+            .is_valid(slot as u64)
+            .map_err(|e| VeinError::internal(e.to_string()))?;
+        let value = if valid {
+            reader
+                .read_vaddr(slot as u64)
+                .map_err(|e| VeinError::internal(e.to_string()))?
+        } else {
+            0
+        };
+        if predicate.matches(value, valid) {
+            filtered.push(slot);
+        }
+    }
+    Ok(filtered)
+}
+
+fn build_single_vault_reader_bytes(
+    header: &VaultHeader,
+    mark: &VaultGranuleMark,
+    bytes: &[u8],
+    row_count: usize,
+) -> Result<Vec<u8>> {
+    if bytes.len() != mark.compressed_len as usize {
+        return Err(VeinError::internal("Vault granule length mismatch"));
+    }
+    let synthetic_header = VaultHeader {
+        magic: *VAULT_HEADER_MAGIC,
+        version: VAULT_FORMAT_VERSION,
+        codec_flags: header.codec_flags,
+        total_rows: row_count as u64,
+        granule_size: row_count as u32,
+        total_granules: 1,
+        marks_offset: (VAULT_HEADER_SIZE + bytes.len()) as u64,
+        checksum: 0,
+    };
+    let synthetic_mark = VaultGranuleMark {
+        byte_offset: VAULT_HEADER_SIZE as u64,
+        ..*mark
+    };
+    let mut output = Vec::with_capacity(
+        VAULT_HEADER_SIZE + bytes.len() + VAULT_MARK_SIZE + VAULT_TRAILER_SIZE,
+    );
+    output.extend_from_slice(&synthetic_header.encode());
+    output.extend_from_slice(bytes);
+    output.extend_from_slice(&synthetic_mark.encode());
+    output.extend_from_slice(&[0u8; 4]);
+    output.extend_from_slice(VAULT_TRAILER_MAGIC);
+    Ok(output)
+}
+
+fn build_single_granule_reader_bytes(
+    header: &AddressHeader,
+    mark: &AddressGranuleMark,
+    bytes: &[u8],
+    row_count: usize,
+) -> Result<Vec<u8>> {
+    if bytes.len() != mark.compressed_len as usize {
+        return Err(VeinError::internal("Address granule length mismatch"));
+    }
+    let synthetic_mark = AddressGranuleMark {
+        byte_offset: HEADER_SIZE as u64,
+        ..*mark
+    };
+    let synthetic_header = AddressHeader {
+        magic: *ADDR_HEADER_MAGIC,
+        version: ADDR_FORMAT_VERSION,
+        codec_flags: header.codec_flags,
+        total_rows: row_count as u64,
+        granule_size: row_count as u32,
+        total_granules: 1,
+        marks_offset: (HEADER_SIZE + bytes.len()) as u64,
+        checksum: 0,
+        slot_width: header.slot_width,
+        _reserved: [0; 27],
+    };
+    let mut output = Vec::with_capacity(
+        HEADER_SIZE + bytes.len() + MARK_SIZE + std::mem::size_of::<u32>() + ADDR_TRAILER_MAGIC.len(),
+    );
+    output.extend_from_slice(&synthetic_header.encode());
+    output.extend_from_slice(bytes);
+    output.extend_from_slice(&synthetic_mark.encode());
+    output.extend_from_slice(&1u32.to_le_bytes());
+    output.extend_from_slice(ADDR_TRAILER_MAGIC);
+    Ok(output)
 }
 
 /// Executes vectorized late-materialization scanning over a single [`PartReader`].
@@ -131,6 +686,28 @@ pub fn scan_part_reader(
     part_reader: &PartReader,
     projection: Option<&[FieldSchema]>,
     next: &mut dyn PipelineNode<DataChunk>,
+) -> Result<()> {
+    scan_part_reader_with_filter(part_reader, projection, None, next)
+}
+
+/// Scans a part reader and applies an optional address predicate during materialization.
+pub fn scan_part_reader_with_filter(
+    part_reader: &PartReader,
+    projection: Option<&[FieldSchema]>,
+    filter: Option<&[AddressFilter]>,
+    next: &mut dyn PipelineNode<DataChunk>,
+) -> Result<()> {
+    let mut stats = ExoScanStats::default();
+    scan_part_reader_with_filter_and_stats(part_reader, projection, filter, next, &mut stats)
+}
+
+/// Scans a part reader and updates detailed scan counters.
+pub fn scan_part_reader_with_filter_and_stats(
+    part_reader: &PartReader,
+    projection: Option<&[FieldSchema]>,
+    filter: Option<&[AddressFilter]>,
+    next: &mut dyn PipelineNode<DataChunk>,
+    stats: &mut ExoScanStats,
 ) -> Result<()> {
     let total_rows = part_reader.total_rows();
     if total_rows == 0 {
@@ -143,6 +720,8 @@ pub fn scan_part_reader(
         tracing::info!(part_id = part_reader.part_id(), "All rows tombstoned, skipping part");
         return Ok(());
     }
+    stats.partitions_scanned += 1;
+    stats.rows_examined += total_rows.saturating_sub(tombstones.deleted_count());
 
     // 2. Determine Projected Columns and their Schemas
     let available_cols = part_reader.column_names();
@@ -179,23 +758,79 @@ pub fn scan_part_reader(
         }
     }
 
+    let mut predicate_scanners: Vec<(String, ExoAddressReader)> = Vec::new();
+    if let Some(filters) = filter {
+        for address_filter in filters {
+            if predicate_scanners
+                .iter()
+                .any(|(column_name, _)| column_name == &address_filter.column)
+            {
+                continue;
+            }
+            let reader = part_reader
+                .open_address_reader(&address_filter.column)
+                .map_err(|e| VeinError::internal(format!("Failed to open predicate address column '{}': {}", address_filter.column, e)))?;
+            predicate_scanners.push((address_filter.column.clone(), reader));
+        }
+    }
+
     // 4. Bounded Vectorized Streaming (O(1) memory) & Late Materialization
     let mut chunk_slots: Vec<u32> = Vec::with_capacity(DEFAULT_EXO_VECTOR_SIZE);
     let mut rows_processed = 0;
     let total_u32 = total_rows.min(u32::MAX as u64) as u32;
+    let granule_size = predicate_scanners
+        .first()
+        .map(|(_, reader)| reader.granule_size())
+        .unwrap_or(DEFAULT_EXO_VECTOR_SIZE);
+    let total_predicate_granules = predicate_scanners
+        .first()
+        .map(|(_, reader)| reader.total_granules())
+        .unwrap_or(0);
+    let mut granule_may_match = vec![true; total_predicate_granules];
+    if !predicate_scanners.is_empty() {
+        stats.granules_considered += total_predicate_granules as u64;
+        for granule_idx in 0..total_predicate_granules {
+            if let Some(filters) = filter {
+                for address_filter in filters {
+                    if let Some((_, reader)) = predicate_scanners
+                        .iter()
+                        .find(|(column_name, _)| column_name == &address_filter.column)
+                    {
+                        let mark = reader
+                            .granule_mark(granule_idx)
+                            .map_err(|e| VeinError::internal(e.to_string()))?;
+                        if !address_filter.predicate.may_match(mark) {
+                            granule_may_match[granule_idx] = false;
+                            stats.granules_pruned += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     for row_id in 0..total_u32 {
+        let granule_idx = (row_id as usize) / granule_size;
+        if granule_idx < granule_may_match.len() && !granule_may_match[granule_idx] {
+            continue;
+        }
         if !tombstones.is_deleted(row_id) {
             chunk_slots.push(row_id);
             if chunk_slots.len() >= DEFAULT_EXO_VECTOR_SIZE {
-                let mut vectors: Vec<ArrayRef> = Vec::with_capacity(column_scanners.len());
-                for (col_name, data_type, scanner) in &mut column_scanners {
-                    let array = materialize_scanner_array(scanner, &chunk_slots, col_name, data_type.as_deref())?;
-                    vectors.push(array);
+                let filtered_slots = apply_address_filter(&mut column_scanners, &mut predicate_scanners, &chunk_slots, filter)?;
+                stats.rows_filtered += (chunk_slots.len() - filtered_slots.len()) as u64;
+                if !filtered_slots.is_empty() {
+                    let mut vectors: Vec<ArrayRef> = Vec::with_capacity(column_scanners.len());
+                    for (col_name, data_type, scanner) in &mut column_scanners {
+                        let array = materialize_scanner_array(scanner, &filtered_slots, col_name, data_type.as_deref())?;
+                        vectors.push(array);
+                    }
+                    rows_processed += filtered_slots.len();
+                    stats.rows_emitted += filtered_slots.len() as u64;
+                    let chunk = DataChunk::from_vectors(vectors);
+                    next.push(chunk)?;
                 }
-                rows_processed += chunk_slots.len();
-                let chunk = DataChunk::from_vectors(vectors);
-                next.push(chunk)?;
                 chunk_slots.clear();
             }
         }
@@ -203,14 +838,19 @@ pub fn scan_part_reader(
 
     // Flush trailing chunk
     if !chunk_slots.is_empty() {
-        let mut vectors: Vec<ArrayRef> = Vec::with_capacity(column_scanners.len());
-        for (col_name, data_type, scanner) in &mut column_scanners {
-            let array = materialize_scanner_array(scanner, &chunk_slots, col_name, data_type.as_deref())?;
-            vectors.push(array);
+        let filtered_slots = apply_address_filter(&mut column_scanners, &mut predicate_scanners, &chunk_slots, filter)?;
+        stats.rows_filtered += (chunk_slots.len() - filtered_slots.len()) as u64;
+        if !filtered_slots.is_empty() {
+            let mut vectors: Vec<ArrayRef> = Vec::with_capacity(column_scanners.len());
+            for (col_name, data_type, scanner) in &mut column_scanners {
+                let array = materialize_scanner_array(scanner, &filtered_slots, col_name, data_type.as_deref())?;
+                vectors.push(array);
+            }
+            rows_processed += filtered_slots.len();
+            stats.rows_emitted += filtered_slots.len() as u64;
+            let chunk = DataChunk::from_vectors(vectors);
+            next.push(chunk)?;
         }
-        rows_processed += chunk_slots.len();
-        let chunk = DataChunk::from_vectors(vectors);
-        next.push(chunk)?;
         chunk_slots.clear();
     }
 
@@ -222,6 +862,38 @@ pub fn scan_part_reader(
     );
 
     Ok(())
+}
+
+fn apply_address_filter(
+    column_scanners: &mut [(String, Option<String>, ColumnScanner)],
+    predicate_scanners: &mut [(String, ExoAddressReader)],
+    slots: &[u32],
+    filter: Option<&[AddressFilter]>,
+) -> Result<Vec<u32>> {
+    let Some(filters) = filter else {
+        return Ok(slots.to_vec());
+    };
+    let mut filtered_slots = slots.to_vec();
+    for filter in filters {
+        if let Some((_, reader)) = predicate_scanners
+            .iter_mut()
+            .find(|(column_name, _)| column_name == &filter.column)
+        {
+            filtered_slots =
+                filter_address_reader_slots(reader, &filtered_slots, &filter.predicate)?;
+        } else if let Some((_, _, scanner)) = column_scanners
+            .iter_mut()
+            .find(|(column_name, _, _)| column_name == &filter.column)
+        {
+            filtered_slots = filter_address_slots(scanner, &filtered_slots, &filter.predicate)?;
+        } else {
+            continue;
+        }
+        if filtered_slots.is_empty() {
+            break;
+        }
+    }
+    Ok(filtered_slots)
 }
 
 /// Helper to materialize a batch of slots from either a Payload Vault or an inlined Address Plane.
@@ -241,6 +913,13 @@ fn materialize_scanner_array(
                 Some("Float64") => {
                     let mut float_builder = Float64Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            float_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -251,6 +930,13 @@ fn materialize_scanner_array(
                 Some("Float32") => {
                     let mut float_builder = Float32Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            float_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -266,6 +952,13 @@ fn materialize_scanner_array(
                 Some("Int32") => {
                     let mut int_builder = Int32Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            int_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -281,6 +974,13 @@ fn materialize_scanner_array(
                 Some("Date32") => {
                     let mut date_builder = Date32Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            date_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -296,6 +996,13 @@ fn materialize_scanner_array(
                 Some("Int16") => {
                     let mut int_builder = Int16Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            int_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -311,6 +1018,13 @@ fn materialize_scanner_array(
                 Some("Int8") => {
                     let mut int_builder = Int8Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            int_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -326,6 +1040,13 @@ fn materialize_scanner_array(
                 Some("UInt32") => {
                     let mut int_builder = UInt32Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            int_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -336,6 +1057,13 @@ fn materialize_scanner_array(
                 Some("UInt16") => {
                     let mut int_builder = UInt16Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            int_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -346,6 +1074,13 @@ fn materialize_scanner_array(
                 Some("UInt8") => {
                     let mut int_builder = UInt8Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            int_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -356,6 +1091,13 @@ fn materialize_scanner_array(
                 Some("Boolean") => {
                     let mut bool_builder = BooleanBuilder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            bool_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -366,6 +1108,13 @@ fn materialize_scanner_array(
                 Some("Int64") | None => {
                     let mut int_builder = Int64Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            int_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;
@@ -376,6 +1125,13 @@ fn materialize_scanner_array(
                 Some("UInt64") => {
                     let mut int_builder = UInt64Builder::with_capacity(slots.len());
                     for &slot in slots {
+                        if !addr_reader
+                            .is_valid(slot as u64)
+                            .map_err(|e| VeinError::internal(e.to_string()))?
+                        {
+                            int_builder.append_null();
+                            continue;
+                        }
                         let vaddr = addr_reader
                             .read_vaddr(slot as u64)
                             .map_err(|e| VeinError::internal(e.to_string()))?;

@@ -11,7 +11,10 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
-use exo::{PartReader, PartWriter};
+use exo::{
+    AddressGranuleMark, AddressHeader, PartReader, PartWriter, ToCanonicalAddress, VaultGranuleMark,
+    VaultHeader, NULL_VADDR,
+};
 use ::types::{VeinSchema, VeinSchemaRef};
 
 use crate::block::{BlockKey, BlockManager, MmapBlockManager, PlaneType};
@@ -44,6 +47,42 @@ pub struct VfsTableStore {
 }
 
 static SHARED_STORE: std::sync::RwLock<Option<Arc<VfsTableStore>>> = std::sync::RwLock::new(None);
+
+fn nullable_primitive_vaddrs<T>(
+    array: &PrimitiveArray<T>,
+) -> (Vec<u64>, Vec<bool>)
+where
+    T: ArrowPrimitiveType,
+    T::Native: ToCanonicalAddress,
+{
+    let values = (0..array.len())
+        .map(|idx| if array.is_null(idx) { 0 } else { array.value(idx).to_canonical() })
+        .collect();
+    let validity = (0..array.len()).map(|idx| array.is_valid(idx)).collect();
+    (values, validity)
+}
+
+fn nullable_binary_values(array: &BinaryArray) -> (Vec<u64>, Vec<Option<Vec<u8>>>) {
+    let vaddrs = (0..array.len())
+        .map(|idx| {
+            if array.is_null(idx) {
+                NULL_VADDR
+            } else {
+                array.value(idx).to_canonical()
+            }
+        })
+        .collect();
+    let payloads = (0..array.len())
+        .map(|idx| {
+            if array.is_null(idx) {
+                None
+            } else {
+                Some(array.value(idx).to_vec())
+            }
+        })
+        .collect();
+    (vaddrs, payloads)
+}
 
 impl VfsTableStore {
     /// Initializes a new [`VfsTableStore`] from [`VfsConfig`].
@@ -207,76 +246,163 @@ impl VfsTableStore {
             match col_array.data_type() {
                 DataType::Int8 => {
                     let arr = col_array.as_any().downcast_ref::<Int8Array>().unwrap();
-                    part_writer.write_i8_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing i8 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 1)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable i8 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_i8_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing i8 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::UInt8 => {
                     let arr = col_array.as_any().downcast_ref::<UInt8Array>().unwrap();
-                    part_writer.write_u8_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing u8 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 1)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable u8 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_u8_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing u8 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::Int16 => {
                     let arr = col_array.as_any().downcast_ref::<Int16Array>().unwrap();
-                    part_writer.write_i16_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing i16 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 1)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable i16 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_i16_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing i16 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::UInt16 => {
                     let arr = col_array.as_any().downcast_ref::<UInt16Array>().unwrap();
-                    part_writer.write_u16_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing u16 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 2)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable u16 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_u16_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing u16 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::Int32 => {
                     let arr = col_array.as_any().downcast_ref::<Int32Array>().unwrap();
-                    part_writer.write_i32_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing i32 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 2)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable i32 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_i32_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing i32 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::UInt32 => {
                     let arr = col_array.as_any().downcast_ref::<UInt32Array>().unwrap();
-                    part_writer.write_u32_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing u32 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 4)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable u32 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_u32_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing u32 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::Float32 => {
                     let arr = col_array.as_any().downcast_ref::<Float32Array>().unwrap();
-                    part_writer.write_f32_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing f32 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 4)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable f32 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_f32_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing f32 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::Int64 => {
                     let arr = col_array.as_any().downcast_ref::<Int64Array>().unwrap();
-                    part_writer.write_primitive_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing i64 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 8)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable i64 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_primitive_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing i64 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::UInt64 => {
                     let arr = col_array.as_any().downcast_ref::<UInt64Array>().unwrap();
-                    part_writer.write_primitive_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing u64 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 8)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable u64 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_primitive_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing u64 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::Float64 => {
                     let arr = col_array.as_any().downcast_ref::<Float64Array>().unwrap();
-                    part_writer.write_primitive_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing f64 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 1)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable f64 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_primitive_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing f64 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::Boolean => {
                     let arr = col_array.as_any().downcast_ref::<BooleanArray>().unwrap();
-                    let bools: Vec<bool> = (0..arr.len()).map(|idx| arr.value(idx)).collect();
-                    part_writer.write_bool_column(col_name, &bools)
-                        .map_err(|e| VfsError::Internal(format!("Error writing bool column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let vaddrs: Vec<u64> = (0..arr.len())
+                            .map(|idx| if arr.is_null(idx) { 0 } else { arr.value(idx).to_canonical() })
+                            .collect();
+                        let validity: Vec<bool> = (0..arr.len()).map(|idx| arr.is_valid(idx)).collect();
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 1)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable bool column '{col_name}': {e}")))?;
+                    } else {
+                        let bools: Vec<bool> = (0..arr.len()).map(|idx| arr.value(idx)).collect();
+                        part_writer.write_bool_column(col_name, &bools)
+                            .map_err(|e| VfsError::Internal(format!("Error writing bool column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::Date32 => {
                     let arr = col_array.as_any().downcast_ref::<Date32Array>().unwrap();
-                    part_writer.write_i32_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing date32 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 8)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable date32 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_i32_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing date32 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::Date64 => {
                     let arr = col_array.as_any().downcast_ref::<Date64Array>().unwrap();
-                    part_writer.write_primitive_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing date64 column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 8)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable date64 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_primitive_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing date64 column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::Timestamp(_, _) => {
                     let int_arr = arrow::compute::cast(col_array.as_ref(), &DataType::Int64)
                         .map_err(|e| VfsError::Internal(format!("Failed to cast timestamp: {e}")))?;
                     let arr = int_arr.as_any().downcast_ref::<Int64Array>().unwrap();
-                    part_writer.write_primitive_column(col_name, arr.values())
-                        .map_err(|e| VfsError::Internal(format!("Error writing timestamp column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        part_writer.write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 8)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable timestamp column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer.write_primitive_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing timestamp column '{col_name}': {e}")))?;
+                    }
                 }
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
                     let str_arr = arrow::compute::cast(col_array.as_ref(), &DataType::Utf8)
@@ -298,17 +424,31 @@ impl VfsTableStore {
                     let bin_arr = arrow::compute::cast(col_array.as_ref(), &DataType::Binary)
                         .map_err(|e| VfsError::Internal(format!("Failed to cast to binary: {e}")))?;
                     let arr = bin_arr.as_any().downcast_ref::<BinaryArray>().unwrap();
-                    let bytes_vec: Vec<Vec<u8>> = (0..arr.len()).map(|idx| arr.value(idx).to_vec()).collect();
-                    part_writer.write_bytes_column(col_name, &bytes_vec)
-                        .map_err(|e| VfsError::Internal(format!("Error writing bytes column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let (vaddrs, payloads) = nullable_binary_values(arr);
+                        part_writer.write_raw_column(col_name, &vaddrs, &payloads)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable bytes column '{col_name}': {e}")))?;
+                    } else {
+                        let bytes_vec: Vec<Vec<u8>> = (0..arr.len()).map(|idx| arr.value(idx).to_vec()).collect();
+                        part_writer.write_bytes_column(col_name, &bytes_vec)
+                            .map_err(|e| VfsError::Internal(format!("Error writing bytes column '{col_name}': {e}")))?;
+                    }
                 }
                 _ => {
                     let str_arr = arrow::compute::cast(col_array.as_ref(), &DataType::Utf8)
                         .map_err(|e| VfsError::Internal(format!("Failed to cast fallback type to utf8: {e}")))?;
                     let arr = str_arr.as_any().downcast_ref::<StringArray>().unwrap();
-                    let strings: Vec<String> = (0..arr.len()).map(|idx| arr.value(idx).to_string()).collect();
-                    part_writer.write_string_column(col_name, &strings)
-                        .map_err(|e| VfsError::Internal(format!("Error writing string column '{col_name}': {e}")))?;
+                    if arr.null_count() > 0 {
+                        let opt_strings: Vec<Option<String>> = (0..arr.len())
+                            .map(|idx| if arr.is_null(idx) { None } else { Some(arr.value(idx).to_string()) })
+                            .collect();
+                        part_writer.write_opt_string_column(col_name, &opt_strings)
+                            .map_err(|e| VfsError::Internal(format!("Error writing nullable string column '{col_name}': {e}")))?;
+                    } else {
+                        let strings: Vec<String> = (0..arr.len()).map(|idx| arr.value(idx).to_string()).collect();
+                        part_writer.write_string_column(col_name, &strings)
+                            .map_err(|e| VfsError::Internal(format!("Error writing string column '{col_name}': {e}")))?;
+                    }
                 }
             }
         }
@@ -455,6 +595,227 @@ impl VfsTableStore {
         let parts: Vec<u32> = serde_json::from_slice(&bytes)
             .map_err(|e| VfsError::Internal(format!("Failed to parse partition list JSON: {e}")))?;
         Ok(parts)
+    }
+
+    /// Loads address-column metadata without reading value granules.
+    pub async fn read_address_index(
+        &self,
+        table_id: u32,
+        part_id: u32,
+        column_name: &str,
+    ) -> Result<(AddressHeader, Vec<AddressGranuleMark>)> {
+        let key = BlockKey {
+            segment: crate::block::SegmentKey::new(table_id, part_id),
+            column_name: column_name.to_string(),
+            plane: PlaneType::AddressPlane,
+        };
+        let extents = self.metadata_engine.get_file(&key.to_canonical_path()).await?;
+        let header_bytes = self.read_file_range(&extents, 0, exo::addr::HEADER_SIZE as u64).await?;
+        let header_array: [u8; exo::addr::HEADER_SIZE] = header_bytes
+            .try_into()
+            .map_err(|_| VfsError::Internal("Invalid address header length".to_string()))?;
+        let header = AddressHeader::decode(&header_array)
+            .map_err(|e| VfsError::Internal(format!("Invalid address header: {e}")))?;
+        let marks_len = (header.total_granules as usize)
+            .checked_mul(exo::addr::MARK_SIZE)
+            .ok_or_else(|| VfsError::Internal("Address marks length overflow".to_string()))?;
+        let marks_bytes = self
+            .read_file_range(&extents, header.marks_offset, marks_len as u64)
+            .await?;
+        let marks = marks_bytes
+            .chunks_exact(exo::addr::MARK_SIZE)
+            .map(|chunk| {
+                let mark_bytes: [u8; exo::addr::MARK_SIZE] = chunk
+                    .try_into()
+                    .map_err(|_| VfsError::Internal("Invalid address mark length".to_string()))?;
+                Ok(AddressGranuleMark::decode(&mark_bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((header, marks))
+    }
+
+    /// Reads a vault header and its complete granule mark table.
+    pub async fn read_vault_index(
+        &self,
+        table_id: u32,
+        part_id: u32,
+        column_name: &str,
+    ) -> Result<(VaultHeader, Vec<VaultGranuleMark>)> {
+        let key = BlockKey {
+            segment: crate::block::SegmentKey::new(table_id, part_id),
+            column_name: column_name.to_string(),
+            plane: PlaneType::PayloadVault,
+        };
+        let extents = self.metadata_engine.get_file(&key.to_canonical_path()).await?;
+        let header_bytes = self.read_file_range(&extents, 0, exo::vault::HEADER_SIZE as u64).await?;
+        let header_array: [u8; exo::vault::HEADER_SIZE] = header_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VfsError::Internal("Invalid vault header length".to_string()))?;
+        let header = VaultHeader::decode(&header_array)
+            .map_err(|e| VfsError::Internal(e.to_string()))?;
+        let marks_len = (header.total_granules as u64)
+            .checked_mul(exo::vault::MARK_SIZE as u64)
+            .ok_or_else(|| VfsError::Internal("Vault marks length overflow".to_string()))?;
+        let marks_bytes = self
+            .read_file_range(&extents, header.marks_offset, marks_len)
+            .await?;
+        let marks = marks_bytes
+            .chunks_exact(exo::vault::MARK_SIZE)
+            .map(|chunk| {
+                let mark_bytes: [u8; exo::vault::MARK_SIZE] = chunk
+                    .try_into()
+                    .map_err(|_| VfsError::Internal("Invalid vault mark length".to_string()))?;
+                Ok(VaultGranuleMark::decode(&mark_bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((header, marks))
+    }
+
+    /// Reads one compressed vault granule using its mark offset and length.
+    pub async fn read_vault_granule(
+        &self,
+        table_id: u32,
+        part_id: u32,
+        column_name: &str,
+        mark: &VaultGranuleMark,
+    ) -> Result<Vec<u8>> {
+        self.read_partition_plane_range(
+            table_id,
+            part_id,
+            column_name,
+            PlaneType::PayloadVault,
+            mark.byte_offset,
+            mark.compressed_len as u64,
+        )
+        .await
+    }
+
+    /// Returns whether a partition plane has persisted extents.
+    pub async fn partition_plane_exists(
+        &self,
+        table_id: u32,
+        part_id: u32,
+        column_name: &str,
+        plane: PlaneType,
+    ) -> Result<bool> {
+        let key = BlockKey {
+            segment: crate::block::SegmentKey::new(table_id, part_id),
+            column_name: column_name.to_string(),
+            plane,
+        };
+        Ok(!self.metadata_engine.get_file(&key.to_canonical_path()).await?.is_empty())
+    }
+
+    /// Reads a complete partition plane when metadata-only inspection is insufficient.
+    pub async fn read_partition_plane_all(
+        &self,
+        table_id: u32,
+        part_id: u32,
+        column_name: &str,
+        plane: PlaneType,
+    ) -> Result<Vec<u8>> {
+        let key = BlockKey {
+            segment: crate::block::SegmentKey::new(table_id, part_id),
+            column_name: column_name.to_string(),
+            plane,
+        };
+        let extents = self.metadata_engine.get_file(&key.to_canonical_path()).await?;
+        let total_len: u64 = extents.iter().map(|extent| extent.length).sum();
+        self.read_file_range(&extents, 0, total_len).await
+    }
+
+    /// Reads one address granule after its index has been loaded.
+    pub async fn read_address_granule(
+        &self,
+        table_id: u32,
+        part_id: u32,
+        column_name: &str,
+        mark: &AddressGranuleMark,
+    ) -> Result<Vec<u8>> {
+        self.read_partition_plane_range(
+            table_id,
+            part_id,
+            column_name,
+            PlaneType::AddressPlane,
+            mark.byte_offset,
+            mark.compressed_len as u64,
+        )
+        .await
+    }
+
+    /// Reads a logical byte range from one partition plane.
+    pub async fn read_partition_plane_range(
+        &self,
+        table_id: u32,
+        part_id: u32,
+        column_name: &str,
+        plane: PlaneType,
+        logical_offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        let key = BlockKey {
+            segment: crate::block::SegmentKey::new(table_id, part_id),
+            column_name: column_name.to_string(),
+            plane,
+        };
+        let extents = self.metadata_engine.get_file(&key.to_canonical_path()).await?;
+        self.read_file_range(&extents, logical_offset, length).await
+    }
+
+    /// Reads a logical byte range from a file represented by ordered VFS extents.
+    /// Extent offsets are physical block offsets; logical ordering is the metadata order.
+    pub async fn read_file_range(
+        &self,
+        extents: &[Extent],
+        logical_offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let requested_end = logical_offset
+            .checked_add(length)
+            .ok_or_else(|| VfsError::Internal("Logical file range overflow".to_string()))?;
+        let mut output = Vec::with_capacity(length as usize);
+        let mut logical_start = 0u64;
+
+        for extent in extents {
+            let logical_end = logical_start
+                .checked_add(extent.length)
+                .ok_or_else(|| VfsError::Internal("Logical extent range overflow".to_string()))?;
+            let overlap_start = logical_offset.max(logical_start);
+            let overlap_end = requested_end.min(logical_end);
+            if overlap_start < overlap_end {
+                let extent_offset = overlap_start - logical_start;
+                let overlap_len = overlap_end - overlap_start;
+                let bytes = self
+                    .block_manager
+                    .read_extent_range(extent, extent_offset, overlap_len)
+                    .await?;
+                if bytes.len() != overlap_len as usize {
+                    return Err(VfsError::Internal(format!(
+                        "Short VFS range read: expected {}, got {}",
+                        overlap_len,
+                        bytes.len()
+                    )));
+                }
+                output.extend_from_slice(&bytes);
+            }
+            logical_start = logical_end;
+            if logical_start >= requested_end {
+                break;
+            }
+        }
+
+        if output.len() != length as usize {
+            return Err(VfsError::Internal(format!(
+                "Logical file range is incomplete: expected {}, got {}",
+                length,
+                output.len()
+            )));
+        }
+        Ok(output)
     }
 
     /// Opens an [`exo::PartReader`] for zero-copy scanning of a partition directly from VFS blocks.
@@ -696,6 +1057,51 @@ mod tests {
         assert_eq!(vault_reader.read_str_slot(1).unwrap(), "bob");
         assert_eq!(vault_reader.read_str_slot(2).unwrap(), "charlie");
         assert_eq!(vault_reader.read_str_slot(3).unwrap(), "david");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_vfs_table_store_preserves_nullable_values() -> Result<()> {
+        let dir = tempdir()?;
+        let config = create_test_config(dir.path());
+        let store = VfsTableStore::init(&config).await?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("enabled", DataType::Boolean, true),
+            Field::new("payload", DataType::Binary, true),
+        ]));
+        let id_array = Arc::new(Int64Array::from(vec![Some(101), None, Some(103)]));
+        let enabled_array = Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)]));
+        let payload_array = Arc::new(BinaryArray::from(vec![
+            Some(b"one".as_ref()),
+            None,
+            Some(b"three".as_ref()),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![id_array, enabled_array, payload_array],
+        )
+        .unwrap();
+
+        store.write_partition(43, 0, &batch).await?;
+        let reader = store.open_partition_reader(43, 0).await?;
+
+        assert_eq!(exo::i64_from_canonical(reader.read_primitive_slot("id", 0)?), 101);
+        use exo::traits::AddressReader;
+        let id_reader = reader.open_address_reader("id")?;
+        let enabled_reader = reader.open_address_reader("enabled")?;
+        assert!(!id_reader.is_valid(1)?);
+        assert!(!enabled_reader.is_valid(1)?);
+        assert_eq!(reader.read_primitive_slot("id", 1)?, 0);
+        assert_eq!(reader.read_primitive_slot("enabled", 1)?, 0);
+
+        use exo::traits::VaultReader;
+        let mut payload_reader = reader.open_vault_reader("payload")?;
+        assert_eq!(payload_reader.read_opt_bytes_slot(0)?, Some(&b"one"[..]));
+        assert_eq!(payload_reader.read_opt_bytes_slot(1)?, None);
+        assert_eq!(payload_reader.read_opt_bytes_slot(2)?, Some(&b"three"[..]));
 
         Ok(())
     }

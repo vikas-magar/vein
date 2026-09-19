@@ -202,14 +202,12 @@ impl PartWriter {
             col_name,
             8,
             |addr| {
-                for s in values {
-                    let vaddr = match s {
-                        Some(str_val) => str_val.as_str().to_canonical(),
-                        None => crate::coord::NULL_VADDR,
-                    };
-                    addr.append_vaddr(vaddr)?;
-                }
-                Ok(())
+                let vaddrs: Vec<u64> = values
+                    .iter()
+                    .map(|value| value.as_deref().map_or(0, ToCanonicalAddress::to_canonical))
+                    .collect();
+                let validity: Vec<bool> = values.iter().map(Option::is_some).collect();
+                addr.append_nullable_batch(&vaddrs, &validity)
             },
             Some(|vault: &mut dyn VaultWriter| {
                 vault.append_batch_opt_strings(values)
@@ -257,10 +255,11 @@ impl PartWriter {
             )));
         }
         self.check_or_set_total_rows(col_name, vaddrs.len() as u64)?;
+        let validity: Vec<bool> = payloads.iter().map(Option::is_some).collect();
         self.write_column_data(
             col_name,
             8,
-            |addr| addr.append_batch(vaddrs),
+            |addr| addr.append_nullable_batch(vaddrs, &validity),
             Some(|vault: &mut dyn VaultWriter| {
                 for p in payloads {
                     vault.append_opt_bytes(p.as_deref())?;
@@ -291,6 +290,29 @@ impl PartWriter {
             col_name,
             slot_width,
             |addr| addr.append_batch(vaddrs),
+            None::<fn(&mut dyn VaultWriter) -> ExoResult<()>>,
+        )
+    }
+
+    /// Writes a nullable address-only column using native-width values and a validity bitmap.
+    pub fn write_raw_address_column_with_validity(
+        &mut self,
+        col_name: &str,
+        vaddrs: &[u64],
+        validity: &[bool],
+        slot_width: u8,
+    ) -> ExoResult<()> {
+        if vaddrs.len() != validity.len() {
+            return Err(ExoError::CodecError(format!(
+                "write_raw_address_column_with_validity mismatch: {} values != {} validity bits",
+                vaddrs.len(), validity.len()
+            )));
+        }
+        self.check_or_set_total_rows(col_name, vaddrs.len() as u64)?;
+        self.write_column_data(
+            col_name,
+            slot_width,
+            |addr| addr.append_nullable_batch(vaddrs, validity),
             None::<fn(&mut dyn VaultWriter) -> ExoResult<()>>,
         )
     }

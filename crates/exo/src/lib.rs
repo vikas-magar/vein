@@ -12,6 +12,7 @@ pub mod compactor;
 pub mod coord;
 pub mod error;
 pub mod part;
+pub mod predicate;
 pub mod tombstone;
 pub mod traits;
 pub mod vault;
@@ -31,6 +32,7 @@ pub use coord::{
 };
 pub use error::{ExoError, ExoResult};
 pub use part::{PartBufferDescriptor, PartDataSource, PartDescriptor, PartReader, PartWriter};
+pub use predicate::{AddressFilter, AddressPredicate, AddressPredicateEvaluator};
 pub use tombstone::{TombstoneHeader, TombstoneMask};
 pub use traits::{
     AddressReader, AddressWriter, StorageBuffer, TombstoneStore, VaultReader, VaultWriter,
