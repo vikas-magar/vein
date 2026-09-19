@@ -18,7 +18,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use exo::traits::{AddressReader, VaultReader};
-use exo::{AddressCoordinate, PartCompactor, PartReader, PartWriter, ToCanonicalAddress};
+use exo::{
+    f64_from_canonical, i64_from_canonical, AddressCoordinate, PartCompactor, PartReader,
+    PartWriter, ToCanonicalAddress,
+};
 
 const GRANULE_SIZE: usize = 1024; // 1,024 rows per Granule
 
@@ -160,8 +163,8 @@ pub fn run_address_only_join(
         part_readers.insert(
             part.part_id(),
             (
-                part.open_vault_reader("order_id")?,
-                part.open_vault_reader("orders_amount")?,
+                part.open_address_reader("order_id")?,
+                part.open_address_reader("orders_amount")?,
                 part.open_vault_reader("orders_shipping_address")?,
             ),
         );
@@ -174,12 +177,9 @@ pub fn run_address_only_join(
             Some(r) => r,
             None => continue,
         };
-        let order_id_str = readers.0.read_str_slot(order_coord.slot_id)?;
-        let amt_str = readers.1.read_str_slot(order_coord.slot_id)?;
+        let order_id = i64_from_canonical(readers.0.read_vaddr(order_coord.slot_id as u64)?);
+        let amount = f64_from_canonical(readers.1.read_vaddr(order_coord.slot_id as u64)?);
         let ship_addr = readers.2.read_str_slot(order_coord.slot_id)?;
-
-        let order_id: i64 = order_id_str.parse()?;
-        let amount: f64 = amt_str.parse()?;
 
         results.push(JoinedResult {
             order_id,
@@ -291,16 +291,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let p0_cust_codes: Vec<String> = part0_orders.iter().map(|o| o.customer_code.clone()).collect();
-    let p0_amounts: Vec<String> = part0_orders.iter().map(|o| o.amount.to_string()).collect();
+    let p0_amounts: Vec<f64> = part0_orders.iter().map(|o| o.amount).collect();
     let p0_addrs: Vec<String> = part0_orders.iter().map(|o| o.shipping_address.clone()).collect();
     let p0_notes: Vec<String> = part0_orders.iter().map(|o| o.order_notes.clone()).collect();
-    let p0_ids: Vec<String> = part0_orders.iter().map(|o| o.order_id.to_string()).collect();
+    let p0_ids: Vec<i64> = part0_orders.iter().map(|o| o.order_id).collect();
 
     let part0_desc = {
         let mut writer = PartWriter::create(&orders_dir, 0, GRANULE_SIZE)?;
-        writer.write_string_column("order_id", &p0_ids)?;
+        writer.write_primitive_column("order_id", &p0_ids)?;
         writer.write_string_column("orders_customer_code", &p0_cust_codes)?;
-        writer.write_string_column("orders_amount", &p0_amounts)?;
+        writer.write_primitive_column("orders_amount", &p0_amounts)?;
         writer.write_string_column("orders_shipping_address", &p0_addrs)?;
         writer.write_string_column("orders_order_notes", &p0_notes)?;
         writer.finish()?
@@ -420,16 +420,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Flush Part 1 files to disk via PartWriter
     let p1_cust_codes: Vec<String> = part1_orders.iter().map(|o| o.customer_code.clone()).collect();
-    let p1_amounts: Vec<String> = part1_orders.iter().map(|o| o.amount.to_string()).collect();
+    let p1_amounts: Vec<f64> = part1_orders.iter().map(|o| o.amount).collect();
     let p1_addrs: Vec<String> = part1_orders.iter().map(|o| o.shipping_address.clone()).collect();
     let p1_notes: Vec<String> = part1_orders.iter().map(|o| o.order_notes.clone()).collect();
-    let p1_ids: Vec<String> = part1_orders.iter().map(|o| o.order_id.to_string()).collect();
+    let p1_ids: Vec<i64> = part1_orders.iter().map(|o| o.order_id).collect();
 
     let part1_desc = {
         let mut writer = PartWriter::create(&orders_dir, 1, GRANULE_SIZE)?;
-        writer.write_string_column("order_id", &p1_ids)?;
+        writer.write_primitive_column("order_id", &p1_ids)?;
         writer.write_string_column("orders_customer_code", &p1_cust_codes)?;
-        writer.write_string_column("orders_amount", &p1_amounts)?;
+        writer.write_primitive_column("orders_amount", &p1_amounts)?;
         writer.write_string_column("orders_shipping_address", &p1_addrs)?;
         writer.write_string_column("orders_order_notes", &p1_notes)?;
         writer.finish()?

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::operators::sink::{CollectSink, DiscardSink};
+use crate::operators::sink::{CollectSink, DiscardSink, StorageSink};
 use crate::operators::source::{MemorySource, ScanSource};
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use crate::runtime::ExecutorBuilder;
@@ -87,7 +87,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                 let projection = if scan.projected_schema.is_empty() {
                     None
                 } else {
-                    Some(scan.projected_schema.iter().map(|f| f.name.clone()).collect())
+                    Some(scan.projected_schema.clone())
                 };
                 Ok(Box::new(
                     ScanSource::new(op, scan.files.clone(), scan.format.clone())
@@ -125,9 +125,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
             DataSink::Shuffle(_) => Err(VeinError::internal(
                 "Shuffle sink is not yet implemented",
             )),
-            DataSink::Storage(_) => Err(VeinError::internal(
-                "Storage sink is not yet implemented",
-            )),
+            DataSink::Storage(target) => Ok(Box::new(StorageSink::new(target.clone()))),
         }
     }
 }

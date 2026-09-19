@@ -108,6 +108,10 @@ pub struct RedbMetadataEngine {
 #[async_trait]
 impl MetadataEngine for RedbMetadataEngine {
     async fn init(config: &VfsConfig) -> Result<Self> {
+        if let Some(parent) = config.metadata_db_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
         let db = Database::create(&config.metadata_db_path)
             .map_err(|e| VfsError::Metadata(format!("Failed to create redb: {e}")))?;
 

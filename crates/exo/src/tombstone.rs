@@ -123,16 +123,13 @@ impl TombstoneMask {
         self.bitmap.is_empty()
     }
 
-    /// Serializes the tombstone mask to disk with a 32-byte header and CRC32-C.
-    ///
-    /// Returns the total bytes written to the file.
-    pub fn save(&self, path: &Path) -> ExoResult<usize> {
+    /// Serializes the tombstone mask to in-memory bytes with header and CRC32-C.
+    pub fn to_bytes(&self) -> ExoResult<Vec<u8>> {
         let mut payload_bytes = Vec::new();
         self.bitmap
             .serialize_into(&mut payload_bytes)
             .map_err(|e| ExoError::TombstoneError(e.to_string()))?;
 
-        // Calculate CRC32-C checksum of serialized bitmap
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&payload_bytes);
         let checksum = hasher.finalize();
@@ -146,12 +143,99 @@ impl TombstoneMask {
             checksum,
         };
 
-        let mut file = File::create(path)?;
-        file.write_all(&header.encode())?;
-        file.write_all(&payload_bytes)?;
-        file.flush()?;
+        let mut out = Vec::with_capacity(TOMB_HEADER_SIZE + payload_bytes.len());
+        out.extend_from_slice(&header.encode());
+        out.extend_from_slice(&payload_bytes);
+        Ok(out)
+    }
 
-        Ok(TOMB_HEADER_SIZE + payload_bytes.len())
+    /// Deserializes a tombstone mask from in-memory bytes.
+    pub fn from_bytes(bytes: &[u8]) -> ExoResult<Self> {
+        if bytes.is_empty() {
+            return Ok(Self::new());
+        }
+        if bytes.len() < TOMB_HEADER_SIZE {
+            return Err(ExoError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Tombstone buffer too small",
+            )));
+        }
+
+        let mut header_buf = [0u8; TOMB_HEADER_SIZE];
+        header_buf.copy_from_slice(&bytes[..TOMB_HEADER_SIZE]);
+        let header = TombstoneHeader::decode(&header_buf)?;
+
+        let payload_len = header.payload_bytes_len as usize;
+        if TOMB_HEADER_SIZE + payload_len > bytes.len() {
+            return Err(ExoError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Tombstone payload length exceeds buffer boundary",
+            )));
+        }
+
+        let payload_bytes = &bytes[TOMB_HEADER_SIZE..TOMB_HEADER_SIZE + payload_len];
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(payload_bytes);
+        let actual_checksum = hasher.finalize();
+
+        if actual_checksum != header.checksum {
+            return Err(ExoError::ChecksumMismatch {
+                expected: header.checksum,
+                actual: actual_checksum,
+                offset: TOMB_HEADER_SIZE as u64,
+            });
+        }
+
+        let bitmap = RoaringBitmap::deserialize_from(payload_bytes)
+            .map_err(|e| ExoError::TombstoneError(e.to_string()))?;
+
+        Ok(Self { bitmap })
+    }
+
+    /// Serializes the tombstone mask to disk with a 32-byte header and CRC32-C.
+    ///
+    /// Implements atomic crash-safe durability: writes to a unique temporary file,
+    /// calls `sync_all()` to flush dirty OS page cache to physical disk, and atomically
+    /// renames the temporary file to the final destination path.
+    ///
+    /// Returns the total bytes written to the file.
+    pub fn save(&self, path: &Path) -> ExoResult<usize> {
+        let file_bytes = self.to_bytes()?;
+
+        // Determine parent directory and unique temporary file path
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("tombstones.exo.tomb");
+
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = parent.join(format!(".{}.tmp.{}.{}", file_name, std::process::id(), count));
+
+        let write_res = (|| -> ExoResult<()> {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(&file_bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_res {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(ExoError::Io(e));
+        }
+
+        // Fsync parent directory to ensure directory entry commit
+        if let Ok(parent_dir) = File::open(parent) {
+            let _ = parent_dir.sync_all();
+        }
+
+        Ok(file_bytes.len())
     }
 
     /// Loads a tombstone mask from disk, verifying header magic and CRC32-C checksum.
@@ -163,50 +247,9 @@ impl TombstoneMask {
         }
 
         let mut file = OpenOptions::new().read(true).open(path)?;
-        let file_len = file.metadata()?.len();
-
-        if file_len < (TOMB_HEADER_SIZE as u64) {
-            return Err(ExoError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("File {:?} too small to be a valid .exo.tomb file", path),
-            )));
-        }
-
-        // 1. Read and validate header
-        let mut header_buf = [0u8; TOMB_HEADER_SIZE];
-        file.read_exact(&mut header_buf)?;
-        let header = TombstoneHeader::decode(&header_buf)?;
-
-        let payload_len = header.payload_bytes_len as usize;
-        if (TOMB_HEADER_SIZE + payload_len) as u64 > file_len {
-            return Err(ExoError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Tombstone payload length exceeds file boundary",
-            )));
-        }
-
-        // 2. Read serialized bitmap payload
-        let mut payload_bytes = vec![0u8; payload_len];
-        file.read_exact(&mut payload_bytes)?;
-
-        // 3. Verify CRC32-C Checksum
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&payload_bytes);
-        let actual_checksum = hasher.finalize();
-
-        if actual_checksum != header.checksum {
-            return Err(ExoError::ChecksumMismatch {
-                expected: header.checksum,
-                actual: actual_checksum,
-                offset: TOMB_HEADER_SIZE as u64,
-            });
-        }
-
-        // 4. Deserialize bitmap
-        let bitmap = RoaringBitmap::deserialize_from(&payload_bytes[..])
-            .map_err(|e| ExoError::TombstoneError(e.to_string()))?;
-
-        Ok(Self { bitmap })
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Self::from_bytes(&bytes)
     }
 }
 

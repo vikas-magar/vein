@@ -16,6 +16,7 @@ use std::time::Instant;
 use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use common::protocol::FieldSchema;
 use common::{Result, VeinError};
 use exec::operators::source::scan::exo_scan::execute_exo_scan;
 use exec::operators::source::scan::parquet::execute_parquet_scan;
@@ -112,7 +113,7 @@ async fn main() -> Result<()> {
             .map_err(|e| VeinError::internal(e.to_string()))?;
 
         writer
-            .write_typed_column("order_id", &order_ids[start_idx..end_idx])
+            .write_primitive_column("order_id", &order_ids[start_idx..end_idx])
             .map_err(|e| VeinError::internal(e.to_string()))?;
         writer
             .write_string_column("user_uuid", &user_uuids[start_idx..end_idx])
@@ -127,7 +128,7 @@ async fn main() -> Result<()> {
             .write_string_column("notes", &notes[start_idx..end_idx])
             .map_err(|e| VeinError::internal(e.to_string()))?;
         writer
-            .write_typed_column("amount", &amounts[start_idx..end_idx])
+            .write_primitive_column("amount", &amounts[start_idx..end_idx])
             .map_err(|e| VeinError::internal(e.to_string()))?;
 
         let desc = writer.finish().map_err(|e| VeinError::internal(e.to_string()))?;
@@ -265,7 +266,18 @@ async fn main() -> Result<()> {
     );
 
     // BENCHMARK B: .exo Projected Scan (Only 2 columns: order_id, amount)
-    let projected_cols = vec!["order_id".to_string(), "amount".to_string()];
+    let projected_cols = vec![
+        FieldSchema {
+            field_id: 0,
+            name: "order_id".to_string(),
+            data_type: "Int64".to_string(),
+        },
+        FieldSchema {
+            field_id: 1,
+            name: "amount".to_string(),
+            data_type: "Float64".to_string(),
+        },
+    ];
     let mut node_proj = BenchPipelineNode::new();
     let t_proj_start = Instant::now();
     execute_exo_scan(&part_path_strings, Some(&projected_cols), &mut node_proj).await?;

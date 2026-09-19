@@ -20,8 +20,8 @@ pub enum LogicalPlan {
     // ── Sources ─────────────────────────────────────────────
     /// A table scan
     Scan {
-        /// The name of the table
-        table_name: String,
+        /// The authoritative table metadata from the catalog.
+        table: std::sync::Arc<crate::metadata::TableMetadata>,
         /// The projection of column IDs to read
         projection: Option<Vec<ColumnId>>,
         /// The filters to push down
@@ -35,6 +35,8 @@ pub enum LogicalPlan {
         url: String,
         /// Inline options (e.g. format).
         options: Vec<(String, String)>,
+        /// Physical files to scan from the catalog.
+        files: Vec<String>,
         /// The resulting schema.
         schema: Box<VeinSchema>,
     },
@@ -301,4 +303,14 @@ pub enum LogicalPlan {
         /// The resulting schema (mirrors the input)
         schema: Box<VeinSchema>,
     },
+}
+
+impl LogicalPlan {
+    /// Returns the table name if this plan node is a table `Scan`.
+    pub fn table_name(&self) -> Option<&str> {
+        match self {
+            LogicalPlan::Scan { table, .. } => Some(&table.name),
+            _ => None,
+        }
+    }
 }

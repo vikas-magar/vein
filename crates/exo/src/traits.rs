@@ -5,6 +5,25 @@
 
 use crate::error::ExoResult;
 
+/// Unified storage buffer that can be backed either by a zero-copy memory map
+/// or an in-memory byte buffer (e.g. decoded from VFS blocks).
+#[derive(Debug)]
+pub enum StorageBuffer {
+    Mmap(memmap2::Mmap),
+    Bytes(Vec<u8>),
+}
+
+impl std::ops::Deref for StorageBuffer {
+    type Target = [u8];
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            StorageBuffer::Mmap(m) => &m[..],
+            StorageBuffer::Bytes(b) => &b[..],
+        }
+    }
+}
+
 /// Stream-oriented writer for the Address Plane (`.exo.addr`).
 pub trait AddressWriter {
     /// Appends a single 64-bit canonical address.

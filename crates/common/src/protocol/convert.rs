@@ -17,7 +17,7 @@ use super::ir::state::{
 use super::task::{
     ArchivedDataSink, ArchivedDataSource, ArchivedExecuteTask, ArchivedExecutionMode,
     ArchivedFieldSchema, ArchivedFileFormat, ArchivedFileScanTask, DataSink, DataSource,
-    ExchangeSource, ExecuteTask, ExecutionMode, FieldSchema, FileFormat, FileScanTask,
+    ExchangeSource, ExecuteTask, ExecutionMode, FieldSchema, FileFormat, FileScanTask, KeyValue,
     ShuffleTarget, StorageTarget, StreamSource,
 };
 
@@ -345,6 +345,15 @@ impl From<&ArchivedDataSink> for DataSink {
             }),
             ArchivedDataSink::Storage(s) => DataSink::Storage(StorageTarget {
                 destination_uri: s.destination_uri.as_str().to_string(),
+                options: s
+                    .options
+                    .iter()
+                    .map(|kv| KeyValue {
+                        key: kv.key.as_str().to_string(),
+                        value: kv.value.as_str().to_string(),
+                    })
+                    .collect(),
+                schema: s.schema.iter().map(FieldSchema::from).collect(),
             }),
         }
     }

@@ -24,3 +24,9 @@ s2n-quic = { workspace = true }
 bytes = "1.0"
 async-trait.workspace = true
 arrow = { workspace = true }
+
+exo = { path = "../exo" }
+vfs = { path = "../vfs" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -34,10 +34,19 @@ impl QueryBinder {
     pub fn new(catalog: Arc<dyn vcs::TableCatalog>, functions: Arc<dyn FunctionRegistry>) -> Self {
         Self { catalog, functions }
     }
+
+    /// Access the underlying table catalog.
+    pub fn catalog(&self) -> &Arc<dyn vcs::TableCatalog> {
+        &self.catalog
+    }
 }
 
 #[async_trait]
 impl LogicalBinder for QueryBinder {
+    fn catalog(&self) -> Option<&Arc<dyn vcs::TableCatalog>> {
+        Some(&self.catalog)
+    }
+
     /// Recursively binds a parsed SQL statement into a LogicalPlan tree.
     /// `EXPLAIN` statements bind the inner query and wrap it in a
     /// [`LogicalPlan::Explain`] node so downstream stages can render the
@@ -114,10 +123,10 @@ pub async fn bind_source<'a>(
                 return Ok(plan);
             }
 
-            let schema = context.catalog.get_table_schema(name).await?;
+            let table = context.catalog.get_table(name).await?;
 
             let mut columns = Vec::new();
-            for field in &schema.fields {
+            for field in &table.schema.fields {
                 let mut bound_field = field.clone();
                 bound_field.id = context.next_id();
                 bound_field.qualifier = alias
@@ -135,7 +144,7 @@ pub async fn bind_source<'a>(
             });
 
             Ok(LogicalPlan::Scan {
-                table_name: name.to_string(),
+                table: table.clone(),
                 projection: None,
                 filters: vec![],
                 schema: Box::new(VeinSchema { fields: columns }),
@@ -172,18 +181,49 @@ pub async fn bind_source<'a>(
             inline_options,
             alias,
         } => {
-            let qualifier = alias.map(|a| a.to_string());
+            let table = context.catalog.get_table(url).await;
+            let (schema, files, detected_format) = match table {
+                Ok(tbl) => (
+                    tbl.schema.clone(),
+                    tbl.files.clone(),
+                    tbl.format.as_ref().map(|f| f.to_string()),
+                ),
+                Err(_) => (Arc::new(VeinSchema { fields: vec![] }), vec![url.to_string()], None),
+            };
+
+            let mut columns = Vec::with_capacity(schema.fields.len());
+            for field in &schema.fields {
+                let mut bound_field = field.clone();
+                bound_field.id = context.next_id();
+                bound_field.qualifier = alias
+                    .map(|a| a.to_string())
+                    .or_else(|| Some(url.to_string()));
+                columns.push(bound_field);
+            }
+
+            let qualifier = alias
+                .map(|a| a.to_string())
+                .or_else(|| Some(url.to_string()));
             scopes.push(Scope {
-                columns: vec![],
+                columns: columns.clone(),
                 aliases: vec![qualifier.clone().unwrap_or_default()],
             });
+
+            let mut options: Vec<(String, String)> = inline_options
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            if let Some(fmt) = detected_format {
+                if !options.iter().any(|(k, _)| k.eq_ignore_ascii_case("format")) {
+                    options.push(("format".to_string(), fmt));
+                }
+            }
+
             Ok(LogicalPlan::ExternalScan {
                 url: url.to_string(),
-                options: inline_options
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-                schema: Box::new(VeinSchema { fields: vec![] }),
+                options,
+                files,
+                schema: Box::new(VeinSchema { fields: columns }),
             })
         }
     }

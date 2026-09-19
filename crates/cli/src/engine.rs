@@ -134,6 +134,11 @@ impl QueryEngine for DistributedCoordinator {
             return Ok(Bytes::from(text));
         }
 
+        let write_info = match &optimized_plan {
+            LogicalPlan::Write { target, schema, .. } => Some((target.clone(), schema.clone())),
+            _ => None,
+        };
+
         // 3. PLAN: Lower the optimized logical plan into a distributed physical Job.
         tracing::debug!(target: "vein_coordinator", "Lowering optimized logical plan to physical DAG");
         let job = self.planner.create_physical_plan(optimized_plan)?;
@@ -147,7 +152,29 @@ impl QueryEngine for DistributedCoordinator {
 
         self.scheduler.execute(job, cancel_token).await?;
 
-        // 5. RECEIVE: Extract the collected Arrow IPC bytes from the dispatcher.
+        // 5. Post-execution handling for Write queries: register in catalog & report OK
+        if let Some((target, schema)) = write_info {
+            let location = if target.starts_with('/')
+                || target.starts_with("./")
+                || target.starts_with("../")
+                || target.starts_with("vfs://")
+            {
+                target.clone()
+            } else {
+                format!("vfs://{target}")
+            };
+            if let Some(catalog) = self.binder.catalog() {
+                let metadata = plan::TableMetadata::new(&target, Arc::new((*schema).clone()))
+                    .with_location(location)
+                    .with_format(plan::TableFormat::Exo);
+                let _ = catalog.register_table(metadata).await;
+            }
+
+            let msg = format!("WRITE OK: table '{target}' successfully written\n");
+            return Ok(Bytes::from(msg));
+        }
+
+        // 6. RECEIVE: Extract the collected Arrow IPC bytes from the dispatcher.
         let output_bytes = self
             .scheduler
             .dispatcher()
@@ -184,11 +211,11 @@ mod tests {
     use std::time::Duration;
     use vcs::InMemoryCatalog;
 
-    /// Builds a fully-wired coordinator over the in-memory catalog.
-    fn coordinator() -> DistributedCoordinator {
+    /// Builds a fully-wired coordinator over a specified catalog.
+    fn coordinator_with_catalog(catalog: Arc<dyn vcs::TableCatalog>) -> DistributedCoordinator {
         DistributedCoordinator::builder()
             .with_binder(Arc::new(QueryBinder::new(
-                Arc::new(InMemoryCatalog::new()),
+                catalog,
                 Arc::new(MockFunctionRegistry::new()),
             )))
             .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
@@ -201,6 +228,11 @@ mod tests {
             )))
             .build()
             .expect("coordinator should build")
+    }
+
+    /// Builds a fully-wired coordinator over the default in-memory catalog.
+    fn coordinator() -> DistributedCoordinator {
+        coordinator_with_catalog(Arc::new(InMemoryCatalog::new()))
     }
 
     #[test]
@@ -238,6 +270,83 @@ mod tests {
         let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
         assert!(text.contains("> 20"), "expected folded literal, got:\n{text}");
         assert!(!text.contains("18 + 2"), "expected folding, got:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn explain_native_exo_table_path_query() {
+        use exo::PartWriter;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let table_path = dir.path();
+
+        // Write an exo partition with id, amount, and status
+        {
+            let mut writer = PartWriter::create(table_path, 0, 256).expect("create writer");
+            let ids: Vec<i64> = vec![1, 2, 3];
+            let amounts: Vec<f64> = vec![10.5, 60.0, 99.99];
+            let statuses: Vec<String> = vec!["A".into(), "B".into(), "C".into()];
+
+            writer.write_primitive_column("id", &ids).expect("write id");
+            writer.write_primitive_column("amount", &amounts).expect("write amount");
+            writer.write_string_column("status", &statuses).expect("write status");
+            writer.finish().expect("finish part");
+        }
+
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let table_str = table_path.to_string_lossy().to_string();
+        catalog.add_table(
+            &table_str,
+            Arc::new(plan::VeinSchema {
+                fields: vec![
+                    plan::ResolvedColumn::new(
+                        plan::ColumnId(0),
+                        "id",
+                        None,
+                        plan::VeinDataType::Int64,
+                    ),
+                    plan::ResolvedColumn::new(
+                        plan::ColumnId(1),
+                        "amount",
+                        None,
+                        plan::VeinDataType::Float64,
+                    ),
+                    plan::ResolvedColumn::new(
+                        plan::ColumnId(2),
+                        "status",
+                        None,
+                        plan::VeinDataType::Utf8,
+                    ),
+                ],
+            }),
+        );
+        let engine = coordinator_with_catalog(catalog);
+        let query_str = format!(
+            "EXPLAIN FROM '{}' |> WHERE amount > 50.0 |> SELECT id, amount",
+            table_str
+        );
+
+        let node = Parser::new(&query_str)
+            .parse_statement()
+            .expect("query should parse");
+        let bytes = engine.submit_query(node).await.expect("explain should succeed");
+        let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
+
+        assert!(text.contains("Explain"), "got:\n{text}");
+        assert!(text.contains("ExternalScan") || text.contains("Scan"), "got:\n{text}");
+        assert!(text.contains("Project"), "got:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn explain_write_query() {
+        let engine = coordinator();
+        let node = Parser::new("EXPLAIN FROM users |> WRITE out_users")
+            .parse_statement()
+            .expect("query should parse");
+        let bytes = engine.submit_query(node).await.expect("explain should succeed");
+        let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
+        assert!(text.contains("Explain"), "got:\n{text}");
+        assert!(text.contains("Write"), "got:\n{text}");
     }
 
     /// Non-EXPLAIN queries proceed through physical planning into the scheduler.
@@ -430,5 +539,146 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, node_id);
         assert_eq!(nodes[0].addr, "127.0.0.1:9191".parse::<SocketAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_end_to_end_vfs_native_write_and_read() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use common::identifiers::NodeId;
+        use common::protocol::{NodeKind, NodeLoad};
+        use exec::ExecutorDaemon;
+        use std::net::SocketAddr;
+
+        let cert = format!("{}/../../certs/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key = format!("{}/../../certs/server.key", env!("CARGO_MANIFEST_DIR"));
+
+        // 0. Set up an isolated VFS store in a fresh temp directory so stale
+        //    partition state from previous test runs never bleeds in.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vfs_cfg = vfs::VfsConfig::from_data_dir(tmp.path());
+        let vfs_store = Arc::new(
+            vfs::VfsTableStore::init(&vfs_cfg)
+                .await
+                .expect("vfs store init"),
+        );
+        vfs::VfsTableStore::set_shared(vfs_store.clone());
+
+        // 1. Start Executor Daemon
+        let exec_addr: SocketAddr = "127.0.0.1:9195".parse().unwrap();
+        let daemon = ExecutorDaemon::builder()
+            .bind(exec_addr)
+            .certificates(&cert, &key)
+            .workers(2)
+            .master("127.0.0.1:9190")
+            .build()
+            .expect("executor daemon should build");
+
+        let cert_c = cert.clone();
+        let key_c = key.clone();
+        tokio::spawn(async move {
+            let _ = daemon.run_control_plane(exec_addr, &cert_c, &key_c).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // 2. Set up Coordinator with registered Executor in scheduler
+        let registry = Arc::new(orchestrator::executor::registry::ExecutorRegistry::new());
+        let node_id = NodeId::new();
+        registry
+            .record_heartbeat(
+                node_id,
+                exec_addr,
+                NodeKind::Executor,
+                NodeLoad {
+                    active_tasks: 0,
+                    cpu_percent: 0.0,
+                    memory_bytes: 0,
+                },
+            )
+            .await;
+
+        let dispatcher = Arc::new(orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::with_cert(&cert));
+        let scheduler = Arc::new(orchestrator::scheduler::Scheduler::new(
+            registry,
+            dispatcher,
+            3,
+            Duration::from_secs(10),
+        ));
+
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let coordinator = Arc::new(
+            DistributedCoordinator::builder()
+                .with_binder(Arc::new(QueryBinder::new(
+                    catalog.clone(),
+                    Arc::new(MockFunctionRegistry::new()),
+                )))
+                .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
+                .with_planner(Arc::new(DefaultPhysicalPlanner::new()))
+                .with_scheduler(scheduler)
+                .build()
+                .expect("coordinator should build"),
+        );
+
+        // 3. Pre-seed a source table directly into VFS blocks (zero loose files)
+        let source_table_name = "src_vfs_items";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let names = Arc::new(StringArray::from(vec!["laptop", "phone", "tablet"]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, names]).unwrap();
+
+        vfs_store
+            .append_partition(source_table_name, &batch)
+            .await
+            .expect("seed vfs table");
+
+        // 4. Execute WRITE query: FROM src_vfs_items |> WRITE dst_vfs_items
+        let write_query = format!("FROM {source_table_name} |> WRITE dst_vfs_items");
+        let node = Parser::new(&write_query)
+            .parse_statement()
+            .expect("query should parse");
+        let write_res = coordinator
+            .submit_query(node)
+            .await
+            .expect("write query should succeed");
+        let write_msg = String::from_utf8(write_res.to_vec()).expect("utf8 response");
+        assert!(write_msg.contains("WRITE OK: table 'dst_vfs_items'"));
+
+        // 5. Verify NO loose filesystem directory exists!
+        assert!(!std::path::Path::new("dst_vfs_items").exists(), "No directory dst_vfs_items on disk!");
+        assert!(!std::path::Path::new("data/dst_vfs_items").exists(), "No directory data/dst_vfs_items on disk!");
+
+        // 6. Execute READ query: FROM dst_vfs_items |> SELECT id, name
+        let read_query = "FROM dst_vfs_items |> SELECT id, name";
+        let node = Parser::new(read_query)
+            .parse_statement()
+            .expect("query should parse");
+        let read_bytes = coordinator
+            .submit_query(node)
+            .await
+            .expect("read query should succeed");
+
+        assert!(!read_bytes.is_empty(), "Read query must return Arrow IPC bytes");
+        let cursor = std::io::Cursor::new(read_bytes.as_ref());
+        let mut reader = arrow::ipc::reader::StreamReader::try_new(cursor, None)
+            .expect("valid arrow ipc stream");
+
+        let mut total_rows = 0;
+        while let Some(Ok(batch)) = reader.next() {
+            total_rows += batch.num_rows();
+            assert_eq!(batch.num_columns(), 2);
+            let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let name_col = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(id_col.value(0), 1);
+            assert_eq!(name_col.value(0), "laptop");
+        }
+        assert_eq!(total_rows, 3, "Must scan all 3 rows from VFS memory-mapped blocks");
+
+        // Clean up: reset shared store so other tests get their own default.
+        vfs::VfsTableStore::reset_shared();
     }
 }

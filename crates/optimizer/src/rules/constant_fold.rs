@@ -35,12 +35,12 @@ impl OptimizerRule for ConstantFoldingRule {
 fn rewrite_node(plan: &LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Scan {
-            table_name,
+            table,
             projection,
             filters,
             schema,
         } => LogicalPlan::Scan {
-            table_name: table_name.clone(),
+            table: table.clone(),
             projection: projection.clone(),
             filters: fold_exprs(filters),
             schema: schema.clone(),
@@ -318,11 +318,16 @@ mod tests {
     }
 
     fn scan() -> LogicalPlan {
+        let schema = Box::new(plan::VeinSchema { fields: vec![] });
+        let table = std::sync::Arc::new(plan::TableMetadata::new(
+            "t",
+            std::sync::Arc::new(*schema.clone()),
+        ));
         LogicalPlan::Scan {
-            table_name: "t".to_string(),
+            table,
             projection: None,
             filters: vec![],
-            schema: Box::new(plan::VeinSchema { fields: vec![] }),
+            schema,
         }
     }
 

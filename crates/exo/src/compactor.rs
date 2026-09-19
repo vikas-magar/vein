@@ -79,13 +79,23 @@ impl PartCompactor {
 
         // 3. Compact each column across all participating parts (binary-agnostic, zero UTF-8 assumptions)
         for col_name in canonical_columns {
+            let has_vault = source_parts[0].has_vault(col_name);
+            let slot_width = source_parts[0].open_address_reader(col_name)?.slot_width();
             let mut active_vaddrs = Vec::with_capacity(expected_output_rows as usize);
-            let mut active_payloads = Vec::with_capacity(expected_output_rows as usize);
+            let mut active_payloads = if has_vault {
+                Some(Vec::with_capacity(expected_output_rows as usize))
+            } else {
+                None
+            };
 
             for part in source_parts {
                 let tombstones = part.tombstones();
                 let addr_reader = part.open_address_reader(col_name)?;
-                let mut vault_reader = part.open_vault_reader(col_name)?;
+                let mut vault_reader = if has_vault {
+                    Some(part.open_vault_reader(col_name)?)
+                } else {
+                    None
+                };
                 let total_rows = part.total_rows() as u32;
 
                 let part_granule_size = addr_reader.granule_size();
@@ -105,14 +115,21 @@ impl PartCompactor {
                         }
 
                         let vaddr = granule_buf[local_idx];
-                        let payload = vault_reader.read_opt_bytes_slot(slot)?.map(|b| b.to_vec());
                         active_vaddrs.push(vaddr);
-                        active_payloads.push(payload);
+
+                        if let (Some(vr), Some(payloads)) = (&mut vault_reader, &mut active_payloads) {
+                            let payload = vr.read_opt_bytes_slot(slot)?.map(|b| b.to_vec());
+                            payloads.push(payload);
+                        }
                     }
                 }
             }
 
-            writer.write_raw_column(col_name, &active_vaddrs, &active_payloads)?;
+            if let Some(ref payloads) = active_payloads {
+                writer.write_raw_column(col_name, &active_vaddrs, payloads)?;
+            } else {
+                writer.write_raw_address_column_with_slot_width(col_name, &active_vaddrs, slot_width)?;
+            }
         }
 
         // 4. Atomically commit the compacted Part

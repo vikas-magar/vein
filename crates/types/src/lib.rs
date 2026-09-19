@@ -1,0 +1,15 @@
+//! Dedicated types crate for the Vein database engine.
+//!
+//! Provides fundamental data types, columns, and schemas used across the entire engine,
+//! with direct, zero-allocation bidirectional conversions to Apache Arrow and serialization support.
+
+/// Column identities and resolved columns.
+pub mod column;
+/// Data types and arrow conversions.
+pub mod data_type;
+/// Schemas and column layouts.
+pub mod schema;
+
+pub use column::{ColumnId, ResolvedColumn};
+pub use data_type::VeinDataType;
+pub use schema::{VeinSchema, VeinSchemaRef};

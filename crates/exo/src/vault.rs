@@ -7,11 +7,11 @@
 //! Strict zero-unwrap policy is enforced.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{ExoError, ExoResult};
-use crate::traits::{VaultReader, VaultWriter};
+use crate::traits::{StorageBuffer, VaultReader, VaultWriter};
 
 pub const VAULT_HEADER_MAGIC: &[u8; 4] = b"EXOV";
 pub const VAULT_TRAILER_MAGIC: &[u8; 4] = b"VEOF";
@@ -129,16 +129,19 @@ impl VaultGranuleMark {
 }
 
 /// Writer for generating `.exo.vault` files.
-pub struct ExoVaultWriter {
-    file: File,
-    path: PathBuf,
+/// Writer for generating `.exo.vault` files.
+pub struct ExoVaultWriter<W: Write + Seek = File> {
+    writer: W,
+    path: Option<PathBuf>,
     granule_size: usize,
-    buffer: Vec<Option<Vec<u8>>>,
+    offsets: Vec<u32>,
+    payload_arena: Vec<u8>,
+    validity: Vec<bool>,
     marks: Vec<VaultGranuleMark>,
     total_rows: u64,
 }
 
-impl ExoVaultWriter {
+impl ExoVaultWriter<File> {
     /// Creates a new `.exo.vault` writer at the specified path.
     pub fn create(path: &Path, granule_size: usize) -> ExoResult<Self> {
         let mut file = File::create(path)?;
@@ -146,10 +149,12 @@ impl ExoVaultWriter {
         file.write_all(&placeholder)?;
 
         Ok(Self {
-            file,
-            path: path.to_path_buf(),
+            writer: file,
+            path: Some(path.to_path_buf()),
             granule_size,
-            buffer: Vec::with_capacity(granule_size),
+            offsets: Vec::with_capacity(granule_size),
+            payload_arena: Vec::with_capacity(granule_size * 64),
+            validity: Vec::with_capacity(granule_size),
             marks: Vec::new(),
             total_rows: 0,
         })
@@ -157,43 +162,60 @@ impl ExoVaultWriter {
 
     /// Returns the target path being written.
     pub fn path(&self) -> &Path {
-        &self.path
+        self.path.as_deref().expect("File writer always has path")
+    }
+}
+
+impl ExoVaultWriter<std::io::Cursor<Vec<u8>>> {
+    /// Creates a new in-memory `.exo.vault` writer that buffers directly in RAM.
+    pub fn create_in_memory(granule_size: usize) -> ExoResult<Self> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let placeholder = [0u8; HEADER_SIZE];
+        cursor.write_all(&placeholder)?;
+
+        Ok(Self {
+            writer: cursor,
+            path: None,
+            granule_size,
+            offsets: Vec::with_capacity(granule_size),
+            payload_arena: Vec::with_capacity(granule_size * 64),
+            validity: Vec::with_capacity(granule_size),
+            marks: Vec::new(),
+            total_rows: 0,
+        })
     }
 
-    /// Flushes the buffered rows for the current granule into a discrete disk block.
+    /// Finishes writing into memory and returns `(total_rows, buffer_bytes)`.
+    pub fn finish_into_bytes(mut self) -> ExoResult<(u64, Vec<u8>)> {
+        let rows = self.finish_internal()?;
+        Ok((rows, self.writer.into_inner()))
+    }
+}
+
+impl<W: Write + Seek> ExoVaultWriter<W> {
+    /// Flushes the buffered rows for the current granule into a discrete block.
     fn flush_granule(&mut self) -> ExoResult<()> {
-        if self.buffer.is_empty() {
+        if self.offsets.len() == 0 {
             return Ok(());
         }
 
-        let byte_offset = self.file.stream_position()?;
-        let num_rows = self.buffer.len();
-        let has_nulls = self.buffer.iter().any(|v| v.is_none());
+        let byte_offset = self.writer.stream_position()?;
+        let num_rows = self.offsets.len();
+        let has_nulls = self.validity.iter().any(|&v| !v);
 
         // 1. Build validity bitmask if granule contains nulls
         let validity_bytes_len = if has_nulls { (num_rows + 7) / 8 } else { 0 };
         let mut validity_bytes = vec![0u8; validity_bytes_len];
         if has_nulls {
-            for (i, item) in self.buffer.iter().enumerate() {
-                if item.is_some() {
+            for (i, &is_valid) in self.validity.iter().enumerate() {
+                if is_valid {
                     validity_bytes[i / 8] |= 1 << (i % 8);
                 }
             }
         }
 
-        // 2. Build local offset table and payload buffer
-        let mut offsets = Vec::with_capacity(num_rows);
-        let mut payload = Vec::new();
-
-        for item in &self.buffer {
-            offsets.push(payload.len() as u32);
-            if let Some(data) = item {
-                payload.extend_from_slice(data);
-            }
-        }
-
         let offsets_bytes_len = (num_rows * 4) as u32;
-        let payload_bytes_len = payload.len() as u32;
+        let payload_bytes_len = self.payload_arena.len() as u32;
         let total_uncompressed_len = (validity_bytes_len as u32) + offsets_bytes_len + payload_bytes_len;
 
         // 3. Write 16-byte Granule Block Header
@@ -208,27 +230,27 @@ impl ExoVaultWriter {
         if has_nulls {
             hasher.update(&validity_bytes);
         }
-        for off in &offsets {
+        for off in &self.offsets {
             hasher.update(&off.to_le_bytes());
         }
-        hasher.update(&payload);
+        hasher.update(&self.payload_arena);
         let crc = hasher.finalize();
         granule_header[12..16].copy_from_slice(&crc.to_le_bytes());
 
-        self.file.write_all(&granule_header)?;
+        self.writer.write_all(&granule_header)?;
 
         // 4. Write validity mask (if present)
         if has_nulls {
-            self.file.write_all(&validity_bytes)?;
+            self.writer.write_all(&validity_bytes)?;
         }
 
         // 5. Write offsets table
-        for off in &offsets {
-            self.file.write_all(&off.to_le_bytes())?;
+        for off in &self.offsets {
+            self.writer.write_all(&off.to_le_bytes())?;
         }
 
         // 6. Write raw payload
-        self.file.write_all(&payload)?;
+        self.writer.write_all(&self.payload_arena)?;
 
         let block_disk_len = (GRANULE_HEADER_SIZE as u32) + total_uncompressed_len;
 
@@ -238,17 +260,60 @@ impl ExoVaultWriter {
             uncompressed_len: total_uncompressed_len,
         });
 
-        self.buffer.clear();
+        self.offsets.clear();
+        self.payload_arena.clear();
+        self.validity.clear();
         Ok(())
+    }
+
+    fn finish_internal(&mut self) -> ExoResult<u64> {
+        self.flush_granule()?;
+
+        let marks_offset = self.writer.stream_position()?;
+
+        for mark in &self.marks {
+            self.writer.write_all(&mark.encode())?;
+        }
+
+        let marks_count = self.marks.len() as u32;
+        self.writer.write_all(&marks_count.to_le_bytes())?;
+        self.writer.write_all(VAULT_TRAILER_MAGIC)?;
+
+        // Seek to 0 and write finalized header
+        self.writer.seek(SeekFrom::Start(0))?;
+        let header = VaultHeader {
+            magic: *VAULT_HEADER_MAGIC,
+            version: VAULT_FORMAT_VERSION,
+            codec_flags: 0,
+            total_rows: self.total_rows,
+            granule_size: self.granule_size as u32,
+            total_granules: self.marks.len() as u32,
+            marks_offset,
+            checksum: 0,
+        };
+
+        self.writer.write_all(&header.encode())?;
+        let _ = self.writer.flush();
+
+        Ok(self.total_rows)
     }
 }
 
-impl VaultWriter for ExoVaultWriter {
+impl<W: Write + Seek> VaultWriter for ExoVaultWriter<W> {
     fn append_opt_bytes(&mut self, payload: Option<&[u8]>) -> ExoResult<()> {
-        self.buffer.push(payload.map(|p| p.to_vec()));
+        self.offsets.push(self.payload_arena.len() as u32);
+        match payload {
+            Some(p) => {
+                self.payload_arena.extend_from_slice(p);
+                self.validity.push(true);
+            }
+            None => {
+                self.validity.push(false);
+            }
+        }
         self.total_rows += 1;
 
-        if self.buffer.len() >= self.granule_size {
+        if self.offsets.len() >= self.granule_size {
             self.flush_granule()?;
         }
         Ok(())
@@ -285,35 +350,7 @@ impl VaultWriter for ExoVaultWriter {
     }
 
     fn finish(mut self) -> ExoResult<u64> {
-        self.flush_granule()?;
-
-        let marks_offset = self.file.stream_position()?;
-
-        for mark in &self.marks {
-            self.file.write_all(&mark.encode())?;
-        }
-
-        let marks_count = self.marks.len() as u32;
-        self.file.write_all(&marks_count.to_le_bytes())?;
-        self.file.write_all(VAULT_TRAILER_MAGIC)?;
-
-        // Seek to 0 and write finalized header
-        self.file.seek(SeekFrom::Start(0))?;
-        let header = VaultHeader {
-            magic: *VAULT_HEADER_MAGIC,
-            version: VAULT_FORMAT_VERSION,
-            codec_flags: 0,
-            total_rows: self.total_rows,
-            granule_size: self.granule_size as u32,
-            total_granules: self.marks.len() as u32,
-            marks_offset,
-            checksum: 0,
-        };
-
-        self.file.write_all(&header.encode())?;
-        self.file.flush()?;
-
-        Ok(self.total_rows)
+        self.finish_internal()
     }
 }
 
@@ -326,40 +363,47 @@ struct CachedVaultGranule {
     payload: Vec<u8>,
 }
 
-/// Production-grade dereferencing reader for `.exo.vault` files.
+/// Production-grade dereferencing reader for `.exo.vault` files backed by memory mapping or RAM buffers.
 pub struct ExoVaultReader {
-    file: File,
+    _file: Option<File>,
+    data: StorageBuffer,
     header: VaultHeader,
     marks: Vec<VaultGranuleMark>,
     cached_granule: Option<CachedVaultGranule>,
 }
 
 impl ExoVaultReader {
-    /// Opens an `.exo.vault` file and loads its tail marks into RAM.
+    /// Opens an `.exo.vault` file and loads its tail marks into RAM using zero-copy memory mapping.
     pub fn open(path: &Path) -> ExoResult<Self> {
-        let mut file = OpenOptions::new().read(true).open(path)?;
-        let file_len = file.metadata()?.len();
+        let file = OpenOptions::new().read(true).open(path)?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Self::from_storage_buffer(Some(file), StorageBuffer::Mmap(mmap))
+    }
 
-        if file_len < (HEADER_SIZE + TRAILER_SIZE) as u64 {
+    /// Constructs an `ExoVaultReader` directly from in-memory bytes (e.g. from VFS blocks).
+    pub fn from_bytes(bytes: Vec<u8>) -> ExoResult<Self> {
+        Self::from_storage_buffer(None, StorageBuffer::Bytes(bytes))
+    }
+
+    fn from_storage_buffer(file: Option<File>, data: StorageBuffer) -> ExoResult<Self> {
+        let file_len = data.len();
+
+        if file_len < HEADER_SIZE + TRAILER_SIZE {
             return Err(ExoError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("File {:?} too small to be a valid .exo.vault file", path),
+                "Buffer too small to be a valid .exo.vault stream",
             )));
         }
 
         // 1. Read header
         let mut header_buf = [0u8; HEADER_SIZE];
-        file.read_exact(&mut header_buf)?;
+        header_buf.copy_from_slice(&data[0..HEADER_SIZE]);
         let header = VaultHeader::decode(&header_buf)?;
 
         // 2. Validate trailer
-        let trailer_offset = file_len - (TRAILER_SIZE as u64);
-        file.seek(SeekFrom::Start(trailer_offset))?;
-        let mut trailer_buf = [0u8; TRAILER_SIZE];
-        file.read_exact(&mut trailer_buf)?;
-
+        let trailer_offset = file_len - TRAILER_SIZE;
         let mut trailer_magic = [0u8; 4];
-        trailer_magic.copy_from_slice(&trailer_buf[4..8]);
+        trailer_magic.copy_from_slice(&data[trailer_offset + 4..file_len]);
         if &trailer_magic != VAULT_TRAILER_MAGIC {
             return Err(ExoError::CorruptedMagic {
                 expected: "VEOF",
@@ -369,26 +413,34 @@ impl ExoVaultReader {
 
         // 3. Load marks table
         let total_granules = header.total_granules as usize;
-        file.seek(SeekFrom::Start(header.marks_offset))?;
-        let mut mark_bytes = vec![0u8; total_granules * MARK_SIZE];
-        file.read_exact(&mut mark_bytes)?;
+        let marks_byte_len = total_granules * MARK_SIZE;
+        let marks_start = header.marks_offset as usize;
+        let marks_end = marks_start + marks_byte_len;
+
+        if marks_end > trailer_offset {
+            return Err(ExoError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Marks table offset exceeds buffer bounds",
+            )));
+        }
 
         let mut marks = Vec::with_capacity(total_granules);
-        for chunk in mark_bytes.chunks_exact(MARK_SIZE) {
+        for chunk in data[marks_start..marks_end].chunks_exact(MARK_SIZE) {
             let mut buf = [0u8; MARK_SIZE];
             buf.copy_from_slice(chunk);
             marks.push(VaultGranuleMark::decode(&buf));
         }
 
         Ok(Self {
-            file,
+            _file: file,
+            data,
             header,
             marks,
             cached_granule: None,
         })
     }
 
-    /// Ensures the specified granule is loaded in the cache.
+    /// Ensures the specified granule is loaded in the cache from buffer bytes.
     fn load_granule(&mut self, granule_idx: usize) -> ExoResult<()> {
         if let Some(ref cached) = self.cached_granule {
             if cached.granule_idx == granule_idx {
@@ -404,11 +456,18 @@ impl ExoVaultReader {
         }
 
         let mark = &self.marks[granule_idx];
-        self.file.seek(SeekFrom::Start(mark.byte_offset))?;
+        let start = mark.byte_offset as usize;
+        let end = start + (mark.compressed_len as usize);
 
-        // 1. Read 16-byte Granule Header
-        let mut g_hdr = [0u8; GRANULE_HEADER_SIZE];
-        self.file.read_exact(&mut g_hdr)?;
+        if end > self.data.len() || start >= end {
+            return Err(ExoError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Vault granule offset out of buffer bounds",
+            )));
+        }
+
+        let granule_bytes = &self.data[start..end];
+        let g_hdr = &granule_bytes[0..GRANULE_HEADER_SIZE];
 
         let flags = g_hdr[1];
         let has_nulls = (flags & 1) != 0;
@@ -419,30 +478,26 @@ impl ExoVaultReader {
         let num_rows = offsets_bytes_len / 4;
         let validity_bytes_len = if has_nulls { (num_rows + 7) / 8 } else { 0 };
 
-        // 2. Read validity mask if present
-        let validity_mask = if has_nulls {
-            let mut v = vec![0u8; validity_bytes_len];
-            self.file.read_exact(&mut v)?;
-            Some(v)
-        } else {
-            None
-        };
+        let validity_start = GRANULE_HEADER_SIZE;
+        let validity_end = validity_start + validity_bytes_len;
+        let offsets_start = validity_end;
+        let offsets_end = offsets_start + offsets_bytes_len;
+        let payload_start = offsets_end;
+        let payload_end = payload_start + payload_bytes_len;
 
-        // 3. Read offsets
-        let mut offsets_data = vec![0u8; offsets_bytes_len];
-        self.file.read_exact(&mut offsets_data)?;
-
-        // 4. Read payload
-        let mut payload_data = vec![0u8; payload_bytes_len];
-        self.file.read_exact(&mut payload_data)?;
+        if payload_end > granule_bytes.len() {
+            return Err(ExoError::CodecError(
+                "Granule payload exceeds block length".to_string(),
+            ));
+        }
 
         // Verify CRC32-C Checksum
         let mut hasher = crc32fast::Hasher::new();
-        if let Some(ref v) = validity_mask {
-            hasher.update(v);
+        if has_nulls {
+            hasher.update(&granule_bytes[validity_start..validity_end]);
         }
-        hasher.update(&offsets_data);
-        hasher.update(&payload_data);
+        hasher.update(&granule_bytes[offsets_start..offsets_end]);
+        hasher.update(&granule_bytes[payload_start..payload_end]);
         let actual_crc = hasher.finalize();
 
         if actual_crc != expected_crc {
@@ -453,8 +508,14 @@ impl ExoVaultReader {
             });
         }
 
+        let validity_mask = if has_nulls {
+            Some(granule_bytes[validity_start..validity_end].to_vec())
+        } else {
+            None
+        };
+
         let mut offsets = Vec::with_capacity(num_rows);
-        for chunk in offsets_data.chunks_exact(4) {
+        for chunk in granule_bytes[offsets_start..offsets_end].chunks_exact(4) {
             offsets.push(u32::from_le_bytes(chunk.try_into().unwrap_or([0u8; 4])));
         }
 
@@ -463,7 +524,7 @@ impl ExoVaultReader {
             rows_in_granule: num_rows,
             validity_mask,
             offsets,
-            payload: payload_data,
+            payload: granule_bytes[payload_start..payload_end].to_vec(),
         });
 
         Ok(())
@@ -719,6 +780,34 @@ mod tests {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_vault_in_memory_roundtrip() -> ExoResult<()> {
+        const GRANULE_SIZE: usize = 128;
+        let test_strings = vec![
+            Some("alpha".to_string()),
+            None,
+            Some("beta".to_string()),
+            Some("gamma long string that exceeds standard sizes 1234567890".to_string()),
+            None,
+        ];
+
+        let mut writer = ExoVaultWriter::create_in_memory(GRANULE_SIZE)?;
+        writer.append_batch_opt_strings(&test_strings)?;
+        let (rows, bytes) = writer.finish_into_bytes()?;
+        assert_eq!(rows, 5);
+
+        let mut reader = ExoVaultReader::from_bytes(bytes)?;
+        assert_eq!(reader.total_rows(), 5);
+
+        assert_eq!(reader.read_opt_str_slot(0)?, Some("alpha"));
+        assert_eq!(reader.read_opt_str_slot(1)?, None);
+        assert_eq!(reader.read_opt_str_slot(2)?, Some("beta"));
+        assert_eq!(reader.read_opt_str_slot(3)?, Some("gamma long string that exceeds standard sizes 1234567890"));
+        assert_eq!(reader.read_opt_str_slot(4)?, None);
 
         Ok(())
     }

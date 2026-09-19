@@ -427,13 +427,14 @@ mod tests {
     }
 
     fn scan_plan() -> LogicalPlan {
+        let schema = std::sync::Arc::new(VeinSchema {
+            fields: vec![col(0, "id"), col(1, "name")],
+        });
         LogicalPlan::Scan {
-            table_name: "users".to_string(),
+            table: std::sync::Arc::new(crate::TableMetadata::new("users", schema.clone())),
             projection: None,
             filters: vec![],
-            schema: Box::new(VeinSchema {
-                fields: vec![col(0, "id"), col(1, "name")],
-            }),
+            schema: Box::new((*schema).clone()),
         }
     }
 

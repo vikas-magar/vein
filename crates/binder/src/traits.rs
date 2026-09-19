@@ -59,4 +59,9 @@ pub trait LogicalBinder: Send + Sync {
     /// `EXPLAIN` statements yield a [`LogicalPlan::Explain`] wrapper over the
     /// bound inner query.
     async fn bind<'a>(&self, node: &'a QueryNode<'a>) -> Result<LogicalPlan>;
+
+    /// Returns the underlying catalog, if available.
+    fn catalog(&self) -> Option<&std::sync::Arc<dyn vcs::TableCatalog>> {
+        None
+    }
 }

@@ -1055,6 +1055,7 @@ dependencies = [
  "common",
  "error",
  "exec",
+ "exo",
  "optimizer",
  "orchestrator",
  "parser",
@@ -1062,10 +1063,12 @@ dependencies = [
  "plan",
  "rkyv",
  "s2n-quic",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "vcs",
+ "vfs",
 ]
 
 [[package]]
@@ -1686,9 +1689,12 @@ dependencies = [
  "parquet 59.1.0",
  "rkyv",
  "s2n-quic",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "types",
+ "vfs",
 ]
 
 [[package]]
@@ -3561,6 +3567,7 @@ dependencies = [
  "arrow",
  "error",
  "parser",
+ "types",
 ]
 
 [[package]]
@@ -5578,6 +5585,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "types"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "error",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "typetag"
 version = "0.2.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5687,15 +5704,23 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 name = "vcs"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "error",
  "futures",
  "iceberg",
  "iceberg-storage-opendal",
  "moka",
+ "opendal 0.45.1",
+ "parquet 59.1.0",
  "plan",
  "rkyv",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
+ "types",
+ "vfs",
 ]
 
 [[package]]
@@ -5728,6 +5753,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vfs"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "bincode",
  "blake3",
@@ -5736,17 +5762,20 @@ dependencies = [
  "common",
  "dashmap",
  "error",
+ "exo",
  "memmap2",
  "opendal 0.45.1",
  "redb",
  "s2n-quic",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "types",
 ]
 
 [[package]]

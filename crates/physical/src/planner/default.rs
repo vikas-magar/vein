@@ -71,7 +71,8 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
             LogicalPlan::Scan { .. }
             | LogicalPlan::ExternalScan { .. }
             | LogicalPlan::Filter { .. }
-            | LogicalPlan::Project { .. } => {
+            | LogicalPlan::Project { .. }
+            | LogicalPlan::Write { .. } => {
                 let mut stages = Vec::new();
                 let output_stage = self
                     .pipeline_builder
@@ -107,8 +108,12 @@ mod tests {
             ResolvedColumn::new(ColumnId(0), "id", None, VeinDataType::Int64),
             ResolvedColumn::new(ColumnId(1), "name", None, VeinDataType::Utf8),
         ]));
+        let table = std::sync::Arc::new(plan::TableMetadata::new(
+            "users",
+            std::sync::Arc::new(*schema.clone()),
+        ));
         LogicalPlan::Scan {
-            table_name: "users".to_string(),
+            table,
             projection: None,
             filters: vec![],
             schema,

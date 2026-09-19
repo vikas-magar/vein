@@ -10,3 +10,4 @@ missing_docs = "deny"
 error = { path = "../error" }
 parser = { path = "../parser" }
 arrow = { workspace = true }
+types = { path = "../types" }

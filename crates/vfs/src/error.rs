@@ -22,6 +22,9 @@ pub enum VfsError {
     #[error("File or partition not found: {0}")]
     NotFound(String),
 
+    #[error("Exo format error: {0}")]
+    Exo(#[from] exo::ExoError),
+
     #[error("Internal VFS error: {0}")]
     Internal(String),
 }

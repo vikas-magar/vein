@@ -136,15 +136,20 @@ mod tests {
     }
 
     fn project(exprs: Vec<LogicalExpr>) -> LogicalPlan {
+        let schema = Box::new(plan::VeinSchema { fields: vec![] });
+        let table = std::sync::Arc::new(plan::TableMetadata::new(
+            "t",
+            std::sync::Arc::new(*schema.clone()),
+        ));
         LogicalPlan::Project {
             input: Box::new(LogicalPlan::Scan {
-                table_name: "t".to_string(),
+                table,
                 projection: None,
                 filters: vec![],
-                schema: Box::new(plan::VeinSchema { fields: vec![] }),
+                schema: schema.clone(),
             }),
             exprs,
-            schema: Box::new(plan::VeinSchema { fields: vec![] }),
+            schema,
         }
     }
 

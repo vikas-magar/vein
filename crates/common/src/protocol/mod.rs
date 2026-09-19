@@ -18,7 +18,7 @@ pub use ir::state::{AggOpCode, JoinKind, StateMode};
 // Re-export task & pipeline definitions
 pub use task::{
     ArchivedExecuteTask, DataSink, DataSource, ExchangeSource, ExecuteTask, ExecutionMode,
-    FieldSchema, FileFormat, FileScanTask, ShuffleTarget, StorageTarget, StreamSource,
+    FieldSchema, FileFormat, FileScanTask, KeyValue, ShuffleTarget, StorageTarget, StreamSource,
 };
 
 // Re-export control-plane events and telemetry

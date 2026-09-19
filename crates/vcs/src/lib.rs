@@ -26,7 +26,11 @@ pub mod scan;
 /// Storage backend configuration and file IO construction.
 pub mod storage;
 
-pub use catalog::{InMemoryCatalog, TableCatalog};
+/// Smart source discovery and schema resolution.
+pub mod discovery;
+
+pub use catalog::{InMemoryCatalog, TableCatalog, TableEntry};
+pub use discovery::{DiscoveredSource, resolve_source};
 
 use std::collections::HashMap;
 use std::sync::Arc;

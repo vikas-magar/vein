@@ -1,5 +1,5 @@
 use crate::pipeline::{DataChunk, PipelineNode, Source};
-use common::protocol::FileFormat;
+use common::protocol::{FieldSchema, FileFormat};
 use common::Result;
 use error::VeinError;
 use opendal::Operator;
@@ -17,7 +17,7 @@ pub struct ScanSource {
     operator: Operator,
     paths: Vec<String>,
     format: FileFormat,
-    projection: Option<Vec<String>>,
+    projection: Option<Vec<FieldSchema>>,
 }
 
 impl ScanSource {
@@ -31,8 +31,8 @@ impl ScanSource {
         }
     }
 
-    /// Configures column projection pushdown.
-    pub fn with_projection(mut self, projection: Option<Vec<String>>) -> Self {
+    /// Configures authoritative column projection pushdown with field types.
+    pub fn with_projection(mut self, projection: Option<Vec<FieldSchema>>) -> Self {
         self.projection = projection;
         self
     }

@@ -99,6 +99,27 @@ pub struct ShuffleTarget {
     pub num_partitions: u16,
 }
 
+/// Key-value option pair for storage and scan configurations.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+pub struct KeyValue {
+    /// Option key name.
+    pub key: String,
+    /// Option value.
+    pub value: String,
+}
+
+impl KeyValue {
+    /// Creates a new key-value pair.
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+}
+
 /// Target for persistent storage output.
 #[derive(
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
@@ -106,6 +127,33 @@ pub struct ShuffleTarget {
 pub struct StorageTarget {
     /// The path or table URI.
     pub destination_uri: String,
+    /// Storage format and execution options.
+    pub options: Vec<KeyValue>,
+    /// Authoritative schema of columns to write.
+    pub schema: Vec<FieldSchema>,
+}
+
+impl StorageTarget {
+    /// Creates a new StorageTarget.
+    pub fn new(
+        destination_uri: impl Into<String>,
+        options: Vec<KeyValue>,
+        schema: Vec<FieldSchema>,
+    ) -> Self {
+        Self {
+            destination_uri: destination_uri.into(),
+            options,
+            schema,
+        }
+    }
+
+    /// Helper to find an option value by key (case-insensitive).
+    pub fn get_option(&self, key: &str) -> Option<&str> {
+        self.options
+            .iter()
+            .find(|kv| kv.key.eq_ignore_ascii_case(key))
+            .map(|kv| kv.value.as_str())
+    }
 }
 
 /// Sink for data produced by a stage.

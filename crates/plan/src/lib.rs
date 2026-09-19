@@ -17,7 +17,13 @@ pub mod plan;
 /// Data types, columns, and table schemas.
 pub mod schema;
 
+/// Standard table metadata, storage formats, and statistics.
+pub mod metadata;
+
 pub use expr::{LogicalExpr, LogicalLiteral, Volatility};
+pub use metadata::{
+    ColumnStatistics, TableFormat, TableMetadata, TableMetadataRef, TableStatistics, TableType,
+};
 pub use plan::display;
 pub use plan::{LogicalPlan, PlanTraversal, SortKey, WindowExpr};
 pub use schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema, VeinSchemaRef};

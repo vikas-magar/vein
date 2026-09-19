@@ -28,6 +28,20 @@ pub trait MetadataEngine: Send + Sync {
     /// Removes a logical file path entirely.
     async fn delete_file(&self, path: &str) -> Result<()>;
 
+    /// Replaces all extents for `path` with a fresh set.
+    ///
+    /// This is the correct operation for manifest files (`_partitions.json`,
+    /// `_schema.json`) that are overwritten on every update. The default
+    /// implementation deletes the existing extents then appends the new ones.
+    async fn replace_file(&self, path: &str, extents: Vec<Extent>) -> Result<()> {
+        // Best-effort delete; ignore NotFound.
+        let _ = self.delete_file(path).await;
+        for extent in extents {
+            self.append_extent(path, extent).await?;
+        }
+        Ok(())
+    }
+
     /// Persists a consensus proposal to storage.
     async fn persist_proposal(
         &self,

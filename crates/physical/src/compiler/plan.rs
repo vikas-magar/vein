@@ -37,7 +37,7 @@ impl PipelineCompiler {
     fn collect_leaf_source(plan: &LogicalPlan) -> Result<(DataSource, VeinSchema)> {
         match plan {
             LogicalPlan::Scan {
-                table_name,
+                table,
                 projection,
                 schema,
                 ..
@@ -55,10 +55,36 @@ impl PipelineCompiler {
                     })
                     .collect();
 
-                let (files, format) = if table_name.ends_with(".exo") || table_name.contains("part_") {
-                    (vec![table_name.clone()], FileFormat::Exo)
+                let files = if !table.files.is_empty() {
+                    table.files.clone()
+                } else if let Some(loc) = &table.location {
+                    vec![loc.clone()]
                 } else {
-                    (vec![format!("{table_name}.parquet")], FileFormat::Parquet)
+                    vec![table.name.clone()]
+                };
+
+                let format = match &table.format {
+                    Some(plan::TableFormat::Exo) => FileFormat::Exo,
+                    Some(plan::TableFormat::Parquet) => FileFormat::Parquet,
+                    Some(plan::TableFormat::Csv) => FileFormat::Csv,
+                    Some(plan::TableFormat::Json) => FileFormat::Json,
+                    Some(plan::TableFormat::Custom(s)) => match s.to_lowercase().as_str() {
+                        "exo" => FileFormat::Exo,
+                        "csv" => FileFormat::Csv,
+                        "json" => FileFormat::Json,
+                        _ => FileFormat::Parquet,
+                    },
+                    _ => {
+                        if files.iter().any(|f| f.ends_with(".parquet")) {
+                            FileFormat::Parquet
+                        } else if files.iter().any(|f| f.ends_with(".csv")) {
+                            FileFormat::Csv
+                        } else if files.iter().any(|f| f.ends_with(".json")) {
+                            FileFormat::Json
+                        } else {
+                            FileFormat::Exo
+                        }
+                    }
                 };
 
                 let scan_task = FileScanTask {
@@ -75,27 +101,34 @@ impl PipelineCompiler {
             LogicalPlan::ExternalScan {
                 url,
                 options,
+                files,
                 schema,
             } => {
-                let format = options
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("format"))
-                    .map(|(_, v)| match v.to_lowercase().as_str() {
+                let scan_files = if !files.is_empty() {
+                    files.clone()
+                } else {
+                    vec![url.clone()]
+                };
+
+                let format = if let Some((_, v)) = options.iter().find(|(k, _)| k.eq_ignore_ascii_case("format")) {
+                    match v.to_lowercase().as_str() {
                         "exo" => FileFormat::Exo,
                         "csv" => FileFormat::Csv,
                         "json" => FileFormat::Json,
                         _ => FileFormat::Parquet,
-                    })
-                    .unwrap_or_else(|| {
-                        if url.ends_with(".exo") || url.contains("part_") {
-                            FileFormat::Exo
-                        } else {
-                            FileFormat::Parquet
-                        }
-                    });
+                    }
+                } else if scan_files.iter().any(|f| f.ends_with(".parquet")) || url.ends_with(".parquet") {
+                    FileFormat::Parquet
+                } else if scan_files.iter().any(|f| f.ends_with(".csv")) || url.ends_with(".csv") {
+                    FileFormat::Csv
+                } else if scan_files.iter().any(|f| f.ends_with(".json")) || url.ends_with(".json") {
+                    FileFormat::Json
+                } else {
+                    FileFormat::Exo
+                };
 
                 let scan_task = FileScanTask {
-                    files: vec![url.clone()],
+                    files: scan_files,
                     format,
                     byte_range: None,
                     column_ids: schema.fields.iter().map(|f| f.id.0 as i32).collect(),
@@ -115,14 +148,15 @@ impl PipelineCompiler {
             }
             LogicalPlan::Filter { input, .. } => Self::collect_leaf_source(input),
             LogicalPlan::Project { input, .. } => Self::collect_leaf_source(input),
+            LogicalPlan::Write { input, .. } => Self::collect_leaf_source(input),
             other => Err(VeinError::planning(
-                format!("Non-linear node encountered in pipeline compiler: {other:?}"),
+                format!("Unsupported source node in linear pipeline compilation: {other:?}"),
                 None,
             )),
         }
     }
 
-    /// Compiles a logical plan node in source-first order.
+    /// Compiles a logical plan into executable vector instructions
     fn compile_node(
         plan: &LogicalPlan,
         current_schema: &VeinSchema,
@@ -130,12 +164,14 @@ impl PipelineCompiler {
     ) -> Result<VeinSchema> {
         match plan {
             LogicalPlan::Scan { filters, schema, .. } => {
+                let upstream_schema = (**schema).clone();
                 for filter in filters {
-                    compiler.compile_filter(filter, schema)?;
+                    compiler.compile_filter(filter, &upstream_schema)?;
                 }
-                Ok((**schema).clone())
+                Ok(upstream_schema)
             }
             LogicalPlan::ExternalScan { schema, .. } => Ok((**schema).clone()),
+            LogicalPlan::Write { input, .. } => Self::compile_node(input, current_schema, compiler),
             LogicalPlan::Filter { input, predicate } => {
                 let upstream_schema = Self::compile_node(input, current_schema, compiler)?;
                 compiler.compile_filter(predicate, &upstream_schema)?;
@@ -173,8 +209,13 @@ mod tests {
             ResolvedColumn::new(ColumnId(2), "y", None, VeinDataType::Int64),
         ]));
 
+        let table = std::sync::Arc::new(plan::TableMetadata::new(
+            "test_table",
+            std::sync::Arc::new(*schema.clone()),
+        ));
+
         let scan = LogicalPlan::Scan {
-            table_name: "test_table".to_string(),
+            table,
             projection: None,
             filters: Vec::new(),
             schema: schema.clone(),
@@ -207,9 +248,17 @@ mod tests {
             ResolvedColumn::new(ColumnId(1), "col_a", None, VeinDataType::Utf8),
         ]));
 
-        // 1. Table with part_ prefix should select FileFormat::Exo
+        // 1. Table with Exo format metadata
+        let table = std::sync::Arc::new(
+            plan::TableMetadata::new(
+                "tbl_10/part_000002",
+                std::sync::Arc::new(*schema.clone()),
+            )
+            .with_format(plan::TableFormat::Exo)
+            .with_files(vec!["tbl_10/part_000002".to_string()]),
+        );
         let scan_exo = LogicalPlan::Scan {
-            table_name: "tbl_10/part_000002".to_string(),
+            table,
             projection: None,
             filters: Vec::new(),
             schema: schema.clone(),
@@ -227,6 +276,7 @@ mod tests {
         let ext_scan = LogicalPlan::ExternalScan {
             url: "s3://bucket/data/orders.exo".to_string(),
             options: vec![("format".to_string(), "exo".to_string())],
+            files: vec!["s3://bucket/data/orders.exo".to_string()],
             schema: schema.clone(),
         };
         let (source_ext, _, _) = PipelineCompiler::compile(&ext_scan).unwrap();

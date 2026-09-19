@@ -54,15 +54,30 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                 data_type: format!("{:?}", f.data_type),
             })
             .collect();
+        let sink = match plan {
+            LogicalPlan::Write { target, options, .. } => {
+                let storage_schema = client_schema;
+                let key_values = options
+                    .iter()
+                    .map(|(k, v)| common::protocol::KeyValue {
+                        key: k.clone(),
+                        value: v.clone(),
+                    })
+                    .collect();
+                let target_obj = common::protocol::StorageTarget::new(target.clone(), key_values, storage_schema);
+                DataSink::Storage(target_obj)
+            }
+            _ => DataSink::Client {
+                schema: client_schema,
+            },
+        };
         let stage_id = StageId::new();
         let task = Task::new(
             TaskId::new(),
             PartitionId::new(),
             source,
             program,
-            DataSink::Client {
-                schema: client_schema,
-            },
+            sink,
         );
         let stage = Stage::new(stage_id).with_task(task);
         stages.push(stage);

@@ -251,11 +251,12 @@ fn build_lines(plan: &LogicalPlan, prefix: &str, child_prefix: &str, out: &mut S
 fn node_line(plan: &LogicalPlan) -> String {
     let (kind, details, show_schema) = match plan {
         LogicalPlan::Scan {
-            table_name,
+            table,
             projection,
             filters,
             ..
         } => {
+            let table_name = &table.name;
             let proj = match projection {
                 Some(cols) => cols
                     .iter()
@@ -614,13 +615,14 @@ mod tests {
     }
 
     fn scan_plan() -> LogicalPlan {
+        let schema = std::sync::Arc::new(crate::VeinSchema {
+            fields: vec![col(0, "id"), col(1, "name")],
+        });
         LogicalPlan::Scan {
-            table_name: "users".to_string(),
+            table: std::sync::Arc::new(crate::TableMetadata::new("users", schema.clone())),
             projection: None,
             filters: vec![],
-            schema: Box::new(crate::VeinSchema {
-                fields: vec![col(0, "id"), col(1, "name")],
-            }),
+            schema: Box::new((*schema).clone()),
         }
     }
 
@@ -744,13 +746,14 @@ mod coverage {
     }
 
     fn scan_plan() -> LogicalPlan {
+        let schema = std::sync::Arc::new(crate::VeinSchema {
+            fields: vec![col(0, "id"), col(1, "name")],
+        });
         LogicalPlan::Scan {
-            table_name: "users".to_string(),
+            table: std::sync::Arc::new(crate::TableMetadata::new("users", schema.clone())),
             projection: None,
             filters: vec![],
-            schema: Box::new(crate::VeinSchema {
-                fields: vec![col(0, "id"), col(1, "name")],
-            }),
+            schema: Box::new((*schema).clone()),
         }
     }
 
@@ -787,7 +790,10 @@ mod coverage {
         vec![
             (
                 LogicalPlan::Scan {
-                    table_name: "users".to_string(),
+                    table: std::sync::Arc::new(crate::TableMetadata::new(
+                        "users",
+                        std::sync::Arc::new(*base_schema.clone()),
+                    )),
                     projection: None,
                     filters: vec![],
                     schema: base_schema.clone(),
@@ -985,6 +991,7 @@ mod coverage {
                 LogicalPlan::ExternalScan {
                     url: "s3://bucket/data".to_string(),
                     options: vec![],
+                    files: vec![],
                     schema: schema(vec![]),
                 },
                 "ExternalScan".to_string(),

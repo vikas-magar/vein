@@ -42,16 +42,15 @@ impl CloudUploader for ZeroCopySinglePutUploader {
             crate::VfsError::Internal(format!("Failed to mmap local block file: {}", e))
         })?;
 
-        // Transmute is safe here because `bytes` does not outlive the `write().await` execution.
-        let slice: &'static [u8] = unsafe { std::mem::transmute(&mmap[..]) };
-        let bytes = bytes::Bytes::from_static(slice);
+        // Cancellation-safe buffer copy from mmap ensures no use-after-free
+        // or dangling slice references if this async future is cancelled/dropped mid-await.
+        let bytes = bytes::Bytes::copy_from_slice(&mmap[..]);
 
         // Single PUT request via OpenDAL
         self.storage.write(s3_path, bytes).await.map_err(|e| {
             crate::VfsError::Internal(format!("OpenDAL single-put write failed: {}", e))
         })?;
 
-        // mmap is safely dropped here since .await has completed.
         Ok(())
     }
 }
@@ -193,8 +192,11 @@ impl MmapBlockManager {
 #[async_trait]
 impl BlockManager for MmapBlockManager {
     async fn init(config: &VfsConfig) -> Result<Self> {
-        // Ensure cache directory exists
+        // Ensure cache directory and storage root exist
         tokio::fs::create_dir_all(&config.local_cache_dir).await?;
+        if let Some(root) = config.storage_config.get("root") {
+            tokio::fs::create_dir_all(root).await?;
+        }
 
         // Generate the first active block ID
         let initial_block_id = Self::generate_block_id(&config.node_ip);
@@ -301,11 +303,11 @@ impl BlockManager for MmapBlockManager {
                 let mut active_write = self.active_block.write().await;
 
                 // Double check idiom: did another thread rotate it while we waited for the write lock?
-                let (_, late_written) = active_write.try_append(data);
+                let (late_offset, late_written) = active_write.try_append(data);
                 if late_written > 0 {
                     extents.push(Extent {
                         block_id: active_write.block_id,
-                        offset: 0,
+                        offset: late_offset,
                         length: late_written as u64,
                         node_ip: self.config.node_ip.clone(),
                     });

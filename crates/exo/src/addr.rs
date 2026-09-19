@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::codec::ForCodec;
 use crate::error::{ExoError, ExoResult};
-use crate::traits::{AddressReader, AddressWriter};
+use crate::traits::{AddressReader, AddressWriter, StorageBuffer};
 
 pub const ADDR_HEADER_MAGIC: &[u8; 4] = b"EXOA";
 pub const ADDR_TRAILER_MAGIC: &[u8; 4] = b"AEOF";
@@ -37,6 +37,8 @@ pub struct AddressHeader {
     pub total_granules: u32,
     pub marks_offset: u64,
     pub checksum: u32,
+    pub slot_width: u8,
+    pub _reserved: [u8; 27],
 }
 
 impl AddressHeader {
@@ -52,6 +54,7 @@ impl AddressHeader {
         buf[24..32].copy_from_slice(&self.marks_offset.to_le_bytes());
         let checksum = crc32fast::hash(&buf[0..32]);
         buf[32..36].copy_from_slice(&checksum.to_le_bytes());
+        buf[36] = if self.slot_width == 0 { 8 } else { self.slot_width };
         buf
     }
 
@@ -86,6 +89,8 @@ impl AddressHeader {
         let granule_size = u32::from_le_bytes(bytes[16..20].try_into().unwrap_or([0u8; 4]));
         let total_granules = u32::from_le_bytes(bytes[20..24].try_into().unwrap_or([0u8; 4]));
         let marks_offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap_or([0u8; 8]));
+        let slot_width_raw = bytes[36];
+        let slot_width = if slot_width_raw == 0 { 8 } else { slot_width_raw };
 
         Ok(Self {
             magic,
@@ -96,6 +101,8 @@ impl AddressHeader {
             total_granules,
             marks_offset,
             checksum,
+            slot_width,
+            _reserved: [0u8; 27],
         })
     }
 }
@@ -144,75 +151,136 @@ impl AddressGranuleMark {
 }
 
 /// Writer for generating `.exo.addr` files.
-pub struct ExoAddressWriter {
-    file: File,
-    path: PathBuf,
+pub struct ExoAddressWriter<W: Write + Seek = File> {
+    writer: W,
+    path: Option<PathBuf>,
     granule_size: usize,
     codec_flags: u16,
-    buffer: Vec<u64>,
+    slot_width: u8,
+    buffer: Vec<u8>,
+    rows_in_granule: usize,
     marks: Vec<AddressGranuleMark>,
     total_rows: u64,
+    min_vaddr: u64,
+    max_vaddr: u64,
 }
 
-impl ExoAddressWriter {
-    /// Creates a new `.exo.addr` writer at the specified path with default RAW codec.
+impl ExoAddressWriter<File> {
+    /// Creates a new `.exo.addr` writer at the specified path with default RAW codec and 8-byte slots.
     pub fn create(path: &Path, granule_size: usize) -> ExoResult<Self> {
-        Self::create_with_codec(path, granule_size, CODEC_RAW)
+        Self::create_with_codec_and_slot_width(path, granule_size, CODEC_RAW, 8)
     }
 
-    /// Creates a new `.exo.addr` writer with Frame-of-Reference (FoR) bit-packing enabled.
+    /// Creates a new `.exo.addr` writer with Frame-of-Reference (FoR) bit-packing enabled and 8-byte slots.
     pub fn create_compressed(path: &Path, granule_size: usize) -> ExoResult<Self> {
-        Self::create_with_codec(path, granule_size, CODEC_FOR)
+        Self::create_with_codec_and_slot_width(path, granule_size, CODEC_FOR, 8)
     }
 
-    /// Creates a new `.exo.addr` writer with explicit codec flags.
+    /// Creates a new `.exo.addr` writer with explicit codec flags and 8-byte slots.
     pub fn create_with_codec(path: &Path, granule_size: usize, codec_flags: u16) -> ExoResult<Self> {
+        Self::create_with_codec_and_slot_width(path, granule_size, codec_flags, 8)
+    }
+
+    /// Creates a new `.exo.addr` writer with explicit slot width (1, 2, 4, or 8 bytes) and RAW codec.
+    pub fn create_with_slot_width(path: &Path, granule_size: usize, slot_width: u8) -> ExoResult<Self> {
+        Self::create_with_codec_and_slot_width(path, granule_size, CODEC_RAW, slot_width)
+    }
+
+    /// Creates a new `.exo.addr` writer with explicit codec flags and slot width.
+    pub fn create_with_codec_and_slot_width(
+        path: &Path,
+        granule_size: usize,
+        codec_flags: u16,
+        slot_width: u8,
+    ) -> ExoResult<Self> {
         let mut file = File::create(path)?;
         // Write blank 64-byte header placeholder
         let placeholder = [0u8; HEADER_SIZE];
         file.write_all(&placeholder)?;
 
+        let valid_width = match slot_width {
+            1 | 2 | 4 | 8 => slot_width,
+            _ => 8,
+        };
+
         Ok(Self {
-            file,
-            path: path.to_path_buf(),
+            writer: file,
+            path: Some(path.to_path_buf()),
             granule_size,
             codec_flags,
-            buffer: Vec::with_capacity(granule_size),
+            slot_width: valid_width,
+            buffer: Vec::with_capacity(granule_size * (valid_width as usize)),
+            rows_in_granule: 0,
             marks: Vec::new(),
             total_rows: 0,
+            min_vaddr: u64::MAX,
+            max_vaddr: 0,
         })
     }
 
     /// Returns the path to the file being written.
     pub fn path(&self) -> &Path {
-        &self.path
+        self.path.as_deref().expect("File writer always has path")
+    }
+}
+
+impl ExoAddressWriter<std::io::Cursor<Vec<u8>>> {
+    /// Creates a new in-memory `.exo.addr` writer that encodes directly into RAM.
+    pub fn create_in_memory(granule_size: usize, slot_width: u8) -> ExoResult<Self> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let placeholder = [0u8; HEADER_SIZE];
+        cursor.write_all(&placeholder)?;
+
+        let valid_width = match slot_width {
+            1 | 2 | 4 | 8 => slot_width,
+            _ => 8,
+        };
+
+        Ok(Self {
+            writer: cursor,
+            path: None,
+            granule_size,
+            codec_flags: CODEC_RAW,
+            slot_width: valid_width,
+            buffer: Vec::with_capacity(granule_size * (valid_width as usize)),
+            rows_in_granule: 0,
+            marks: Vec::new(),
+            total_rows: 0,
+            min_vaddr: u64::MAX,
+            max_vaddr: 0,
+        })
     }
 
+    /// Finishes writing into memory and returns `(total_rows, buffer_bytes)`.
+    pub fn finish_into_bytes(mut self) -> ExoResult<(u64, Vec<u8>)> {
+        let rows = self.finish_internal()?;
+        Ok((rows, self.writer.into_inner()))
+    }
+}
+
+impl<W: Write + Seek> ExoAddressWriter<W> {
     /// Flushes the current in-memory buffer into a discrete physical granule on disk.
     fn flush_granule(&mut self) -> ExoResult<()> {
-        if self.buffer.is_empty() {
+        if self.rows_in_granule == 0 {
             return Ok(());
         }
 
-        let byte_offset = self.file.stream_position()?;
-        let min_vaddr = self.buffer.iter().copied().min().unwrap_or(0);
-        let max_vaddr = self.buffer.iter().copied().max().unwrap_or(0);
-        let uncompressed_len = (self.buffer.len() * 8) as u32;
+        let byte_offset = self.writer.stream_position()?;
+        let min_vaddr = if self.min_vaddr == u64::MAX { 0 } else { self.min_vaddr };
+        let max_vaddr = self.max_vaddr;
+        let uncompressed_len = self.buffer.len() as u32;
 
-        let compressed_len = if self.codec_flags == CODEC_FOR {
-            let (_, bit_width, packed_data) = ForCodec::encode_granule(&self.buffer);
-            self.file.write_all(&[bit_width])?;
-            self.file.write_all(&packed_data)?;
+        let compressed_len = if self.codec_flags == CODEC_FOR && self.slot_width == 8 {
+            let mut u64_buf = Vec::with_capacity(self.rows_in_granule);
+            for chunk in self.buffer.chunks_exact(8) {
+                u64_buf.push(u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])));
+            }
+            let (_, bit_width, packed_data) = ForCodec::encode_granule(&u64_buf);
+            self.writer.write_all(&[bit_width])?;
+            self.writer.write_all(&packed_data)?;
             (1 + packed_data.len()) as u32
         } else {
-            // Convert slice of u64 to byte slice
-            let byte_slice = unsafe {
-                std::slice::from_raw_parts(
-                    self.buffer.as_ptr() as *const u8,
-                    self.buffer.len() * 8,
-                )
-            };
-            self.file.write_all(byte_slice)?;
+            self.writer.write_all(&self.buffer)?;
             uncompressed_len
         };
 
@@ -225,55 +293,30 @@ impl ExoAddressWriter {
         });
 
         self.buffer.clear();
-        Ok(())
-    }
-}
-
-impl AddressWriter for ExoAddressWriter {
-    fn append_vaddr(&mut self, vaddr: u64) -> ExoResult<()> {
-        self.buffer.push(vaddr);
-        self.total_rows += 1;
-
-        if self.buffer.len() >= self.granule_size {
-            self.flush_granule()?;
-        }
+        self.rows_in_granule = 0;
+        self.min_vaddr = u64::MAX;
+        self.max_vaddr = 0;
         Ok(())
     }
 
-    fn append_batch(&mut self, vaddrs: &[u64]) -> ExoResult<()> {
-        let mut remaining = vaddrs;
-        while !remaining.is_empty() {
-            let capacity_left = self.granule_size - self.buffer.len();
-            let take = std::cmp::min(capacity_left, remaining.len());
-            self.buffer.extend_from_slice(&remaining[..take]);
-            self.total_rows += take as u64;
-            remaining = &remaining[take..];
-
-            if self.buffer.len() >= self.granule_size {
-                self.flush_granule()?;
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> ExoResult<u64> {
+    fn finish_internal(&mut self) -> ExoResult<u64> {
         // Flush any lingering values in the final granule
         self.flush_granule()?;
 
-        let marks_offset = self.file.stream_position()?;
+        let marks_offset = self.writer.stream_position()?;
 
         // Write marks table
         for mark in &self.marks {
-            self.file.write_all(&mark.encode())?;
+            self.writer.write_all(&mark.encode())?;
         }
 
         // Write trailer (marks count + AEOF magic)
         let marks_count = self.marks.len() as u32;
-        self.file.write_all(&marks_count.to_le_bytes())?;
-        self.file.write_all(ADDR_TRAILER_MAGIC)?;
+        self.writer.write_all(&marks_count.to_le_bytes())?;
+        self.writer.write_all(ADDR_TRAILER_MAGIC)?;
 
         // Seek back to start and write finalized header
-        self.file.seek(SeekFrom::Start(0))?;
+        self.writer.seek(SeekFrom::Start(0))?;
 
         let header = AddressHeader {
             magic: *ADDR_HEADER_MAGIC,
@@ -284,19 +327,52 @@ impl AddressWriter for ExoAddressWriter {
             total_granules: self.marks.len() as u32,
             marks_offset,
             checksum: 0,
+            slot_width: self.slot_width,
+            _reserved: [0u8; 27],
         };
 
-        self.file.write_all(&header.encode())?;
-        self.file.flush()?;
+        self.writer.write_all(&header.encode())?;
+        let _ = self.writer.flush();
 
         Ok(self.total_rows)
     }
 }
 
-/// Zero-copy reader for `.exo.addr` files backed by memory mapping.
+impl<W: Write + Seek> AddressWriter for ExoAddressWriter<W> {
+    fn append_vaddr(&mut self, vaddr: u64) -> ExoResult<()> {
+        match self.slot_width {
+            1 => self.buffer.push(vaddr as u8),
+            2 => self.buffer.extend_from_slice(&(vaddr as u16).to_le_bytes()),
+            4 => self.buffer.extend_from_slice(&(vaddr as u32).to_le_bytes()),
+            _ => self.buffer.extend_from_slice(&vaddr.to_le_bytes()),
+        }
+        self.min_vaddr = self.min_vaddr.min(vaddr);
+        self.max_vaddr = self.max_vaddr.max(vaddr);
+        self.rows_in_granule += 1;
+        self.total_rows += 1;
+
+        if self.rows_in_granule >= self.granule_size {
+            self.flush_granule()?;
+        }
+        Ok(())
+    }
+
+    fn append_batch(&mut self, vaddrs: &[u64]) -> ExoResult<()> {
+        for &vaddr in vaddrs {
+            self.append_vaddr(vaddr)?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> ExoResult<u64> {
+        self.finish_internal()
+    }
+}
+
+/// Production-grade zero-copy reader for `.exo.addr` streams.
 pub struct ExoAddressReader {
-    _file: File,
-    mmap: memmap2::Mmap,
+    _file: Option<File>,
+    data: StorageBuffer,
     header: AddressHeader,
     marks: Vec<AddressGranuleMark>,
 }
@@ -305,28 +381,34 @@ impl ExoAddressReader {
     /// Opens an `.exo.addr` file and loads its metadata.
     pub fn open(path: &Path) -> ExoResult<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
-        let metadata = file.metadata()?;
-        let file_len = metadata.len() as usize;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Self::from_storage_buffer(Some(file), StorageBuffer::Mmap(mmap))
+    }
+
+    /// Constructs an `ExoAddressReader` directly from in-memory bytes (e.g. from VFS blocks).
+    pub fn from_bytes(bytes: Vec<u8>) -> ExoResult<Self> {
+        Self::from_storage_buffer(None, StorageBuffer::Bytes(bytes))
+    }
+
+    fn from_storage_buffer(file: Option<File>, data: StorageBuffer) -> ExoResult<Self> {
+        let file_len = data.len();
 
         if file_len < HEADER_SIZE + TRAILER_SIZE {
             return Err(ExoError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("File {:?} too small to be a valid .exo.addr file", path),
+                "Buffer too small to be a valid .exo.addr stream",
             )));
         }
 
-        // Create zero-copy memory map
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-
         // Decode and validate header
         let mut header_buf = [0u8; HEADER_SIZE];
-        header_buf.copy_from_slice(&mmap[0..HEADER_SIZE]);
+        header_buf.copy_from_slice(&data[0..HEADER_SIZE]);
         let header = AddressHeader::decode(&header_buf)?;
 
         // Validate trailer magic at tail
         let trailer_offset = file_len - TRAILER_SIZE;
         let mut trailer_magic = [0u8; 4];
-        trailer_magic.copy_from_slice(&mmap[trailer_offset + 4..file_len]);
+        trailer_magic.copy_from_slice(&data[trailer_offset + 4..file_len]);
         if &trailer_magic != ADDR_TRAILER_MAGIC {
             return Err(ExoError::CorruptedMagic {
                 expected: "AEOF",
@@ -342,12 +424,12 @@ impl ExoAddressReader {
         if marks_end > trailer_offset {
             return Err(ExoError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Marks table offset exceeds file bounds",
+                "Marks table offset exceeds buffer bounds",
             )));
         }
 
         let mut marks = Vec::with_capacity(total_granules);
-        for chunk in mmap[marks_start..marks_end].chunks_exact(MARK_SIZE) {
+        for chunk in data[marks_start..marks_end].chunks_exact(MARK_SIZE) {
             let mut mark_buf = [0u8; MARK_SIZE];
             mark_buf.copy_from_slice(chunk);
             marks.push(AddressGranuleMark::decode(&mark_buf));
@@ -355,7 +437,7 @@ impl ExoAddressReader {
 
         Ok(Self {
             _file: file,
-            mmap,
+            data,
             header,
             marks,
         })
@@ -365,6 +447,33 @@ impl ExoAddressReader {
     #[inline(always)]
     pub fn codec_flags(&self) -> u16 {
         self.header.codec_flags
+    }
+
+    /// Returns the slot width (1, 2, 4, or 8 bytes) configured for this address column.
+    #[inline(always)]
+    pub fn slot_width(&self) -> u8 {
+        self.header.slot_width
+    }
+
+    /// Returns a direct slice of the raw granule bytes from the buffer.
+    pub fn scan_raw_granule_bytes(&self, granule_idx: usize) -> ExoResult<&[u8]> {
+        if granule_idx >= self.marks.len() {
+            return Err(ExoError::InvalidGranuleIndex {
+                index: granule_idx,
+                total_granules: self.marks.len(),
+            });
+        }
+        let mark = &self.marks[granule_idx];
+        let start = mark.byte_offset as usize;
+        let byte_len = mark.uncompressed_len as usize;
+        let end = start + byte_len;
+        if end > self.data.len() {
+            return Err(ExoError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Granule offset exceeds buffer boundary",
+            )));
+        }
+        Ok(&self.data[start..end])
     }
 }
 
@@ -393,7 +502,8 @@ impl AddressReader for ExoAddressReader {
         }
 
         let mark = &self.marks[granule_idx];
-        let num_values = (mark.uncompressed_len / 8) as usize;
+        let slot_w = self.header.slot_width as usize;
+        let num_values = (mark.uncompressed_len as usize) / slot_w;
 
         if out_buffer.len() < num_values {
             return Err(ExoError::BufferTooSmall {
@@ -402,28 +512,65 @@ impl AddressReader for ExoAddressReader {
             });
         }
 
-        if self.header.codec_flags == CODEC_FOR {
+        if self.header.codec_flags == CODEC_FOR && self.header.slot_width == 8 {
             let start = mark.byte_offset as usize;
             let end = start + (mark.compressed_len as usize);
-            if end > self.mmap.len() || end <= start {
+            if end > self.data.len() || end <= start {
                 return Err(ExoError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "FoR granule offset exceeds memory map boundary",
+                    "FoR granule offset exceeds buffer boundary",
                 )));
             }
-            let granule_bytes = &self.mmap[start..end];
+            let granule_bytes = &self.data[start..end];
             let bit_width = granule_bytes[0];
             let packed_data = &granule_bytes[1..];
             ForCodec::decode_granule(packed_data, mark.min_vaddr, bit_width, num_values, out_buffer)
         } else {
-            let slice = self.scan_granule_slice(granule_idx)?;
-            out_buffer[..slice.len()].copy_from_slice(slice);
-            Ok(slice.len())
+            let start = mark.byte_offset as usize;
+            let byte_len = mark.uncompressed_len as usize;
+            let end = start + byte_len;
+            if end > self.data.len() {
+                return Err(ExoError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Granule offset exceeds buffer boundary",
+                )));
+            }
+            let raw_bytes = &self.data[start..end];
+            match self.header.slot_width {
+                1 => {
+                    for (i, &b) in raw_bytes[..num_values].iter().enumerate() {
+                        out_buffer[i] = b as u64;
+                    }
+                }
+                2 => {
+                    for (i, chunk) in raw_bytes.chunks_exact(2).take(num_values).enumerate() {
+                        out_buffer[i] = u16::from_le_bytes(chunk.try_into().unwrap_or([0; 2])) as u64;
+                    }
+                }
+                4 => {
+                    for (i, chunk) in raw_bytes.chunks_exact(4).take(num_values).enumerate() {
+                        out_buffer[i] = u32::from_le_bytes(chunk.try_into().unwrap_or([0; 4])) as u64;
+                    }
+                }
+                _ => {
+                    for (i, chunk) in raw_bytes.chunks_exact(8).take(num_values).enumerate() {
+                        out_buffer[i] = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+                    }
+                }
+            }
+            Ok(num_values)
         }
     }
 
-    /// Zero-copy borrowed slice directly into mmap memory for RAW uncompressed granules!
+    /// Zero-copy borrowed slice directly into memory for RAW uncompressed granules with 8-byte slots!
     fn scan_granule_slice(&self, granule_idx: usize) -> ExoResult<&[u64]> {
+        if self.header.slot_width != 8 {
+            return Err(ExoError::CodecError(format!(
+                "Cannot obtain &[u64] slice from column with slot_width = {}; use read_granule or read_vaddr instead",
+                self.header.slot_width
+            )));
+        }
+
         if self.header.codec_flags == CODEC_FOR {
             return Err(ExoError::CodecError(
                 "Cannot obtain zero-copy &[u64] slice from FoR bit-packed granule; use read_granule() instead".to_string(),
@@ -442,27 +589,27 @@ impl AddressReader for ExoAddressReader {
         let byte_len = mark.uncompressed_len as usize;
         let end = start + byte_len;
 
-        if end > self.mmap.len() {
+        if end > self.data.len() {
             return Err(ExoError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "Granule offset exceeds memory map boundary",
+                "Granule offset exceeds buffer boundary",
             )));
         }
 
-        let raw_bytes = &self.mmap[start..end];
+        let raw_bytes = &self.data[start..end];
         let num_u64s = byte_len / 8;
 
         // Verify 8-byte alignment for safe zero-copy slice casting
         let ptr = raw_bytes.as_ptr();
         if (ptr as usize) % std::mem::align_of::<u64>() != 0 {
             return Err(ExoError::CodecError(
-                "Mmap pointer is unaligned for u64 array".to_string(),
+                "Buffer pointer is unaligned for u64 array".to_string(),
             ));
         }
 
         // Safety:
         // 1. Pointer is aligned to 8 bytes.
-        // 2. Memory is valid for the lifetime of `self.mmap`.
+        // 2. Memory is valid for the lifetime of `self.data`.
         // 3. Size is exactly `num_u64s * 8`.
         let u64_slice = unsafe { std::slice::from_raw_parts(ptr as *const u64, num_u64s) };
         Ok(u64_slice)
@@ -488,9 +635,26 @@ impl AddressReader for ExoAddressReader {
         let gsize = self.granule_size();
         let g_idx = (row_idx as usize) / gsize;
         let offset = (row_idx as usize) % gsize;
+        let slot_w = self.header.slot_width as usize;
+
         if self.codec_flags() == CODEC_RAW {
-            let slice = self.scan_granule_slice(g_idx)?;
-            Ok(slice[offset])
+            let mark = &self.marks[g_idx];
+            let start = mark.byte_offset as usize + offset * slot_w;
+            let end = start + slot_w;
+            if end > self.data.len() {
+                return Err(ExoError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Slot offset exceeds buffer boundary",
+                )));
+            }
+            let bytes = &self.data[start..end];
+            let val = match self.header.slot_width {
+                1 => bytes[0] as u64,
+                2 => u16::from_le_bytes(bytes.try_into().unwrap_or([0; 2])) as u64,
+                4 => u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])) as u64,
+                _ => u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])),
+            };
+            Ok(val)
         } else {
             let mut buf = vec![0u64; gsize];
             let read = self.read_granule(g_idx, &mut buf)?;
@@ -678,6 +842,27 @@ mod tests {
                 assert_eq!(total_granules, 0);
             }
             res => panic!("Expected InvalidGranuleIndex error, got: {:?}", res),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_address_in_memory_roundtrip() -> ExoResult<()> {
+        const GRANULE_SIZE: usize = 256;
+        let test_vaddrs: Vec<u64> = (0..500).map(|i| i * 42).collect();
+
+        let mut writer = ExoAddressWriter::create_in_memory(GRANULE_SIZE, 8)?;
+        writer.append_batch(&test_vaddrs)?;
+        let (rows, bytes) = writer.finish_into_bytes()?;
+        assert_eq!(rows, 500);
+
+        let reader = ExoAddressReader::from_bytes(bytes)?;
+        assert_eq!(reader.total_rows(), 500);
+        assert_eq!(reader.total_granules(), 2);
+
+        for (i, &expected) in test_vaddrs.iter().enumerate() {
+            assert_eq!(reader.read_vaddr(i as u64)?, expected);
         }
 
         Ok(())
