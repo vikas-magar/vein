@@ -2,10 +2,10 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use common::identifiers::{PartitionId, TaskId};
-use common::protocol::{ExchangeFragment, ExchangeKey, ExchangeManifest};
-use common::transport::VcsExchangeClient;
 use common::Result;
+use common::identifiers::{PartitionId, TaskId};
+use common::protocol::{ExchangeFragment, ExchangeKey, ExchangeManifest, SpillRun};
+use common::transport::VcsExchangeClient;
 use error::VeinError;
 
 /// Synchronous metadata contract used by synchronous pipeline nodes.
@@ -28,6 +28,21 @@ pub trait ExchangeMetadata: Send + Sync {
         key: ExchangeKey,
         partition_id: PartitionId,
     ) -> Result<Vec<ExchangeFragment>>;
+
+    /// Registers one open join spill run.
+    fn register_spill(&self, spill: SpillRun) -> Result<()>;
+
+    /// Returns sealed spill runs for one task attempt.
+    fn get_spills(&self, key: ExchangeKey, task_id: TaskId, attempt: u32) -> Result<Vec<SpillRun>>;
+
+    /// Marks one spill run sealed.
+    fn seal_spill(&self, storage_path: String) -> Result<()>;
+
+    /// Marks one spill run aborted.
+    fn abort_spill(&self, storage_path: String) -> Result<()>;
+
+    /// Deletes one spill descriptor after physical cleanup.
+    fn delete_spill(&self, storage_path: String) -> Result<()>;
 }
 
 /// VCS-backed implementation for executor workers.
@@ -51,7 +66,9 @@ impl VcsExchangeMetadata {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|error| VeinError::internal(format!("build VCS metadata runtime: {error}")))?;
+                .map_err(|error| {
+                    VeinError::internal(format!("build VCS metadata runtime: {error}"))
+                })?;
             runtime.block_on(operation)
         })
         .join()
@@ -87,6 +104,31 @@ impl ExchangeMetadata for VcsExchangeMetadata {
     ) -> Result<Vec<ExchangeFragment>> {
         let client = self.client.clone();
         self.run_blocking(async move { client.get_partition(key, partition_id).await })
+    }
+
+    fn register_spill(&self, spill: SpillRun) -> Result<()> {
+        let client = self.client.clone();
+        self.run_blocking(async move { client.register_spill(spill).await })
+    }
+
+    fn get_spills(&self, key: ExchangeKey, task_id: TaskId, attempt: u32) -> Result<Vec<SpillRun>> {
+        let client = self.client.clone();
+        self.run_blocking(async move { client.get_spills(key, task_id, attempt).await })
+    }
+
+    fn seal_spill(&self, storage_path: String) -> Result<()> {
+        let client = self.client.clone();
+        self.run_blocking(async move { client.seal_spill(storage_path).await })
+    }
+
+    fn abort_spill(&self, storage_path: String) -> Result<()> {
+        let client = self.client.clone();
+        self.run_blocking(async move { client.abort_spill(storage_path).await })
+    }
+
+    fn delete_spill(&self, storage_path: String) -> Result<()> {
+        let client = self.client.clone();
+        self.run_blocking(async move { client.delete_spill(storage_path).await })
     }
 }
 

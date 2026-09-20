@@ -16,6 +16,7 @@ use std::time::Instant;
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use common::Result;
 use common::cancellation::CancellationToken;
+use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, ExecuteTask, MicroProgram, VeinControlEvent};
 use error::VeinError;
 
@@ -49,8 +50,13 @@ pub struct TaskResult {
 /// [`Source`], [`Transform`], and [`Sink`] implementations are selected here
 /// from the self-contained task description a worker receives.
 pub trait ExecutorBuilder: Send + Sync {
-    /// Build a source from the task's [`DataSource`].
-    fn build_source(&self, source: &DataSource) -> Result<Box<dyn Source<DataChunk>>>;
+    /// Build a source from the task's [`DataSource`] and attempt identity.
+    fn build_source(
+        &self,
+        source: &DataSource,
+        task_id: TaskId,
+        attempt: u32,
+    ) -> Result<Box<dyn Source<DataChunk>>>;
 
     /// Build a Vector VM transform interpreting the task's [`MicroProgram`].
     fn build_vm(
@@ -246,7 +252,9 @@ impl DefaultTaskExecutor {
             Box::new(CancelGuard::new(Box::new(SinkHandle(sink.clone())), cancel));
 
         let mut vm = self.builder.build_vm(&task.program, head)?;
-        let mut source: Box<dyn Source<DataChunk>> = self.builder.build_source(&task.source)?;
+        let mut source: Box<dyn Source<DataChunk>> =
+            self.builder
+                .build_source(&task.source, task.task_id, task.attempt)?;
         source.execute(&mut *vm).await?;
 
         let mut sink = sink

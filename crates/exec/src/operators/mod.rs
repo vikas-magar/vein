@@ -15,8 +15,10 @@ pub mod source;
 pub mod transform;
 
 pub use join::{
-    ArrowJoinKeyExtractor, HashJoinTable, JoinKey, JoinKeyBatch, JoinKeyExtractor, JoinKeyPart,
-    JoinKeyRow, JoinMatch, JoinPartitioner, JoinRowRef,
+    ArrowJoinKeyExtractor, DEFAULT_JOIN_MEMORY_LIMIT, HashJoinTable, JoinKey, JoinKeyBatch,
+    JoinKeyExtractor, JoinKeyPart, JoinKeyRow, JoinMatch, JoinMemoryBudget, JoinPartitioner,
+    JoinRowRef, JoinSpillIdentity, JoinSpillWriter, VfsJoinSpillWriter, new_attempt_spill_path,
+    new_spill_path,
 };
 pub use sink::{CollectSink, DiscardSink};
 pub use source::{MemorySource, ScanSource};

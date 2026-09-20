@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::identifiers::PartitionId;
-use crate::protocol::{ExchangeFragment, ExchangeKey, ExchangeManifest};
 use crate::identifiers::TaskId;
+use crate::protocol::{ExchangeFragment, ExchangeKey, ExchangeManifest, SpillRun};
 
 /// A request sent to the VCS exchange authority.
 #[derive(
@@ -51,6 +51,35 @@ pub enum VcsExchangeRequest {
         /// Exchange identity.
         key: ExchangeKey,
     },
+    /// Register or replace one join spill run.
+    RegisterSpill {
+        /// Durable spill descriptor.
+        spill: SpillRun,
+    },
+    /// Discover spill runs for one task attempt.
+    GetSpills {
+        /// Exchange identity.
+        key: ExchangeKey,
+        /// Owning task.
+        task_id: TaskId,
+        /// Retry attempt.
+        attempt: u32,
+    },
+    /// Mark one spill run as sealed.
+    SealSpill {
+        /// Spill run path.
+        storage_path: String,
+    },
+    /// Mark one spill run as aborted.
+    AbortSpill {
+        /// Spill run path.
+        storage_path: String,
+    },
+    /// Delete one spill descriptor after physical cleanup.
+    DeleteSpill {
+        /// Spill run path.
+        storage_path: String,
+    },
 }
 
 /// A response returned by the VCS exchange authority.
@@ -69,6 +98,11 @@ pub enum VcsExchangeResponse {
     Partition {
         /// Fragment descriptors.
         fragments: Vec<ExchangeFragment>,
+    },
+    /// Spill descriptors belonging to one task attempt.
+    Spills {
+        /// Durable spill descriptors.
+        spills: Vec<SpillRun>,
     },
     /// The request was rejected.
     Error {

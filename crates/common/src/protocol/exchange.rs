@@ -9,7 +9,15 @@ use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
 /// wire type independent from EXO lets value-native sources participate in the
 /// same exchange protocol without taking a dependency on the storage crate.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub struct ExchangeAddressColumn {
     /// Canonical address for every physical row in the Arrow payload.
@@ -23,7 +31,15 @@ pub struct ExchangeAddressColumn {
 /// The VFS layer frames this encoded value. The Arrow bytes remain opaque to the
 /// metadata/control plane, while address sidecars remain available to reducers.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub struct ExchangeBatch {
     /// One independently decodable Arrow IPC stream.
@@ -102,16 +118,19 @@ impl ExchangeBatch {
                         .map_err(|_| "exchange row count overflows usize".to_string())?;
                     let validity_len = usize::try_from(read_u64(bytes, &mut cursor)?)
                         .map_err(|_| "exchange validity length overflows usize".to_string())?;
-                    let address_bytes = row_count
-                        .checked_mul(8)
-                        .ok_or_else(|| "exchange address byte length overflows usize".to_string())?;
+                    let address_bytes = row_count.checked_mul(8).ok_or_else(|| {
+                        "exchange address byte length overflows usize".to_string()
+                    })?;
                     let address_bytes = read_bytes(bytes, &mut cursor, address_bytes)?;
                     let addresses = address_bytes
                         .chunks_exact(8)
                         .map(|value| u64::from_le_bytes(value.try_into().expect("8-byte chunk")))
                         .collect();
                     let validity = read_bytes(bytes, &mut cursor, validity_len)?.to_vec();
-                    address_columns.push(Some(ExchangeAddressColumn { addresses, validity }));
+                    address_columns.push(Some(ExchangeAddressColumn {
+                        addresses,
+                        validity,
+                    }));
                 }
                 marker => {
                     return Err(format!("invalid exchange address column marker {marker}"));
@@ -146,16 +165,28 @@ fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, String> {
 }
 
 fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, String> {
-    read_bytes(bytes, cursor, 4).map(|value| u32::from_le_bytes(value.try_into().expect("4-byte slice")))
+    read_bytes(bytes, cursor, 4)
+        .map(|value| u32::from_le_bytes(value.try_into().expect("4-byte slice")))
 }
 
 fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
-    read_bytes(bytes, cursor, 8).map(|value| u64::from_le_bytes(value.try_into().expect("8-byte slice")))
+    read_bytes(bytes, cursor, 8)
+        .map(|value| u64::from_le_bytes(value.try_into().expect("8-byte slice")))
 }
 
 /// Identity of one shuffle exchange.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub struct ExchangeKey {
     /// Query owning the exchange.
@@ -166,7 +197,16 @@ pub struct ExchangeKey {
 
 /// Lifecycle state of a shuffle exchange.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub enum ExchangeState {
     /// Producers may publish fragments.
@@ -179,7 +219,15 @@ pub enum ExchangeState {
 
 /// One immutable persisted shuffle fragment.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub struct ExchangeFragment {
     /// Exchange partition containing this fragment.
@@ -200,9 +248,76 @@ pub struct ExchangeFragment {
     pub checksum: u64,
 }
 
+/// Lifecycle state of one join spill run.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub enum SpillRunState {
+    /// The producer may still append frames.
+    Open,
+    /// The run is complete and may be consumed.
+    Sealed,
+    /// The run is no longer valid.
+    Aborted,
+}
+
+/// Durable descriptor for one join spill run.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub struct SpillRun {
+    /// Exchange that owns the join.
+    pub exchange_key: ExchangeKey,
+    /// Task attempt that produced the run.
+    pub task_id: TaskId,
+    /// Retry attempt number.
+    pub attempt: u32,
+    /// Reducer partition containing the run.
+    pub partition_id: u32,
+    /// Grace-hash subpartition of the run.
+    pub subpartition_id: u32,
+    /// VFS or object-store path containing the frames.
+    pub storage_path: String,
+    /// Bytes written to the run.
+    pub byte_len: u64,
+    /// Rows written to the run.
+    pub row_count: u64,
+    /// Rolling content checksum.
+    pub checksum: u64,
+    /// Current lifecycle state.
+    pub state: SpillRunState,
+    /// Lease expiration in Unix milliseconds.
+    pub lease_until_ms: u64,
+}
+
 /// Authoritative metadata for one exchange stage.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub struct ExchangeManifest {
     /// Exchange identity.

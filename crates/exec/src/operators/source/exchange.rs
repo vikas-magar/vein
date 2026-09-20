@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use common::Result;
 use common::arrow::AsyncIpcDecoder;
 use common::identifiers::PartitionId;
 use common::protocol::{ExchangeBatch, ExchangeFragment, ExchangeKey, FieldSchema};
-use common::Result;
 use error::VeinError;
 use exo::AddressBatch;
 
@@ -28,40 +28,20 @@ pub async fn read_exchange_batches(
     path: &str,
     expected_schema: &[FieldSchema],
 ) -> Result<(Vec<DecodedExchangeBatch>, u64)> {
-    let frames = store
-        .read_exchange_frames(path)
+    let mut reader = store
+        .open_exchange_frame_reader(path)
         .await
-        .map_err(|e| VeinError::internal(format!("failed to read exchange '{path}': {e}")))?;
+        .map_err(|e| VeinError::internal(format!("failed to open exchange '{path}': {e}")))?;
     let mut batches = Vec::new();
     let mut bytes_read = 0u64;
 
-    for frame in frames {
+    while let Some(frame) = reader
+        .next_frame()
+        .await
+        .map_err(|e| VeinError::internal(format!("failed to read exchange '{path}': {e}")))?
+    {
         bytes_read = bytes_read.saturating_add(frame.len() as u64);
-        let exchange = ExchangeBatch::decode(&frame)
-            .map_err(|error| VeinError::internal(format!("invalid exchange batch: {error}")))?;
-        let mut decoder = AsyncIpcDecoder::new();
-        let decoded = decoder.push_chunk(Bytes::from(exchange.arrow_ipc))?;
-        if decoded.len() != 1 {
-            return Err(VeinError::internal(format!(
-                "exchange frame contains {} Arrow batches, expected exactly one",
-                decoded.len()
-            )));
-        }
-        let batch = decoded
-            .into_iter()
-            .next()
-            .ok_or_else(|| VeinError::internal("exchange frame did not contain an Arrow batch"))?;
-        validate_schema(batch.schema().as_ref(), expected_schema, path)?;
-        let address_columns = decode_address_columns(
-            exchange.address_columns,
-            batch.num_columns(),
-            batch.num_rows(),
-            path,
-        )?;
-        batches.push(DecodedExchangeBatch {
-            record_batch: batch,
-            address_columns,
-        });
+        batches.push(decode_exchange_frame(&frame, expected_schema, path)?);
     }
     Ok((batches, bytes_read))
 }
@@ -81,6 +61,39 @@ pub async fn read_exchange_fragments(
         bytes_read = bytes_read.saturating_add(fragment_bytes);
     }
     Ok((batches, bytes_read))
+}
+
+/// Decodes exactly one bounded exchange payload.
+pub fn decode_exchange_frame(
+    frame: &[u8],
+    expected_schema: &[FieldSchema],
+    path: &str,
+) -> Result<DecodedExchangeBatch> {
+    let exchange = ExchangeBatch::decode(frame)
+        .map_err(|error| VeinError::internal(format!("invalid exchange batch: {error}")))?;
+    let mut decoder = AsyncIpcDecoder::new();
+    let decoded = decoder.push_chunk(Bytes::from(exchange.arrow_ipc))?;
+    if decoded.len() != 1 {
+        return Err(VeinError::internal(format!(
+            "exchange frame contains {} Arrow batches, expected exactly one",
+            decoded.len()
+        )));
+    }
+    let batch = decoded
+        .into_iter()
+        .next()
+        .ok_or_else(|| VeinError::internal("exchange frame did not contain an Arrow batch"))?;
+    validate_schema(batch.schema().as_ref(), expected_schema, path)?;
+    let address_columns = decode_address_columns(
+        exchange.address_columns,
+        batch.num_columns(),
+        batch.num_rows(),
+        path,
+    )?;
+    Ok(DecodedExchangeBatch {
+        record_batch: batch,
+        address_columns,
+    })
 }
 
 fn decode_address_columns(
@@ -133,7 +146,6 @@ pub struct VfsExchangeSource {
     exchange_key: Option<ExchangeKey>,
     partition_id: Option<PartitionId>,
     metadata: Option<SharedExchangeMetadata>,
-    batches: Option<Vec<DecodedExchangeBatch>>,
     bytes_read: u64,
 }
 
@@ -151,7 +163,6 @@ impl VfsExchangeSource {
             exchange_key: None,
             partition_id: None,
             metadata: None,
-            batches: None,
             bytes_read: 0,
         }
     }
@@ -173,24 +184,35 @@ impl VfsExchangeSource {
 #[async_trait::async_trait(?Send)]
 impl Source<DataChunk> for VfsExchangeSource {
     async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunk>) -> Result<()> {
-        let (batches, bytes_read) = match (&self.metadata, self.exchange_key, self.partition_id) {
-            (Some(metadata), Some(exchange_key), Some(partition_id)) => {
-                let fragments = metadata.get_partition(exchange_key, partition_id)?;
-                read_exchange_fragments(&self.store, &fragments, &self.schema).await?
-            }
-            _ => read_exchange_batches(&self.store, &self.path, &self.schema).await?,
+        let paths = match (&self.metadata, self.exchange_key, self.partition_id) {
+            (Some(metadata), Some(exchange_key), Some(partition_id)) => metadata
+                .get_partition(exchange_key, partition_id)?
+                .into_iter()
+                .map(|fragment| fragment.storage_path)
+                .collect::<Vec<_>>(),
+            _ => vec![self.path.clone()],
         };
-        self.bytes_read = bytes_read;
-        self.batches = Some(batches);
 
-        if let Some(batches) = self.batches.take() {
-            for batch in batches {
+        for path in paths {
+            let mut reader = self
+                .store
+                .open_exchange_frame_reader(&path)
+                .await
+                .map_err(|e| {
+                    VeinError::internal(format!("failed to open exchange '{path}': {e}"))
+                })?;
+            while let Some(frame) = reader.next_frame().await.map_err(|e| {
+                VeinError::internal(format!("failed to read exchange '{path}': {e}"))
+            })? {
+                self.bytes_read = self.bytes_read.saturating_add(frame.len() as u64);
+                let batch = decode_exchange_frame(&frame, &self.schema, &path)?;
                 next.push(DataChunk::from_vectors_with_addresses(
                     batch.record_batch.columns().to_vec(),
                     batch.address_columns,
                 )?)?;
             }
         }
+
         next.flush()?;
         Ok(())
     }

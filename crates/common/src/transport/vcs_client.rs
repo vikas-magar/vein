@@ -2,15 +2,16 @@
 
 use std::path::Path;
 
+use crate::Result;
 use crate::identifiers::{PartitionId, TaskId};
 use crate::protocol::{
-    ExchangeFragment, ExchangeKey, ExchangeManifest, VcsExchangeRequest, VcsExchangeResponse,
+    ExchangeFragment, ExchangeKey, ExchangeManifest, SpillRun, VcsExchangeRequest,
+    VcsExchangeResponse,
 };
 use crate::transport::{
-    build_quic_client, extract_control_payload, frame_control_message, ConnectionManager,
-    QuicClient,
+    ConnectionManager, QuicClient, build_quic_client, extract_control_payload,
+    frame_control_message,
 };
-use crate::Result;
 use error::VeinError;
 
 /// A pooled QUIC client for exchange metadata operations.
@@ -22,10 +23,7 @@ pub struct VcsExchangeClient {
 
 impl VcsExchangeClient {
     /// Connects to a VCS endpoint using the supplied CA certificate.
-    pub fn connect(
-        target: impl Into<String>,
-        ca_cert_path: impl AsRef<Path>,
-    ) -> Result<Self> {
+    pub fn connect(target: impl Into<String>, ca_cert_path: impl AsRef<Path>) -> Result<Self> {
         let quic = build_quic_client(ca_cert_path)?;
         Ok(Self {
             target: target.into(),
@@ -87,7 +85,10 @@ impl VcsExchangeClient {
 
     /// Reads a sealed exchange manifest.
     pub async fn get_manifest(&self, key: ExchangeKey) -> Result<ExchangeManifest> {
-        response_manifest(self.request(VcsExchangeRequest::GetManifest { key }).await?)
+        response_manifest(
+            self.request(VcsExchangeRequest::GetManifest { key })
+                .await?,
+        )
     }
 
     /// Reads the fragments assigned to one reducer partition.
@@ -105,12 +106,73 @@ impl VcsExchangeClient {
         }
     }
 
-    /// Deletes exchange metadata after retention cleanup.
-    pub async fn delete_exchange(&self, key: ExchangeKey) -> Result<()> {
+    /// Registers one open join spill run.
+    pub async fn register_spill(&self, spill: SpillRun) -> Result<()> {
         match self
-            .request(VcsExchangeRequest::Delete { key })
+            .request(VcsExchangeRequest::RegisterSpill { spill })
             .await?
         {
+            VcsExchangeResponse::Ack => Ok(()),
+            other => Err(unexpected_response("register spill", other)),
+        }
+    }
+
+    /// Discovers sealed spill runs for one task attempt.
+    pub async fn get_spills(
+        &self,
+        key: ExchangeKey,
+        task_id: TaskId,
+        attempt: u32,
+    ) -> Result<Vec<SpillRun>> {
+        match self
+            .request(VcsExchangeRequest::GetSpills {
+                key,
+                task_id,
+                attempt,
+            })
+            .await?
+        {
+            VcsExchangeResponse::Spills { spills } => Ok(spills),
+            other => Err(unexpected_response("spill discovery", other)),
+        }
+    }
+
+    /// Marks one spill run sealed.
+    pub async fn seal_spill(&self, storage_path: String) -> Result<()> {
+        match self
+            .request(VcsExchangeRequest::SealSpill { storage_path })
+            .await?
+        {
+            VcsExchangeResponse::Ack => Ok(()),
+            other => Err(unexpected_response("seal spill", other)),
+        }
+    }
+
+    /// Marks one spill run aborted.
+    pub async fn abort_spill(&self, storage_path: String) -> Result<()> {
+        match self
+            .request(VcsExchangeRequest::AbortSpill { storage_path })
+            .await?
+        {
+            VcsExchangeResponse::Ack => Ok(()),
+            other => Err(unexpected_response("abort spill", other)),
+        }
+    }
+
+    /// Deletes one spill descriptor after physical cleanup.
+    pub async fn delete_spill(&self, storage_path: String) -> Result<()> {
+        match self
+            .request(VcsExchangeRequest::DeleteSpill { storage_path })
+            .await?
+        {
+            VcsExchangeResponse::Ack => Ok(()),
+            other => Err(unexpected_response("delete spill", other)),
+        }
+    }
+
+    /// Deletes exchange metadata after retention cleanup.
+    pub async fn delete_exchange(&self, key: ExchangeKey) -> Result<()> {
+        match self.request(VcsExchangeRequest::Delete { key }).await? {
             VcsExchangeResponse::Ack => Ok(()),
             other => Err(unexpected_response("delete", other)),
         }

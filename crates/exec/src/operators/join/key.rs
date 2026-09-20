@@ -4,16 +4,15 @@
 //! directly. Arrow-backed sources use this module as their value-native path.
 
 use arrow::array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray,
-    TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Array, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use common::Result;
 use error::VeinError;
 use exo::{
-    canonical_from_f32_native, canonical_from_f64, canonical_from_i16_native,
-    canonical_from_i32, canonical_from_i32_native, canonical_from_i64, canonical_from_i8_native,
-    AddressBatch,
+    AddressBatch, canonical_from_f32_native, canonical_from_f64, canonical_from_i8_native,
+    canonical_from_i16_native, canonical_from_i32, canonical_from_i32_native, canonical_from_i64,
 };
 use std::hash::{Hash, Hasher};
 
@@ -33,6 +32,18 @@ pub enum JoinKeyPart {
         /// Original variable-width value used for exact verification.
         value: Vec<u8>,
     },
+}
+
+/// Estimates heap memory retained by one join-key component.
+impl JoinKeyPart {
+    fn estimated_heap_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Canonical(_) => 0,
+                Self::Bytes(value) => value.len(),
+                Self::CanonicalWithVerification { value, .. } => value.len(),
+            }
+    }
 }
 
 /// A composite key supporting one or more join columns.
@@ -56,6 +67,16 @@ impl JoinKey {
                 JoinKeyPart::Canonical(_) | JoinKeyPart::CanonicalWithVerification { .. }
             )
         })
+    }
+
+    /// Estimates heap bytes retained by this key in the build hash table.
+    pub(crate) fn estimated_heap_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .parts
+                .iter()
+                .map(JoinKeyPart::estimated_heap_size)
+                .sum::<usize>()
     }
 
     /// Computes a stable hash shared by local hash tables and shuffle routing.
@@ -134,12 +155,8 @@ impl JoinKeyBatch {
         Ok(Self::new(rows))
     }
 
-
     /// Builds composite canonical keys from per-column EXO address sidecars.
-    pub fn from_address_batches(
-        batches: &[&AddressBatch],
-        row_indices: &[u32],
-    ) -> Result<Self> {
+    pub fn from_address_batches(batches: &[&AddressBatch], row_indices: &[u32]) -> Result<Self> {
         if batches.is_empty() {
             return Err(VeinError::internal(
                 "address-native join requires at least one key column",
@@ -236,10 +253,11 @@ pub fn try_extract_address_keys(
                 is_null = true;
                 break;
             }
-            let part = match exact_variable_bytes(chunk.vectors[column].as_ref(), row_index as usize) {
-                Some(value) => JoinKeyPart::CanonicalWithVerification { address, value },
-                None => JoinKeyPart::Canonical(address),
-            };
+            let part =
+                match exact_variable_bytes(chunk.vectors[column].as_ref(), row_index as usize) {
+                    Some(value) => JoinKeyPart::CanonicalWithVerification { address, value },
+                    None => JoinKeyPart::Canonical(address),
+                };
             parts.push(part);
         }
         let key = (!is_null).then(|| JoinKey::new(parts));
@@ -282,10 +300,9 @@ impl JoinKeyExtractor for ArrowJoinKeyExtractor {
         let arrays: Vec<_> = key_columns
             .iter()
             .map(|&column| {
-                chunk
-                    .vectors
-                    .get(column)
-                    .ok_or_else(|| VeinError::internal(format!("join key column {column} is out of bounds")))
+                chunk.vectors.get(column).ok_or_else(|| {
+                    VeinError::internal(format!("join key column {column} is out of bounds"))
+                })
             })
             .collect::<Result<_>>()?;
 
@@ -324,19 +341,19 @@ fn extract_part(array: &dyn Array, row: usize) -> Result<Option<JoinKeyPart>> {
     }
 
     if let Some(values) = array.as_any().downcast_ref::<Int8Array>() {
-        return Ok(Some(JoinKeyPart::Canonical(canonical_from_i8_native(
-            values.value(row),
-        ) as u64)));
+        return Ok(Some(JoinKeyPart::Canonical(
+            canonical_from_i8_native(values.value(row)) as u64,
+        )));
     }
     if let Some(values) = array.as_any().downcast_ref::<Int16Array>() {
-        return Ok(Some(JoinKeyPart::Canonical(canonical_from_i16_native(
-            values.value(row),
-        ) as u64)));
+        return Ok(Some(JoinKeyPart::Canonical(
+            canonical_from_i16_native(values.value(row)) as u64,
+        )));
     }
     if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
-        return Ok(Some(JoinKeyPart::Canonical(canonical_from_i32_native(
-            values.value(row),
-        ) as u64)));
+        return Ok(Some(JoinKeyPart::Canonical(
+            canonical_from_i32_native(values.value(row)) as u64,
+        )));
     }
     if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
         return Ok(Some(JoinKeyPart::Canonical(canonical_from_i64(
@@ -356,9 +373,9 @@ fn extract_part(array: &dyn Array, row: usize) -> Result<Option<JoinKeyPart>> {
         return Ok(Some(JoinKeyPart::Canonical(values.value(row))));
     }
     if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
-        return Ok(Some(JoinKeyPart::Canonical(canonical_from_f32_native(
-            values.value(row),
-        ) as u64)));
+        return Ok(Some(JoinKeyPart::Canonical(
+            canonical_from_f32_native(values.value(row)) as u64,
+        )));
     }
     if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
         return Ok(Some(JoinKeyPart::Canonical(canonical_from_f64(
@@ -373,19 +390,20 @@ fn extract_part(array: &dyn Array, row: usize) -> Result<Option<JoinKeyPart>> {
             values.value(row),
         ))));
     }
-    if let Some(values) = array
-        .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()
-    {
+    if let Some(values) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
         return Ok(Some(JoinKeyPart::Canonical(canonical_from_i64(
             values.value(row),
         ))));
     }
     if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(Some(JoinKeyPart::Bytes(values.value(row).as_bytes().to_vec())));
+        return Ok(Some(JoinKeyPart::Bytes(
+            values.value(row).as_bytes().to_vec(),
+        )));
     }
     if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return Ok(Some(JoinKeyPart::Bytes(values.value(row).as_bytes().to_vec())));
+        return Ok(Some(JoinKeyPart::Bytes(
+            values.value(row).as_bytes().to_vec(),
+        )));
     }
     if let Some(values) = array.as_any().downcast_ref::<BinaryArray>() {
         return Ok(Some(JoinKeyPart::Bytes(values.value(row).to_vec())));
@@ -432,19 +450,17 @@ mod tests {
     #[test]
     fn preserves_selected_physical_rows_and_null_keys() {
         let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(10), None, Some(30)]));
-        let chunk = DataChunk::new(
-            vec![values],
-            SelectionVector::new_sparse(vec![2, 1]),
-        );
+        let chunk = DataChunk::new(vec![values], SelectionVector::new_sparse(vec![2, 1]));
 
         let batch = ArrowJoinKeyExtractor
             .extract(&chunk, &[0])
             .expect("key extraction succeeds");
 
         assert_eq!(batch.rows()[0].row_index, 2);
-        assert_eq!(batch.rows()[0].key.as_ref().unwrap().parts, vec![
-            JoinKeyPart::Canonical(exo::canonical_from_i64(30)),
-        ]);
+        assert_eq!(
+            batch.rows()[0].key.as_ref().unwrap().parts,
+            vec![JoinKeyPart::Canonical(exo::canonical_from_i64(30)),]
+        );
         assert!(batch.rows()[1].key.is_none());
         assert_eq!(batch.matching_rows().count(), 1);
     }

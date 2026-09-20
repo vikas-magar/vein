@@ -1,32 +1,38 @@
 //! Partition-local hash join source over VFS exchange partitions.
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::UInt32Array;
 use arrow::compute::take;
+use common::Result;
+use common::arrow::IpcStreamEncoder;
 use common::identifiers::PartitionId;
+use common::protocol::{ExchangeAddressColumn, ExchangeBatch, SpillRun, SpillRunState};
 use common::protocol::{
     ExchangeInput, FieldSchema, JoinKeyMode, JoinKeySpec, JoinSource as ProtocolJoinSource,
     PhysicalJoinType,
 };
-use common::Result;
 use error::VeinError;
 use exo::AddressBatch;
 
-use crate::operators::join::{
-    try_extract_address_keys, ArrowJoinKeyExtractor, HashJoinTable, JoinKeyBatch, JoinKeyExtractor,
-};
 use crate::exchange::SharedExchangeMetadata;
-use crate::operators::source::exchange::{
-    read_exchange_batches, read_exchange_fragments, DecodedExchangeBatch,
+use crate::operators::join::{
+    ArrowJoinKeyExtractor, HashJoinTable, JoinKeyBatch, JoinKeyExtractor, JoinKeyRow,
+    JoinSpillIdentity, JoinSpillWriter, VfsJoinSpillWriter, new_attempt_spill_path, new_spill_path,
+    try_extract_address_keys,
 };
+use crate::operators::source::exchange::{DecodedExchangeBatch, decode_exchange_frame};
 use crate::pipeline::{DataChunk, PipelineNode, Source};
+
+const SPILL_PARTITION_COUNT: usize = 32;
 
 /// Executes one partition-local physical join.
 pub struct HashJoinSource {
     source: ProtocolJoinSource,
     store: Arc<vfs::VfsTableStore>,
     metadata: Option<SharedExchangeMetadata>,
+    spill_identity: Option<JoinSpillIdentity>,
     bytes_read: u64,
 }
 
@@ -37,6 +43,7 @@ impl HashJoinSource {
             source,
             store,
             metadata: None,
+            spill_identity: None,
             bytes_read: 0,
         }
     }
@@ -51,20 +58,29 @@ impl HashJoinSource {
             source,
             store,
             metadata: Some(metadata),
+            spill_identity: None,
             bytes_read: 0,
         }
     }
 
-    async fn read_input(
-        &self,
-        input: &ExchangeInput,
-        schema: &[FieldSchema],
-    ) -> Result<(Vec<DecodedExchangeBatch>, u64)> {
+    /// Associates the source with its executor task attempt for spill ownership.
+    pub fn with_spill_identity(mut self, identity: JoinSpillIdentity) -> Self {
+        self.spill_identity = Some(identity);
+        self
+    }
+
+    fn input_paths(&self, input: &ExchangeInput) -> Result<Vec<String>> {
         if let Some(metadata) = &self.metadata {
-            let fragments = metadata.get_partition(input.exchange_key, PartitionId::from_raw(input.partition_id as u16))?;
-            return read_exchange_fragments(&self.store, &fragments, schema).await;
+            return Ok(metadata
+                .get_partition(
+                    input.exchange_key,
+                    PartitionId::from_raw(input.partition_id as u16),
+                )?
+                .into_iter()
+                .map(|fragment| fragment.storage_path)
+                .collect());
         }
-        read_exchange_batches(&self.store, &Self::partition_path(input), schema).await
+        Ok(vec![Self::partition_path(input)])
     }
 
     fn partition_path(input: &ExchangeInput) -> String {
@@ -76,7 +92,9 @@ impl HashJoinSource {
             .map(|key| {
                 schema
                     .iter()
-                    .position(|field| field.field_id == key.field_id || field.name == key.column_name)
+                    .position(|field| {
+                        field.field_id == key.field_id || field.name == key.column_name
+                    })
                     .ok_or_else(|| {
                         VeinError::internal(format!(
                             "join key '{}' is absent from exchange schema",
@@ -141,9 +159,162 @@ impl HashJoinSource {
                 }
                 AddressBatch::from_nullable(addresses, &validity)
                     .map(Some)
-                    .map_err(|error| VeinError::internal(format!("join address sidecar failed: {error}")))
+                    .map_err(|error| {
+                        VeinError::internal(format!("join address sidecar failed: {error}"))
+                    })
             })
             .collect()
+    }
+
+    fn encode_selected_spill_frame(batch: &DecodedExchangeBatch, rows: &[u32]) -> Result<Vec<u8>> {
+        let indices = UInt32Array::from(rows.to_vec());
+        let columns = batch
+            .record_batch
+            .columns()
+            .iter()
+            .map(|column| {
+                take(column.as_ref(), &indices, None).map_err(|error| {
+                    VeinError::internal(format!("join spill materialization failed: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let selected =
+            arrow::record_batch::RecordBatch::try_new(batch.record_batch.schema(), columns)
+                .map_err(|error| {
+                    VeinError::internal(format!("join spill batch failed: {error}"))
+                })?;
+        let mut encoder = IpcStreamEncoder::new();
+        encoder.write_batch(&selected)?;
+        let address_columns = Self::materialize_addresses(&batch.address_columns, rows)?
+            .into_iter()
+            .map(|column| {
+                column.map(|column| {
+                    let (addresses, validity) = column.into_parts();
+                    ExchangeAddressColumn {
+                        addresses,
+                        validity,
+                    }
+                })
+            })
+            .collect();
+        ExchangeBatch {
+            arrow_ipc: encoder.finish()?,
+            address_columns,
+        }
+        .encode()
+        .map_err(|error| VeinError::internal(format!("join spill encoding failed: {error}")))
+    }
+
+    fn spill_build_batch(
+        writer: &dyn JoinSpillWriter,
+        prefix: &str,
+        partition_id: u32,
+        identity: Option<JoinSpillIdentity>,
+        batch: &DecodedExchangeBatch,
+        keys: &JoinKeyBatch,
+        paths: &mut [Option<String>],
+        stats: &mut HashMap<String, (u64, u64, u64)>,
+    ) -> Result<()> {
+        let mut rows = (0..SPILL_PARTITION_COUNT)
+            .map(|_| Vec::<u32>::new())
+            .collect::<Vec<_>>();
+        for row in keys.matching_rows() {
+            rows[(row.hash as usize) % SPILL_PARTITION_COUNT].push(row.row_index);
+        }
+
+        for (subpartition, row_indices) in rows.iter().enumerate() {
+            if row_indices.is_empty() {
+                continue;
+            }
+            let path = paths[subpartition].get_or_insert_with(|| match identity {
+                Some(identity) => new_attempt_spill_path(
+                    &format!("{prefix}/subpartition_{subpartition:03}"),
+                    partition_id,
+                    identity,
+                ),
+                None => new_spill_path(
+                    &format!("{prefix}/subpartition_{subpartition:03}"),
+                    partition_id,
+                ),
+            });
+            let frame = Self::encode_selected_spill_frame(batch, row_indices)?;
+            writer.append_frame(path, &frame)?;
+            let entry = stats.entry(path.clone()).or_default();
+            entry.0 = entry.0.saturating_add(frame.len() as u64);
+            entry.1 = entry.1.saturating_add(row_indices.len() as u64);
+            entry.2 = entry.2.rotate_left(5) ^ Self::spill_checksum(&frame);
+        }
+        Ok(())
+    }
+
+    fn spill_checksum(frame: &[u8]) -> u64 {
+        frame.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ *byte as u64).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    fn publish_spills(
+        &self,
+        paths: &[Option<String>],
+        stats: &HashMap<String, (u64, u64, u64)>,
+    ) -> Result<()> {
+        let (Some(metadata), Some(identity)) = (&self.metadata, self.spill_identity) else {
+            return Ok(());
+        };
+        let lease_until_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| VeinError::internal(format!("spill lease clock failed: {error}")))?
+            .as_millis()
+            .saturating_add(3_600_000) as u64;
+
+        for (subpartition_id, path) in paths.iter().enumerate() {
+            let Some(path) = path else {
+                continue;
+            };
+            let (byte_len, row_count, checksum) = stats
+                .get(path)
+                .copied()
+                .ok_or_else(|| VeinError::internal("join spill statistics are missing"))?;
+            let spill = SpillRun {
+                exchange_key: self.source.left.exchange_key,
+                task_id: identity.task_id,
+                attempt: identity.attempt,
+                partition_id: self.source.left.partition_id,
+                subpartition_id: subpartition_id as u32,
+                storage_path: path.clone(),
+                byte_len,
+                row_count,
+                checksum,
+                state: SpillRunState::Open,
+                lease_until_ms,
+            };
+            metadata.register_spill(spill)?;
+            if let Err(error) = metadata.seal_spill(path.clone()) {
+                let _ = metadata.abort_spill(path.clone());
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn discover_spills(&self, fallback: &[Option<String>]) -> Result<Vec<Option<String>>> {
+        let (Some(metadata), Some(identity)) = (&self.metadata, self.spill_identity) else {
+            return Ok(fallback.to_vec());
+        };
+        let spills = metadata.get_spills(
+            self.source.left.exchange_key,
+            identity.task_id,
+            identity.attempt,
+        )?;
+        let mut discovered = vec![None; SPILL_PARTITION_COUNT];
+        for spill in spills {
+            if spill.partition_id == self.source.left.partition_id
+                && (spill.subpartition_id as usize) < discovered.len()
+            {
+                discovered[spill.subpartition_id as usize] = Some(spill.storage_path);
+            }
+        }
+        Ok(discovered)
     }
 
     fn materialize_output(
@@ -154,30 +325,60 @@ impl HashJoinSource {
     ) -> Result<DataChunk> {
         let left_indices = UInt32Array::from(left_rows.to_vec());
         let right_indices = UInt32Array::from(right_rows.to_vec());
-        let mut vectors = Vec::with_capacity(
-            left.record_batch.num_columns() + right.record_batch.num_columns(),
-        );
+        let mut vectors =
+            Vec::with_capacity(left.record_batch.num_columns() + right.record_batch.num_columns());
 
         for column in left.record_batch.columns() {
-            vectors.push(
-                take(column.as_ref(), &left_indices, None)
-                    .map_err(|e| VeinError::internal(format!("join left materialization failed: {e}")))?,
-            );
+            vectors.push(take(column.as_ref(), &left_indices, None).map_err(|e| {
+                VeinError::internal(format!("join left materialization failed: {e}"))
+            })?);
         }
         for column in right.record_batch.columns() {
-            vectors.push(
-                take(column.as_ref(), &right_indices, None)
-                    .map_err(|e| VeinError::internal(format!("join right materialization failed: {e}")))?,
-            );
+            vectors.push(take(column.as_ref(), &right_indices, None).map_err(|e| {
+                VeinError::internal(format!("join right materialization failed: {e}"))
+            })?);
         }
 
-        let mut address_columns =
-            Self::materialize_addresses(&left.address_columns, left_rows)?;
+        let mut address_columns = Self::materialize_addresses(&left.address_columns, left_rows)?;
         address_columns.extend(Self::materialize_addresses(
             &right.address_columns,
             right_rows,
         )?);
         DataChunk::from_vectors_with_addresses(vectors, address_columns)
+    }
+
+    fn emit_matches(
+        next: &mut dyn PipelineNode<DataChunk>,
+        left_batches: &[DecodedExchangeBatch],
+        right_batch: &DecodedExchangeBatch,
+        matches: Vec<crate::operators::join::JoinMatch>,
+    ) -> Result<()> {
+        let mut grouped: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+        for item in matches {
+            grouped
+                .entry(item.build_row.batch_id)
+                .or_default()
+                .push((item.build_row.row_index, item.probe_row.row_index));
+        }
+
+        for (left_batch_id, pairs) in grouped {
+            let left_batch = left_batches
+                .get(left_batch_id as usize)
+                .ok_or_else(|| VeinError::internal("join build batch reference is invalid"))?;
+            let mut left_rows = Vec::with_capacity(pairs.len());
+            let mut right_rows = Vec::with_capacity(pairs.len());
+            for (left_row, right_row) in pairs {
+                left_rows.push(left_row);
+                right_rows.push(right_row);
+            }
+            next.push(Self::materialize_output(
+                left_batch,
+                right_batch,
+                &left_rows,
+                &right_rows,
+            )?)?;
+        }
+        Ok(())
     }
 }
 
@@ -192,9 +393,7 @@ impl Source<DataChunk> for HashJoinSource {
         if self.source.left.partition_count != self.source.right.partition_count
             || self.source.left.partition_id != self.source.right.partition_id
         {
-            return Err(VeinError::internal(
-                "join inputs are not partition aligned",
-            ));
+            return Err(VeinError::internal("join inputs are not partition aligned"));
         }
         if !self.source.is_equi_join() {
             return Err(VeinError::internal(
@@ -202,58 +401,163 @@ impl Source<DataChunk> for HashJoinSource {
             ));
         }
 
-        let (left_batches, left_bytes) = self
-            .read_input(&self.source.left, &self.source.left_schema)
-            .await?;
-        let (right_batches, right_bytes) = self
-            .read_input(&self.source.right, &self.source.right_schema)
-            .await?;
-        self.bytes_read = left_bytes.saturating_add(right_bytes);
-
         let left_columns = Self::key_columns(&self.source.left_schema, &self.source.left_keys)?;
         let right_columns = Self::key_columns(&self.source.right_schema, &self.source.right_keys)?;
 
+        // Build state is retained for the current partition; the probe side is
+        // decoded and processed one exchange frame at a time.
+        let mut left_batches = Vec::new();
         let mut table = HashJoinTable::new();
-        for (batch_id, batch) in left_batches.iter().enumerate() {
-            let chunk = Self::chunk_for_batch(batch)?;
-            let keys = Self::extract_keys(&chunk, &left_columns, &self.source.left_keys)?;
-            table.insert_batch(batch_id as u32, &keys)?;
+        let spill_writer = VfsJoinSpillWriter::new(self.store.clone());
+        let mut spill_paths = vec![None; SPILL_PARTITION_COUNT];
+        let mut spill_stats = HashMap::new();
+        let left_paths = self.input_paths(&self.source.left)?;
+        for path in left_paths {
+            let mut reader = self
+                .store
+                .open_exchange_frame_reader(&path)
+                .await
+                .map_err(|e| {
+                    VeinError::internal(format!("failed to open exchange '{path}': {e}"))
+                })?;
+            while let Some(frame) = reader.next_frame().await.map_err(|e| {
+                VeinError::internal(format!("failed to read exchange '{path}': {e}"))
+            })? {
+                self.bytes_read = self.bytes_read.saturating_add(frame.len() as u64);
+                let batch = decode_exchange_frame(&frame, &self.source.left_schema, &path)?;
+                let chunk = Self::chunk_for_batch(&batch)?;
+                let batch_id = left_batches.len() as u32;
+                let keys = Self::extract_keys(&chunk, &left_columns, &self.source.left_keys)?;
+                match table.insert_batch(batch_id, &keys) {
+                    Ok(()) => left_batches.push(batch),
+                    Err(error @ VeinError::ResourceExhausted { .. }) => {
+                        Self::spill_build_batch(
+                            &spill_writer,
+                            &self.source.left.path_prefix,
+                            self.source.left.partition_id,
+                            self.spill_identity,
+                            &batch,
+                            &keys,
+                            &mut spill_paths,
+                            &mut spill_stats,
+                        )?;
+                        tracing::debug!(
+                            error = %error,
+                            "spilled join build frame into hash subpartitions"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
 
-        for (probe_id, right_batch) in right_batches.iter().enumerate() {
-            let probe_chunk = Self::chunk_for_batch(right_batch)?;
-            let probe_keys =
-                Self::extract_keys(&probe_chunk, &right_columns, &self.source.right_keys)?;
-            let matches = table.probe_batch(probe_id as u32, &probe_keys);
+        self.publish_spills(&spill_paths, &spill_stats)?;
 
-            let mut grouped: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
-            for item in matches {
-                grouped
-                    .entry(item.build_row.batch_id)
-                    .or_default()
-                    .push((item.build_row.row_index, item.probe_row.row_index));
-            }
+        let active_spill_paths = self.discover_spills(&spill_paths)?;
+        let mut probe_id = 0u32;
+        let right_paths = self.input_paths(&self.source.right)?;
+        for path in right_paths {
+            let mut reader = self
+                .store
+                .open_exchange_frame_reader(&path)
+                .await
+                .map_err(|e| {
+                    VeinError::internal(format!("failed to open exchange '{path}': {e}"))
+                })?;
+            while let Some(frame) = reader.next_frame().await.map_err(|e| {
+                VeinError::internal(format!("failed to read exchange '{path}': {e}"))
+            })? {
+                self.bytes_read = self.bytes_read.saturating_add(frame.len() as u64);
+                let right_batch = decode_exchange_frame(&frame, &self.source.right_schema, &path)?;
+                let probe_chunk = Self::chunk_for_batch(&right_batch)?;
+                let probe_keys =
+                    Self::extract_keys(&probe_chunk, &right_columns, &self.source.right_keys)?;
+                let current_probe_id = probe_id;
+                probe_id = probe_id.saturating_add(1);
+                let matches = table.probe_batch(current_probe_id, &probe_keys);
+                Self::emit_matches(next, &left_batches, &right_batch, matches)?;
 
-            for (left_batch_id, pairs) in grouped {
-                let left_batch = left_batches
-                    .get(left_batch_id as usize)
-                    .ok_or_else(|| VeinError::internal("join build batch reference is invalid"))?;
-                let mut left_rows = Vec::with_capacity(pairs.len());
-                let mut right_rows = Vec::with_capacity(pairs.len());
-                for (left_row, right_row) in pairs {
-                    left_rows.push(left_row);
-                    right_rows.push(right_row);
+                let mut probe_partitions = (0..SPILL_PARTITION_COUNT)
+                    .map(|_| Vec::<JoinKeyRow>::new())
+                    .collect::<Vec<_>>();
+                for row in probe_keys.rows() {
+                    if row.key.is_some() {
+                        probe_partitions[(row.hash as usize) % SPILL_PARTITION_COUNT]
+                            .push(row.clone());
+                    }
                 }
-                next.push(Self::materialize_output(
-                    left_batch,
-                    right_batch,
-                    &left_rows,
-                    &right_rows,
-                )?)?;
+
+                for (subpartition, rows) in probe_partitions.into_iter().enumerate() {
+                    let Some(spill_path) = active_spill_paths[subpartition].as_ref() else {
+                        continue;
+                    };
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    let probe_partition = JoinKeyBatch::new(rows);
+                    let mut spill_reader = self
+                        .store
+                        .open_exchange_frame_reader(spill_path)
+                        .await
+                        .map_err(|e| {
+                            VeinError::internal(format!(
+                                "failed to open join spill '{spill_path}': {e}"
+                            ))
+                        })?;
+                    while let Some(spill_frame) = spill_reader.next_frame().await.map_err(|e| {
+                        VeinError::internal(format!(
+                            "failed to read join spill '{spill_path}': {e}"
+                        ))
+                    })? {
+                        let spilled_batch = decode_exchange_frame(
+                            &spill_frame,
+                            &self.source.left_schema,
+                            spill_path,
+                        )?;
+                        let spilled_chunk = Self::chunk_for_batch(&spilled_batch)?;
+                        let spilled_keys = Self::extract_keys(
+                            &spilled_chunk,
+                            &left_columns,
+                            &self.source.left_keys,
+                        )?;
+                        let mut spilled_table = HashJoinTable::new();
+                        spilled_table.insert_batch(0, &spilled_keys)?;
+                        let spilled_matches =
+                            spilled_table.probe_batch(current_probe_id, &probe_partition);
+                        Self::emit_matches(
+                            next,
+                            std::slice::from_ref(&spilled_batch),
+                            &right_batch,
+                            spilled_matches,
+                        )?;
+                    }
+                }
             }
         }
 
         next.flush()?;
+        for spill_path in spill_paths.into_iter().flatten() {
+            match spill_writer.delete_run(&spill_path) {
+                Ok(()) => {
+                    if let Some(metadata) = &self.metadata {
+                        if let Err(error) = metadata.delete_spill(spill_path.clone()) {
+                            tracing::warn!(
+                                path = %spill_path,
+                                error = %error,
+                                "join spill metadata cleanup deferred for garbage collection"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %spill_path,
+                        error = %error,
+                        "join spill cleanup deferred for garbage collection"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

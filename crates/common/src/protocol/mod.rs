@@ -15,7 +15,7 @@ pub mod vcs_exchange;
 // Re-export Micro-IR definitions
 pub use exchange::{
     ExchangeAddressColumn, ExchangeBatch, ExchangeFragment, ExchangeKey, ExchangeManifest,
-    ExchangeState,
+    ExchangeState, SpillRun, SpillRunState,
 };
 pub use ir::constant::ScalarConstant;
 pub use ir::op::MicroOp;

@@ -4,12 +4,12 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use iceberg::io::FileIO;
 use common::identifiers::{NodeId, QueryId, StageId, TaskId};
 use common::protocol::{
-    ExchangeFragment, ExchangeKey, ExchangeManifest, ExchangeState,
+    ExchangeFragment, ExchangeKey, ExchangeManifest, ExchangeState, SpillRun, SpillRunState,
 };
 use error::{Result, VeinError};
+use iceberg::io::FileIO;
 
 /// VCS contract for exchange lifecycle and fragment discovery.
 #[async_trait]
@@ -41,6 +41,26 @@ pub trait ExchangeCatalog: Send + Sync {
 
     /// Removes exchange metadata after retention and query cleanup.
     async fn delete_exchange(&self, key: ExchangeKey) -> Result<()>;
+
+    /// Registers or replaces one join spill run.
+    async fn register_spill(&self, spill: SpillRun) -> Result<()>;
+
+    /// Discovers spill runs belonging to one task attempt.
+    async fn get_spills(
+        &self,
+        key: ExchangeKey,
+        task_id: TaskId,
+        attempt: u32,
+    ) -> Result<Vec<SpillRun>>;
+
+    /// Transitions one spill run to sealed.
+    async fn seal_spill(&self, storage_path: &str) -> Result<()>;
+
+    /// Transitions one spill run to aborted.
+    async fn abort_spill(&self, storage_path: &str) -> Result<()>;
+
+    /// Deletes one spill descriptor after physical cleanup.
+    async fn delete_spill(&self, storage_path: &str) -> Result<()>;
 }
 
 /// In-memory VCS exchange catalog used by the current VCS process.
@@ -50,6 +70,7 @@ pub trait ExchangeCatalog: Send + Sync {
 #[derive(Clone, Default)]
 pub struct InMemoryExchangeCatalog {
     manifests: Arc<RwLock<HashMap<ExchangeKey, ExchangeManifest>>>,
+    spills: Arc<RwLock<HashMap<String, SpillRun>>>,
 }
 
 impl InMemoryExchangeCatalog {
@@ -62,10 +83,7 @@ impl InMemoryExchangeCatalog {
             .ok_or_else(|| VeinError::not_found(format!("exchange {key:?}")))
     }
 
-    fn validate_fragment(
-        manifest: &ExchangeManifest,
-        fragment: &ExchangeFragment,
-    ) -> Result<()> {
+    fn validate_fragment(manifest: &ExchangeManifest, fragment: &ExchangeFragment) -> Result<()> {
         if manifest.state != ExchangeState::Open {
             return Err(VeinError::shuffle(format!(
                 "exchange {:?} is not open",
@@ -98,7 +116,9 @@ impl ExchangeCatalog for InMemoryExchangeCatalog {
         schema_fingerprint: String,
     ) -> Result<ExchangeManifest> {
         if partition_count == 0 {
-            return Err(VeinError::shuffle("exchange must have at least one partition"));
+            return Err(VeinError::shuffle(
+                "exchange must have at least one partition",
+            ));
         }
 
         let mut manifests = self
@@ -119,12 +139,8 @@ impl ExchangeCatalog for InMemoryExchangeCatalog {
             return Ok(existing.clone());
         }
 
-        let manifest = ExchangeManifest::new(
-            key,
-            partition_count,
-            expected_tasks,
-            schema_fingerprint,
-        );
+        let manifest =
+            ExchangeManifest::new(key, partition_count, expected_tasks, schema_fingerprint);
         manifests.insert(key, manifest.clone());
         Ok(manifest)
     }
@@ -139,14 +155,9 @@ impl ExchangeCatalog for InMemoryExchangeCatalog {
             .ok_or_else(|| VeinError::not_found(format!("exchange {key:?}")))?;
         Self::validate_fragment(manifest, &fragment)?;
 
-        if let Some(existing) = manifest
-            .fragments
-            .iter_mut()
-            .find(|existing| {
-                existing.task_id == fragment.task_id
-                    && existing.partition_id == fragment.partition_id
-            })
-        {
+        if let Some(existing) = manifest.fragments.iter_mut().find(|existing| {
+            existing.task_id == fragment.task_id && existing.partition_id == fragment.partition_id
+        }) {
             if fragment.attempt < existing.attempt {
                 return Ok(());
             }
@@ -172,10 +183,7 @@ impl ExchangeCatalog for InMemoryExchangeCatalog {
         match manifest.state {
             ExchangeState::Sealed => return Ok(manifest.clone()),
             ExchangeState::Aborted => {
-                return Err(VeinError::shuffle(format!(
-                    "exchange {:?} is aborted",
-                    key
-                )));
+                return Err(VeinError::shuffle(format!("exchange {:?} is aborted", key)));
             }
             ExchangeState::Open => {}
         }
@@ -230,8 +238,81 @@ impl ExchangeCatalog for InMemoryExchangeCatalog {
             .map(|_| ())
             .ok_or_else(|| VeinError::not_found(format!("exchange {key:?}")))
     }
-}
 
+    async fn register_spill(&self, spill: SpillRun) -> Result<()> {
+        let mut spills = self
+            .spills
+            .write()
+            .map_err(|_| VeinError::internal("spill catalog write lock poisoned"))?;
+        if spill.storage_path.is_empty() || spill.state != SpillRunState::Open {
+            return Err(VeinError::shuffle(
+                "spill must be registered with an open state and path",
+            ));
+        }
+        spills.insert(spill.storage_path.clone(), spill);
+        Ok(())
+    }
+
+    async fn get_spills(
+        &self,
+        key: ExchangeKey,
+        task_id: TaskId,
+        attempt: u32,
+    ) -> Result<Vec<SpillRun>> {
+        let spills = self
+            .spills
+            .read()
+            .map_err(|_| VeinError::internal("spill catalog read lock poisoned"))?;
+        Ok(spills
+            .values()
+            .filter(|spill| {
+                spill.exchange_key == key
+                    && spill.task_id == task_id
+                    && spill.attempt == attempt
+                    && spill.state == SpillRunState::Sealed
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn seal_spill(&self, storage_path: &str) -> Result<()> {
+        let mut spills = self
+            .spills
+            .write()
+            .map_err(|_| VeinError::internal("spill catalog write lock poisoned"))?;
+        let spill = spills
+            .get_mut(storage_path)
+            .ok_or_else(|| VeinError::not_found(format!("spill {storage_path}")))?;
+        if spill.state != SpillRunState::Open {
+            return Err(VeinError::shuffle("spill is not open"));
+        }
+        spill.state = SpillRunState::Sealed;
+        Ok(())
+    }
+
+    async fn abort_spill(&self, storage_path: &str) -> Result<()> {
+        let mut spills = self
+            .spills
+            .write()
+            .map_err(|_| VeinError::internal("spill catalog write lock poisoned"))?;
+        let spill = spills
+            .get_mut(storage_path)
+            .ok_or_else(|| VeinError::not_found(format!("spill {storage_path}")))?;
+        spill.state = SpillRunState::Aborted;
+        Ok(())
+    }
+
+    async fn delete_spill(&self, storage_path: &str) -> Result<()> {
+        let mut spills = self
+            .spills
+            .write()
+            .map_err(|_| VeinError::internal("spill catalog write lock poisoned"))?;
+        spills
+            .remove(storage_path)
+            .map(|_| ())
+            .ok_or_else(|| VeinError::not_found(format!("spill {storage_path}")))
+    }
+}
 
 /// File-backed exchange catalog used by the VCS authority.
 ///
@@ -243,7 +324,9 @@ impl ExchangeCatalog for InMemoryExchangeCatalog {
 pub struct PersistentExchangeCatalog {
     file_io: FileIO,
     manifest_path: String,
+    spill_path: String,
     manifests: Arc<tokio::sync::Mutex<HashMap<ExchangeKey, ExchangeManifest>>>,
+    spills: Arc<tokio::sync::Mutex<HashMap<String, SpillRun>>>,
 }
 
 impl PersistentExchangeCatalog {
@@ -251,16 +334,31 @@ impl PersistentExchangeCatalog {
     /// when the object exists.
     pub async fn open(file_io: FileIO, manifest_path: impl Into<String>) -> Result<Self> {
         let manifest_path = manifest_path.into();
+        let spill_path = format!("{}.spills.json", manifest_path.trim_end_matches(".json"));
         let input = file_io
             .new_input(&manifest_path)
             .map_err(VeinError::Iceberg)?;
         let manifests = if input.exists().await.map_err(VeinError::Iceberg)? {
             let bytes = input.read().await.map_err(VeinError::Iceberg)?;
-            let snapshot: Vec<ExchangeManifest> = serde_json::from_slice(&bytes)
-                .map_err(|e| VeinError::serialization(format!("invalid exchange catalog snapshot: {e}")))?;
+            let snapshot: Vec<ExchangeManifest> = serde_json::from_slice(&bytes).map_err(|e| {
+                VeinError::serialization(format!("invalid exchange catalog snapshot: {e}"))
+            })?;
             snapshot
                 .into_iter()
                 .map(|manifest| (manifest.key, manifest))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let spill_input = file_io.new_input(&spill_path).map_err(VeinError::Iceberg)?;
+        let spills = if spill_input.exists().await.map_err(VeinError::Iceberg)? {
+            let bytes = spill_input.read().await.map_err(VeinError::Iceberg)?;
+            let snapshot: Vec<SpillRun> = serde_json::from_slice(&bytes).map_err(|e| {
+                VeinError::serialization(format!("invalid spill catalog snapshot: {e}"))
+            })?;
+            snapshot
+                .into_iter()
+                .map(|spill| (spill.storage_path.clone(), spill))
                 .collect()
         } else {
             HashMap::new()
@@ -269,7 +367,9 @@ impl PersistentExchangeCatalog {
         Ok(Self {
             file_io,
             manifest_path,
+            spill_path,
             manifests: Arc::new(tokio::sync::Mutex::new(manifests)),
+            spills: Arc::new(tokio::sync::Mutex::new(spills)),
         })
     }
 
@@ -278,8 +378,9 @@ impl PersistentExchangeCatalog {
         manifests: &HashMap<ExchangeKey, ExchangeManifest>,
     ) -> Result<()> {
         let snapshot: Vec<ExchangeManifest> = manifests.values().cloned().collect();
-        let bytes = serde_json::to_vec(&snapshot)
-            .map_err(|e| VeinError::serialization(format!("failed to encode exchange catalog: {e}")))?;
+        let bytes = serde_json::to_vec(&snapshot).map_err(|e| {
+            VeinError::serialization(format!("failed to encode exchange catalog: {e}"))
+        })?;
         let output = self
             .file_io
             .new_output(&self.manifest_path)
@@ -290,10 +391,22 @@ impl PersistentExchangeCatalog {
             .map_err(VeinError::Iceberg)
     }
 
-    fn validate_fragment(
-        manifest: &ExchangeManifest,
-        fragment: &ExchangeFragment,
-    ) -> Result<()> {
+    async fn persist_spills_locked(&self, spills: &HashMap<String, SpillRun>) -> Result<()> {
+        let snapshot: Vec<SpillRun> = spills.values().cloned().collect();
+        let bytes = serde_json::to_vec(&snapshot).map_err(|e| {
+            VeinError::serialization(format!("failed to encode spill catalog: {e}"))
+        })?;
+        let output = self
+            .file_io
+            .new_output(&self.spill_path)
+            .map_err(VeinError::Iceberg)?;
+        output
+            .write(Bytes::from(bytes))
+            .await
+            .map_err(VeinError::Iceberg)
+    }
+
+    fn validate_fragment(manifest: &ExchangeManifest, fragment: &ExchangeFragment) -> Result<()> {
         if manifest.state != ExchangeState::Open {
             return Err(VeinError::shuffle(format!(
                 "exchange {:?} is not open",
@@ -326,7 +439,9 @@ impl ExchangeCatalog for PersistentExchangeCatalog {
         schema_fingerprint: String,
     ) -> Result<ExchangeManifest> {
         if partition_count == 0 {
-            return Err(VeinError::shuffle("exchange must have at least one partition"));
+            return Err(VeinError::shuffle(
+                "exchange must have at least one partition",
+            ));
         }
 
         let mut manifests = self.manifests.lock().await;
@@ -344,12 +459,8 @@ impl ExchangeCatalog for PersistentExchangeCatalog {
         }
 
         let previous = manifests.clone();
-        let manifest = ExchangeManifest::new(
-            key,
-            partition_count,
-            expected_tasks,
-            schema_fingerprint,
-        );
+        let manifest =
+            ExchangeManifest::new(key, partition_count, expected_tasks, schema_fingerprint);
         manifests.insert(key, manifest.clone());
         if let Err(error) = self.persist_locked(&manifests).await {
             *manifests = previous;
@@ -403,10 +514,7 @@ impl ExchangeCatalog for PersistentExchangeCatalog {
             match manifest.state {
                 ExchangeState::Sealed => return Ok(manifest.clone()),
                 ExchangeState::Aborted => {
-                    return Err(VeinError::shuffle(format!(
-                        "exchange {:?} is aborted",
-                        key
-                    )));
+                    return Err(VeinError::shuffle(format!("exchange {:?} is aborted", key)));
                 }
                 ExchangeState::Open => {}
             }
@@ -475,6 +583,85 @@ impl ExchangeCatalog for PersistentExchangeCatalog {
         }
         Ok(())
     }
+
+    async fn register_spill(&self, spill: SpillRun) -> Result<()> {
+        if spill.storage_path.is_empty() || spill.state != SpillRunState::Open {
+            return Err(VeinError::shuffle(
+                "spill must be registered with an open state and path",
+            ));
+        }
+        let mut spills = self.spills.lock().await;
+        let previous = spills.clone();
+        spills.insert(spill.storage_path.clone(), spill);
+        if let Err(error) = self.persist_spills_locked(&spills).await {
+            *spills = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn get_spills(
+        &self,
+        key: ExchangeKey,
+        task_id: TaskId,
+        attempt: u32,
+    ) -> Result<Vec<SpillRun>> {
+        let spills = self.spills.lock().await;
+        Ok(spills
+            .values()
+            .filter(|spill| {
+                spill.exchange_key == key
+                    && spill.task_id == task_id
+                    && spill.attempt == attempt
+                    && spill.state == SpillRunState::Sealed
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn seal_spill(&self, storage_path: &str) -> Result<()> {
+        let mut spills = self.spills.lock().await;
+        let previous = spills.clone();
+        let spill = spills
+            .get_mut(storage_path)
+            .ok_or_else(|| VeinError::not_found(format!("spill {storage_path}")))?;
+        if spill.state != SpillRunState::Open {
+            return Err(VeinError::shuffle("spill is not open"));
+        }
+        spill.state = SpillRunState::Sealed;
+        if let Err(error) = self.persist_spills_locked(&spills).await {
+            *spills = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn abort_spill(&self, storage_path: &str) -> Result<()> {
+        let mut spills = self.spills.lock().await;
+        let previous = spills.clone();
+        let spill = spills
+            .get_mut(storage_path)
+            .ok_or_else(|| VeinError::not_found(format!("spill {storage_path}")))?;
+        spill.state = SpillRunState::Aborted;
+        if let Err(error) = self.persist_spills_locked(&spills).await {
+            *spills = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn delete_spill(&self, storage_path: &str) -> Result<()> {
+        let mut spills = self.spills.lock().await;
+        let previous = spills.clone();
+        spills
+            .remove(storage_path)
+            .ok_or_else(|| VeinError::not_found(format!("spill {storage_path}")))?;
+        if let Err(error) = self.persist_spills_locked(&spills).await {
+            *spills = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 /// Creates an exchange fragment descriptor for a persisted VFS object.
@@ -521,17 +708,11 @@ mod tests {
             .unwrap();
 
         catalog
-            .publish_fragment(
-                key,
-                fragment(0, task, 0, "fragment-old", None, 10, 1, 7),
-            )
+            .publish_fragment(key, fragment(0, task, 0, "fragment-old", None, 10, 1, 7))
             .await
             .unwrap();
         catalog
-            .publish_fragment(
-                key,
-                fragment(0, task, 1, "fragment-new", None, 12, 1, 8),
-            )
+            .publish_fragment(key, fragment(0, task, 1, "fragment-new", None, 12, 1, 8))
             .await
             .unwrap();
 
@@ -552,21 +733,15 @@ mod tests {
         let key = key(QueryId::from_raw(11), StageId::from_raw(12));
         let task = TaskId::from_raw(13);
 
-        let catalog = PersistentExchangeCatalog::open(
-            FileIO::new_with_fs(),
-            path.clone(),
-        )
-        .await
-        .unwrap();
+        let catalog = PersistentExchangeCatalog::open(FileIO::new_with_fs(), path.clone())
+            .await
+            .unwrap();
         catalog
             .create_exchange(key, 1, vec![task], "schema-v2".to_string())
             .await
             .unwrap();
         catalog
-            .publish_fragment(
-                key,
-                fragment(0, task, 0, "fragment", None, 64, 4, 99),
-            )
+            .publish_fragment(key, fragment(0, task, 0, "fragment", None, 64, 4, 99))
             .await
             .unwrap();
         catalog.seal_exchange(key).await.unwrap();
@@ -577,5 +752,53 @@ mod tests {
         let manifest = reopened.get_manifest(key).await.unwrap();
         assert_eq!(manifest.state, ExchangeState::Sealed);
         assert_eq!(manifest.fragments[0].row_count, 4);
+    }
+
+    #[tokio::test]
+    async fn spill_catalog_publishes_seals_discovers_and_deletes() {
+        let catalog = InMemoryExchangeCatalog::default();
+        let exchange_key = key(QueryId::from_raw(21), StageId::from_raw(22));
+        let task_id = TaskId::from_raw(23);
+        let spill = SpillRun {
+            exchange_key,
+            task_id,
+            attempt: 1,
+            partition_id: 0,
+            subpartition_id: 4,
+            storage_path: "spill/run-4".to_string(),
+            byte_len: 128,
+            row_count: 16,
+            checksum: 99,
+            state: SpillRunState::Open,
+            lease_until_ms: 123,
+        };
+
+        catalog.register_spill(spill.clone()).await.unwrap();
+        assert!(
+            catalog
+                .get_spills(exchange_key, task_id, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        catalog.seal_spill(&spill.storage_path).await.unwrap();
+        let discovered = catalog.get_spills(exchange_key, task_id, 1).await.unwrap();
+        assert_eq!(
+            discovered,
+            vec![SpillRun {
+                state: SpillRunState::Sealed,
+                ..spill.clone()
+            }]
+        );
+
+        catalog.delete_spill(&spill.storage_path).await.unwrap();
+        assert!(
+            catalog
+                .get_spills(exchange_key, task_id, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

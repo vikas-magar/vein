@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 
 use crate::exchange::SharedExchangeMetadata;
-use crate::operators::join::HashJoinSource;
+use crate::operators::join::{HashJoinSource, JoinSpillIdentity};
 use crate::operators::sink::{CollectSink, DiscardSink, ShuffleSink, StorageSink};
 use crate::operators::source::{MemorySource, ScanSource, VfsExchangeSource};
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
@@ -16,6 +16,7 @@ use crate::runtime::ExecutorBuilder;
 use crate::udf::FunctionRegistry;
 use crate::vm::VectorVmExecutor;
 use common::Result;
+use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, MicroProgram};
 use error::VeinError;
 
@@ -104,7 +105,12 @@ impl DefaultExecutorBuilder {
 }
 
 impl ExecutorBuilder for DefaultExecutorBuilder {
-    fn build_source(&self, source: &DataSource) -> Result<Box<dyn Source<DataChunk>>> {
+    fn build_source(
+        &self,
+        source: &DataSource,
+        task_id: TaskId,
+        attempt: u32,
+    ) -> Result<Box<dyn Source<DataChunk>>> {
         match source {
             DataSource::Memory => Ok(Box::new(MemorySource::dummy())),
             DataSource::File(scan) => {
@@ -160,7 +166,8 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                         metadata.clone(),
                     ),
                     None => HashJoinSource::with_store(join.clone(), store),
-                };
+                }
+                .with_spill_identity(JoinSpillIdentity { task_id, attempt });
                 Ok(Box::new(source))
             }
             DataSource::Stream(_) => {

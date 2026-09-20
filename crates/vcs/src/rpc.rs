@@ -4,9 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use common::protocol::{VcsExchangeRequest, VcsExchangeResponse};
-use common::transport::{
-    build_quic_server, extract_control_payload, frame_control_message,
-};
+use common::transport::{build_quic_server, extract_control_payload, frame_control_message};
 use error::{Result, VeinError};
 use tracing::{debug, info, warn};
 
@@ -31,12 +29,7 @@ impl VcsExchangeServer {
 
     /// Runs the QUIC listener until it is stopped by the caller or the server
     /// encounters a bind/accept error.
-    pub async fn run(
-        &self,
-        bind_addr: SocketAddr,
-        cert_path: &str,
-        key_path: &str,
-    ) -> Result<()> {
+    pub async fn run(&self, bind_addr: SocketAddr, cert_path: &str, key_path: &str) -> Result<()> {
         let mut server = build_quic_server(bind_addr, cert_path, key_path)?;
         info!(target: "vein_vcs", %bind_addr, "VCS exchange service listening");
 
@@ -129,6 +122,30 @@ async fn execute_request(
             .delete_exchange(key)
             .await
             .map(|_| VcsExchangeResponse::Ack),
+        VcsExchangeRequest::RegisterSpill { spill } => catalog
+            .register_spill(spill)
+            .await
+            .map(|_| VcsExchangeResponse::Ack),
+        VcsExchangeRequest::GetSpills {
+            key,
+            task_id,
+            attempt,
+        } => catalog
+            .get_spills(key, task_id, attempt)
+            .await
+            .map(|spills| VcsExchangeResponse::Spills { spills }),
+        VcsExchangeRequest::SealSpill { storage_path } => catalog
+            .seal_spill(&storage_path)
+            .await
+            .map(|_| VcsExchangeResponse::Ack),
+        VcsExchangeRequest::AbortSpill { storage_path } => catalog
+            .abort_spill(&storage_path)
+            .await
+            .map(|_| VcsExchangeResponse::Ack),
+        VcsExchangeRequest::DeleteSpill { storage_path } => catalog
+            .delete_spill(&storage_path)
+            .await
+            .map(|_| VcsExchangeResponse::Ack),
     };
 
     result.unwrap_or_else(|error| VcsExchangeResponse::Error {
@@ -140,8 +157,9 @@ async fn send_response(
     stream: &mut s2n_quic::stream::BidirectionalStream,
     response: &VcsExchangeResponse,
 ) -> Result<()> {
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(response)
-        .map_err(|error| VeinError::serialization(format!("failed to encode VCS response: {error}")))?;
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(response).map_err(|error| {
+        VeinError::serialization(format!("failed to encode VCS response: {error}"))
+    })?;
     debug!(target: "vein_vcs", bytes = bytes.len(), "Sending VCS exchange response");
     stream
         .send(frame_control_message(&bytes))
@@ -152,4 +170,3 @@ async fn send_response(
         .map_err(|error| VeinError::quic_send(error.to_string()))?;
     Ok(())
 }
-

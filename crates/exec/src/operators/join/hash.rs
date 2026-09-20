@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use super::key::{JoinKey, JoinKeyBatch};
+use super::memory::JoinMemoryBudget;
 use common::Result;
 use error::VeinError;
 
@@ -27,17 +28,36 @@ pub struct JoinMatch {
     pub probe_row: JoinRowRef,
 }
 
+const HASH_ENTRY_OVERHEAD: usize = 48;
+
 /// A partition-local hash table for exact equi-join matching.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HashJoinTable {
     buckets: HashMap<u64, Vec<(JoinKey, JoinRowRef)>>,
     build_rows: u64,
+    budget: JoinMemoryBudget,
+    reserved_bytes: usize,
 }
 
 impl HashJoinTable {
-    /// Creates an empty hash table.
+    /// Creates an empty hash table with the default memory budget.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_budget(JoinMemoryBudget::default())
+    }
+
+    /// Creates an empty hash table with an injected memory budget.
+    pub fn with_budget(budget: JoinMemoryBudget) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            build_rows: 0,
+            budget,
+            reserved_bytes: 0,
+        }
+    }
+
+    /// Current build-state memory reservation.
+    pub fn memory_bytes(&self) -> usize {
+        self.reserved_bytes
     }
 
     /// Number of non-null rows inserted into the table.
@@ -47,18 +67,37 @@ impl HashJoinTable {
 
     /// Inserts all non-null rows from one extracted batch.
     pub fn insert_batch(&mut self, batch_id: u32, batch: &JoinKeyBatch) -> Result<()> {
+        let required = batch
+            .matching_rows()
+            .map(|row| {
+                row.key
+                    .as_ref()
+                    .map(|key| {
+                        key.estimated_heap_size()
+                            .saturating_add(HASH_ENTRY_OVERHEAD)
+                    })
+                    .unwrap_or(0)
+            })
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+            .ok_or_else(|| {
+                VeinError::resource_exhausted("join build state", usize::MAX, self.budget.limit())
+            })?;
+
+        self.budget.try_reserve(required)?;
+        self.reserved_bytes = self.reserved_bytes.saturating_add(required);
+
         for row in batch.matching_rows() {
             let key = row
                 .key
                 .as_ref()
                 .ok_or_else(|| VeinError::internal("matching row has no join key"))?;
-            self.buckets
-                .entry(row.hash)
-                .or_default()
-                .push((key.clone(), JoinRowRef {
+            self.buckets.entry(row.hash).or_default().push((
+                key.clone(),
+                JoinRowRef {
                     batch_id,
                     row_index: row.row_index,
-                }));
+                },
+            ));
             self.build_rows = self.build_rows.saturating_add(1);
         }
         Ok(())
@@ -90,13 +129,59 @@ impl HashJoinTable {
     }
 }
 
+impl Drop for HashJoinTable {
+    fn drop(&mut self) {
+        self.budget.release(self.reserved_bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{HashJoinTable, JoinRowRef};
-    use crate::operators::join::{JoinKey, JoinKeyBatch, JoinKeyPart, JoinKeyRow};
+    use crate::operators::join::{
+        JoinKey, JoinKeyBatch, JoinKeyPart, JoinKeyRow, JoinMemoryBudget,
+    };
 
     fn batch(rows: Vec<JoinKeyRow>) -> JoinKeyBatch {
         JoinKeyBatch::new(rows)
+    }
+
+    #[test]
+    fn rejects_build_state_above_budget() {
+        let key = JoinKey::new(vec![JoinKeyPart::Canonical(7)]);
+        let mut table = HashJoinTable::with_budget(JoinMemoryBudget::with_limit(1));
+        let result = table.insert_batch(
+            1,
+            &batch(vec![JoinKeyRow {
+                row_index: 0,
+                hash: key.stable_hash(),
+                key: Some(key),
+            }]),
+        );
+        assert!(result.is_err());
+        assert_eq!(table.build_rows(), 0);
+        assert_eq!(table.memory_bytes(), 0);
+    }
+
+    #[test]
+    fn releases_build_state_budget_on_drop() {
+        let budget = JoinMemoryBudget::with_limit(1024);
+        {
+            let key = JoinKey::new(vec![JoinKeyPart::Canonical(7)]);
+            let mut table = HashJoinTable::with_budget(budget.clone());
+            table
+                .insert_batch(
+                    1,
+                    &batch(vec![JoinKeyRow {
+                        row_index: 0,
+                        hash: key.stable_hash(),
+                        key: Some(key),
+                    }]),
+                )
+                .expect("build succeeds");
+            assert!(budget.used() > 0);
+        }
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
@@ -131,12 +216,25 @@ mod tests {
         );
 
         assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].build_row, JoinRowRef { batch_id: 1, row_index: 2 });
-        assert_eq!(matches[1].build_row, JoinRowRef { batch_id: 1, row_index: 4 });
-        assert!(matches.iter().all(|item| item.probe_row == JoinRowRef {
-            batch_id: 9,
-            row_index: 5
-        }));
+        assert_eq!(
+            matches[0].build_row,
+            JoinRowRef {
+                batch_id: 1,
+                row_index: 2
+            }
+        );
+        assert_eq!(
+            matches[1].build_row,
+            JoinRowRef {
+                batch_id: 1,
+                row_index: 4
+            }
+        );
+        assert!(matches.iter().all(|item| item.probe_row
+            == JoinRowRef {
+                batch_id: 9,
+                row_index: 5
+            }));
     }
 
     #[test]
@@ -153,16 +251,18 @@ mod tests {
             )
             .expect("build succeeds");
 
-        assert!(table
-            .probe_batch(
-                2,
-                &batch(vec![JoinKeyRow {
-                    row_index: 0,
-                    hash: 0,
-                    key: None,
-                }])
-            )
-            .is_empty());
+        assert!(
+            table
+                .probe_batch(
+                    2,
+                    &batch(vec![JoinKeyRow {
+                        row_index: 0,
+                        hash: 0,
+                        key: None,
+                    }])
+                )
+                .is_empty()
+        );
         assert_eq!(table.build_rows(), 0);
     }
 

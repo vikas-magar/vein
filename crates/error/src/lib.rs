@@ -104,6 +104,17 @@ pub enum VeinError {
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
 
+    /// A bounded execution resource could not satisfy a reservation.
+    #[error("Resource exhausted: {resource}, requested {requested} bytes, limit {limit} bytes")]
+    ResourceExhausted {
+        /// Resource whose budget was exceeded.
+        resource: String,
+        /// Bytes requested by the operation.
+        requested: usize,
+        /// Configured resource limit.
+        limit: usize,
+    },
+
     // ── Shuffle ──────────────────────────────────────────────
     /// A partition was drained more than once.
     #[error("Partition {0} already drained")]
@@ -184,6 +195,15 @@ impl VeinError {
         Self::Internal {
             message: message.into(),
             source: None,
+        }
+    }
+
+    /// Create a bounded-resource exhaustion error.
+    pub fn resource_exhausted(resource: impl Into<String>, requested: usize, limit: usize) -> Self {
+        Self::ResourceExhausted {
+            resource: resource.into(),
+            requested,
+            limit,
         }
     }
 
