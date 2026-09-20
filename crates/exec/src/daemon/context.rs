@@ -1,7 +1,8 @@
+use crate::runtime::TaskResult;
+use arrow::record_batch::RecordBatch;
 use common::cancellation::CancellationToken;
 use common::identifiers::{NodeId, TaskId};
 use common::protocol::ExecuteTask;
-use crate::runtime::TaskResult;
 use dashmap::DashMap;
 use s2n_quic::Client;
 use std::sync::Arc;
@@ -16,6 +17,8 @@ pub struct QueuedTask {
     pub cancel: CancellationToken,
     /// Channel to return the execution result back to the dispatch handler.
     pub responder: oneshot::Sender<common::Result<TaskResult>>,
+    /// Optional bounded stream for client result batches.
+    pub output_sender: Option<flume::Sender<RecordBatch>>,
 }
 
 /// Shared state for the Executor Daemon.

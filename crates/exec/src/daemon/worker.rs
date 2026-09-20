@@ -49,16 +49,30 @@ impl WorkerPool {
                             let executor = executor.clone();
                             tokio::task::spawn_local(async move {
                                 let task_id = queued_task.task.task_id;
-                                let result = executor.execute(&queued_task.task, queued_task.cancel).await;
+                                let result = match queued_task.output_sender {
+                                    Some(output) => {
+                                        executor
+                                            .execute_streaming(
+                                                &queued_task.task,
+                                                queued_task.cancel,
+                                                output,
+                                            )
+                                            .await
+                                    }
+                                    None => {
+                                        executor
+                                            .execute(&queued_task.task, queued_task.cancel)
+                                            .await
+                                    }
+                                };
                                 match &result {
                                     Ok(res) => info!(
                                         "Worker {} finished task {}: {} rows",
                                         core_id, task_id, res.row_count
                                     ),
-                                    Err(e) => error!(
-                                        "Worker {} task {} failed: {}",
-                                        core_id, task_id, e
-                                    ),
+                                    Err(e) => {
+                                        error!("Worker {} task {} failed: {}", core_id, task_id, e)
+                                    }
                                 }
                                 let _ = queued_task.responder.send(result);
                             });

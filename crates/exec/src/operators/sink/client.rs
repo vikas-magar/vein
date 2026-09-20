@@ -19,6 +19,8 @@ use std::sync::Arc;
 pub struct CollectSink {
     output: Vec<RecordBatch>,
     field_names: Vec<String>,
+    output_sender: Option<flume::Sender<RecordBatch>>,
+    rows_emitted: u64,
 }
 
 impl CollectSink {
@@ -27,6 +29,8 @@ impl CollectSink {
         Self {
             output: Vec::new(),
             field_names: Vec::new(),
+            output_sender: None,
+            rows_emitted: 0,
         }
     }
 
@@ -35,6 +39,21 @@ impl CollectSink {
         Self {
             output: Vec::new(),
             field_names,
+            output_sender: None,
+            rows_emitted: 0,
+        }
+    }
+
+    /// Create a client sink that forwards each materialized batch through a bounded channel.
+    pub fn with_field_names_and_sender(
+        field_names: Vec<String>,
+        output_sender: flume::Sender<RecordBatch>,
+    ) -> Self {
+        Self {
+            output: Vec::new(),
+            field_names,
+            output_sender: Some(output_sender),
+            rows_emitted: 0,
         }
     }
 }
@@ -67,11 +86,7 @@ impl PipelineNode<DataChunk> for CollectSink {
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| format!("col_{i}"));
-            fields.push(Field::new(
-                col_name,
-                vec.data_type().clone(),
-                true,
-            ));
+            fields.push(Field::new(col_name, vec.data_type().clone(), true));
             let array = take(vec.as_ref(), &indices, None)
                 .map_err(|e| VeinError::internal(format!("client sink take failed: {e}")))?;
             columns.push(array);
@@ -80,7 +95,14 @@ impl PipelineNode<DataChunk> for CollectSink {
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema, columns)
             .map_err(|e| VeinError::internal(format!("client sink record batch failed: {e}")))?;
-        self.output.push(batch);
+        self.rows_emitted += batch.num_rows() as u64;
+        if let Some(sender) = &self.output_sender {
+            sender
+                .send(batch)
+                .map_err(|e| VeinError::internal(format!("client result channel closed: {e}")))?;
+        } else {
+            self.output.push(batch);
+        }
         Ok(())
     }
 
@@ -92,5 +114,9 @@ impl PipelineNode<DataChunk> for CollectSink {
 impl Sink<DataChunk> for CollectSink {
     fn collect(&mut self) -> Vec<RecordBatch> {
         std::mem::take(&mut self.output)
+    }
+
+    fn row_count(&self) -> u64 {
+        self.rows_emitted
     }
 }

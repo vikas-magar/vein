@@ -24,6 +24,7 @@ s2n-quic = { workspace = true }
 bytes = "1.0"
 async-trait.workspace = true
 arrow = { workspace = true }
+futures = { workspace = true }
 
 exo = { path = "../exo" }
 vfs = { path = "../vfs" }

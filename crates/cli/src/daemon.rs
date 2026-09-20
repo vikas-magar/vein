@@ -1,6 +1,7 @@
 use crate::engine::QueryEngine;
-use common::transport::{extract_control_payload, frame_control_message};
 use common::Result;
+use common::transport::{extract_control_payload, frame_control_message};
+use futures::StreamExt;
 use s2n_quic::Server;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -41,7 +42,9 @@ impl MasterDaemon {
             .with_tls((std::path::Path::new(cert), std::path::Path::new(key)))
             .map_err(|e| error::VeinError::internal(format!("TLS configuration error: {e}")))?
             .with_io(bind_addr)
-            .map_err(|e| error::VeinError::internal(format!("Socket bind error on {bind_addr}: {e}")))?
+            .map_err(|e| {
+                error::VeinError::internal(format!("Socket bind error on {bind_addr}: {e}"))
+            })?
             .start()
             .map_err(|e| error::VeinError::internal(format!("Server start error: {e}")))?;
 
@@ -91,10 +94,13 @@ impl MasterDaemon {
                                     "Query payload exceeds maximum allowed size; rejecting"
                                 );
                                 let err_resp = common::protocol::ProtocolResponse::Error {
-                                    message: "Query payload exceeds maximum allowed size".to_string(),
+                                    message: "Query payload exceeds maximum allowed size"
+                                        .to_string(),
                                 };
-                                if let Ok(err_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&err_resp) {
-                                    let _ = stream.send(bytes::Bytes::from(err_bytes.into_vec())).await;
+                                if let Ok(err_bytes) =
+                                    rkyv::to_bytes::<rkyv::rancor::Error>(&err_resp)
+                                {
+                                    let _ = stream.send(frame_control_message(&err_bytes)).await;
                                 }
                                 return;
                             }
@@ -109,7 +115,11 @@ impl MasterDaemon {
                             let mut aligned = rkyv::util::AlignedVec::<16>::new();
                             aligned.extend_from_slice(payload);
 
-                            if let Ok(archived) = rkyv::access::<common::protocol::ArchivedVeinControlEvent, rkyv::rancor::Error>(&aligned) {
+                            if let Ok(archived) = rkyv::access::<
+                                common::protocol::ArchivedVeinControlEvent,
+                                rkyv::rancor::Error,
+                            >(&aligned)
+                            {
                                 match archived {
                                     common::protocol::ArchivedVeinControlEvent::Heartbeat {
                                         node_id,
@@ -118,16 +128,23 @@ impl MasterDaemon {
                                         advertise_addr,
                                         ..
                                     } => {
-                                        let nid = common::identifiers::NodeId::from_raw(node_id.0.to_native());
+                                        let nid = common::identifiers::NodeId::from_raw(
+                                            node_id.0.to_native(),
+                                        );
                                         let kind = common::protocol::NodeKind::from(node_kind);
                                         let load = common::protocol::NodeLoad::from(load);
                                         let addr_str = advertise_addr.as_str();
                                         debug!(target: "vein_master", %nid, %addr_str, "Received heartbeat from node");
-                                        if let (Ok(addr), Some(registry)) = (addr_str.parse::<std::net::SocketAddr>(), engine.registry()) {
+                                        if let (Ok(addr), Some(registry)) = (
+                                            addr_str.parse::<std::net::SocketAddr>(),
+                                            engine.registry(),
+                                        ) {
                                             registry.record_heartbeat(nid, addr, kind, load).await;
                                         }
                                         let ack = common::protocol::VeinControlEvent::HeartbeatAck;
-                                        if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&ack) {
+                                        if let Ok(bytes) =
+                                            rkyv::to_bytes::<rkyv::rancor::Error>(&ack)
+                                        {
                                             let wire = frame_control_message(&bytes);
                                             let _ = stream.send(wire).await;
                                             let _ = stream.finish();
@@ -154,80 +171,171 @@ impl MasterDaemon {
                             &buf[..]
                         };
 
-                        let request = match rkyv::access::<common::protocol::ArchivedProtocolRequest, rkyv::rancor::Error>(client_payload) {
+                        let request = match rkyv::access::<
+                            common::protocol::ArchivedProtocolRequest,
+                            rkyv::rancor::Error,
+                        >(client_payload)
+                        {
                             Ok(req) => req,
                             Err(e) => {
                                 warn!(target: "vein_master", error = %e, "Failed to decode ProtocolRequest from client");
                                 let err_resp = common::protocol::ProtocolResponse::Error {
                                     message: format!("Malformed ProtocolRequest payload: {e}"),
                                 };
-                                if let Ok(err_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&err_resp) {
-                                    let _ = stream.send(bytes::Bytes::from(err_bytes.into_vec())).await;
+                                if let Ok(err_bytes) =
+                                    rkyv::to_bytes::<rkyv::rancor::Error>(&err_resp)
+                                {
+                                    let _ = stream.send(frame_control_message(&err_bytes)).await;
                                 }
                                 return;
                             }
                         };
 
-                        // 3. Process the typed request & produce a typed ProtocolResponse
-                        let response = match request {
+                        macro_rules! send_response {
+                            ($response:expr) => {{
+                                let response = $response;
+                                match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
+                                    Ok(response_bytes) => {
+                                        if let Err(err) = stream
+                                            .send(frame_control_message(&response_bytes))
+                                            .await
+                                        {
+                                            warn!(
+                                                target: "vein_master",
+                                                error = %err,
+                                                "Failed to send ProtocolResponse to client"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        error!(
+                                            target: "vein_master",
+                                            error = %error,
+                                            "Failed to serialize ProtocolResponse via rkyv"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }};
+                        }
+
+                        match request {
                             common::protocol::ArchivedProtocolRequest::ExecuteSql { sql } => {
                                 let sql_str = sql.as_str();
                                 info!(target: "vein_master", query = %sql_str, "Processing ExecuteSql request");
                                 let mut parser = parser::Parser::new(sql_str);
                                 match parser.parse_statement() {
                                     Ok(statement) => match engine.submit_query(statement).await {
-                                        Ok(result_bytes) => {
-                                            if let Ok(text) = String::from_utf8(result_bytes.to_vec()) {
+                                        Ok(crate::engine::QueryOutput::Plan(text)) => {
+                                            send_response!(
                                                 common::protocol::ProtocolResponse::Plan { text }
-                                            } else {
-                                                common::protocol::ProtocolResponse::Data {
-                                                    batch: result_bytes.to_vec(),
+                                            );
+                                        }
+                                        Ok(crate::engine::QueryOutput::Write {
+                                            table,
+                                            row_count,
+                                        }) => {
+                                            send_response!(common::protocol::ProtocolResponse::WriteCompleted {
+                                                table,
+                                                row_count,
+                                            });
+                                        }
+                                        Ok(crate::engine::QueryOutput::Data {
+                                            query_id,
+                                            stream: mut result_stream,
+                                        }) => {
+                                            send_response!(common::protocol::ProtocolResponse::QueryResultStart { query_id });
+                                            let mut sequence = 0u64;
+                                            let mut row_count = 0u64;
+                                            while let Some(event) = result_stream.next().await {
+                                                match event {
+                                                    Ok(common::ResultEvent::Start { .. }) => {}
+                                                    Ok(common::ResultEvent::Batch(
+                                                        result_batch,
+                                                    )) => {
+                                                        let mut encoder =
+                                                            common::arrow::IpcStreamEncoder::new();
+                                                        if let Err(error) =
+                                                            encoder.encode(&result_batch.batch)
+                                                        {
+                                                            send_response!(common::protocol::ProtocolResponse::Error {
+                                                                message: error.to_string(),
+                                                            });
+                                                            return;
+                                                        }
+                                                        let payload = match encoder.finalize() {
+                                                            Ok(payload) => payload,
+                                                            Err(error) => {
+                                                                send_response!(common::protocol::ProtocolResponse::Error {
+                                                                    message: error.to_string(),
+                                                                });
+                                                                return;
+                                                            }
+                                                        };
+                                                        row_count = match row_count.checked_add(
+                                                            result_batch.row_count() as u64,
+                                                        ) {
+                                                            Some(value) => value,
+                                                            None => {
+                                                                send_response!(common::protocol::ProtocolResponse::Error {
+                                                                    message: "result row count overflow".to_string(),
+                                                                });
+                                                                return;
+                                                            }
+                                                        };
+                                                        send_response!(common::protocol::ProtocolResponse::QueryResultBatch {
+                                                            query_id,
+                                                            sequence,
+                                                            batch: payload,
+                                                        });
+                                                        sequence += 1;
+                                                    }
+                                                    Ok(common::ResultEvent::End { .. }) => {}
+                                                    Ok(common::ResultEvent::Error { message }) => {
+                                                        send_response!(common::protocol::ProtocolResponse::Error { message });
+                                                        return;
+                                                    }
+                                                    Err(error) => {
+                                                        send_response!(common::protocol::ProtocolResponse::Error {
+                                                            message: error.to_string(),
+                                                        });
+                                                        return;
+                                                    }
                                                 }
                                             }
+                                            send_response!(common::protocol::ProtocolResponse::QueryResultEnd {
+                                                query_id,
+                                                row_count,
+                                            });
                                         }
-                                        Err(e) => {
-                                            error!(target: "vein_master", error = %e, "Query execution failed");
-                                            common::protocol::ProtocolResponse::Error {
-                                                message: e.to_string(),
-                                            }
+                                        Err(error) => {
+                                            error!(target: "vein_master", error = %error, "Query execution failed");
+                                            send_response!(
+                                                common::protocol::ProtocolResponse::Error {
+                                                    message: error.to_string(),
+                                                }
+                                            );
                                         }
                                     },
-                                    Err(e) => {
-                                        error!(target: "vein_master", error = ?e, "Query parsing failed");
-                                        common::protocol::ProtocolResponse::Error {
-                                            message: format!("Parse error: {e:?}"),
-                                        }
+                                    Err(error) => {
+                                        send_response!(common::protocol::ProtocolResponse::Error {
+                                            message: format!("Parse error: {error:?}"),
+                                        });
                                     }
                                 }
                             }
                             common::protocol::ArchivedProtocolRequest::CancelQuery { query_id } => {
-                                info!(target: "vein_master", %query_id, "Received CancelQuery request");
-                                common::protocol::ProtocolResponse::QueryCancelled {
-                                    query_id: common::identifiers::QueryId::from_raw(query_id.0.to_native()),
-                                }
-                            }
-                        };
-
-                        // 4. Serialize response via rkyv and stream back to client
-                        match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
-                            Ok(response_bytes) => {
-                                info!(
-                                    target: "vein_master",
-                                    bytes_len = response_bytes.len(),
-                                    "Streaming rkyv ProtocolResponse back to client"
+                                send_response!(
+                                    common::protocol::ProtocolResponse::QueryCancelled {
+                                        query_id: common::identifiers::QueryId::from_raw(
+                                            query_id.0.to_native()
+                                        ),
+                                    }
                                 );
-                                if let Err(err) = stream.send(bytes::Bytes::from(response_bytes.into_vec())).await {
-                                    warn!(
-                                        target: "vein_master",
-                                        error = %err,
-                                        "Failed to send ProtocolResponse to client"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!(target: "vein_master", error = %e, "Failed to serialize ProtocolResponse via rkyv");
                             }
                         }
+                        let _ = stream.finish();
                     });
                 }
             });

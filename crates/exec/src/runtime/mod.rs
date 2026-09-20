@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
+use common::Result;
 use common::cancellation::CancellationToken;
 use common::protocol::{DataSink, DataSource, ExecuteTask, MicroProgram, VeinControlEvent};
-use common::Result;
 use error::VeinError;
 
 /// Operator telemetry and profiling.
@@ -63,6 +63,19 @@ pub trait ExecutorBuilder: Send + Sync {
     /// stage; a sink that returns data (e.g. `DataSink::Client`) exposes it via
     /// [`Sink::collect`].
     fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>>;
+
+    /// Build a sink that forwards client batches through a bounded output channel.
+    ///
+    /// Non-client sinks may use the regular sink implementation because their
+    /// results are persisted or discarded rather than returned to the client.
+    fn build_streaming_sink(
+        &self,
+        sink: &DataSink,
+        output: flume::Sender<RecordBatch>,
+    ) -> Result<Box<dyn Sink<DataChunk>>> {
+        let _ = output;
+        self.build_sink(sink)
+    }
 }
 
 /// Executes a single task (`source -> transforms -> sink`) end-to-end.
@@ -77,6 +90,26 @@ pub trait ExecutorBuilder: Send + Sync {
 pub trait TaskExecutor: Send + Sync {
     /// Run one task, driving its source through the operator chain.
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult>;
+
+    /// Execute a task while forwarding client batches through a bounded channel.
+    ///
+    /// The default adapter preserves compatibility for custom executors; the
+    /// default executor overrides this to avoid retaining the complete output.
+    async fn execute_streaming(
+        &self,
+        task: &ExecuteTask,
+        cancel: CancellationToken,
+        output: flume::Sender<RecordBatch>,
+    ) -> Result<TaskResult> {
+        let mut result = self.execute(task, cancel).await?;
+        for batch in result.output.drain(..) {
+            output
+                .send_async(batch)
+                .await
+                .map_err(|e| VeinError::internal(format!("task output channel closed: {e}")))?;
+        }
+        Ok(result)
+    }
 }
 
 /// Serializes produced [`RecordBatch`]es into wire bytes for the data plane
@@ -94,6 +127,16 @@ impl ArrowIpcOutputEncoder {
     /// Create a new [`ArrowIpcOutputEncoder`].
     pub fn new() -> Self {
         Self
+    }
+
+    /// Encodes exactly one batch as a self-contained IPC stream.
+    ///
+    /// Result frames use this unit so the receiver can decode each batch
+    /// independently while preserving bounded transport memory.
+    pub fn encode_batch(&self, batch: &RecordBatch) -> Result<Bytes> {
+        let mut encoder = common::arrow::IpcStreamEncoder::new();
+        encoder.encode(batch)?;
+        Ok(Bytes::from(encoder.finalize()?))
     }
 }
 
@@ -181,38 +224,38 @@ impl DefaultTaskExecutor {
     pub fn new(builder: Arc<dyn ExecutorBuilder>) -> Self {
         Self { builder }
     }
-}
 
-#[async_trait(?Send)]
-impl TaskExecutor for DefaultTaskExecutor {
-    async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult> {
+    async fn execute_with_output(
+        &self,
+        task: &ExecuteTask,
+        cancel: CancellationToken,
+        output_sender: Option<flume::Sender<RecordBatch>>,
+    ) -> Result<TaskResult> {
         let start = Instant::now();
         if cancel.is_cancelled() {
             return Err(VeinError::cancelled());
         }
 
-        // 1. Terminal node: build the sink and share it so the runner can call
-        //    `Sink::collect` after execution. Wrapped in a cancellation guard.
-        let sink: Arc<Mutex<Box<dyn Sink<DataChunk>>>> =
-            Arc::new(Mutex::new(self.builder.build_sink(&task.sink)?));
-        let head: Box<dyn PipelineNode<DataChunk>> = Box::new(CancelGuard::new(
-            Box::new(SinkHandle(sink.clone())),
-            cancel,
-        ));
+        let sink = if let Some(sender) = output_sender {
+            self.builder.build_streaming_sink(&task.sink, sender)?
+        } else {
+            self.builder.build_sink(&task.sink)?
+        };
+        let sink: Arc<Mutex<Box<dyn Sink<DataChunk>>>> = Arc::new(Mutex::new(sink));
+        let head: Box<dyn PipelineNode<DataChunk>> =
+            Box::new(CancelGuard::new(Box::new(SinkHandle(sink.clone())), cancel));
 
-        // 2. Build the Vector VM transform from the task's MicroProgram.
         let mut vm = self.builder.build_vm(&task.program, head)?;
-
-        // 3. Build the source and drive the whole chain.
         let mut source: Box<dyn Source<DataChunk>> = self.builder.build_source(&task.source)?;
         source.execute(&mut *vm).await?;
 
-        // 4. Assemble the result from the sink (Spark `collect`-style).
-        let output = sink
+        let mut sink = sink
             .lock()
-            .map_err(|_| VeinError::internal("sink mutex poisoned"))?
-            .collect();
-        let row_count = output.iter().map(|b| b.num_rows() as u64).sum();
+            .map_err(|_| VeinError::internal("sink mutex poisoned"))?;
+        let output = sink.collect();
+        let row_count = sink
+            .row_count()
+            .max(output.iter().map(|batch| batch.num_rows() as u64).sum());
         let duration_ns = start.elapsed().as_nanos() as u64;
 
         Ok(TaskResult {
@@ -223,6 +266,22 @@ impl TaskExecutor for DefaultTaskExecutor {
                 duration_ns,
             },
         })
+    }
+}
+
+#[async_trait(?Send)]
+impl TaskExecutor for DefaultTaskExecutor {
+    async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult> {
+        self.execute_with_output(task, cancel, None).await
+    }
+
+    async fn execute_streaming(
+        &self,
+        task: &ExecuteTask,
+        cancel: CancellationToken,
+        output: flume::Sender<RecordBatch>,
+    ) -> Result<TaskResult> {
+        self.execute_with_output(task, cancel, Some(output)).await
     }
 }
 
@@ -241,6 +300,7 @@ mod tests {
         ExecuteTask {
             mode: ExecutionMode::Batch,
             task_id: TaskId::new(),
+            attempt: 0,
             query_id: QueryId::new(),
             stage_id: StageId::new(),
             source: DataSource::Memory, // dummy: Int64 [1,2,3,4,5]
@@ -266,7 +326,10 @@ mod tests {
 
     #[tokio::test]
     async fn runs_memory_filter_to_client() {
-        let result = runner().execute(&task(), CancellationToken::new()).await.unwrap();
+        let result = runner()
+            .execute(&task(), CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(result.row_count, 3);
         assert_eq!(result.output.len(), 1);
         let col = result.output[0]
@@ -276,6 +339,20 @@ mod tests {
             .unwrap();
         assert_eq!(col.values(), &[3, 4, 5]);
         assert!(result.metrics.duration_ns > 0);
+    }
+
+    #[tokio::test]
+    async fn streams_client_batches_without_retaining_output() {
+        let (sender, receiver) = flume::bounded(1);
+        let result = runner()
+            .execute_streaming(&task(), CancellationToken::new(), sender)
+            .await
+            .unwrap();
+        let batch = receiver.recv_async().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert!(receiver.is_empty());
+        assert_eq!(result.row_count, 3);
+        assert!(result.output.is_empty());
     }
 
     #[tokio::test]
@@ -332,6 +409,7 @@ mod tests {
         let task = ExecuteTask {
             mode: ExecutionMode::Batch,
             task_id: TaskId::new(),
+            attempt: 0,
             query_id: QueryId::new(),
             stage_id: StageId::new(),
             source: DataSource::File(scan_task),
@@ -349,13 +427,18 @@ mod tests {
                         src2: 2,
                     },
                     MicroOp::FilterMask { bool_reg: 2 },
-                    MicroOp::ProjectRegisters { out_regs: vec![0, 1] },
+                    MicroOp::ProjectRegisters {
+                        out_regs: vec![0, 1],
+                    },
                 ],
             },
             sink: DataSink::Client { schema: vec![] },
         };
 
-        let result = runner().execute(&task, CancellationToken::new()).await.unwrap();
+        let result = runner()
+            .execute(&task, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(result.row_count, 5); // 60.0, 70.0, 80.0, 90.0, 100.0
         assert_eq!(result.output.len(), 1);
         let batch = &result.output[0];

@@ -3,17 +3,16 @@
 //! Provides fast O(1) in-place extraction from validated rkyv buffers without
 //! lifetime infection or rkyv::Deserialize Pool strategy mismatches.
 
-use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
-use super::exchange::{ArchivedExchangeKey, ExchangeKey};
 use super::control::{
     ArchivedNodeKind, ArchivedNodeLoad, ArchivedVeinControlEvent, NodeKind, NodeLoad,
     VeinControlEvent,
 };
+use super::exchange::{ArchivedExchangeKey, ExchangeKey};
 use super::ir::constant::{ArchivedScalarConstant, ScalarConstant};
 use super::ir::op::{ArchivedMicroOp, MicroOp};
 use super::ir::program::{ArchivedMicroProgram, MicroProgram};
 use super::ir::state::{
-    ArchivedAggOpCode, ArchivedJoinKind, ArchivedStateMode, AggOpCode, JoinKind, StateMode,
+    AggOpCode, ArchivedAggOpCode, ArchivedJoinKind, ArchivedStateMode, JoinKind, StateMode,
 };
 use super::join::{
     ArchivedExchangeInput, ArchivedJoinKeyMode, ArchivedJoinKeySpec, ArchivedJoinSource,
@@ -27,6 +26,7 @@ use super::task::{
     FieldSchema, FileFormat, FileScanTask, KeyValue, ScanPredicate, ScanPredicateValue,
     ShuffleTarget, StorageTarget, StreamSource,
 };
+use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
 
 // ── Micro-IR Conversions ──────────────────────────────────────────
 
@@ -303,7 +303,11 @@ impl From<&ArchivedScanPredicateValue> for ScanPredicateValue {
 impl From<&ArchivedScanPredicate> for ScanPredicate {
     fn from(archived: &ArchivedScanPredicate) -> Self {
         match archived {
-            ArchivedScanPredicate::Address { column, operator, value } => Self::Address {
+            ArchivedScanPredicate::Address {
+                column,
+                operator,
+                value,
+            } => Self::Address {
                 column: column.as_str().to_string(),
                 operator: operator.as_str().to_string(),
                 value: ScanPredicateValue::from(value),
@@ -425,7 +429,11 @@ impl From<&ArchivedJoinSource> for JoinSource {
             right_keys: archived.right_keys.iter().map(JoinKeySpec::from).collect(),
             requires_exact_verification: archived.requires_exact_verification,
             left_schema: archived.left_schema.iter().map(FieldSchema::from).collect(),
-            right_schema: archived.right_schema.iter().map(FieldSchema::from).collect(),
+            right_schema: archived
+                .right_schema
+                .iter()
+                .map(FieldSchema::from)
+                .collect(),
         }
     }
 }
@@ -494,6 +502,7 @@ impl From<&ArchivedExecuteTask> for ExecuteTask {
         Self {
             mode: ExecutionMode::from(&archived.mode),
             task_id: TaskId::from_raw(archived.task_id.0.to_native()),
+            attempt: archived.attempt.to_native(),
             query_id: QueryId::from_raw(archived.query_id.0.to_native()),
             stage_id: StageId::from_raw(archived.stage_id.0.to_native()),
             source: DataSource::from(&archived.source),
@@ -541,6 +550,7 @@ impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
             ArchivedVeinControlEvent::TaskCompleted {
                 task_id,
                 query_id,
+                attempt,
                 row_count,
                 bytes_read,
                 duration_ns,
@@ -548,10 +558,48 @@ impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
             } => VeinControlEvent::TaskCompleted {
                 task_id: TaskId::from_raw(task_id.0.to_native()),
                 query_id: QueryId::from_raw(query_id.0.to_native()),
+                attempt: attempt.to_native(),
                 row_count: row_count.to_native(),
                 bytes_read: bytes_read.to_native(),
                 duration_ns: duration_ns.to_native(),
                 result_bytes: result_bytes.as_ref().map(|b| b.as_slice().to_vec()),
+            },
+            ArchivedVeinControlEvent::TaskResultStart {
+                task_id,
+                query_id,
+                attempt,
+            } => VeinControlEvent::TaskResultStart {
+                task_id: TaskId::from_raw(task_id.0.to_native()),
+                query_id: QueryId::from_raw(query_id.0.to_native()),
+                attempt: attempt.to_native(),
+            },
+            ArchivedVeinControlEvent::TaskResultBatch {
+                task_id,
+                query_id,
+                attempt,
+                sequence,
+                result_bytes,
+            } => VeinControlEvent::TaskResultBatch {
+                task_id: TaskId::from_raw(task_id.0.to_native()),
+                query_id: QueryId::from_raw(query_id.0.to_native()),
+                attempt: attempt.to_native(),
+                sequence: sequence.to_native(),
+                result_bytes: result_bytes.as_slice().to_vec(),
+            },
+            ArchivedVeinControlEvent::TaskResultEnd {
+                task_id,
+                query_id,
+                attempt,
+                row_count,
+                bytes_read,
+                duration_ns,
+            } => VeinControlEvent::TaskResultEnd {
+                task_id: TaskId::from_raw(task_id.0.to_native()),
+                query_id: QueryId::from_raw(query_id.0.to_native()),
+                attempt: attempt.to_native(),
+                row_count: row_count.to_native(),
+                bytes_read: bytes_read.to_native(),
+                duration_ns: duration_ns.to_native(),
             },
             ArchivedVeinControlEvent::DispatchTask(task) => {
                 VeinControlEvent::DispatchTask(ExecuteTask::from(task))
@@ -559,10 +607,12 @@ impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
             ArchivedVeinControlEvent::TaskFailed {
                 task_id,
                 query_id,
+                attempt,
                 error,
             } => VeinControlEvent::TaskFailed {
                 task_id: TaskId::from_raw(task_id.0.to_native()),
                 query_id: QueryId::from_raw(query_id.0.to_native()),
+                attempt: attempt.to_native(),
                 error: error.as_str().to_string(),
             },
             ArchivedVeinControlEvent::CancelTask { task_id, query_id } => {
@@ -571,13 +621,12 @@ impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
                     query_id: QueryId::from_raw(query_id.0.to_native()),
                 }
             }
-            ArchivedVeinControlEvent::ExplicitDrain {
-                query_id,
-                stage_id,
-            } => VeinControlEvent::ExplicitDrain {
-                query_id: QueryId::from_raw(query_id.0.to_native()),
-                stage_id: StageId::from_raw(stage_id.0.to_native()),
-            },
+            ArchivedVeinControlEvent::ExplicitDrain { query_id, stage_id } => {
+                VeinControlEvent::ExplicitDrain {
+                    query_id: QueryId::from_raw(query_id.0.to_native()),
+                    stage_id: StageId::from_raw(stage_id.0.to_native()),
+                }
+            }
             ArchivedVeinControlEvent::Heartbeat {
                 node_id,
                 node_kind,
@@ -601,13 +650,12 @@ impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
                 stage_id: StageId::from_raw(stage_id.0.to_native()),
                 num_partitions: num_partitions.to_native(),
             },
-            ArchivedVeinControlEvent::DrainCompleted {
-                query_id,
-                stage_id,
-            } => VeinControlEvent::DrainCompleted {
-                query_id: QueryId::from_raw(query_id.0.to_native()),
-                stage_id: StageId::from_raw(stage_id.0.to_native()),
-            },
+            ArchivedVeinControlEvent::DrainCompleted { query_id, stage_id } => {
+                VeinControlEvent::DrainCompleted {
+                    query_id: QueryId::from_raw(query_id.0.to_native()),
+                    stage_id: StageId::from_raw(stage_id.0.to_native()),
+                }
+            }
         }
     }
 }

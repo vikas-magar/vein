@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use bytes::Bytes;
-use common::Result;
+use common::{Result, ResultEvent, SendableResultStream, bounded_result_channel};
+use futures::StreamExt;
 use std::sync::Arc;
 
 use binder::LogicalBinder;
@@ -10,14 +10,29 @@ use physical::PhysicalPlanner;
 use plan::LogicalPlan;
 use plan::display;
 
-/// The absolute highest-level abstraction for the Database Engine.
-/// Represents the complete end-to-end lifecycle from query submission to result retrieval.
+/// The result of executing a bound query.
+pub enum QueryOutput {
+    /// A distributed result stream that owns its bounded execution lifecycle.
+    Data {
+        query_id: common::identifiers::QueryId,
+        stream: SendableResultStream,
+    },
+    /// A rendered EXPLAIN plan.
+    Plan(String),
+    /// A successful write operation.
+    Write {
+        /// Destination table name.
+        table: String,
+        /// Rows written when known.
+        row_count: u64,
+    },
+}
+
+/// The absolute highest-level abstraction for the database engine.
 #[async_trait]
 pub trait QueryEngine: Send + Sync {
-    /// Submits a parsed statement and returns the result bytes. Executed
-    /// queries return Arrow IPC; `EXPLAIN` statements short-circuit and
-    /// return the rendered (optimized) plan text as UTF-8.
-    async fn submit_query<'a>(&self, node: QueryNode<'a>) -> Result<Bytes>;
+    /// Execute a parsed pipe query and return a typed result.
+    async fn submit_query<'a>(&self, node: QueryNode<'a>) -> Result<QueryOutput>;
 
     /// Optional access to the executor registry (used by Master daemon to record heartbeats).
     fn registry(&self) -> Option<Arc<orchestrator::executor::ExecutorRegistry>> {
@@ -107,31 +122,73 @@ impl DistributedCoordinatorBuilder {
     }
 }
 
+impl DistributedCoordinator {
+    fn stream_job(&self, job: physical::Job) -> SendableResultStream {
+        let query_id = job.query_id;
+        let scheduler = self.scheduler.clone();
+        let dispatcher = scheduler.dispatcher().clone();
+        let upstream = dispatcher.open_result_stream(query_id);
+        let (sender, stream) = bounded_result_channel(32);
+        let cancel = common::cancellation::CancellationToken::new();
+        let execution_cancel = cancel.clone();
+
+        tokio::spawn(async move {
+            let mut upstream = upstream;
+            let mut execution = Box::pin(scheduler.execute(job, execution_cancel));
+            let mut execution_result = None;
+            let mut upstream_done = false;
+
+            while execution_result.is_none() || !upstream_done {
+                tokio::select! {
+                    result = &mut execution, if execution_result.is_none() => {
+                        dispatcher.close_result_stream(query_id);
+                        execution_result = Some(result);
+                    }
+                    event = upstream.next(), if !upstream_done => {
+                        match event {
+                            Some(event) => {
+                                if sender.send(event).await.is_err() {
+                                    cancel.cancel();
+                                    dispatcher.close_result_stream(query_id);
+                                    return;
+                                }
+                            }
+                            None => upstream_done = true,
+                        }
+                    }
+                }
+            }
+
+            if let Some(Err(error)) = execution_result {
+                let _ = sender
+                    .send(Ok(ResultEvent::Error {
+                        message: error.to_string(),
+                    }))
+                    .await;
+            }
+        });
+
+        stream
+    }
+}
+
 #[async_trait]
 impl QueryEngine for DistributedCoordinator {
     fn registry(&self) -> Option<Arc<orchestrator::executor::ExecutorRegistry>> {
         Some(self.scheduler.registry().clone())
     }
 
-    async fn submit_query<'a>(&self, node: QueryNode<'a>) -> Result<Bytes> {
-        let start_time = std::time::Instant::now();
-
-        // 1. BIND: Convert raw SQL AST to a Semantic Logical Plan
+    async fn submit_query<'a>(&self, node: QueryNode<'a>) -> Result<QueryOutput> {
         tracing::debug!(target: "vein_coordinator", "Binding SQL AST to semantic logical plan");
         let logical_plan = self.binder.bind(&node).await?;
 
-        // 2. OPTIMIZE: Apply rule-based rewrites (constant folding, ...)
         tracing::debug!(target: "vein_coordinator", "Applying rule-based plan optimizations");
         let optimized_plan = self.optimizer.optimize(logical_plan)?;
 
-        // 2.5 EXPLAIN: render the optimized plan and return it directly —
-        //             EXPLAIN never executes. `format_plan` already emits a
-        //             trailing newline.
         if let LogicalPlan::Explain { .. } = &optimized_plan {
             let text = display::format_plan(&optimized_plan);
             tracing::info!(target: "vein_coordinator", "EXPLAIN statement evaluated; returning rendered plan");
-            tracing::debug!(target: "vein_coordinator", "Rendered plan:\n{text}");
-            return Ok(Bytes::from(text));
+            return Ok(QueryOutput::Plan(text));
         }
 
         let write_info = match &optimized_plan {
@@ -139,21 +196,22 @@ impl QueryEngine for DistributedCoordinator {
             _ => None,
         };
 
-        // 3. PLAN: Lower the optimized logical plan into a distributed physical Job.
         tracing::debug!(target: "vein_coordinator", "Lowering optimized logical plan to physical DAG");
         let job = self.planner.create_physical_plan(optimized_plan)?;
         let query_id = job.query_id;
-
-        // 4. DISPATCH: The Scheduler breaks the Job into stages/tasks and dispatches them.
         let output_stage = job.output_stage_id();
         tracing::info!(target: "vein_coordinator", ?output_stage, "Dispatching physical job to cluster scheduler");
 
-        let cancel_token = common::cancellation::CancellationToken::new();
-
-        self.scheduler.execute(job, cancel_token).await?;
-
-        // 5. Post-execution handling for Write queries: register in catalog & report OK
         if let Some((target, schema)) = write_info {
+            let dispatcher = self.scheduler.dispatcher().clone();
+            let _result_stream = dispatcher.open_result_stream(query_id);
+            let execution_result = self
+                .scheduler
+                .execute(job, common::cancellation::CancellationToken::new())
+                .await;
+            dispatcher.close_result_stream(query_id);
+            execution_result?;
+
             let location = if target.starts_with('/')
                 || target.starts_with("./")
                 || target.starts_with("../")
@@ -169,32 +227,16 @@ impl QueryEngine for DistributedCoordinator {
                     .with_format(plan::TableFormat::Exo);
                 let _ = catalog.register_table(metadata).await;
             }
-
-            let msg = format!("WRITE OK: table '{target}' successfully written\n");
-            return Ok(Bytes::from(msg));
+            return Ok(QueryOutput::Write {
+                table: target,
+                row_count: 0,
+            });
         }
 
-        // 6. RECEIVE: Extract the collected Arrow IPC bytes from the dispatcher.
-        let output_bytes = self
-            .scheduler
-            .dispatcher()
-            .take_query_output(query_id)
-            .unwrap_or_default();
-
-        // 6. FEEDBACK: Report execution telemetry back to the Reinforcement Learning Optimizer
-        let telemetry = common::protocol::QueryTelemetry {
+        Ok(QueryOutput::Data {
             query_id,
-            execution_time_ms: start_time.elapsed().as_millis() as u64,
-            rows_produced: 0,
-        };
-        tracing::debug!(
-            target: "vein_coordinator",
-            query_id = %telemetry.query_id,
-            elapsed_ms = telemetry.execution_time_ms,
-            "Query execution telemetry recorded"
-        );
-
-        Ok(output_bytes)
+            stream: self.stream_job(job),
+        })
     }
 }
 
@@ -251,11 +293,13 @@ mod tests {
         let node = Parser::new("EXPLAIN FROM users |> SELECT id, name")
             .parse_statement()
             .expect("query should parse");
-        let bytes = engine
+        let QueryOutput::Plan(text) = engine
             .submit_query(node)
             .await
-            .expect("explain should succeed");
-        let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
+            .expect("explain should succeed")
+        else {
+            panic!("EXPLAIN should return a plan");
+        };
         assert!(text.contains("Explain"), "got:\n{text}");
         assert!(text.contains("Scan [table: users"), "got:\n{text}");
         assert!(text.contains("Project"), "got:\n{text}");
@@ -269,11 +313,13 @@ mod tests {
         let node = Parser::new("EXPLAIN FROM users |> WHERE age > 18 + 2 |> SELECT id")
             .parse_statement()
             .expect("query should parse");
-        let bytes = engine
+        let QueryOutput::Plan(text) = engine
             .submit_query(node)
             .await
-            .expect("explain should succeed");
-        let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
+            .expect("explain should succeed")
+        else {
+            panic!("EXPLAIN should return a plan");
+        };
         // Scan-level predicate pushdown renders the filter as scan metadata.
         assert!(
             text.contains("filters: 1"),
@@ -343,11 +389,13 @@ mod tests {
         let node = Parser::new(&query_str)
             .parse_statement()
             .expect("query should parse");
-        let bytes = engine
+        let QueryOutput::Plan(text) = engine
             .submit_query(node)
             .await
-            .expect("explain should succeed");
-        let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
+            .expect("explain should succeed")
+        else {
+            panic!("EXPLAIN should return a plan");
+        };
 
         assert!(text.contains("Explain"), "got:\n{text}");
         assert!(
@@ -363,32 +411,45 @@ mod tests {
         let node = Parser::new("EXPLAIN FROM users |> WRITE out_users")
             .parse_statement()
             .expect("query should parse");
-        let bytes = engine
+        let QueryOutput::Plan(text) = engine
             .submit_query(node)
             .await
-            .expect("explain should succeed");
-        let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
+            .expect("explain should succeed")
+        else {
+            panic!("EXPLAIN should return a plan");
+        };
         assert!(text.contains("Explain"), "got:\n{text}");
         assert!(text.contains("Write"), "got:\n{text}");
     }
 
-    /// Non-EXPLAIN queries proceed through physical planning into the scheduler.
-    /// In an isolated test harness without remote executor daemons registered,
-    /// scheduling fails with `No executors available`.
+    /// Non-EXPLAIN queries return a lazy stream; scheduling errors are delivered
+    /// through that stream so callers can consume one uniform result protocol.
     #[tokio::test]
-    async fn plain_query_reaches_physical_planning() {
+    async fn plain_query_reports_scheduler_error_through_stream() {
         let engine = coordinator();
         let node = Parser::new("FROM users |> SELECT id, name")
             .parse_statement()
             .expect("query should parse");
-        let err = engine
+        let QueryOutput::Data { mut stream, .. } = engine
             .submit_query(node)
             .await
-            .expect_err("no executors registered");
-        assert!(
-            err.to_string().contains("No executors available"),
-            "got {err}"
-        );
+            .expect("planning should return a result stream")
+        else {
+            panic!("plain query should return data");
+        };
+
+        let mut saw_scheduler_error = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("result stream should remain transport-valid") {
+                ResultEvent::Error { message } => {
+                    saw_scheduler_error = message.contains("No executors available");
+                }
+                ResultEvent::Start { .. }
+                | ResultEvent::Batch(_)
+                | ResultEvent::End { .. } => {}
+            }
+        }
+        assert!(saw_scheduler_error, "scheduler error was not streamed");
     }
 
     #[tokio::test]
@@ -441,6 +502,7 @@ mod tests {
         let task = ExecuteTask {
             mode: ExecutionMode::Batch,
             task_id,
+            attempt: 0,
             query_id,
             stage_id: StageId::new(),
             source: DataSource::Memory,
@@ -450,6 +512,8 @@ mod tests {
             },
             sink: DataSink::Client { schema: vec![] },
         };
+
+        let result_stream = dispatcher.open_result_stream(query_id);
 
         // 1. Dispatch over real QUIC
         dispatcher
@@ -462,22 +526,19 @@ mod tests {
             .wait_for_completion(query_id, task_id)
             .await
             .expect("wait for completion over QUIC should succeed");
+        dispatcher.close_result_stream(query_id);
 
-        // 3. Take query output
-        let output = dispatcher
-            .take_query_output(query_id)
-            .expect("should have query output");
-
-        // 4. Verify Arrow IPC stream
-        assert!(!output.is_empty(), "output bytes should not be empty");
-        let cursor = std::io::Cursor::new(output.as_ref());
-        let reader = arrow::ipc::reader::StreamReader::try_new(cursor, None)
-            .expect("valid arrow ipc stream");
+        // 3. Consume the bounded result stream without materializing a response buffer.
+        let mut result_stream = result_stream;
         let mut total_rows = 0;
-        for batch in reader {
-            let b = batch.expect("valid batch");
-            total_rows += b.num_rows();
+        while let Some(event) = result_stream.next().await {
+            match event.expect("valid result event") {
+                ResultEvent::Batch(batch) => total_rows += batch.row_count(),
+                ResultEvent::Error { message } => panic!("query failed: {message}"),
+                ResultEvent::Start { .. } | ResultEvent::End { .. } => {}
+            }
         }
+        assert_eq!(total_rows, 5, "stream should account for all rows");
         assert_eq!(total_rows, 5, "MemorySource produces 5 rows");
     }
 
@@ -492,11 +553,11 @@ mod tests {
         let key = format!("{}/../../certs/server.key", env!("CARGO_MANIFEST_DIR"));
 
         let master_addr: SocketAddr = "127.0.0.1:9190".parse().unwrap();
-        let registry = Arc::new(orchestrator::executor::registry::ExecutorRegistry::new());
+        let registry = Arc::new(ExecutorRegistry::new());
         let dispatcher = Arc::new(
-            orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::with_cert(&cert),
+            QuicTaskDispatcher::with_cert(&cert),
         );
-        let scheduler = Arc::new(orchestrator::scheduler::Scheduler::new(
+        let scheduler = Arc::new(Scheduler::new(
             registry.clone(),
             dispatcher,
             3,
@@ -622,7 +683,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // 2. Set up Coordinator with registered Executor in scheduler
-        let registry = Arc::new(orchestrator::executor::registry::ExecutorRegistry::new());
+        let registry = Arc::new(ExecutorRegistry::new());
         let node_id = NodeId::new();
         registry
             .record_heartbeat(
@@ -638,9 +699,9 @@ mod tests {
             .await;
 
         let dispatcher = Arc::new(
-            orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::with_cert(&cert),
+            QuicTaskDispatcher::with_cert(&cert),
         );
-        let scheduler = Arc::new(orchestrator::scheduler::Scheduler::new(
+        let scheduler = Arc::new(Scheduler::new(
             registry,
             dispatcher,
             3,
@@ -685,8 +746,10 @@ mod tests {
             .submit_query(node)
             .await
             .expect("write query should succeed");
-        let write_msg = String::from_utf8(write_res.to_vec()).expect("utf8 response");
-        assert!(write_msg.contains("WRITE OK: table 'dst_vfs_items'"));
+        let QueryOutput::Write { table, .. } = write_res else {
+            panic!("WRITE should return a write result");
+        };
+        assert_eq!(table, "dst_vfs_items");
 
         // 5. Verify NO loose filesystem directory exists!
         assert!(
@@ -703,35 +766,38 @@ mod tests {
         let node = Parser::new(read_query)
             .parse_statement()
             .expect("query should parse");
-        let read_bytes = coordinator
+        let read_output = coordinator
             .submit_query(node)
             .await
             .expect("read query should succeed");
-
-        assert!(
-            !read_bytes.is_empty(),
-            "Read query must return Arrow IPC bytes"
-        );
-        let cursor = std::io::Cursor::new(read_bytes.as_ref());
-        let mut reader = arrow::ipc::reader::StreamReader::try_new(cursor, None)
-            .expect("valid arrow ipc stream");
+        let QueryOutput::Data { mut stream, .. } = read_output else {
+            panic!("read query should return a data stream");
+        };
 
         let mut total_rows = 0;
-        while let Some(Ok(batch)) = reader.next() {
-            total_rows += batch.num_rows();
-            assert_eq!(batch.num_columns(), 2);
-            let id_col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            let name_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            assert_eq!(id_col.value(0), 1);
-            assert_eq!(name_col.value(0), "laptop");
+        while let Some(event) = stream.next().await {
+            match event.expect("valid result event") {
+                ResultEvent::Batch(batch) => {
+                    total_rows += batch.row_count();
+                    assert_eq!(batch.batch.num_columns(), 2);
+                    let id_col = batch
+                        .batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    let name_col = batch
+                        .batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    assert_eq!(id_col.value(0), 1);
+                    assert_eq!(name_col.value(0), "laptop");
+                }
+                ResultEvent::Error { message } => panic!("query failed: {message}"),
+                ResultEvent::Start { .. } | ResultEvent::End { .. } => {}
+            }
         }
         assert_eq!(
             total_rows, 3,

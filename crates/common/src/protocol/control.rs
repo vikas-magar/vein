@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
 use super::task::ExecuteTask;
+use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
 
 /// Kind of a Vein cluster node.
 #[derive(
@@ -64,14 +64,53 @@ pub enum VeinControlEvent {
         task_id: TaskId,
         /// Query the task belongs to.
         query_id: QueryId,
+        /// Retry attempt for this task.
+        attempt: u32,
         /// Number of rows produced.
         row_count: u64,
         /// Bytes read from storage.
         bytes_read: u64,
         /// Wall-clock duration in nanoseconds.
         duration_ns: u64,
-        /// Serialized Arrow IPC stream for DataSink::Client tasks.
+        /// Serialized Arrow IPC stream for non-streaming task results.
         result_bytes: Option<Vec<u8>>,
+    },
+    /// Starts a streamed client result for a task.
+    TaskResultStart {
+        /// The task producing the result.
+        task_id: TaskId,
+        /// Query the task belongs to.
+        query_id: QueryId,
+        /// Retry attempt for this task.
+        attempt: u32,
+    },
+    /// Carries one independently framed Arrow IPC batch for a streamed result.
+    TaskResultBatch {
+        /// The task producing the result.
+        task_id: TaskId,
+        /// Query the task belongs to.
+        query_id: QueryId,
+        /// Retry attempt for this task.
+        attempt: u32,
+        /// Monotonic batch sequence within the task attempt.
+        sequence: u64,
+        /// Arrow IPC payload containing exactly one record batch.
+        result_bytes: Vec<u8>,
+    },
+    /// Completes a streamed client result for a task.
+    TaskResultEnd {
+        /// The task producing the result.
+        task_id: TaskId,
+        /// Query the task belongs to.
+        query_id: QueryId,
+        /// Retry attempt for this task.
+        attempt: u32,
+        /// Number of rows produced.
+        row_count: u64,
+        /// Bytes read from storage.
+        bytes_read: u64,
+        /// Wall-clock duration in nanoseconds.
+        duration_ns: u64,
     },
     /// A new task assigned to this Executor.
     DispatchTask(ExecuteTask),
@@ -81,6 +120,8 @@ pub enum VeinControlEvent {
         task_id: TaskId,
         /// Query the task belongs to.
         query_id: QueryId,
+        /// Retry attempt for this task.
+        attempt: u32,
         /// Error message.
         error: String,
     },

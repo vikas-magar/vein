@@ -13,15 +13,16 @@ pub mod task;
 pub mod vcs_exchange;
 
 // Re-export Micro-IR definitions
+pub use exchange::{
+    ExchangeAddressColumn, ExchangeBatch, ExchangeFragment, ExchangeKey, ExchangeManifest,
+    ExchangeState,
+};
 pub use ir::constant::ScalarConstant;
 pub use ir::op::MicroOp;
 pub use ir::program::{MicroProgram, RegId};
 pub use ir::state::{AggOpCode, JoinKind, StateMode};
-pub use exchange::{
-    ExchangeAddressColumn, ExchangeBatch, ExchangeFragment, ExchangeKey, ExchangeManifest, ExchangeState,
-};
-pub use vcs_exchange::{VcsExchangeRequest, VcsExchangeResponse};
 pub use join::{ExchangeInput, JoinKeyMode, JoinKeySpec, JoinSource, PhysicalJoinType};
+pub use vcs_exchange::{VcsExchangeRequest, VcsExchangeResponse};
 
 // Re-export task & pipeline definitions
 pub use task::{
@@ -91,6 +92,7 @@ mod tests {
         let task = ExecuteTask {
             mode: ExecutionMode::Batch,
             task_id: TaskId::new(),
+            attempt: 0,
             query_id: QueryId::new(),
             stage_id: StageId::new(),
             source: DataSource::File(FileScanTask {
@@ -173,8 +175,8 @@ mod tests {
         let mut hb_aligned = rkyv::util::AlignedVec::<16>::new();
         hb_aligned.extend_from_slice(&hb_bytes);
 
-        let archived_hb =
-            rkyv::access::<control::ArchivedVeinControlEvent, Error>(&hb_aligned).expect("Heartbeat access failed");
+        let archived_hb = rkyv::access::<control::ArchivedVeinControlEvent, Error>(&hb_aligned)
+            .expect("Heartbeat access failed");
 
         match archived_hb {
             control::ArchivedVeinControlEvent::Heartbeat {

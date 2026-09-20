@@ -11,17 +11,17 @@ use tracing::{error, info};
 use crate::daemon::{DaemonContext, QueuedTask, WorkerPool};
 use crate::exchange::VcsExchangeMetadata;
 use crate::factory::TaskExecutorBuilder;
-use crate::runtime::{ArrowIpcOutputEncoder, OutputEncoder, TaskExecutor};
+use crate::runtime::{ArrowIpcOutputEncoder, TaskExecutor};
+use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::{NodeId, QueryId, TaskId};
 use common::protocol::{
     ArchivedVeinControlEvent, DataSink, ExecuteTask, NodeKind, NodeLoad, VeinControlEvent,
 };
 use common::transport::{
-    build_quic_client, build_quic_server, extract_control_payload, frame_control_message,
-    VcsExchangeClient,
+    VcsExchangeClient, build_quic_client, build_quic_server, extract_control_payload,
+    frame_control_message,
 };
-use common::Result;
 use error::VeinError;
 
 /// Configuration for an [`ExecutorDaemon`].
@@ -119,7 +119,9 @@ impl ExecutorDaemon {
                 let mut stream = match conn.open_bidirectional_stream().await {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::trace!("Heartbeat open stream to master {target_addr} failed: {e}");
+                        tracing::trace!(
+                            "Heartbeat open stream to master {target_addr} failed: {e}"
+                        );
                         continue;
                     }
                 };
@@ -194,17 +196,16 @@ impl ExecutorDaemon {
                         let mut aligned = rkyv::util::AlignedVec::<16>::new();
                         aligned.extend_from_slice(payload);
 
-                        let archived = match rkyv::access::<
-                            ArchivedVeinControlEvent,
-                            rkyv::rancor::Error,
-                        >(&aligned)
-                        {
-                            Ok(e) => e,
-                            Err(e) => {
-                                error!("Failed to validate control event bytes: {}", e);
-                                return;
-                            }
-                        };
+                        let archived =
+                            match rkyv::access::<ArchivedVeinControlEvent, rkyv::rancor::Error>(
+                                &aligned,
+                            ) {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    error!("Failed to validate control event bytes: {}", e);
+                                    return;
+                                }
+                            };
 
                         match archived {
                             ArchivedVeinControlEvent::DispatchTask(archived_task) => {
@@ -218,11 +219,20 @@ impl ExecutorDaemon {
 
                                 let cancel = CancellationToken::new();
                                 ctx.register_task(task_id, cancel.clone());
+                                let is_client = matches!(&task.sink, DataSink::Client { .. });
+                                let attempt = task.attempt;
+                                let (output_sender, output_receiver) = if is_client {
+                                    let (sender, receiver) = flume::bounded(8);
+                                    (Some(sender), Some(receiver))
+                                } else {
+                                    (None, None)
+                                };
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 let queued = QueuedTask {
                                     task: task.clone(),
                                     cancel,
                                     responder: tx,
+                                    output_sender,
                                 };
 
                                 if let Err(e) = ctx.task_queue.send_async(queued).await {
@@ -231,6 +241,7 @@ impl ExecutorDaemon {
                                     let fail_event = VeinControlEvent::TaskFailed {
                                         task_id,
                                         query_id,
+                                        attempt,
                                         error: format!("Worker queue error: {e}"),
                                     };
                                     if let Ok(bytes) =
@@ -243,57 +254,259 @@ impl ExecutorDaemon {
                                     return;
                                 }
 
+                                if is_client {
+                                    let start = VeinControlEvent::TaskResultStart {
+                                        task_id,
+                                        query_id,
+                                        attempt,
+                                    };
+                                    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&start)
+                                    {
+                                        Ok(bytes) => bytes,
+                                        Err(e) => {
+                                            error!("Failed to serialize result start: {}", e);
+                                            return;
+                                        }
+                                    };
+                                    if let Err(e) = stream.send(frame_control_message(&bytes)).await
+                                    {
+                                        error!("Failed to stream result start: {}", e);
+                                        return;
+                                    }
+
+                                    let output_receiver =
+                                        output_receiver.expect("client output receiver");
+                                    tokio::spawn(async move {
+                                        let encoder = ArrowIpcOutputEncoder::new();
+                                        let mut sequence = 0u64;
+                                        while let Ok(batch) = output_receiver.recv_async().await {
+                                            let payload = match encoder.encode_batch(&batch) {
+                                                Ok(payload) => payload,
+                                                Err(e) => {
+                                                    error!(
+                                                        "Failed to encode streamed result: {}",
+                                                        e
+                                                    );
+                                                    return;
+                                                }
+                                            };
+                                            let event = VeinControlEvent::TaskResultBatch {
+                                                task_id,
+                                                query_id,
+                                                attempt,
+                                                sequence,
+                                                result_bytes: payload.to_vec(),
+                                            };
+                                            let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(
+                                                &event,
+                                            ) {
+                                                Ok(bytes) => bytes,
+                                                Err(e) => {
+                                                    error!(
+                                                        "Failed to serialize streamed result: {}",
+                                                        e
+                                                    );
+                                                    return;
+                                                }
+                                            };
+                                            if let Err(e) =
+                                                stream.send(frame_control_message(&bytes)).await
+                                            {
+                                                error!("Failed to stream result batch: {}", e);
+                                                return;
+                                            }
+                                            sequence += 1;
+                                        }
+
+                                        ctx.active_tasks.remove(&task_id);
+                                        match rx.await {
+                                            Ok(Ok(res)) => {
+                                                let end = VeinControlEvent::TaskResultEnd {
+                                                    task_id,
+                                                    query_id,
+                                                    attempt,
+                                                    row_count: res.row_count,
+                                                    bytes_read: res.metrics.bytes_read,
+                                                    duration_ns: res.metrics.duration_ns,
+                                                };
+                                                if let Ok(bytes) =
+                                                    rkyv::to_bytes::<rkyv::rancor::Error>(&end)
+                                                {
+                                                    let _ = stream
+                                                        .send(frame_control_message(&bytes))
+                                                        .await;
+                                                }
+                                            }
+                                            Ok(Err(err)) => {
+                                                let event = VeinControlEvent::TaskFailed {
+                                                    task_id,
+                                                    query_id,
+                                                    attempt,
+                                                    error: err.to_string(),
+                                                };
+                                                if let Ok(bytes) =
+                                                    rkyv::to_bytes::<rkyv::rancor::Error>(&event)
+                                                {
+                                                    let _ = stream
+                                                        .send(frame_control_message(&bytes))
+                                                        .await;
+                                                }
+                                            }
+                                            Err(_) => {}
+                                        }
+                                        let _ = stream.finish();
+                                    });
+                                    return;
+                                }
+
                                 // Await task execution completion from worker
                                 let exec_result = rx.await;
                                 ctx.active_tasks.remove(&task_id);
 
-                                let event = match exec_result {
-                                    Ok(Ok(res)) => {
-                                        let result_bytes = if matches!(task.sink, DataSink::Client { .. }) {
-                                            let encoder = ArrowIpcOutputEncoder::new();
-                                            match encoder.encode(&res.output) {
-                                                Ok(b) => Some(b.to_vec()),
-                                                Err(e) => {
-                                                    error!("Failed to encode output batches into Arrow IPC: {}", e);
-                                                    None
-                                                }
-                                            }
-                                        } else {
-                                            None
-                                        };
-
-                                        VeinControlEvent::TaskCompleted {
+                                match exec_result {
+                                    Ok(Ok(res))
+                                        if matches!(&task.sink, DataSink::Client { .. }) =>
+                                    {
+                                        let start = VeinControlEvent::TaskResultStart {
                                             task_id,
                                             query_id,
+                                            attempt,
+                                        };
+                                        let start_bytes =
+                                            match rkyv::to_bytes::<rkyv::rancor::Error>(&start) {
+                                                Ok(bytes) => bytes,
+                                                Err(e) => {
+                                                    error!(
+                                                        "Failed to serialize result start: {}",
+                                                        e
+                                                    );
+                                                    return;
+                                                }
+                                            };
+                                        if let Err(e) =
+                                            stream.send(frame_control_message(&start_bytes)).await
+                                        {
+                                            error!("Failed to stream result start: {}", e);
+                                            return;
+                                        }
+
+                                        let encoder = ArrowIpcOutputEncoder::new();
+                                        for (sequence, batch) in res.output.iter().enumerate() {
+                                            let payload = match encoder.encode_batch(batch) {
+                                                Ok(bytes) => bytes,
+                                                Err(e) => {
+                                                    error!(
+                                                        "Failed to encode result batch {}: {}",
+                                                        sequence, e
+                                                    );
+                                                    return;
+                                                }
+                                            };
+                                            let event = VeinControlEvent::TaskResultBatch {
+                                                task_id,
+                                                query_id,
+                                                attempt,
+                                                sequence: sequence as u64,
+                                                result_bytes: payload.to_vec(),
+                                            };
+                                            let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(
+                                                &event,
+                                            ) {
+                                                Ok(bytes) => bytes,
+                                                Err(e) => {
+                                                    error!(
+                                                        "Failed to serialize result batch {}: {}",
+                                                        sequence, e
+                                                    );
+                                                    return;
+                                                }
+                                            };
+                                            if let Err(e) =
+                                                stream.send(frame_control_message(&bytes)).await
+                                            {
+                                                error!(
+                                                    "Failed to stream result batch {}: {}",
+                                                    sequence, e
+                                                );
+                                                return;
+                                            }
+                                        }
+
+                                        let end = VeinControlEvent::TaskResultEnd {
+                                            task_id,
+                                            query_id,
+                                            attempt,
                                             row_count: res.row_count,
                                             bytes_read: res.metrics.bytes_read,
                                             duration_ns: res.metrics.duration_ns,
-                                            result_bytes,
-                                        }
-                                    }
-                                    Ok(Err(err)) => VeinControlEvent::TaskFailed {
-                                        task_id,
-                                        query_id,
-                                        error: err.to_string(),
-                                    },
-                                    Err(_) => VeinControlEvent::TaskFailed {
-                                        task_id,
-                                        query_id,
-                                        error: "Worker dropped task channel without responding"
-                                            .to_string(),
-                                    },
-                                };
-
-                                match rkyv::to_bytes::<rkyv::rancor::Error>(&event) {
-                                    Ok(bytes) => {
-                                        let wire = frame_control_message(&bytes);
-                                        if let Err(e) = stream.send(wire).await {
-                                            error!("Failed to stream task response to master: {}", e);
+                                        };
+                                        match rkyv::to_bytes::<rkyv::rancor::Error>(&end) {
+                                            Ok(bytes) => {
+                                                if let Err(e) =
+                                                    stream.send(frame_control_message(&bytes)).await
+                                                {
+                                                    error!("Failed to stream result end: {}", e);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to serialize result end: {}", e)
+                                            }
                                         }
                                         let _ = stream.finish();
                                     }
-                                    Err(e) => {
-                                        error!("Failed to serialize TaskCompleted event: {}", e);
+                                    Ok(Ok(res)) => {
+                                        let event = VeinControlEvent::TaskCompleted {
+                                            task_id,
+                                            query_id,
+                                            attempt,
+                                            row_count: res.row_count,
+                                            bytes_read: res.metrics.bytes_read,
+                                            duration_ns: res.metrics.duration_ns,
+                                            result_bytes: None,
+                                        };
+                                        match rkyv::to_bytes::<rkyv::rancor::Error>(&event) {
+                                            Ok(bytes) => {
+                                                let _ = stream
+                                                    .send(frame_control_message(&bytes))
+                                                    .await;
+                                                let _ = stream.finish();
+                                            }
+                                            Err(e) => error!(
+                                                "Failed to serialize TaskCompleted event: {}",
+                                                e
+                                            ),
+                                        }
+                                    }
+                                    Ok(Err(err)) => {
+                                        let event = VeinControlEvent::TaskFailed {
+                                            task_id,
+                                            query_id,
+                                            attempt,
+                                            error: err.to_string(),
+                                        };
+                                        if let Ok(bytes) =
+                                            rkyv::to_bytes::<rkyv::rancor::Error>(&event)
+                                        {
+                                            let _ =
+                                                stream.send(frame_control_message(&bytes)).await;
+                                        }
+                                        let _ = stream.finish();
+                                    }
+                                    Err(_) => {
+                                        let event = VeinControlEvent::TaskFailed {
+                                            task_id,
+                                            query_id,
+                                            attempt,
+                                            error: "Worker dropped task channel without responding"
+                                                .to_string(),
+                                        };
+                                        if let Ok(bytes) =
+                                            rkyv::to_bytes::<rkyv::rancor::Error>(&event)
+                                        {
+                                            let _ =
+                                                stream.send(frame_control_message(&bytes)).await;
+                                        }
+                                        let _ = stream.finish();
                                     }
                                 }
                             }
@@ -451,13 +664,10 @@ impl ExecutorDaemonBuilder {
         // The task executor (default stages + expressions) that runs tasks.
         let mut task_builder = TaskExecutorBuilder::new();
         if let Some(endpoint) = self.vcs_endpoint {
-            let ca_cert = self
-                .vcs_ca_cert
-                .unwrap_or_else(|| config.cert_path.clone());
+            let ca_cert = self.vcs_ca_cert.unwrap_or_else(|| config.cert_path.clone());
             let client = VcsExchangeClient::connect(endpoint, ca_cert)?;
-            task_builder = task_builder.with_exchange_metadata(Arc::new(
-                VcsExchangeMetadata::new(client),
-            ));
+            task_builder =
+                task_builder.with_exchange_metadata(Arc::new(VcsExchangeMetadata::new(client)));
         }
         let executor: Arc<dyn TaskExecutor> = Arc::new(task_builder.build());
         let workers = WorkerPool::start(config.workers, rx, executor);
@@ -485,6 +695,7 @@ mod tests {
         let task = ExecuteTask {
             mode: ExecutionMode::Batch,
             task_id: TaskId::new(),
+            attempt: 0,
             query_id: QueryId::new(),
             stage_id: StageId::new(),
             source: DataSource::File(FileScanTask {
@@ -602,4 +813,3 @@ mod tests {
         }
     }
 }
-

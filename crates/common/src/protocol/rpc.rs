@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::identifiers::{QueryId, TaskId};
 use super::task::ExecuteTask;
+use crate::identifiers::{QueryId, TaskId};
 
 /// Request from Client to Master.
 #[derive(
@@ -37,14 +37,32 @@ pub enum ProtocolResponse {
         /// Rendered execution plan text.
         text: String,
     },
-    /// A chunk of result data (Arrow IPC).
-    Data {
-        /// Serialized Arrow IPC batch.
+    /// Announces the beginning of a streamed query result.
+    QueryResultStart {
+        /// The query producing the result.
+        query_id: QueryId,
+    },
+    /// One independently decodable Arrow IPC record batch.
+    QueryResultBatch {
+        /// The query producing the result.
+        query_id: QueryId,
+        /// Monotonically increasing batch sequence.
+        sequence: u64,
+        /// Serialized Arrow IPC payload for exactly one record batch.
         batch: Vec<u8>,
     },
     /// The query finished successfully.
-    QueryCompleted {
-        /// Total rows produced (for batch queries).
+    QueryResultEnd {
+        /// The query producing the result.
+        query_id: QueryId,
+        /// Total rows produced.
+        row_count: u64,
+    },
+    /// A write query completed successfully.
+    WriteCompleted {
+        /// Destination table name.
+        table: String,
+        /// Rows written when known.
         row_count: u64,
     },
     /// Query successfully cancelled.

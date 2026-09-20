@@ -5,16 +5,18 @@
 
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
+
 use crate::exchange::SharedExchangeMetadata;
+use crate::operators::join::HashJoinSource;
 use crate::operators::sink::{CollectSink, DiscardSink, ShuffleSink, StorageSink};
 use crate::operators::source::{MemorySource, ScanSource, VfsExchangeSource};
-use crate::operators::join::HashJoinSource;
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use crate::runtime::ExecutorBuilder;
 use crate::udf::FunctionRegistry;
 use crate::vm::VectorVmExecutor;
-use common::protocol::{DataSink, DataSource, MicroProgram};
 use common::Result;
+use common::protocol::{DataSink, DataSource, MicroProgram};
 use error::VeinError;
 
 /// Builds a [`TaskExecutor`](crate::runtime::TaskExecutor) with configurable
@@ -147,7 +149,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                     None => source,
                 };
                 Ok(Box::new(source))
-            },
+            }
             DataSource::Join(join) => {
                 let store = vfs::VfsTableStore::shared_or_default()
                     .map_err(|e| VeinError::internal(format!("open VFS join store: {e}")))?;
@@ -160,10 +162,10 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                     None => HashJoinSource::with_store(join.clone(), store),
                 };
                 Ok(Box::new(source))
-            },
-            DataSource::Stream(_) => Err(VeinError::internal(
-                "Stream source is not yet implemented",
-            )),
+            }
+            DataSource::Stream(_) => {
+                Err(VeinError::internal("Stream source is not yet implemented"))
+            }
         }
     }
 
@@ -192,6 +194,23 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                 self.metadata.clone(),
             ))),
             DataSink::Storage(target) => Ok(Box::new(StorageSink::new(target.clone()))),
+        }
+    }
+
+    fn build_streaming_sink(
+        &self,
+        sink: &DataSink,
+        output: flume::Sender<RecordBatch>,
+    ) -> Result<Box<dyn Sink<DataChunk>>> {
+        match sink {
+            DataSink::Client { schema } => {
+                let field_names = schema.iter().map(|field| field.name.clone()).collect();
+                Ok(Box::new(CollectSink::with_field_names_and_sender(
+                    field_names,
+                    output,
+                )))
+            }
+            _ => self.build_sink(sink),
         }
     }
 }

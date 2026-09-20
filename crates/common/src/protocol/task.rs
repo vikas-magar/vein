@@ -1,16 +1,24 @@
 //! Physical task definitions, execution modes, sources, and sinks.
 
-use std::ops::Range;
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 
-use crate::identifiers::{QueryId, StageId, TaskId};
-use super::ir::MicroProgram;
 use super::exchange::ExchangeKey;
+use super::ir::MicroProgram;
 use super::join::{JoinKeySpec, JoinSource};
+use crate::identifiers::{QueryId, StageId, TaskId};
 
 /// Supported file formats for storage scans.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub enum FileFormat {
     /// Apache Parquet
@@ -38,7 +46,14 @@ pub struct FieldSchema {
 
 /// A typed scalar value used by storage-level predicate pushdown.
 #[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub enum ScanPredicateValue {
     /// Boolean value.
@@ -57,7 +72,14 @@ pub enum ScanPredicateValue {
 
 /// A predicate that can be evaluated by a storage format without materializing rows.
 #[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub enum ScanPredicate {
     /// A comparison against a canonical-address-backed column.
@@ -180,7 +202,15 @@ pub struct ShuffleTarget {
 
 /// Key-value option pair for storage and scan configurations.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub struct KeyValue {
     /// Option key name.
@@ -281,6 +311,8 @@ pub struct ExecuteTask {
     pub mode: ExecutionMode,
     /// Unique task identifier.
     pub task_id: TaskId,
+    /// Retry attempt for this task, starting at zero.
+    pub attempt: u32,
     /// Query this task belongs to.
     pub query_id: QueryId,
     /// Stage this task is part of.

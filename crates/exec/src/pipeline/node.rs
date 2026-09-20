@@ -47,4 +47,9 @@ pub trait Sink<B>: PipelineNode<B> {
     fn collect(&mut self) -> Vec<RecordBatch> {
         Vec::new()
     }
+
+    /// Number of rows consumed by this sink.
+    fn row_count(&self) -> u64 {
+        0
+    }
 }

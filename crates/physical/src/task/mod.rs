@@ -52,6 +52,7 @@ impl Task {
         ExecuteTask {
             mode,
             task_id: self.task_id,
+            attempt: 0,
             query_id,
             stage_id,
             source: self.source,
