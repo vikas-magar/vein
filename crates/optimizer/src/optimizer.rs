@@ -23,7 +23,7 @@ use crate::context::{
     OptimizationDiagnostics, OptimizerConfig, OptimizerContext, RuleExecution,
 };
 use crate::rule::{OptimizerRule, RuleType};
-use crate::rules::ConstantFoldingRule;
+use crate::rules::{ConstantFoldingRule, ExpressionSimplificationRule};
 
 /// The engine-facing optimizer seam.
 ///
@@ -68,10 +68,12 @@ impl OptimizerPipeline {
 
     /// The default production pipeline: heuristic rules only.
     ///
-    /// Currently installs [`ConstantFoldingRule`]; new universally-beneficial
-    /// rules are added here as they land.
+    /// Installs constant folding followed by expression simplification.
     pub fn production() -> Self {
-        Self::new(vec![Arc::new(ConstantFoldingRule)])
+        Self::new(vec![
+            Arc::new(ConstantFoldingRule),
+            Arc::new(ExpressionSimplificationRule),
+        ])
     }
 }
 
