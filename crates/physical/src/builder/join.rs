@@ -2,16 +2,18 @@
 
 use std::sync::Arc;
 
+use common::Result;
 use common::identifiers::{PartitionId, QueryId, StageId, TaskId};
 use common::protocol::{
     DataSink, DataSource, ExchangeInput, FieldSchema, JoinKeyMode, JoinKeySpec, JoinSource,
     MicroProgram, PhysicalJoinType, ShuffleTarget,
 };
-use common::Result;
 use error::VeinError;
 use parser::ast::expr::BinaryOp;
 use parser::ast::pipe_op::JoinType;
-use plan::{LogicalExpr, LogicalPlan, PlanTraversal, ResolvedColumn, VeinSchema};
+use plan::{
+    LogicalExpr, LogicalPlan, PlanTraversal, ResolvedColumn, TableFormat, VeinDataType, VeinSchema,
+};
 
 use crate::builder::pipeline::{DefaultPipelineStageBuilder, PipelineStageBuilder};
 use crate::compiler::BytecodeCompiler;
@@ -116,13 +118,25 @@ impl JoinStageBuilder for DefaultJoinStageBuilder {
             ));
         }
 
+        let address_native = key_pairs.iter().all(|(left_column, right_column)| {
+            left_column.data_type == right_column.data_type
+                && supports_address_key(left_column, left.schema())
+                && supports_address_key(right_column, right.schema())
+                && address_key_available(left.as_ref(), left_column)
+                && address_key_available(right.as_ref(), right_column)
+        });
+        let key_mode = if address_native {
+            JoinKeyMode::AddressNative
+        } else {
+            JoinKeyMode::ValueNative
+        };
         let left_keys: Vec<JoinKeySpec> = key_pairs
             .iter()
-            .map(|(left, _)| key_spec(left))
+            .map(|(left, _)| key_spec(left, key_mode))
             .collect();
         let right_keys: Vec<JoinKeySpec> = key_pairs
             .iter()
-            .map(|(_, right)| key_spec(right))
+            .map(|(_, right)| key_spec(right, key_mode))
             .collect();
 
         let (left_source, left_program, left_schema) =
@@ -192,8 +206,7 @@ impl JoinStageBuilder for DefaultJoinStageBuilder {
         let right_distribution =
             Distribution::Hash(HashPartitioning::new(right_keys.clone(), partition_count));
 
-        let (join_program, output_schema) =
-            compile_post_join_program(plan, join_schema)?;
+        let (join_program, output_schema) = compile_post_join_program(plan, join_schema)?;
 
         let output_schema = output_schema
             .fields
@@ -225,7 +238,10 @@ impl JoinStageBuilder for DefaultJoinStageBuilder {
                 join_type: PhysicalJoinType::Inner,
                 left_keys: left_keys.clone(),
                 right_keys: right_keys.clone(),
-                requires_exact_verification: true,
+                requires_exact_verification: address_native
+                    && key_pairs
+                        .iter()
+                        .any(|(left, _)| is_variable_width(&left.data_type)),
                 left_schema: left_schema_fields.clone(),
                 right_schema: right_schema_fields.clone(),
             });
@@ -305,10 +321,7 @@ fn compile_post_join_node(
             compiler.compile_filter(predicate, &input_schema)?;
             Ok(input_schema)
         }
-        _ => Err(VeinError::planning(
-            "unsupported operator above join",
-            None,
-        )),
+        _ => Err(VeinError::planning("unsupported operator above join", None)),
     }
 }
 
@@ -332,11 +345,81 @@ fn schema_fingerprint(schema: &[FieldSchema]) -> String {
         .join("|")
 }
 
-fn key_spec(column: &ResolvedColumn) -> JoinKeySpec {
+fn key_spec(column: &ResolvedColumn, mode: JoinKeyMode) -> JoinKeySpec {
     JoinKeySpec {
         field_id: column.id.0 as i32,
         column_name: column.name.clone(),
-        mode: JoinKeyMode::Auto,
+        mode,
+    }
+}
+
+fn is_variable_width(data_type: &VeinDataType) -> bool {
+    matches!(
+        data_type,
+        VeinDataType::Utf8
+            | VeinDataType::LargeUtf8
+            | VeinDataType::StringView
+            | VeinDataType::Binary
+            | VeinDataType::LargeBinary
+            | VeinDataType::BinaryView
+    )
+}
+
+fn supports_address_key(column: &ResolvedColumn, schema: &VeinSchema) -> bool {
+    schema.fields.iter().any(|field| field.id == column.id)
+        && matches!(
+            column.data_type,
+            VeinDataType::Boolean
+                | VeinDataType::Int8
+                | VeinDataType::Int16
+                | VeinDataType::Int32
+                | VeinDataType::Int64
+                | VeinDataType::UInt8
+                | VeinDataType::UInt16
+                | VeinDataType::UInt32
+                | VeinDataType::UInt64
+                | VeinDataType::Float32
+                | VeinDataType::Float64
+                | VeinDataType::Utf8
+                | VeinDataType::LargeUtf8
+                | VeinDataType::StringView
+                | VeinDataType::Binary
+                | VeinDataType::LargeBinary
+                | VeinDataType::BinaryView
+                | VeinDataType::Date32
+                | VeinDataType::Timestamp(_)
+        )
+}
+
+fn address_key_available(plan: &LogicalPlan, column: &ResolvedColumn) -> bool {
+    match plan {
+        LogicalPlan::Scan { table, schema, .. } => {
+            matches!(table.format.as_ref(), Some(TableFormat::Exo))
+                && supports_address_key(column, schema)
+        }
+        LogicalPlan::Filter { input, .. } | LogicalPlan::Write { input, .. } => {
+            address_key_available(input, column)
+        }
+        LogicalPlan::Project {
+            input,
+            exprs,
+            schema,
+        } => {
+            let Some(expression) = schema
+                .fields
+                .iter()
+                .zip(exprs.iter())
+                .find_map(|(field, expression)| (field.id == column.id).then_some(expression))
+            else {
+                return false;
+            };
+            let LogicalExpr::Column(source_column) = expression else {
+                return false;
+            };
+            address_key_available(input, source_column)
+        }
+        LogicalPlan::SubqueryAlias { input, .. } => address_key_available(input, column),
+        _ => false,
     }
 }
 
@@ -381,10 +464,22 @@ fn collect_equi_keys(
                 ));
             };
 
-            let left_is_left = left_schema.fields.iter().any(|field| field.id == left_column.id);
-            let right_is_right = right_schema.fields.iter().any(|field| field.id == right_column.id);
-            let left_is_right = right_schema.fields.iter().any(|field| field.id == left_column.id);
-            let right_is_left = left_schema.fields.iter().any(|field| field.id == right_column.id);
+            let left_is_left = left_schema
+                .fields
+                .iter()
+                .any(|field| field.id == left_column.id);
+            let right_is_right = right_schema
+                .fields
+                .iter()
+                .any(|field| field.id == right_column.id);
+            let left_is_right = right_schema
+                .fields
+                .iter()
+                .any(|field| field.id == left_column.id);
+            let right_is_left = left_schema
+                .fields
+                .iter()
+                .any(|field| field.id == right_column.id);
 
             if left_is_left && right_is_right {
                 output.push((left_column.clone(), right_column.clone()));
@@ -402,5 +497,67 @@ fn collect_equi_keys(
             "physical join currently supports only conjunctive equality predicates",
             None,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plan::{ColumnId, TableMetadata};
+    use std::sync::Arc;
+
+    fn scan(column: ResolvedColumn, format: Option<TableFormat>) -> LogicalPlan {
+        let schema = VeinSchema {
+            fields: vec![column.clone()],
+        };
+        let mut table = TableMetadata::new("test", Arc::new(schema.clone()));
+        table.format = format;
+        LogicalPlan::Scan {
+            table: Arc::new(table),
+            projection: None,
+            filters: vec![],
+            schema: Box::new(schema),
+        }
+    }
+
+    fn column(id: usize, data_type: VeinDataType) -> ResolvedColumn {
+        ResolvedColumn::new(ColumnId(id), format!("c{id}"), None, data_type)
+    }
+
+    #[test]
+    fn selects_address_native_only_for_exo_keys() {
+        let left_column = column(1, VeinDataType::Int64);
+        let right_column = column(2, VeinDataType::Int64);
+        let left = scan(left_column.clone(), Some(TableFormat::Exo));
+        let right = scan(right_column.clone(), Some(TableFormat::Exo));
+
+        assert!(address_key_available(&left, &left_column));
+        assert!(address_key_available(&right, &right_column));
+        assert_eq!(
+            key_spec(&left_column, JoinKeyMode::AddressNative).mode,
+            JoinKeyMode::AddressNative
+        );
+    }
+
+    #[test]
+    fn falls_back_to_value_native_when_one_side_lacks_addresses() {
+        let left_column = column(1, VeinDataType::Int64);
+        let right_column = column(2, VeinDataType::Int64);
+        let left = scan(left_column.clone(), Some(TableFormat::Exo));
+        let right = scan(right_column.clone(), Some(TableFormat::Parquet));
+
+        assert!(address_key_available(&left, &left_column));
+        assert!(!address_key_available(&right, &right_column));
+        assert_eq!(
+            key_spec(&right_column, JoinKeyMode::ValueNative).mode,
+            JoinKeyMode::ValueNative
+        );
+    }
+
+    #[test]
+    fn variable_width_address_keys_require_exact_verification() {
+        assert!(is_variable_width(&VeinDataType::Utf8));
+        assert!(is_variable_width(&VeinDataType::Binary));
+        assert!(!is_variable_width(&VeinDataType::Int64));
     }
 }

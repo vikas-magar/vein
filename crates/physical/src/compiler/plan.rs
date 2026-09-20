@@ -4,17 +4,18 @@
 //! relational nodes ([`LogicalPlan::Scan`], [`LogicalPlan::Filter`], [`LogicalPlan::Project`])
 //! and compiles them into a unified [`DataSource`] and [`MicroProgram`].
 
+use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{
-    DataSource, FieldSchema, FileFormat, FileScanTask, MicroProgram, ScanPredicate, ScanPredicateValue,
+    DataSource, FieldSchema, FileFormat, FileScanTask, MicroProgram, ScanPredicate,
+    ScanPredicateValue,
 };
-use common::Result;
 use error::VeinError;
+use parser::ast::expr::BinaryOp;
+use plan::LogicalPlan;
 use plan::expr::literal::LogicalLiteral;
 use plan::expr::logical::LogicalExpr;
 use plan::schema::VeinSchema;
-use parser::ast::expr::BinaryOp;
-use plan::LogicalPlan;
 
 use super::expr::BytecodeCompiler;
 
@@ -46,6 +47,12 @@ impl PipelineCompiler {
     /// Only predicates directly attached to a scan are eligible. Filters above a
     /// projection or expression are left to the Micro-IR residual filter.
     fn extract_scan_predicates(plan: &LogicalPlan) -> Vec<ScanPredicate> {
+        // Address predicates are a physical capability of EXO. Other sources
+        // retain the expression for residual execution until they expose their
+        // own zone-map contract.
+        if !Self::scan_supports_address_pruning(plan) {
+            return Vec::new();
+        }
         match plan {
             LogicalPlan::Scan { filters, .. } => {
                 let mut predicates = Vec::new();
@@ -72,6 +79,18 @@ impl PipelineCompiler {
         matches!(plan, LogicalPlan::Scan { .. } | LogicalPlan::Filter { .. })
     }
 
+    fn scan_supports_address_pruning(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Scan { table, .. } => {
+                matches!(table.format.as_ref(), Some(plan::TableFormat::Exo))
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Write { input, .. } => Self::scan_supports_address_pruning(input),
+            _ => false,
+        }
+    }
+
     fn collect_scan_predicates(expr: &LogicalExpr, output: &mut Vec<ScanPredicate>) {
         if let LogicalExpr::BinaryOp {
             left,
@@ -89,18 +108,18 @@ impl PipelineCompiler {
 
     fn compile_scan_predicate(expr: &LogicalExpr) -> Option<ScanPredicate> {
         match expr {
-            LogicalExpr::IsNull { expr } => Self::column_name(expr).map(|column| {
-                ScanPredicate::AddressNull {
+            LogicalExpr::IsNull { expr } => {
+                Self::column_name(expr).map(|column| ScanPredicate::AddressNull {
                     column,
                     is_null: true,
-                }
-            }),
-            LogicalExpr::IsNotNull { expr } => Self::column_name(expr).map(|column| {
-                ScanPredicate::AddressNull {
+                })
+            }
+            LogicalExpr::IsNotNull { expr } => {
+                Self::column_name(expr).map(|column| ScanPredicate::AddressNull {
                     column,
                     is_null: false,
-                }
-            }),
+                })
+            }
             LogicalExpr::InList {
                 expr,
                 list,
@@ -116,15 +135,16 @@ impl PipelineCompiler {
             LogicalExpr::BinaryOp {
                 left, op, right, ..
             } => {
-                let (column, operator, literal) = match (Self::column_name(left), Self::literal_to_scan_value(right)) {
-                    (Some(column), Some(value)) => (column, Self::operator_name(op)?, value),
-                    (None, _) => {
-                        let column = Self::column_name(right)?;
-                        let value = Self::literal_to_scan_value(left)?;
-                        (column, Self::reverse_operator_name(op)?, value)
-                    }
-                    _ => return None,
-                };
+                let (column, operator, literal) =
+                    match (Self::column_name(left), Self::literal_to_scan_value(right)) {
+                        (Some(column), Some(value)) => (column, Self::operator_name(op)?, value),
+                        (None, _) => {
+                            let column = Self::column_name(right)?;
+                            let value = Self::literal_to_scan_value(left)?;
+                            (column, Self::reverse_operator_name(op)?, value)
+                        }
+                        _ => return None,
+                    };
                 Some(ScanPredicate::Address {
                     column,
                     operator: operator.to_string(),
@@ -268,18 +288,24 @@ impl PipelineCompiler {
                     vec![url.clone()]
                 };
 
-                let format = if let Some((_, v)) = options.iter().find(|(k, _)| k.eq_ignore_ascii_case("format")) {
+                let format = if let Some((_, v)) = options
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("format"))
+                {
                     match v.to_lowercase().as_str() {
                         "exo" => FileFormat::Exo,
                         "csv" => FileFormat::Csv,
                         "json" => FileFormat::Json,
                         _ => FileFormat::Parquet,
                     }
-                } else if scan_files.iter().any(|f| f.ends_with(".parquet")) || url.ends_with(".parquet") {
+                } else if scan_files.iter().any(|f| f.ends_with(".parquet"))
+                    || url.ends_with(".parquet")
+                {
                     FileFormat::Parquet
                 } else if scan_files.iter().any(|f| f.ends_with(".csv")) || url.ends_with(".csv") {
                     FileFormat::Csv
-                } else if scan_files.iter().any(|f| f.ends_with(".json")) || url.ends_with(".json") {
+                } else if scan_files.iter().any(|f| f.ends_with(".json")) || url.ends_with(".json")
+                {
                     FileFormat::Json
                 } else {
                     FileFormat::Exo
@@ -322,7 +348,9 @@ impl PipelineCompiler {
         compiler: &mut BytecodeCompiler,
     ) -> Result<VeinSchema> {
         match plan {
-            LogicalPlan::Scan { filters, schema, .. } => {
+            LogicalPlan::Scan {
+                filters, schema, ..
+            } => {
                 let upstream_schema = (**schema).clone();
                 for filter in filters {
                     compiler.compile_filter(filter, &upstream_schema)?;
@@ -469,18 +497,18 @@ mod tests {
 
     #[test]
     fn test_compile_exo_scan_format() {
-        let schema = Box::new(VeinSchema::new(vec![
-            ResolvedColumn::new(ColumnId(1), "col_a", None, VeinDataType::Utf8),
-        ]));
+        let schema = Box::new(VeinSchema::new(vec![ResolvedColumn::new(
+            ColumnId(1),
+            "col_a",
+            None,
+            VeinDataType::Utf8,
+        )]));
 
         // 1. Table with Exo format metadata
         let table = std::sync::Arc::new(
-            plan::TableMetadata::new(
-                "tbl_10/part_000002",
-                std::sync::Arc::new(*schema.clone()),
-            )
-            .with_format(plan::TableFormat::Exo)
-            .with_files(vec!["tbl_10/part_000002".to_string()]),
+            plan::TableMetadata::new("tbl_10/part_000002", std::sync::Arc::new(*schema.clone()))
+                .with_format(plan::TableFormat::Exo)
+                .with_files(vec!["tbl_10/part_000002".to_string()]),
         );
         let scan_exo = LogicalPlan::Scan {
             table,

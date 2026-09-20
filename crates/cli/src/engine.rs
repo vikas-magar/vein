@@ -3,12 +3,12 @@ use bytes::Bytes;
 use common::Result;
 use std::sync::Arc;
 
-use optimizer::Optimizer;
-use physical::PhysicalPlanner;
-use parser::ast::query::QueryNode;
-use plan::display;
-use plan::LogicalPlan;
 use binder::LogicalBinder;
+use optimizer::Optimizer;
+use parser::ast::query::QueryNode;
+use physical::PhysicalPlanner;
+use plan::LogicalPlan;
+use plan::display;
 
 /// The absolute highest-level abstraction for the Database Engine.
 /// Represents the complete end-to-end lifecycle from query submission to result retrieval.
@@ -203,9 +203,9 @@ mod tests {
     use super::*;
     use binder::QueryBinder;
     use binder::testing::MockFunctionRegistry;
-    use orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher;
     use orchestrator::ExecutorRegistry;
     use orchestrator::Scheduler;
+    use orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher;
     use parser::Parser;
     use physical::DefaultPhysicalPlanner;
     use std::time::Duration;
@@ -251,7 +251,10 @@ mod tests {
         let node = Parser::new("EXPLAIN FROM users |> SELECT id, name")
             .parse_statement()
             .expect("query should parse");
-        let bytes = engine.submit_query(node).await.expect("explain should succeed");
+        let bytes = engine
+            .submit_query(node)
+            .await
+            .expect("explain should succeed");
         let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
         assert!(text.contains("Explain"), "got:\n{text}");
         assert!(text.contains("Scan [table: users"), "got:\n{text}");
@@ -266,9 +269,16 @@ mod tests {
         let node = Parser::new("EXPLAIN FROM users |> WHERE age > 18 + 2 |> SELECT id")
             .parse_statement()
             .expect("query should parse");
-        let bytes = engine.submit_query(node).await.expect("explain should succeed");
+        let bytes = engine
+            .submit_query(node)
+            .await
+            .expect("explain should succeed");
         let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
-        assert!(text.contains("> 20"), "expected folded literal, got:\n{text}");
+        // Scan-level predicate pushdown renders the filter as scan metadata.
+        assert!(
+            text.contains("filters: 1"),
+            "expected scan filter, got:\n{text}"
+        );
         assert!(!text.contains("18 + 2"), "expected folding, got:\n{text}");
     }
 
@@ -288,8 +298,12 @@ mod tests {
             let statuses: Vec<String> = vec!["A".into(), "B".into(), "C".into()];
 
             writer.write_primitive_column("id", &ids).expect("write id");
-            writer.write_primitive_column("amount", &amounts).expect("write amount");
-            writer.write_string_column("status", &statuses).expect("write status");
+            writer
+                .write_primitive_column("amount", &amounts)
+                .expect("write amount");
+            writer
+                .write_string_column("status", &statuses)
+                .expect("write status");
             writer.finish().expect("finish part");
         }
 
@@ -329,11 +343,17 @@ mod tests {
         let node = Parser::new(&query_str)
             .parse_statement()
             .expect("query should parse");
-        let bytes = engine.submit_query(node).await.expect("explain should succeed");
+        let bytes = engine
+            .submit_query(node)
+            .await
+            .expect("explain should succeed");
         let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
 
         assert!(text.contains("Explain"), "got:\n{text}");
-        assert!(text.contains("ExternalScan") || text.contains("Scan"), "got:\n{text}");
+        assert!(
+            text.contains("ExternalScan") || text.contains("Scan"),
+            "got:\n{text}"
+        );
         assert!(text.contains("Project"), "got:\n{text}");
     }
 
@@ -343,7 +363,10 @@ mod tests {
         let node = Parser::new("EXPLAIN FROM users |> WRITE out_users")
             .parse_statement()
             .expect("query should parse");
-        let bytes = engine.submit_query(node).await.expect("explain should succeed");
+        let bytes = engine
+            .submit_query(node)
+            .await
+            .expect("explain should succeed");
         let text = String::from_utf8(bytes.to_vec()).expect("explain output should be utf-8");
         assert!(text.contains("Explain"), "got:\n{text}");
         assert!(text.contains("Write"), "got:\n{text}");
@@ -358,7 +381,10 @@ mod tests {
         let node = Parser::new("FROM users |> SELECT id, name")
             .parse_statement()
             .expect("query should parse");
-        let err = engine.submit_query(node).await.expect_err("no executors registered");
+        let err = engine
+            .submit_query(node)
+            .await
+            .expect_err("no executors registered");
         assert!(
             err.to_string().contains("No executors available"),
             "got {err}"
@@ -368,10 +394,12 @@ mod tests {
     #[tokio::test]
     async fn test_end_to_end_quic_task_dispatch_and_stream_return() {
         use common::identifiers::{NodeId, QueryId, StageId, TaskId};
-        use common::protocol::{DataSink, DataSource, ExecuteTask, ExecutionMode, MicroProgram, NodeKind, NodeLoad};
+        use common::protocol::{
+            DataSink, DataSource, ExecuteTask, ExecutionMode, MicroProgram, NodeKind, NodeLoad,
+        };
+        use exec::ExecutorDaemon;
         use orchestrator::executor::NodeInfo;
         use orchestrator::traits::TaskDispatcher;
-        use exec::ExecutorDaemon;
         use std::net::SocketAddr;
 
         let cert = format!("{}/../../certs/server.crt", env!("CARGO_MANIFEST_DIR"));
@@ -465,7 +493,9 @@ mod tests {
 
         let master_addr: SocketAddr = "127.0.0.1:9190".parse().unwrap();
         let registry = Arc::new(orchestrator::executor::registry::ExecutorRegistry::new());
-        let dispatcher = Arc::new(orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::with_cert(&cert));
+        let dispatcher = Arc::new(
+            orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::with_cert(&cert),
+        );
         let scheduler = Arc::new(orchestrator::scheduler::Scheduler::new(
             registry.clone(),
             dispatcher,
@@ -524,9 +554,14 @@ mod tests {
         }
 
         assert!(!resp.is_empty(), "master should send back ack");
-        assert_eq!(resp[0], common::transport::CONTROL_STREAM_OPCODE, "ack should have control opcode");
+        assert_eq!(
+            resp[0],
+            common::transport::CONTROL_STREAM_OPCODE,
+            "ack should have control opcode"
+        );
 
-        let payload = common::transport::extract_control_payload(&resp).expect("extract ack payload");
+        let payload =
+            common::transport::extract_control_payload(&resp).expect("extract ack payload");
 
         let mut aligned = rkyv::util::AlignedVec::<16>::new();
         aligned.extend_from_slice(payload);
@@ -538,7 +573,10 @@ mod tests {
         let nodes = registry.available(Duration::from_secs(5)).await;
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, node_id);
-        assert_eq!(nodes[0].addr, "127.0.0.1:9191".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            nodes[0].addr,
+            "127.0.0.1:9191".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -599,7 +637,9 @@ mod tests {
             )
             .await;
 
-        let dispatcher = Arc::new(orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::with_cert(&cert));
+        let dispatcher = Arc::new(
+            orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::with_cert(&cert),
+        );
         let scheduler = Arc::new(orchestrator::scheduler::Scheduler::new(
             registry,
             dispatcher,
@@ -649,8 +689,14 @@ mod tests {
         assert!(write_msg.contains("WRITE OK: table 'dst_vfs_items'"));
 
         // 5. Verify NO loose filesystem directory exists!
-        assert!(!std::path::Path::new("dst_vfs_items").exists(), "No directory dst_vfs_items on disk!");
-        assert!(!std::path::Path::new("data/dst_vfs_items").exists(), "No directory data/dst_vfs_items on disk!");
+        assert!(
+            !std::path::Path::new("dst_vfs_items").exists(),
+            "No directory dst_vfs_items on disk!"
+        );
+        assert!(
+            !std::path::Path::new("data/dst_vfs_items").exists(),
+            "No directory data/dst_vfs_items on disk!"
+        );
 
         // 6. Execute READ query: FROM dst_vfs_items |> SELECT id, name
         let read_query = "FROM dst_vfs_items |> SELECT id, name";
@@ -662,7 +708,10 @@ mod tests {
             .await
             .expect("read query should succeed");
 
-        assert!(!read_bytes.is_empty(), "Read query must return Arrow IPC bytes");
+        assert!(
+            !read_bytes.is_empty(),
+            "Read query must return Arrow IPC bytes"
+        );
         let cursor = std::io::Cursor::new(read_bytes.as_ref());
         let mut reader = arrow::ipc::reader::StreamReader::try_new(cursor, None)
             .expect("valid arrow ipc stream");
@@ -671,12 +720,23 @@ mod tests {
         while let Some(Ok(batch)) = reader.next() {
             total_rows += batch.num_rows();
             assert_eq!(batch.num_columns(), 2);
-            let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let name_col = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let name_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
             assert_eq!(id_col.value(0), 1);
             assert_eq!(name_col.value(0), "laptop");
         }
-        assert_eq!(total_rows, 3, "Must scan all 3 rows from VFS memory-mapped blocks");
+        assert_eq!(
+            total_rows, 3,
+            "Must scan all 3 rows from VFS memory-mapped blocks"
+        );
 
         // Clean up: reset shared store so other tests get their own default.
         vfs::VfsTableStore::reset_shared();

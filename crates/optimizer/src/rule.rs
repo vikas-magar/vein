@@ -39,12 +39,29 @@ pub trait OptimizerRule: Send + Sync {
         }
     }
 
+    /// Whether this rule needs the complete plan and a top-down analysis.
+    ///
+    /// Plan-scoped rules are invoked once per sweep through apply_plan
+    /// instead of being applied independently to every node.
+    fn is_plan_rule(&self) -> bool {
+        false
+    }
+
+    /// Attempts to rewrite a complete logical plan.
+    ///
+    /// Node-scoped rules use the default implementation. Plan-scoped rules
+    /// override this method to perform analyses such as required-column
+    /// propagation that cannot be expressed as a bottom-up node rewrite.
+    fn apply_plan(
+        &self,
+        _plan: &LogicalPlan,
+        _context: &OptimizerContext,
+    ) -> Result<Option<LogicalPlan>> {
+        Ok(None)
+    }
+
     /// Attempts to rewrite a single plan node.
     ///
-    /// Returns `Some(rewritten)` if the node was changed and `None` otherwise.
-    fn apply(
-        &self,
-        plan: &LogicalPlan,
-        context: &OptimizerContext,
-    ) -> Result<Option<LogicalPlan>>;
+    /// Returns Some(rewritten) if the node was changed and None otherwise.
+    fn apply(&self, plan: &LogicalPlan, context: &OptimizerContext) -> Result<Option<LogicalPlan>>;
 }

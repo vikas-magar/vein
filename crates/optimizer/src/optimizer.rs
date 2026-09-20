@@ -21,7 +21,11 @@ use plan::{LogicalPlan, PlanTraversal};
 
 use crate::context::{OptimizationDiagnostics, OptimizerConfig, OptimizerContext, RuleExecution};
 use crate::rule::{OptimizerRule, RuleType};
-use crate::rules::{ConstantFoldingRule, ExpressionSimplificationRule, FilterNormalizationRule};
+use crate::rules::{
+    ColumnPruningRule, ConstantFoldingRule, ExpressionSimplificationRule, FilterNormalizationRule,
+    JoinPredicateTransitivityRule, PredicatePushdownRule, ScanFilterPushdownRule,
+    ScanStatisticsPruningRule,
+};
 
 /// The engine-facing optimizer seam.
 ///
@@ -72,6 +76,11 @@ impl OptimizerPipeline {
             Arc::new(ConstantFoldingRule),
             Arc::new(ExpressionSimplificationRule),
             Arc::new(FilterNormalizationRule),
+            Arc::new(ScanStatisticsPruningRule),
+            Arc::new(JoinPredicateTransitivityRule),
+            Arc::new(PredicatePushdownRule),
+            Arc::new(ScanFilterPushdownRule),
+            Arc::new(ColumnPruningRule),
         ])
     }
 }
@@ -149,6 +158,13 @@ fn apply_rule(
     plan: LogicalPlan,
     context: &OptimizerContext,
 ) -> Result<(LogicalPlan, bool)> {
+    if rule.is_plan_rule() {
+        return Ok(match rule.apply_plan(&plan, context)? {
+            Some(rewritten) => (rewritten, true),
+            None => (plan, false),
+        });
+    }
+
     let changed = Cell::new(false);
     let result = rewrite_bottom_up(plan, &mut |node| {
         Ok(match rule.apply(&node, context)? {
