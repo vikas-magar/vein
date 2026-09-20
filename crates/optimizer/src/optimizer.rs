@@ -19,11 +19,9 @@ use std::time::Instant;
 use error::{Result, VeinError};
 use plan::{LogicalPlan, PlanTraversal};
 
-use crate::context::{
-    OptimizationDiagnostics, OptimizerConfig, OptimizerContext, RuleExecution,
-};
+use crate::context::{OptimizationDiagnostics, OptimizerConfig, OptimizerContext, RuleExecution};
 use crate::rule::{OptimizerRule, RuleType};
-use crate::rules::{ConstantFoldingRule, ExpressionSimplificationRule};
+use crate::rules::{ConstantFoldingRule, ExpressionSimplificationRule, FilterNormalizationRule};
 
 /// The engine-facing optimizer seam.
 ///
@@ -73,6 +71,7 @@ impl OptimizerPipeline {
         Self::new(vec![
             Arc::new(ConstantFoldingRule),
             Arc::new(ExpressionSimplificationRule),
+            Arc::new(FilterNormalizationRule),
         ])
     }
 }

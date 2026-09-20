@@ -23,4 +23,7 @@ pub use context::{
 };
 pub use optimizer::{Optimizer, OptimizerPipeline};
 pub use rule::{OptimizerRule, RuleType};
-pub use rules::{ constant_fold::ConstantFoldingRule, expression_simplify::ExpressionSimplificationRule, };
+pub use rules::{
+    constant_fold::ConstantFoldingRule, expression_simplify::ExpressionSimplificationRule,
+    filter_normalize::FilterNormalizationRule,
+};
