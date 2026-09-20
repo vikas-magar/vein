@@ -14,18 +14,16 @@
 
 use std::cell::Cell;
 use std::sync::Arc;
+use std::time::Instant;
 
-use error::Result;
+use error::{Result, VeinError};
 use plan::{LogicalPlan, PlanTraversal};
 
+use crate::context::{
+    OptimizationDiagnostics, OptimizerConfig, OptimizerContext, RuleExecution,
+};
 use crate::rule::{OptimizerRule, RuleType};
 use crate::rules::ConstantFoldingRule;
-
-/// Hard cap on the number of full rule sweeps before giving up.
-///
-/// Correct rules converge in one sweep (once a node is folded, re-folding it
-/// is a no-op); the cap exists to bound misbehaving or interacting rules.
-const MAX_SWEEPS: usize = 8;
 
 /// The engine-facing optimizer seam.
 ///
@@ -41,12 +39,22 @@ pub trait Optimizer: Send + Sync {
 /// An ordered, extensible collection of rules driven to a fixpoint.
 pub struct OptimizerPipeline {
     rules: Vec<Arc<dyn OptimizerRule>>,
+    config: OptimizerConfig,
 }
 
 impl OptimizerPipeline {
     /// Creates a pipeline from the given rules.
     pub fn new(rules: Vec<Arc<dyn OptimizerRule>>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            config: OptimizerConfig::default(),
+        }
+    }
+
+    /// Sets the optimizer configuration.
+    pub fn with_config(mut self, config: OptimizerConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Appends a rule to the pipeline.
@@ -74,39 +82,75 @@ impl Default for OptimizerPipeline {
     }
 }
 
-impl Optimizer for OptimizerPipeline {
-    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        let heuristic_rules: Vec<_> = self
+impl OptimizerPipeline {
+    /// Optimizes a plan and returns rule execution diagnostics.
+    pub fn optimize_with_diagnostics(
+        &self,
+        plan: LogicalPlan,
+    ) -> Result<(LogicalPlan, OptimizationDiagnostics)> {
+        let context = OptimizerContext::new(self.config.clone());
+        let rules: Vec<_> = self
             .rules
             .iter()
             .filter(|rule| rule.rule_type() == RuleType::Heuristic)
             .collect();
 
+        let mut diagnostics = OptimizationDiagnostics::default();
         let mut current = plan;
-        for _ in 0..MAX_SWEEPS {
+
+        for sweep in 1..=context.config().max_sweeps {
             let mut next = current;
             let mut changed = false;
-            for rule in &heuristic_rules {
-                let (result, any_changed) = apply_rule(rule.as_ref(), next)?;
+
+            for rule in &rules {
+                let started = Instant::now();
+                let (result, any_changed) = apply_rule(rule.as_ref(), next, &context)?;
                 next = result;
                 changed |= any_changed;
+                diagnostics.rule_executions.push(RuleExecution {
+                    rule_name: rule.name().to_string(),
+                    phase: rule.phase(),
+                    sweep,
+                    changed: any_changed,
+                    elapsed: started.elapsed(),
+                });
             }
+
+            diagnostics.sweeps = sweep;
             if !changed {
-                return Ok(next);
+                return Ok((next, diagnostics));
             }
             current = next;
         }
-        Ok(current)
+
+        Err(VeinError::planning(
+            format!(
+                "optimizer did not converge within {} sweeps",
+                context.config().max_sweeps
+            ),
+            None,
+        ))
+    }
+}
+
+impl Optimizer for OptimizerPipeline {
+    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        self.optimize_with_diagnostics(plan)
+            .map(|(optimized, _)| optimized)
     }
 }
 
 /// Applies a single rule bottom-up to the whole plan.
 ///
 /// Returns the rewritten plan and whether the rule changed anything.
-fn apply_rule(rule: &dyn OptimizerRule, plan: LogicalPlan) -> Result<(LogicalPlan, bool)> {
+fn apply_rule(
+    rule: &dyn OptimizerRule,
+    plan: LogicalPlan,
+    context: &OptimizerContext,
+) -> Result<(LogicalPlan, bool)> {
     let changed = Cell::new(false);
     let result = rewrite_bottom_up(plan, &mut |node| {
-        Ok(match rule.apply(&node)? {
+        Ok(match rule.apply(&node, context)? {
             Some(rewritten) => {
                 changed.set(true);
                 rewritten

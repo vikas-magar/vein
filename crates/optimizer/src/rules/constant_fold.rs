@@ -11,6 +11,7 @@ use plan::{
     LogicalExpr, LogicalLiteral, LogicalPlan, SortKey, WindowExpr,
 };
 
+use crate::context::OptimizerContext;
 use crate::rule::{OptimizerRule, RuleType};
 
 /// A heuristic rule that folds constant sub-expressions into literals.
@@ -25,7 +26,11 @@ impl OptimizerRule for ConstantFoldingRule {
         RuleType::Heuristic
     }
 
-    fn apply(&self, plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    fn apply(
+        &self,
+        plan: &LogicalPlan,
+        _context: &OptimizerContext,
+    ) -> Result<Option<LogicalPlan>> {
         let rewritten = rewrite_node(plan);
         Ok((rewritten != *plan).then_some(rewritten))
     }
@@ -405,7 +410,7 @@ mod tests {
             schema: Box::new(plan::VeinSchema { fields: vec![] }),
         };
 
-        let optimized = rule.apply(&plan).unwrap().expect("plan must change");
+        let optimized = rule.apply(&plan, &OptimizerContext::default()).unwrap().expect("plan must change");
         let LogicalPlan::Aggregate {
             grouping_sets,
             aggs,
@@ -422,14 +427,14 @@ mod tests {
     fn unchanged_plan_returns_none() {
         let rule = ConstantFoldingRule;
         let plan = project(vec![lit(17)]);
-        assert!(rule.apply(&plan).unwrap().is_none());
+        assert!(rule.apply(&plan, &OptimizerContext::default()).unwrap().is_none());
     }
 
     #[test]
     fn project_exprs_are_folded() {
         let plan = project(vec![bin(BinaryOp::Multiply, lit(3), lit(4))]);
         let optimized = ConstantFoldingRule
-            .apply(&plan)
+            .apply(&plan, &OptimizerContext::default())
             .unwrap()
             .expect("plan must change");
         let LogicalPlan::Project { exprs, .. } = optimized else {
@@ -447,7 +452,7 @@ mod tests {
         };
 
         let optimized = ConstantFoldingRule
-            .apply(&plan)
+            .apply(&plan, &OptimizerContext::default())
             .unwrap()
             .expect("plan must change");
         let LogicalPlan::Filter { predicate, .. } = optimized else {
@@ -456,3 +461,4 @@ mod tests {
         assert_eq!(predicate, LogicalExpr::Literal(LogicalLiteral::Boolean(false)));
     }
 }
+
