@@ -473,9 +473,11 @@ impl VfsTableStore {
                 DataType::Int64 => {
                     let arr = col_array.as_any().downcast_ref::<Int64Array>().unwrap();
                     if arr.null_count() > 0 {
-                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        let values: Vec<Option<i64>> = (0..arr.len())
+                            .map(|idx| arr.is_valid(idx).then(|| arr.value(idx)))
+                            .collect();
                         part_writer
-                            .write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 8)
+                            .write_nullable_primitive_column(col_name, &values)
                             .map_err(|e| {
                                 VfsError::Internal(format!(
                                     "Error writing nullable i64 column '{col_name}': {e}"
@@ -494,9 +496,11 @@ impl VfsTableStore {
                 DataType::UInt64 => {
                     let arr = col_array.as_any().downcast_ref::<UInt64Array>().unwrap();
                     if arr.null_count() > 0 {
-                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        let values: Vec<Option<u64>> = (0..arr.len())
+                            .map(|idx| arr.is_valid(idx).then(|| arr.value(idx)))
+                            .collect();
                         part_writer
-                            .write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 8)
+                            .write_nullable_primitive_column(col_name, &values)
                             .map_err(|e| {
                                 VfsError::Internal(format!(
                                     "Error writing nullable u64 column '{col_name}': {e}"
@@ -515,9 +519,11 @@ impl VfsTableStore {
                 DataType::Float64 => {
                     let arr = col_array.as_any().downcast_ref::<Float64Array>().unwrap();
                     if arr.null_count() > 0 {
-                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        let values: Vec<Option<f64>> = (0..arr.len())
+                            .map(|idx| arr.is_valid(idx).then(|| arr.value(idx)))
+                            .collect();
                         part_writer
-                            .write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 1)
+                            .write_nullable_primitive_column(col_name, &values)
                             .map_err(|e| {
                                 VfsError::Internal(format!(
                                     "Error writing nullable f64 column '{col_name}': {e}"
@@ -589,9 +595,11 @@ impl VfsTableStore {
                 DataType::Date64 => {
                     let arr = col_array.as_any().downcast_ref::<Date64Array>().unwrap();
                     if arr.null_count() > 0 {
-                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        let values: Vec<Option<i64>> = (0..arr.len())
+                            .map(|idx| arr.is_valid(idx).then(|| arr.value(idx)))
+                            .collect();
                         part_writer
-                            .write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 8)
+                            .write_nullable_primitive_column(col_name, &values)
                             .map_err(|e| {
                                 VfsError::Internal(format!(
                                     "Error writing nullable date64 column '{col_name}': {e}"
@@ -607,6 +615,17 @@ impl VfsTableStore {
                             })?;
                     }
                 }
+                DataType::Time64(_) | DataType::Duration(_) => {
+                    let int_arr = arrow::compute::cast(col_array.as_ref(), &DataType::Int64)
+                        .map_err(|e| VfsError::Internal(format!("Failed to cast temporal column: {e}")))?;
+                    let arr = int_arr.as_any().downcast_ref::<Int64Array>().unwrap();
+                    let values: Vec<Option<i64>> = (0..arr.len())
+                        .map(|idx| arr.is_valid(idx).then(|| arr.value(idx)))
+                        .collect();
+                    part_writer
+                        .write_nullable_primitive_column(col_name, &values)
+                        .map_err(|e| VfsError::Internal(format!("Error writing temporal column '{col_name}': {e}")))?;
+                }
                 DataType::Timestamp(_, _) => {
                     let int_arr = arrow::compute::cast(col_array.as_ref(), &DataType::Int64)
                         .map_err(|e| {
@@ -614,9 +633,11 @@ impl VfsTableStore {
                         })?;
                     let arr = int_arr.as_any().downcast_ref::<Int64Array>().unwrap();
                     if arr.null_count() > 0 {
-                        let (vaddrs, validity) = nullable_primitive_vaddrs(arr);
+                        let values: Vec<Option<i64>> = (0..arr.len())
+                            .map(|idx| arr.is_valid(idx).then(|| arr.value(idx)))
+                            .collect();
                         part_writer
-                            .write_raw_address_column_with_validity(col_name, &vaddrs, &validity, 8)
+                            .write_nullable_primitive_column(col_name, &values)
                             .map_err(|e| {
                                 VfsError::Internal(format!(
                                     "Error writing nullable timestamp column '{col_name}': {e}"
@@ -630,6 +651,48 @@ impl VfsTableStore {
                                     "Error writing timestamp column '{col_name}': {e}"
                                 ))
                             })?;
+                    }
+                }
+                DataType::FixedSizeBinary(_) => {
+                    let arr = col_array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+                    let vaddrs: Vec<u64> = (0..arr.len())
+                        .map(|idx| if arr.is_null(idx) { 0 } else { arr.value(idx).to_canonical() })
+                        .collect();
+                    let payloads: Vec<Option<Vec<u8>>> = (0..arr.len())
+                        .map(|idx| arr.is_valid(idx).then(|| arr.value(idx).to_vec()))
+                        .collect();
+                    part_writer
+                        .write_raw_column(col_name, &vaddrs, &payloads)
+                        .map_err(|e| VfsError::Internal(format!("Error writing fixed binary column '{col_name}': {e}")))?;
+                }
+                DataType::Decimal128(_, _) => {
+                    let arr = col_array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                    if arr.null_count() > 0 {
+                        let values: Vec<Option<i128>> = (0..arr.len())
+                            .map(|idx| arr.is_valid(idx).then(|| arr.value(idx)))
+                            .collect();
+                        part_writer
+                            .write_nullable_primitive_column(col_name, &values)
+                            .map_err(|e| VfsError::Internal(format!("Error writing Decimal128 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer
+                            .write_primitive_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing Decimal128 column '{col_name}': {e}")))?;
+                    }
+                }
+                DataType::Decimal256(_, _) => {
+                    let arr = col_array.as_any().downcast_ref::<Decimal256Array>().unwrap();
+                    if arr.null_count() > 0 {
+                        let values: Vec<Option<i256>> = (0..arr.len())
+                            .map(|idx| arr.is_valid(idx).then(|| arr.value(idx)))
+                            .collect();
+                        part_writer
+                            .write_nullable_primitive_column(col_name, &values)
+                            .map_err(|e| VfsError::Internal(format!("Error writing Decimal256 column '{col_name}': {e}")))?;
+                    } else {
+                        part_writer
+                            .write_primitive_column(col_name, arr.values())
+                            .map_err(|e| VfsError::Internal(format!("Error writing Decimal256 column '{col_name}': {e}")))?;
                     }
                 }
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
@@ -694,40 +757,10 @@ impl VfsTableStore {
                     }
                 }
                 _ => {
-                    let str_arr = arrow::compute::cast(col_array.as_ref(), &DataType::Utf8)
-                        .map_err(|e| {
-                            VfsError::Internal(format!("Failed to cast fallback type to utf8: {e}"))
-                        })?;
-                    let arr = str_arr.as_any().downcast_ref::<StringArray>().unwrap();
-                    if arr.null_count() > 0 {
-                        let opt_strings: Vec<Option<String>> = (0..arr.len())
-                            .map(|idx| {
-                                if arr.is_null(idx) {
-                                    None
-                                } else {
-                                    Some(arr.value(idx).to_string())
-                                }
-                            })
-                            .collect();
-                        part_writer
-                            .write_opt_string_column(col_name, &opt_strings)
-                            .map_err(|e| {
-                                VfsError::Internal(format!(
-                                    "Error writing nullable string column '{col_name}': {e}"
-                                ))
-                            })?;
-                    } else {
-                        let strings: Vec<String> = (0..arr.len())
-                            .map(|idx| arr.value(idx).to_string())
-                            .collect();
-                        part_writer
-                            .write_string_column(col_name, &strings)
-                            .map_err(|e| {
-                                VfsError::Internal(format!(
-                                    "Error writing string column '{col_name}': {e}"
-                                ))
-                            })?;
-                    }
+                    return Err(VfsError::Internal(format!(
+                        "EXO does not support safe typed storage for Arrow data type {:?}",
+                        col_array.data_type()
+                    )));
                 }
             }
         }

@@ -15,7 +15,7 @@ use crate::addr::{ExoAddressReader, ExoAddressWriter};
 use crate::coord::ToCanonicalAddress;
 use crate::error::{ExoError, ExoResult};
 use crate::tombstone::TombstoneMask;
-use crate::traits::{AddressReader, AddressWriter, VaultWriter};
+use crate::traits::{AddressReader, AddressWriter, ExactValueCodec, VaultWriter};
 use crate::vault::{ExoVaultReader, ExoVaultWriter};
 
 /// Metadata descriptor for an immutable Part.
@@ -340,28 +340,87 @@ impl PartWriter {
         )
     }
 
-    /// Writes a primitive column directly to `.exo.addr` without creating any `.exo.vault`.
-    pub fn write_primitive_column<T: ToCanonicalAddress>(
+    /// Writes a primitive column using the canonical EXO width policy.
+    ///
+    /// Values below 64 bits are stored in the address plane only. Values of
+    /// exactly 64 bits are stored in both the address plane and the exact-value
+    /// vault so address joins and exact late materialization can coexist.
+    pub fn write_primitive_column<T: ExactValueCodec>(
         &mut self,
         col_name: &str,
         values: &[T],
     ) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
-        self.write_column_data(
-            col_name,
-            8,
-            |addr| {
-                for val in values {
-                    addr.append_vaddr(val.to_canonical())?;
-                }
-                Ok(())
-            },
-            None::<fn(&mut dyn VaultWriter) -> ExoResult<()>>,
-        )
+        let slot_width = if T::WIDTH >= 8 { 8 } else { T::WIDTH };
+        if T::WIDTH >= 8 {
+            self.write_column_data(
+                col_name,
+                slot_width,
+                |addr| {
+                    for val in values {
+                        addr.append_vaddr(val.to_canonical())?;
+                    }
+                    Ok(())
+                },
+                Some(|vault: &mut dyn VaultWriter| {
+                    for val in values {
+                        vault.append_fixed_bytes(&val.encode_exact())?;
+                    }
+                    Ok(())
+                }),
+            )
+        } else {
+            self.write_column_data(
+                col_name,
+                slot_width,
+                |addr| {
+                    for val in values {
+                        addr.append_vaddr(val.to_canonical())?;
+                    }
+                    Ok(())
+                },
+                None::<fn(&mut dyn VaultWriter) -> ExoResult<()>>,
+            )
+        }
+    }
+
+    /// Writes a nullable primitive column using the canonical EXO width policy.
+    pub fn write_nullable_primitive_column<T: ExactValueCodec>(
+        &mut self,
+        col_name: &str,
+        values: &[Option<T>],
+    ) -> ExoResult<()> {
+        self.check_or_set_total_rows(col_name, values.len() as u64)?;
+        let slot_width = if T::WIDTH >= 8 { 8 } else { T::WIDTH };
+        let vaddrs: Vec<u64> = values
+            .iter()
+            .map(|value| value.as_ref().map_or(0, ToCanonicalAddress::to_canonical))
+            .collect();
+        let validity: Vec<bool> = values.iter().map(Option::is_some).collect();
+        if T::WIDTH >= 8 {
+            self.write_column_data(
+                col_name,
+                slot_width,
+                |addr| addr.append_nullable_batch(&vaddrs, &validity),
+                Some(|vault: &mut dyn VaultWriter| {
+                    for value in values {
+                        vault.append_opt_fixed_bytes(value.as_ref().map(ExactValueCodec::encode_exact).as_deref())?;
+                    }
+                    Ok(())
+                }),
+            )
+        } else {
+            self.write_column_data(
+                col_name,
+                slot_width,
+                |addr| addr.append_nullable_batch(&vaddrs, &validity),
+                None::<fn(&mut dyn VaultWriter) -> ExoResult<()>>,
+            )
+        }
     }
 
     /// Writes a primitive column with a specific codec.
-    pub fn write_primitive_column_with_codec<T: ToCanonicalAddress>(
+    pub fn write_primitive_column_with_codec<T: ExactValueCodec>(
         &mut self,
         col_name: &str,
         values: &[T],
@@ -951,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn test_primitive_inlining_zero_vault() -> ExoResult<()> {
+    fn test_primitive_address_and_exact_vault() -> ExoResult<()> {
         let dir = tempdir()?;
         let mut writer = PartWriter::create(dir.path(), 99, 256)?;
 
@@ -960,14 +1019,30 @@ mod tests {
 
         writer.write_primitive_column("id", &ids)?;
         writer.write_primitive_column("value", &values)?;
+        let decimals128: Vec<i128> = vec![-1234567890123456789, 42, i128::MAX, 0, -1, 999];
+        let decimals256: Vec<arrow::datatypes::i256> = decimals128
+            .iter()
+            .copied()
+            .map(arrow::datatypes::i256::from)
+            .collect();
+        writer.write_primitive_column("decimal128", &decimals128)?;
+        writer.write_primitive_column("decimal256", &decimals256)?;
         let descriptor = writer.finish()?;
 
         let reader = PartReader::open(&descriptor.path, 99)?;
         assert_eq!(reader.total_rows(), 6);
 
-        // Invariant: zero bytes in vault because vault doesn't exist for primitives!
-        assert!(!reader.has_vault("id"));
-        assert!(!reader.has_vault("value"));
+        // 64-bit primitives retain an exact payload alongside their join address.
+        assert!(reader.has_vault("id"));
+        assert!(reader.has_vault("value"));
+        let mut id_vault = reader.open_vault_reader("id")?;
+        let mut value_vault = reader.open_vault_reader("value")?;
+        assert_eq!(id_vault.read_bytes_slot(0)?, &ids[0].to_le_bytes());
+        assert_eq!(value_vault.read_bytes_slot(0)?, &values[0].to_le_bytes());
+        let mut decimal128_vault = reader.open_vault_reader("decimal128")?;
+        let mut decimal256_vault = reader.open_vault_reader("decimal256")?;
+        assert_eq!(decimal128_vault.read_bytes_slot(0)?, &decimals128[0].to_le_bytes());
+        assert_eq!(decimal256_vault.read_bytes_slot(0)?, &decimals256[0].to_le_bytes());
 
         // Direct reading from address plane:
         for (i, &expected_id) in ids.iter().enumerate() {

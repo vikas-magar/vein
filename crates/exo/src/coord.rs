@@ -77,6 +77,20 @@ impl ToCanonicalAddress for [u8] {
     }
 }
 
+impl ToCanonicalAddress for i128 {
+    #[inline(always)]
+    fn to_canonical(&self) -> u64 {
+        twox_hash::XxHash64::oneshot(CANONICAL_SEED, &self.to_le_bytes())
+    }
+}
+
+impl ToCanonicalAddress for arrow::datatypes::i256 {
+    #[inline(always)]
+    fn to_canonical(&self) -> u64 {
+        twox_hash::XxHash64::oneshot(CANONICAL_SEED, &self.to_le_bytes())
+    }
+}
+
 impl ToCanonicalAddress for i64 {
     #[inline(always)]
     fn to_canonical(&self) -> u64 {

@@ -9,10 +9,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder,
-    Int8Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder, UInt8Builder,
-    UInt16Builder, UInt32Builder, UInt64Builder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Date64Array, Decimal128Array, Decimal256Array,
+    FixedSizeBinaryBuilder,
+    Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder,
+    UInt8Builder,
+    UInt16Builder, UInt32Builder, UInt64Builder, Int64Array,
 };
+use arrow::datatypes::{DataType, TimeUnit};
 use common::protocol::FieldSchema;
 use common::Result;
 use error::VeinError;
@@ -21,7 +24,7 @@ use exo::{
     f32_from_canonical_native, f64_from_canonical, i8_from_canonical_native,
     i16_from_canonical_native, i32_from_canonical_native, i64_from_canonical,
     AddressBatch, AddressFilter, AddressGranuleMark, AddressHeader, AddressPredicateEvaluator, ExoAddressReader,
-    ExoVaultReader, PartReader, VaultGranuleMark, VaultHeader,
+    classify_type_name, ExoVaultReader, PartReader, VaultGranuleMark, VaultHeader,
 };
 use exo::addr::{ADDR_FORMAT_VERSION, ADDR_HEADER_MAGIC, ADDR_TRAILER_MAGIC, HEADER_SIZE, MARK_SIZE};
 use exo::vault::{
@@ -201,15 +204,10 @@ enum VfsColumnIndex {
 }
 
 fn data_type_uses_vault(data_type: Option<&str>) -> bool {
-    matches!(
-        data_type,
-        Some("Utf8")
-            | Some("LargeUtf8")
-            | Some("Binary")
-            | Some("LargeBinary")
-            | Some("Utf8View")
-            | Some("BinaryView")
-    )
+    data_type
+        .and_then(classify_type_name)
+        .map(|class| class.uses_vault())
+        .unwrap_or(false)
 }
 
 fn vfs_index_shape(index: &VfsColumnIndex) -> (u64, usize, usize) {
@@ -962,7 +960,7 @@ fn materialize_scanner_array(
 ) -> Result<ArrayRef> {
     match scanner {
         ColumnScanner::Vault(vault_reader) => {
-            materialize_column_array(vault_reader, slots, col_name)
+            materialize_column_array(vault_reader, slots, col_name, data_type)
         }
         ColumnScanner::Address(addr_reader) => {
             let slot_width = addr_reader.slot_width();
@@ -1209,7 +1207,160 @@ fn materialize_column_array(
     vault_reader: &mut ExoVaultReader,
     slots: &[u32],
     col_name: &str,
+    data_type: Option<&str>,
 ) -> Result<ArrayRef> {
+    match data_type {
+        Some("Date64") => {
+            let values = read_fixed_i64_values(vault_reader, slots, col_name)?;
+            return Ok(Arc::new(Date64Array::from(values)) as ArrayRef);
+        }
+        Some(type_name) if type_name.starts_with("FixedSizeBinary(") => {
+            let width = type_name
+                .strip_prefix("FixedSizeBinary(")
+                .and_then(|value| value.strip_suffix(')'))
+                .and_then(|value| value.parse::<i32>().ok())
+                .ok_or_else(|| VeinError::internal(format!("Invalid fixed binary type '{type_name}'")))?;
+            let mut builder = FixedSizeBinaryBuilder::new(width);
+            for &slot in slots {
+                if vault_reader
+                    .is_null(slot)
+                    .map_err(|e| VeinError::internal(e.to_string()))?
+                {
+                    builder.append_null();
+                } else {
+                    let bytes = vault_reader
+                        .read_fixed_bytes_slot(slot)
+                        .map_err(|e| VeinError::internal(format!("Error reading fixed binary payload for column '{col_name}' at slot {slot}: {e}")))?;
+                    builder
+                        .append_value(bytes)
+                        .map_err(|e| VeinError::internal(format!("Invalid fixed binary payload for column '{col_name}' at slot {slot}: {e}")))?;
+                }
+            }
+            return Ok(Arc::new(builder.finish()) as ArrayRef);
+        }
+        Some(type_name)
+            if type_name.starts_with("Timestamp(")
+                || type_name.starts_with("Time64(")
+                || type_name.starts_with("Duration(") =>
+        {
+            let values = read_fixed_i64_values(vault_reader, slots, col_name)?;
+            let target_type = parse_temporal_type(type_name)?;
+            let array = Int64Array::from(values);
+            return arrow::compute::cast(&array, &target_type)
+                .map_err(|e| VeinError::internal(format!("Failed to materialize '{type_name}' for column '{col_name}': {e}")));
+        }
+        Some(decimal_type) if decimal_type.starts_with("Decimal128(") => {
+            let (precision, scale) = parse_decimal_type(decimal_type)?;
+            let mut values = Vec::with_capacity(slots.len());
+            for &slot in slots {
+                if vault_reader
+                    .is_null(slot)
+                    .map_err(|e| VeinError::internal(e.to_string()))?
+                {
+                    values.push(None);
+                    continue;
+                }
+                let bytes = vault_reader
+                    .read_fixed_bytes_slot(slot)
+                    .map_err(|e| VeinError::internal(format!("Error reading Decimal128 payload for column '{col_name}' at slot {slot}: {e}")))?;
+                let raw: [u8; 16] = bytes.try_into().map_err(|_| {
+                    VeinError::internal(format!("Invalid Decimal128 payload width for column '{col_name}' at slot {slot}"))
+                })?;
+                values.push(Some(i128::from_le_bytes(raw)));
+            }
+            let array = Decimal128Array::from(values)
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| VeinError::internal(format!("Invalid Decimal128 metadata for column '{col_name}': {e}")))?;
+            return Ok(Arc::new(array) as ArrayRef);
+        }
+        Some(decimal_type) if decimal_type.starts_with("Decimal256(") => {
+            let (precision, scale) = parse_decimal_type(decimal_type)?;
+            let mut values = Vec::with_capacity(slots.len());
+            for &slot in slots {
+                if vault_reader
+                    .is_null(slot)
+                    .map_err(|e| VeinError::internal(e.to_string()))?
+                {
+                    values.push(None);
+                    continue;
+                }
+                let bytes = vault_reader
+                    .read_fixed_bytes_slot(slot)
+                    .map_err(|e| VeinError::internal(format!("Error reading Decimal256 payload for column '{col_name}' at slot {slot}: {e}")))?;
+                let raw: [u8; 32] = bytes.try_into().map_err(|_| {
+                    VeinError::internal(format!("Invalid Decimal256 payload width for column '{col_name}' at slot {slot}"))
+                })?;
+                values.push(Some(arrow::datatypes::i256::from_le_bytes(raw)));
+            }
+            let array = Decimal256Array::from(values)
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| VeinError::internal(format!("Invalid Decimal256 metadata for column '{col_name}': {e}")))?;
+            return Ok(Arc::new(array) as ArrayRef);
+        }
+        Some("Int64") => {
+            let mut builder = Int64Builder::with_capacity(slots.len());
+            for &slot in slots {
+                if vault_reader
+                    .is_null(slot)
+                    .map_err(|e| VeinError::internal(e.to_string()))?
+                {
+                    builder.append_null();
+                    continue;
+                }
+                let bytes = vault_reader
+                    .read_fixed_bytes_slot(slot)
+                    .map_err(|e| VeinError::internal(format!("Error reading Int64 payload for column '{col_name}' at slot {slot}: {e}")))?;
+                let raw: [u8; 8] = bytes.try_into().map_err(|_| {
+                    VeinError::internal(format!("Invalid Int64 payload width for column '{col_name}' at slot {slot}"))
+                })?;
+                builder.append_value(i64::from_le_bytes(raw));
+            }
+            return Ok(Arc::new(builder.finish()) as ArrayRef);
+        }
+        Some("UInt64") => {
+            let mut builder = UInt64Builder::with_capacity(slots.len());
+            for &slot in slots {
+                if vault_reader
+                    .is_null(slot)
+                    .map_err(|e| VeinError::internal(e.to_string()))?
+                {
+                    builder.append_null();
+                    continue;
+                }
+                let bytes = vault_reader
+                    .read_fixed_bytes_slot(slot)
+                    .map_err(|e| VeinError::internal(format!("Error reading UInt64 payload for column '{col_name}' at slot {slot}: {e}")))?;
+                let raw: [u8; 8] = bytes.try_into().map_err(|_| {
+                    VeinError::internal(format!("Invalid UInt64 payload width for column '{col_name}' at slot {slot}"))
+                })?;
+                builder.append_value(u64::from_le_bytes(raw));
+            }
+            return Ok(Arc::new(builder.finish()) as ArrayRef);
+        }
+        Some("Float64") => {
+            let mut builder = Float64Builder::with_capacity(slots.len());
+            for &slot in slots {
+                if vault_reader
+                    .is_null(slot)
+                    .map_err(|e| VeinError::internal(e.to_string()))?
+                {
+                    builder.append_null();
+                    continue;
+                }
+                let bytes = vault_reader
+                    .read_fixed_bytes_slot(slot)
+                    .map_err(|e| VeinError::internal(format!("Error reading Float64 payload for column '{col_name}' at slot {slot}: {e}")))?;
+                let raw: [u8; 8] = bytes.try_into().map_err(|_| {
+                    VeinError::internal(format!("Invalid Float64 payload width for column '{col_name}' at slot {slot}"))
+                })?;
+                builder.append_value(f64::from_le_bytes(raw));
+            }
+            return Ok(Arc::new(builder.finish()) as ArrayRef);
+        }
+        _ => {}
+    }
+
+    // Variable-width and non-native values use the existing borrowed payload path.
     // 1. Attempt high-speed String materialization
     let mut str_builder = StringBuilder::with_capacity(slots.len(), slots.len() * 32);
     match vault_reader.materialize_string_batch(slots, &mut str_builder) {
@@ -1233,6 +1384,107 @@ fn materialize_column_array(
             Ok(Arc::new(bin_builder.finish()) as ArrayRef)
         }
     }
+}
+
+fn read_fixed_i64_values(
+    vault_reader: &mut ExoVaultReader,
+    slots: &[u32],
+    col_name: &str,
+) -> Result<Vec<Option<i64>>> {
+    let mut values = Vec::with_capacity(slots.len());
+    for &slot in slots {
+        if vault_reader
+            .is_null(slot)
+            .map_err(|e| VeinError::internal(e.to_string()))?
+        {
+            values.push(None);
+            continue;
+        }
+        let bytes = vault_reader
+            .read_fixed_bytes_slot(slot)
+            .map_err(|e| VeinError::internal(format!("Error reading temporal payload for column '{col_name}' at slot {slot}: {e}")))?;
+        let raw: [u8; 8] = bytes.try_into().map_err(|_| {
+            VeinError::internal(format!("Invalid temporal payload width for column '{col_name}' at slot {slot}"))
+        })?;
+        values.push(Some(i64::from_le_bytes(raw)));
+    }
+    Ok(values)
+}
+
+fn parse_temporal_type(type_name: &str) -> Result<DataType> {
+    let (prefix, inner) = if let Some(inner) = type_name
+        .strip_prefix("Timestamp(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        ("Timestamp", inner)
+    } else if let Some(inner) = type_name
+        .strip_prefix("Time64(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        ("Time64", inner)
+    } else if let Some(inner) = type_name
+        .strip_prefix("Duration(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        ("Duration", inner)
+    } else {
+        return Err(VeinError::internal(format!("Invalid temporal type '{type_name}'")));
+    };
+
+    let mut fields = inner.split(',').map(str::trim);
+    let first = fields.next().unwrap_or_default();
+
+    // VeinDataType stores timestamps as Timestamp(timezone), while Arrow's
+    // debug form is Timestamp(unit, timezone). Vein timestamps use microseconds.
+    if prefix == "Timestamp" && (first == "None" || first.starts_with('"')) {
+        let timezone = (first != "None").then(|| Arc::<str>::from(first.trim_matches('"')));
+        return Ok(DataType::Timestamp(TimeUnit::Microsecond, timezone));
+    }
+
+    let unit = match first {
+        "Second" => TimeUnit::Second,
+        "Millisecond" => TimeUnit::Millisecond,
+        "Microsecond" => TimeUnit::Microsecond,
+        "Nanosecond" => TimeUnit::Nanosecond,
+        other => return Err(VeinError::internal(format!("Unsupported temporal unit '{other}'"))),
+    };
+
+    let timezone = if prefix == "Timestamp" {
+        fields
+            .next()
+            .and_then(|value| value.strip_prefix("Some("))
+            .and_then(|value| value.strip_suffix(')'))
+            .map(|value| Arc::<str>::from(value.trim_matches('"')))
+    } else {
+        None
+    };
+
+    match prefix {
+        "Timestamp" => Ok(DataType::Timestamp(unit, timezone)),
+        "Time64" => Ok(DataType::Time64(unit)),
+        "Duration" => Ok(DataType::Duration(unit)),
+        _ => Err(VeinError::internal(format!("Unsupported temporal type '{type_name}'"))),
+    }
+}
+
+fn parse_decimal_type(type_name: &str) -> Result<(u8, i8)> {
+    let inner = type_name
+        .strip_prefix("Decimal128(")
+        .or_else(|| type_name.strip_prefix("Decimal256("))
+        .and_then(|value| value.strip_suffix(')'))
+        .ok_or_else(|| VeinError::internal(format!("Invalid decimal type '{type_name}'")))?;
+    let (precision, scale) = inner
+        .split_once(',')
+        .ok_or_else(|| VeinError::internal(format!("Invalid decimal type '{type_name}'")))?;
+    let precision = precision
+        .trim()
+        .parse::<u8>()
+        .map_err(|e| VeinError::internal(format!("Invalid decimal precision: {e}")))?;
+    let scale = scale
+        .trim()
+        .parse::<i8>()
+        .map_err(|e| VeinError::internal(format!("Invalid decimal scale: {e}")))?;
+    Ok((precision, scale))
 }
 
 /// Resolves the directory of the partition or table.

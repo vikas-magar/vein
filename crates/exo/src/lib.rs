@@ -14,6 +14,7 @@ pub mod coord;
 pub mod error;
 pub mod part;
 pub mod predicate;
+pub mod storage_class;
 pub mod tombstone;
 pub mod traits;
 pub mod vault;
@@ -35,8 +36,13 @@ pub use coord::{
 pub use error::{ExoError, ExoResult};
 pub use part::{PartBufferDescriptor, PartDataSource, PartDescriptor, PartReader, PartWriter};
 pub use predicate::{AddressFilter, AddressPredicate, AddressPredicateEvaluator};
+pub use storage_class::{
+    address_preserves_order, classify_storage, classify_type_name, data_type_uses_vault,
+    requires_collision_verification, require_storage_class, ExoStorageClass,
+};
 pub use tombstone::{TombstoneHeader, TombstoneMask};
 pub use traits::{
-    AddressReader, AddressWriter, StorageBuffer, TombstoneStore, VaultReader, VaultWriter,
+    AddressReader, AddressWriter, ExactValueCodec, StorageBuffer, TombstoneStore, VaultReader,
+    VaultWriter,
 };
 pub use vault::{ExoVaultReader, ExoVaultWriter, VaultGranuleMark, VaultHeader};

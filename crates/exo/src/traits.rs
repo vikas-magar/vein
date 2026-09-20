@@ -3,7 +3,47 @@
 //! Provides modular interfaces for storage writers, zero-copy readers,
 //! and late materialization decoders.
 
+use crate::coord::ToCanonicalAddress;
 use crate::error::ExoResult;
+
+/// Encodes a primitive value into its canonical address and exact vault representation.
+///
+/// Implementations must use a stable, little-endian exact encoding. Values below 64 bits
+/// remain address-only; 64-bit values are persisted in both planes.
+pub trait ExactValueCodec: ToCanonicalAddress {
+    const WIDTH: u8;
+
+    fn encode_exact(&self) -> Vec<u8>;
+}
+
+macro_rules! impl_exo_value_encoding {
+    ($ty:ty, $width:expr, $encode:expr) => {
+        impl ExactValueCodec for $ty {
+            const WIDTH: u8 = $width;
+
+            #[inline]
+            fn encode_exact(&self) -> Vec<u8> {
+                $encode(self)
+            }
+        }
+    };
+}
+
+impl_exo_value_encoding!(i8, 1, |value: &i8| vec![*value as u8]);
+impl_exo_value_encoding!(u8, 1, |value: &u8| vec![*value]);
+impl_exo_value_encoding!(bool, 1, |value: &bool| vec![u8::from(*value)]);
+impl_exo_value_encoding!(i16, 2, |value: &i16| value.to_le_bytes().to_vec());
+impl_exo_value_encoding!(u16, 2, |value: &u16| value.to_le_bytes().to_vec());
+impl_exo_value_encoding!(i32, 4, |value: &i32| value.to_le_bytes().to_vec());
+impl_exo_value_encoding!(u32, 4, |value: &u32| value.to_le_bytes().to_vec());
+impl_exo_value_encoding!(f32, 4, |value: &f32| value.to_le_bytes().to_vec());
+impl_exo_value_encoding!(i64, 8, |value: &i64| value.to_le_bytes().to_vec());
+impl_exo_value_encoding!(u64, 8, |value: &u64| value.to_le_bytes().to_vec());
+impl_exo_value_encoding!(f64, 8, |value: &f64| value.to_le_bytes().to_vec());
+impl_exo_value_encoding!(i128, 16, |value: &i128| value.to_le_bytes().to_vec());
+impl_exo_value_encoding!(arrow::datatypes::i256, 32, |value: &arrow::datatypes::i256| value
+    .to_le_bytes()
+    .to_vec());
 
 /// Unified storage buffer that can be backed either by a zero-copy memory map
 /// or an in-memory byte buffer (e.g. decoded from VFS blocks).
@@ -78,6 +118,21 @@ pub trait VaultWriter {
     /// Appends a raw byte payload for a row.
     fn append_bytes(&mut self, payload: &[u8]) -> ExoResult<()>;
 
+    /// Appends an exact fixed-width value payload.
+    #[inline]
+    fn append_fixed_bytes(&mut self, payload: &[u8]) -> ExoResult<()> {
+        self.append_bytes(payload)
+    }
+
+    /// Appends an optional exact fixed-width value payload.
+    #[inline]
+    fn append_opt_fixed_bytes(&mut self, payload: Option<&[u8]>) -> ExoResult<()> {
+        match payload {
+            Some(payload) => self.append_fixed_bytes(payload),
+            None => self.append_null(),
+        }
+    }
+
     /// Appends a string value for a row.
     fn append_str(&mut self, val: &str) -> ExoResult<()>;
 
@@ -114,6 +169,12 @@ pub trait VaultReader: Send {
 
     /// O(1) slot dereferencing returning borrowed raw byte slice.
     fn read_bytes_slot(&mut self, slot_id: u32) -> ExoResult<&[u8]>;
+
+    /// O(1) slot dereferencing for an exact fixed-width value payload.
+    #[inline]
+    fn read_fixed_bytes_slot(&mut self, slot_id: u32) -> ExoResult<&[u8]> {
+        self.read_bytes_slot(slot_id)
+    }
 
     /// O(1) slot dereferencing returning optional borrowed string slice (None if NULL).
     fn read_opt_str_slot(&mut self, slot_id: u32) -> ExoResult<Option<&str>>;
