@@ -1345,7 +1345,33 @@ impl VfsTableStore {
         let table_id = Self::resolve_table_id(table_name_or_id);
         let existing = self.resolve_table_parts(table_id).await.unwrap_or_default();
         let next_part_id = existing.iter().max().map(|m| m + 1).unwrap_or(0);
-        self.write_partition(table_id, next_part_id, batch).await
+        let started = std::time::Instant::now();
+        let result = self.write_partition(table_id, next_part_id, batch).await;
+        match &result {
+            Ok(summary) => tracing::info!(
+                target: "vein.audit",
+                event = "vfs_partition_committed",
+                table = %table_name_or_id,
+                table_id = summary.table_id,
+                partition_id = summary.part_id,
+                rows = summary.total_rows,
+                columns = summary.column_names.len(),
+                extents = summary.extents.len(),
+                duration_ms = started.elapsed().as_millis() as u64,
+                "vfs_partition_committed"
+            ),
+            Err(error) => tracing::error!(
+                target: "vein.audit",
+                event = "vfs_partition_commit_failed",
+                table = %table_name_or_id,
+                table_id,
+                partition_id = next_part_id,
+                duration_ms = started.elapsed().as_millis() as u64,
+                error = %error,
+                "vfs_partition_commit_failed"
+            ),
+        }
+        result
     }
 
     /// Synchronous variant of [`append_partition`](Self::append_partition).

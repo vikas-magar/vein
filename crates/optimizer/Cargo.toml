@@ -10,3 +10,4 @@ missing_docs = "deny"
 plan = { path = "../plan" }
 parser = { path = "../parser" }
 error = { path = "../error" }
+tracing = { workspace = true }

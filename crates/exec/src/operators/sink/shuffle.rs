@@ -267,11 +267,15 @@ impl PipelineNode<DataChunk> for ShuffleSink {
             self.target.schema_fingerprint.clone(),
         )?;
 
+        let mut total_rows = 0u64;
+        let mut total_bytes = 0u64;
         for partition in 0..self.target.num_partitions {
             let stats = self
                 .partition_stats
                 .get(partition as usize)
                 .ok_or_else(|| VeinError::internal("shuffle partition statistics are out of bounds"))?;
+            total_rows = total_rows.saturating_add(stats.row_count);
+            total_bytes = total_bytes.saturating_add(stats.byte_len);
             metadata.publish_fragment(
                 self.target.exchange_key,
                 common::protocol::ExchangeFragment {
@@ -286,6 +290,18 @@ impl PipelineNode<DataChunk> for ShuffleSink {
                 },
             )?;
         }
+        tracing::info!(
+            target: "vein.audit",
+            event = "shuffle_exchange_published",
+            %self.target.exchange_key.query_id,
+            %self.target.exchange_key.stage_id,
+            producer_task_id = %self.target.producer_task_id,
+            attempt = self.target.attempt,
+            partitions = self.target.num_partitions,
+            rows = total_rows,
+            bytes = total_bytes,
+            "shuffle_exchange_published"
+        );
         Ok(())
     }
 }

@@ -178,6 +178,8 @@ pub async fn execute_exo_scan_with_filter_and_stats(
     }
 
     tracing::info!(
+        target: "vein.audit",
+        event = "exo_scan_completed",
         partitions_scanned = stats.partitions_scanned,
         granules_considered = stats.granules_considered,
         granules_pruned = stats.granules_pruned,

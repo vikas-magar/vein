@@ -2,6 +2,7 @@ use crate::daemon::QueuedTask;
 use crate::runtime::TaskExecutor;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 use tokio::task::LocalSet;
 use tracing::{error, info};
 
@@ -49,6 +50,23 @@ impl WorkerPool {
                             let executor = executor.clone();
                             tokio::task::spawn_local(async move {
                                 let task_id = queued_task.task.task_id;
+                                let request_id = queued_task.task.request_id;
+                                let query_id = queued_task.task.query_id;
+                                let stage_id = queued_task.task.stage_id;
+                                let attempt = queued_task.task.attempt;
+                                let started = Instant::now();
+                                tracing::info!(
+                                    target: "vein.audit",
+                                    event = "task_started",
+                                    worker_id = core_id,
+                                    %request_id,
+                                     %task_id,
+                                    %query_id,
+                                    %stage_id,
+                                    attempt,
+                                    execution_mode = ?queued_task.task.mode,
+                                    "task_started"
+                                );
                                 let result = match queued_task.output_sender {
                                     Some(output) => {
                                         executor
@@ -66,12 +84,37 @@ impl WorkerPool {
                                     }
                                 };
                                 match &result {
-                                    Ok(res) => info!(
-                                        "Worker {} finished task {}: {} rows",
-                                        core_id, task_id, res.row_count
-                                    ),
+                                    Ok(res) => {
+                                        let duration_ms = started.elapsed().as_millis() as u64;
+                                        info!(
+                                            target: "vein.audit",
+                                            event = "task_finished",
+                                            worker_id = core_id,
+                                            %request_id,
+                                     %task_id,
+                                            %query_id,
+                                            %stage_id,
+                                            attempt,
+                                            rows = res.row_count,
+                                            duration_ms,
+                                            "task_finished"
+                                        );
+                                    }
                                     Err(e) => {
-                                        error!("Worker {} task {} failed: {}", core_id, task_id, e)
+                                        let duration_ms = started.elapsed().as_millis() as u64;
+                                        error!(
+                                            target: "vein.audit",
+                                            event = "task_failed",
+                                            worker_id = core_id,
+                                            %request_id,
+                                     %task_id,
+                                            %query_id,
+                                            %stage_id,
+                                            attempt,
+                                            duration_ms,
+                                            error = %e,
+                                            "task_failed"
+                                        );
                                     }
                                 }
                                 let _ = queued_task.responder.send(result);

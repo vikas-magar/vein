@@ -45,7 +45,7 @@ pub use rpc::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
+    use crate::identifiers::{NodeId, QueryId, RequestId, StageId, TaskId};
     use rkyv::rancor::Error;
 
     #[test]
@@ -90,6 +90,7 @@ mod tests {
     #[test]
     fn test_execute_task_rkyv_zero_copy_roundtrip() {
         let task = ExecuteTask {
+            request_id: RequestId::new(),
             mode: ExecutionMode::Batch,
             task_id: TaskId::new(),
             attempt: 0,

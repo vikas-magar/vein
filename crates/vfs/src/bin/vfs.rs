@@ -78,7 +78,7 @@ pub fn load_topology(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    common::logging::init("vfs-node")?;
 
     let cli = Cli::parse();
     tracing::info!("Starting VFS Node: {}", cli.node_id);

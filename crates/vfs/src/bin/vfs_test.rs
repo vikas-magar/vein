@@ -11,7 +11,7 @@ use vfs::topology::crush::{ClusterMap, Node};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    common::logging::init("vfs-test")?;
 
     tracing::info!("Initializing VeinFS Integration Test...");
 

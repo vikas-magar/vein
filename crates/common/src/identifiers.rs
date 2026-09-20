@@ -55,6 +55,7 @@ macro_rules! id_newtype {
     };
 }
 
+id_newtype!(RequestId, u128, pub);
 id_newtype!(QueryId, u128, pub);
 id_newtype!(TaskId, u128, pub);
 id_newtype!(StageId, u64, pub);

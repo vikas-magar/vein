@@ -3,7 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    common::logging::init("vfs-client")?;
 
     let logical_path = "/demo/cluster_test.bin";
     let data = vec![42u8; 16 * 1024 * 1024]; // 1MB of dummy data

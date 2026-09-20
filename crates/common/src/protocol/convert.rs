@@ -26,7 +26,7 @@ use super::task::{
     FieldSchema, FileFormat, FileScanTask, KeyValue, ScanPredicate, ScanPredicateValue,
     ShuffleTarget, StorageTarget, StreamSource,
 };
-use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
+use crate::identifiers::{NodeId, QueryId, RequestId, StageId, TaskId};
 
 // ── Micro-IR Conversions ──────────────────────────────────────────
 
@@ -500,6 +500,7 @@ impl From<&ArchivedDataSink> for DataSink {
 impl From<&ArchivedExecuteTask> for ExecuteTask {
     fn from(archived: &ArchivedExecuteTask) -> Self {
         Self {
+            request_id: RequestId::from_raw(archived.request_id.0.to_native()),
             mode: ExecutionMode::from(&archived.mode),
             task_id: TaskId::from_raw(archived.task_id.0.to_native()),
             attempt: archived.attempt.to_native(),

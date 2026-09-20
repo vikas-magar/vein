@@ -268,7 +268,16 @@ impl TableCatalog for InMemoryCatalog {
             .tables
             .write()
             .map_err(|e| VeinError::internal(format!("Failed to acquire catalog lock: {e}")))?;
-        tables.insert(metadata.name.clone(), Arc::new(metadata));
+        let table_name = metadata.name.clone();
+        let schema_columns = metadata.schema.fields.len();
+        tables.insert(table_name.clone(), Arc::new(metadata));
+        tracing::info!(
+            target: "vein.audit",
+            event = "vcs_table_registered",
+            table = %table_name,
+            columns = schema_columns,
+            "vcs_table_registered"
+        );
         Ok(())
     }
 }

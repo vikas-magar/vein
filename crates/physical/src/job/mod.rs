@@ -7,7 +7,7 @@ pub mod validate;
 pub use edge::{StageEdge, StageInputPort};
 
 use crate::stage::Stage;
-use common::identifiers::{QueryId, StageId};
+use common::identifiers::{QueryId, RequestId, StageId};
 use common::protocol::ExecutionMode;
 use error::VeinError;
 use std::collections::HashMap;
@@ -19,6 +19,8 @@ use std::collections::HashMap;
 /// for a single query, and is what the scheduler consumes to drive execution.
 #[derive(Debug, Clone)]
 pub struct Job {
+    /// The request lineage shared by all task attempts in this job.
+    pub request_id: RequestId,
     /// The query this job answers.
     pub query_id: QueryId,
     /// The execution mode for all stages in this job.
@@ -40,6 +42,7 @@ impl Job {
     /// stages unreachable from the output stage, so that later infallible
     /// accessors ([`Job::get_stage`], [`Job::topological_order`]) are safe.
     pub fn new(
+        request_id: RequestId,
         query_id: QueryId,
         stages: Vec<Stage>,
         edges: Vec<StageEdge>,
@@ -75,6 +78,7 @@ impl Job {
         validate::validate_reachability(&stages_map, output_stage, &predecessors)?;
 
         Ok(Self {
+            request_id,
             query_id,
             mode,
             stages: stages_map,
@@ -138,6 +142,7 @@ mod tests {
     #[test]
     fn test_dogleg_order_is_leaves_first() {
         let job = Job::new(
+            RequestId::new(),
             QueryId::new(),
             vec![stage(1), stage(2), stage(3), stage(4)],
             vec![edge(1, 2), edge(2, 4), edge(1, 3), edge(3, 4)],
@@ -166,6 +171,7 @@ mod tests {
     #[test]
     fn test_cycle_rejected() {
         let err = Job::new(
+            RequestId::new(),
             QueryId::new(),
             vec![stage(1), stage(2)],
             vec![edge(1, 2), edge(2, 1)],
@@ -179,6 +185,7 @@ mod tests {
     #[test]
     fn test_single_stage() {
         let job = Job::new(
+            RequestId::new(),
             QueryId::new(),
             vec![stage(1)],
             vec![],
@@ -192,6 +199,7 @@ mod tests {
     #[test]
     fn test_dangling_edge_rejected() {
         let err = Job::new(
+            RequestId::new(),
             QueryId::new(),
             vec![stage(1)],
             vec![edge(1, 99)],
@@ -205,6 +213,7 @@ mod tests {
     #[test]
     fn test_missing_output_stage_rejected() {
         let err = Job::new(
+            RequestId::new(),
             QueryId::new(),
             vec![stage(1)],
             vec![],
@@ -221,6 +230,7 @@ mod tests {
     #[test]
     fn test_unreachable_stage_rejected() {
         let err = Job::new(
+            RequestId::new(),
             QueryId::new(),
             vec![stage(1), stage(2), stage(3)],
             vec![edge(1, 2)],

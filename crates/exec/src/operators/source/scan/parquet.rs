@@ -91,7 +91,7 @@ pub async fn execute_parquet_scan(
     next: &mut dyn PipelineNode<DataChunk>,
 ) -> Result<()> {
     for path in paths {
-        tracing::info!(path = %path, format = "parquet", "Starting Parquet file scan");
+        tracing::info!(target: "vein.audit", event = "scan_started", path = %path, format = "parquet", "scan_started");
 
         let reader = OpendalParquetReader::new(operator, path).await?;
 
@@ -121,7 +121,7 @@ pub async fn execute_parquet_scan(
             next.push(chunk)?;
         }
 
-        tracing::info!(path = %path, rows_processed = total_rows, "Finished scanning Parquet file");
+        tracing::info!(target: "vein.audit", event = "scan_completed", path = %path, format = "parquet", rows = total_rows, "scan_completed");
     }
 
     Ok(())

@@ -44,12 +44,12 @@ impl TableCache {
     ) -> Result<Arc<Table>> {
         // Check hot cache first
         if let Some(cached) = self.inner.get(ident).await {
-            tracing::debug!(?ident, "table cache hit");
+            tracing::debug!(target: "vein.audit", event = "catalog_cache_hit", ?ident, "catalog_cache_hit");
             return Ok(cached);
         }
 
         // Cache miss — fetch from Iceberg catalog (reads metadata.json from disk/S3)
-        tracing::debug!(?ident, "table cache miss, loading from catalog");
+        tracing::debug!(target: "vein.audit", event = "catalog_cache_miss", ?ident, "catalog_cache_miss");
         let table = catalog
             .load_table(ident)
             .await
@@ -63,12 +63,12 @@ impl TableCache {
     /// Invalidate a specific table entry (called when a new snapshot is committed).
     pub async fn invalidate(&self, ident: &TableIdent) {
         self.inner.invalidate(ident).await;
-        tracing::info!(?ident, "table cache invalidated");
+        tracing::info!(target: "vein.audit", event = "catalog_cache_invalidated", ?ident, "catalog_cache_invalidated");
     }
 
     /// Invalidate all entries (e.g., after VCS restart or full refresh).
     pub async fn invalidate_all(&self) {
         self.inner.invalidate_all();
-        tracing::info!("full table cache invalidation");
+        tracing::info!(target: "vein.audit", event = "catalog_cache_invalidated_all", "catalog_cache_invalidated_all");
     }
 }

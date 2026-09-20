@@ -403,6 +403,22 @@ impl Source<DataChunk> for HashJoinSource {
 
         let left_columns = Self::key_columns(&self.source.left_schema, &self.source.left_keys)?;
         let right_columns = Self::key_columns(&self.source.right_schema, &self.source.right_keys)?;
+        let address_key_mode = self
+            .source
+            .left_keys
+            .iter()
+            .chain(self.source.right_keys.iter())
+            .all(|key| !matches!(key.mode, JoinKeyMode::ValueNative));
+        tracing::info!(
+            target: "vein.audit",
+            event = "join_started",
+            input_query_id = %self.source.left.exchange_key.query_id,
+            input_stage_id = %self.source.left.exchange_key.stage_id,
+            partition_id = self.source.left.partition_id,
+            join_type = ?self.source.join_type,
+            key_mode = if address_key_mode { "address_candidate" } else { "value" },
+            "join_started"
+        );
 
         // Build state is retained for the current partition; the probe side is
         // decoded and processed one exchange frame at a time.
@@ -411,6 +427,10 @@ impl Source<DataChunk> for HashJoinSource {
         let spill_writer = VfsJoinSpillWriter::new(self.store.clone());
         let mut spill_paths = vec![None; SPILL_PARTITION_COUNT];
         let mut spill_stats = HashMap::new();
+        let mut build_rows = 0u64;
+        let mut probe_rows = 0u64;
+        let mut matches_emitted = 0u64;
+        let mut spill_frames = 0u64;
         let left_paths = self.input_paths(&self.source.left)?;
         for path in left_paths {
             let mut reader = self
@@ -428,9 +448,11 @@ impl Source<DataChunk> for HashJoinSource {
                 let chunk = Self::chunk_for_batch(&batch)?;
                 let batch_id = left_batches.len() as u32;
                 let keys = Self::extract_keys(&chunk, &left_columns, &self.source.left_keys)?;
+                build_rows = build_rows.saturating_add(keys.len() as u64);
                 match table.insert_batch(batch_id, &keys) {
                     Ok(()) => left_batches.push(batch),
                     Err(error @ VeinError::ResourceExhausted { .. }) => {
+                        spill_frames = spill_frames.saturating_add(1);
                         Self::spill_build_batch(
                             &spill_writer,
                             &self.source.left.path_prefix,
@@ -472,9 +494,11 @@ impl Source<DataChunk> for HashJoinSource {
                 let probe_chunk = Self::chunk_for_batch(&right_batch)?;
                 let probe_keys =
                     Self::extract_keys(&probe_chunk, &right_columns, &self.source.right_keys)?;
+                probe_rows = probe_rows.saturating_add(probe_keys.len() as u64);
                 let current_probe_id = probe_id;
                 probe_id = probe_id.saturating_add(1);
                 let matches = table.probe_batch(current_probe_id, &probe_keys);
+                matches_emitted = matches_emitted.saturating_add(matches.len() as u64);
                 Self::emit_matches(next, &left_batches, &right_batch, matches)?;
 
                 let mut probe_partitions = (0..SPILL_PARTITION_COUNT)
@@ -524,6 +548,7 @@ impl Source<DataChunk> for HashJoinSource {
                         spilled_table.insert_batch(0, &spilled_keys)?;
                         let spilled_matches =
                             spilled_table.probe_batch(current_probe_id, &probe_partition);
+                        matches_emitted = matches_emitted.saturating_add(spilled_matches.len() as u64);
                         Self::emit_matches(
                             next,
                             std::slice::from_ref(&spilled_batch),
@@ -558,6 +583,20 @@ impl Source<DataChunk> for HashJoinSource {
                 }
             }
         }
+        tracing::info!(
+            target: "vein.audit",
+            event = "join_completed",
+            %self.source.left.exchange_key.query_id,
+            %self.source.left.exchange_key.stage_id,
+            partition_id = self.source.left.partition_id,
+            key_mode = if address_key_mode { "address_candidate" } else { "value" },
+            build_rows,
+            probe_rows,
+            matches = matches_emitted,
+            exchange_bytes_read = self.bytes_read,
+            spill_frames,
+            "join_completed"
+        );
         Ok(())
     }
 

@@ -236,7 +236,20 @@ pub async fn bind_pipeline<'a>(
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
-    for pipe in pipes {
+    tracing::info!(
+        target: "vein.audit",
+        event = "binding_started",
+        operator_count = pipes.len(),
+        "binding_started"
+    );
+    for (operator_index, pipe) in pipes.iter().enumerate() {
+        tracing::debug!(
+            target: "vein.audit",
+            event = "binding_operator",
+            operator_index,
+            operator = ?pipe,
+            "binding_operator"
+        );
         plan = match pipe {
             // Relational Core
             PipeOperator::Where { predicate } => {
@@ -332,5 +345,11 @@ pub async fn bind_pipeline<'a>(
         };
     }
 
+    tracing::info!(
+        target: "vein.audit",
+        event = "binding_completed",
+        operator_count = pipes.len(),
+        "binding_completed"
+    );
     Ok(plan)
 }

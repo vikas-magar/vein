@@ -5,6 +5,7 @@ pub mod default;
 pub use default::DefaultPhysicalPlanner;
 
 use crate::job::Job;
+use common::identifiers::RequestId;
 use common::Result;
 use plan::LogicalPlan;
 
@@ -14,5 +15,5 @@ use plan::LogicalPlan;
 /// physical [`Job`] of stages and tasks that the cluster scheduler can execute.
 pub trait PhysicalPlanner: Send + Sync {
     /// Lower a logical plan into a physical [`Job`].
-    fn create_physical_plan(&self, logical_plan: LogicalPlan) -> Result<Job>;
+    fn create_physical_plan(&self, request_id: RequestId, logical_plan: LogicalPlan) -> Result<Job>;
 }

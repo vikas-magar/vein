@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -114,14 +115,18 @@ impl TaskDispatcher for QuicTaskDispatcher {
     async fn dispatch(&self, executor: &NodeInfo, task: ExecuteTask) -> Result<(), VeinError> {
         let client = self.get_or_init_client()?;
         let target_addr = executor.addr.to_string();
+        let request_id = task.request_id;
         let query_id = task.query_id;
         let task_id = task.task_id;
         let expected_attempt = task.attempt;
+        let rpc_started = Instant::now();
 
         tracing::debug!(
             target: "vein_dispatcher",
+            %request_id,
             %query_id,
             %task_id,
+            attempt = expected_attempt,
             executor_addr = %target_addr,
             "Opening QUIC stream to dispatch task"
         );
@@ -140,6 +145,7 @@ impl TaskDispatcher for QuicTaskDispatcher {
 
         // 2. Send opcode (0x02) + length-prefixed payload
         let wire = frame_control_message(&bytes);
+        let wire_len = wire.len();
         stream.send(wire).await.map_err(|e| {
             VeinError::internal(format!("Failed to send task payload to executor: {e}"))
         })?;
@@ -147,6 +153,19 @@ impl TaskDispatcher for QuicTaskDispatcher {
         stream
             .finish()
             .map_err(|e| VeinError::internal(format!("Failed to finish send stream: {e}")))?;
+
+        tracing::info!(
+            target: "vein.audit",
+            event = "rpc_task_dispatch_sent",
+            %request_id,
+            %query_id,
+            %task_id,
+            attempt = expected_attempt,
+            executor_addr = %target_addr,
+            bytes_sent = wire_len,
+            duration_ms = rpc_started.elapsed().as_millis() as u64,
+            "rpc_task_dispatch_sent"
+        );
 
         // 3. Setup completion oneshot channel and spawn reader task
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -165,8 +184,10 @@ impl TaskDispatcher for QuicTaskDispatcher {
             let mut saw_frame = false;
             let mut sequence = 0u64;
             let mut seen_sequences = HashSet::new();
+            let mut response_bytes = 0u64;
 
             while let Ok(Some(chunk)) = stream.receive().await {
+                response_bytes += chunk.len() as u64;
                 let frames = match frame_decoder.push_chunk(&chunk) {
                     Ok(frames) => frames,
                     Err(error) => {
@@ -288,11 +309,16 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                 continue;
                             }
                             tracing::info!(
-                                target: "vein_dispatcher",
+                                target: "vein.audit",
+                                event = "rpc_task_result_received",
+                                %request_id,
                                 %query_id,
                                 %task_id,
+                                attempt = expected_attempt,
                                 rows = row_count.to_native(),
-                                "Task completed successfully on executor"
+                                bytes_received = response_bytes,
+                                duration_ms = rpc_started.elapsed().as_millis() as u64,
+                                "rpc_task_result_received"
                             );
                             let _ = tx.send(Ok(()));
                             return;

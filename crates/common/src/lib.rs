@@ -10,6 +10,9 @@ pub mod cancellation;
 
 /// System initialization and node primitives.
 pub mod system;
+
+/// Shared structured logging initialization.
+pub mod logging;
 /// AF_XDP logic for network processing.
 #[cfg(target_os = "linux")]
 pub mod xdp;

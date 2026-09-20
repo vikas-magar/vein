@@ -223,11 +223,25 @@ impl MasterDaemon {
                         match request {
                             common::protocol::ArchivedProtocolRequest::ExecuteSql { sql } => {
                                 let sql_str = sql.as_str();
-                                info!(target: "vein_master", query = %sql_str, "Processing ExecuteSql request");
+                                let request_started = std::time::Instant::now();
+                                tracing::info!(
+                                    target: "vein.audit",
+                                    event = "query_received",
+                                    query = %sql_str,
+                                    query_bytes = sql_str.len(),
+                                    "query_received"
+                                );
                                 let mut parser = parser::Parser::new(sql_str);
                                 match parser.parse_statement() {
                                     Ok(statement) => match engine.submit_query(statement).await {
                                         Ok(crate::engine::QueryOutput::Plan(text)) => {
+                                            tracing::info!(
+                                                target: "vein.audit",
+                                                event = "query_completed",
+                                                outcome = "plan",
+                                                duration_ms = request_started.elapsed().as_millis() as u64,
+                                                "query_completed"
+                                            );
                                             send_response!(
                                                 common::protocol::ProtocolResponse::Plan { text }
                                             );
@@ -236,6 +250,15 @@ impl MasterDaemon {
                                             table,
                                             row_count,
                                         }) => {
+                                            tracing::info!(
+                                                target: "vein.audit",
+                                                event = "query_completed",
+                                                outcome = "write",
+                                                table = %table,
+                                                rows = row_count,
+                                                duration_ms = request_started.elapsed().as_millis() as u64,
+                                                "query_completed"
+                                            );
                                             send_response!(common::protocol::ProtocolResponse::WriteCompleted {
                                                 table,
                                                 row_count,
@@ -304,13 +327,29 @@ impl MasterDaemon {
                                                     }
                                                 }
                                             }
+                                            tracing::info!(
+                                                target: "vein.audit",
+                                                event = "query_completed",
+                                                %query_id,
+                                                outcome = "data",
+                                                rows = row_count,
+                                                batches = sequence,
+                                                duration_ms = request_started.elapsed().as_millis() as u64,
+                                                "query_completed"
+                                            );
                                             send_response!(common::protocol::ProtocolResponse::QueryResultEnd {
                                                 query_id,
                                                 row_count,
                                             });
                                         }
                                         Err(error) => {
-                                            error!(target: "vein_master", error = %error, "Query execution failed");
+                                            error!(
+                                                target: "vein.audit",
+                                                event = "query_failed",
+                                                duration_ms = request_started.elapsed().as_millis() as u64,
+                                                error = %error,
+                                                "query_failed"
+                                            );
                                             send_response!(
                                                 common::protocol::ProtocolResponse::Error {
                                                     message: error.to_string(),
@@ -319,6 +358,14 @@ impl MasterDaemon {
                                         }
                                     },
                                     Err(error) => {
+                                        tracing::warn!(
+                                            target: "vein.audit",
+                                            event = "query_rejected",
+                                            reason = "parse_error",
+                                            duration_ms = request_started.elapsed().as_millis() as u64,
+                                            error = ?error,
+                                            "query_rejected"
+                                        );
                                         send_response!(common::protocol::ProtocolResponse::Error {
                                             message: format!("Parse error: {error:?}"),
                                         });

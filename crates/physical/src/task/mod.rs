@@ -1,6 +1,6 @@
 //! The atomic unit of work dispatched to a single executor.
 
-use common::identifiers::{PartitionId, QueryId, StageId, TaskId};
+use common::identifiers::{PartitionId, QueryId, RequestId, StageId, TaskId};
 use common::protocol::{DataSink, DataSource, ExecuteTask, ExecutionMode, MicroProgram};
 
 /// The smallest schedulable unit of a physical plan.
@@ -45,11 +45,13 @@ impl Task {
     /// owning query and stage from the caller.
     pub fn into_execute_task(
         self,
+        request_id: RequestId,
         query_id: QueryId,
         stage_id: StageId,
         mode: ExecutionMode,
     ) -> ExecuteTask {
         ExecuteTask {
+            request_id,
             mode,
             task_id: self.task_id,
             attempt: 0,

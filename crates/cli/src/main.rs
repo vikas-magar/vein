@@ -4,8 +4,8 @@ pub mod engine;
 use clap::{Parser, Subcommand};
 use exec::ExecutorDaemon;
 use std::sync::Arc;
+use common::logging;
 use tracing::{debug, error, info};
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[derive(Parser, Debug)]
 #[command(name = "vein-server")]
@@ -95,11 +95,7 @@ fn build_default_coordinator() -> Result<Arc<engine::DistributedCoordinator>, St
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(filter)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    logging::init("vein-server")?;
 
     let cli = Cli::parse();
 

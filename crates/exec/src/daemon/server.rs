@@ -212,9 +212,16 @@ impl ExecutorDaemon {
                                 let task = ExecuteTask::from(archived_task);
                                 let task_id = task.task_id;
                                 let query_id = task.query_id;
-                                info!(
-                                    "Received DispatchTask for Task {:?} (Query {:?})",
-                                    task_id, query_id
+                                let request_id = task.request_id;
+                                tracing::info!(
+                                    target: "vein.audit",
+                                    event = "rpc_task_received",
+                                    %request_id,
+                                    %query_id,
+                                    %task_id,
+                                    attempt = task.attempt,
+                                    executor_node = %ctx.node_id,
+                                    "rpc_task_received"
                                 );
 
                                 let cancel = CancellationToken::new();
@@ -236,7 +243,16 @@ impl ExecutorDaemon {
                                 };
 
                                 if let Err(e) = ctx.task_queue.send_async(queued).await {
-                                    error!("Failed to push task to worker queue: {}", e);
+                                    tracing::error!(
+                                        target: "vein.audit",
+                                        event = "rpc_task_queue_failed",
+                                        %request_id,
+                                        %query_id,
+                                        %task_id,
+                                        attempt,
+                                        error = %e,
+                                        "rpc_task_queue_failed"
+                                    );
                                     ctx.active_tasks.remove(&task_id);
                                     let fail_event = VeinControlEvent::TaskFailed {
                                         task_id,
@@ -253,6 +269,17 @@ impl ExecutorDaemon {
                                     }
                                     return;
                                 }
+
+                                tracing::info!(
+                                    target: "vein.audit",
+                                    event = "rpc_task_queued",
+                                    %request_id,
+                                    %query_id,
+                                    %task_id,
+                                    attempt,
+                                    client_result = is_client,
+                                    "rpc_task_queued"
+                                );
 
                                 if is_client {
                                     let start = VeinControlEvent::TaskResultStart {
@@ -683,7 +710,7 @@ impl ExecutorDaemonBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::identifiers::{NodeId, QueryId, StageId, TaskId};
+    use common::identifiers::{NodeId, QueryId, RequestId, StageId, TaskId};
     use common::protocol::{
         DataSink, DataSource, ExecuteTask, ExecutionMode, FileFormat, FileScanTask, MicroOp,
         MicroProgram, NodeKind, NodeLoad, ScalarConstant, VeinControlEvent,
@@ -693,6 +720,7 @@ mod tests {
     #[test]
     fn test_zero_copy_dispatch_task() {
         let task = ExecuteTask {
+            request_id: RequestId::new(),
             mode: ExecutionMode::Batch,
             task_id: TaskId::new(),
             attempt: 0,

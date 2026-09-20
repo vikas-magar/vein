@@ -2,8 +2,8 @@ use common::protocol::{ArchivedProtocolResponse, ProtocolRequest};
 use common::transport::{ControlFrameDecoder, build_quic_client};
 use s2n_quic::client::Connect;
 use std::net::SocketAddr;
+use common::logging;
 use tracing::{debug, error, info};
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 const MASTER_ADDR: &str = "127.0.0.1:8080";
 const CERT_PATH: &str = "certs/server.crt";
@@ -12,9 +12,7 @@ const DEFAULT_QUERY: &str = "FROM users |> WHERE age > 18 + 2 |> SELECT id, name
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    logging::init("vein-client")?;
 
     let query = std::env::args()
         .nth(1)

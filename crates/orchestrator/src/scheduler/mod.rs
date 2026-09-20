@@ -8,7 +8,7 @@ use common::protocol::ExecutionMode;
 use error::VeinError;
 use physical::Job;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 /// Orchestrates the execution of a [`Job`] across the cluster.
@@ -91,7 +91,7 @@ impl Scheduler {
                 let mode = *job.mode();
                 let execute_task = task
                     .clone()
-                    .into_execute_task(query_id, stage.stage_id, mode);
+                    .into_execute_task(job.request_id, query_id, stage.stage_id, mode);
 
                 // Pick the least-loaded executor (executors are already sorted by load).
                 let executor = executors[i % executors.len()].clone();
@@ -102,11 +102,35 @@ impl Scheduler {
 
                 join_set.spawn(async move {
                     let task_id = execute_task.task_id;
+                    let stage_id = execute_task.stage_id;
                     let mut attempts = 0;
+                    let task_started = Instant::now();
                     loop {
                         // 1. Dispatch
+                        let dispatch_started = Instant::now();
+                        tracing::info!(
+                            target: "vein.audit",
+                            event = "task_dispatch_started",
+                            %query_id,
+                            %stage_id,
+                            %task_id,
+                            executor = %executor.node_id,
+                            attempt = attempts,
+                            "task_dispatch_started"
+                        );
                         if let Err(e) = dispatcher.dispatch(&executor, execute_task.clone()).await {
-                            tracing::warn!("Dispatch failed to node {}: {}", executor.node_id, e);
+                            tracing::warn!(
+                                target: "vein.audit",
+                                event = "task_dispatch_failed",
+                                %query_id,
+                                %stage_id,
+                                %task_id,
+                                executor = %executor.node_id,
+                                attempt = attempts,
+                                duration_ms = dispatch_started.elapsed().as_millis() as u64,
+                                error = %e,
+                                "task_dispatch_failed"
+                            );
                             attempts += 1;
                             if attempts > max_retries {
                                 return Err(e);
@@ -133,13 +157,32 @@ impl Scheduler {
                         };
 
                         match wait_result {
-                            Ok(_) => return Ok(()), // Success, move to next task in the wave
+                            Ok(_) => {
+                                tracing::info!(
+                                    target: "vein.audit",
+                                    event = "task_completed",
+                                    %query_id,
+                                    %stage_id,
+                                    %task_id,
+                                    executor = %executor.node_id,
+                                    attempt = attempts,
+                                    duration_ms = task_started.elapsed().as_millis() as u64,
+                                    "task_completed"
+                                );
+                                return Ok(());
+                            }
                             Err(e) => {
                                 tracing::warn!(
-                                    "Task {} failed on node {}: {}",
-                                    task_id,
-                                    executor.node_id,
-                                    e
+                                    target: "vein.audit",
+                                    event = "task_attempt_failed",
+                                    %query_id,
+                                    %stage_id,
+                                    %task_id,
+                                    executor = %executor.node_id,
+                                    attempt = attempts,
+                                    duration_ms = task_started.elapsed().as_millis() as u64,
+                                    error = %e,
+                                    "task_attempt_failed"
                                 );
                                 attempts += 1;
                                 if attempts > max_retries {
@@ -196,7 +239,7 @@ impl Scheduler {
             for task in stage.tasks() {
                 let execute_task = task
                     .clone()
-                    .into_execute_task(job.query_id, stage.stage_id, ExecutionMode::Streaming);
+                    .into_execute_task(job.request_id, job.query_id, stage.stage_id, ExecutionMode::Streaming);
 
                 // Dispatch task
                 self.dispatcher.dispatch(executor, execute_task.clone()).await?;

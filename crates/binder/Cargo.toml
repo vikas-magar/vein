@@ -12,6 +12,7 @@ vcs = { path = "../vcs" }
 error = { path = "../error" }
 parser = { path = "../parser" }
 async-trait = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use common::identifiers::QueryId;
+use common::identifiers::{QueryId, RequestId};
 use common::protocol::ExecutionMode;
 use common::Result;
 use error::VeinError;
@@ -89,8 +89,14 @@ fn contains_linear_join(plan: &LogicalPlan) -> bool {
 }
 
 impl PhysicalPlanner for DefaultPhysicalPlanner {
-    fn create_physical_plan(&self, logical_plan: LogicalPlan) -> Result<Job> {
+    fn create_physical_plan(&self, request_id: RequestId, logical_plan: LogicalPlan) -> Result<Job> {
         let query_id = QueryId::new();
+        tracing::info!(
+            target: "vein.audit",
+            event = "physical_planning_started",
+            %query_id,
+            "physical_planning_started"
+        );
 
         if contains_linear_join(&logical_plan) {
             let mut stages = Vec::new();
@@ -101,7 +107,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 &mut stages,
                 &mut edges,
             )?;
-            return Job::new(query_id, stages, edges, output_stage, ExecutionMode::Batch);
+            return Job::new(request_id, query_id, stages, edges, output_stage, ExecutionMode::Batch);
         }
 
         match &logical_plan {
@@ -114,7 +120,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 let output_stage = self
                     .pipeline_builder
                     .build(query_id, &logical_plan, &mut stages)?;
-                Job::new(query_id, stages, vec![], output_stage, ExecutionMode::Batch)
+                Job::new(request_id, query_id, stages, vec![], output_stage, ExecutionMode::Batch)
             }
             LogicalPlan::Aggregate { .. } => {
                 let mut stages = Vec::new();
@@ -125,7 +131,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                     &mut stages,
                     &mut edges,
                 )?;
-                Job::new(query_id, stages, edges, output_stage, ExecutionMode::Batch)
+                Job::new(request_id, query_id, stages, edges, output_stage, ExecutionMode::Batch)
             }
             LogicalPlan::Join { .. } => {
                 let mut stages = Vec::new();
@@ -136,7 +142,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                     &mut stages,
                     &mut edges,
                 )?;
-                Job::new(query_id, stages, edges, output_stage, ExecutionMode::Batch)
+                Job::new(request_id, query_id, stages, edges, output_stage, ExecutionMode::Batch)
             }
             other => Err(VeinError::planning(
                 format!("Logical plan node not yet supported by physical planner: {other:?}"),
@@ -172,7 +178,9 @@ mod tests {
     fn test_create_physical_plan_for_linear_scan() {
         let planner = DefaultPhysicalPlanner::new();
         let plan = mock_scan_plan();
-        let job = planner.create_physical_plan(plan).expect("plan should succeed");
+        let job = planner
+            .create_physical_plan(RequestId::new(), plan)
+            .expect("plan should succeed");
 
         assert_eq!(job.topological_order().len(), 1);
         let stage_id = job.output_stage_id();

@@ -161,14 +161,34 @@ impl VcsCatalog {
         expected_tasks: Vec<common::identifiers::TaskId>,
         schema_fingerprint: impl Into<String>,
     ) -> Result<common::protocol::ExchangeManifest> {
-        self.exchange_catalog
+        let schema_fingerprint = schema_fingerprint.into();
+        let result = self.exchange_catalog
             .create_exchange(
-                key,
+                key.clone(),
                 partition_count,
                 expected_tasks,
-                schema_fingerprint.into(),
+                schema_fingerprint.clone(),
             )
-            .await
+            .await;
+        match &result {
+            Ok(manifest) => tracing::info!(
+                target: "vein.audit",
+                event = "vcs_exchange_created",
+                exchange = ?key,
+                partitions = partition_count,
+                schema_fingerprint = %schema_fingerprint,
+                state = ?manifest.state,
+                "vcs_exchange_created"
+            ),
+            Err(error) => tracing::error!(
+                target: "vein.audit",
+                event = "vcs_exchange_create_failed",
+                exchange = ?key,
+                error = %error,
+                "vcs_exchange_create_failed"
+            ),
+        }
+        result
     }
 
     /// Publishes one durable exchange fragment through VCS.
@@ -177,7 +197,36 @@ impl VcsCatalog {
         key: common::protocol::ExchangeKey,
         fragment: common::protocol::ExchangeFragment,
     ) -> Result<()> {
-        self.exchange_catalog.publish_fragment(key, fragment).await
+        let partition_id = fragment.partition_id;
+        let task_id = fragment.task_id;
+        let attempt = fragment.attempt;
+        let row_count = fragment.row_count;
+        let byte_len = fragment.byte_len;
+        let result = self.exchange_catalog.publish_fragment(key.clone(), fragment).await;
+        match &result {
+            Ok(()) => tracing::info!(
+                target: "vein.audit",
+                event = "vcs_exchange_fragment_published",
+                exchange = ?key,
+                partition_id,
+                %task_id,
+                attempt,
+                rows = row_count,
+                bytes = byte_len,
+                "vcs_exchange_fragment_published"
+            ),
+            Err(error) => tracing::error!(
+                target: "vein.audit",
+                event = "vcs_exchange_fragment_publish_failed",
+                exchange = ?key,
+                partition_id,
+                %task_id,
+                attempt,
+                error = %error,
+                "vcs_exchange_fragment_publish_failed"
+            ),
+        }
+        result
     }
 
     /// Seals an exchange after all registered producers publish output.
@@ -185,7 +234,24 @@ impl VcsCatalog {
         &self,
         key: common::protocol::ExchangeKey,
     ) -> Result<common::protocol::ExchangeManifest> {
-        self.exchange_catalog.seal_exchange(key).await
+        let result = self.exchange_catalog.seal_exchange(key.clone()).await;
+        match &result {
+            Ok(manifest) => tracing::info!(
+                target: "vein.audit",
+                event = "vcs_exchange_sealed",
+                exchange = ?key,
+                fragments = manifest.fragments.len(),
+                "vcs_exchange_sealed"
+            ),
+            Err(error) => tracing::error!(
+                target: "vein.audit",
+                event = "vcs_exchange_seal_failed",
+                exchange = ?key,
+                error = %error,
+                "vcs_exchange_seal_failed"
+            ),
+        }
+        result
     }
 
     /// Reads a sealed exchange manifest through VCS.

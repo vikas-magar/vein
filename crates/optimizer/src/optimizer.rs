@@ -107,6 +107,13 @@ impl OptimizerPipeline {
 
         let mut diagnostics = OptimizationDiagnostics::default();
         let mut current = plan;
+        tracing::info!(
+            target: "vein.audit",
+            event = "optimizer_started",
+            rule_count = rules.len(),
+            max_sweeps = context.config().max_sweeps,
+            "optimizer_started"
+        );
 
         for sweep in 1..=context.config().max_sweeps {
             let mut next = current;
@@ -117,17 +124,35 @@ impl OptimizerPipeline {
                 let (result, any_changed) = apply_rule(rule.as_ref(), next, &context)?;
                 next = result;
                 changed |= any_changed;
+                let elapsed = started.elapsed();
+                tracing::debug!(
+                    target: "vein.audit",
+                    event = "optimizer_rule_applied",
+                    rule = rule.name(),
+                    phase = ?rule.phase(),
+                    sweep,
+                    changed = any_changed,
+                    duration_us = elapsed.as_micros() as u64,
+                    "optimizer_rule_applied"
+                );
                 diagnostics.rule_executions.push(RuleExecution {
                     rule_name: rule.name().to_string(),
                     phase: rule.phase(),
                     sweep,
                     changed: any_changed,
-                    elapsed: started.elapsed(),
+                    elapsed,
                 });
             }
 
             diagnostics.sweeps = sweep;
             if !changed {
+                tracing::info!(
+                    target: "vein.audit",
+                    event = "optimizer_converged",
+                    sweeps = sweep,
+                    rule_executions = diagnostics.rule_executions.len(),
+                    "optimizer_converged"
+                );
                 return Ok((next, diagnostics));
             }
             current = next;

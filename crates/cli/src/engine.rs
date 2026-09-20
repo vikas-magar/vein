@@ -9,6 +9,7 @@ use parser::ast::query::QueryNode;
 use physical::PhysicalPlanner;
 use plan::LogicalPlan;
 use plan::display;
+use tracing::{info_span, Instrument};
 
 /// The result of executing a bound query.
 pub enum QueryOutput {
@@ -124,6 +125,7 @@ impl DistributedCoordinatorBuilder {
 
 impl DistributedCoordinator {
     fn stream_job(&self, job: physical::Job) -> SendableResultStream {
+        let request_id = job.request_id;
         let query_id = job.query_id;
         let scheduler = self.scheduler.clone();
         let dispatcher = scheduler.dispatcher().clone();
@@ -132,6 +134,12 @@ impl DistributedCoordinator {
         let cancel = common::cancellation::CancellationToken::new();
         let execution_cancel = cancel.clone();
 
+        let query_span = info_span!(
+            target: "vein.audit",
+            "query_execution",
+            request_id = %request_id,
+            query_id = %query_id
+        );
         tokio::spawn(async move {
             let mut upstream = upstream;
             let mut execution = Box::pin(scheduler.execute(job, execution_cancel));
@@ -160,13 +168,25 @@ impl DistributedCoordinator {
             }
 
             if let Some(Err(error)) = execution_result {
+                tracing::error!(
+                    target: "vein.audit",
+                    event = "result_stream_failed",
+                    error = %error,
+                    "result_stream_failed"
+                );
                 let _ = sender
                     .send(Ok(ResultEvent::Error {
                         message: error.to_string(),
                     }))
                     .await;
+            } else {
+                tracing::info!(
+                    target: "vein.audit",
+                    event = "result_stream_completed",
+                    "result_stream_completed"
+                );
             }
-        });
+        }.instrument(query_span));
 
         stream
     }
@@ -179,6 +199,18 @@ impl QueryEngine for DistributedCoordinator {
     }
 
     async fn submit_query<'a>(&self, node: QueryNode<'a>) -> Result<QueryOutput> {
+        let request_id = common::identifiers::RequestId::new();
+        let query_span = info_span!(
+            target: "vein.audit",
+            "query_request",
+            request_id = %request_id
+        );
+        async move {
+        tracing::info!(
+            target: "vein.audit",
+            event = "query_lifecycle_started",
+            "query_lifecycle_started"
+        );
         tracing::debug!(target: "vein_coordinator", "Binding SQL AST to semantic logical plan");
         let logical_plan = self.binder.bind(&node).await?;
 
@@ -197,7 +229,9 @@ impl QueryEngine for DistributedCoordinator {
         };
 
         tracing::debug!(target: "vein_coordinator", "Lowering optimized logical plan to physical DAG");
-        let job = self.planner.create_physical_plan(optimized_plan)?;
+        let job = self
+            .planner
+            .create_physical_plan(request_id, optimized_plan)?;
         let query_id = job.query_id;
         let output_stage = job.output_stage_id();
         tracing::info!(target: "vein_coordinator", ?output_stage, "Dispatching physical job to cluster scheduler");
@@ -237,6 +271,9 @@ impl QueryEngine for DistributedCoordinator {
             query_id,
             stream: self.stream_job(job),
         })
+        }
+        .instrument(query_span)
+        .await
     }
 }
 
@@ -497,9 +534,11 @@ mod tests {
             },
         };
 
+        let request_id = common::identifiers::RequestId::new();
         let query_id = QueryId::new();
         let task_id = TaskId::new();
         let task = ExecuteTask {
+            request_id,
             mode: ExecutionMode::Batch,
             task_id,
             attempt: 0,

@@ -297,7 +297,7 @@ impl TaskExecutor for DefaultTaskExecutor {
 mod tests {
     use super::*;
     use crate::factory::TaskExecutorBuilder;
-    use common::identifiers::{QueryId, StageId, TaskId};
+    use common::identifiers::{QueryId, RequestId, StageId, TaskId};
     use common::protocol::{ExecutionMode, MicroOp, ScalarConstant};
 
     fn runner() -> DefaultTaskExecutor {
@@ -306,6 +306,7 @@ mod tests {
 
     fn task() -> ExecuteTask {
         ExecuteTask {
+            request_id: RequestId::new(),
             mode: ExecutionMode::Batch,
             task_id: TaskId::new(),
             attempt: 0,
@@ -415,6 +416,7 @@ mod tests {
         };
 
         let task = ExecuteTask {
+            request_id: RequestId::new(),
             mode: ExecutionMode::Batch,
             task_id: TaskId::new(),
             attempt: 0,

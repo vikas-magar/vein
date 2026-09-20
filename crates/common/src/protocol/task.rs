@@ -6,7 +6,7 @@ use std::ops::Range;
 use super::exchange::ExchangeKey;
 use super::ir::MicroProgram;
 use super::join::{JoinKeySpec, JoinSource};
-use crate::identifiers::{QueryId, StageId, TaskId};
+use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
 
 /// Supported file formats for storage scans.
 #[derive(
@@ -307,6 +307,8 @@ pub enum ExecutionMode {
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub struct ExecuteTask {
+    /// Stable request lineage identifier shared by coordinator, scheduler, and executors.
+    pub request_id: RequestId,
     /// Execution mode (Batch or Streaming).
     pub mode: ExecutionMode,
     /// Unique task identifier.
