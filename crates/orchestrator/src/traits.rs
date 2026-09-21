@@ -1,6 +1,17 @@
 use async_trait::async_trait;
 
 use crate::executor::NodeInfo;
+
+/// Metrics returned after a task attempt completes successfully.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TaskCompletion {
+    /// Rows produced or persisted by the task sink.
+    pub row_count: u64,
+    /// Bytes read by the task source.
+    pub bytes_read: u64,
+    /// Task wall-clock duration in nanoseconds.
+    pub duration_ns: u64,
+}
 use common::SendableResultStream;
 use common::identifiers::{QueryId, TaskId};
 use common::protocol::ExecuteTask;
@@ -18,7 +29,7 @@ pub trait TaskDispatcher: Send + Sync {
         &self,
         query_id: QueryId,
         task_id: TaskId,
-    ) -> Result<(), VeinError>;
+    ) -> Result<TaskCompletion, VeinError>;
 
     /// Cancel a running task on the executor.
     async fn cancel_task(

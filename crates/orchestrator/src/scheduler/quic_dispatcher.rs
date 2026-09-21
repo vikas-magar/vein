@@ -16,7 +16,7 @@ use common::{
 use error::VeinError;
 
 use crate::executor::NodeInfo;
-use crate::traits::TaskDispatcher;
+use crate::traits::{TaskCompletion, TaskDispatcher};
 
 const DEFAULT_CERT_PATH: &str = "certs/server.crt";
 
@@ -28,7 +28,12 @@ pub struct QuicTaskDispatcher {
     cert_path: String,
     client: Mutex<Option<Arc<QuicClient>>>,
     completions: Arc<
-        Mutex<HashMap<(QueryId, TaskId), tokio::sync::oneshot::Receiver<Result<(), VeinError>>>>,
+        Mutex<
+            HashMap<
+                (QueryId, TaskId),
+                tokio::sync::oneshot::Receiver<Result<TaskCompletion, VeinError>>,
+            >,
+        >,
     >,
     result_senders: Arc<Mutex<HashMap<QueryId, ResultChannelSender>>>,
     result_started: Arc<Mutex<HashSet<QueryId>>>,
@@ -303,7 +308,11 @@ impl TaskDispatcher for QuicTaskDispatcher {
                             sequence += 1;
                         }
                         ArchivedVeinControlEvent::TaskResultEnd {
-                            row_count, attempt, ..
+                            row_count,
+                            bytes_read,
+                            duration_ns,
+                            attempt,
+                            ..
                         } => {
                             if attempt.to_native() != expected_attempt {
                                 continue;
@@ -320,11 +329,17 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                 duration_ms = rpc_started.elapsed().as_millis() as u64,
                                 "rpc_task_result_received"
                             );
-                            let _ = tx.send(Ok(()));
+                            let _ = tx.send(Ok(TaskCompletion {
+                                row_count: row_count.to_native(),
+                                bytes_read: bytes_read.to_native(),
+                                duration_ns: duration_ns.to_native(),
+                            }));
                             return;
                         }
                         ArchivedVeinControlEvent::TaskCompleted {
-                            row_count: _row_count,
+                            row_count,
+                            bytes_read,
+                            duration_ns,
                             result_bytes,
                             attempt,
                             ..
@@ -389,7 +404,11 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                     sequence += 1;
                                 }
                             }
-                            let _ = tx.send(Ok(()));
+                            let _ = tx.send(Ok(TaskCompletion {
+                                row_count: row_count.to_native(),
+                                bytes_read: bytes_read.to_native(),
+                                duration_ns: duration_ns.to_native(),
+                            }));
                             return;
                         }
                         ArchivedVeinControlEvent::TaskFailed { error, attempt, .. } => {
@@ -439,7 +458,7 @@ impl TaskDispatcher for QuicTaskDispatcher {
         &self,
         query_id: QueryId,
         task_id: TaskId,
-    ) -> std::result::Result<(), VeinError> {
+    ) -> std::result::Result<TaskCompletion, VeinError> {
         let rx = {
             let mut completions = self
                 .completions

@@ -8,8 +8,8 @@ use arrow::array::*;
 use arrow::compute::take;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
-use common::protocol::StorageTarget;
 use common::Result;
+use common::protocol::StorageTarget;
 use error::VeinError;
 use parquet::arrow::ArrowWriter;
 
@@ -21,6 +21,7 @@ pub struct StorageSink {
     batches: Vec<RecordBatch>,
     field_names: Vec<String>,
     vfs_store: Option<Arc<vfs::VfsTableStore>>,
+    rows_written: u64,
 }
 
 impl StorageSink {
@@ -40,6 +41,7 @@ impl StorageSink {
             batches: Vec::new(),
             field_names,
             vfs_store,
+            rows_written: 0,
         }
     }
 }
@@ -65,11 +67,7 @@ impl PipelineNode<DataChunk> for StorageSink {
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| format!("col_{i}"));
-            fields.push(Field::new(
-                col_name,
-                vec.data_type().clone(),
-                true,
-            ));
+            fields.push(Field::new(col_name, vec.data_type().clone(), true));
             let array = take(vec.as_ref(), &indices, None)
                 .map_err(|e| VeinError::internal(format!("storage sink take failed: {e}")))?;
             columns.push(array);
@@ -78,6 +76,7 @@ impl PipelineNode<DataChunk> for StorageSink {
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema, columns)
             .map_err(|e| VeinError::internal(format!("storage sink record batch failed: {e}")))?;
+        self.rows_written += batch.num_rows() as u64;
         self.batches.push(batch);
         Ok(())
     }
@@ -89,8 +88,10 @@ impl PipelineNode<DataChunk> for StorageSink {
         }
 
         let schema = self.batches[0].schema();
-        let combined_batch = arrow::compute::concat_batches(&schema, &self.batches)
-            .map_err(|e| VeinError::internal(format!("Failed to concatenate record batches: {e}")))?;
+        let combined_batch =
+            arrow::compute::concat_batches(&schema, &self.batches).map_err(|e| {
+                VeinError::internal(format!("Failed to concatenate record batches: {e}"))
+            })?;
 
         let dest_uri = self.target.destination_uri.clone();
         let format = self
@@ -119,20 +120,31 @@ impl StorageSink {
         };
 
         if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| VeinError::io(format!("Failed to create directory '{}'", parent.display()), e))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                VeinError::io(
+                    format!("Failed to create directory '{}'", parent.display()),
+                    e,
+                )
+            })?;
         }
 
-        let file = File::create(&file_path)
-            .map_err(|e| VeinError::io(format!("Failed to create Parquet file '{}'", file_path.display()), e))?;
+        let file = File::create(&file_path).map_err(|e| {
+            VeinError::io(
+                format!("Failed to create Parquet file '{}'", file_path.display()),
+                e,
+            )
+        })?;
 
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
-            .map_err(|e| VeinError::internal(format!("Failed to initialize Parquet writer: {e}")))?;
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).map_err(|e| {
+            VeinError::internal(format!("Failed to initialize Parquet writer: {e}"))
+        })?;
 
-        writer.write(batch)
-            .map_err(|e| VeinError::internal(format!("Failed to write Parquet record batch: {e}")))?;
+        writer.write(batch).map_err(|e| {
+            VeinError::internal(format!("Failed to write Parquet record batch: {e}"))
+        })?;
 
-        writer.close()
+        writer
+            .close()
             .map_err(|e| VeinError::internal(format!("Failed to close Parquet writer: {e}")))?;
 
         tracing::info!(
@@ -151,9 +163,9 @@ impl StorageSink {
         };
 
         // Automatically pick the next sequential partition id — no hardcoded 0.
-        let summary = store
-            .append_partition_sync(dest_uri, batch)
-            .map_err(|e| VeinError::internal(format!("Failed to write table '{dest_uri}' to VFS: {e}")))?;
+        let summary = store.append_partition_sync(dest_uri, batch).map_err(|e| {
+            VeinError::internal(format!("Failed to write table '{dest_uri}' to VFS: {e}"))
+        })?;
 
         tracing::info!(
             table = %dest_uri,
@@ -172,6 +184,10 @@ impl Sink<DataChunk> for StorageSink {
         let _ = self.flush();
         Vec::new()
     }
+
+    fn row_count(&self) -> u64 {
+        self.rows_written
+    }
 }
 
 #[cfg(test)]
@@ -188,8 +204,16 @@ mod tests {
                 value: "exo".to_string(),
             }],
             vec![
-                FieldSchema { field_id: 0, name: "id".to_string(),   data_type: "Int64".to_string() },
-                FieldSchema { field_id: 1, name: "name".to_string(), data_type: "Utf8".to_string()  },
+                FieldSchema {
+                    field_id: 0,
+                    name: "id".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                FieldSchema {
+                    field_id: 1,
+                    name: "name".to_string(),
+                    data_type: "Utf8".to_string(),
+                },
             ],
         )
     }
@@ -199,10 +223,9 @@ mod tests {
     fn fresh_vfs_store() -> (Arc<vfs::VfsTableStore>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = vfs::VfsConfig::from_data_dir(tmp.path());
-        let store = vfs::VfsTableStore::run_async(async move {
-            vfs::VfsTableStore::init(&cfg).await
-        })
-        .expect("vfs store init");
+        let store =
+            vfs::VfsTableStore::run_async(async move { vfs::VfsTableStore::init(&cfg).await })
+                .expect("vfs store init");
         (Arc::new(store), tmp)
     }
 
@@ -220,24 +243,33 @@ mod tests {
             ],
             selection: SelectionVector::new_dense(3),
             address_columns: vec![None, None],
-        }).unwrap();
+        })
+        .unwrap();
         sink.flush().unwrap();
 
         // ── second flush → part_id = 1  (multi-partition append) ─────────────
         let mut sink2 = StorageSink::with_vfs_store(make_target(table_name), Some(store.clone()));
-        sink2.push(DataChunk {
-            vectors: vec![
-                Arc::new(Int64Array::from(vec![4, 5])),
-                Arc::new(StringArray::from(vec!["dave", "eve"])),
-            ],
-            selection: SelectionVector::new_dense(2),
-            address_columns: vec![None, None],
-        }).unwrap();
+        sink2
+            .push(DataChunk {
+                vectors: vec![
+                    Arc::new(Int64Array::from(vec![4, 5])),
+                    Arc::new(StringArray::from(vec!["dave", "eve"])),
+                ],
+                selection: SelectionVector::new_dense(2),
+                address_columns: vec![None, None],
+            })
+            .unwrap();
         sink2.flush().unwrap();
 
         // Verify NO loose directories were created on disk.
-        assert!(!std::path::Path::new(table_name).exists(), "No loose table directory on disk!");
-        assert!(!std::path::Path::new(&format!("data/{table_name}")).exists(), "No data/table directory on disk!");
+        assert!(
+            !std::path::Path::new(table_name).exists(),
+            "No loose table directory on disk!"
+        );
+        assert!(
+            !std::path::Path::new(&format!("data/{table_name}")).exists(),
+            "No data/table directory on disk!"
+        );
 
         // Verify both partitions exist in VFS blocks with correct row counts.
         let table_id = vfs::VfsTableStore::resolve_table_id(table_name);
@@ -258,4 +290,3 @@ mod tests {
         assert_eq!(schema.fields[1].name, "name");
     }
 }
-

@@ -9,7 +9,7 @@ use parser::ast::query::QueryNode;
 use physical::PhysicalPlanner;
 use plan::LogicalPlan;
 use plan::display;
-use tracing::{info_span, Instrument};
+use tracing::{Instrument, info_span};
 
 /// The result of executing a bound query.
 pub enum QueryOutput {
@@ -140,53 +140,56 @@ impl DistributedCoordinator {
             request_id = %request_id,
             query_id = %query_id
         );
-        tokio::spawn(async move {
-            let mut upstream = upstream;
-            let mut execution = Box::pin(scheduler.execute(job, execution_cancel));
-            let mut execution_result = None;
-            let mut upstream_done = false;
+        tokio::spawn(
+            async move {
+                let mut upstream = upstream;
+                let mut execution = Box::pin(scheduler.execute(job, execution_cancel));
+                let mut execution_result = None;
+                let mut upstream_done = false;
 
-            while execution_result.is_none() || !upstream_done {
-                tokio::select! {
-                    result = &mut execution, if execution_result.is_none() => {
-                        dispatcher.close_result_stream(query_id);
-                        execution_result = Some(result);
-                    }
-                    event = upstream.next(), if !upstream_done => {
-                        match event {
-                            Some(event) => {
-                                if sender.send(event).await.is_err() {
-                                    cancel.cancel();
-                                    dispatcher.close_result_stream(query_id);
-                                    return;
+                while execution_result.is_none() || !upstream_done {
+                    tokio::select! {
+                        result = &mut execution, if execution_result.is_none() => {
+                            dispatcher.close_result_stream(query_id);
+                            execution_result = Some(result);
+                        }
+                        event = upstream.next(), if !upstream_done => {
+                            match event {
+                                Some(event) => {
+                                    if sender.send(event).await.is_err() {
+                                        cancel.cancel();
+                                        dispatcher.close_result_stream(query_id);
+                                        return;
+                                    }
                                 }
+                                None => upstream_done = true,
                             }
-                            None => upstream_done = true,
                         }
                     }
                 }
-            }
 
-            if let Some(Err(error)) = execution_result {
-                tracing::error!(
-                    target: "vein.audit",
-                    event = "result_stream_failed",
-                    error = %error,
-                    "result_stream_failed"
-                );
-                let _ = sender
-                    .send(Ok(ResultEvent::Error {
-                        message: error.to_string(),
-                    }))
-                    .await;
-            } else {
-                tracing::info!(
-                    target: "vein.audit",
-                    event = "result_stream_completed",
-                    "result_stream_completed"
-                );
+                if let Some(Err(error)) = execution_result {
+                    tracing::error!(
+                        target: "vein.audit",
+                        event = "result_stream_failed",
+                        error = %error,
+                        "result_stream_failed"
+                    );
+                    let _ = sender
+                        .send(Ok(ResultEvent::Error {
+                            message: error.to_string(),
+                        }))
+                        .await;
+                } else {
+                    tracing::info!(
+                        target: "vein.audit",
+                        event = "result_stream_completed",
+                        "result_stream_completed"
+                    );
+                }
             }
-        }.instrument(query_span));
+            .instrument(query_span),
+        );
 
         stream
     }
@@ -244,7 +247,7 @@ impl QueryEngine for DistributedCoordinator {
                 .execute(job, common::cancellation::CancellationToken::new())
                 .await;
             dispatcher.close_result_stream(query_id);
-            execution_result?;
+            let completion = execution_result?;
 
             let location = if target.starts_with('/')
                 || target.starts_with("./")
@@ -263,7 +266,7 @@ impl QueryEngine for DistributedCoordinator {
             }
             return Ok(QueryOutput::Write {
                 table: target,
-                row_count: 0,
+                row_count: completion.row_count,
             });
         }
 
@@ -481,9 +484,7 @@ mod tests {
                 ResultEvent::Error { message } => {
                     saw_scheduler_error = message.contains("No executors available");
                 }
-                ResultEvent::Start { .. }
-                | ResultEvent::Batch(_)
-                | ResultEvent::End { .. } => {}
+                ResultEvent::Start { .. } | ResultEvent::Batch(_) | ResultEvent::End { .. } => {}
             }
         }
         assert!(saw_scheduler_error, "scheduler error was not streamed");
@@ -593,9 +594,7 @@ mod tests {
 
         let master_addr: SocketAddr = "127.0.0.1:9190".parse().unwrap();
         let registry = Arc::new(ExecutorRegistry::new());
-        let dispatcher = Arc::new(
-            QuicTaskDispatcher::with_cert(&cert),
-        );
+        let dispatcher = Arc::new(QuicTaskDispatcher::with_cert(&cert));
         let scheduler = Arc::new(Scheduler::new(
             registry.clone(),
             dispatcher,
@@ -737,9 +736,7 @@ mod tests {
             )
             .await;
 
-        let dispatcher = Arc::new(
-            QuicTaskDispatcher::with_cert(&cert),
-        );
+        let dispatcher = Arc::new(QuicTaskDispatcher::with_cert(&cert));
         let scheduler = Arc::new(Scheduler::new(
             registry,
             dispatcher,

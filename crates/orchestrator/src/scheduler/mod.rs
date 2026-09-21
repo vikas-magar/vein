@@ -2,7 +2,7 @@ pub mod elasticity;
 pub mod quic_dispatcher;
 
 use crate::executor::ExecutorRegistry;
-use crate::traits::TaskDispatcher;
+use crate::traits::{TaskCompletion, TaskDispatcher};
 use common::cancellation::CancellationToken;
 use common::protocol::ExecutionMode;
 use error::VeinError;
@@ -50,7 +50,11 @@ impl Scheduler {
     }
 
     /// Execute the [`Job`], choosing the strategy based on its execution mode.
-    pub async fn execute(&self, job: Job, cancel: CancellationToken) -> Result<(), VeinError> {
+    pub async fn execute(
+        &self,
+        job: Job,
+        cancel: CancellationToken,
+    ) -> Result<TaskCompletion, VeinError> {
         match job.mode() {
             ExecutionMode::Batch => self.execute_batch_waves(job, cancel).await,
             ExecutionMode::Streaming => self.execute_streaming_topology(job, cancel).await,
@@ -66,8 +70,10 @@ impl Scheduler {
         &self,
         job: Job,
         cancel: CancellationToken,
-    ) -> Result<(), VeinError> {
+    ) -> Result<TaskCompletion, VeinError> {
         let order = job.topological_order();
+        let output_stage_id = job.output_stage_id();
+        let mut total = TaskCompletion::default();
 
         for stage_id in order {
             // Check cancellation before each wave
@@ -89,9 +95,9 @@ impl Scheduler {
             for (i, task) in stage.tasks().iter().enumerate() {
                 let query_id = job.query_id;
                 let mode = *job.mode();
-                let execute_task = task
-                    .clone()
-                    .into_execute_task(job.request_id, query_id, stage.stage_id, mode);
+                let execute_task =
+                    task.clone()
+                        .into_execute_task(job.request_id, query_id, stage.stage_id, mode);
 
                 // Pick the least-loaded executor (executors are already sorted by load).
                 let executor = executors[i % executors.len()].clone();
@@ -157,7 +163,7 @@ impl Scheduler {
                         };
 
                         match wait_result {
-                            Ok(_) => {
+                            Ok(completion) => {
                                 tracing::info!(
                                     target: "vein.audit",
                                     event = "task_completed",
@@ -166,10 +172,11 @@ impl Scheduler {
                                     %task_id,
                                     executor = %executor.node_id,
                                     attempt = attempts,
+                                    rows = completion.row_count,
                                     duration_ms = task_started.elapsed().as_millis() as u64,
                                     "task_completed"
                                 );
-                                return Ok(());
+                                return Ok(completion);
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -194,25 +201,30 @@ impl Scheduler {
                 });
             }
 
+            // Only the final output stage contributes query/write rows.
+            let is_output_stage = stage_id == output_stage_id;
             // Wait for every task of the stage before advancing the wave.
             while let Some(res) = join_set.join_next().await {
                 match res {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(completion)) if is_output_stage => {
+                        total.row_count += completion.row_count;
+                        total.bytes_read += completion.bytes_read;
+                        total.duration_ns += completion.duration_ns;
+                    }
+                    Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         cancel.cancel();
                         return Err(e);
                     }
                     Err(e) => {
                         cancel.cancel();
-                        return Err(VeinError::internal(format!(
-                            "stage task panicked: {e}"
-                        )));
+                        return Err(VeinError::internal(format!("stage task panicked: {e}")));
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(total)
     }
 
     /// Schedule a Streaming query by dispatching all stages simultaneously.
@@ -220,8 +232,9 @@ impl Scheduler {
         &self,
         job: Job,
         cancel: CancellationToken,
-    ) -> Result<(), VeinError> {
+    ) -> Result<TaskCompletion, VeinError> {
         let order = job.topological_order();
+        let mut total = TaskCompletion::default();
 
         let executors = self.registry.available(Duration::from_secs(15)).await;
         if executors.is_empty() {
@@ -237,12 +250,17 @@ impl Scheduler {
             let executor = &executors[i % executors.len()]; // Round-robin assign
 
             for task in stage.tasks() {
-                let execute_task = task
-                    .clone()
-                    .into_execute_task(job.request_id, job.query_id, stage.stage_id, ExecutionMode::Streaming);
+                let execute_task = task.clone().into_execute_task(
+                    job.request_id,
+                    job.query_id,
+                    stage.stage_id,
+                    ExecutionMode::Streaming,
+                );
 
                 // Dispatch task
-                self.dispatcher.dispatch(executor, execute_task.clone()).await?;
+                self.dispatcher
+                    .dispatch(executor, execute_task.clone())
+                    .await?;
 
                 // Spawn a monitoring task for this continuous fragment
                 let dispatcher = self.dispatcher.clone();
@@ -266,8 +284,10 @@ impl Scheduler {
                     cancel.cancel(); // Trigger topology rollback/cancellation
                     return Err(e);
                 }
-                Ok(Ok(_)) => {
-                    // A streaming fragment finished cleanly (EOF on source)
+                Ok(Ok(completion)) => {
+                    total.row_count += completion.row_count;
+                    total.bytes_read += completion.bytes_read;
+                    total.duration_ns += completion.duration_ns;
                 }
                 Err(e) => {
                     tracing::error!("Monitoring task panicked: {}", e);
@@ -277,6 +297,6 @@ impl Scheduler {
             }
         }
 
-        Ok(())
+        Ok(total)
     }
 }
