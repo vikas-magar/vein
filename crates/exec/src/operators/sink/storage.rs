@@ -10,6 +10,7 @@ use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
 use common::Result;
 use common::protocol::StorageTarget;
+use distributed::{ArtifactId, ArtifactRef, TableWritePart};
 use error::VeinError;
 use parquet::arrow::ArrowWriter;
 
@@ -22,6 +23,7 @@ pub struct StorageSink {
     field_names: Vec<String>,
     vfs_store: Option<Arc<vfs::VfsTableStore>>,
     rows_written: u64,
+    write_parts: Vec<TableWritePart>,
 }
 
 impl StorageSink {
@@ -42,6 +44,7 @@ impl StorageSink {
             field_names,
             vfs_store,
             rows_written: 0,
+            write_parts: Vec::new(),
         }
     }
 }
@@ -159,26 +162,54 @@ impl StorageSink {
         Ok(())
     }
 
-    fn write_exo(&self, dest_uri: &str, batch: &RecordBatch) -> Result<()> {
+    fn write_exo(&mut self, dest_uri: &str, batch: &RecordBatch) -> Result<()> {
         let store = match &self.vfs_store {
             Some(s) => s.clone(),
             None => vfs::VfsTableStore::shared_or_default()
                 .map_err(|e| VeinError::internal(format!("Failed to get VfsTableStore: {e}")))?,
         };
 
-        let summary = if self.target.get_option("staging_table").is_some() {
-            let partition_id = self.target.get_option("partition_id").ok_or_else(|| {
-                VeinError::internal("staged VFS write is missing partition_id")
-            })?.parse::<u32>().map_err(|error| {
-                VeinError::internal(format!("invalid storage partition_id: {error}"))
-            })?;
-            store.write_table_sync(dest_uri, partition_id, batch)
-        } else {
-            store.append_partition_sync(dest_uri, batch)
+        let staged_partition_id = self
+            .target
+            .get_option("partition_id")
+            .map(|value| {
+                value.parse::<u32>().map_err(|error| {
+                    VeinError::internal(format!("invalid storage partition_id: {error}"))
+                })
+            })
+            .transpose()?;
+
+        let summary = match staged_partition_id {
+            Some(partition_id) => store.write_table_sync(dest_uri, partition_id, batch),
+            None => store.append_partition_sync(dest_uri, batch),
         }
         .map_err(|e| {
             VeinError::internal(format!("Failed to write table '{dest_uri}' to VFS: {e}"))
         })?;
+
+        if let Some(partition_id) = staged_partition_id {
+            let write_id = self
+                .target
+                .get_option("write_id")
+                .ok_or_else(|| VeinError::internal("staged VFS write is missing write_id"))?;
+            let staging_table = self
+                .target
+                .get_option("staging_table")
+                .ok_or_else(|| VeinError::internal("staged VFS write is missing staging_table"))?;
+            self.write_parts.push(TableWritePart {
+                partition_id,
+                artifact: ArtifactRef {
+                    id: ArtifactId::from(format!("{write_id}:part:{partition_id}")),
+                    uri: format!("vfs://{staging_table}/part_{partition_id:06}"),
+                    checksum: format!(
+                        "{}:{}:{}",
+                        summary.table_id, partition_id, summary.total_rows
+                    ),
+                    size_bytes: summary.extents.iter().map(|extent| extent.length).sum(),
+                },
+                row_count: summary.total_rows,
+            });
+        }
 
         tracing::info!(
             table = %dest_uri,
@@ -200,6 +231,10 @@ impl Sink<DataChunk> for StorageSink {
 
     fn row_count(&self) -> u64 {
         self.rows_written
+    }
+
+    fn write_parts(&mut self) -> Vec<TableWritePart> {
+        std::mem::take(&mut self.write_parts)
     }
 }
 

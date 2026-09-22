@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use common::protocol::CatalogSnapshotToken;
+
 use crate::expr::LogicalLiteral;
 use crate::plan::SortKey;
 use crate::schema::VeinSchemaRef;
@@ -139,6 +141,8 @@ pub struct TableMetadata {
     pub sort_order: Vec<SortKey>,
     /// Statistical metadata for Cost-Based Optimization (CBO).
     pub statistics: Option<TableStatistics>,
+    /// Catalog snapshot pinned for planning and execution.
+    pub catalog_snapshot: Option<CatalogSnapshotToken>,
     /// Extensible key-value properties (e.g. compression codec, snapshot IDs, options).
     pub properties: HashMap<String, String>,
     /// Optional human-readable table description or comment.
@@ -161,9 +165,16 @@ impl TableMetadata {
             partition_columns: Vec::new(),
             sort_order: Vec::new(),
             statistics: None,
+            catalog_snapshot: None,
             properties: HashMap::new(),
             comment: None,
         }
+    }
+
+    /// Pins the table to a catalog snapshot for planning and execution.
+    pub fn with_catalog_snapshot(mut self, snapshot: CatalogSnapshotToken) -> Self {
+        self.catalog_snapshot = Some(snapshot);
+        self
     }
 
     /// Sets the table type.

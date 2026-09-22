@@ -98,7 +98,7 @@ impl ExchangeCatalog for ReplicatedExchangeCatalog {
         schema_fingerprint: String,
     ) -> Result<ExchangeManifest> {
         let manifest = ExchangeManifest::new(
-            key.clone(),
+            key,
             partition_count,
             expected_tasks.clone(),
             schema_fingerprint.clone(),
@@ -126,7 +126,7 @@ impl ExchangeCatalog for ReplicatedExchangeCatalog {
                 fragment.partition_id,
                 fragment.attempt
             )),
-            key: key.clone(),
+            key: key,
             fragment: fragment.clone(),
         })
         .await?;
@@ -139,7 +139,7 @@ impl ExchangeCatalog for ReplicatedExchangeCatalog {
                 "exchange:seal:{}:{}",
                 key.query_id, key.stage_id
             )),
-            key: key.clone(),
+            key: key,
         })
         .await?;
         self.inner.seal_exchange(key).await
@@ -187,7 +187,7 @@ impl ExchangeCatalog for ReplicatedExchangeCatalog {
                 "exchange:delete:{}:{}",
                 key.query_id, key.stage_id
             )),
-            key: key.clone(),
+            key: key,
         })
         .await?;
         self.inner.delete_exchange(key).await

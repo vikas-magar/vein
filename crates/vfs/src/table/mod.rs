@@ -137,6 +137,7 @@ impl ExchangeFrameReader {
 }
 
 static SHARED_STORE: std::sync::RwLock<Option<Arc<VfsTableStore>>> = std::sync::RwLock::new(None);
+static SHARED_STORE_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn nullable_primitive_vaddrs<T>(array: &PrimitiveArray<T>) -> (Vec<u64>, Vec<bool>)
 where
@@ -210,7 +211,7 @@ impl VfsTableStore {
     ///
     /// | Variable             | Default       | Description                  |
     /// |----------------------|---------------|------------------------------|
-    /// | `VEIN_DATA_DIR`      | `/tmp/veinfs` | Root for all VFS data        |
+    /// | `VEIN_DATA_DIR`      | `./vein_data` | Root for all VFS data        |
     /// | `VEIN_BLOCK_SIZE_MB` | `5120` (5 GB) | Block file size in MiB       |
     /// | `VEIN_NODE_IP`       | `127.0.0.1`   | Node IP for data locality    |
     ///
@@ -218,16 +219,19 @@ impl VfsTableStore {
     /// fully configured store (e.g. in tests or when the server reads from a
     /// config file).
     pub fn shared_or_default() -> Result<Arc<VfsTableStore>> {
-        {
-            if let Ok(guard) = SHARED_STORE.read() {
-                if let Some(store) = &*guard {
-                    return Ok(store.clone());
-                }
+        let _init_guard = SHARED_STORE_INIT
+            .lock()
+            .map_err(|e| VfsError::Internal(format!("Failed to acquire SHARED_STORE_INIT lock: {e}")))?;
+
+        if let Ok(guard) = SHARED_STORE.read() {
+            if let Some(store) = &*guard {
+                return Ok(store.clone());
             }
         }
 
-        // VfsConfig::default() delegates to VfsConfig::from_env(), so this
-        // automatically picks up VEIN_DATA_DIR, VEIN_BLOCK_SIZE_MB, VEIN_NODE_IP.
+        // Initialization is serialized before opening redb. This guarantees
+        // that concurrent callers in one process never create two handles for
+        // the same metadata database.
         let store = Self::run_async(async {
             let config = VfsConfig::default();
             VfsTableStore::init(&config).await

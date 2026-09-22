@@ -64,12 +64,17 @@ impl VfsConfig {
         }
     }
 
+    /// Builds a configuration rooted at one executor's private storage area.
+    pub fn for_executor(data_root: &std::path::Path, executor_id: &str) -> Self {
+        Self::from_data_dir(&data_root.join("executors").join(executor_id))
+    }
+
     /// Builds a [`VfsConfig`] from environment variables, falling back to
-    /// `/tmp/veinfs` when none are set.
+    /// `./vein_data` when none are set.
     ///
     /// | Variable              | Default            | Description                        |
     /// |-----------------------|--------------------|------------------------------------|
-    /// | `VEIN_DATA_DIR`       | `/tmp/veinfs`      | Root for all VFS data              |
+    /// | `VEIN_DATA_DIR`       | `./vein_data`      | Root for all VFS data              |
     /// | `VEIN_BLOCK_SIZE_MB`  | `5120` (5 GB)      | Block file size in mebibytes       |
     /// | `VEIN_NODE_IP`        | `127.0.0.1`        | Node IP recorded for data locality |
     ///
@@ -77,7 +82,7 @@ impl VfsConfig {
     pub fn from_env() -> Self {
         let data_dir = std::env::var("VEIN_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp/veinfs"));
+            .unwrap_or_else(|_| PathBuf::from("./vein_data"));
 
         let block_size_bytes = std::env::var("VEIN_BLOCK_SIZE_MB")
             .ok()
@@ -97,7 +102,7 @@ impl VfsConfig {
 
 impl Default for VfsConfig {
     /// Equivalent to [`VfsConfig::from_env()`] — honours `VEIN_DATA_DIR` etc.
-    /// Falls back to `/tmp/veinfs` when the variables are absent.
+    /// Falls back to `./vein_data` when the variables are absent.
     fn default() -> Self {
         Self::from_env()
     }

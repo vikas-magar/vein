@@ -4,6 +4,7 @@
 //! lifetime infection or rkyv::Deserialize Pool strategy mismatches.
 
 use super::control::{
+    TableWritePartDescriptor,
     ArchivedNodeKind, ArchivedNodeLoad, ArchivedRaftRpcEnvelope, ArchivedRaftRpcKind,
     ArchivedVeinControlEvent, NodeKind, NodeLoad, RaftRpcEnvelope, RaftRpcKind, VeinControlEvent,
 };
@@ -20,9 +21,11 @@ use super::join::{
     PhysicalJoinType,
 };
 use super::task::{
-    ArchivedDataSink, ArchivedDataSource, ArchivedExecuteTask, ArchivedExecutionMode,
-    ArchivedFieldSchema, ArchivedFileFormat, ArchivedFileScanTask, ArchivedScanPredicate,
-    ArchivedScanPredicateValue, DataSink, DataSource, ExchangeSource, ExecuteTask, ExecutionMode,
+    ArchivedCatalogSnapshotToken, ArchivedDataSink, ArchivedDataSource, ArchivedExecuteTask,
+    ArchivedExecutionMode, ArchivedFieldSchema, ArchivedFileFormat, ArchivedFileScanTask,
+    ArchivedScanPredicate,
+    ArchivedScanPredicateValue, CatalogSnapshotToken, DataSink, DataSource, ExchangeSource,
+    ExecuteTask, ExecutionMode,
     FieldSchema, FileFormat, FileScanTask, KeyValue, ScanPredicate, ScanPredicateValue,
     ShuffleTarget, StorageTarget, StreamSource,
 };
@@ -324,6 +327,17 @@ impl From<&ArchivedScanPredicate> for ScanPredicate {
     }
 }
 
+impl From<&ArchivedCatalogSnapshotToken> for CatalogSnapshotToken {
+    fn from(archived: &ArchivedCatalogSnapshotToken) -> Self {
+        Self::new(
+            archived.table_id.as_str(),
+            archived.catalog_revision.as_str(),
+            archived.snapshot_id.as_str(),
+            archived.schema_version.to_native(),
+        )
+    }
+}
+
 impl From<&ArchivedFileScanTask> for FileScanTask {
     fn from(archived: &ArchivedFileScanTask) -> Self {
         Self {
@@ -349,6 +363,10 @@ impl From<&ArchivedFileScanTask> for FileScanTask {
                 .map(ScanPredicate::from)
                 .collect(),
             task_id: TaskId::from_raw(archived.task_id.0.to_native()),
+            catalog_snapshot: archived
+                .catalog_snapshot
+                .as_ref()
+                .map(CatalogSnapshotToken::from),
             shuffle_target_path: archived
                 .shuffle_target_path
                 .as_ref()
@@ -576,6 +594,7 @@ impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
                 bytes_read,
                 duration_ns,
                 result_bytes,
+                write_parts,
             } => VeinControlEvent::TaskCompleted {
                 task_id: TaskId::from_raw(task_id.0.to_native()),
                 query_id: QueryId::from_raw(query_id.0.to_native()),
@@ -584,6 +603,14 @@ impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
                 bytes_read: bytes_read.to_native(),
                 duration_ns: duration_ns.to_native(),
                 result_bytes: result_bytes.as_ref().map(|b| b.as_slice().to_vec()),
+                write_parts: write_parts.iter().map(|part| TableWritePartDescriptor {
+                    partition_id: part.partition_id.to_native(),
+                    artifact_id: part.artifact_id.as_str().to_owned(),
+                    artifact_uri: part.artifact_uri.as_str().to_owned(),
+                    checksum: part.checksum.as_str().to_owned(),
+                    size_bytes: part.size_bytes.to_native(),
+                    row_count: part.row_count.to_native(),
+                }).collect(),
             },
             ArchivedVeinControlEvent::TaskResultStart {
                 task_id,

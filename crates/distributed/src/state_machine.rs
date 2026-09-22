@@ -86,6 +86,11 @@ impl MetadataStateMachine {
             MetadataCommand::PublishTableSnapshot {
                 table_id, snapshot, ..
             } => {
+                if snapshot.metadata_payload.is_empty() {
+                    return Err(DistributedError::InvalidCommand(
+                        "table snapshot is missing complete metadata".to_owned(),
+                    ));
+                }
                 self.state.tables.insert(
                     table_id.clone(),
                     TableRecord {
@@ -312,7 +317,7 @@ mod tests {
                     size_bytes: 128,
                 },
                 schema_fingerprint: "schema-v1".to_owned(),
-                metadata_payload: Vec::new(),
+                metadata_payload: vec![1],
             },
         }
     }

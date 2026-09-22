@@ -28,36 +28,23 @@ pub struct DiscoveredSource {
 
 /// Resolves a source by name, file path, or VFS table reference.
 pub async fn resolve_source(name_or_path: &str) -> Result<DiscoveredSource> {
-    // 0. Check VFS native memory-mapped block tables first!
-    if let Ok(store) = vfs::VfsTableStore::shared_or_default() {
-        let table_id = vfs::VfsTableStore::resolve_table_id(name_or_path);
-        if let Ok(schema) = store.read_table_schema(table_id).await {
-            let parts = store.resolve_table_parts(table_id).await.unwrap_or_default();
-            let files = if parts.is_empty() {
-                vec![format!("vfs://tbl_{table_id}/part_000000")]
-            } else {
-                parts
-                    .iter()
-                    .map(|p| format!("vfs://tbl_{table_id}/part_{p:06}"))
-                    .collect()
-            };
-            return Ok(DiscoveredSource {
-                name: name_or_path.to_string(),
-                location: format!("vfs://tbl_{table_id}"),
-                format: "exo".to_string(),
-                schema,
-                files,
-            });
-        }
-    }
-
-    // 1. Check if name_or_path directly exists as a file or directory
+    // Concrete filesystem paths are authoritative. This prevents a stale VFS
+    // table whose deterministic hash happens to match the path from masking the
+    // actual source format on disk.
     let path = Path::new(name_or_path);
     if path.exists() {
         return resolve_existing_path(name_or_path, path);
     }
 
-    // 2. Check for cloud URIs (s3://, gcs://, etc.)
+    // VFS tables are resolved by the authoritative catalog service. This
+    // discovery layer must never open executor-local metadata.redb.
+    if name_or_path.starts_with("vfs://") {
+        return Err(VeinError::not_found(format!(
+            "VFS source '{name_or_path}' must be resolved through the VCS catalog"
+        )));
+    }
+
+    // Cloud URIs are resolved after local filesystem sources.
     if name_or_path.contains("://") {
         return resolve_cloud_uri(name_or_path).await;
     }
@@ -229,6 +216,17 @@ async fn resolve_cloud_uri(uri: &str) -> Result<DiscoveredSource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn filesystem_path_precedes_vfs_metadata() {
+        if Path::new("./data/input").is_dir() {
+            let source = resolve_source("./data/input")
+                .await
+                .expect("filesystem Parquet directory should resolve");
+            assert_eq!(source.format, "parquet");
+            assert!(source.files.iter().all(|file| file.ends_with(".parquet")));
+        }
+    }
 
     #[tokio::test]
     async fn test_resolve_users_parquet_if_exists() {

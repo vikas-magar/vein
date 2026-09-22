@@ -162,10 +162,10 @@ mod tests {
             ResolvedColumn::new(ColumnId(0), "id", None, VeinDataType::Int64),
             ResolvedColumn::new(ColumnId(1), "name", None, VeinDataType::Utf8),
         ]));
-        let table = std::sync::Arc::new(plan::TableMetadata::new(
-            "users",
-            std::sync::Arc::new(*schema.clone()),
-        ));
+        let table = std::sync::Arc::new(
+            plan::TableMetadata::new("users", std::sync::Arc::new(*schema.clone()))
+                .with_format(plan::TableFormat::Parquet),
+        );
         LogicalPlan::Scan {
             table,
             projection: None,

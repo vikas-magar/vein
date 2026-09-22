@@ -8,6 +8,7 @@ common = { path = "../common" }
 error = { path = "../error" }
 physical = { path = "../physical" }
 vcs = { path = "../vcs" }
+distributed = { path = "../distributed" }
 
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }

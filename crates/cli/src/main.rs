@@ -27,7 +27,7 @@ enum Commands {
     Vcs {
         #[arg(short, long, default_value = "0.0.0.0:9090")]
         bind: String,
-        #[arg(long, default_value = "file:///tmp/vein-warehouse")]
+        #[arg(long, default_value = "file://./vein_data/vcs-warehouse")]
         warehouse: String,
         #[arg(short, long, default_value = "certs/server.crt")]
         cert: String,
@@ -40,7 +40,7 @@ enum Commands {
         #[arg(long)]
         raft_advertise: Option<String>,
         /// Path for durable OpenRaft metadata and log state.
-        #[arg(long, default_value = "/tmp/vein-vcs-raft.json")]
+        #[arg(long, default_value = "./vein_data/vcs-raft.json")]
         raft_state: String,
         /// Bootstrap a brand-new single-node Raft group.
         #[arg(long, default_value_t = false)]
@@ -110,6 +110,11 @@ async fn build_default_coordinator(
             vcs::RemoteVcsCatalog::connect(endpoint, ca_cert)
                 .map_err(|error| format!("Failed to connect to remote VCS catalog: {error}"))?,
         );
+        let revision = catalog
+            .health_check()
+            .await
+            .map_err(|error| format!("Remote VCS health check failed: {error}"))?;
+        info!(target: "vein_server", vcs = %catalog.target(), catalog_revision = %revision.as_str(), "Remote VCS authority validated");
         engine::DistributedCoordinator::builder()
             .with_binder(Arc::new(binder::QueryBinder::new(
                 catalog.clone(),
@@ -124,7 +129,7 @@ async fn build_default_coordinator(
             .map_err(|e| format!("Failed to build DistributedCoordinator: {e}"))?
     } else {
         let warehouse = std::env::var("VEIN_CATALOG_WAREHOUSE")
-            .unwrap_or_else(|_| "file:///tmp/vein-warehouse".to_string());
+            .unwrap_or_else(|_| "file://./vein_data/vcs-warehouse".to_string());
         let catalog = Arc::new(
             vcs::VcsCatalog::new("vein", warehouse, vcs::storage::StorageConfig::LocalFs)
                 .await
@@ -164,17 +169,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             raft_bootstrap,
         } => {
             info!(target: "vein_server", %bind, %warehouse, raft_id, %raft_state, raft_bootstrap, "Starting Vein VCS authority");
-            let catalog =
-                vcs::VcsCatalog::new("vein", warehouse, vcs::storage::StorageConfig::LocalFs)
-                    .await?;
             let addr: std::net::SocketAddr = bind
                 .parse()
                 .map_err(|e| format!("Invalid VCS bind address '{bind}': {e}"))?;
             let advertise = raft_advertise.unwrap_or_else(|| bind.clone());
-            let mut raft_config = RaftConfig::default();
-            raft_config.cluster_name = "vein-vcs".to_string();
             let raft_config = Arc::new(
-                raft_config
+                RaftConfig {
+                    cluster_name: "vein-vcs".to_string(),
+                    ..Default::default()
+                }
                     .validate()
                     .map_err(|e| format!("Invalid VCS Raft configuration: {e}"))?,
             );
@@ -191,9 +194,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 members.insert(raft_id, BasicNode::new(advertise));
                 raft.initialize(members).await?;
             }
-            let catalog = Arc::new(catalog.with_metadata_writer(Arc::new(
-                OpenRaftMetadataWriter::new(raft.clone(), raft_view_storage),
-            )));
+            let writer = Arc::new(OpenRaftMetadataWriter::new(raft.clone(), raft_view_storage));
+            let catalog = Arc::new(
+                vcs::VcsCatalog::new_with_metadata_writer(
+                    "vein",
+                    warehouse,
+                    vcs::storage::StorageConfig::LocalFs,
+                    writer,
+                )
+                .await?,
+            );
             let raft_handler = Arc::new(OpenRaftRpcHandler::new(raft));
             vcs::VcsExchangeServer::new(catalog.shared_exchange_catalog())
                 .with_raft_rpc_handler(raft_handler)
@@ -239,6 +249,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let addr: std::net::SocketAddr = bind
                 .parse()
                 .map_err(|e| format!("Invalid bind address '{bind}': {e}"))?;
+
+            let data_root = std::env::var("VEIN_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("./vein_data"));
+            let executor_id = bind.replace(':', "_").replace('/', "_");
+            let vfs_config = vfs::VfsConfig::for_executor(&data_root, &executor_id);
+            let vfs_store = Arc::new(vfs::VfsTableStore::init(&vfs_config).await?);
+            vfs::VfsTableStore::set_shared(vfs_store);
 
             let mut builder = ExecutorDaemon::builder()
                 .bind(addr)

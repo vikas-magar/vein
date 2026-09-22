@@ -7,7 +7,7 @@ use binder::LogicalBinder;
 use distributed::{
     ArtifactId as DistributedArtifactId, ArtifactRef as DistributedArtifactRef,
     SnapshotId as DistributedSnapshotId, TableId as DistributedTableId,
-    TableSnapshot as DistributedTableSnapshot, TableWriteMode, TableWritePart, WriteId,
+    TableSnapshot as DistributedTableSnapshot, TableWriteMode, WriteId,
 };
 use optimizer::Optimizer;
 use parser::ast::query::QueryNode;
@@ -331,7 +331,8 @@ impl QueryEngine for DistributedCoordinator {
                     )
                     .await
                     .map_err(|error| error::VeinError::internal(error.to_string()))?;
-                let location = if target.starts_with('/')
+
+             let location = if target.starts_with('/')
                     || target.starts_with("./")
                     || target.starts_with("../")
                     || target.starts_with("vfs://")
@@ -386,13 +387,8 @@ impl QueryEngine for DistributedCoordinator {
                 }
             };
 
-            let vfs_store = vfs::VfsTableStore::shared_or_default()
-                .map_err(|error| error::VeinError::internal(error.to_string()))?;
-            let staging_id = vfs::VfsTableStore::resolve_table_id(&staging_table);
-            let staged_parts = vfs_store
-                .resolve_table_parts(staging_id)
-                .await
-                .map_err(|error| error::VeinError::internal(error.to_string()))?;
+            let staged_parts = completion.write_parts.clone();
+
             if staged_parts.len() != expected_parts as usize {
                 let _ = table_write_catalog
                     .abort_table_write(prepared.write_id.clone())
@@ -404,52 +400,22 @@ impl QueryEngine for DistributedCoordinator {
                 )));
             }
 
-            for part_id in &staged_parts {
-                let row_count = vfs_store
-                    .open_partition_reader(staging_id, *part_id)
-                    .await
-                    .map_err(|error| error::VeinError::internal(error.to_string()))?
-                    .total_rows();
+            for part in staged_parts {
                 table_write_catalog
-                    .publish_table_write_part(
-                        prepared.write_id.clone(),
-                        TableWritePart {
-                            partition_id: *part_id,
-                            artifact: DistributedArtifactRef {
-                                id: DistributedArtifactId::from(format!(
-                                    "{}:part:{}",
-                                    prepared.write_id, part_id
-                                )),
-                                uri: format!("vfs://{staging_table}/part_{part_id:06}"),
-                                checksum: format!("{}:{part_id}", prepared.generation),
-                                size_bytes: 0,
-                            },
-                            row_count,
-                        },
-                    )
+                    .publish_table_write_part(prepared.write_id.clone(), part)
                     .await?;
             }
 
-            let location = if target.starts_with('/')
-                || target.starts_with("./")
-                || target.starts_with("../")
-                || target.starts_with("vfs://")
-            {
-                target.clone()
-            } else {
-                format!("vfs://{target}")
-            };
+
+            let location = format!("vfs://{staging_table}");
             let metadata = plan::TableMetadata::new(&target, Arc::new((*schema).clone()))
                 .with_location(location)
                 .with_format(plan::TableFormat::Exo);
-            let publication = vfs_store
-                .publish_staged_table(
-                    &staging_table,
-                    &target,
-                    mode == TableWriteMode::Overwrite,
-                )
-                .await
-                .map_err(|error| error::VeinError::internal(error.to_string()))?;
+            let published_bytes = completion
+                .write_parts
+                .iter()
+                .map(|part| part.artifact.size_bytes)
+                .sum::<u64>();
             let schema_fingerprint = metadata
                 .schema
                 .fields
@@ -461,9 +427,9 @@ impl QueryEngine for DistributedCoordinator {
                 id: DistributedSnapshotId::from(format!("{}@{}", target, prepared.generation)),
                 manifest: DistributedArtifactRef {
                     id: DistributedArtifactId::from(format!("{}:manifest", prepared.write_id)),
-                    uri: format!("vfs://tbl_{}/generation/{}", publication.table_id, prepared.generation),
+                    uri: format!("vfs://{staging_table}/generation/{}", prepared.generation),
                     checksum: schema_fingerprint.clone(),
-                    size_bytes: publication.extent_count as u64,
+                    size_bytes: published_bytes,
                 },
                 schema_fingerprint,
                 metadata_payload: vcs::state::encode_table_metadata(&metadata)?,
@@ -492,13 +458,31 @@ mod tests {
     use super::*;
     use binder::QueryBinder;
     use binder::testing::MockFunctionRegistry;
+    use exec::ExecutorDaemon;
     use orchestrator::ExecutorRegistry;
     use orchestrator::Scheduler;
     use orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher;
     use parser::Parser;
     use physical::DefaultPhysicalPlanner;
+    use std::net::SocketAddr;
     use std::time::Duration;
-    use vcs::InMemoryCatalog;
+    use vcs::{InMemoryCatalog, TableCatalog};
+
+    fn local_test_executor(
+        exec_addr: SocketAddr,
+        master_addr: &str,
+        cert: &str,
+        key: &str,
+    ) -> ExecutorDaemon {
+        ExecutorDaemon::builder()
+            .bind(exec_addr)
+            .certificates(cert, key)
+            .workers(2)
+            .master(master_addr)
+            .local_development()
+            .build()
+            .expect("executor daemon should build")
+    }
 
     /// Builds a fully-wired coordinator over a specified catalog.
     fn coordinator_with_catalog(catalog: Arc<dyn vcs::CatalogReader>) -> DistributedCoordinator {
@@ -674,7 +658,7 @@ mod tests {
     #[tokio::test]
     async fn plain_query_reports_scheduler_error_through_stream() {
         let engine = coordinator();
-        let node = Parser::new("FROM users |> SELECT id, name")
+        let node = Parser::new("FROM 'users' WITH (format = 'parquet') |> SELECT id, name")
             .parse_statement()
             .expect("query should parse");
         let QueryOutput::Data { mut stream, .. } = engine
@@ -703,7 +687,6 @@ mod tests {
         use common::protocol::{
             DataSink, DataSource, ExecuteTask, ExecutionMode, MicroProgram, NodeKind, NodeLoad,
         };
-        use exec::ExecutorDaemon;
         use orchestrator::executor::NodeInfo;
         use orchestrator::traits::TaskDispatcher;
         use std::net::SocketAddr;
@@ -712,14 +695,7 @@ mod tests {
         let key = format!("{}/../../certs/server.key", env!("CARGO_MANIFEST_DIR"));
 
         let exec_addr: SocketAddr = "127.0.0.1:9185".parse().unwrap();
-        let daemon = ExecutorDaemon::builder()
-            .bind(exec_addr)
-            .certificates(&cert, &key)
-            .workers(2)
-            .master("127.0.0.1:9180")
-            .local_development()
-            .build()
-            .expect("executor daemon should build");
+        let daemon = local_test_executor(exec_addr, "127.0.0.1:9180", &cert, &key);
 
         let cert_c = cert.clone();
         let key_c = key.clone();
@@ -817,7 +793,7 @@ mod tests {
                     catalog.clone(),
                     Arc::new(MockFunctionRegistry::new()),
                 )))
-                .with_catalog_writer(catalog)
+                .with_catalog_writer(catalog.clone())
                 .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
                 .with_planner(Arc::new(DefaultPhysicalPlanner::new()))
                 .with_scheduler(scheduler)
@@ -895,7 +871,6 @@ mod tests {
         use arrow::record_batch::RecordBatch;
         use common::identifiers::NodeId;
         use common::protocol::{NodeKind, NodeLoad};
-        use exec::ExecutorDaemon;
         use std::net::SocketAddr;
 
         let cert = format!("{}/../../certs/server.crt", env!("CARGO_MANIFEST_DIR"));
@@ -914,14 +889,7 @@ mod tests {
 
         // 1. Start Executor Daemon
         let exec_addr: SocketAddr = "127.0.0.1:9195".parse().unwrap();
-        let daemon = ExecutorDaemon::builder()
-            .bind(exec_addr)
-            .certificates(&cert, &key)
-            .workers(2)
-            .master("127.0.0.1:9190")
-            .local_development()
-            .build()
-            .expect("executor daemon should build");
+        let daemon = local_test_executor(exec_addr, "127.0.0.1:9190", &cert, &key);
 
         let cert_c = cert.clone();
         let key_c = key.clone();
@@ -962,7 +930,7 @@ mod tests {
                     catalog.clone(),
                     Arc::new(MockFunctionRegistry::new()),
                 )))
-                .with_catalog_writer(catalog)
+                .with_catalog_writer(catalog.clone())
                 .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
                 .with_planner(Arc::new(DefaultPhysicalPlanner::new()))
                 .with_scheduler(scheduler)
@@ -984,6 +952,24 @@ mod tests {
             .append_partition(source_table_name, &batch)
             .await
             .expect("seed vfs table");
+        catalog
+            .register_table(
+                plan::TableMetadata::new(
+                    source_table_name,
+                    Arc::new(plan::VeinSchema::from(schema.as_ref())),
+                )
+                .with_location(format!(
+                    "vfs://tbl_{}",
+                    vfs::VfsTableStore::resolve_table_id(source_table_name)
+                ))
+                .with_format(plan::TableFormat::Exo)
+                .with_files(vec![format!(
+                    "vfs://tbl_{}/part_000000",
+                    vfs::VfsTableStore::resolve_table_id(source_table_name)
+                )]),
+            )
+            .await
+            .expect("register VFS source metadata");
 
         // 4. Execute WRITE query: FROM src_vfs_items |> WRITE dst_vfs_items
         let write_query = format!("FROM {source_table_name} |> WRITE dst_vfs_items");

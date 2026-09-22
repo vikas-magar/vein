@@ -14,7 +14,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{CommitReceipt, MetadataStateMachine, Result};
+use crate::{CommitReceipt, MetadataStateMachine, Result, SnapshotId, TransactionId};
 
 use super::VeinRaftConfig;
 
@@ -194,6 +194,16 @@ fn storage_io(
     error: std::io::Error,
 ) -> StorageError<u64> {
     StorageError::from_io_error(subject, verb, error)
+}
+
+fn internal_entry_receipt(state: &PersistedState, entry: &Entry<VeinRaftConfig>) -> CommitReceipt {
+    let identity = format!("raft-internal:{}", entry.log_id.index);
+    CommitReceipt {
+        transaction_id: TransactionId::from(identity.clone()),
+        revision: state.catalog.revision.clone(),
+        snapshot_id: SnapshotId::from(identity),
+        command_fingerprint: "raft-internal-noop".to_owned(),
+    }
 }
 
 impl RaftLogReader<VeinRaftConfig> for DurableLogReader {
@@ -462,9 +472,12 @@ impl RaftStorage<VeinRaftConfig> for DurableRaftStorage {
                     }
                     EntryPayload::Membership(membership) => {
                         state.membership =
-                            StoredMembership::new(Some(entry.log_id.clone()), membership.clone())
+                            StoredMembership::new(Some(entry.log_id.clone()), membership.clone());
+                        results.push(internal_entry_receipt(state, entry));
                     }
-                    EntryPayload::Blank => {}
+                    EntryPayload::Blank => {
+                        results.push(internal_entry_receipt(state, entry));
+                    }
                 }
                 state.applied = Some(entry.log_id.clone());
             }
@@ -638,6 +651,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_returns_one_receipt_for_every_raft_entry() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("raft.json");
+        let mut store = DurableRaftStorage::open(&path).unwrap();
+        let first = Entry::<VeinRaftConfig>::new_blank(LogId::new(LeaderId::new(1, 7), 0));
+        let second = Entry::<VeinRaftConfig>::new_blank(LogId::new(LeaderId::new(1, 7), 1));
+        store
+            .append_to_log(vec![first.clone(), second.clone()])
+            .await
+            .unwrap();
+
+        let receipts = store
+            .apply_to_state_machine(&[first, second])
+            .await
+            .unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts
+            .iter()
+            .all(|receipt| receipt.command_fingerprint == "raft-internal-noop"));
+    }
+
+    #[tokio::test]
     async fn snapshot_round_trip_is_validated() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("raft.json");
@@ -655,7 +690,7 @@ mod tests {
                     size_bytes: 1,
                 },
                 schema_fingerprint: "schema".to_owned(),
-                metadata_payload: Vec::new(),
+                metadata_payload: vec![1],
             },
         };
         let entry = Entry::<VeinRaftConfig>::from_app_data(command);

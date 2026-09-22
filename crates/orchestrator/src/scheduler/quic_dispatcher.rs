@@ -225,6 +225,7 @@ impl TaskDispatcher for QuicTaskDispatcher {
                         }
                         ArchivedVeinControlEvent::TaskResultBatch {
                             result_bytes,
+
                             attempt,
                             sequence: frame_sequence,
                             ..
@@ -333,6 +334,7 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                 row_count: row_count.to_native(),
                                 bytes_read: bytes_read.to_native(),
                                 duration_ns: duration_ns.to_native(),
+                                write_parts: Vec::new(),
                             }));
                             return;
                         }
@@ -341,6 +343,7 @@ impl TaskDispatcher for QuicTaskDispatcher {
                             bytes_read,
                             duration_ns,
                             result_bytes,
+                            write_parts,
                             attempt,
                             ..
                         } => {
@@ -408,6 +411,21 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                 row_count: row_count.to_native(),
                                 bytes_read: bytes_read.to_native(),
                                 duration_ns: duration_ns.to_native(),
+                                write_parts: write_parts
+                                    .iter()
+                                    .map(|part| distributed::TableWritePart {
+                                        partition_id: part.partition_id.to_native(),
+                                        artifact: distributed::ArtifactRef {
+                                            id: distributed::ArtifactId::from(
+                                                part.artifact_id.as_str(),
+                                            ),
+                                            uri: part.artifact_uri.as_str().to_owned(),
+                                            checksum: part.checksum.as_str().to_owned(),
+                                            size_bytes: part.size_bytes.to_native(),
+                                        },
+                                        row_count: part.row_count.to_native(),
+                                    })
+                                    .collect(),
                             }));
                             return;
                         }

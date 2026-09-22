@@ -24,6 +24,7 @@ use common::transport::{
 };
 use distributed::RaftRpcHandler;
 use error::VeinError;
+use vcs::RemoteVcsCatalog;
 
 /// Configuration for an [`ExecutorDaemon`].
 #[derive(Debug, Clone)]
@@ -530,6 +531,14 @@ impl ExecutorDaemon {
                                             bytes_read: res.metrics.bytes_read,
                                             duration_ns: res.metrics.duration_ns,
                                             result_bytes: None,
+                                             write_parts: res.write_parts.iter().map(|part| common::protocol::TableWritePartDescriptor {
+                                                 partition_id: part.partition_id,
+                                                 artifact_id: part.artifact.id.to_string(),
+                                                 artifact_uri: part.artifact.uri.clone(),
+                                                 checksum: part.artifact.checksum.clone(),
+                                                 size_bytes: part.artifact.size_bytes,
+                                                 row_count: part.row_count,
+                                             }).collect(),
                                         };
                                         match rkyv::to_bytes::<rkyv::rancor::Error>(&event) {
                                             Ok(bytes) => {
@@ -757,9 +766,11 @@ impl ExecutorDaemonBuilder {
         let mut task_builder = TaskExecutorBuilder::new();
         if let Some(endpoint) = self.vcs_endpoint {
             let ca_cert = self.vcs_ca_cert.unwrap_or_else(|| config.cert_path.clone());
-            let client = VcsExchangeClient::connect(endpoint, ca_cert)?;
-            task_builder =
-                task_builder.with_exchange_metadata(Arc::new(VcsExchangeMetadata::new(client)));
+            let catalog = Arc::new(RemoteVcsCatalog::connect(endpoint.clone(), &ca_cert)?);
+            let exchange_client = VcsExchangeClient::connect(endpoint, ca_cert)?;
+            task_builder = task_builder
+                .with_catalog_validator(catalog)
+                .with_exchange_metadata(Arc::new(VcsExchangeMetadata::new(exchange_client)));
         }
         let executor: Arc<dyn TaskExecutor> = Arc::new(task_builder.build());
         let workers = WorkerPool::start(config.workers, rx, executor);
@@ -800,6 +811,7 @@ mod tests {
                 projected_schema: vec![],
                 scan_predicates: Vec::new(),
                 task_id: TaskId::new(),
+                catalog_snapshot: None,
                 shuffle_target_path: None,
             }),
             program: MicroProgram {

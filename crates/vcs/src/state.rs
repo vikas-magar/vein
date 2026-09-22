@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use iceberg::io::FileIO;
 use plan::{SortKey, TableFormat, TableMetadata, TableStatistics, TableType, VeinSchema};
@@ -88,19 +87,37 @@ impl PersistedTable {
     }
 }
 
+const TABLE_METADATA_PAYLOAD_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TableMetadataPayload {
+    version: u16,
+    metadata: PersistedTable,
+}
+
 /// Encodes the complete authoritative table metadata payload for replication.
 pub fn encode_table_metadata(metadata: &TableMetadata) -> Result<Vec<u8>> {
-    serde_json::to_vec(&PersistedTable::from(metadata)).map_err(|error| {
+    serde_json::to_vec(&TableMetadataPayload {
+        version: TABLE_METADATA_PAYLOAD_VERSION,
+        metadata: PersistedTable::from(metadata),
+    })
+    .map_err(|error| {
         VeinError::serialization(format!("failed to encode table metadata payload: {error}"))
     })
 }
 
 /// Decodes a complete authoritative table metadata payload from replication.
 pub fn decode_table_metadata(payload: &[u8]) -> Result<TableMetadata> {
-    let persisted: PersistedTable = serde_json::from_slice(payload).map_err(|error| {
+    let envelope: TableMetadataPayload = serde_json::from_slice(payload).map_err(|error| {
         VeinError::serialization(format!("invalid table metadata payload: {error}"))
     })?;
-    Ok(persisted.into_metadata())
+    if envelope.version != TABLE_METADATA_PAYLOAD_VERSION {
+        return Err(VeinError::serialization(format!(
+            "unsupported table metadata payload version {}",
+            envelope.version
+        )));
+    }
+    Ok(envelope.metadata.into_metadata())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,23 +239,6 @@ fn ensure_local_parent(path: &str) -> Result<()> {
     })
 }
 
-/// Read/write contract for durable VCS state.
-#[async_trait]
-pub trait CatalogState: Send + Sync {
-    /// Returns the current revision.
-    async fn revision(&self) -> CatalogRevision;
-
-    /// Resolves one table descriptor.
-    async fn get(&self, name: &str) -> Option<Arc<TableMetadata>>;
-
-    /// Publishes one table descriptor using optimistic concurrency.
-    async fn commit_table(
-        &self,
-        expected_revision: &CatalogRevision,
-        metadata: &TableMetadata,
-    ) -> Result<CatalogRevision>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,24 +355,5 @@ mod tests {
         assert!(state.get("first").await.is_some());
         assert!(state.get("second").await.is_none());
         assert_eq!(state.revision().await.as_str(), "2");
-    }
-}
-
-#[async_trait]
-impl CatalogState for PersistentCatalogState {
-    async fn revision(&self) -> CatalogRevision {
-        PersistentCatalogState::revision(self).await
-    }
-
-    async fn get(&self, name: &str) -> Option<Arc<TableMetadata>> {
-        PersistentCatalogState::get(self, name).await
-    }
-
-    async fn commit_table(
-        &self,
-        expected_revision: &CatalogRevision,
-        metadata: &TableMetadata,
-    ) -> Result<CatalogRevision> {
-        PersistentCatalogState::commit_table(self, expected_revision, metadata).await
     }
 }

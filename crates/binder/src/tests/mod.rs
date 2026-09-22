@@ -6,7 +6,6 @@
 //! specs: `bind(sql).await` then shape/schema assertions.
 
 use plan::{LogicalExpr, LogicalPlan, PlanTraversal};
-use plan::ResolvedColumn;
 use crate::testing;
 
 /// Binds `sql` and unwraps the plan (tests assume the query is valid).
@@ -109,16 +108,6 @@ pub fn assert_schema(plan: &LogicalPlan, expected: &[(&str, Option<&str>, bool)]
             field.id
         );
     }
-}
-
-/// True when the plan's schema contains a column with exactly this identity.
-pub fn has_column(plan: &LogicalPlan, name: &str) -> bool {
-    plan.schema().fields.iter().any(|f| f.name == name)
-}
-
-/// The output column of the topmost projection for `index`.
-pub fn output_column(plan: &LogicalPlan, index: usize) -> &ResolvedColumn {
-    &plan.schema().fields[index]
 }
 
 #[cfg(test)]

@@ -210,6 +210,76 @@ impl PipelineCompiler {
         }
     }
 
+    /// Infers a source format only when the catalog did not provide one.
+    ///
+    /// EXO is never used as an implicit fallback: native EXO requires an explicit
+    /// catalog format or an unambiguous native marker in the source directory.
+    fn infer_source_format(files: &[String]) -> Result<FileFormat> {
+        let mut detected = None;
+
+        for file in files {
+            let path = std::path::Path::new(file);
+            let candidate = if file.starts_with("vfs://")
+                || path.join("_schema.json").is_file()
+                || path
+                    .read_dir()
+                    .map(|entries| {
+                        entries.flatten().any(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".exo.addr")
+                        })
+                    })
+                    .unwrap_or(false)
+            {
+                Some(FileFormat::Exo)
+            } else if file.to_ascii_lowercase().ends_with(".parquet")
+                || path
+                    .read_dir()
+                    .map(|entries| {
+                        entries.flatten().any(|entry| {
+                            entry
+                                .path()
+                                .extension()
+                                .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"))
+                        })
+                    })
+                    .unwrap_or(false)
+            {
+                Some(FileFormat::Parquet)
+            } else if file.to_ascii_lowercase().ends_with(".csv") {
+                Some(FileFormat::Csv)
+            } else if file.to_ascii_lowercase().ends_with(".json") {
+                Some(FileFormat::Json)
+            } else {
+                None
+            };
+
+            if let Some(candidate) = candidate {
+                if let Some(previous) = &detected {
+                    if previous != &candidate {
+                        return Err(VeinError::planning(
+                            format!("source paths contain mixed formats: {files:?}"),
+                            None,
+                        ));
+                    }
+                } else {
+                    detected = Some(candidate);
+                }
+            }
+        }
+
+        detected.ok_or_else(|| {
+            VeinError::planning(
+                format!(
+                    "source format is missing from catalog metadata and cannot be inferred from paths: {files:?}"
+                ),
+                None,
+            )
+        })
+    }
+
     /// Recursively locates the leaf data source and schema.
     fn collect_leaf_source(plan: &LogicalPlan) -> Result<(DataSource, VeinSchema)> {
         match plan {
@@ -251,17 +321,7 @@ impl PipelineCompiler {
                         "json" => FileFormat::Json,
                         _ => FileFormat::Parquet,
                     },
-                    _ => {
-                        if files.iter().any(|f| f.ends_with(".parquet")) {
-                            FileFormat::Parquet
-                        } else if files.iter().any(|f| f.ends_with(".csv")) {
-                            FileFormat::Csv
-                        } else if files.iter().any(|f| f.ends_with(".json")) {
-                            FileFormat::Json
-                        } else {
-                            FileFormat::Exo
-                        }
-                    }
+                    _ => Self::infer_source_format(&files)?,
                 };
 
                 let scan_task = FileScanTask {
@@ -272,6 +332,7 @@ impl PipelineCompiler {
                     projected_schema,
                     scan_predicates: Vec::new(),
                     task_id: TaskId::new(),
+                    catalog_snapshot: table.catalog_snapshot.clone(),
                     shuffle_target_path: None,
                 };
                 Ok((DataSource::File(scan_task), (**schema).clone()))
@@ -308,7 +369,10 @@ impl PipelineCompiler {
                 {
                     FileFormat::Json
                 } else {
-                    FileFormat::Exo
+                    return Err(VeinError::planning(
+                        format!("external source format is missing for '{url}'"),
+                        None,
+                    ));
                 };
 
                 let scan_task = FileScanTask {
@@ -327,6 +391,7 @@ impl PipelineCompiler {
                         .collect(),
                     scan_predicates: Vec::new(),
                     task_id: TaskId::new(),
+                    catalog_snapshot: None,
                     shuffle_target_path: None,
                 };
                 Ok((DataSource::File(scan_task), (**schema).clone()))
@@ -390,16 +455,32 @@ mod tests {
     use plan::schema::{ColumnId, ResolvedColumn, VeinDataType};
 
     #[test]
+    fn test_missing_format_infers_parquet_from_source_file() {
+        let format = PipelineCompiler::infer_source_format(&[
+            "./data/input/part-00000.parquet".to_string(),
+        ])
+        .expect("Parquet source format should be inferred");
+        assert_eq!(format, FileFormat::Parquet);
+    }
+
+    #[test]
+    fn test_missing_format_does_not_default_to_exo() {
+        let error = PipelineCompiler::infer_source_format(&["./data/input".to_string()])
+            .expect_err("ambiguous source format must fail planning");
+        assert!(error.to_string().contains("source format is missing"));
+    }
+
+    #[test]
     fn test_compile_linear_pipeline() {
         let schema = Box::new(VeinSchema::new(vec![
             ResolvedColumn::new(ColumnId(1), "x", None, VeinDataType::Int64),
             ResolvedColumn::new(ColumnId(2), "y", None, VeinDataType::Int64),
         ]));
 
-        let table = std::sync::Arc::new(plan::TableMetadata::new(
-            "test_table",
-            std::sync::Arc::new(*schema.clone()),
-        ));
+        let table = std::sync::Arc::new(
+            plan::TableMetadata::new("test_table", std::sync::Arc::new(*schema.clone()))
+                .with_format(plan::TableFormat::Parquet),
+        );
 
         let scan = LogicalPlan::Scan {
             table,

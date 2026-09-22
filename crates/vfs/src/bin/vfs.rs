@@ -94,8 +94,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind_addr
     );
 
-    // Isolate node state directories
-    let base_dir = format!("/tmp/veinfs/{}", cli.node_id);
+    // Isolate node state directories beneath the shared Vein data root.
+    let data_root = std::env::var("VEIN_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("./vein_data"));
+    let base_dir = data_root.join(&cli.node_id);
     tokio::fs::create_dir_all(&base_dir).await?;
 
     let mut storage_config_map = HashMap::new();
@@ -116,8 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let vfs_config = VfsConfig {
-        local_cache_dir: std::path::PathBuf::from(format!("{}/blocks", base_dir)),
-        metadata_db_path: std::path::PathBuf::from(format!("{}/metadata.redb", base_dir)),
+        local_cache_dir: base_dir.join("blocks"),
+        metadata_db_path: base_dir.join("metadata.redb"),
         block_size_bytes: 16 * 1024 * 1024,
         max_ingestion_buffer_bytes: 1024 * 1024,
         node_ip: bind_addr

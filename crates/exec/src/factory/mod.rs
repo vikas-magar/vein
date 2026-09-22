@@ -19,6 +19,7 @@ use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, MicroProgram};
 use error::VeinError;
+use vcs::{CatalogReader, RemoteVcsCatalog};
 
 /// Builds a [`TaskExecutor`](crate::runtime::TaskExecutor) with configurable
 /// stages and Vector VM execution engine.
@@ -30,6 +31,7 @@ pub struct TaskExecutorBuilder {
     builder: Arc<dyn ExecutorBuilder>,
     registry: Arc<FunctionRegistry>,
     metadata: Option<SharedExchangeMetadata>,
+    catalog: Option<Arc<RemoteVcsCatalog>>,
 }
 
 impl TaskExecutorBuilder {
@@ -40,6 +42,7 @@ impl TaskExecutorBuilder {
             builder: Arc::new(DefaultExecutorBuilder::new(registry.clone())),
             registry,
             metadata: None,
+            catalog: None,
         }
     }
 
@@ -57,10 +60,18 @@ impl TaskExecutorBuilder {
         self
     }
 
+    /// Configure the authoritative VCS used to validate pinned table snapshots.
+    pub fn with_catalog_validator(mut self, catalog: Arc<RemoteVcsCatalog>) -> Self {
+        self.catalog = Some(catalog);
+        self.rebuild_default();
+        self
+    }
+
     fn rebuild_default(&mut self) {
-        self.builder = Arc::new(DefaultExecutorBuilder::with_exchange_metadata(
+        self.builder = Arc::new(DefaultExecutorBuilder::with_configuration(
             self.registry.clone(),
             self.metadata.clone(),
+            self.catalog.clone(),
         ));
     }
 
@@ -87,6 +98,7 @@ impl Default for TaskExecutorBuilder {
 pub struct DefaultExecutorBuilder {
     registry: Arc<FunctionRegistry>,
     metadata: Option<SharedExchangeMetadata>,
+    catalog: Option<Arc<RemoteVcsCatalog>>,
 }
 
 impl DefaultExecutorBuilder {
@@ -100,11 +112,33 @@ impl DefaultExecutorBuilder {
         registry: Arc<FunctionRegistry>,
         metadata: Option<SharedExchangeMetadata>,
     ) -> Self {
-        Self { registry, metadata }
+        Self::with_configuration(registry, metadata, None)
+    }
+
+    /// Creates a builder with exchange metadata and catalog snapshot validation.
+    pub fn with_configuration(
+        registry: Arc<FunctionRegistry>,
+        metadata: Option<SharedExchangeMetadata>,
+        catalog: Option<Arc<RemoteVcsCatalog>>,
+    ) -> Self {
+        Self { registry, metadata, catalog }
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl ExecutorBuilder for DefaultExecutorBuilder {
+    async fn validate_task(&self, task: &common::protocol::ExecuteTask) -> Result<()> {
+        let Some(catalog) = &self.catalog else {
+            return Ok(());
+        };
+        if let DataSource::File(scan) = &task.source
+            && let Some(snapshot) = &scan.catalog_snapshot
+        {
+            catalog.validate_snapshot(snapshot).await?;
+        }
+        Ok(())
+    }
+
     fn build_source(
         &self,
         source: &DataSource,

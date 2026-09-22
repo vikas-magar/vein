@@ -113,7 +113,7 @@ mod tests {
                     size_bytes: 128,
                 },
                 schema_fingerprint: "schema-v1".to_owned(),
-                metadata_payload: Vec::new(),
+                metadata_payload: vec![1],
             },
         }
     }

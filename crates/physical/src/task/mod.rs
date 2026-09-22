@@ -50,6 +50,11 @@ impl Task {
         stage_id: StageId,
         mode: ExecutionMode,
     ) -> ExecuteTask {
+        let mut sink = self.sink;
+        if let DataSink::Storage(target) = &mut sink {
+            target.set_option("partition_id", self.partition.into_raw().to_string());
+        }
+
         ExecuteTask {
             request_id,
             mode,
@@ -59,7 +64,7 @@ impl Task {
             stage_id,
             source: self.source,
             program: self.program,
-            sink: self.sink,
+            sink,
         }
     }
 }

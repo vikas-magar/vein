@@ -18,6 +18,7 @@ use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, ExecuteTask, MicroProgram, VeinControlEvent};
+use distributed::TableWritePart;
 use error::VeinError;
 
 /// Operator telemetry and profiling.
@@ -42,6 +43,8 @@ pub struct TaskResult {
     pub output: Vec<RecordBatch>,
     /// Execution metrics (bytes read, duration).
     pub metrics: TaskMetrics,
+    /// Immutable physical parts produced by a storage sink.
+    pub write_parts: Vec<TableWritePart>,
 }
 
 /// Builds pipeline stages for a task from the wire protocol.
@@ -49,7 +52,15 @@ pub struct TaskResult {
 /// Decouples `exec` from `common::protocol`: the executor's own
 /// [`Source`], [`Transform`], and [`Sink`] implementations are selected here
 /// from the self-contained task description a worker receives.
+#[async_trait(?Send)]
 pub trait ExecutorBuilder: Send + Sync {
+    /// Validates all authoritative catalog tokens carried by a task before
+    /// opening any physical source.
+    async fn validate_task(&self, task: &ExecuteTask) -> Result<()> {
+        let _ = task;
+        Ok(())
+    }
+
     /// Build a source from the task's [`DataSource`] and attempt identity.
     fn build_source(
         &self,
@@ -242,6 +253,8 @@ impl DefaultTaskExecutor {
             return Err(VeinError::cancelled());
         }
 
+        self.builder.validate_task(task).await?;
+
         let sink = if let Some(sender) = output_sender {
             self.builder.build_streaming_sink(&task.sink, sender)?
         } else {
@@ -273,6 +286,7 @@ impl DefaultTaskExecutor {
                 bytes_read: source.bytes_read(),
                 duration_ns,
             },
+            write_parts: sink.write_parts(),
         })
     }
 }
@@ -412,6 +426,7 @@ mod tests {
             ],
             scan_predicates: Vec::new(),
             task_id: TaskId::new(),
+            catalog_snapshot: None,
             shuffle_target_path: None,
         };
 

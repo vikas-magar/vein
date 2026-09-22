@@ -26,15 +26,16 @@ pub use vcs_exchange::{VcsExchangeRequest, VcsExchangeResponse};
 
 // Re-export task & pipeline definitions
 pub use task::{
-    ArchivedExecuteTask, DataSink, DataSource, ExchangeSource, ExecuteTask, ExecutionMode,
-    FieldSchema, FileFormat, FileScanTask, KeyValue, ScanPredicate, ScanPredicateValue,
+    ArchivedCatalogSnapshotToken, ArchivedExecuteTask, CatalogSnapshotToken, DataSink, DataSource,
+    ExchangeSource, ExecuteTask, ExecutionMode, FieldSchema, FileFormat, FileScanTask, KeyValue,
+    ScanPredicate, ScanPredicateValue,
     ShuffleTarget, StorageTarget, StreamSource,
 };
 
 // Re-export control-plane events and telemetry
 pub use control::{
     ArchivedRaftRpcEnvelope, ArchivedRaftRpcKind, ArchivedVeinControlEvent, NodeKind, NodeLoad,
-    QueryTelemetry, RaftRpcEnvelope, RaftRpcKind, TaskTelemetry, VeinControlEvent,
+    QueryTelemetry, RaftRpcEnvelope, RaftRpcKind, TableWritePartDescriptor, TaskTelemetry, VeinControlEvent,
 };
 
 // Re-export RPC types
@@ -105,6 +106,7 @@ mod tests {
                 projected_schema: vec![],
                 scan_predicates: Vec::new(),
                 task_id: TaskId::new(),
+                catalog_snapshot: None,
                 shuffle_target_path: None,
             }),
             program: MicroProgram::new(

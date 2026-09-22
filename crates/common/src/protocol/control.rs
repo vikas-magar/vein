@@ -5,6 +5,27 @@ use serde::{Deserialize, Serialize};
 use super::task::ExecuteTask;
 use crate::identifiers::{NodeId, QueryId, StageId, TaskId};
 
+/// Immutable physical part descriptor returned by an executor-side table write.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub struct TableWritePartDescriptor {
+    pub partition_id: u32,
+    pub artifact_id: String,
+    pub artifact_uri: String,
+    pub checksum: String,
+    pub size_bytes: u64,
+    pub row_count: u64,
+}
+
 /// Kind of a Vein cluster node.
 #[derive(
     Debug,
@@ -110,6 +131,8 @@ pub enum VeinControlEvent {
         duration_ns: u64,
         /// Serialized Arrow IPC stream for non-streaming task results.
         result_bytes: Option<Vec<u8>>,
+        /// Executor-produced immutable write descriptors.
+        write_parts: Vec<TableWritePartDescriptor>,
     },
     /// Starts a streamed client result for a task.
     TaskResultStart {

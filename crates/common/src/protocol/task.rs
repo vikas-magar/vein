@@ -107,6 +107,46 @@ pub enum ScanPredicate {
     },
 }
 
+/// Immutable catalog snapshot token carried with a physical scan.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub struct CatalogSnapshotToken {
+    /// Stable table identity in the catalog.
+    pub table_id: String,
+    /// Catalog revision used to plan the query.
+    pub catalog_revision: String,
+    /// Committed table snapshot selected by the planner.
+    pub snapshot_id: String,
+    /// Schema version selected by the planner.
+    pub schema_version: u64,
+}
+
+impl CatalogSnapshotToken {
+    /// Creates a catalog snapshot token.
+    pub fn new(
+        table_id: impl Into<String>,
+        catalog_revision: impl Into<String>,
+        snapshot_id: impl Into<String>,
+        schema_version: u64,
+    ) -> Self {
+        Self {
+            table_id: table_id.into(),
+            catalog_revision: catalog_revision.into(),
+            snapshot_id: snapshot_id.into(),
+            schema_version,
+        }
+    }
+}
+
 /// Self-contained file scan instruction for an Executor.
 #[derive(
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
@@ -126,6 +166,8 @@ pub struct FileScanTask {
     pub scan_predicates: Vec<ScanPredicate>,
     /// Task identifier for reporting.
     pub task_id: TaskId,
+    /// Catalog snapshot pinned by the planning session.
+    pub catalog_snapshot: Option<CatalogSnapshotToken>,
     /// VFS path prefix to send output to, if applicable.
     pub shuffle_target_path: Option<String>,
 }
@@ -262,6 +304,20 @@ impl StorageTarget {
             .iter()
             .find(|kv| kv.key.eq_ignore_ascii_case(key))
             .map(|kv| kv.value.as_str())
+    }
+
+    /// Sets an option, replacing an existing key case-insensitively.
+    pub fn set_option(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        if let Some(option) = self
+            .options
+            .iter_mut()
+            .find(|option| option.key.eq_ignore_ascii_case(&key))
+        {
+            option.value = value.into();
+        } else {
+            self.options.push(KeyValue::new(key, value));
+        }
     }
 }
 

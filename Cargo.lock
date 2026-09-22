@@ -1781,6 +1781,7 @@ dependencies = [
  "tokio",
  "tracing",
  "types",
+ "vcs",
  "vfs",
 ]
 
@@ -3410,6 +3411,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "common",
+ "distributed",
  "error",
  "futures",
  "physical",
@@ -3696,6 +3698,7 @@ name = "plan"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "common",
  "error",
  "parser",
  "serde",

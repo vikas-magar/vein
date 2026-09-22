@@ -3,11 +3,11 @@
 use crate::compiler::PipelineCompiler;
 use crate::stage::Stage;
 use crate::task::Task;
+use common::Result;
 use common::identifiers::{PartitionId, QueryId, StageId, TaskId};
 use common::protocol::{DataSink, DataSource, FieldSchema, MicroProgram};
-use common::Result;
-use plan::schema::VeinSchema;
 use plan::LogicalPlan;
+use plan::schema::VeinSchema;
 
 /// Trait for translating linear, non-blocking logical plans into a single physical [`Stage`].
 pub trait PipelineStageBuilder: Send + Sync {
@@ -56,20 +56,22 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
             .collect();
         let task_id = TaskId::new();
         let sink = match plan {
-            LogicalPlan::Write { target, options, .. } => {
+            LogicalPlan::Write {
+                target, options, ..
+            } => {
                 let storage_schema = client_schema;
-                let mut key_values: Vec<common::protocol::KeyValue> = options
+                let key_values: Vec<common::protocol::KeyValue> = options
                     .iter()
                     .map(|(k, v)| common::protocol::KeyValue {
                         key: k.clone(),
                         value: v.clone(),
                     })
                     .collect();
-                key_values.push(common::protocol::KeyValue {
-                    key: "partition_id".to_string(),
-                    value: (task_id.into_raw() as u32).to_string(),
-                });
-                let target_obj = common::protocol::StorageTarget::new(target.clone(), key_values, storage_schema);
+                let target_obj = common::protocol::StorageTarget::new(
+                    target.clone(),
+                    key_values,
+                    storage_schema,
+                );
                 DataSink::Storage(target_obj)
             }
             _ => DataSink::Client {
@@ -77,13 +79,7 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
             },
         };
         let stage_id = StageId::new();
-        let task = Task::new(
-            task_id,
-            PartitionId::new(),
-            source,
-            program,
-            sink,
-        );
+        let task = Task::new(task_id, PartitionId::from_raw(0), source, program, sink);
         let stage = Stage::new(stage_id).with_task(task);
         stages.push(stage);
         Ok(stage_id)

@@ -70,19 +70,52 @@ pub trait TableCatalog: Send + Sync {
         session: &mut PlanningSession,
         name: &str,
     ) -> Result<Arc<TableMetadata>> {
+        Ok(self.resolve_table_snapshot(session, name).await?.metadata.clone())
+    }
+
+    /// Resolves the complete authoritative snapshot used by physical planning.
+    async fn resolve_table_snapshot(
+        &self,
+        session: &mut PlanningSession,
+        name: &str,
+    ) -> Result<Arc<TableSnapshot>> {
         if let Some(snapshot) = session.table(name) {
-            return Ok(snapshot.metadata.clone());
+            return Ok(snapshot);
         }
 
         let metadata = self.get_table(name).await?;
         let snapshot = Arc::new(TableSnapshot::from_metadata(
-            metadata.clone(),
+            metadata,
             session.catalog_revision.clone(),
         ));
         session
-            .insert(snapshot)
+            .insert(snapshot.clone())
             .map_err(|error| VeinError::internal(error.to_string()))?;
-        Ok(metadata)
+        Ok(snapshot)
+    }
+
+    /// Validates a snapshot token against the current catalog authority.
+    async fn validate_snapshot(
+        &self,
+        token: &common::protocol::CatalogSnapshotToken,
+    ) -> Result<()> {
+        let revision = self.catalog_revision().await?;
+        if revision.as_str() != token.catalog_revision {
+            return Err(VeinError::internal(format!(
+                "stale catalog revision '{}', current revision is '{}'",
+                token.catalog_revision,
+                revision.as_str()
+            )));
+        }
+        let metadata = self.get_table(&token.table_id).await?;
+        let expected = format!("{}:{}", revision.as_str(), metadata.name);
+        if token.snapshot_id != expected {
+            return Err(VeinError::internal(format!(
+                "stale table snapshot '{}', expected '{}'",
+                token.snapshot_id, expected
+            )));
+        }
+        Ok(())
     }
 
     /// Registers authoritative table metadata in the catalog.
@@ -272,10 +305,10 @@ impl TableCatalog for InMemoryCatalog {
                 return Ok(entry.clone());
             }
             for entry in tables.values() {
-                if let Some(loc) = &entry.location {
-                    if loc == name || loc == base_name {
-                        return Ok(entry.clone());
-                    }
+                if let Some(loc) = &entry.location
+                    && (loc == name || loc == base_name)
+                {
+                    return Ok(entry.clone());
                 }
             }
         }

@@ -15,7 +15,10 @@ use distributed::{
 use error::{Result, VeinError};
 use plan::TableMetadata;
 
-use crate::catalog_rpc::{VcsCatalogRequest, VcsCatalogResponse};
+use crate::catalog_rpc::{
+    VcsCatalogRequest, VcsCatalogResponse, decode_payload, decode_response, encode_payload,
+    encode_request,
+};
 use crate::{CatalogReader, CatalogRevision, CatalogWriter, PlanningSession, TableWriteCatalog};
 
 /// Remote VCS catalog client.
@@ -47,10 +50,14 @@ impl RemoteVcsCatalog {
         &self.target
     }
 
+    /// Verifies that the remote VCS is reachable and serving catalog requests.
+    pub async fn health_check(&self) -> Result<CatalogRevision> {
+        Ok(self.begin_planning_session().await?.catalog_revision)
+    }
+
     async fn request(&self, request: VcsCatalogRequest) -> Result<VcsCatalogResponse> {
         let mut stream = self.client.open_stream(&self.target).await?;
-        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&request)
-            .map_err(|error| VeinError::serialization(format!("encode VCS catalog request: {error}")))?;
+        let payload = encode_request(&request).map_err(VeinError::serialization)?;
         stream
             .send(frame_control_message(&payload))
             .await
@@ -65,26 +72,13 @@ impl RemoteVcsCatalog {
         }
         let response_payload = extract_control_payload(&buffer)
             .ok_or_else(|| VeinError::serialization("invalid VCS catalog response frame"))?;
-        let mut aligned = rkyv::util::AlignedVec::<16>::new();
-        aligned.extend_from_slice(response_payload);
-        let response = rkyv::from_bytes::<VcsCatalogResponse, rkyv::rancor::Error>(&aligned)
-            .map_err(|error| VeinError::serialization(format!("decode VCS catalog response: {error}")))?;
+        let response = decode_response(response_payload).map_err(VeinError::serialization)?;
         match response {
-            VcsCatalogResponse::Error { message } => {
-                Err(VeinError::internal(format!("VCS catalog rejected request: {message}")))
-            }
+            VcsCatalogResponse::Error { message } => Err(VeinError::internal(format!(
+                "VCS catalog rejected request: {message}"
+            ))),
             response => Ok(response),
         }
-    }
-
-    async fn json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>> {
-        serde_json::to_vec(value)
-            .map_err(|error| VeinError::serialization(format!("encode {label}: {error}")))
-    }
-
-    fn decode_json<T: serde::de::DeserializeOwned>(payload: &[u8], label: &str) -> Result<T> {
-        serde_json::from_slice(payload)
-            .map_err(|error| VeinError::serialization(format!("decode {label}: {error}")))
     }
 }
 
@@ -110,7 +104,12 @@ impl CatalogReader for RemoteVcsCatalog {
                 name: name.to_string(),
             })
             .await?;
-        let VcsCatalogResponse::Table { revision, metadata } = response else {
+        let VcsCatalogResponse::Table {
+            revision,
+            metadata,
+            snapshot: token,
+        } = response
+        else {
             return Err(VeinError::serialization("unexpected VCS table response"));
         };
         let revision = CatalogRevision::new(revision);
@@ -121,15 +120,48 @@ impl CatalogReader for RemoteVcsCatalog {
                 session.catalog_revision.as_str()
             )));
         }
-        let metadata: Arc<TableMetadata> = Arc::new(Self::decode_json(&metadata, "table metadata")?);
-        let snapshot = Arc::new(crate::TableSnapshot::from_metadata(
+        let metadata: Arc<TableMetadata> = Arc::new(
+            decode_payload(&metadata, "table metadata").map_err(VeinError::serialization)?,
+        );
+        let mut snapshot = crate::TableSnapshot::from_metadata(
             metadata.clone(),
             revision,
-        ));
+        );
+        snapshot.table_id = crate::TableId::new(token.table_id.clone());
+        snapshot.snapshot_id = crate::SnapshotId::new(token.snapshot_id.clone());
+        snapshot.schema_version = crate::SchemaVersion::new(token.schema_version);
         session
-            .insert(snapshot)
+            .insert(Arc::new(snapshot))
             .map_err(|error| VeinError::internal(error.to_string()))?;
         Ok(metadata)
+    }
+
+    async fn resolve_table_snapshot(
+        &self,
+        session: &mut PlanningSession,
+        name: &str,
+    ) -> Result<Arc<crate::TableSnapshot>> {
+        self.resolve_table(session, name).await?;
+        session
+            .table(name)
+            .ok_or_else(|| VeinError::internal("remote VCS did not return a table snapshot"))
+    }
+
+    async fn validate_snapshot(
+        &self,
+        token: &common::protocol::CatalogSnapshotToken,
+    ) -> Result<()> {
+        match self
+            .request(VcsCatalogRequest::ValidateSnapshot {
+                snapshot: token.clone(),
+            })
+            .await?
+        {
+            VcsCatalogResponse::SnapshotValidated => Ok(()),
+            _ => Err(VeinError::serialization(
+                "unexpected VCS snapshot validation response",
+            )),
+        }
     }
 }
 
@@ -145,7 +177,8 @@ impl CatalogWriter for RemoteVcsCatalog {
         expected_revision: &CatalogRevision,
         metadata: TableMetadata,
     ) -> Result<()> {
-        let payload = Self::json(&metadata, "table metadata").await?;
+        let payload =
+            encode_payload(&metadata, "table metadata").map_err(VeinError::serialization)?;
         match self
             .request(VcsCatalogRequest::RegisterTable {
                 expected_revision: expected_revision.as_str().to_string(),
@@ -181,7 +214,7 @@ impl TableWriteCatalog for RemoteVcsCatalog {
             .await?;
         match response {
             VcsCatalogResponse::WriteIntent { intent } => {
-                Self::decode_json(&intent, "table write intent")
+                decode_payload(&intent, "table write intent").map_err(VeinError::serialization)
             }
             _ => Err(VeinError::serialization("unexpected VCS prepare response")),
         }
@@ -192,7 +225,8 @@ impl TableWriteCatalog for RemoteVcsCatalog {
         write_id: WriteId,
         part: TableWritePart,
     ) -> Result<CommitReceipt> {
-        let payload = Self::json(&part, "table write part").await?;
+        let payload =
+            encode_payload(&part, "table write part").map_err(VeinError::serialization)?;
         let response = self
             .request(VcsCatalogRequest::PublishTableWritePart {
                 write_id: write_id.to_string(),
@@ -201,7 +235,7 @@ impl TableWriteCatalog for RemoteVcsCatalog {
             .await?;
         match response {
             VcsCatalogResponse::Receipt { receipt } => {
-                Self::decode_json(&receipt, "commit receipt")
+                decode_payload(&receipt, "commit receipt").map_err(VeinError::serialization)
             }
             _ => Err(VeinError::serialization("unexpected VCS part response")),
         }
@@ -212,7 +246,8 @@ impl TableWriteCatalog for RemoteVcsCatalog {
         write_id: WriteId,
         snapshot: DistributedTableSnapshot,
     ) -> Result<CommitReceipt> {
-        let payload = Self::json(&snapshot, "table snapshot").await?;
+        let payload =
+            encode_payload(&snapshot, "table snapshot").map_err(VeinError::serialization)?;
         let response = self
             .request(VcsCatalogRequest::CommitTableWrite {
                 write_id: write_id.to_string(),
@@ -221,7 +256,7 @@ impl TableWriteCatalog for RemoteVcsCatalog {
             .await?;
         match response {
             VcsCatalogResponse::Receipt { receipt } => {
-                Self::decode_json(&receipt, "commit receipt")
+                decode_payload(&receipt, "commit receipt").map_err(VeinError::serialization)
             }
             _ => Err(VeinError::serialization("unexpected VCS commit response")),
         }
@@ -235,7 +270,7 @@ impl TableWriteCatalog for RemoteVcsCatalog {
             .await?;
         match response {
             VcsCatalogResponse::Receipt { receipt } => {
-                Self::decode_json(&receipt, "commit receipt")
+                decode_payload(&receipt, "commit receipt").map_err(VeinError::serialization)
             }
             _ => Err(VeinError::serialization("unexpected VCS abort response")),
         }

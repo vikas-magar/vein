@@ -210,6 +210,8 @@ impl Scheduler {
                         total.row_count += completion.row_count;
                         total.bytes_read += completion.bytes_read;
                         total.duration_ns += completion.duration_ns;
+
+                        total.write_parts.extend(completion.write_parts);
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {

@@ -27,6 +27,37 @@ pub trait CatalogReader: Send + Sync {
         session: &mut PlanningSession,
         name: &str,
     ) -> Result<Arc<TableMetadata>>;
+
+    /// Resolves the complete snapshot identity for physical planning.
+    async fn resolve_table_snapshot(
+        &self,
+        session: &mut PlanningSession,
+        name: &str,
+    ) -> Result<Arc<crate::TableSnapshot>> {
+        let metadata = self.resolve_table(session, name).await?;
+        Ok(session
+            .table(name)
+            .unwrap_or_else(|| Arc::new(crate::TableSnapshot::from_metadata(
+                metadata,
+                session.catalog_revision.clone(),
+            ))))
+    }
+
+    /// Validates a planned snapshot against the authoritative catalog.
+    async fn validate_snapshot(
+        &self,
+        token: &common::protocol::CatalogSnapshotToken,
+    ) -> Result<()> {
+        let revision = self.begin_planning_session().await?.catalog_revision;
+        if revision.as_str() != token.catalog_revision {
+            return Err(error::VeinError::internal(format!(
+                "stale catalog revision '{}', current revision is '{}'",
+                token.catalog_revision,
+                revision.as_str()
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Write contract for authoritative catalog publication.
@@ -89,6 +120,21 @@ where
         name: &str,
     ) -> Result<Arc<TableMetadata>> {
         TableCatalog::resolve_table(self, session, name).await
+    }
+
+    async fn resolve_table_snapshot(
+        &self,
+        session: &mut PlanningSession,
+        name: &str,
+    ) -> Result<Arc<crate::TableSnapshot>> {
+        TableCatalog::resolve_table_snapshot(self, session, name).await
+    }
+
+    async fn validate_snapshot(
+        &self,
+        token: &common::protocol::CatalogSnapshotToken,
+    ) -> Result<()> {
+        TableCatalog::validate_snapshot(self, token).await
     }
 }
 

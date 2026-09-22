@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 
 use crate::executor::NodeInfo;
+use distributed::TableWritePart;
 
 /// Metrics returned after a task attempt completes successfully.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TaskCompletion {
     /// Rows produced or persisted by the task sink.
     pub row_count: u64,
@@ -11,6 +12,8 @@ pub struct TaskCompletion {
     pub bytes_read: u64,
     /// Task wall-clock duration in nanoseconds.
     pub duration_ns: u64,
+    /// Immutable physical parts published by an executor-side storage sink.
+    pub write_parts: Vec<TableWritePart>,
 }
 use common::SendableResultStream;
 use common::identifiers::{QueryId, TaskId};
