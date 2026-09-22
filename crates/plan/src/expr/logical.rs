@@ -6,7 +6,7 @@ use parser::ast::expr::BinaryOp;
 use parser::ast::pipe_op::WindowFrame;
 
 /// A node in the logical expression tree
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LogicalExpr {
     // ── Atoms ─────────────────────────────────────────────
     /// A reference to a column in the current scope

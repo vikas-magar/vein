@@ -9,11 +9,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::model::{CatalogRevision, PlanningSession, TableSnapshot};
 use async_trait::async_trait;
 use error::{Result, VeinError};
-use plan::{
-    ResolvedColumn, TableFormat, TableMetadata, VeinDataType, VeinSchema, VeinSchemaRef,
-};
+use plan::{ResolvedColumn, TableFormat, TableMetadata, VeinDataType, VeinSchema, VeinSchemaRef};
 
 /// Type alias for [`TableMetadata`] representing an authoritative catalog table entry.
 pub type TableEntry = TableMetadata;
@@ -55,8 +54,49 @@ pub trait TableCatalog: Send + Sync {
         Ok(table.files.clone())
     }
 
+    /// Returns the current immutable catalog revision.
+    async fn catalog_revision(&self) -> Result<CatalogRevision> {
+        Ok(CatalogRevision::default())
+    }
+
+    /// Starts a planning session pinned to one catalog revision.
+    async fn begin_planning_session(&self) -> Result<PlanningSession> {
+        Ok(PlanningSession::new(self.catalog_revision().await?))
+    }
+
+    /// Resolves a table within a pinned planning session.
+    async fn resolve_table(
+        &self,
+        session: &mut PlanningSession,
+        name: &str,
+    ) -> Result<Arc<TableMetadata>> {
+        if let Some(snapshot) = session.table(name) {
+            return Ok(snapshot.metadata.clone());
+        }
+
+        let metadata = self.get_table(name).await?;
+        let snapshot = Arc::new(TableSnapshot::from_metadata(
+            metadata.clone(),
+            session.catalog_revision.clone(),
+        ));
+        session
+            .insert(snapshot)
+            .map_err(|error| VeinError::internal(error.to_string()))?;
+        Ok(metadata)
+    }
+
     /// Registers authoritative table metadata in the catalog.
     async fn register_table(&self, metadata: TableMetadata) -> Result<()>;
+
+    /// Registers metadata only if the expected catalog revision is still current.
+    async fn register_table_at(
+        &self,
+        expected_revision: CatalogRevision,
+        metadata: TableMetadata,
+    ) -> Result<()> {
+        let _ = expected_revision;
+        self.register_table(metadata).await
+    }
 
     /// Registers a table with an explicit schema, physical storage location, and format.
     async fn register_table_entry(
@@ -285,7 +325,12 @@ impl TableCatalog for InMemoryCatalog {
 /// Builds a non-factorized, non-nullable fixture column with a placeholder
 /// id (the binder reassigns ids from its column counter on bind).
 fn fixture_column(name: &str, qualifier: &str, data_type: VeinDataType) -> ResolvedColumn {
-    ResolvedColumn::new(plan::ColumnId(0), name, Some(qualifier.to_string()), data_type)
+    ResolvedColumn::new(
+        plan::ColumnId(0),
+        name,
+        Some(qualifier.to_string()),
+        data_type,
+    )
 }
 
 /// Builds a table schema for a catalog fixture.

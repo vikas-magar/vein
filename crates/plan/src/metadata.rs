@@ -13,7 +13,7 @@ use crate::plan::SortKey;
 use crate::schema::VeinSchemaRef;
 
 /// The kind of table represented in the catalog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TableType {
     /// A persistent managed base table.
     #[default]
@@ -27,7 +27,7 @@ pub enum TableType {
 }
 
 /// The physical storage format of a table.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TableFormat {
     /// Native Vein Dual-Plane VFS table format (`exo`).
     Exo,
@@ -92,7 +92,7 @@ impl From<String> for TableFormat {
 
 /// Statistics for an individual column, used by the optimizer for selectivity estimation,
 /// join ordering, and min/max data skipping (zone maps).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ColumnStatistics {
     /// Number of null values in this column.
     pub null_count: Option<u64>,
@@ -105,7 +105,7 @@ pub struct ColumnStatistics {
 }
 
 /// Aggregate statistics for a table, consumed by the Cost-Based Optimizer (CBO).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TableStatistics {
     /// Total estimated or exact row count.
     pub num_rows: Option<u64>,
@@ -119,7 +119,7 @@ pub struct TableStatistics {
 ///
 /// Encapsulates all relational, physical, partitioning, and statistical properties
 /// needed for query analysis, logical optimization, and physical plan generation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TableMetadata {
     /// The unique or qualified name of the table.
     pub name: String,

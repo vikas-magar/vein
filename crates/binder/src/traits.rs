@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use error::Result;
 use parser::ast::query::QueryNode;
 use plan::{LogicalPlan, VeinDataType, Volatility};
+use vcs::CatalogRevision;
 
 /// Supported runtimes for User-Defined Functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,15 @@ pub trait FunctionRegistry: Send + Sync {
     fn resolve(&self, name: &str) -> Result<FunctionSignature>;
 }
 
+/// A logical plan together with the catalog revision used to bind it.
+#[derive(Debug)]
+pub struct BoundQuery {
+    /// Bound logical plan.
+    pub plan: LogicalPlan,
+    /// Catalog revision pinned for all source resolution.
+    pub catalog_revision: CatalogRevision,
+}
+
 /// The core logical binder trait.
 ///
 /// Binds an AST [`QueryNode`] into a validated, type-coerced [`LogicalPlan`].
@@ -60,8 +70,16 @@ pub trait LogicalBinder: Send + Sync {
     /// bound inner query.
     async fn bind<'a>(&self, node: &'a QueryNode<'a>) -> Result<LogicalPlan>;
 
+    /// Binds a query and returns the catalog revision used for source resolution.
+    async fn bind_with_catalog_revision<'a>(&self, node: &'a QueryNode<'a>) -> Result<BoundQuery> {
+        Ok(BoundQuery {
+            plan: self.bind(node).await?,
+            catalog_revision: CatalogRevision::default(),
+        })
+    }
+
     /// Returns the underlying catalog, if available.
-    fn catalog(&self) -> Option<&std::sync::Arc<dyn vcs::TableCatalog>> {
+    fn catalog(&self) -> Option<&std::sync::Arc<dyn vcs::CatalogReader>> {
         None
     }
 }

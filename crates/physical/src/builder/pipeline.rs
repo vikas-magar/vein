@@ -54,16 +54,21 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                 data_type: format!("{:?}", f.data_type),
             })
             .collect();
+        let task_id = TaskId::new();
         let sink = match plan {
             LogicalPlan::Write { target, options, .. } => {
                 let storage_schema = client_schema;
-                let key_values = options
+                let mut key_values: Vec<common::protocol::KeyValue> = options
                     .iter()
                     .map(|(k, v)| common::protocol::KeyValue {
                         key: k.clone(),
                         value: v.clone(),
                     })
                     .collect();
+                key_values.push(common::protocol::KeyValue {
+                    key: "partition_id".to_string(),
+                    value: (task_id.into_raw() as u32).to_string(),
+                });
                 let target_obj = common::protocol::StorageTarget::new(target.clone(), key_values, storage_schema);
                 DataSink::Storage(target_obj)
             }
@@ -73,7 +78,7 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         };
         let stage_id = StageId::new();
         let task = Task::new(
-            TaskId::new(),
+            task_id,
             PartitionId::new(),
             source,
             program,

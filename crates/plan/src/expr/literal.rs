@@ -1,7 +1,7 @@
 use crate::schema::VeinDataType;
 
 /// A literal value inside a logical expression
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LogicalLiteral {
     /// A null value of a specific type
     Null(VeinDataType),

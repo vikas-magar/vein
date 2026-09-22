@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 common = { path = "../common" }
+distributed = { path = "../distributed" }
+openraft = { workspace = true }
 orchestrator = { path = "../orchestrator" }
 exec = { path = "../exec" }
 error = { path = "../error" }

@@ -93,7 +93,11 @@ impl PipelineNode<DataChunk> for StorageSink {
                 VeinError::internal(format!("Failed to concatenate record batches: {e}"))
             })?;
 
-        let dest_uri = self.target.destination_uri.clone();
+        let dest_uri = self
+            .target
+            .get_option("staging_table")
+            .unwrap_or(&self.target.destination_uri)
+            .to_string();
         let format = self
             .target
             .get_option("format")
@@ -162,8 +166,17 @@ impl StorageSink {
                 .map_err(|e| VeinError::internal(format!("Failed to get VfsTableStore: {e}")))?,
         };
 
-        // Automatically pick the next sequential partition id — no hardcoded 0.
-        let summary = store.append_partition_sync(dest_uri, batch).map_err(|e| {
+        let summary = if self.target.get_option("staging_table").is_some() {
+            let partition_id = self.target.get_option("partition_id").ok_or_else(|| {
+                VeinError::internal("staged VFS write is missing partition_id")
+            })?.parse::<u32>().map_err(|error| {
+                VeinError::internal(format!("invalid storage partition_id: {error}"))
+            })?;
+            store.write_table_sync(dest_uri, partition_id, batch)
+        } else {
+            store.append_partition_sync(dest_uri, batch)
+        }
+        .map_err(|e| {
             VeinError::internal(format!("Failed to write table '{dest_uri}' to VFS: {e}"))
         })?;
 

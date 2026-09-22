@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 common = { path = "../common" }
+distributed = { path = "../distributed" }
 error = { path = "../error" }
 tokio = { workspace = true }
 arrow = { workspace = true }

@@ -3,14 +3,21 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use common::protocol::{VcsExchangeRequest, VcsExchangeResponse};
+use common::protocol::{VcsExchangeRequest, VcsExchangeResponse, VeinControlEvent};
+use distributed::{TableId, TableSnapshot, TableWriteMode, TableWritePart, WriteId};
+use crate::catalog_rpc::{VcsCatalogRequest, VcsCatalogResponse};
+use crate::{CatalogReader, CatalogWriter, TableWriteCatalog};
 use common::transport::{build_quic_server, extract_control_payload, frame_control_message};
+use distributed::RaftRpcHandler;
 use error::{Result, VeinError};
 use tracing::{debug, info, warn};
 
 use crate::ExchangeCatalog;
 
-const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+// Keep the listener limit aligned with the bounded Raft RPC transport limit.
+// Snapshot chunking remains a separate concern; this prevents the VCS endpoint
+// from rejecting valid bounded control frames before OpenRaft sees them.
+const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 /// VCS exchange metadata service.
 ///
@@ -19,12 +26,41 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 /// immutable fragment descriptors and exchange lifecycle state.
 pub struct VcsExchangeServer {
     catalog: Arc<dyn ExchangeCatalog>,
+    raft_rpc_handler: Option<Arc<dyn RaftRpcHandler>>,
+    catalog_reader: Option<Arc<dyn CatalogReader>>,
+    catalog_writer: Option<Arc<dyn CatalogWriter>>,
+    table_write_catalog: Option<Arc<dyn TableWriteCatalog>>,
 }
 
 impl VcsExchangeServer {
     /// Creates a service backed by the supplied VCS exchange catalog.
     pub fn new(catalog: Arc<dyn ExchangeCatalog>) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            raft_rpc_handler: None,
+            catalog_reader: None,
+            catalog_writer: None,
+            table_write_catalog: None,
+        }
+    }
+
+    /// Attaches an OpenRaft RPC handler to the shared VCS control-plane listener.
+    pub fn with_raft_rpc_handler(mut self, handler: Arc<dyn RaftRpcHandler>) -> Self {
+        self.raft_rpc_handler = Some(handler);
+        self
+    }
+
+    /// Attaches the authoritative table catalog contracts to this listener.
+    pub fn with_catalog_authority(
+        mut self,
+        reader: Arc<dyn CatalogReader>,
+        writer: Arc<dyn CatalogWriter>,
+        table_writes: Arc<dyn TableWriteCatalog>,
+    ) -> Self {
+        self.catalog_reader = Some(reader);
+        self.catalog_writer = Some(writer);
+        self.table_write_catalog = Some(table_writes);
+        self
     }
 
     /// Runs the QUIC listener until it is stopped by the caller or the server
@@ -35,11 +71,21 @@ impl VcsExchangeServer {
 
         while let Some(mut connection) = server.accept().await {
             let catalog = self.catalog.clone();
+            let raft_rpc_handler = self.raft_rpc_handler.clone();
+            let catalog_reader = self.catalog_reader.clone();
+            let catalog_writer = self.catalog_writer.clone();
+            let table_write_catalog = self.table_write_catalog.clone();
             tokio::spawn(async move {
                 while let Ok(Some(mut stream)) = connection.accept_bidirectional_stream().await {
                     let catalog = catalog.clone();
+                    let raft_rpc_handler = raft_rpc_handler.clone();
+                    let catalog_reader = catalog_reader.clone();
+                    let catalog_writer = catalog_writer.clone();
+                    let table_write_catalog = table_write_catalog.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_stream(&mut stream, catalog).await {
+                        if let Err(error) =
+                            handle_stream(&mut stream, catalog, raft_rpc_handler, catalog_reader, catalog_writer, table_write_catalog).await
+                        {
                             warn!(target: "vein_vcs", %error, "VCS exchange request failed");
                         }
                     });
@@ -55,6 +101,10 @@ impl VcsExchangeServer {
 async fn handle_stream(
     stream: &mut s2n_quic::stream::BidirectionalStream,
     catalog: Arc<dyn ExchangeCatalog>,
+    raft_rpc_handler: Option<Arc<dyn RaftRpcHandler>>,
+    catalog_reader: Option<Arc<dyn CatalogReader>>,
+    catalog_writer: Option<Arc<dyn CatalogWriter>>,
+    table_write_catalog: Option<Arc<dyn TableWriteCatalog>>,
 ) -> Result<()> {
     let mut buffer = Vec::new();
     while let Ok(Some(chunk)) = stream.receive().await {
@@ -76,9 +126,42 @@ async fn handle_stream(
 
     let payload = extract_control_payload(&buffer)
         .ok_or_else(|| VeinError::serialization("invalid VCS request frame"))?;
+    if let Some(handler) = raft_rpc_handler {
+        if let Ok(VeinControlEvent::RaftRpcRequest(request)) = decode_control_event(payload) {
+            let response = handler.handle(request).await;
+            send_control_response(stream, &response).await?;
+            return Ok(());
+        }
+    }
+
+    if let Ok(request) = decode_catalog_request(payload) {
+        let response = execute_catalog_request(
+            request,
+            catalog_reader,
+            catalog_writer,
+            table_write_catalog,
+        )
+        .await;
+        return send_catalog_response(stream, &response).await;
+    }
+
     let request = decode_request(payload)?;
     let response = execute_request(catalog, request).await;
     send_response(stream, &response).await
+}
+
+fn decode_control_event(payload: &[u8]) -> Result<VeinControlEvent> {
+    let mut aligned = rkyv::util::AlignedVec::<16>::new();
+    aligned.extend_from_slice(payload);
+    rkyv::from_bytes::<VeinControlEvent, rkyv::rancor::Error>(&aligned)
+        .map_err(|error| VeinError::serialization(format!("invalid control event: {error}")))
+}
+
+fn decode_catalog_request(payload: &[u8]) -> Result<VcsCatalogRequest> {
+    let mut aligned = rkyv::util::AlignedVec::<16>::new();
+    aligned.extend_from_slice(payload);
+    rkyv::from_bytes::<VcsCatalogRequest, rkyv::rancor::Error>(&aligned)
+        .map_err(|error| VeinError::serialization(format!("invalid VCS catalog request: {error}")))
 }
 
 fn decode_request(payload: &[u8]) -> Result<VcsExchangeRequest> {
@@ -151,6 +234,132 @@ async fn execute_request(
     result.unwrap_or_else(|error| VcsExchangeResponse::Error {
         message: error.to_string(),
     })
+}
+
+
+async fn execute_catalog_request(
+    request: VcsCatalogRequest,
+    reader: Option<Arc<dyn CatalogReader>>,
+    writer: Option<Arc<dyn CatalogWriter>>,
+    table_writes: Option<Arc<dyn TableWriteCatalog>>,
+) -> VcsCatalogResponse {
+    let result = async {
+        match request {
+            VcsCatalogRequest::BeginPlanning => {
+                let reader = reader.as_ref().ok_or_else(|| VeinError::internal("VCS catalog reader is not configured"))?;
+                let session = reader.begin_planning_session().await?;
+                Ok(VcsCatalogResponse::Revision {
+                    revision: session.catalog_revision.as_str().to_string(),
+                })
+            }
+            VcsCatalogRequest::ResolveTable { revision, name } => {
+                let reader = reader.as_ref().ok_or_else(|| VeinError::internal("VCS catalog reader is not configured"))?;
+                let mut session = crate::PlanningSession::new(crate::CatalogRevision::new(revision));
+                let metadata = reader.resolve_table(&mut session, &name).await?;
+                let payload = serde_json::to_vec(metadata.as_ref())
+                    .map_err(|error| VeinError::serialization(format!("encode table metadata: {error}")))?;
+                Ok(VcsCatalogResponse::Table {
+                    revision: session.catalog_revision.as_str().to_string(),
+                    metadata: payload,
+                })
+            }
+            VcsCatalogRequest::RegisterTable { expected_revision, metadata } => {
+                let writer = writer.as_ref().ok_or_else(|| VeinError::internal("VCS catalog writer is not configured"))?;
+                let metadata: plan::TableMetadata = serde_json::from_slice(&metadata)
+                    .map_err(|error| VeinError::serialization(format!("decode table metadata: {error}")))?;
+                writer
+                    .register_table_at(&crate::CatalogRevision::new(expected_revision), metadata)
+                    .await?;
+                Ok(VcsCatalogResponse::Ack)
+            }
+            VcsCatalogRequest::PrepareTableWrite { write_id, table_id, mode, expected_parts } => {
+                let table_writes = table_writes.as_ref().ok_or_else(|| VeinError::internal("VCS table-write catalog is not configured"))?;
+                let mode = match mode.as_str() {
+                    "overwrite" => TableWriteMode::Overwrite,
+                    "append" => TableWriteMode::Append,
+                    value => return Err(VeinError::internal(format!("invalid table write mode '{value}'"))),
+                };
+                let intent = table_writes
+                    .prepare_table_write(WriteId::from(write_id), TableId::from(table_id), mode, expected_parts)
+                    .await?;
+                Ok(VcsCatalogResponse::WriteIntent {
+                    intent: serde_json::to_vec(&intent)
+                        .map_err(|error| VeinError::serialization(format!("encode table write intent: {error}")))?,
+                })
+            }
+            VcsCatalogRequest::PublishTableWritePart { write_id, part } => {
+                let table_writes = table_writes.as_ref().ok_or_else(|| VeinError::internal("VCS table-write catalog is not configured"))?;
+                let part: TableWritePart = serde_json::from_slice(&part)
+                    .map_err(|error| VeinError::serialization(format!("decode table write part: {error}")))?;
+                let receipt = table_writes
+                    .publish_table_write_part(WriteId::from(write_id), part)
+                    .await?;
+                Ok(VcsCatalogResponse::Receipt {
+                    receipt: serde_json::to_vec(&receipt)
+                        .map_err(|error| VeinError::serialization(format!("encode commit receipt: {error}")))?,
+                })
+            }
+            VcsCatalogRequest::CommitTableWrite { write_id, snapshot } => {
+                let table_writes = table_writes.as_ref().ok_or_else(|| VeinError::internal("VCS table-write catalog is not configured"))?;
+                let snapshot: TableSnapshot = serde_json::from_slice(&snapshot)
+                    .map_err(|error| VeinError::serialization(format!("decode table snapshot: {error}")))?;
+                let receipt = table_writes
+                    .commit_table_write(WriteId::from(write_id), snapshot)
+                    .await?;
+                Ok(VcsCatalogResponse::Receipt {
+                    receipt: serde_json::to_vec(&receipt)
+                        .map_err(|error| VeinError::serialization(format!("encode commit receipt: {error}")))?,
+                })
+            }
+            VcsCatalogRequest::AbortTableWrite { write_id } => {
+                let table_writes = table_writes.as_ref().ok_or_else(|| VeinError::internal("VCS table-write catalog is not configured"))?;
+                let receipt = table_writes.abort_table_write(WriteId::from(write_id)).await?;
+                Ok(VcsCatalogResponse::Receipt {
+                    receipt: serde_json::to_vec(&receipt)
+                        .map_err(|error| VeinError::serialization(format!("encode commit receipt: {error}")))?,
+                })
+            }
+        }
+    }
+    .await;
+
+    result.unwrap_or_else(|error: VeinError| VcsCatalogResponse::Error {
+        message: error.to_string(),
+    })
+}
+
+async fn send_catalog_response(
+    stream: &mut s2n_quic::stream::BidirectionalStream,
+    response: &VcsCatalogResponse,
+) -> Result<()> {
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(response).map_err(|error| {
+        VeinError::serialization(format!("failed to encode VCS catalog response: {error}"))
+    })?;
+    stream
+        .send(frame_control_message(&bytes))
+        .await
+        .map_err(|error| VeinError::quic_send(error.to_string()))?;
+    stream
+        .finish()
+        .map_err(|error| VeinError::quic_send(error.to_string()))?;
+    Ok(())
+}
+
+async fn send_control_response(
+    stream: &mut s2n_quic::stream::BidirectionalStream,
+    response: &VeinControlEvent,
+) -> Result<()> {
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(response).map_err(|error| {
+        VeinError::serialization(format!("failed to encode Raft response: {error}"))
+    })?;
+    stream
+        .send(frame_control_message(&bytes))
+        .await
+        .map_err(|error| VeinError::quic_send(error.to_string()))?;
+    stream
+        .finish()
+        .map_err(|error| VeinError::quic_send(error.to_string()))?;
+    Ok(())
 }
 
 async fn send_response(

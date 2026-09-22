@@ -38,6 +38,19 @@ pub struct VfsPartitionSummary {
     pub extents: Vec<Extent>,
 }
 
+/// Result of publishing immutable staged partitions into a visible table name.
+#[derive(Debug, Clone)]
+pub struct VfsTablePublication {
+    /// Visible table identifier.
+    pub table_id: u32,
+    /// Partitions made visible by this publication.
+    pub part_ids: Vec<u32>,
+    /// Total rows made visible by this publication.
+    pub total_rows: u64,
+    /// Number of metadata extents aliased into the visible table.
+    pub extent_count: usize,
+}
+
 /// Core VFS Table Store managing native Dual-Plane columnar table partitions in VFS blocks.
 #[derive(Clone)]
 pub struct VfsTableStore {
@@ -1372,6 +1385,112 @@ impl VfsTableStore {
             ),
         }
         result
+    }
+
+    /// Publishes staged table metadata under a visible table name without copying
+    /// the underlying immutable block extents.
+    pub async fn publish_staged_table(
+        &self,
+        staging_table: &str,
+        visible_table: &str,
+        overwrite: bool,
+    ) -> Result<VfsTablePublication> {
+        let staging_id = Self::resolve_table_id(staging_table);
+        let visible_id = Self::resolve_table_id(visible_table);
+        let staged_parts = self.resolve_table_parts(staging_id).await?;
+        if staged_parts.is_empty() {
+            return Err(VfsError::NotFound(format!(
+                "staged table '{staging_table}' has no partitions"
+            )));
+        }
+
+        let schema_path = format!("tbl_{staging_id}/_schema.json");
+        let schema_extents = self.metadata_engine.get_file(&schema_path).await?;
+        if schema_extents.is_empty() {
+            return Err(VfsError::NotFound(schema_path));
+        }
+        self.metadata_engine
+            .replace_file(&format!("tbl_{visible_id}/_schema.json"), schema_extents.clone())
+            .await?;
+
+        let schema = self.read_table_schema(staging_id).await?;
+        let mut aliased_extents = schema_extents.len();
+        for part_id in &staged_parts {
+            for field in &schema.fields {
+                for plane in [PlaneType::AddressPlane, PlaneType::PayloadVault] {
+                    let source = BlockKey {
+                        segment: crate::block::SegmentKey::new(staging_id, *part_id),
+                        column_name: field.name.clone(),
+                        plane,
+                    }
+                    .to_canonical_path();
+                    let destination = BlockKey {
+                        segment: crate::block::SegmentKey::new(visible_id, *part_id),
+                        column_name: field.name.clone(),
+                        plane,
+                    }
+                    .to_canonical_path();
+                    let extents = self
+                        .metadata_engine
+                        .get_file(&source)
+                        .await
+                        .unwrap_or_default();
+                    if extents.is_empty() {
+                        let _ = self.metadata_engine.delete_file(&destination).await;
+                    } else {
+                        aliased_extents += extents.len();
+                        self.metadata_engine.replace_file(&destination, extents).await?;
+                    }
+                }
+            }
+        }
+
+        let mut visible_parts = if overwrite {
+            Vec::new()
+        } else {
+            self.resolve_table_parts(visible_id).await.unwrap_or_default()
+        };
+        visible_parts.extend(staged_parts.iter().copied());
+        visible_parts.sort_unstable();
+        visible_parts.dedup();
+        let parts_json = serde_json::to_vec(&visible_parts)
+            .map_err(|error| VfsError::Internal(format!("serialize visible partitions: {error}")))?;
+        let parts_extents = self.block_manager.append(&parts_json).await?;
+        self.metadata_engine
+            .replace_file(&format!("tbl_{visible_id}/_partitions.json"), parts_extents)
+            .await?;
+        self.metadata_engine
+            .replace_file(
+                &format!("tbl_{visible_id}/_SUCCESS"),
+                self.block_manager.append(b"OK").await?,
+            )
+            .await?;
+
+        let mut total_rows = 0;
+        for part_id in &staged_parts {
+            total_rows += self
+                .open_partition_reader(staging_id, *part_id)
+                .await?
+                .total_rows();
+        }
+        tracing::info!(
+            target: "vein.audit",
+            event = "vfs_staged_table_published",
+            staging_table = %staging_table,
+            visible_table = %visible_table,
+            table_id = visible_id,
+            partitions = staged_parts.len(),
+            rows = total_rows,
+            extents = aliased_extents,
+            overwrite,
+            "vfs_staged_table_published"
+        );
+        Ok(VfsTablePublication {
+            table_id: visible_id,
+            part_ids: staged_parts,
+            total_rows,
+            extent_count: aliased_extents,
+        })
     }
 
     /// Synchronous variant of [`append_partition`](Self::append_partition).

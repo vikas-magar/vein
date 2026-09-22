@@ -22,6 +22,7 @@ use common::transport::{
     VcsExchangeClient, build_quic_client, build_quic_server, extract_control_payload,
     frame_control_message,
 };
+use distributed::RaftRpcHandler;
 use error::VeinError;
 
 /// Configuration for an [`ExecutorDaemon`].
@@ -46,6 +47,7 @@ pub struct ExecutorDaemon {
     config: Option<ExecutorDaemonConfig>,
     ctx: Arc<DaemonContext>,
     _workers: Option<WorkerPool>,
+    raft_rpc_handler: Option<Arc<dyn RaftRpcHandler>>,
 }
 
 impl ExecutorDaemon {
@@ -55,6 +57,7 @@ impl ExecutorDaemon {
             config: None,
             ctx,
             _workers: None,
+            raft_rpc_handler: None,
         }
     }
 
@@ -78,10 +81,12 @@ impl ExecutorDaemon {
         let cert = config.cert_path.clone();
         let key = config.key_path.clone();
         let ctx = self.ctx.clone();
+        let raft_rpc_handler = self.raft_rpc_handler.clone();
 
         tokio::spawn(async move {
             info!("Initializing Control Plane on {}", bind);
-            let daemon = Self::new(ctx);
+            let mut daemon = Self::new(ctx);
+            daemon.raft_rpc_handler = raft_rpc_handler;
             if let Err(e) = daemon.run_control_plane(bind, &cert, &key).await {
                 error!("Executor control plane failed: {}", e);
             }
@@ -173,11 +178,13 @@ impl ExecutorDaemon {
 
         while let Some(mut connection) = server.accept().await {
             let ctx = self.ctx.clone();
+            let raft_rpc_handler = self.raft_rpc_handler.clone();
 
             // Handle multiplexed control streams
             tokio::spawn(async move {
                 while let Ok(Some(mut stream)) = connection.accept_bidirectional_stream().await {
                     let ctx = ctx.clone();
+                    let raft_rpc_handler = raft_rpc_handler.clone();
                     tokio::spawn(async move {
                         let mut buffer = Vec::new();
                         while let Ok(Some(chunk)) = stream.receive().await {
@@ -208,6 +215,39 @@ impl ExecutorDaemon {
                             };
 
                         match archived {
+                            ArchivedVeinControlEvent::RaftRpcRequest(_) => {
+                                let request = match VeinControlEvent::from(archived) {
+                                    VeinControlEvent::RaftRpcRequest(request) => request,
+                                    _ => unreachable!("validated Raft request changed variant"),
+                                };
+                                let response = match raft_rpc_handler.as_ref() {
+                                    Some(handler) => handler.handle(request.clone()).await,
+                                    None => VeinControlEvent::RaftRpcResponse {
+                                        envelope: common::protocol::RaftRpcEnvelope {
+                                            request_id: request.request_id,
+                                            kind: request.kind,
+                                            payload: Vec::new(),
+                                        },
+                                        error: Some(
+                                            "Raft RPC service is not configured".to_string(),
+                                        ),
+                                    },
+                                };
+                                match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
+                                    Ok(bytes) => {
+                                        if let Err(error) =
+                                            stream.send(frame_control_message(&bytes)).await
+                                        {
+                                            error!("Failed to send Raft RPC response: {}", error);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        error!("Failed to serialize Raft RPC response: {}", error);
+                                    }
+                                }
+                                let _ = stream.finish();
+                                return;
+                            }
                             ArchivedVeinControlEvent::DispatchTask(archived_task) => {
                                 let task = ExecuteTask::from(archived_task);
                                 let task_id = task.task_id;
@@ -605,6 +645,8 @@ pub struct ExecutorDaemonBuilder {
     workers: usize,
     vcs_endpoint: Option<String>,
     vcs_ca_cert: Option<String>,
+    allow_local_metadata: bool,
+    raft_rpc_handler: Option<Arc<dyn RaftRpcHandler>>,
 }
 
 impl ExecutorDaemonBuilder {
@@ -619,6 +661,8 @@ impl ExecutorDaemonBuilder {
             workers: 4,
             vcs_endpoint: None,
             vcs_ca_cert: None,
+            allow_local_metadata: false,
+            raft_rpc_handler: None,
         }
     }
 
@@ -660,6 +704,21 @@ impl ExecutorDaemonBuilder {
         self
     }
 
+    /// Allows an explicitly local development executor without a remote VCS.
+    ///
+    /// Production executors must use vcs_exchange so exchange and spill
+    /// metadata are governed by the shared VCS authority.
+    pub fn local_development(mut self) -> Self {
+        self.allow_local_metadata = true;
+        self
+    }
+
+    /// Installs the Raft RPC service used by the control-plane listener.
+    pub fn raft_rpc_handler(mut self, handler: Arc<dyn RaftRpcHandler>) -> Self {
+        self.raft_rpc_handler = Some(handler);
+        self
+    }
+
     /// Assemble the daemon, wiring the task queue, executor abstraction, worker
     /// pool, and control plane together.
     pub fn build(self) -> Result<ExecutorDaemon> {
@@ -688,6 +747,12 @@ impl ExecutorDaemonBuilder {
         let master_client = Arc::new(build_quic_client(&config.cert_path)?);
         let ctx = DaemonContext::new(config.node_id, tx, master_client);
 
+        if self.vcs_endpoint.is_none() && !self.allow_local_metadata {
+            return Err(VeinError::internal(
+                "remote VCS metadata endpoint is required; use local_development for local tests",
+            ));
+        }
+
         // The task executor (default stages + expressions) that runs tasks.
         let mut task_builder = TaskExecutorBuilder::new();
         if let Some(endpoint) = self.vcs_endpoint {
@@ -703,6 +768,7 @@ impl ExecutorDaemonBuilder {
             config: Some(config),
             ctx,
             _workers: Some(workers),
+            raft_rpc_handler: self.raft_rpc_handler,
         })
     }
 }

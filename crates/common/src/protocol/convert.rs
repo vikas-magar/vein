@@ -4,8 +4,8 @@
 //! lifetime infection or rkyv::Deserialize Pool strategy mismatches.
 
 use super::control::{
-    ArchivedNodeKind, ArchivedNodeLoad, ArchivedVeinControlEvent, NodeKind, NodeLoad,
-    VeinControlEvent,
+    ArchivedNodeKind, ArchivedNodeLoad, ArchivedRaftRpcEnvelope, ArchivedRaftRpcKind,
+    ArchivedVeinControlEvent, NodeKind, NodeLoad, RaftRpcEnvelope, RaftRpcKind, VeinControlEvent,
 };
 use super::exchange::{ArchivedExchangeKey, ExchangeKey};
 use super::ir::constant::{ArchivedScalarConstant, ScalarConstant};
@@ -535,6 +535,26 @@ impl From<&ArchivedNodeLoad> for NodeLoad {
     }
 }
 
+impl From<&ArchivedRaftRpcKind> for RaftRpcKind {
+    fn from(archived: &ArchivedRaftRpcKind) -> Self {
+        match archived {
+            ArchivedRaftRpcKind::Vote => RaftRpcKind::Vote,
+            ArchivedRaftRpcKind::AppendEntries => RaftRpcKind::AppendEntries,
+            ArchivedRaftRpcKind::InstallSnapshot => RaftRpcKind::InstallSnapshot,
+        }
+    }
+}
+
+impl From<&ArchivedRaftRpcEnvelope> for RaftRpcEnvelope {
+    fn from(archived: &ArchivedRaftRpcEnvelope) -> Self {
+        Self {
+            request_id: archived.request_id.to_native(),
+            kind: RaftRpcKind::from(&archived.kind),
+            payload: archived.payload.as_slice().to_vec(),
+        }
+    }
+}
+
 impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
     fn from(archived: &ArchivedVeinControlEvent) -> Self {
         match archived {
@@ -602,6 +622,15 @@ impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
                 bytes_read: bytes_read.to_native(),
                 duration_ns: duration_ns.to_native(),
             },
+            ArchivedVeinControlEvent::RaftRpcRequest(envelope) => {
+                VeinControlEvent::RaftRpcRequest(RaftRpcEnvelope::from(envelope))
+            }
+            ArchivedVeinControlEvent::RaftRpcResponse { envelope, error } => {
+                VeinControlEvent::RaftRpcResponse {
+                    envelope: RaftRpcEnvelope::from(envelope),
+                    error: error.as_ref().map(|value| value.as_str().to_string()),
+                }
+            }
             ArchivedVeinControlEvent::DispatchTask(task) => {
                 VeinControlEvent::DispatchTask(ExecuteTask::from(task))
             }

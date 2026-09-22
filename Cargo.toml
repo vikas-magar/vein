@@ -5,7 +5,7 @@ edition = "2024"
 
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/types", "crates/vcs", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/orchestrator", "crates/cli", "crates/vfs", "crates/ebpf", "crates/plan", "crates/physical", "crates/optimizer", "crates/exo"]
+members = ["crates/common", "crates/types", "crates/vcs", "crates/distributed", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/orchestrator", "crates/cli", "crates/vfs", "crates/ebpf", "crates/plan", "crates/physical", "crates/optimizer", "crates/exo"]
 
 [workspace.dependencies]
 async-trait = "0.1.89"
@@ -28,6 +28,7 @@ iceberg = "0.10.0"
 iceberg-storage-opendal = { version = "0.10.0", features = ["opendal-fs", "opendal-s3"] }
 strum = { version = "0.28.0", features = ["derive"] }
 ordered-float = "5.3.0"
+openraft = { version = "0.9.25", features = ["serde"] }
 
 [dependencies]
 common = { path = "crates/common" }

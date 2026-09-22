@@ -2,9 +2,15 @@ pub mod daemon;
 pub mod engine;
 
 use clap::{Parser, Subcommand};
-use exec::ExecutorDaemon;
-use std::sync::Arc;
 use common::logging;
+use distributed::{
+    DurableRaftStorage, OpenRaftMetadataWriter, OpenRaftRpcHandler, QuicRaftNetworkFactory,
+    start_raft_node,
+};
+use exec::ExecutorDaemon;
+use openraft::{BasicNode, Config as RaftConfig};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use tracing::{debug, error, info};
 
 #[derive(Parser, Debug)]
@@ -27,6 +33,18 @@ enum Commands {
         cert: String,
         #[arg(short, long, default_value = "certs/server.key")]
         key: String,
+        /// Stable OpenRaft node identifier.
+        #[arg(long, default_value_t = 1)]
+        raft_id: u64,
+        /// Address advertised to other VCS nodes. Defaults to the bind address.
+        #[arg(long)]
+        raft_advertise: Option<String>,
+        /// Path for durable OpenRaft metadata and log state.
+        #[arg(long, default_value = "/tmp/vein-vcs-raft.json")]
+        raft_state: String,
+        /// Bootstrap a brand-new single-node Raft group.
+        #[arg(long, default_value_t = false)]
+        raft_bootstrap: bool,
     },
     /// Start a Master node (Query Coordinator)
     Master {
@@ -36,6 +54,9 @@ enum Commands {
         cert: String,
         #[arg(short, long, default_value = "certs/server.key")]
         key: String,
+        /// Remote VCS catalog endpoint used by production master mode.
+        #[arg(long)]
+        vcs: String,
     },
     /// Start an Executor node (Compute Daemon)
     Executor {
@@ -47,9 +68,9 @@ enum Commands {
         cert: String,
         #[arg(short, long, default_value = "certs/server.key")]
         key: String,
-        /// Optional VCS exchange metadata endpoint, for example 127.0.0.1:9090.
+        /// Remote VCS metadata authority. Required for production executors.
         #[arg(long)]
-        vcs: Option<String>,
+        vcs: String,
     },
     /// Run a full local cluster (Master + Executor) in a single process
     Local {
@@ -66,29 +87,61 @@ enum Commands {
     },
 }
 
-fn build_default_coordinator() -> Result<Arc<engine::DistributedCoordinator>, String> {
+async fn build_default_coordinator(
+    vcs_endpoint: Option<&str>,
+    ca_cert: &str,
+) -> Result<Arc<engine::DistributedCoordinator>, String> {
     debug!(target: "vein_server", "Initializing Master subsystems and Scheduler");
     let registry = Arc::new(orchestrator::executor::registry::ExecutorRegistry::new());
-    let dispatcher =
-        Arc::new(orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::new());
+    let dispatcher = Arc::new(orchestrator::scheduler::quic_dispatcher::QuicTaskDispatcher::new());
     let scheduler = Arc::new(orchestrator::scheduler::Scheduler::new(
         registry,
         dispatcher,
-        3,                                  // max_retries
-        std::time::Duration::from_secs(30), // timeout
+        3,
+        std::time::Duration::from_secs(30),
     ));
 
-    debug!(target: "vein_server", "Building DistributedCoordinator with default subsystems");
-    let coordinator = engine::DistributedCoordinator::builder()
-        .with_binder(Arc::new(binder::QueryBinder::new(
-            Arc::new(vcs::InMemoryCatalog::new()),
-            Arc::new(binder::testing::MockFunctionRegistry::new()),
-        )))
-        .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
-        .with_planner(Arc::new(physical::DefaultPhysicalPlanner::new()))
-        .with_scheduler(scheduler)
-        .build()
-        .map_err(|e| format!("Failed to build DistributedCoordinator: {e}"))?;
+    debug!(target: "vein_server", "Building DistributedCoordinator with catalog authority");
+    let optimizer = Arc::new(optimizer::OptimizerPipeline::production());
+    let planner = Arc::new(physical::DefaultPhysicalPlanner::new());
+
+    let coordinator = if let Some(endpoint) = vcs_endpoint {
+        let catalog = Arc::new(
+            vcs::RemoteVcsCatalog::connect(endpoint, ca_cert)
+                .map_err(|error| format!("Failed to connect to remote VCS catalog: {error}"))?,
+        );
+        engine::DistributedCoordinator::builder()
+            .with_binder(Arc::new(binder::QueryBinder::new(
+                catalog.clone(),
+                Arc::new(binder::testing::MockFunctionRegistry::new()),
+            )))
+            .with_catalog_writer(catalog.clone())
+            .with_table_write_catalog(catalog)
+            .with_optimizer(optimizer)
+            .with_planner(planner)
+            .with_scheduler(scheduler)
+            .build()
+            .map_err(|e| format!("Failed to build DistributedCoordinator: {e}"))?
+    } else {
+        let warehouse = std::env::var("VEIN_CATALOG_WAREHOUSE")
+            .unwrap_or_else(|_| "file:///tmp/vein-warehouse".to_string());
+        let catalog = Arc::new(
+            vcs::VcsCatalog::new("vein", warehouse, vcs::storage::StorageConfig::LocalFs)
+                .await
+                .map_err(|error| format!("Failed to initialize local VCS catalog: {error}"))?,
+        );
+        engine::DistributedCoordinator::builder()
+            .with_binder(Arc::new(binder::QueryBinder::new(
+                catalog.clone(),
+                Arc::new(binder::testing::MockFunctionRegistry::new()),
+            )))
+            .with_catalog_writer(catalog)
+            .with_optimizer(optimizer)
+            .with_planner(planner)
+            .with_scheduler(scheduler)
+            .build()
+            .map_err(|e| format!("Failed to build DistributedCoordinator: {e}"))?
+    };
 
     Ok(Arc::new(coordinator))
 }
@@ -105,23 +158,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             warehouse,
             cert,
             key,
+            raft_id,
+            raft_advertise,
+            raft_state,
+            raft_bootstrap,
         } => {
-            info!(target: "vein_server", %bind, %warehouse, "Starting Vein VCS authority");
-            let catalog = Arc::new(
+            info!(target: "vein_server", %bind, %warehouse, raft_id, %raft_state, raft_bootstrap, "Starting Vein VCS authority");
+            let catalog =
                 vcs::VcsCatalog::new("vein", warehouse, vcs::storage::StorageConfig::LocalFs)
-                    .await?,
-            );
+                    .await?;
             let addr: std::net::SocketAddr = bind
                 .parse()
                 .map_err(|e| format!("Invalid VCS bind address '{bind}': {e}"))?;
+            let advertise = raft_advertise.unwrap_or_else(|| bind.clone());
+            let mut raft_config = RaftConfig::default();
+            raft_config.cluster_name = "vein-vcs".to_string();
+            let raft_config = Arc::new(
+                raft_config
+                    .validate()
+                    .map_err(|e| format!("Invalid VCS Raft configuration: {e}"))?,
+            );
+            let raft_client = Arc::new(common::transport::QuicClient::new(
+                common::transport::build_quic_client(&cert)?,
+            ));
+            let raft_network = QuicRaftNetworkFactory::new(raft_client);
+            let raft_storage = DurableRaftStorage::open(&raft_state)?;
+            let raft_view_storage = raft_storage.clone();
+            let raft =
+                Arc::new(start_raft_node(raft_id, raft_config, raft_network, raft_storage).await?);
+            if raft_bootstrap {
+                let mut members = BTreeMap::new();
+                members.insert(raft_id, BasicNode::new(advertise));
+                raft.initialize(members).await?;
+            }
+            let catalog = Arc::new(catalog.with_metadata_writer(Arc::new(
+                OpenRaftMetadataWriter::new(raft.clone(), raft_view_storage),
+            )));
+            let raft_handler = Arc::new(OpenRaftRpcHandler::new(raft));
             vcs::VcsExchangeServer::new(catalog.shared_exchange_catalog())
+                .with_raft_rpc_handler(raft_handler)
+                .with_catalog_authority(catalog.clone(), catalog.clone(), catalog)
                 .run(addr, &cert, &key)
                 .await?;
         }
-        Commands::Master { bind, cert, key } => {
+        Commands::Master {
+            bind,
+            cert,
+            key,
+            vcs,
+        } => {
             info!(target: "vein_server", %bind, %cert, "Starting Vein Master node");
 
-            let coordinator = build_default_coordinator()?;
+            let coordinator = build_default_coordinator(Some(&vcs), &cert).await?;
 
             // Start the Master Daemon
             let addr: std::net::SocketAddr = bind
@@ -157,9 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .certificates(&cert, &key)
                 .workers(4)
                 .master(&master);
-            if let Some(vcs) = vcs {
-                builder = builder.vcs_exchange(&vcs, &cert);
-            }
+            builder = builder.vcs_exchange(&vcs, &cert);
             builder.build()?.start().await?;
         }
         Commands::Local {
@@ -183,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .parse()
                 .map_err(|e| format!("Invalid executor bind address '{executor_bind}': {e}"))?;
 
-            let coordinator = build_default_coordinator()?;
+            let coordinator = build_default_coordinator(None, &cert).await?;
             let master_daemon = daemon::MasterDaemon::new(coordinator);
             let cert_m = cert.clone();
             let key_m = key.clone();
@@ -203,6 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .certificates(&cert_e, &key_e)
                     .workers(workers)
                     .master(&master_target)
+                    .local_development()
                     .build()
                 {
                     Ok(d) => d,
@@ -228,4 +315,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-

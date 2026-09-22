@@ -4,13 +4,15 @@ use iceberg::table::Table;
 use iceberg::{Catalog, TableIdent};
 use moka::future::Cache;
 
+use crate::model::{CatalogRevision, SnapshotId, TableSnapshot};
+
 use error::{Result, VeinError};
 
 /// Maximum number of table entries kept in the hot cache.
 /// At ~1KB per TableMetadata, 1000 tables ≈ 1MB of catalog RAM.
 const MAX_TABLE_CACHE_ENTRIES: u64 = 1_000;
 
-/// Hot metadata cache: TableIdent → Arc<Table>
+/// Hot physical-adapter cache: (TableIdent, catalog revision, snapshot) → Arc<Table>.
 ///
 /// - A cache hit returns the Arc<Table> with zero IO.
 /// - A cache miss calls catalog.load_table() and inserts the result.
@@ -18,7 +20,7 @@ const MAX_TABLE_CACHE_ENTRIES: u64 = 1_000;
 /// - Invalidation: call `invalidate(&ident)` when VCS receives a snapshot change.
 #[derive(Clone, Debug)]
 pub struct TableCache {
-    inner: Cache<TableIdent, Arc<Table>>,
+    inner: Cache<(TableIdent, CatalogRevision, SnapshotId), Arc<Table>>,
 }
 
 impl Default for TableCache {
@@ -40,10 +42,17 @@ impl TableCache {
     pub async fn get_or_load(
         &self,
         ident: &TableIdent,
+        snapshot: &TableSnapshot,
         catalog: &dyn Catalog,
     ) -> Result<Arc<Table>> {
+        let cache_key = (
+            ident.clone(),
+            snapshot.catalog_revision.clone(),
+            snapshot.snapshot_id.clone(),
+        );
+
         // Check hot cache first
-        if let Some(cached) = self.inner.get(ident).await {
+        if let Some(cached) = self.inner.get(&cache_key).await {
             tracing::debug!(target: "vein.audit", event = "catalog_cache_hit", ?ident, "catalog_cache_hit");
             return Ok(cached);
         }
@@ -56,13 +65,15 @@ impl TableCache {
             .map_err(VeinError::Iceberg)?;
         let table = Arc::new(table);
 
-        self.inner.insert(ident.clone(), Arc::clone(&table)).await;
+        self.inner.insert(cache_key, Arc::clone(&table)).await;
         Ok(table)
     }
 
     /// Invalidate a specific table entry (called when a new snapshot is committed).
     pub async fn invalidate(&self, ident: &TableIdent) {
-        self.inner.invalidate(ident).await;
+        // The cache key includes revision and snapshot, so invalidate all variants
+        // for the logical table rather than risking a stale physical adapter entry.
+        self.inner.invalidate_all();
         tracing::info!(target: "vein.audit", event = "catalog_cache_invalidated", ?ident, "catalog_cache_invalidated");
     }
 

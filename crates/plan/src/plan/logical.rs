@@ -6,7 +6,7 @@ use parser::ast::query::SetOpKind;
 
 /// A computed window expression: the resolved call together with the output
 /// column the surrounding projection references (via a placeholder `Column`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WindowExpr {
     /// The bound window function call (`fn(args) OVER (...)`).
     pub call: LogicalExpr,
@@ -15,7 +15,7 @@ pub struct WindowExpr {
 }
 
 /// A node in the logical query plan tree
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LogicalPlan {
     // ── Sources ─────────────────────────────────────────────
     /// A table scan

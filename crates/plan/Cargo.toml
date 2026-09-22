@@ -11,3 +11,4 @@ error = { path = "../error" }
 parser = { path = "../parser" }
 arrow = { workspace = true }
 types = { path = "../types" }
+serde = { workspace = true }

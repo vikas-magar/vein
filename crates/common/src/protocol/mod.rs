@@ -33,7 +33,8 @@ pub use task::{
 
 // Re-export control-plane events and telemetry
 pub use control::{
-    ArchivedVeinControlEvent, NodeKind, NodeLoad, QueryTelemetry, TaskTelemetry, VeinControlEvent,
+    ArchivedRaftRpcEnvelope, ArchivedRaftRpcKind, ArchivedVeinControlEvent, NodeKind, NodeLoad,
+    QueryTelemetry, RaftRpcEnvelope, RaftRpcKind, TaskTelemetry, VeinControlEvent,
 };
 
 // Re-export RPC types

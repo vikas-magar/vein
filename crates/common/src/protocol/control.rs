@@ -41,6 +41,42 @@ pub struct NodeLoad {
     pub memory_bytes: u64,
 }
 
+/// Raft RPC kind carried by the shared control-plane envelope.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+pub enum RaftRpcKind {
+    /// RequestVote RPC.
+    Vote,
+    /// AppendEntries RPC.
+    AppendEntries,
+    /// InstallSnapshot RPC.
+    InstallSnapshot,
+}
+
+/// Opaque, versioned payload envelope for a single Raft RPC.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+#[rkyv(attr(allow(missing_docs)))]
+pub struct RaftRpcEnvelope {
+    /// Correlates a response with its request on a multiplexed control connection.
+    pub request_id: u64,
+    /// RPC operation encoded in the payload.
+    pub kind: RaftRpcKind,
+    /// Serialized OpenRaft request or response bytes.
+    pub payload: Vec<u8>,
+}
+
 /// Control events sent as QUIC datagrams (<1200 bytes) or multiplexed streams.
 #[derive(
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
@@ -111,6 +147,15 @@ pub enum VeinControlEvent {
         bytes_read: u64,
         /// Wall-clock duration in nanoseconds.
         duration_ns: u64,
+    },
+    /// An OpenRaft request sent to a peer node.
+    RaftRpcRequest(RaftRpcEnvelope),
+    /// The response to an OpenRaft request.
+    RaftRpcResponse {
+        /// Correlation and operation metadata for the request.
+        envelope: RaftRpcEnvelope,
+        /// Error returned by the peer, if the RPC was rejected.
+        error: Option<String>,
     },
     /// A new task assigned to this Executor.
     DispatchTask(ExecuteTask),

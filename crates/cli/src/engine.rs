@@ -4,6 +4,11 @@ use futures::StreamExt;
 use std::sync::Arc;
 
 use binder::LogicalBinder;
+use distributed::{
+    ArtifactId as DistributedArtifactId, ArtifactRef as DistributedArtifactRef,
+    SnapshotId as DistributedSnapshotId, TableId as DistributedTableId,
+    TableSnapshot as DistributedTableSnapshot, TableWriteMode, TableWritePart, WriteId,
+};
 use optimizer::Optimizer;
 use parser::ast::query::QueryNode;
 use physical::PhysicalPlanner;
@@ -52,6 +57,10 @@ pub struct DistributedCoordinator {
     pub planner: Arc<dyn PhysicalPlanner>,
     /// The cluster scheduler responsible for dispatching tasks
     pub scheduler: Arc<orchestrator::scheduler::Scheduler>,
+    /// Authoritative catalog writer used to publish completed writes.
+    pub catalog_writer: Option<Arc<dyn vcs::CatalogWriter>>,
+    /// Authoritative atomic table-generation writer.
+    pub table_write_catalog: Option<Arc<dyn vcs::TableWriteCatalog>>,
 }
 
 impl DistributedCoordinator {
@@ -62,6 +71,8 @@ impl DistributedCoordinator {
             optimizer: None,
             planner: None,
             scheduler: None,
+            catalog_writer: None,
+            table_write_catalog: None,
         }
     }
 }
@@ -72,6 +83,8 @@ pub struct DistributedCoordinatorBuilder {
     optimizer: Option<Arc<dyn Optimizer>>,
     planner: Option<Arc<dyn PhysicalPlanner>>,
     scheduler: Option<Arc<orchestrator::scheduler::Scheduler>>,
+    catalog_writer: Option<Arc<dyn vcs::CatalogWriter>>,
+    table_write_catalog: Option<Arc<dyn vcs::TableWriteCatalog>>,
 }
 
 impl DistributedCoordinatorBuilder {
@@ -99,6 +112,21 @@ impl DistributedCoordinatorBuilder {
         self
     }
 
+    /// Injects the authoritative catalog writer used by write queries.
+    pub fn with_catalog_writer(mut self, catalog_writer: Arc<dyn vcs::CatalogWriter>) -> Self {
+        self.catalog_writer = Some(catalog_writer);
+        self
+    }
+
+    /// Injects the authoritative table-generation transaction service.
+    pub fn with_table_write_catalog(
+        mut self,
+        table_write_catalog: Arc<dyn vcs::TableWriteCatalog>,
+    ) -> Self {
+        self.table_write_catalog = Some(table_write_catalog);
+        self
+    }
+
     /// Validates dependencies and constructs the `DistributedCoordinator`.
     pub fn build(self) -> Result<DistributedCoordinator> {
         let binder = self
@@ -119,6 +147,8 @@ impl DistributedCoordinatorBuilder {
             optimizer,
             planner,
             scheduler,
+            catalog_writer: self.catalog_writer,
+            table_write_catalog: self.table_write_catalog,
         })
     }
 }
@@ -215,10 +245,11 @@ impl QueryEngine for DistributedCoordinator {
             "query_lifecycle_started"
         );
         tracing::debug!(target: "vein_coordinator", "Binding SQL AST to semantic logical plan");
-        let logical_plan = self.binder.bind(&node).await?;
+        let bound_query = self.binder.bind_with_catalog_revision(&node).await?;
+        let logical_plan = bound_query.plan;
 
         tracing::debug!(target: "vein_coordinator", "Applying rule-based plan optimizations");
-        let optimized_plan = self.optimizer.optimize(logical_plan)?;
+        let mut optimized_plan = self.optimizer.optimize(logical_plan)?;
 
         if let LogicalPlan::Explain { .. } = &optimized_plan {
             let text = display::format_plan(&optimized_plan);
@@ -226,8 +257,49 @@ impl QueryEngine for DistributedCoordinator {
             return Ok(QueryOutput::Plan(text));
         }
 
-        let write_info = match &optimized_plan {
-            LogicalPlan::Write { target, schema, .. } => Some((target.clone(), schema.clone())),
+        let write_info = match &mut optimized_plan {
+            LogicalPlan::Write {
+                target,
+                options,
+                schema,
+                ..
+            } => {
+                let mode = match options
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("mode"))
+                    .map(|(_, value)| value.as_str())
+                    .unwrap_or("overwrite")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "overwrite" => TableWriteMode::Overwrite,
+                    "append" => TableWriteMode::Append,
+                    value => {
+                        return Err(error::VeinError::semantic(
+                            format!("unsupported WRITE mode '{value}'"),
+                            None,
+                        ));
+                    }
+                };
+                let write_id = WriteId::from(format!("write:{request_id}"));
+                let staging_table = format!("__vein_stage_{}", request_id);
+                options.push(("write_id".to_string(), write_id.to_string()));
+                options.push(("staging_table".to_string(), staging_table.clone()));
+                options.push((
+                    "write_mode".to_string(),
+                    match mode {
+                        TableWriteMode::Overwrite => "overwrite".to_string(),
+                        TableWriteMode::Append => "append".to_string(),
+                    },
+                ));
+                Some((
+                    target.clone(),
+                    schema.clone(),
+                    write_id,
+                    staging_table,
+                    mode,
+                ))
+            }
             _ => None,
         };
 
@@ -239,7 +311,64 @@ impl QueryEngine for DistributedCoordinator {
         let output_stage = job.output_stage_id();
         tracing::info!(target: "vein_coordinator", ?output_stage, "Dispatching physical job to cluster scheduler");
 
-        if let Some((target, schema)) = write_info {
+        if let Some((target, schema, write_id, staging_table, mode)) = write_info {
+            if self.table_write_catalog.is_none() {
+                let dispatcher = self.scheduler.dispatcher().clone();
+                let _result_stream = dispatcher.open_result_stream(query_id);
+                let execution_result = self
+                    .scheduler
+                    .execute(job, common::cancellation::CancellationToken::new())
+                    .await;
+                dispatcher.close_result_stream(query_id);
+                let completion = execution_result?;
+                let vfs_store = vfs::VfsTableStore::shared_or_default()
+                    .map_err(|error| error::VeinError::internal(error.to_string()))?;
+                vfs_store
+                    .publish_staged_table(
+                        &staging_table,
+                        &target,
+                        mode == TableWriteMode::Overwrite,
+                    )
+                    .await
+                    .map_err(|error| error::VeinError::internal(error.to_string()))?;
+                let location = if target.starts_with('/')
+                    || target.starts_with("./")
+                    || target.starts_with("../")
+                    || target.starts_with("vfs://")
+                {
+                    target.clone()
+                } else {
+                    format!("vfs://{target}")
+                };
+                let catalog = self.catalog_writer.as_ref().ok_or_else(|| {
+                    error::VeinError::internal("catalog writer is required for local WRITE queries")
+                })?;
+                let metadata = plan::TableMetadata::new(&target, Arc::new((*schema).clone()))
+                    .with_location(location)
+                    .with_format(plan::TableFormat::Exo);
+                catalog.register_table(metadata).await?;
+                return Ok(QueryOutput::Write {
+                    table: target,
+                    row_count: completion.row_count,
+                });
+            }
+            let table_write_catalog = self
+                .table_write_catalog
+                .as_ref()
+                .expect("table write catalog checked above");
+            let expected_parts = job
+                .get_stage(output_stage)
+                .map(|stage| stage.tasks().len() as u32)
+                .filter(|count| *count > 0)
+                .ok_or_else(|| error::VeinError::internal("WRITE output stage has no tasks"))?;
+            let prepared = table_write_catalog
+                .prepare_table_write(
+                    write_id.clone(),
+                    DistributedTableId::from(target.clone()),
+                    mode,
+                    expected_parts,
+                )
+                .await?;
             let dispatcher = self.scheduler.dispatcher().clone();
             let _result_stream = dispatcher.open_result_stream(query_id);
             let execution_result = self
@@ -247,7 +376,59 @@ impl QueryEngine for DistributedCoordinator {
                 .execute(job, common::cancellation::CancellationToken::new())
                 .await;
             dispatcher.close_result_stream(query_id);
-            let completion = execution_result?;
+            let completion = match execution_result {
+                Ok(completion) => completion,
+                Err(error) => {
+                    let _ = table_write_catalog
+                        .abort_table_write(prepared.write_id.clone())
+                        .await;
+                    return Err(error);
+                }
+            };
+
+            let vfs_store = vfs::VfsTableStore::shared_or_default()
+                .map_err(|error| error::VeinError::internal(error.to_string()))?;
+            let staging_id = vfs::VfsTableStore::resolve_table_id(&staging_table);
+            let staged_parts = vfs_store
+                .resolve_table_parts(staging_id)
+                .await
+                .map_err(|error| error::VeinError::internal(error.to_string()))?;
+            if staged_parts.len() != expected_parts as usize {
+                let _ = table_write_catalog
+                    .abort_table_write(prepared.write_id.clone())
+                    .await;
+                return Err(error::VeinError::internal(format!(
+                    "WRITE produced {} staged partitions, expected {}",
+                    staged_parts.len(),
+                    expected_parts
+                )));
+            }
+
+            for part_id in &staged_parts {
+                let row_count = vfs_store
+                    .open_partition_reader(staging_id, *part_id)
+                    .await
+                    .map_err(|error| error::VeinError::internal(error.to_string()))?
+                    .total_rows();
+                table_write_catalog
+                    .publish_table_write_part(
+                        prepared.write_id.clone(),
+                        TableWritePart {
+                            partition_id: *part_id,
+                            artifact: DistributedArtifactRef {
+                                id: DistributedArtifactId::from(format!(
+                                    "{}:part:{}",
+                                    prepared.write_id, part_id
+                                )),
+                                uri: format!("vfs://{staging_table}/part_{part_id:06}"),
+                                checksum: format!("{}:{part_id}", prepared.generation),
+                                size_bytes: 0,
+                            },
+                            row_count,
+                        },
+                    )
+                    .await?;
+            }
 
             let location = if target.starts_with('/')
                 || target.starts_with("./")
@@ -258,12 +439,38 @@ impl QueryEngine for DistributedCoordinator {
             } else {
                 format!("vfs://{target}")
             };
-            if let Some(catalog) = self.binder.catalog() {
-                let metadata = plan::TableMetadata::new(&target, Arc::new((*schema).clone()))
-                    .with_location(location)
-                    .with_format(plan::TableFormat::Exo);
-                let _ = catalog.register_table(metadata).await;
-            }
+            let metadata = plan::TableMetadata::new(&target, Arc::new((*schema).clone()))
+                .with_location(location)
+                .with_format(plan::TableFormat::Exo);
+            let publication = vfs_store
+                .publish_staged_table(
+                    &staging_table,
+                    &target,
+                    mode == TableWriteMode::Overwrite,
+                )
+                .await
+                .map_err(|error| error::VeinError::internal(error.to_string()))?;
+            let schema_fingerprint = metadata
+                .schema
+                .fields
+                .iter()
+                .map(|field| format!("{}:{:?}", field.name, field.data_type))
+                .collect::<Vec<_>>()
+                .join("|");
+            let snapshot = DistributedTableSnapshot {
+                id: DistributedSnapshotId::from(format!("{}@{}", target, prepared.generation)),
+                manifest: DistributedArtifactRef {
+                    id: DistributedArtifactId::from(format!("{}:manifest", prepared.write_id)),
+                    uri: format!("vfs://tbl_{}/generation/{}", publication.table_id, prepared.generation),
+                    checksum: schema_fingerprint.clone(),
+                    size_bytes: publication.extent_count as u64,
+                },
+                schema_fingerprint,
+                metadata_payload: vcs::state::encode_table_metadata(&metadata)?,
+            };
+            table_write_catalog
+                .commit_table_write(prepared.write_id, snapshot)
+                .await?;
             return Ok(QueryOutput::Write {
                 table: target,
                 row_count: completion.row_count,
@@ -294,7 +501,7 @@ mod tests {
     use vcs::InMemoryCatalog;
 
     /// Builds a fully-wired coordinator over a specified catalog.
-    fn coordinator_with_catalog(catalog: Arc<dyn vcs::TableCatalog>) -> DistributedCoordinator {
+    fn coordinator_with_catalog(catalog: Arc<dyn vcs::CatalogReader>) -> DistributedCoordinator {
         DistributedCoordinator::builder()
             .with_binder(Arc::new(QueryBinder::new(
                 catalog,
@@ -510,6 +717,7 @@ mod tests {
             .certificates(&cert, &key)
             .workers(2)
             .master("127.0.0.1:9180")
+            .local_development()
             .build()
             .expect("executor daemon should build");
 
@@ -602,12 +810,14 @@ mod tests {
             Duration::from_secs(10),
         ));
 
+        let catalog = Arc::new(InMemoryCatalog::new());
         let coordinator = Arc::new(
             DistributedCoordinator::builder()
                 .with_binder(Arc::new(QueryBinder::new(
-                    Arc::new(InMemoryCatalog::new()),
+                    catalog.clone(),
                     Arc::new(MockFunctionRegistry::new()),
                 )))
+                .with_catalog_writer(catalog)
                 .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
                 .with_planner(Arc::new(DefaultPhysicalPlanner::new()))
                 .with_scheduler(scheduler)
@@ -709,6 +919,7 @@ mod tests {
             .certificates(&cert, &key)
             .workers(2)
             .master("127.0.0.1:9190")
+            .local_development()
             .build()
             .expect("executor daemon should build");
 
@@ -751,6 +962,7 @@ mod tests {
                     catalog.clone(),
                     Arc::new(MockFunctionRegistry::new()),
                 )))
+                .with_catalog_writer(catalog)
                 .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
                 .with_planner(Arc::new(DefaultPhysicalPlanner::new()))
                 .with_scheduler(scheduler)
