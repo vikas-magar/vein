@@ -10,7 +10,8 @@ use distributed::{
     TableSnapshot as DistributedTableSnapshot, TableWriteMode, WriteId,
 };
 use optimizer::Optimizer;
-use parser::ast::query::QueryNode;
+use parser::ast::pipe_op::PipeOperator;
+use parser::ast::query::{Query, QueryNode, TableSource};
 use physical::PhysicalPlanner;
 use plan::LogicalPlan;
 use plan::display;
@@ -225,6 +226,68 @@ impl DistributedCoordinator {
     }
 }
 
+fn collect_external_sources<'a>(node: &QueryNode<'a>, sources: &mut Vec<&'a str>) {
+    match node {
+        QueryNode::Plain { query } => {
+            collect_external_sources_in_query(query, sources);
+        }
+        QueryNode::Explain { query } => {
+            collect_external_sources_in_query(query, sources);
+        }
+    }
+}
+
+fn collect_external_sources_in_query<'a>(query: &Query<'a>, sources: &mut Vec<&'a str>) {
+    if let TableSource::ObjectStore { url, .. } = &query.source {
+        sources.push(url);
+    }
+
+    if let TableSource::Subquery { query, .. } = &query.source {
+        collect_external_sources_in_query(query, sources);
+    }
+
+    for pipe in &query.pipes {
+        match pipe {
+            PipeOperator::Join { join } => {
+                collect_external_sources_in_query(&join.right, sources);
+            }
+            PipeOperator::SetOp { right, .. } => {
+                collect_external_sources_in_query(right, sources);
+            }
+            PipeOperator::With { ctes } => {
+                for cte in ctes {
+                    collect_external_sources_in_query(&cte.query, sources);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn register_external_sources(
+    node: &QueryNode<'_>,
+    writer: Option<&Arc<dyn vcs::CatalogWriter>>,
+) -> Result<()> {
+    let mut sources = Vec::new();
+    collect_external_sources(node, &mut sources);
+
+    if sources.is_empty() {
+        return Ok(());
+    }
+
+    let writer = writer.ok_or_else(|| {
+        error::VeinError::internal(
+            "external source registration requires an authoritative catalog writer",
+        )
+    })?;
+
+    for source in sources {
+        writer.register_external_source(source).await?;
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl QueryEngine for DistributedCoordinator {
     fn registry(&self) -> Option<Arc<orchestrator::executor::ExecutorRegistry>> {
@@ -244,6 +307,9 @@ impl QueryEngine for DistributedCoordinator {
             event = "query_lifecycle_started",
             "query_lifecycle_started"
         );
+        tracing::debug!(target: "vein_coordinator", "Registering external sources in the authoritative catalog");
+        register_external_sources(&node, self.catalog_writer.as_ref()).await?;
+
         tracing::debug!(target: "vein_coordinator", "Binding SQL AST to semantic logical plan");
         let bound_query = self.binder.bind_with_catalog_revision(&node).await?;
         let logical_plan = bound_query.plan;
@@ -425,6 +491,8 @@ impl QueryEngine for DistributedCoordinator {
                 .join("|");
             let snapshot = DistributedTableSnapshot {
                 id: DistributedSnapshotId::from(format!("{}@{}", target, prepared.generation)),
+                table_name: target.clone(),
+                schema_version: 1,
                 manifest: DistributedArtifactRef {
                     id: DistributedArtifactId::from(format!("{}:manifest", prepared.write_id)),
                     uri: format!("vfs://{staging_table}/generation/{}", prepared.generation),
@@ -432,7 +500,7 @@ impl QueryEngine for DistributedCoordinator {
                     size_bytes: published_bytes,
                 },
                 schema_fingerprint,
-                metadata_payload: vcs::state::encode_table_metadata(&metadata)?,
+                metadata_payload: vcs::encode_table_metadata(&metadata)?,
             };
             table_write_catalog
                 .commit_table_write(prepared.write_id, snapshot)
@@ -485,12 +553,13 @@ mod tests {
     }
 
     /// Builds a fully-wired coordinator over a specified catalog.
-    fn coordinator_with_catalog(catalog: Arc<dyn vcs::CatalogReader>) -> DistributedCoordinator {
+    fn coordinator_with_catalog(catalog: Arc<InMemoryCatalog>) -> DistributedCoordinator {
         DistributedCoordinator::builder()
             .with_binder(Arc::new(QueryBinder::new(
-                catalog,
+                catalog.clone(),
                 Arc::new(MockFunctionRegistry::new()),
             )))
+            .with_catalog_writer(catalog)
             .with_optimizer(Arc::new(optimizer::OptimizerPipeline::production()))
             .with_planner(Arc::new(DefaultPhysicalPlanner::new()))
             .with_scheduler(Arc::new(Scheduler::new(
@@ -657,8 +726,19 @@ mod tests {
     /// through that stream so callers can consume one uniform result protocol.
     #[tokio::test]
     async fn plain_query_reports_scheduler_error_through_stream() {
-        let engine = coordinator();
-        let node = Parser::new("FROM 'users' WITH (format = 'parquet') |> SELECT id, name")
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let users = catalog.get_table("users").await.expect("users fixture");
+        catalog
+            .register_table_entry(
+                "users",
+                users.schema.clone(),
+                None,
+                Some("parquet".to_string()),
+            )
+            .await
+            .expect("users metadata should be registered");
+        let engine = coordinator_with_catalog(catalog);
+        let node = Parser::new("FROM users |> SELECT id, name")
             .parse_statement()
             .expect("query should parse");
         let QueryOutput::Data { mut stream, .. } = engine

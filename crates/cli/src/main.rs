@@ -82,6 +82,9 @@ enum Commands {
         cert: String,
         #[arg(short, long, default_value = "certs/server.key")]
         key: String,
+        /// Remote Raft-backed VCS metadata authority.
+        #[arg(long, default_value = "127.0.0.1:9090")]
+        vcs: String,
         #[arg(short, long, default_value_t = 4)]
         workers: usize,
     },
@@ -128,24 +131,10 @@ async fn build_default_coordinator(
             .build()
             .map_err(|e| format!("Failed to build DistributedCoordinator: {e}"))?
     } else {
-        let warehouse = std::env::var("VEIN_CATALOG_WAREHOUSE")
-            .unwrap_or_else(|_| "file://./vein_data/vcs-warehouse".to_string());
-        let catalog = Arc::new(
-            vcs::VcsCatalog::new("vein", warehouse, vcs::storage::StorageConfig::LocalFs)
-                .await
-                .map_err(|error| format!("Failed to initialize local VCS catalog: {error}"))?,
+        return Err(
+            "A remote Raft-backed VCS endpoint is required; start the VCS service and pass --vcs"
+                .to_string(),
         );
-        engine::DistributedCoordinator::builder()
-            .with_binder(Arc::new(binder::QueryBinder::new(
-                catalog.clone(),
-                Arc::new(binder::testing::MockFunctionRegistry::new()),
-            )))
-            .with_catalog_writer(catalog)
-            .with_optimizer(optimizer)
-            .with_planner(planner)
-            .with_scheduler(scheduler)
-            .build()
-            .map_err(|e| format!("Failed to build DistributedCoordinator: {e}"))?
     };
 
     Ok(Arc::new(coordinator))
@@ -178,8 +167,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cluster_name: "vein-vcs".to_string(),
                     ..Default::default()
                 }
-                    .validate()
-                    .map_err(|e| format!("Invalid VCS Raft configuration: {e}"))?,
+                .validate()
+                .map_err(|e| format!("Invalid VCS Raft configuration: {e}"))?,
             );
             let raft_client = Arc::new(common::transport::QuicClient::new(
                 common::transport::build_quic_client(&cert)?,
@@ -189,21 +178,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let raft_view_storage = raft_storage.clone();
             let raft =
                 Arc::new(start_raft_node(raft_id, raft_config, raft_network, raft_storage).await?);
-            if raft_bootstrap {
+            let raft_initialized = raft.is_initialized().await?;
+            if raft_bootstrap && !raft_initialized {
                 let mut members = BTreeMap::new();
                 members.insert(raft_id, BasicNode::new(advertise));
                 raft.initialize(members).await?;
+                info!(
+                    target: "vein.audit",
+                    raft_id,
+                    "Raft cluster bootstrapped"
+                );
+            } else if raft_bootstrap && raft_initialized {
+                info!(
+                    target: "vein.audit",
+                    raft_id,
+                    "Raft cluster already initialized; skipping bootstrap"
+                );
+            } else if !raft_initialized {
+                return Err("Raft state is uninitialized; start once with --raft-bootstrap".into());
             }
             let writer = Arc::new(OpenRaftMetadataWriter::new(raft.clone(), raft_view_storage));
-            let catalog = Arc::new(
-                vcs::VcsCatalog::new_with_metadata_writer(
-                    "vein",
-                    warehouse,
-                    vcs::storage::StorageConfig::LocalFs,
-                    writer,
-                )
-                .await?,
-            );
+            let catalog = Arc::new(vcs::VcsCatalog::new(writer).await?);
             let raft_handler = Arc::new(OpenRaftRpcHandler::new(raft));
             vcs::VcsExchangeServer::new(catalog.shared_exchange_catalog())
                 .with_raft_rpc_handler(raft_handler)
@@ -271,6 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             executor_bind,
             cert,
             key,
+            vcs,
             workers,
         } => {
             info!(
@@ -287,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .parse()
                 .map_err(|e| format!("Invalid executor bind address '{executor_bind}': {e}"))?;
 
-            let coordinator = build_default_coordinator(None, &cert).await?;
+            let coordinator = build_default_coordinator(Some(&vcs), &cert).await?;
             let master_daemon = daemon::MasterDaemon::new(coordinator);
             let cert_m = cert.clone();
             let key_m = key.clone();

@@ -102,6 +102,11 @@ pub enum VcsCatalogRequest {
         /// User-visible or canonical table name.
         name: String,
     },
+    /// Discover and register an external source before planning.
+    RegisterExternalSource {
+        /// Filesystem or cloud source URI.
+        source: String,
+    },
     /// Validate that a planned table snapshot is still authoritative.
     ValidateSnapshot {
         /// Stable table and snapshot identity from the planning response.

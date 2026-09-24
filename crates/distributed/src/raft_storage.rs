@@ -667,9 +667,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receipts.len(), 2);
-        assert!(receipts
-            .iter()
-            .all(|receipt| receipt.command_fingerprint == "raft-internal-noop"));
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.command_fingerprint == "raft-internal-noop")
+        );
     }
 
     #[tokio::test]
@@ -683,6 +685,8 @@ mod tests {
             expected_revision: crate::CatalogRevision::INITIAL,
             snapshot: crate::TableSnapshot {
                 id: crate::SnapshotId::from("snapshot"),
+                table_name: "table".to_owned(),
+                schema_version: 1,
                 manifest: crate::ArtifactRef {
                     id: crate::ArtifactId::from("manifest"),
                     uri: "vfs://manifest".to_owned(),

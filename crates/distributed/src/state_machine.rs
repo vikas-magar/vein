@@ -27,6 +27,29 @@ impl MetadataStateMachine {
                     table_id, record.table_id
                 )));
             }
+            if state.table_names.get(&record.latest.table_name) != Some(table_id) {
+                return Err(DistributedError::InvalidSnapshot(format!(
+                    "table name '{}' does not resolve to '{}'",
+                    record.latest.table_name, table_id
+                )));
+            }
+            if record.latest.schema_version == 0
+                || record.latest.metadata_payload.is_empty()
+                || record.latest.schema_fingerprint.is_empty()
+            {
+                return Err(DistributedError::InvalidSnapshot(format!(
+                    "table '{}' has invalid snapshot metadata",
+                    record.latest.table_name
+                )));
+            }
+        }
+        for (name, table_id) in &state.table_names {
+            if !state.tables.contains_key(table_id) {
+                return Err(DistributedError::InvalidSnapshot(format!(
+                    "table name '{}' points to missing table '{}'",
+                    name, table_id
+                )));
+            }
         }
 
         for (write_id, intent) in &state.writes {
@@ -86,11 +109,18 @@ impl MetadataStateMachine {
             MetadataCommand::PublishTableSnapshot {
                 table_id, snapshot, ..
             } => {
-                if snapshot.metadata_payload.is_empty() {
+                if snapshot.table_name.is_empty()
+                    || snapshot.schema_version == 0
+                    || snapshot.schema_fingerprint.is_empty()
+                    || snapshot.metadata_payload.is_empty()
+                {
                     return Err(DistributedError::InvalidCommand(
-                        "table snapshot is missing complete metadata".to_owned(),
+                        "table snapshot is missing stable identity or complete metadata".to_owned(),
                     ));
                 }
+                self.state
+                    .table_names
+                    .insert(snapshot.table_name.clone(), table_id.clone());
                 self.state.tables.insert(
                     table_id.clone(),
                     TableRecord {
@@ -120,9 +150,7 @@ impl MetadataStateMachine {
                 }
                 self.state.writes.insert(intent.write_id.clone(), intent);
             }
-            MetadataCommand::PublishTableWritePart {
-                write_id, part, ..
-            } => {
+            MetadataCommand::PublishTableWritePart { write_id, part, .. } => {
                 let intent = self.state.writes.get_mut(&write_id).ok_or_else(|| {
                     DistributedError::InvalidCommand("table write intent not found".to_owned())
                 })?;
@@ -155,13 +183,21 @@ impl MetadataStateMachine {
                         "table write is incomplete or not prepared".to_owned(),
                     ));
                 }
-                if snapshot.metadata_payload.is_empty() {
+                if snapshot.table_name.is_empty()
+                    || snapshot.schema_version == 0
+                    || snapshot.schema_fingerprint.is_empty()
+                    || snapshot.metadata_payload.is_empty()
+                {
                     return Err(DistributedError::InvalidCommand(
-                        "table write snapshot is missing complete metadata".to_owned(),
+                        "table write snapshot is missing stable identity or complete metadata"
+                            .to_owned(),
                     ));
                 }
                 let table_id = intent.table_id.clone();
                 intent.state = TableWriteState::Committed;
+                self.state
+                    .table_names
+                    .insert(snapshot.table_name.clone(), table_id.clone());
                 self.state.tables.insert(
                     table_id.clone(),
                     TableRecord {
@@ -295,8 +331,8 @@ impl MetadataStateMachine {
 mod tests {
     use super::*;
     use crate::{
-        ArtifactId, ArtifactRef, CatalogRevision, SnapshotId, TableId, TableSnapshot, TableWriteIntent,
-        TableWriteMode, TableWritePart, TableWriteState, TransactionId, WriteId,
+        ArtifactId, ArtifactRef, CatalogRevision, SnapshotId, TableId, TableSnapshot,
+        TableWriteIntent, TableWriteMode, TableWritePart, TableWriteState, TransactionId, WriteId,
     };
 
     fn command(
@@ -310,6 +346,8 @@ mod tests {
             expected_revision,
             snapshot: TableSnapshot {
                 id: SnapshotId::from(snapshot),
+                table_name: "orders".to_owned(),
+                schema_version: 1,
                 manifest: ArtifactRef {
                     id: ArtifactId::from(format!("manifest-{snapshot}")),
                     uri: format!("vfs://manifests/{snapshot}"),
@@ -352,6 +390,8 @@ mod tests {
     fn write_snapshot() -> TableSnapshot {
         TableSnapshot {
             id: SnapshotId::from("snapshot-write-1"),
+            table_name: "orders".to_owned(),
+            schema_version: 1,
             manifest: ArtifactRef {
                 id: ArtifactId::from("manifest-write-1"),
                 uri: "vfs://manifests/write-1".to_owned(),
@@ -478,7 +518,11 @@ mod tests {
             SnapshotId::from("snapshot-write-1")
         );
         assert_eq!(
-            state.state().write(&WriteId::from("write-1")).unwrap().state,
+            state
+                .state()
+                .write(&WriteId::from("write-1"))
+                .unwrap()
+                .state,
             TableWriteState::Committed
         );
     }
@@ -502,7 +546,11 @@ mod tests {
 
         assert!(state.state().table(&TableId::from("orders")).is_none());
         assert_eq!(
-            state.state().write(&WriteId::from("write-2")).unwrap().state,
+            state
+                .state()
+                .write(&WriteId::from("write-2"))
+                .unwrap()
+                .state,
             TableWriteState::Aborted
         );
     }

@@ -5941,6 +5941,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "blake3",
  "bytes",
  "common",
  "distributed",
@@ -5948,7 +5949,6 @@ dependencies = [
  "futures",
  "iceberg",
  "iceberg-storage-opendal",
- "moka",
  "opendal 0.45.1",
  "parquet 59.1.0",
  "plan",

@@ -35,12 +35,12 @@ pub trait CatalogReader: Send + Sync {
         name: &str,
     ) -> Result<Arc<crate::TableSnapshot>> {
         let metadata = self.resolve_table(session, name).await?;
-        Ok(session
-            .table(name)
-            .unwrap_or_else(|| Arc::new(crate::TableSnapshot::from_metadata(
+        Ok(session.table(name).unwrap_or_else(|| {
+            Arc::new(crate::TableSnapshot::from_metadata(
                 metadata,
                 session.catalog_revision.clone(),
-            ))))
+            ))
+        }))
     }
 
     /// Validates a planned snapshot against the authoritative catalog.
@@ -65,6 +65,25 @@ pub trait CatalogReader: Send + Sync {
 pub trait CatalogWriter: CatalogReader {
     /// Publishes a table metadata entry at the current revision.
     async fn register_table(&self, metadata: TableMetadata) -> Result<()>;
+
+    /// Discovers and explicitly registers an external source.
+    ///
+    /// External source discovery is an ingestion operation. It is never part of
+    /// ordinary table lookup, so every successful result has a VCS revision.
+    async fn register_external_source(&self, source: &str) -> Result<Arc<TableMetadata>> {
+        let mut session = self.begin_planning_session().await?;
+        if let Ok(metadata) = self.resolve_table(&mut session, source).await {
+            return Ok(metadata);
+        }
+
+        let discovered = crate::discovery::resolve_source(source).await?;
+        let metadata = TableMetadata::new(discovered.name, discovered.schema)
+            .with_location(discovered.location)
+            .with_format(plan::TableFormat::from(discovered.format.as_str()))
+            .with_files(discovered.files);
+        self.register_table(metadata.clone()).await?;
+        Ok(Arc::new(metadata))
+    }
 
     /// Publishes a table metadata entry against an expected revision.
     async fn register_table_at(

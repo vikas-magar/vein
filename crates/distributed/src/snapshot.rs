@@ -18,6 +18,8 @@ pub struct ArtifactRef {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TableSnapshot {
     pub id: SnapshotId,
+    pub table_name: String,
+    pub schema_version: u64,
     pub manifest: ArtifactRef,
     pub schema_fingerprint: String,
     /// Canonical serialized complete table metadata owned by VCS.
@@ -42,6 +44,7 @@ pub struct CommitReceipt {
 pub struct CatalogView {
     pub revision: CatalogRevision,
     pub tables: BTreeMap<TableId, TableRecord>,
+    pub table_names: BTreeMap<String, TableId>,
     pub exchanges: BTreeMap<String, ExchangeManifest>,
     pub spills: BTreeMap<String, SpillRun>,
     pub writes: BTreeMap<WriteId, TableWriteIntent>,

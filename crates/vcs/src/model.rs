@@ -127,11 +127,28 @@ pub struct TableSnapshot {
     pub capabilities: BTreeSet<TableCapability>,
 }
 
+/// Returns the deterministic stable identity for table metadata.
+pub(crate) fn stable_table_identity(metadata: &TableMetadata) -> String {
+    let identity = metadata.location.as_deref().unwrap_or(&metadata.name);
+    format!("table:{}", blake3::hash(identity.as_bytes()).to_hex())
+}
+
+/// Returns the canonical schema fingerprint for table metadata.
+pub(crate) fn schema_fingerprint(metadata: &TableMetadata) -> String {
+    metadata
+        .schema
+        .fields
+        .iter()
+        .map(|field| format!("{}:{:?}", field.name, field.data_type))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 impl TableSnapshot {
     /// Builds a stable planning snapshot from authoritative table metadata.
     pub fn from_metadata(metadata: Arc<TableMetadata>, catalog_revision: CatalogRevision) -> Self {
         let table_name = metadata.name.clone();
-        let table_id = TableId::new(format!("table:{table_name}"));
+        let table_id = TableId::new(stable_table_identity(&metadata));
         let snapshot_id = SnapshotId::new(format!("{}:{table_name}", catalog_revision.as_str()));
         let mut capabilities = BTreeSet::from([
             TableCapability::SnapshotRead,
@@ -277,5 +294,40 @@ mod tests {
             session.insert(snapshot),
             Err(PlanningSessionError::RevisionMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn stable_identity_uses_location_not_display_name() {
+        let first = TableMetadata::new("orders", Arc::new(plan::VeinSchema::empty()))
+            .with_location("vfs://warehouse/orders");
+        let second = TableMetadata::new("renamed_orders", Arc::new(plan::VeinSchema::empty()))
+            .with_location("vfs://warehouse/orders");
+
+        assert_eq!(
+            stable_table_identity(&first),
+            stable_table_identity(&second)
+        );
+        assert_ne!(
+            stable_table_identity(&first),
+            stable_table_identity(
+                &TableMetadata::new("orders", Arc::new(plan::VeinSchema::empty()))
+                    .with_location("vfs://warehouse/customers")
+            )
+        );
+    }
+
+    #[test]
+    fn snapshot_uses_stable_identity() {
+        let metadata = Arc::new(
+            TableMetadata::new("orders", Arc::new(plan::VeinSchema::empty()))
+                .with_location("vfs://warehouse/orders"),
+        );
+        let snapshot = TableSnapshot::from_metadata(metadata, CatalogRevision::new("7"));
+
+        assert_eq!(
+            snapshot.table_id.as_str(),
+            stable_table_identity(&snapshot.metadata)
+        );
+        assert_eq!(snapshot.schema_version.value(), 1);
     }
 }

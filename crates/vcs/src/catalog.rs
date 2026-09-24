@@ -70,7 +70,11 @@ pub trait TableCatalog: Send + Sync {
         session: &mut PlanningSession,
         name: &str,
     ) -> Result<Arc<TableMetadata>> {
-        Ok(self.resolve_table_snapshot(session, name).await?.metadata.clone())
+        Ok(self
+            .resolve_table_snapshot(session, name)
+            .await?
+            .metadata
+            .clone())
     }
 
     /// Resolves the complete authoritative snapshot used by physical planning.
@@ -311,24 +315,6 @@ impl TableCatalog for InMemoryCatalog {
                     return Ok(entry.clone());
                 }
             }
-        }
-
-        // Smart source discovery fallback
-        if let Ok(discovered) = crate::discovery::resolve_source(name).await {
-            let format: TableFormat = discovered.format.as_str().into();
-            let metadata = Arc::new(
-                TableMetadata::new(discovered.name, discovered.schema)
-                    .with_location(discovered.location)
-                    .with_format(format)
-                    .with_files(discovered.files),
-            );
-            if let Ok(mut tables) = self.tables.write() {
-                tables.insert(name.to_string(), metadata.clone());
-                if !tables.contains_key(base_name) {
-                    tables.insert(base_name.to_string(), metadata.clone());
-                }
-            }
-            return Ok(metadata);
         }
 
         Err(VeinError::not_found(format!(

@@ -106,6 +106,8 @@ mod tests {
             expected_revision: CatalogRevision::INITIAL,
             snapshot: TableSnapshot {
                 id: SnapshotId::from(snapshot),
+                table_name: "orders".to_owned(),
+                schema_version: 1,
                 manifest: ArtifactRef {
                     id: ArtifactId::from(format!("manifest-{snapshot}")),
                     uri: format!("vfs://manifests/{snapshot}"),

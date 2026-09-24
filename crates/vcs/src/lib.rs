@@ -1,7 +1,6 @@
 #![deny(missing_docs)]
 
-//! Vein Catalog Service: versioned metadata, scan planning, and the
-//! planner-facing catalog seam.
+//! Vein Catalog Service: versioned metadata and the planner-facing catalog seam.
 
 /// The planner-facing catalog seam and its in-memory implementation.
 pub mod catalog;
@@ -11,9 +10,6 @@ pub mod catalog_rpc;
 
 /// Remote catalog client for coordinators.
 pub mod catalog_client;
-
-/// Hot table metadata cache.
-pub mod cache;
 
 /// Broadcast events sent to Master nodes (snapshot changes, heartbeats).
 ///
@@ -29,12 +25,6 @@ pub mod exchange;
 /// QUIC exchange metadata service.
 pub mod rpc;
 
-/// Cache of pre-computed scan plans for warm query replays.
-pub mod plan_cache;
-
-/// Scan planning: translates predicates into file scan tasks.
-pub mod scan;
-
 /// Storage backend configuration and file IO construction.
 pub mod storage;
 
@@ -45,7 +35,7 @@ pub mod discovery;
 pub mod service;
 
 /// Durable revisioned table metadata state.
-pub mod state;
+mod state;
 
 /// Immutable catalog revisions and planning-session metadata.
 pub mod model;
@@ -59,13 +49,14 @@ pub use model::{
     CatalogRevision, PlanningSession, PlanningSessionError, SchemaVersion, SnapshotId,
     TableCapability, TableHandle, TableId, TableSnapshot,
 };
+
+use crate::model::{schema_fingerprint, stable_table_identity};
 pub use rpc::VcsExchangeServer;
 pub use service::{CatalogReader, CatalogWriter, TableWriteCatalog};
-pub use state::PersistentCatalogState;
 
-use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
+
+pub use state::{decode_table_metadata, encode_table_metadata};
 
 use async_trait::async_trait;
 use distributed::{
@@ -76,122 +67,49 @@ use distributed::{
     TransactionId as DistributedTransactionId, WriteId,
 };
 use error::{Result, VeinError};
-use iceberg::expr::Predicate;
-use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-
-use crate::cache::TableCache;
-use crate::plan_cache::{ScanPlan, ScanPlanCache};
-use crate::scan::plan_scan;
-use crate::state::{decode_table_metadata, encode_table_metadata};
-use crate::storage::{StorageConfig, build_file_io};
 
 /// The Vein Catalog Service.
 ///
-/// This is the authoritative catalog service for table identity, schemas, snapshots,
-/// and planner metadata. Iceberg is retained only as a format-specific physical
-/// adapter for manifest and file-scan operations; it is never used to resolve the
-/// visible table metadata.
+/// This is the authoritative Raft-backed catalog service for table identity, schemas,
+/// snapshots, and planner metadata. Iceberg is used only for storage I/O; it is never
+/// used to resolve or own visible table metadata.
 ///
 /// # Does NOT
 /// - Execute queries
 /// - Talk to Executor nodes directly
 /// - Know anything about QUIC routing or topology
-enum CatalogBackend {
-    Local,
-    Replicated(Arc<dyn ReplicatedMetadataWriter>),
-}
-
-/// VCS catalog service state and authority backend.
 pub struct VcsCatalog {
-    /// Iceberg adapter used only for format-specific manifest/scan operations.
-    /// VCS-owned metadata remains authoritative for table identity and schema.
-    iceberg_adapter: Arc<dyn Catalog>,
-    table_cache: TableCache,
-    plan_cache: ScanPlanCache,
-    catalog_state: Option<Arc<PersistentCatalogState>>,
+    writer: Arc<dyn ReplicatedMetadataWriter>,
     exchange_catalog: Arc<dyn ExchangeCatalog>,
-    backend: CatalogBackend,
 }
 
 #[async_trait]
 impl TableCatalog for VcsCatalog {
     async fn get_table(&self, name: &str) -> Result<Arc<plan::TableMetadata>> {
-        // A concrete path is an external source, not a logical VCS table name.
-        // Resolve its on-disk format before consulting any stale catalog entry.
-        if Path::new(name).exists() {
-            let discovered = crate::discovery::resolve_source(name).await?;
-            return Ok(Arc::new(
-                plan::TableMetadata::new(discovered.name, discovered.schema)
-                    .with_location(discovered.location)
-                    .with_format(plan::TableFormat::from(discovered.format.as_str()))
-                    .with_files(discovered.files),
-            ));
-        }
-
-        if let CatalogBackend::Replicated(writer) = &self.backend {
-            let view = writer
-                .read_view()
-                .await
-                .map_err(|error| VeinError::internal(error.to_string()))?;
-            let table_id = DistributedTableId::from(name.to_owned());
-            let record = view.table(&table_id).ok_or_else(|| {
-                VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
-            })?;
-            let metadata = decode_table_metadata(&record.latest.metadata_payload)?;
-            if metadata.name != name {
-                return Err(VeinError::internal(format!(
-                    "table metadata name '{}' does not match requested table '{}'",
-                    metadata.name, name
-                )));
-            }
-            let metadata = metadata.with_catalog_snapshot(
-                common::protocol::CatalogSnapshotToken::new(
-                    table_id.as_str(),
-                    view.revision.value().to_string(),
-                    record.latest.id.as_str(),
-                    1,
-                ),
-            );
-            return Ok(Arc::new(metadata));
-        }
-
-        let catalog_state = self.catalog_state.as_ref().ok_or_else(|| {
-            VeinError::internal("replicated catalog lookup did not resolve from the Raft view")
+        let view = self
+            .writer
+            .read_view()
+            .await
+            .map_err(|error| VeinError::internal(error.to_string()))?;
+        let table_id = view.table_names.get(name).cloned().ok_or_else(|| {
+            VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
         })?;
-        if let Some(metadata) = catalog_state.get(name).await {
-            let revision = catalog_state.revision().await;
-            let snapshot_id = format!("{}:{}", revision.as_str(), metadata.name);
-            let metadata = (*metadata).clone().with_catalog_snapshot(
-                common::protocol::CatalogSnapshotToken::new(
-                    metadata.name.clone(),
-                    revision.as_str(),
-                    snapshot_id,
-                    1,
-                ),
-            );
-            return Ok(Arc::new(metadata));
+        let record = view.table(&table_id).ok_or_else(|| {
+            VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
+        })?;
+        let metadata = decode_table_metadata(&record.latest.metadata_payload)?;
+        if metadata.name != name {
+            return Err(VeinError::internal(format!(
+                "table metadata name '{}' does not match requested table '{}'",
+                metadata.name, name
+            )));
         }
-
-        let discovered = crate::discovery::resolve_source(name).await?;
-        let metadata = plan::TableMetadata::new(discovered.name.clone(), discovered.schema)
-            .with_location(discovered.location)
-            .with_format(plan::TableFormat::from(discovered.format.as_str()))
-            .with_files(discovered.files);
-        let expected_revision = self.authoritative_revision().await?;
-        <Self as TableCatalog>::register_table_at(self, expected_revision, metadata.clone())
-            .await?;
-        let revision = self.authoritative_revision().await?;
-
-        tracing::info!(
-            target: "vein.audit",
-            event = "vcs_table_discovered",
-            table = %name,
-            format = ?metadata.format,
-            catalog_revision = %revision.as_str(),
-            "vcs_table_discovered"
-        );
-
+        let metadata = metadata.with_catalog_snapshot(common::protocol::CatalogSnapshotToken::new(
+            table_id.as_str(),
+            view.revision.value().to_string(),
+            record.latest.id.as_str(),
+            record.latest.schema_version,
+        ));
         Ok(Arc::new(metadata))
     }
 
@@ -214,18 +132,32 @@ impl TableCatalog for VcsCatalog {
         &self,
         token: &common::protocol::CatalogSnapshotToken,
     ) -> Result<()> {
-        let snapshot = self.resolve_table_snapshot(&token.table_id).await?;
-        if token.catalog_revision != snapshot.catalog_revision.as_str()
-            || token.snapshot_id != snapshot.snapshot_id.as_str()
-            || token.schema_version != snapshot.schema_version.value()
-        {
+        let view = self
+            .writer
+            .read_view()
+            .await
+            .map_err(|error| VeinError::internal(error.to_string()))?;
+        let record = view
+            .table(&DistributedTableId::from(token.table_id.clone()))
+            .ok_or_else(|| {
+                VeinError::not_found(format!(
+                    "Table identity '{}' is not registered in VCS Catalog",
+                    token.table_id
+                ))
+            })?;
+        let catalog_revision = view.revision.value().to_string();
+        let snapshot_id = record.latest.id.as_str().to_owned();
+        let schema_version = record.latest.schema_version;
+        if token.snapshot_id != snapshot_id || token.schema_version != schema_version {
             return Err(VeinError::internal(format!(
-                "stale table snapshot '{}': token revision '{}' snapshot '{}', current revision '{}' snapshot '{}'",
+                "stale table snapshot '{}': token revision '{}' snapshot '{}' schema version '{}', current revision '{}' snapshot '{}' schema version '{}'",
                 token.table_id,
                 token.catalog_revision,
                 token.snapshot_id,
-                snapshot.catalog_revision.as_str(),
-                snapshot.snapshot_id.as_str()
+                token.schema_version,
+                catalog_revision,
+                snapshot_id,
+                schema_version
             )));
         }
         Ok(())
@@ -248,24 +180,38 @@ impl TableCatalog for VcsCatalog {
         let table_name = metadata.name.clone();
         let schema_columns = metadata.schema.fields.len();
 
-        let revision = match &self.backend {
-            CatalogBackend::Replicated(writer) => writer
-                .propose(metadata_command(&expected_revision, &metadata)?)
-                .await
-                .map(|receipt| CatalogRevision::new(receipt.revision.value().to_string()))
-                .map_err(|error| VeinError::internal(error.to_string()))?,
-            CatalogBackend::Local => {
-                let catalog_state = self.catalog_state.as_ref().ok_or_else(|| {
-                    VeinError::internal("local catalog state is not initialized")
-                })?;
-                PersistentCatalogState::commit_table(
-                    catalog_state.as_ref(),
-                    &expected_revision,
-                    &metadata,
-                )
-                .await?
-            }
-        };
+        let view = self
+            .writer
+            .read_view()
+            .await
+            .map_err(|error| VeinError::internal(error.to_string()))?;
+        let table_id = view
+            .table_names
+            .get(&table_name)
+            .cloned()
+            .unwrap_or_else(|| DistributedTableId::from(stable_table_identity(&metadata)));
+        let fingerprint = schema_fingerprint(&metadata);
+        let schema_version = view
+            .table(&table_id)
+            .map(|record| {
+                if record.latest.schema_fingerprint == fingerprint {
+                    record.latest.schema_version
+                } else {
+                    record.latest.schema_version.saturating_add(1)
+                }
+            })
+            .unwrap_or(1);
+        let revision = self
+            .writer
+            .propose(metadata_command(
+                &expected_revision,
+                &metadata,
+                table_id,
+                schema_version,
+            )?)
+            .await
+            .map(|receipt| CatalogRevision::new(receipt.revision.value().to_string()))
+            .map_err(|error| VeinError::internal(error.to_string()))?;
 
         tracing::info!(
             target: "vein.audit",
@@ -289,7 +235,7 @@ impl TableWriteCatalog for VcsCatalog {
         mode: TableWriteMode,
         expected_parts: u32,
     ) -> Result<TableWriteIntent> {
-        let writer = self.replicated_writer()?;
+        let writer = &self.writer;
         let view = writer
             .read_view()
             .await
@@ -344,7 +290,7 @@ impl TableWriteCatalog for VcsCatalog {
         write_id: WriteId,
         part: TableWritePart,
     ) -> Result<distributed::CommitReceipt> {
-        let writer = self.replicated_writer()?;
+        let writer = &self.writer;
         let partition_id = part.partition_id;
         let row_count = part.row_count;
         let receipt = writer
@@ -376,7 +322,7 @@ impl TableWriteCatalog for VcsCatalog {
         write_id: WriteId,
         snapshot: DistributedTableSnapshot,
     ) -> Result<distributed::CommitReceipt> {
-        let writer = self.replicated_writer()?;
+        let writer = &self.writer;
         let view = writer
             .read_view()
             .await
@@ -404,7 +350,7 @@ impl TableWriteCatalog for VcsCatalog {
     }
 
     async fn abort_table_write(&self, write_id: WriteId) -> Result<distributed::CommitReceipt> {
-        let writer = self.replicated_writer()?;
+        let writer = &self.writer;
         let receipt = writer
             .propose(MetadataCommand::AbortTableWrite {
                 transaction_id: DistributedTransactionId::from(format!(
@@ -426,9 +372,52 @@ impl TableWriteCatalog for VcsCatalog {
     }
 }
 
+fn physical_manifest(
+    metadata: &plan::TableMetadata,
+    revision: u64,
+) -> Result<DistributedArtifactRef> {
+    let uri = metadata
+        .location
+        .clone()
+        .or_else(|| metadata.files.first().cloned())
+        .ok_or_else(|| {
+            VeinError::internal(format!(
+                "table '{}' has no physical location or data files",
+                metadata.name
+            ))
+        })?;
+    let descriptor = serde_json::to_vec(&(
+        &metadata.location,
+        &metadata.format,
+        &metadata.files,
+        &metadata.partition_columns,
+        &metadata.sort_order,
+        &metadata.statistics,
+    ))
+    .map_err(|error| {
+        VeinError::serialization(format!(
+            "failed to encode physical manifest for table '{}': {error}",
+            metadata.name
+        ))
+    })?;
+
+    Ok(DistributedArtifactRef {
+        id: DistributedArtifactId::from(format!("manifest:{}:{}", metadata.name, revision)),
+        uri,
+        checksum: blake3::hash(&descriptor).to_hex().to_string(),
+        size_bytes: metadata
+            .statistics
+            .as_ref()
+            .and_then(|statistics| statistics.total_bytes)
+            .unwrap_or(0),
+    })
+}
+
 fn metadata_command(
     expected_revision: &CatalogRevision,
     metadata: &plan::TableMetadata,
+    table_id: DistributedTableId,
+    schema_version: u64,
 ) -> Result<MetadataCommand> {
     let revision = expected_revision
         .as_str()
@@ -436,187 +425,44 @@ fn metadata_command(
         .map_err(|error| VeinError::internal(format!("invalid catalog revision: {error}")))?;
     let distributed_revision = DistributedCatalogRevision::new(revision);
     let transaction_id =
-        DistributedTransactionId::from(format!("table:{}:{}", metadata.name, revision));
-    let snapshot_id = DistributedSnapshotId::from(format!("{}@{}", metadata.name, revision));
-    let schema_fingerprint = metadata
-        .schema
-        .fields
-        .iter()
-        .map(|field| format!("{}:{:?}", field.name, field.data_type))
-        .collect::<Vec<_>>()
-        .join("|");
+        DistributedTransactionId::from(format!("table:{}:{}", table_id.as_str(), revision));
+    let snapshot_id = DistributedSnapshotId::from(format!("{}@{}", table_id.as_str(), revision));
 
     Ok(MetadataCommand::PublishTableSnapshot {
         transaction_id,
-        table_id: DistributedTableId::from(metadata.name.clone()),
+        table_id,
         expected_revision: distributed_revision,
         snapshot: DistributedTableSnapshot {
-            id: snapshot_id.clone(),
-            manifest: DistributedArtifactRef {
-                id: DistributedArtifactId::from(format!("catalog-{}", metadata.name)),
-                uri: format!("catalog://tables/{}", metadata.name),
-                checksum: schema_fingerprint.clone(),
-                size_bytes: 0,
-            },
-            schema_fingerprint,
+            id: snapshot_id,
+            table_name: metadata.name.clone(),
+            schema_version,
+            manifest: physical_manifest(metadata, revision)?,
+            schema_fingerprint: schema_fingerprint(metadata),
             metadata_payload: encode_table_metadata(metadata)?,
         },
     })
 }
 
-fn validate_adapter_request(
-    snapshot: &crate::model::TableSnapshot,
-    ident: &TableIdent,
-) -> Result<()> {
-    if snapshot.name != ident.name() {
-        return Err(VeinError::internal(format!(
-            "physical adapter table '{}' does not match VCS snapshot '{}'",
-            ident.name(),
-            snapshot.name
-        )));
-    }
-    if snapshot.metadata.format != Some(plan::TableFormat::Iceberg) {
-        return Err(VeinError::internal(format!(
-            "table '{}' is not registered with the Iceberg physical adapter",
-            snapshot.name
-        )));
-    }
-    Ok(())
-}
-
-fn table_state_path(warehouse: &str) -> String {
-    format!(
-        "{}/_vein/catalog/tables.json",
-        warehouse.trim_end_matches('/')
-    )
-}
-
-fn exchange_manifest_path(warehouse: &str) -> String {
-    format!(
-        "{}/_vein/exchanges/manifests.json",
-        warehouse.trim_end_matches('/')
-    )
-}
-
 impl VcsCatalog {
     async fn authoritative_revision(&self) -> Result<CatalogRevision> {
-        match &self.backend {
-            CatalogBackend::Local => Ok(self
-                .catalog_state
-                .as_ref()
-                .ok_or_else(|| VeinError::internal("local catalog state is not initialized"))?
-                .revision()
-                .await),
-            CatalogBackend::Replicated(writer) => {
-                let view = writer
-                    .read_view()
-                    .await
-                    .map_err(|error| VeinError::internal(error.to_string()))?;
-                Ok(CatalogRevision::new(view.revision.value().to_string()))
-            }
-        }
+        let view = self
+            .writer
+            .read_view()
+            .await
+            .map_err(|error| VeinError::internal(error.to_string()))?;
+        Ok(CatalogRevision::new(view.revision.value().to_string()))
     }
 
-    fn replicated_writer(&self) -> Result<&Arc<dyn ReplicatedMetadataWriter>> {
-        match &self.backend {
-            CatalogBackend::Replicated(writer) => Ok(writer),
-            CatalogBackend::Local => Err(VeinError::internal(
-                "replicated metadata writer is required for authoritative table writes",
-            )),
-        }
-    }
-
-    /// Create a new VcsCatalog with the given storage configuration.
-    ///
-    /// # Arguments
-    /// - `catalog_name`: A name for this catalog (e.g. "vein-prod")
-    /// - `warehouse_location`: The root path where Iceberg table metadata lives
-    /// - `storage`: Which storage backend to use (local FS or S3)
-    pub async fn new(
-        catalog_name: impl Into<String>,
-        warehouse_location: impl Into<String>,
-        storage: StorageConfig,
-    ) -> Result<Self> {
-        let file_io = build_file_io(&storage)?;
-        let warehouse = warehouse_location.into();
-        let exchange_manifest_path = exchange_manifest_path(&warehouse);
-        let exchange_catalog =
-            PersistentExchangeCatalog::open(file_io.clone(), exchange_manifest_path).await?;
-        Self::build(
-            catalog_name,
-            warehouse,
-            storage,
-            file_io,
-            Arc::new(exchange_catalog),
-            CatalogBackend::Local,
-        )
-        .await
-    }
-
-    /// Creates a VCS catalog whose exchange metadata is replicated through Raft.
-    pub async fn new_with_metadata_writer(
-        catalog_name: impl Into<String>,
-        warehouse_location: impl Into<String>,
-        storage: StorageConfig,
-        writer: Arc<dyn ReplicatedMetadataWriter>,
-    ) -> Result<Self> {
-        let file_io = build_file_io(&storage)?;
-        let warehouse = warehouse_location.into();
+    /// Creates a Raft-backed VCS catalog authority.
+    pub async fn new(writer: Arc<dyn ReplicatedMetadataWriter>) -> Result<Self> {
         let exchange_catalog = Arc::new(crate::exchange::ReplicatedExchangeCatalog::new(
             Arc::new(crate::exchange::InMemoryExchangeCatalog::default()),
             writer.clone(),
         ));
-        Self::build(
-            catalog_name,
-            warehouse,
-            storage,
-            file_io,
-            exchange_catalog,
-            CatalogBackend::Replicated(writer),
-        )
-        .await
-    }
-
-    async fn build(
-        catalog_name: impl Into<String>,
-        warehouse: String,
-        storage: StorageConfig,
-        file_io: iceberg::io::FileIO,
-        exchange_catalog: Arc<dyn ExchangeCatalog>,
-        backend: CatalogBackend,
-    ) -> Result<Self> {
-        let catalog_state = match &backend {
-            CatalogBackend::Local => Some(
-                PersistentCatalogState::open(file_io.clone(), table_state_path(&warehouse)).await?,
-            ),
-            CatalogBackend::Replicated(_) => None,
-        };
-
-        let factory: Arc<dyn iceberg::io::StorageFactory> = match &storage {
-            StorageConfig::LocalFs => Arc::new(iceberg::io::LocalFsStorageFactory),
-            StorageConfig::S3 { .. } => {
-                Arc::new(iceberg_storage_opendal::OpenDalStorageFactory::S3 {
-                    customized_credential_load: None,
-                })
-            }
-        };
-
-        let catalog = MemoryCatalogBuilder::default()
-            .with_storage_factory(factory)
-            .load(
-                catalog_name,
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
-            )
-            .await
-            .map_err(VeinError::Iceberg)?;
 
         Ok(Self {
-            iceberg_adapter: Arc::new(catalog),
-            table_cache: TableCache::new(),
-            plan_cache: ScanPlanCache::new(),
-            catalog_state,
+            writer,
             exchange_catalog,
-            backend,
         })
     }
 
@@ -680,10 +526,7 @@ impl VcsCatalog {
         let attempt = fragment.attempt;
         let row_count = fragment.row_count;
         let byte_len = fragment.byte_len;
-        let result = self
-            .exchange_catalog
-            .publish_fragment(key, fragment)
-            .await;
+        let result = self.exchange_catalog.publish_fragment(key, fragment).await;
         match &result {
             Ok(()) => tracing::info!(
                 target: "vein.audit",
@@ -747,24 +590,6 @@ impl VcsCatalog {
     // Catalog Management — used by VCS admin / ingestion pipeline
     // -------------------------------------------------------------------------
 
-    /// Register a new namespace in the catalog.
-    pub async fn create_namespace(&self, ns: &NamespaceIdent) -> Result<()> {
-        self.iceberg_adapter
-            .create_namespace(ns, HashMap::new())
-            .await
-            .map_err(VeinError::Iceberg)?;
-        Ok(())
-    }
-
-    /// Register a new table in the catalog.
-    pub async fn create_table(&self, ns: &NamespaceIdent, creation: TableCreation) -> Result<()> {
-        self.iceberg_adapter
-            .create_table(ns, creation)
-            .await
-            .map_err(VeinError::Iceberg)?;
-        Ok(())
-    }
-
     // -------------------------------------------------------------------------
     // Query Planning — called by Master node for every incoming query
     // -------------------------------------------------------------------------
@@ -785,134 +610,69 @@ impl VcsCatalog {
             session.catalog_revision.clone(),
         );
 
-        if let CatalogBackend::Replicated(writer) = &self.backend {
-            let view = writer
+        {
+            let view = self
+                .writer
                 .read_view()
                 .await
                 .map_err(|error| VeinError::internal(error.to_string()))?;
-            let record = view
-                .table(&DistributedTableId::from(name.to_owned()))
-                .ok_or_else(|| {
-                    VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
-                })?;
-            let metadata = if Path::new(name).exists() {
-                metadata.as_ref().clone()
-            } else {
-                decode_table_metadata(&record.latest.metadata_payload)?
-            };
+            let table_id = view.table_names.get(name).cloned().ok_or_else(|| {
+                VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
+            })?;
+            let record = view.table(&table_id).ok_or_else(|| {
+                VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
+            })?;
+            let metadata = decode_table_metadata(&record.latest.metadata_payload)?;
             if metadata.name != name {
                 return Err(VeinError::internal(format!(
                     "table snapshot metadata name '{}' does not match '{}'",
                     metadata.name, name
                 )));
             }
-            let metadata = metadata.with_catalog_snapshot(
-                common::protocol::CatalogSnapshotToken::new(
-                    name,
+            let metadata =
+                metadata.with_catalog_snapshot(common::protocol::CatalogSnapshotToken::new(
+                    table_id.as_str(),
                     view.revision.value().to_string(),
                     record.latest.id.as_str(),
-                    1,
-                ),
-            );
+                    record.latest.schema_version,
+                ));
+            snapshot.table_id = TableId::new(table_id.as_str());
             snapshot.snapshot_id = SnapshotId::new(record.latest.id.as_str());
+            snapshot.schema_version = SchemaVersion::new(record.latest.schema_version);
             snapshot.manifest_uri = Some(record.latest.manifest.uri.clone());
             snapshot.metadata = Arc::new(metadata);
         }
 
         Ok(Arc::new(snapshot))
     }
+}
 
-    async fn validate_snapshot_current(
-        &self,
-        snapshot: &crate::model::TableSnapshot,
-    ) -> Result<()> {
-        match &self.backend {
-            CatalogBackend::Local => {
-                let actual = self.authoritative_revision().await?;
-                if actual != snapshot.catalog_revision {
-                    return Err(VeinError::internal(format!(
-                        "stale table snapshot '{}': expected catalog revision '{}', actual '{}'",
-                        snapshot.name,
-                        snapshot.catalog_revision.as_str(),
-                        actual.as_str()
-                    )));
-                }
-            }
-            CatalogBackend::Replicated(writer) => {
-                let view = writer
-                    .read_view()
-                    .await
-                    .map_err(|error| VeinError::internal(error.to_string()))?;
-                let actual_revision = CatalogRevision::new(view.revision.value().to_string());
-                let record = view
-                    .table(&DistributedTableId::from(snapshot.name.clone()))
-                    .ok_or_else(|| {
-                        VeinError::not_found(format!(
-                            "Table '{}' is not registered in VCS Catalog",
-                            snapshot.name
-                        ))
-                    })?;
-                if actual_revision != snapshot.catalog_revision
-                    || record.latest.id.as_str() != snapshot.snapshot_id.as_str()
-                {
-                    return Err(VeinError::internal(format!(
-                        "stale table snapshot '{}': planned revision '{}' and snapshot '{}', actual revision '{}' and snapshot '{}'",
-                        snapshot.name,
-                        snapshot.catalog_revision.as_str(),
-                        snapshot.snapshot_id.as_str(),
-                        actual_revision.as_str(),
-                        record.latest.id
-                    )));
-                }
-            }
-        }
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_manifest_uses_real_location_and_content_checksum() {
+        let metadata = plan::TableMetadata::new("orders", Arc::new(plan::VeinSchema::empty()))
+            .with_location("vfs://tables/orders")
+            .with_files(vec!["vfs://tables/orders/part-0.exo".to_owned()]);
+
+        let manifest = physical_manifest(&metadata, 7).expect("manifest should be created");
+        assert_eq!(manifest.uri, "vfs://tables/orders");
+        assert_eq!(manifest.size_bytes, 0);
+        assert!(!manifest.checksum.is_empty());
+        assert_eq!(manifest.id.as_str(), "manifest:orders:7");
     }
 
-    /// Loads a physical table through the adapter using VCS-pinned metadata.
-    pub async fn load_table(
-        &self,
-        snapshot: &crate::model::TableSnapshot,
-        ident: &TableIdent,
-    ) -> Result<iceberg::table::Table> {
-        self.validate_snapshot_current(snapshot).await?;
-        validate_adapter_request(snapshot, ident)?;
-        let table = self
-            .table_cache
-            .get_or_load(ident, snapshot, &*self.iceberg_adapter)
-            .await?;
-        Ok((*table).clone())
-    }
+    #[test]
+    fn physical_manifest_rejects_metadata_without_physical_artifacts() {
+        let metadata = plan::TableMetadata::new("orders", Arc::new(plan::VeinSchema::empty()));
 
-    /// Resolves a scan plan for VCS-pinned metadata and an optional predicate.
-    pub async fn resolve_scan(
-        &self,
-        snapshot: &crate::model::TableSnapshot,
-        ident: &TableIdent,
-        columns: Option<Vec<String>>,
-        predicate: Option<Predicate>,
-    ) -> Result<ScanPlan> {
-        self.validate_snapshot_current(snapshot).await?;
-        validate_adapter_request(snapshot, ident)?;
-        let table = self
-            .table_cache
-            .get_or_load(ident, snapshot, &*self.iceberg_adapter)
-            .await?;
-        plan_scan(&table, columns, predicate, &self.plan_cache).await
-    }
-
-    // -------------------------------------------------------------------------
-    // Cache Invalidation — called when new data is ingested into a table
-    // -------------------------------------------------------------------------
-
-    /// Invalidate all cached state for a table.
-    ///
-    /// Call this when a new Iceberg snapshot is committed to the table.
-    /// After this call, the next `resolve_scan()` will re-read metadata from storage.
-    pub async fn invalidate_table(&self, ident: &TableIdent) {
-        self.table_cache.invalidate(ident).await;
-        self.plan_cache
-            .invalidate_table(ident.namespace().as_ref(), ident.name())
-            .await;
+        let error = physical_manifest(&metadata, 1).expect_err("manifest must require an artifact");
+        assert!(
+            error
+                .to_string()
+                .contains("no physical location or data files")
+        );
     }
 }

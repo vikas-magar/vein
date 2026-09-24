@@ -201,26 +201,7 @@ pub async fn bind_source<'a>(
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
-            let has_explicit_format = options
-                .iter()
-                .any(|(key, _)| key.eq_ignore_ascii_case("format"));
-
-            let table = if std::path::Path::new(url).exists() {
-                match vcs::discovery::resolve_source(url).await {
-                    Ok(source) => Ok(Arc::new(
-                        plan::TableMetadata::new(source.name, source.schema)
-                            .with_location(source.location)
-                            .with_format(plan::TableFormat::from(source.format.as_str()))
-                            .with_files(source.files),
-                    )),
-                    Err(discovery_error) => context
-                        .resolve_table(url)
-                        .await
-                        .map_err(|_| discovery_error),
-                }
-            } else {
-                context.resolve_table(url).await
-            };
+            let table = context.resolve_table(url).await;
 
             let (schema, files, detected_format) = match table {
                 Ok(tbl) => (
@@ -228,11 +209,17 @@ pub async fn bind_source<'a>(
                     tbl.files.clone(),
                     tbl.format.as_ref().map(|f| f.to_string()),
                 ),
-                Err(_error) if has_explicit_format && !std::path::Path::new(url).exists() => (
-                    Arc::new(VeinSchema { fields: vec![] }),
-                    vec![url.to_string()],
-                    None,
-                ),
+                Err(_error)
+                    if options
+                        .iter()
+                        .any(|(key, _)| key.eq_ignore_ascii_case("format")) =>
+                {
+                    (
+                        Arc::new(VeinSchema { fields: vec![] }),
+                        vec![url.to_string()],
+                        None,
+                    )
+                }
                 Err(error) => return Err(error),
             };
 

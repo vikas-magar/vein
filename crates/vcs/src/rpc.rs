@@ -272,6 +272,32 @@ async fn execute_catalog_request(
                     snapshot: token,
                 })
             }
+            VcsCatalogRequest::RegisterExternalSource { source } => {
+                let writer = writer
+                    .as_ref()
+                    .ok_or_else(|| VeinError::internal("VCS catalog writer is not configured"))?;
+                let metadata = writer.register_external_source(&source).await?;
+                let revision = writer.begin_planning_session().await?.catalog_revision;
+                let snapshot = writer
+                    .resolve_table_snapshot(
+                        &mut crate::PlanningSession::new(revision.clone()),
+                        &metadata.name,
+                    )
+                    .await?;
+                let payload = encode_payload(snapshot.metadata.as_ref(), "table metadata")
+                    .map_err(VeinError::serialization)?;
+                let token = common::protocol::CatalogSnapshotToken::new(
+                    snapshot.table_id.as_str(),
+                    snapshot.catalog_revision.as_str(),
+                    snapshot.snapshot_id.as_str(),
+                    snapshot.schema_version.value(),
+                );
+                Ok(VcsCatalogResponse::Table {
+                    revision: snapshot.catalog_revision.as_str().to_string(),
+                    metadata: payload,
+                    snapshot: token,
+                })
+            }
             VcsCatalogRequest::ValidateSnapshot { snapshot } => {
                 let reader = reader
                     .as_ref()

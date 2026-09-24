@@ -7,9 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    CatalogView, DistributedError, MetadataCommand, MetadataStateMachine, Result,
-};
+use crate::{CatalogView, DistributedError, MetadataCommand, MetadataStateMachine, Result};
 
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
@@ -136,13 +134,19 @@ mod tests {
         TableSnapshot, TransactionId,
     };
 
-    fn command(transaction: &str, snapshot: &str, expected_revision: CatalogRevision) -> MetadataCommand {
+    fn command(
+        transaction: &str,
+        snapshot: &str,
+        expected_revision: CatalogRevision,
+    ) -> MetadataCommand {
         MetadataCommand::PublishTableSnapshot {
             transaction_id: TransactionId::from(transaction),
             table_id: TableId::from("orders"),
             expected_revision,
             snapshot: TableSnapshot {
                 id: SnapshotId::from(snapshot),
+                table_name: "orders".to_owned(),
+                schema_version: 1,
                 manifest: ArtifactRef {
                     id: ArtifactId::from(format!("manifest-{snapshot}")),
                     uri: format!("vfs://manifests/{snapshot}"),
@@ -273,6 +277,8 @@ mod tests {
                 table_id: TableId::from("customers"),
                 latest: TableSnapshot {
                     id: SnapshotId::from("snapshot-1"),
+                    table_name: "orders".to_owned(),
+                    schema_version: 1,
                     manifest: ArtifactRef {
                         id: ArtifactId::from("manifest-1"),
                         uri: "vfs://manifests/snapshot-1".to_owned(),
@@ -280,7 +286,7 @@ mod tests {
                         size_bytes: 128,
                     },
                     schema_fingerprint: "schema-v1".to_owned(),
-                metadata_payload: vec![1],
+                    metadata_payload: vec![1],
                 },
             },
         );

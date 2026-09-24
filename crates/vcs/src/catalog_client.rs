@@ -123,10 +123,7 @@ impl CatalogReader for RemoteVcsCatalog {
         let metadata: Arc<TableMetadata> = Arc::new(
             decode_payload(&metadata, "table metadata").map_err(VeinError::serialization)?,
         );
-        let mut snapshot = crate::TableSnapshot::from_metadata(
-            metadata.clone(),
-            revision,
-        );
+        let mut snapshot = crate::TableSnapshot::from_metadata(metadata.clone(), revision);
         snapshot.table_id = crate::TableId::new(token.table_id.clone());
         snapshot.snapshot_id = crate::SnapshotId::new(token.snapshot_id.clone());
         snapshot.schema_version = crate::SchemaVersion::new(token.schema_version);
@@ -170,6 +167,22 @@ impl CatalogWriter for RemoteVcsCatalog {
     async fn register_table(&self, metadata: TableMetadata) -> Result<()> {
         let revision = self.begin_planning_session().await?.catalog_revision;
         self.register_table_at(&revision, metadata).await
+    }
+
+    async fn register_external_source(&self, source: &str) -> Result<Arc<TableMetadata>> {
+        match self
+            .request(VcsCatalogRequest::RegisterExternalSource {
+                source: source.to_owned(),
+            })
+            .await?
+        {
+            VcsCatalogResponse::Table { metadata, .. } => Ok(Arc::new(
+                decode_payload(&metadata, "table metadata").map_err(VeinError::serialization)?,
+            )),
+            _ => Err(VeinError::serialization(
+                "unexpected VCS external-source response",
+            )),
+        }
     }
 
     async fn register_table_at(
