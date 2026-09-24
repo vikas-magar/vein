@@ -143,7 +143,11 @@ mod tests {
     fn test_control_event_zero_copy_in_place() {
         let task_id = TaskId::new();
         let query_id = QueryId::new();
-        let event = VeinControlEvent::CancelTask { task_id, query_id };
+        let event = VeinControlEvent::CancelTask {
+            task_id,
+            query_id,
+            attempt: 3,
+        };
         let bytes = rkyv::to_bytes::<Error>(&event).expect("CancelTask serialization failed");
 
         let mut aligned = rkyv::util::AlignedVec::<16>::new();
@@ -156,9 +160,11 @@ mod tests {
             control::ArchivedVeinControlEvent::CancelTask {
                 task_id: archived_tid,
                 query_id: archived_qid,
+                attempt,
             } => {
                 assert_eq!(TaskId::from_raw(archived_tid.0.to_native()), task_id);
                 assert_eq!(QueryId::from_raw(archived_qid.0.to_native()), query_id);
+                assert_eq!(attempt.to_native(), 3);
             }
             _ => panic!("expected CancelTask"),
         }

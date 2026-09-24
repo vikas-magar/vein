@@ -199,6 +199,8 @@ pub enum VeinControlEvent {
         task_id: TaskId,
         /// Query the task belongs to.
         query_id: QueryId,
+        /// Retry attempt to cancel.
+        attempt: u32,
     },
     /// Explicitly drain a shuffle partition in VFS.
     ExplicitDrain {

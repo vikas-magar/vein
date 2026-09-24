@@ -18,7 +18,7 @@ use exo::{
 };
 
 use crate::block::{BlockKey, BlockManager, MmapBlockManager, PlaneType};
-use crate::metadata::{Extent, MetadataEngine, RedbMetadataEngine};
+use crate::metadata::{Extent, MetadataEngine, MetadataFileUpdate, RedbMetadataEngine};
 use crate::{Result, VfsConfig, VfsError};
 
 /// Summary returned upon committing a table partition directly into VFS blocks.
@@ -1413,11 +1413,11 @@ impl VfsTableStore {
         if schema_extents.is_empty() {
             return Err(VfsError::NotFound(schema_path));
         }
-        self.metadata_engine
-            .replace_file(&format!("tbl_{visible_id}/_schema.json"), schema_extents.clone())
-            .await?;
-
         let schema = self.read_table_schema(staging_id).await?;
+        let mut metadata_updates = vec![MetadataFileUpdate {
+            path: format!("tbl_{visible_id}/_schema.json"),
+            extents: schema_extents.clone(),
+        }];
         let mut aliased_extents = schema_extents.len();
         for part_id in &staged_parts {
             for field in &schema.fields {
@@ -1434,17 +1434,18 @@ impl VfsTableStore {
                         plane,
                     }
                     .to_canonical_path();
-                    let extents = self
-                        .metadata_engine
-                        .get_file(&source)
-                        .await
-                        .unwrap_or_default();
-                    if extents.is_empty() {
-                        let _ = self.metadata_engine.delete_file(&destination).await;
-                    } else {
+                    let extents = match self.metadata_engine.get_file(&source).await {
+                        Ok(extents) => extents,
+                        Err(VfsError::NotFound(_)) => Vec::new(),
+                        Err(error) => return Err(error),
+                    };
+                    if !extents.is_empty() {
                         aliased_extents += extents.len();
-                        self.metadata_engine.replace_file(&destination, extents).await?;
                     }
+                    metadata_updates.push(MetadataFileUpdate {
+                        path: destination,
+                        extents,
+                    });
                 }
             }
         }
@@ -1452,7 +1453,11 @@ impl VfsTableStore {
         let mut visible_parts = if overwrite {
             Vec::new()
         } else {
-            self.resolve_table_parts(visible_id).await.unwrap_or_default()
+            match self.resolve_table_parts(visible_id).await {
+                Ok(parts) => parts,
+                Err(VfsError::NotFound(_)) => Vec::new(),
+                Err(error) => return Err(error),
+            }
         };
         visible_parts.extend(staged_parts.iter().copied());
         visible_parts.sort_unstable();
@@ -1460,14 +1465,16 @@ impl VfsTableStore {
         let parts_json = serde_json::to_vec(&visible_parts)
             .map_err(|error| VfsError::Internal(format!("serialize visible partitions: {error}")))?;
         let parts_extents = self.block_manager.append(&parts_json).await?;
+        metadata_updates.push(MetadataFileUpdate {
+            path: format!("tbl_{visible_id}/_partitions.json"),
+            extents: parts_extents,
+        });
+        metadata_updates.push(MetadataFileUpdate {
+            path: format!("tbl_{visible_id}/_SUCCESS"),
+            extents: self.block_manager.append(b"OK").await?,
+        });
         self.metadata_engine
-            .replace_file(&format!("tbl_{visible_id}/_partitions.json"), parts_extents)
-            .await?;
-        self.metadata_engine
-            .replace_file(
-                &format!("tbl_{visible_id}/_SUCCESS"),
-                self.block_manager.append(b"OK").await?,
-            )
+            .replace_files_atomically(metadata_updates)
             .await?;
 
         let mut total_rows = 0;

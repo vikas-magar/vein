@@ -93,51 +93,82 @@ pub async fn execute_exo_scan_with_filter_and_stats(
     next: &mut dyn PipelineNode<DataChunk>,
     stats: &mut ExoScanStats,
 ) -> Result<()> {
-    let vfs_store = vfs::VfsTableStore::shared_or_default().ok();
-
     for path_str in paths {
-        // 1. Check if this is a native VFS table or URI (e.g. "vfs://tbl_1", "vfs://my_table", or table name)
-        let is_vfs_candidate = path_str.starts_with("vfs://") || !Path::new(path_str).exists();
-        if is_vfs_candidate {
-            if let Some(store) = &vfs_store {
-                let table_id = vfs::VfsTableStore::resolve_table_id(path_str);
-                let explicit_part = vfs::VfsTableStore::extract_part_id_from_uri(path_str);
-                let part_ids = match explicit_part {
-                    Some(pid) => vec![pid],
-                    None => {
-                        let parts = store.resolve_table_parts(table_id).await.unwrap_or_default();
-                        if parts.is_empty() {
-                            vec![0]
-                        } else {
-                            parts
-                        }
-                    }
-                };
+        // Existing local paths are scanned from their filesystem representation.
+        // Non-local references are catalog/VFS references and must not fall through
+        // to filesystem discovery when VFS resolution fails.
+        let is_local_path = !path_str.contains("://")
+            && tokio::fs::try_exists(path_str)
+                .await
+                .map_err(|error| {
+                    VeinError::io(format!("Failed to inspect EXO source '{path_str}'"), error)
+                })?;
+        let is_vfs_reference = path_str.starts_with("vfs://") || !is_local_path;
 
-                let mut scanned_any = false;
-                for part_id in part_ids {
-                    if scan_vfs_address_partition(store, table_id, part_id, projection, filter, next, stats).await? {
-                        scanned_any = true;
-                        continue;
-                    }
-                    if let Ok(part_reader) = store.open_partition_reader(table_id, part_id).await {
-                        tracing::info!(
-                            table_id = table_id,
-                            part_id = part_id,
-                            rows = part_reader.total_rows(),
-                            "Scanning native VFS memory-mapped block partition"
-                        );
-                        scan_part_reader_with_filter_and_stats(&part_reader, projection, filter, next, stats)?;
-                        scanned_any = true;
-                    }
-                }
-                if scanned_any {
+        if is_vfs_reference {
+            let store = vfs::VfsTableStore::shared_or_default()
+                .map_err(|error| VeinError::internal(format!("open VFS EXO source: {error}")))?;
+            let table_id = vfs::VfsTableStore::resolve_table_id(path_str);
+            let explicit_part = vfs::VfsTableStore::extract_part_id_from_uri(path_str);
+            let part_ids = match explicit_part {
+                Some(pid) => vec![pid],
+                None => store
+                    .resolve_table_parts(table_id)
+                    .await
+                    .map_err(|error| {
+                        VeinError::internal(format!(
+                            "resolve VFS EXO table '{path_str}' partitions: {error}"
+                        ))
+                    })?,
+            };
+
+            if part_ids.is_empty() {
+                return Err(VeinError::not_found(format!(
+                    "VFS EXO table '{path_str}' has no visible partitions"
+                )));
+            }
+
+            for part_id in part_ids {
+                if scan_vfs_address_partition(
+                    &store,
+                    table_id,
+                    part_id,
+                    projection,
+                    filter,
+                    next,
+                    stats,
+                )
+                .await?
+                {
                     continue;
                 }
+
+                let part_reader = store
+                    .open_partition_reader(table_id, part_id)
+                    .await
+                    .map_err(|error| {
+                        VeinError::internal(format!(
+                            "open VFS EXO table '{path_str}' partition {part_id}: {error}"
+                        ))
+                    })?;
+                tracing::info!(
+                    table_id = table_id,
+                    part_id = part_id,
+                    rows = part_reader.total_rows(),
+                    "Scanning native VFS memory-mapped block partition"
+                );
+                scan_part_reader_with_filter_and_stats(
+                    &part_reader,
+                    projection,
+                    filter,
+                    next,
+                    stats,
+                )?;
             }
+            continue;
         }
 
-        // 2. Legacy filesystem path scan (for filesystem folders containing .exo.addr files)
+        // Local filesystem path scan for folders containing .exo.addr files.
         let path = Path::new(path_str);
         let base_dir = resolve_part_dir(path)?;
 

@@ -20,6 +20,25 @@ use crate::traits::{TaskCompletion, TaskDispatcher};
 
 const DEFAULT_CERT_PATH: &str = "certs/server.crt";
 
+fn validate_result_identity(
+    event_task_id: TaskId,
+    event_query_id: QueryId,
+    event_attempt: u32,
+    expected_task_id: TaskId,
+    expected_query_id: QueryId,
+    expected_attempt: u32,
+) -> Result<(), VeinError> {
+    if (event_task_id, event_query_id, event_attempt)
+        != (expected_task_id, expected_query_id, expected_attempt)
+    {
+        return Err(VeinError::internal(
+            "executor result identity does not match dispatched task",
+        ));
+    }
+
+    Ok(())
+}
+
 /// The QUIC Task Dispatcher.
 ///
 /// Responsible for serializing `ExecuteTask`s and streaming them to the appropriate
@@ -30,7 +49,7 @@ pub struct QuicTaskDispatcher {
     completions: Arc<
         Mutex<
             HashMap<
-                (QueryId, TaskId),
+                (QueryId, TaskId, u32),
                 tokio::sync::oneshot::Receiver<Result<TaskCompletion, VeinError>>,
             >,
         >,
@@ -179,7 +198,7 @@ impl TaskDispatcher for QuicTaskDispatcher {
                 .completions
                 .lock()
                 .map_err(|_| VeinError::internal("completions mutex poisoned"))?;
-            completions.insert((query_id, task_id), rx);
+            completions.insert((query_id, task_id, expected_attempt), rx);
         }
 
         let result_senders = self.result_senders.clone();
@@ -187,11 +206,24 @@ impl TaskDispatcher for QuicTaskDispatcher {
         tokio::spawn(async move {
             let mut frame_decoder = ControlFrameDecoder::new();
             let mut saw_frame = false;
+            let mut saw_start = false;
             let mut sequence = 0u64;
             let mut seen_sequences = HashSet::new();
+            let mut received_rows = 0u64;
             let mut response_bytes = 0u64;
 
-            while let Ok(Some(chunk)) = stream.receive().await {
+            loop {
+                let chunk = match stream.receive().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = tx.send(Err(VeinError::TaskFailed {
+                            task_id: task_id.to_string(),
+                            message: format!("executor result stream failed: {error}"),
+                        }));
+                        return;
+                    }
+                };
                 response_bytes += chunk.len() as u64;
                 let frames = match frame_decoder.push_chunk(&chunk) {
                     Ok(frames) => frames,
@@ -218,29 +250,62 @@ impl TaskDispatcher for QuicTaskDispatcher {
                     };
 
                     match archived {
-                        ArchivedVeinControlEvent::TaskResultStart { attempt, .. } => {
-                            if attempt.to_native() != expected_attempt {
-                                continue;
+                        ArchivedVeinControlEvent::TaskResultStart {
+                            task_id: event_task_id,
+                            query_id: event_query_id,
+                            attempt,
+                        } => {
+                            if let Err(error) = validate_result_identity(
+                                TaskId::from_raw(event_task_id.0.to_native()),
+                                QueryId::from_raw(event_query_id.0.to_native()),
+                                attempt.to_native(),
+                                task_id,
+                                query_id,
+                                expected_attempt,
+                            ) {
+                                let _ = tx.send(Err(error));
+                                return;
                             }
+                            if saw_start {
+                                let _ = tx
+                                    .send(Err(VeinError::internal("duplicate result start frame")));
+                                return;
+                            }
+                            saw_start = true;
                         }
                         ArchivedVeinControlEvent::TaskResultBatch {
+                            task_id: event_task_id,
+                            query_id: event_query_id,
                             result_bytes,
-
                             attempt,
                             sequence: frame_sequence,
                             ..
                         } => {
-                            if attempt.to_native() != expected_attempt {
-                                continue;
+                            if let Err(error) = validate_result_identity(
+                                TaskId::from_raw(event_task_id.0.to_native()),
+                                QueryId::from_raw(event_query_id.0.to_native()),
+                                attempt.to_native(),
+                                task_id,
+                                query_id,
+                                expected_attempt,
+                            ) {
+                                let _ = tx.send(Err(error));
+                                return;
+                            }
+                            if !saw_start {
+                                let _ = tx.send(Err(VeinError::internal(
+                                    "result batch arrived outside the result stream lifecycle",
+                                )));
+                                return;
                             }
                             let frame_sequence = frame_sequence.to_native();
                             if !seen_sequences.insert(frame_sequence) {
-                                continue;
+                                let _ = tx.send(Err(VeinError::internal(
+                                    "duplicate result batch sequence",
+                                )));
+                                return;
                             }
                             if frame_sequence != sequence {
-                                if frame_sequence < sequence {
-                                    continue;
-                                }
                                 let _ = tx.send(Err(VeinError::internal(
                                     "result batch sequence is not monotonic",
                                 )));
@@ -273,7 +338,13 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                     return;
                                 }
                             };
-                            let batch = batches.into_iter().next().expect("checked one batch");
+                            let Some(batch) = batches.into_iter().next() else {
+                                let _ = tx.send(Err(VeinError::internal(
+                                    "result batch decoder returned no record batch",
+                                )));
+                                return;
+                            };
+                            received_rows = received_rows.saturating_add(batch.num_rows() as u64);
                             let should_start = result_started
                                 .lock()
                                 .map(|mut started| started.insert(query_id))
@@ -309,14 +380,36 @@ impl TaskDispatcher for QuicTaskDispatcher {
                             sequence += 1;
                         }
                         ArchivedVeinControlEvent::TaskResultEnd {
+                            task_id: event_task_id,
+                            query_id: event_query_id,
                             row_count,
                             bytes_read,
                             duration_ns,
                             attempt,
-                            ..
                         } => {
-                            if attempt.to_native() != expected_attempt {
-                                continue;
+                            if let Err(error) = validate_result_identity(
+                                TaskId::from_raw(event_task_id.0.to_native()),
+                                QueryId::from_raw(event_query_id.0.to_native()),
+                                attempt.to_native(),
+                                task_id,
+                                query_id,
+                                expected_attempt,
+                            ) {
+                                let _ = tx.send(Err(error));
+                                return;
+                            }
+                            if !saw_start {
+                                let _ = tx.send(Err(VeinError::internal(
+                                    "result end arrived outside the result stream lifecycle",
+                                )));
+                                return;
+                            }
+                            let row_count = row_count.to_native();
+                            if received_rows != row_count {
+                                let _ = tx.send(Err(VeinError::internal(format!(
+                                    "result row count mismatch: received {received_rows}, declared {row_count}",
+                                ))));
+                                return;
                             }
                             tracing::info!(
                                 target: "vein.audit",
@@ -325,13 +418,13 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                 %query_id,
                                 %task_id,
                                 attempt = expected_attempt,
-                                rows = row_count.to_native(),
+                                rows = row_count,
                                 bytes_received = response_bytes,
                                 duration_ms = rpc_started.elapsed().as_millis() as u64,
                                 "rpc_task_result_received"
                             );
                             let _ = tx.send(Ok(TaskCompletion {
-                                row_count: row_count.to_native(),
+                                row_count,
                                 bytes_read: bytes_read.to_native(),
                                 duration_ns: duration_ns.to_native(),
                                 write_parts: Vec::new(),
@@ -339,6 +432,8 @@ impl TaskDispatcher for QuicTaskDispatcher {
                             return;
                         }
                         ArchivedVeinControlEvent::TaskCompleted {
+                            task_id: event_task_id,
+                            query_id: event_query_id,
                             row_count,
                             bytes_read,
                             duration_ns,
@@ -347,9 +442,20 @@ impl TaskDispatcher for QuicTaskDispatcher {
                             attempt,
                             ..
                         } => {
-                            if attempt.to_native() != expected_attempt {
-                                continue;
+                            if let Err(error) = validate_result_identity(
+                                TaskId::from_raw(event_task_id.0.to_native()),
+                                QueryId::from_raw(event_query_id.0.to_native()),
+                                attempt.to_native(),
+                                task_id,
+                                query_id,
+                                expected_attempt,
+                            ) {
+                                let _ = tx.send(Err(error));
+                                return;
                             }
+                            let has_result_bytes =
+                                matches!(&result_bytes, rkyv::option::ArchivedOption::Some(_));
+                            let mut decoded_rows = 0u64;
                             let sender = result_senders
                                 .lock()
                                 .ok()
@@ -372,6 +478,8 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                     }
                                 };
                                 for batch in batches {
+                                    decoded_rows =
+                                        decoded_rows.saturating_add(batch.num_rows() as u64);
                                     let should_start = result_started
                                         .lock()
                                         .map(|mut started| started.insert(query_id))
@@ -407,8 +515,15 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                     sequence += 1;
                                 }
                             }
+                            let declared_row_count = row_count.to_native();
+                            if has_result_bytes && decoded_rows != declared_row_count {
+                                let _ = tx.send(Err(VeinError::internal(format!(
+                                    "task result row count mismatch: decoded {decoded_rows}, declared {declared_row_count}",
+                                ))));
+                                return;
+                            }
                             let _ = tx.send(Ok(TaskCompletion {
-                                row_count: row_count.to_native(),
+                                row_count: declared_row_count,
                                 bytes_read: bytes_read.to_native(),
                                 duration_ns: duration_ns.to_native(),
                                 write_parts: write_parts
@@ -429,9 +544,22 @@ impl TaskDispatcher for QuicTaskDispatcher {
                             }));
                             return;
                         }
-                        ArchivedVeinControlEvent::TaskFailed { error, attempt, .. } => {
-                            if attempt.to_native() != expected_attempt {
-                                continue;
+                        ArchivedVeinControlEvent::TaskFailed {
+                            task_id: event_task_id,
+                            query_id: event_query_id,
+                            error,
+                            attempt,
+                        } => {
+                            if let Err(error) = validate_result_identity(
+                                TaskId::from_raw(event_task_id.0.to_native()),
+                                QueryId::from_raw(event_query_id.0.to_native()),
+                                attempt.to_native(),
+                                task_id,
+                                query_id,
+                                expected_attempt,
+                            ) {
+                                let _ = tx.send(Err(error));
+                                return;
                             }
                             tracing::warn!(
                                 target: "vein_dispatcher",
@@ -476,13 +604,14 @@ impl TaskDispatcher for QuicTaskDispatcher {
         &self,
         query_id: QueryId,
         task_id: TaskId,
+        attempt: u32,
     ) -> std::result::Result<TaskCompletion, VeinError> {
         let rx = {
             let mut completions = self
                 .completions
                 .lock()
                 .map_err(|_| VeinError::internal("completions mutex poisoned"))?;
-            completions.remove(&(query_id, task_id))
+            completions.remove(&(query_id, task_id, attempt))
         };
 
         match rx {
@@ -490,7 +619,7 @@ impl TaskDispatcher for QuicTaskDispatcher {
                 VeinError::internal("Task completion channel was dropped prematurely")
             })?,
             None => Err(VeinError::internal(format!(
-                "No pending completion channel found for Task {task_id}"
+                "No pending completion channel found for Task {task_id} attempt {attempt}"
             ))),
         }
     }
@@ -500,6 +629,7 @@ impl TaskDispatcher for QuicTaskDispatcher {
         executor: &NodeInfo,
         query_id: QueryId,
         task_id: TaskId,
+        attempt: u32,
     ) -> std::result::Result<(), VeinError> {
         let client = self.get_or_init_client()?;
         let target_addr = executor.addr.to_string();
@@ -510,7 +640,11 @@ impl TaskDispatcher for QuicTaskDispatcher {
             ))
         })?;
 
-        let event = VeinControlEvent::CancelTask { task_id, query_id };
+        let event = VeinControlEvent::CancelTask {
+            task_id,
+            query_id,
+            attempt,
+        };
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&event)
             .map_err(|e| VeinError::internal(format!("Failed to serialize CancelTask: {e}")))?;
 
@@ -527,5 +661,29 @@ impl TaskDispatcher for QuicTaskDispatcher {
 
     fn close_result_stream(&self, query_id: QueryId) {
         QuicTaskDispatcher::close_result_stream(self, query_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_result_identity;
+    use common::identifiers::{QueryId, TaskId};
+
+    #[test]
+    fn accepts_matching_result_identity() {
+        let task_id = TaskId::from_raw(11);
+        let query_id = QueryId::from_raw(22);
+        assert!(validate_result_identity(task_id, query_id, 3, task_id, query_id, 3).is_ok());
+    }
+
+    #[test]
+    fn rejects_mismatched_result_identity() {
+        let task_id = TaskId::from_raw(11);
+        let query_id = QueryId::from_raw(22);
+        assert!(
+            validate_result_identity(TaskId::from_raw(12), query_id, 3, task_id, query_id, 3,)
+                .is_err()
+        );
+        assert!(validate_result_identity(task_id, query_id, 4, task_id, query_id, 3,).is_err());
     }
 }

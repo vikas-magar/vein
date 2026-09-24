@@ -672,10 +672,15 @@ impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
                 attempt: attempt.to_native(),
                 error: error.as_str().to_string(),
             },
-            ArchivedVeinControlEvent::CancelTask { task_id, query_id } => {
+            ArchivedVeinControlEvent::CancelTask {
+                task_id,
+                query_id,
+                attempt,
+            } => {
                 VeinControlEvent::CancelTask {
                     task_id: TaskId::from_raw(task_id.0.to_native()),
                     query_id: QueryId::from_raw(query_id.0.to_native()),
+                    attempt: attempt.to_native(),
                 }
             }
             ArchivedVeinControlEvent::ExplicitDrain { query_id, stage_id } => {

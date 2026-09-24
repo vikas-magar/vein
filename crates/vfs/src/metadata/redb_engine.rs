@@ -1,5 +1,5 @@
 use crate::config::HashAlgo;
-use crate::metadata::{Extent, MetadataEngine};
+use crate::metadata::{Extent, MetadataEngine, MetadataFileUpdate};
 use crate::{Result, VfsConfig, VfsError};
 use async_trait::async_trait;
 use redb::{Database, ReadableTable, TableDefinition, TableHandle};
@@ -314,6 +314,70 @@ impl MetadataEngine for RedbMetadataEngine {
         })
         .await
         .map_err(|e| VfsError::Internal(format!("Tokio spawn blocking failed: {}", e)))?
+    }
+
+    async fn replace_files_atomically(&self, updates: Vec<MetadataFileUpdate>) -> Result<()> {
+        let db = self.db.clone();
+        let hash_algo = self.hash_algo.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let write_txn = db
+                .begin_write()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
+
+            {
+                let mut table = write_txn
+                    .open_table(EXTENTS_TABLE)
+                    .map_err(|e| VfsError::Metadata(e.to_string()))?;
+
+                for update in updates {
+                    let start_key = compound_key(&update.path, 0, &hash_algo);
+                    let end_key = compound_key(&update.path, u64::MAX, &hash_algo);
+                    let mut keys_to_delete = Vec::new();
+
+                    {
+                        let range = table
+                            .range::<&[u8]>(start_key.as_slice()..=end_key.as_slice())
+                            .map_err(|e| VfsError::Metadata(e.to_string()))?;
+                        for item in range {
+                            let (key, _) = item.map_err(|e| VfsError::Metadata(e.to_string()))?;
+                            keys_to_delete.push(key.value().to_vec());
+                        }
+                    }
+
+                    for key in keys_to_delete {
+                        table
+                            .remove(key.as_slice())
+                            .map_err(|e| VfsError::Metadata(e.to_string()))?;
+                    }
+
+                    let mut logical_offset = 0u64;
+                    for extent in update.extents {
+                        let key = compound_key(&update.path, logical_offset, &hash_algo);
+                        let serialized =
+                            bincode::serialize(&extent).map_err(|e| VfsError::Metadata(e.to_string()))?;
+                        table
+                            .insert(key.as_slice(), serialized.as_slice())
+                            .map_err(|e| VfsError::Metadata(e.to_string()))?;
+                        logical_offset = logical_offset
+                            .checked_add(extent.length)
+                            .ok_or_else(|| {
+                                VfsError::Metadata(format!(
+                                    "Metadata extent length overflow for '{}'",
+                                    update.path
+                                ))
+                            })?;
+                    }
+                }
+            }
+
+            write_txn
+                .commit()
+                .map_err(|e| VfsError::Metadata(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| VfsError::Internal(format!("Tokio spawn blocking failed: {e}")))?
     }
 
     async fn persist_proposal(

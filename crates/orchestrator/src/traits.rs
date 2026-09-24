@@ -32,6 +32,7 @@ pub trait TaskDispatcher: Send + Sync {
         &self,
         query_id: QueryId,
         task_id: TaskId,
+        attempt: u32,
     ) -> Result<TaskCompletion, VeinError>;
 
     /// Cancel a running task on the executor.
@@ -40,6 +41,7 @@ pub trait TaskDispatcher: Send + Sync {
         executor: &NodeInfo,
         query_id: QueryId,
         task_id: TaskId,
+        attempt: u32,
     ) -> std::result::Result<(), VeinError>;
 
     /// Open a bounded result stream before dispatching a query's tasks.

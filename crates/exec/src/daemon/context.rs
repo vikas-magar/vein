@@ -26,7 +26,7 @@ pub struct DaemonContext {
     /// Unique identity of this node.
     pub node_id: NodeId,
     /// Active tasks that can be cancelled in O(1) time.
-    pub active_tasks: DashMap<TaskId, CancellationToken>,
+    pub active_tasks: DashMap<(TaskId, u32), CancellationToken>,
     /// Global queue for unassigned tasks (Work-Stealing).
     pub task_queue: flume::Sender<QueuedTask>,
     /// Outbound QUIC client to talk to the Master.
@@ -49,13 +49,13 @@ impl DaemonContext {
     }
 
     /// Register a new task.
-    pub fn register_task(&self, task_id: TaskId, token: CancellationToken) {
-        self.active_tasks.insert(task_id, token);
+    pub fn register_task(&self, task_id: TaskId, attempt: u32, token: CancellationToken) {
+        self.active_tasks.insert((task_id, attempt), token);
     }
 
-    /// Cancel a running task.
-    pub fn cancel_task(&self, task_id: TaskId) {
-        if let Some((_, token)) = self.active_tasks.remove(&task_id) {
+    /// Cancel a running task attempt.
+    pub fn cancel_task(&self, task_id: TaskId, attempt: u32) {
+        if let Some((_, token)) = self.active_tasks.remove(&(task_id, attempt)) {
             token.cancel();
         }
     }

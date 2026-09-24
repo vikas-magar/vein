@@ -820,6 +820,7 @@ mod tests {
         let result_stream = dispatcher.open_result_stream(query_id);
 
         // 1. Dispatch over real QUIC
+        let task_attempt = task.attempt;
         dispatcher
             .dispatch(&executor_info, task)
             .await
@@ -827,7 +828,7 @@ mod tests {
 
         // 2. Wait for completion over real QUIC
         dispatcher
-            .wait_for_completion(query_id, task_id)
+            .wait_for_completion(query_id, task_id, task_attempt)
             .await
             .expect("wait for completion over QUIC should succeed");
         dispatcher.close_result_stream(query_id);

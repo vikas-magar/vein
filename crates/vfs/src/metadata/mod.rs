@@ -11,6 +11,13 @@ pub struct Extent {
     pub node_ip: String,
 }
 
+/// A replacement for one logical metadata file in an atomic metadata commit.
+#[derive(Debug, Clone)]
+pub struct MetadataFileUpdate {
+    pub path: String,
+    pub extents: Vec<Extent>,
+}
+
 /// The core Metadata Engine trait, allowing alternative implementations for testing.
 #[async_trait]
 pub trait MetadataEngine: Send + Sync {
@@ -34,7 +41,23 @@ pub trait MetadataEngine: Send + Sync {
     /// `_schema.json`) that are overwritten on every update. The default
     /// implementation deletes the existing extents then appends the new ones.
     async fn replace_file(&self, path: &str, extents: Vec<Extent>) -> Result<()> {
-        // Best-effort delete; ignore NotFound.
+        self.replace_files_atomically(vec![MetadataFileUpdate {
+            path: path.to_string(),
+            extents,
+        }])
+        .await
+    }
+
+    /// Atomically replaces multiple logical metadata files.
+    async fn replace_files_atomically(&self, updates: Vec<MetadataFileUpdate>) -> Result<()> {
+        for update in updates {
+            self.replace_file_sequentially(&update.path, update.extents).await?;
+        }
+        Ok(())
+    }
+
+    /// Fallback for metadata backends without transactional batch support.
+    async fn replace_file_sequentially(&self, path: &str, extents: Vec<Extent>) -> Result<()> {
         let _ = self.delete_file(path).await;
         for extent in extents {
             self.append_extent(path, extent).await?;

@@ -41,6 +41,8 @@ pub struct ExecutorDaemonConfig {
     pub node_id: NodeId,
     /// Number of worker threads.
     pub workers: usize,
+    /// Maximum number of tasks waiting for a worker.
+    pub task_queue_capacity: usize,
 }
 
 /// The Executor Daemon: manages worker pool execution and QUIC network listeners.
@@ -266,7 +268,7 @@ impl ExecutorDaemon {
                                 );
 
                                 let cancel = CancellationToken::new();
-                                ctx.register_task(task_id, cancel.clone());
+                                ctx.register_task(task_id, task.attempt, cancel.clone());
                                 let is_client = matches!(&task.sink, DataSink::Client { .. });
                                 let attempt = task.attempt;
                                 let (output_sender, output_receiver) = if is_client {
@@ -283,23 +285,34 @@ impl ExecutorDaemon {
                                     output_sender,
                                 };
 
-                                if let Err(e) = ctx.task_queue.send_async(queued).await {
-                                    tracing::error!(
+                                if let Err(e) = ctx.task_queue.try_send(queued) {
+                                    let (event_name, error) = match e {
+                                        flume::TrySendError::Full(_) => (
+                                            "rpc_task_queue_full",
+                                            "EXECUTOR_QUEUE_FULL: executor admission queue is temporarily full"
+                                                .to_string(),
+                                        ),
+                                        flume::TrySendError::Disconnected(_) => (
+                                            "rpc_task_queue_failed",
+                                            "executor task queue is disconnected".to_string(),
+                                        ),
+                                    };
+                                    tracing::warn!(
                                         target: "vein.audit",
-                                        event = "rpc_task_queue_failed",
+                                        event = event_name,
                                         %request_id,
                                         %query_id,
                                         %task_id,
                                         attempt,
-                                        error = %e,
-                                        "rpc_task_queue_failed"
+                                        error = %error,
+                                        "executor task admission rejected"
                                     );
-                                    ctx.active_tasks.remove(&task_id);
+                                    ctx.active_tasks.remove(&(task_id, attempt));
                                     let fail_event = VeinControlEvent::TaskFailed {
                                         task_id,
                                         query_id,
                                         attempt,
-                                        error: format!("Worker queue error: {e}"),
+                                        error,
                                     };
                                     if let Ok(bytes) =
                                         rkyv::to_bytes::<rkyv::rancor::Error>(&fail_event)
@@ -386,7 +399,7 @@ impl ExecutorDaemon {
                                             sequence += 1;
                                         }
 
-                                        ctx.active_tasks.remove(&task_id);
+                                        ctx.active_tasks.remove(&(task_id, attempt));
                                         match rx.await {
                                             Ok(Ok(res)) => {
                                                 let end = VeinControlEvent::TaskResultEnd {
@@ -429,7 +442,7 @@ impl ExecutorDaemon {
 
                                 // Await task execution completion from worker
                                 let exec_result = rx.await;
-                                ctx.active_tasks.remove(&task_id);
+                                ctx.active_tasks.remove(&(task_id, attempt));
 
                                 match exec_result {
                                     Ok(Ok(res))
@@ -531,14 +544,20 @@ impl ExecutorDaemon {
                                             bytes_read: res.metrics.bytes_read,
                                             duration_ns: res.metrics.duration_ns,
                                             result_bytes: None,
-                                             write_parts: res.write_parts.iter().map(|part| common::protocol::TableWritePartDescriptor {
-                                                 partition_id: part.partition_id,
-                                                 artifact_id: part.artifact.id.to_string(),
-                                                 artifact_uri: part.artifact.uri.clone(),
-                                                 checksum: part.artifact.checksum.clone(),
-                                                 size_bytes: part.artifact.size_bytes,
-                                                 row_count: part.row_count,
-                                             }).collect(),
+                                            write_parts: res
+                                                .write_parts
+                                                .iter()
+                                                .map(|part| {
+                                                    common::protocol::TableWritePartDescriptor {
+                                                        partition_id: part.partition_id,
+                                                        artifact_id: part.artifact.id.to_string(),
+                                                        artifact_uri: part.artifact.uri.clone(),
+                                                        checksum: part.artifact.checksum.clone(),
+                                                        size_bytes: part.artifact.size_bytes,
+                                                        row_count: part.row_count,
+                                                    }
+                                                })
+                                                .collect(),
                                         };
                                         match rkyv::to_bytes::<rkyv::rancor::Error>(&event) {
                                             Ok(bytes) => {
@@ -586,14 +605,19 @@ impl ExecutorDaemon {
                                     }
                                 }
                             }
-                            ArchivedVeinControlEvent::CancelTask { task_id, query_id } => {
+                            ArchivedVeinControlEvent::CancelTask {
+                                task_id,
+                                query_id,
+                                attempt,
+                            } => {
                                 let task_id = TaskId::from_raw(task_id.0.to_native());
                                 let query_id = QueryId::from_raw(query_id.0.to_native());
+                                let attempt = attempt.to_native();
                                 info!(
-                                    "Received CancelTask for Task {:?} (Query {:?})",
-                                    task_id, query_id
+                                    "Received CancelTask for Task {:?} (Query {:?}, attempt {})",
+                                    task_id, query_id, attempt
                                 );
-                                ctx.cancel_task(task_id);
+                                ctx.cancel_task(task_id, attempt);
                             }
                             ArchivedVeinControlEvent::Heartbeat {
                                 node_id,
@@ -652,6 +676,7 @@ pub struct ExecutorDaemonBuilder {
     master_addr: Option<String>,
     node_id: NodeId,
     workers: usize,
+    task_queue_capacity: Option<usize>,
     vcs_endpoint: Option<String>,
     vcs_ca_cert: Option<String>,
     allow_local_metadata: bool,
@@ -668,6 +693,7 @@ impl ExecutorDaemonBuilder {
             master_addr: None,
             node_id: NodeId::new(),
             workers: 4,
+            task_queue_capacity: None,
             vcs_endpoint: None,
             vcs_ca_cert: None,
             allow_local_metadata: false,
@@ -703,6 +729,12 @@ impl ExecutorDaemonBuilder {
     /// The number of worker threads.
     pub fn workers(mut self, n: usize) -> Self {
         self.workers = n;
+        self
+    }
+
+    /// Maximum number of tasks waiting for a worker. A full queue rejects work immediately.
+    pub fn task_queue_capacity(mut self, capacity: usize) -> Self {
+        self.task_queue_capacity = Some(capacity);
         self
     }
 
@@ -746,13 +778,21 @@ impl ExecutorDaemonBuilder {
                 .ok_or_else(|| VeinError::internal("master address is required"))?,
             node_id: self.node_id,
             workers: self.workers,
+            task_queue_capacity: self
+                .task_queue_capacity
+                .unwrap_or_else(|| self.workers.saturating_mul(4).max(1)),
         };
         if config.workers == 0 {
             return Err(VeinError::internal("at least one worker is required"));
         }
+        if config.task_queue_capacity == 0 {
+            return Err(VeinError::internal(
+                "task queue capacity must be greater than zero",
+            ));
+        }
 
-        // Task queue: the control plane produces, the workers consume.
-        let (tx, rx) = flume::unbounded();
+        // Keep both queued and active work bounded by the worker count and queue capacity.
+        let (tx, rx) = flume::bounded(config.task_queue_capacity);
         let master_client = Arc::new(build_quic_client(&config.cert_path)?);
         let ctx = DaemonContext::new(config.node_id, tx, master_client);
 
@@ -865,7 +905,11 @@ mod tests {
     fn test_zero_copy_control_in_place() {
         let task_id = TaskId::new();
         let query_id = QueryId::new();
-        let event = VeinControlEvent::CancelTask { task_id, query_id };
+        let event = VeinControlEvent::CancelTask {
+            task_id,
+            query_id,
+            attempt: 0,
+        };
         let bytes = rkyv::to_bytes::<Error>(&event).expect("serialization succeeds");
 
         let mut aligned = rkyv::util::AlignedVec::<16>::new();
@@ -878,11 +922,13 @@ mod tests {
             ArchivedVeinControlEvent::CancelTask {
                 task_id: archived_tid,
                 query_id: archived_qid,
+                attempt,
             } => {
                 let parsed_tid = TaskId::from_raw(archived_tid.0.to_native());
                 let parsed_qid = QueryId::from_raw(archived_qid.0.to_native());
                 assert_eq!(parsed_tid, task_id);
                 assert_eq!(parsed_qid, query_id);
+                assert_eq!(attempt.to_native(), 0);
             }
             _ => panic!("expected CancelTask"),
         }

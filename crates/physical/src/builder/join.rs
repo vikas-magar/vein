@@ -22,10 +22,11 @@ use crate::job::{StageEdge, StageInputPort};
 use crate::stage::Stage;
 use crate::task::Task;
 
-/// Number of exchange partitions used by the default join stage builder.
-///
-/// The reducer stage creates one partition-local task per exchange partition.
+/// Maximum exchange partitions used when statistics are unavailable or very large.
 pub const DEFAULT_JOIN_PARTITIONS: u16 = 32;
+
+const TARGET_ROWS_PER_PARTITION: u64 = 250_000;
+const TARGET_BYTES_PER_PARTITION: u64 = 128 * 1024 * 1024;
 
 /// Builds the physical stages for a logical join.
 pub trait JoinStageBuilder: Send + Sync {
@@ -147,7 +148,13 @@ impl JoinStageBuilder for DefaultJoinStageBuilder {
         let left_stage_id = StageId::new();
         let right_stage_id = StageId::new();
         let join_stage_id = StageId::new();
-        let partition_count = DEFAULT_JOIN_PARTITIONS;
+        let partition_count = choose_join_partition_count(left, right);
+        tracing::debug!(
+            target: "vein.optimizer",
+            event = "join_partition_count_selected",
+            partition_count,
+            "selected adaptive join partition count"
+        );
         let left_task_id = TaskId::new();
         let right_task_id = TaskId::new();
         let left_exchange_key = common::protocol::ExchangeKey {
@@ -272,6 +279,48 @@ impl JoinStageBuilder for DefaultJoinStageBuilder {
 
         Ok(join_stage_id)
     }
+}
+
+fn choose_join_partition_count(left: &LogicalPlan, right: &LogicalPlan) -> u16 {
+    let Some((max_rows, max_bytes)) = join_statistics(left, right) else {
+        return DEFAULT_JOIN_PARTITIONS;
+    };
+
+    let row_partitions = ceil_div(max_rows, TARGET_ROWS_PER_PARTITION);
+    let byte_partitions = ceil_div(max_bytes, TARGET_BYTES_PER_PARTITION);
+    row_partitions
+        .max(byte_partitions)
+        .clamp(1, DEFAULT_JOIN_PARTITIONS as u64) as u16
+}
+
+fn join_statistics(left: &LogicalPlan, right: &LogicalPlan) -> Option<(u64, u64)> {
+    let left = source_statistics(left)?;
+    let right = source_statistics(right)?;
+    Some((left.0.max(right.0), left.1.max(right.1)))
+}
+
+fn source_statistics(plan: &LogicalPlan) -> Option<(u64, u64)> {
+    match plan {
+        LogicalPlan::Scan { table, .. } => {
+            let stats = table.statistics.as_ref()?;
+            match (stats.num_rows, stats.total_bytes) {
+                (Some(rows), Some(bytes)) => Some((rows, bytes)),
+                (Some(rows), None) => Some((rows, 0)),
+                (None, Some(bytes)) => Some((0, bytes)),
+                (None, None) => None,
+            }
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::SubqueryAlias { input, .. } => source_statistics(input),
+        _ => None,
+    }
+}
+
+fn ceil_div(value: u64, divisor: u64) -> u64 {
+    value / divisor + u64::from(value % divisor != 0)
 }
 
 fn find_join_plan(plan: &LogicalPlan) -> Option<&LogicalPlan> {
@@ -503,7 +552,7 @@ fn collect_equi_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plan::{ColumnId, TableMetadata};
+    use plan::{ColumnId, TableMetadata, TableStatistics};
     use std::sync::Arc;
 
     fn scan(column: ResolvedColumn, format: Option<TableFormat>) -> LogicalPlan {
@@ -522,6 +571,75 @@ mod tests {
 
     fn column(id: usize, data_type: VeinDataType) -> ResolvedColumn {
         ResolvedColumn::new(ColumnId(id), format!("c{id}"), None, data_type)
+    }
+
+    #[test]
+    fn chooses_one_partition_for_small_catalog_statistics() {
+        let stats = TableStatistics {
+            num_rows: Some(1_000),
+            total_bytes: Some(64 * 1024),
+            ..Default::default()
+        };
+        let mut left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Exo));
+        let mut right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Exo));
+        if let LogicalPlan::Scan { table, .. } = &mut left {
+            Arc::make_mut(table).statistics = Some(stats.clone());
+        }
+        if let LogicalPlan::Scan { table, .. } = &mut right {
+            Arc::make_mut(table).statistics = Some(stats);
+        }
+
+        assert_eq!(choose_join_partition_count(&left, &right), 1);
+    }
+
+    #[test]
+    fn falls_back_to_default_partitions_without_statistics() {
+        let left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Exo));
+        let right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Exo));
+
+        assert_eq!(
+            choose_join_partition_count(&left, &right),
+            DEFAULT_JOIN_PARTITIONS
+        );
+    }
+
+    #[test]
+    fn falls_back_when_catalog_statistics_are_empty() {
+        let mut left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Exo));
+        let mut right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Exo));
+        if let LogicalPlan::Scan { table, .. } = &mut left {
+            Arc::make_mut(table).statistics = Some(TableStatistics::default());
+        }
+        if let LogicalPlan::Scan { table, .. } = &mut right {
+            Arc::make_mut(table).statistics = Some(TableStatistics::default());
+        }
+
+        assert_eq!(
+            choose_join_partition_count(&left, &right),
+            DEFAULT_JOIN_PARTITIONS
+        );
+    }
+
+    #[test]
+    fn caps_large_statistics_at_default_partition_limit() {
+        let stats = TableStatistics {
+            num_rows: Some(u64::MAX),
+            total_bytes: Some(u64::MAX),
+            ..Default::default()
+        };
+        let mut left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Exo));
+        let mut right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Exo));
+        if let LogicalPlan::Scan { table, .. } = &mut left {
+            Arc::make_mut(table).statistics = Some(stats.clone());
+        }
+        if let LogicalPlan::Scan { table, .. } = &mut right {
+            Arc::make_mut(table).statistics = Some(stats);
+        }
+
+        assert_eq!(
+            choose_join_partition_count(&left, &right),
+            DEFAULT_JOIN_PARTITIONS
+        );
     }
 
     #[test]

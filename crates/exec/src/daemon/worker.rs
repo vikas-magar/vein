@@ -48,7 +48,7 @@ impl WorkerPool {
                         // Work-stealing loop: pull tasks asynchronously
                         while let Ok(queued_task) = queue_clone.recv_async().await {
                             let executor = executor.clone();
-                            tokio::task::spawn_local(async move {
+                            {
                                 let task_id = queued_task.task.task_id;
                                 let request_id = queued_task.task.request_id;
                                 let query_id = queued_task.task.query_id;
@@ -87,38 +87,38 @@ impl WorkerPool {
                                     Ok(res) => {
                                         let duration_ms = started.elapsed().as_millis() as u64;
                                         info!(
-                                            target: "vein.audit",
-                                            event = "task_finished",
-                                            worker_id = core_id,
-                                            %request_id,
-                                     %task_id,
-                                            %query_id,
-                                            %stage_id,
-                                            attempt,
-                                            rows = res.row_count,
-                                            duration_ms,
-                                            "task_finished"
-                                        );
+                                               target: "vein.audit",
+                                               event = "task_finished",
+                                               worker_id = core_id,
+                                               %request_id,
+                                        %task_id,
+                                               %query_id,
+                                               %stage_id,
+                                               attempt,
+                                               rows = res.row_count,
+                                               duration_ms,
+                                               "task_finished"
+                                           );
                                     }
                                     Err(e) => {
                                         let duration_ms = started.elapsed().as_millis() as u64;
                                         error!(
-                                            target: "vein.audit",
-                                            event = "task_failed",
-                                            worker_id = core_id,
-                                            %request_id,
-                                     %task_id,
-                                            %query_id,
-                                            %stage_id,
-                                            attempt,
-                                            duration_ms,
-                                            error = %e,
-                                            "task_failed"
-                                        );
+                                               target: "vein.audit",
+                                               event = "task_failed",
+                                               worker_id = core_id,
+                                               %request_id,
+                                        %task_id,
+                                               %query_id,
+                                               %stage_id,
+                                               attempt,
+                                               duration_ms,
+                                               error = %e,
+                                               "task_failed"
+                                           );
                                     }
                                 }
                                 let _ = queued_task.responder.send(result);
-                            });
+                            }
                         }
                         info!("Worker {} shutting down", core_id);
                     });
