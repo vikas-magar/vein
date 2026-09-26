@@ -961,7 +961,8 @@ mod tests {
         //    partition state from previous test runs never bleeds in.
         let tmp = tempfile::tempdir().expect("tempdir");
         let vfs_cfg = vfs::VfsConfig::from_data_dir(tmp.path());
-        let _vfs_store = vfs::VfsTableStore::shared_for_config(&vfs_cfg)?;
+        let vfs_store = vfs::VfsTableStore::shared_for_config(&vfs_cfg)
+            .expect("isolated VFS store should initialize");
 
         // 1. Start Executor Daemon
         let exec_addr: SocketAddr = "127.0.0.1:9195".parse().unwrap();
