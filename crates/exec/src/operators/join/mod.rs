@@ -12,7 +12,7 @@ pub use key::{
     ArrowJoinKeyExtractor, JoinKey, JoinKeyBatch, JoinKeyExtractor, JoinKeyPart, JoinKeyRow,
     try_extract_address_keys,
 };
-pub use memory::{DEFAULT_JOIN_MEMORY_LIMIT, JoinMemoryBudget};
+pub use memory::{DEFAULT_JOIN_MEMORY_LIMIT, JoinMemoryBudget, JoinMemoryReservation};
 pub use partition::JoinPartitioner;
 pub use source::HashJoinSource;
 pub use spill::{

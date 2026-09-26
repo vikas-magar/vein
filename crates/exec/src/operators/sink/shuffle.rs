@@ -5,15 +5,14 @@ use arrow::array::{ArrayRef, UInt32Array};
 use arrow::compute::take;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
+use common::Result;
 use common::arrow::IpcStreamEncoder;
 use common::protocol::{ExchangeAddressColumn, ExchangeBatch, JoinKeyMode, ShuffleTarget};
-use common::Result;
 use error::VeinError;
-use exo::AddressBatch;
 
 use crate::exchange::SharedExchangeMetadata;
 use crate::operators::join::{
-    try_extract_address_keys, ArrowJoinKeyExtractor, JoinKeyExtractor, JoinPartitioner,
+    ArrowJoinKeyExtractor, JoinKeyExtractor, JoinPartitioner, try_extract_address_keys,
 };
 use crate::pipeline::{DataChunk, PipelineNode, Sink};
 
@@ -79,8 +78,9 @@ impl ShuffleSink {
     fn store(&self) -> Result<Arc<vfs::VfsTableStore>> {
         match &self.vfs_store {
             Some(store) => Ok(store.clone()),
-            None => vfs::VfsTableStore::shared_or_default()
-                .map_err(|e| VeinError::internal(format!("failed to open VFS exchange store: {e}"))),
+            None => vfs::VfsTableStore::shared_or_default().map_err(|e| {
+                VeinError::internal(format!("failed to open VFS exchange store: {e}"))
+            }),
         }
     }
 
@@ -94,7 +94,9 @@ impl ShuffleSink {
                     self.target
                         .schema
                         .iter()
-                        .position(|field| field.field_id == key.field_id || field.name == key.column_name)
+                        .position(|field| {
+                            field.field_id == key.field_id || field.name == key.column_name
+                        })
                         .ok_or_else(|| {
                             VeinError::internal(format!(
                                 "shuffle key '{}' is absent from exchange schema",
@@ -125,15 +127,36 @@ impl ShuffleSink {
     }
 
     fn materialize_batch(&self, chunk: &DataChunk, indices: &[u32]) -> Result<RecordBatch> {
-        let index_array = UInt32Array::from(indices.to_vec());
-        let columns: Vec<ArrayRef> = chunk
-            .vectors
-            .iter()
-            .map(|array| {
-                take(array.as_ref(), &index_array, None)
-                    .map_err(|e| VeinError::internal(format!("shuffle row materialization failed: {e}")))
-            })
-            .collect::<Result<_>>()?;
+        let range = indices
+            .first()
+            .copied()
+            .zip(indices.last().copied())
+            .and_then(|(first, last)| {
+                (last as usize + 1 == first as usize + indices.len()
+                    && indices
+                        .iter()
+                        .enumerate()
+                        .all(|(offset, &index)| index as usize == first as usize + offset))
+                .then_some(first as usize..last as usize + 1)
+            });
+        let columns: Vec<ArrayRef> = if let Some(range) = range {
+            chunk
+                .vectors
+                .iter()
+                .map(|array| array.slice(range.start, range.len()))
+                .collect()
+        } else {
+            let index_array = UInt32Array::from(indices.to_vec());
+            chunk
+                .vectors
+                .iter()
+                .map(|array| {
+                    take(array.as_ref(), &index_array, None).map_err(|e| {
+                        VeinError::internal(format!("shuffle row materialization failed: {e}"))
+                    })
+                })
+                .collect::<Result<_>>()?
+        };
 
         let fields: Vec<Field> = if self.target.schema.len() == columns.len() {
             self.target
@@ -148,7 +171,9 @@ impl ShuffleSink {
             columns
                 .iter()
                 .enumerate()
-                .map(|(index, array)| Field::new(format!("col_{index}"), array.data_type().clone(), true))
+                .map(|(index, array)| {
+                    Field::new(format!("col_{index}"), array.data_type().clone(), true)
+                })
                 .collect()
         };
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
@@ -168,20 +193,22 @@ impl ShuffleSink {
                     return Ok(None);
                 };
                 let mut addresses = Vec::with_capacity(indices.len());
-                let mut validity = Vec::with_capacity(indices.len());
-                for &index in indices {
+                let mut validity = vec![0u8; indices.len().div_ceil(8)];
+                for (row, &index) in indices.iter().enumerate() {
                     let Some((address, valid)) = sidecar.get(index as usize) else {
                         return Err(VeinError::internal(
                             "shuffle address sidecar row is out of bounds",
                         ));
                     };
                     addresses.push(address);
-                    validity.push(valid);
+                    if valid {
+                        validity[row / 8] |= 1 << (row % 8);
+                    }
                 }
-                let selected = AddressBatch::from_nullable(addresses, &validity)
-                    .map_err(|error| VeinError::internal(format!("shuffle address sidecar failed: {error}")))?;
-                let (addresses, validity) = selected.into_parts();
-                Ok(Some(ExchangeAddressColumn { addresses, validity }))
+                Ok(Some(ExchangeAddressColumn {
+                    addresses,
+                    validity,
+                }))
             })
             .collect()
     }
@@ -206,7 +233,8 @@ impl PipelineNode<DataChunk> for ShuffleSink {
                     .target
                     .partition_keys
                     .iter()
-                    .any(|key| matches!(key.mode, JoinKeyMode::AddressNative)) => {
+                    .any(|key| matches!(key.mode, JoinKeyMode::AddressNative)) =>
+                {
                     return Err(VeinError::internal(
                         "address-native shuffle key requested but source did not provide address sidecars",
                     ));
@@ -239,18 +267,20 @@ impl PipelineNode<DataChunk> for ShuffleSink {
                 arrow_ipc,
                 address_columns: self.materialize_addresses(&chunk, indices)?,
             };
-            let payload = exchange_batch
-                .encode()
-                .map_err(|error| VeinError::internal(format!("failed to encode shuffle batch: {error}")))?;
-            store.append_exchange_frame_sync(&self.partition_path(partition as u16), &payload)
+            let payload = exchange_batch.encode().map_err(|error| {
+                VeinError::internal(format!("failed to encode shuffle batch: {error}"))
+            })?;
+            let payload_len = payload.len() as u64;
+            let payload_checksum = stable_payload_hash(&payload);
+            store
+                .append_exchange_frame_sync(&self.partition_path(partition as u16), payload)
                 .map_err(|e| VeinError::internal(format!("failed to append shuffle frame: {e}")))?;
-            let stats = self
-                .partition_stats
-                .get_mut(partition)
-                .ok_or_else(|| VeinError::internal("shuffle partition statistics are out of bounds"))?;
-            stats.byte_len = stats.byte_len.saturating_add(payload.len() as u64);
+            let stats = self.partition_stats.get_mut(partition).ok_or_else(|| {
+                VeinError::internal("shuffle partition statistics are out of bounds")
+            })?;
+            stats.byte_len = stats.byte_len.saturating_add(payload_len);
             stats.row_count = stats.row_count.saturating_add(indices.len() as u64);
-            stats.checksum = stats.checksum.rotate_left(5) ^ stable_payload_hash(&payload);
+            stats.checksum = stats.checksum.rotate_left(5) ^ payload_checksum;
         }
         Ok(())
     }
@@ -273,7 +303,9 @@ impl PipelineNode<DataChunk> for ShuffleSink {
             let stats = self
                 .partition_stats
                 .get(partition as usize)
-                .ok_or_else(|| VeinError::internal("shuffle partition statistics are out of bounds"))?;
+                .ok_or_else(|| {
+                    VeinError::internal("shuffle partition statistics are out of bounds")
+                })?;
             total_rows = total_rows.saturating_add(stats.row_count);
             total_bytes = total_bytes.saturating_add(stats.byte_len);
             metadata.publish_fragment(
@@ -315,6 +347,7 @@ mod tests {
     use common::arrow::SelectionVector;
     use common::identifiers::{QueryId, StageId, TaskId};
     use common::protocol::{ExchangeKey, FieldSchema, JoinKeyMode, JoinKeySpec};
+    use exo::AddressBatch;
 
     fn target() -> ShuffleTarget {
         let task_id = TaskId::from_raw(2);
@@ -335,10 +368,34 @@ mod tests {
                 mode: JoinKeyMode::ValueNative,
             }],
             schema: vec![
-                FieldSchema { field_id: 0, name: "id".to_string(), data_type: "Int64".to_string() },
-                FieldSchema { field_id: 1, name: "value".to_string(), data_type: "Utf8".to_string() },
+                FieldSchema {
+                    field_id: 0,
+                    name: "id".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                FieldSchema {
+                    field_id: 1,
+                    name: "value".to_string(),
+                    data_type: "Utf8".to_string(),
+                },
             ],
         }
+    }
+
+    #[test]
+    fn packs_selected_address_validity_without_intermediate_bitmap() {
+        let sink = ShuffleSink::with_vfs_store(target(), None);
+        let sidecar = AddressBatch::from_nullable(vec![10, 20, 30], &[true, false, true])
+            .expect("valid sidecar");
+        let chunk = DataChunk {
+            vectors: vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef],
+            selection: SelectionVector::new_dense(3),
+            address_columns: vec![Some(sidecar)],
+        };
+        let selected = sink.materialize_addresses(&chunk, &[2, 1, 0]).unwrap();
+        let selected = selected[0].as_ref().unwrap();
+        assert_eq!(selected.addresses, vec![30, 20, 10]);
+        assert_eq!(selected.validity, vec![0b0000_0101]);
     }
 
     #[test]

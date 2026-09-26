@@ -146,7 +146,10 @@ impl MmapBlockManager {
             crate::block::PlaneType::Tombstone => memmap2::Advice::WillNeed,
         };
         mmap.advise(advice).map_err(|e| {
-            crate::VfsError::Internal(format!("Failed to advise OS page cache for plane {:?}: {}", plane, e))
+            crate::VfsError::Internal(format!(
+                "Failed to advise OS page cache for plane {:?}: {}",
+                plane, e
+            ))
         })
     }
 
@@ -158,7 +161,10 @@ impl MmapBlockManager {
             crate::block::PlaneType::Tombstone => memmap2::Advice::WillNeed,
         };
         mmap.advise(advice).map_err(|e| {
-            crate::VfsError::Internal(format!("Failed to advise OS page cache for plane {:?}: {}", plane, e))
+            crate::VfsError::Internal(format!(
+                "Failed to advise OS page cache for plane {:?}: {}",
+                plane, e
+            ))
         })
     }
 
@@ -219,17 +225,18 @@ impl BlockManager for MmapBlockManager {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("bin")
                 && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                    && let Ok(block_id) = stem.parse::<u64>() {
-                        // Skip the initial block we just created
-                        if block_id != initial_block_id {
-                            tracing::info!("Re-queuing orphaned block {} for upload", block_id);
-                            let sealed = SealedBlock {
-                                block_id,
-                                path: path.clone(),
-                            };
-                            let _ = upload_tx.send(sealed).await;
-                        }
-                    }
+                && let Ok(block_id) = stem.parse::<u64>()
+            {
+                // Skip the initial block we just created
+                if block_id != initial_block_id {
+                    tracing::info!("Re-queuing orphaned block {} for upload", block_id);
+                    let sealed = SealedBlock {
+                        block_id,
+                        path: path.clone(),
+                    };
+                    let _ = upload_tx.send(sealed).await;
+                }
+            }
         }
 
         let uploader = Arc::new(ZeroCopySinglePutUploader::new(storage.clone()));
@@ -355,9 +362,10 @@ impl BlockManager for MmapBlockManager {
                 .seek(std::io::SeekFrom::Start(extent.offset))
                 .await
                 .is_ok()
-                && file.read_exact(&mut buf).await.is_ok() {
-                    return Ok(buf);
-                }
+                && file.read_exact(&mut buf).await.is_ok()
+            {
+                return Ok(buf);
+            }
         }
 
         // Cache Miss: Fetch from infinite cloud backend
@@ -390,6 +398,29 @@ impl BlockManager for MmapBlockManager {
             return Ok(Vec::new());
         }
 
+        let mut output = Vec::with_capacity(length as usize);
+        self.read_extent_range_into(extent, offset, length, &mut output)
+            .await?;
+        Ok(output)
+    }
+
+    async fn read_extent_range_into(
+        &self,
+        extent: &Extent,
+        offset: u64,
+        length: u64,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        if offset.checked_add(length).is_none() || offset + length > extent.length {
+            return Err(crate::VfsError::Internal(format!(
+                "Extent range out of bounds: offset={offset}, length={length}, extent_length={}",
+                extent.length
+            )));
+        }
+        if length == 0 {
+            return Ok(());
+        }
+
         let absolute_offset = extent.offset + offset;
         let local_path = self
             .config
@@ -397,15 +428,23 @@ impl BlockManager for MmapBlockManager {
             .join(format!("{}.bin", extent.block_id));
         if let Ok(mut file) = tokio::fs::File::open(&local_path).await {
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            let mut buf = vec![0u8; length as usize];
+            let original_len = output.len();
+            let end = original_len.checked_add(length as usize).ok_or_else(|| {
+                crate::VfsError::Internal("Range read length overflow".to_string())
+            })?;
+            output.resize(end, 0);
             if file
                 .seek(std::io::SeekFrom::Start(absolute_offset))
                 .await
                 .is_ok()
-                && file.read_exact(&mut buf).await.is_ok()
+                && file
+                    .read_exact(&mut output[original_len..end])
+                    .await
+                    .is_ok()
             {
-                return Ok(buf);
+                return Ok(());
             }
+            output.truncate(original_len);
         }
 
         let s3_path = format!("blocks/{}.bin", extent.block_id);
@@ -416,15 +455,22 @@ impl BlockManager for MmapBlockManager {
             .range(absolute_offset..=end)
             .await
             .map_err(|e| crate::VfsError::Internal(e.to_string()))?;
-        Ok(data.to_vec())
+        if data.len() != length as usize {
+            return Err(crate::VfsError::Internal(format!(
+                "Short object-store range read: expected {length}, got {}",
+                data.len()
+            )));
+        }
+        output.extend_from_slice(&data);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use crate::block::PlaneType;
+    use tempfile::tempdir;
 
     #[test]
     fn test_advise_mmap_planes() -> Result<()> {
@@ -437,7 +483,8 @@ mod tests {
             .open(&file_path)
             .map_err(|e| crate::VfsError::Internal(e.to_string()))?;
 
-        file.set_len(4096).map_err(|e| crate::VfsError::Internal(e.to_string()))?;
+        file.set_len(4096)
+            .map_err(|e| crate::VfsError::Internal(e.to_string()))?;
 
         // Test MmapMut advice
         let mmap_mut = unsafe { MmapMut::map_mut(&file) }

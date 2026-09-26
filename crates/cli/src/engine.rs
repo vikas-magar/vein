@@ -961,12 +961,7 @@ mod tests {
         //    partition state from previous test runs never bleeds in.
         let tmp = tempfile::tempdir().expect("tempdir");
         let vfs_cfg = vfs::VfsConfig::from_data_dir(tmp.path());
-        let vfs_store = Arc::new(
-            vfs::VfsTableStore::init(&vfs_cfg)
-                .await
-                .expect("vfs store init"),
-        );
-        vfs::VfsTableStore::set_shared(vfs_store.clone());
+        let _vfs_store = vfs::VfsTableStore::shared_for_config(&vfs_cfg)?;
 
         // 1. Start Executor Daemon
         let exec_addr: SocketAddr = "127.0.0.1:9195".parse().unwrap();

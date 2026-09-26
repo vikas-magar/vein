@@ -41,7 +41,7 @@ pub async fn read_exchange_batches(
         .map_err(|e| VeinError::internal(format!("failed to read exchange '{path}': {e}")))?
     {
         bytes_read = bytes_read.saturating_add(frame.len() as u64);
-        batches.push(decode_exchange_frame(&frame, expected_schema, path)?);
+        batches.push(decode_exchange_frame(frame, expected_schema, path)?);
     }
     Ok((batches, bytes_read))
 }
@@ -65,11 +65,11 @@ pub async fn read_exchange_fragments(
 
 /// Decodes exactly one bounded exchange payload.
 pub fn decode_exchange_frame(
-    frame: &[u8],
+    frame: Vec<u8>,
     expected_schema: &[FieldSchema],
     path: &str,
 ) -> Result<DecodedExchangeBatch> {
-    let exchange = ExchangeBatch::decode(frame)
+    let exchange = ExchangeBatch::decode_owned(frame)
         .map_err(|error| VeinError::internal(format!("invalid exchange batch: {error}")))?;
     let mut decoder = AsyncIpcDecoder::new();
     let decoded = decoder.push_chunk(Bytes::from(exchange.arrow_ipc))?;
@@ -205,7 +205,7 @@ impl Source<DataChunk> for VfsExchangeSource {
                 VeinError::internal(format!("failed to read exchange '{path}': {e}"))
             })? {
                 self.bytes_read = self.bytes_read.saturating_add(frame.len() as u64);
-                let batch = decode_exchange_frame(&frame, &self.schema, &path)?;
+                let batch = decode_exchange_frame(frame, &self.schema, &path)?;
                 next.push(DataChunk::from_vectors_with_addresses(
                     batch.record_batch.columns().to_vec(),
                     batch.address_columns,

@@ -50,6 +50,21 @@ impl SelectionVector {
         self.size
     }
 
+    /// Returns the selected rows as one contiguous physical range when possible.
+    pub fn contiguous_range(&self) -> Option<std::ops::Range<usize>> {
+        if self.indices.is_none() {
+            return Some(0..self.size);
+        }
+        let first = *self.indices.as_ref()?.first()? as usize;
+        let end = first.checked_add(self.size)?;
+        self.indices
+            .as_ref()?
+            .iter()
+            .enumerate()
+            .all(|(offset, &index)| index as usize == first + offset)
+            .then_some(first..end)
+    }
+
     /// Whether this selection vector has zero valid rows.
     pub fn is_empty(&self) -> bool {
         self.size == 0
@@ -259,6 +274,19 @@ mod tests {
         assert_eq!(sv.size(), 5);
         assert_eq!(sv.get_index(0), 0);
         assert_eq!(sv.get_index(3), 3);
+    }
+
+    #[test]
+    fn selection_reports_dense_contiguous_ranges() {
+        assert_eq!(SelectionVector::new_dense(5).contiguous_range(), Some(0..5));
+        assert_eq!(
+            SelectionVector::new_sparse(vec![4, 5, 6]).contiguous_range(),
+            Some(4..7)
+        );
+        assert_eq!(
+            SelectionVector::new_sparse(vec![4, 6]).contiguous_range(),
+            None
+        );
     }
 
     #[test]

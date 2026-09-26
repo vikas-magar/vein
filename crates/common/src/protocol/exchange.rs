@@ -53,25 +53,47 @@ impl ExchangeBatch {
     const VERSION: u32 = 1;
 
     /// Encodes this batch for storage in one VFS exchange frame.
-    pub fn encode(&self) -> Result<Vec<u8>, String> {
+    pub fn encode(self) -> Result<Vec<u8>, String> {
         let arrow_len = u64::try_from(self.arrow_ipc.len())
             .map_err(|_| "exchange Arrow payload is too large".to_string())?;
         let column_count = u32::try_from(self.address_columns.len())
             .map_err(|_| "exchange has too many columns".to_string())?;
 
-        let mut output = Vec::with_capacity(
-            4usize
-                .saturating_add(4)
-                .saturating_add(8)
-                .saturating_add(self.arrow_ipc.len()),
-        );
-        output.extend_from_slice(Self::MAGIC);
-        output.extend_from_slice(&Self::VERSION.to_le_bytes());
-        output.extend_from_slice(&arrow_len.to_le_bytes());
-        output.extend_from_slice(&self.arrow_ipc);
+        let sidecar_len = self
+            .address_columns
+            .iter()
+            .try_fold(4usize, |length, column| {
+                let column_len = match column {
+                    None => 1,
+                    Some(column) => 1usize
+                        .checked_add(16)?
+                        .checked_add(column.addresses.len().checked_mul(8)?)?
+                        .checked_add(column.validity.len())?,
+                };
+                length.checked_add(column_len)
+            })
+            .ok_or_else(|| "exchange sidecar length overflows usize".to_string())?;
+
+        let mut output = self.arrow_ipc;
+        let payload_len = output.len();
+        let framed_len = payload_len
+            .checked_add(16)
+            .ok_or_else(|| "exchange frame length overflows usize".to_string())?;
+        output
+            .try_reserve(
+                16usize
+                    .checked_add(sidecar_len)
+                    .ok_or_else(|| "exchange frame capacity overflows usize".to_string())?,
+            )
+            .map_err(|error| format!("unable to reserve exchange frame: {error}"))?;
+        output.resize(framed_len, 0);
+        output.copy_within(0..payload_len, 16);
+        output[0..4].copy_from_slice(Self::MAGIC);
+        output[4..8].copy_from_slice(&Self::VERSION.to_le_bytes());
+        output[8..16].copy_from_slice(&arrow_len.to_le_bytes());
         output.extend_from_slice(&column_count.to_le_bytes());
 
-        for column in &self.address_columns {
+        for column in self.address_columns {
             match column {
                 None => output.push(0),
                 Some(column) => {
@@ -82,7 +104,7 @@ impl ExchangeBatch {
                         .map_err(|_| "exchange validity bitmap is too large".to_string())?;
                     output.extend_from_slice(&row_count.to_le_bytes());
                     output.extend_from_slice(&validity_len.to_le_bytes());
-                    for address in &column.addresses {
+                    for address in column.addresses {
                         output.extend_from_slice(&address.to_le_bytes());
                     }
                     output.extend_from_slice(&column.validity);
@@ -94,6 +116,28 @@ impl ExchangeBatch {
 
     /// Decodes and validates one stored exchange payload.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let (arrow_range, address_columns) = Self::decode_parts(bytes)?;
+        Ok(Self {
+            arrow_ipc: bytes[arrow_range].to_vec(),
+            address_columns,
+        })
+    }
+
+    /// Decodes an owned frame by reusing its allocation for the Arrow IPC payload.
+    pub fn decode_owned(mut bytes: Vec<u8>) -> Result<Self, String> {
+        let (arrow_range, address_columns) = Self::decode_parts(&bytes)?;
+        let arrow_len = arrow_range.len();
+        bytes.copy_within(arrow_range, 0);
+        bytes.truncate(arrow_len);
+        Ok(Self {
+            arrow_ipc: bytes,
+            address_columns,
+        })
+    }
+
+    fn decode_parts(
+        bytes: &[u8],
+    ) -> Result<(std::ops::Range<usize>, Vec<Option<ExchangeAddressColumn>>), String> {
         let mut cursor = 0usize;
         let magic = read_bytes(bytes, &mut cursor, 4)?;
         if magic != Self::MAGIC {
@@ -105,7 +149,9 @@ impl ExchangeBatch {
 
         let arrow_len = usize::try_from(read_u64(bytes, &mut cursor)?)
             .map_err(|_| "exchange Arrow payload length overflows usize".to_string())?;
-        let arrow_ipc = read_bytes(bytes, &mut cursor, arrow_len)?.to_vec();
+        let arrow_start = cursor;
+        read_bytes(bytes, &mut cursor, arrow_len)?;
+        let arrow_range = arrow_start..cursor;
         let column_count = usize::try_from(read_u32(bytes, &mut cursor)?)
             .map_err(|_| "exchange column count overflows usize".to_string())?;
         let mut address_columns = Vec::with_capacity(column_count);
@@ -141,10 +187,7 @@ impl ExchangeBatch {
         if cursor != bytes.len() {
             return Err("trailing bytes in exchange batch payload".to_string());
         }
-        Ok(Self {
-            arrow_ipc,
-            address_columns,
-        })
+        Ok((arrow_range, address_columns))
     }
 }
 
@@ -380,5 +423,30 @@ impl ExchangeManifest {
                 })
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExchangeAddressColumn, ExchangeBatch};
+
+    #[test]
+    fn owned_decode_preserves_exchange_payload() {
+        let exchange = ExchangeBatch {
+            arrow_ipc: (0..64).collect(),
+            address_columns: vec![
+                Some(ExchangeAddressColumn {
+                    addresses: vec![3, 5, 8],
+                    validity: vec![0b0000_0101],
+                }),
+                None,
+            ],
+        };
+        let encoded = exchange.encode().expect("encode exchange frame");
+        let borrowed = ExchangeBatch::decode(&encoded).expect("decode borrowed frame");
+        let owned = ExchangeBatch::decode_owned(encoded).expect("decode owned frame");
+
+        assert_eq!(borrowed, owned);
+        assert_eq!(owned.arrow_ipc, (0..64).collect::<Vec<u8>>());
     }
 }

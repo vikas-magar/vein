@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::codec::ForCodec;
 use crate::error::{ExoError, ExoResult};
+use crate::mark_spool::MarkSpool;
 use crate::traits::{AddressReader, AddressWriter, StorageBuffer};
 
 pub const ADDR_HEADER_MAGIC: &[u8; 4] = b"EXOA";
@@ -66,7 +67,11 @@ impl AddressHeader {
         buf[24..32].copy_from_slice(&self.marks_offset.to_le_bytes());
         let checksum = crc32fast::hash(&buf[0..32]);
         buf[32..36].copy_from_slice(&checksum.to_le_bytes());
-        buf[36] = if self.slot_width == 0 { 8 } else { self.slot_width };
+        buf[36] = if self.slot_width == 0 {
+            8
+        } else {
+            self.slot_width
+        };
         buf
     }
 
@@ -102,7 +107,11 @@ impl AddressHeader {
         let total_granules = u32::from_le_bytes(bytes[20..24].try_into().unwrap_or([0u8; 4]));
         let marks_offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap_or([0u8; 8]));
         let slot_width_raw = bytes[36];
-        let slot_width = if slot_width_raw == 0 { 8 } else { slot_width_raw };
+        let slot_width = if slot_width_raw == 0 {
+            8
+        } else {
+            slot_width_raw
+        };
 
         Ok(Self {
             magic,
@@ -186,6 +195,8 @@ pub struct ExoAddressWriter<W: Write + Seek = File> {
     validity: Vec<u8>,
     rows_in_granule: usize,
     marks: Vec<AddressGranuleMark>,
+    mark_spool: Option<MarkSpool>,
+    mark_count: u32,
     total_rows: u64,
     min_vaddr: u64,
     max_vaddr: u64,
@@ -205,12 +216,20 @@ impl ExoAddressWriter<File> {
     }
 
     /// Creates a new `.exo.addr` writer with explicit codec flags and 8-byte slots.
-    pub fn create_with_codec(path: &Path, granule_size: usize, codec_flags: u16) -> ExoResult<Self> {
+    pub fn create_with_codec(
+        path: &Path,
+        granule_size: usize,
+        codec_flags: u16,
+    ) -> ExoResult<Self> {
         Self::create_with_codec_and_slot_width(path, granule_size, codec_flags, 8)
     }
 
     /// Creates a new `.exo.addr` writer with explicit slot width (1, 2, 4, or 8 bytes) and RAW codec.
-    pub fn create_with_slot_width(path: &Path, granule_size: usize, slot_width: u8) -> ExoResult<Self> {
+    pub fn create_with_slot_width(
+        path: &Path,
+        granule_size: usize,
+        slot_width: u8,
+    ) -> ExoResult<Self> {
         Self::create_with_codec_and_slot_width(path, granule_size, CODEC_RAW, slot_width)
     }
 
@@ -241,6 +260,8 @@ impl ExoAddressWriter<File> {
             validity: Vec::with_capacity((granule_size + 7) / 8),
             rows_in_granule: 0,
             marks: Vec::new(),
+            mark_spool: Some(MarkSpool::create_near(path, "addr-marks")?),
+            mark_count: 0,
             total_rows: 0,
             min_vaddr: u64::MAX,
             max_vaddr: 0,
@@ -277,6 +298,8 @@ impl ExoAddressWriter<std::io::Cursor<Vec<u8>>> {
             validity: Vec::with_capacity((granule_size + 7) / 8),
             rows_in_granule: 0,
             marks: Vec::new(),
+            mark_spool: None,
+            mark_count: 0,
             total_rows: 0,
             min_vaddr: u64::MAX,
             max_vaddr: 0,
@@ -304,12 +327,14 @@ impl<W: Write + Seek> ExoAddressWriter<W> {
         let max_vaddr = self.max_vaddr;
         let bitmap_len = self.validity.len();
         let value_offset = aligned_value_offset(bitmap_len)?;
-        let validity_len = u32::try_from(value_offset)
-            .map_err(|_| ExoError::CodecError("Address validity bitmap is too large".to_string()))?;
+        let validity_len = u32::try_from(value_offset).map_err(|_| {
+            ExoError::CodecError("Address validity bitmap is too large".to_string())
+        })?;
         let uncompressed_len = self.buffer.len() as u32;
         self.writer.write_all(&self.validity)?;
         if value_offset > bitmap_len {
-            self.writer.write_all(&[0u8; ADDRESS_VALUE_ALIGNMENT][..value_offset - bitmap_len])?;
+            self.writer
+                .write_all(&[0u8; ADDRESS_VALUE_ALIGNMENT][..value_offset - bitmap_len])?;
         }
 
         let encoded_values_len = if self.codec_flags == CODEC_FOR && self.slot_width == 8 {
@@ -329,16 +354,20 @@ impl<W: Write + Seek> ExoAddressWriter<W> {
         let compressed_len = validity_len
             .checked_add(encoded_values_len)
             .ok_or_else(|| ExoError::CodecError("Address granule length overflow".to_string()))?;
-        self.marks.push(AddressGranuleMark {
+        let mark = AddressGranuleMark {
             byte_offset,
             compressed_len,
             uncompressed_len,
             min_vaddr,
             max_vaddr,
             validity_len,
-            flags: (if self.has_non_null { MARK_FLAG_HAS_NON_NULL } else { 0 })
-                | (if self.has_null { MARK_FLAG_HAS_NULL } else { 0 }),
-        });
+            flags: (if self.has_non_null {
+                MARK_FLAG_HAS_NON_NULL
+            } else {
+                0
+            }) | (if self.has_null { MARK_FLAG_HAS_NULL } else { 0 }),
+        };
+        self.append_mark(mark)?;
 
         self.buffer.clear();
         self.validity.clear();
@@ -350,6 +379,19 @@ impl<W: Write + Seek> ExoAddressWriter<W> {
         Ok(())
     }
 
+    fn append_mark(&mut self, mark: AddressGranuleMark) -> ExoResult<()> {
+        if let Some(spool) = &mut self.mark_spool {
+            spool.append(&mark.encode())?;
+        } else {
+            self.marks.push(mark);
+        }
+        self.mark_count = self
+            .mark_count
+            .checked_add(1)
+            .ok_or_else(|| ExoError::CodecError("Address granule mark count exceeds u32".into()))?;
+        Ok(())
+    }
+
     fn finish_internal(&mut self) -> ExoResult<u64> {
         // Flush any lingering values in the final granule
         self.flush_granule()?;
@@ -357,12 +399,16 @@ impl<W: Write + Seek> ExoAddressWriter<W> {
         let marks_offset = self.writer.stream_position()?;
 
         // Write marks table
-        for mark in &self.marks {
-            self.writer.write_all(&mark.encode())?;
+        if let Some(spool) = &mut self.mark_spool {
+            spool.copy_to(&mut self.writer)?;
+        } else {
+            for mark in &self.marks {
+                self.writer.write_all(&mark.encode())?;
+            }
         }
 
         // Write trailer (marks count + AEOF magic)
-        let marks_count = self.marks.len() as u32;
+        let marks_count = self.mark_count;
         self.writer.write_all(&marks_count.to_le_bytes())?;
         self.writer.write_all(ADDR_TRAILER_MAGIC)?;
 
@@ -375,7 +421,7 @@ impl<W: Write + Seek> ExoAddressWriter<W> {
             codec_flags: self.codec_flags,
             total_rows: self.total_rows,
             granule_size: self.granule_size as u32,
-            total_granules: self.marks.len() as u32,
+            total_granules: self.mark_count,
             marks_offset,
             checksum: 0,
             slot_width: self.slot_width,
@@ -431,7 +477,9 @@ impl<W: Write + Seek> AddressWriter for ExoAddressWriter<W> {
 
     fn append_nullable_batch(&mut self, vaddrs: &[u64], validity: &[bool]) -> ExoResult<()> {
         if vaddrs.len() != validity.len() {
-            return Err(ExoError::CodecError("Address values and validity lengths differ".to_string()));
+            return Err(ExoError::CodecError(
+                "Address values and validity lengths differ".to_string(),
+            ));
         }
         for (&vaddr, &valid) in vaddrs.iter().zip(validity) {
             self.append_nullable_vaddr(vaddr, valid)?;
@@ -580,7 +628,9 @@ impl ExoAddressReader {
         let values = &bytes[mark.validity_len as usize..total_len];
         if header.codec_flags == CODEC_FOR && header.slot_width == 8 {
             if values.is_empty() {
-                return Err(ExoError::CodecError("Compressed granule has no codec header".to_string()));
+                return Err(ExoError::CodecError(
+                    "Compressed granule has no codec header".to_string(),
+                ));
             }
             return ForCodec::decode_granule(
                 &values[1..],
@@ -618,7 +668,11 @@ impl ExoAddressReader {
                     out_buffer[idx] = u64::from_le_bytes(value.try_into().unwrap_or([0; 8]));
                 }
             }
-            width => return Err(ExoError::CodecError(format!("Unsupported address slot width: {width}"))),
+            width => {
+                return Err(ExoError::CodecError(format!(
+                    "Unsupported address slot width: {width}"
+                )));
+            }
         }
         Ok(num_values)
     }
@@ -626,10 +680,12 @@ impl ExoAddressReader {
     /// Copies the fetched granule validity bitmap into a caller-owned buffer.
     /// Returns metadata for one address granule.
     pub fn granule_mark(&self, granule_idx: usize) -> ExoResult<&AddressGranuleMark> {
-        self.marks.get(granule_idx).ok_or(ExoError::InvalidGranuleIndex {
-            index: granule_idx,
-            total_granules: self.marks.len(),
-        })
+        self.marks
+            .get(granule_idx)
+            .ok_or(ExoError::InvalidGranuleIndex {
+                index: granule_idx,
+                total_granules: self.marks.len(),
+            })
     }
 
     pub fn granule_validity_bytes<'a>(
@@ -645,7 +701,6 @@ impl ExoAddressReader {
         }
         Ok(&bytes[..validity_len])
     }
-
 }
 
 impl AddressReader for ExoAddressReader {
@@ -696,7 +751,13 @@ impl AddressReader for ExoAddressReader {
             let granule_bytes = &self.data[start..end];
             let bit_width = granule_bytes[0];
             let packed_data = &granule_bytes[1..];
-            ForCodec::decode_granule(packed_data, mark.min_vaddr, bit_width, num_values, out_buffer)
+            ForCodec::decode_granule(
+                packed_data,
+                mark.min_vaddr,
+                bit_width,
+                num_values,
+                out_buffer,
+            )
         } else {
             let start = values_start;
             let byte_len = mark.uncompressed_len as usize;
@@ -716,12 +777,14 @@ impl AddressReader for ExoAddressReader {
                 }
                 2 => {
                     for (i, chunk) in raw_bytes.chunks_exact(2).take(num_values).enumerate() {
-                        out_buffer[i] = u16::from_le_bytes(chunk.try_into().unwrap_or([0; 2])) as u64;
+                        out_buffer[i] =
+                            u16::from_le_bytes(chunk.try_into().unwrap_or([0; 2])) as u64;
                     }
                 }
                 4 => {
                     for (i, chunk) in raw_bytes.chunks_exact(4).take(num_values).enumerate() {
-                        out_buffer[i] = u32::from_le_bytes(chunk.try_into().unwrap_or([0; 4])) as u64;
+                        out_buffer[i] =
+                            u32::from_le_bytes(chunk.try_into().unwrap_or([0; 4])) as u64;
                     }
                 }
                 _ => {
@@ -789,21 +852,24 @@ impl AddressReader for ExoAddressReader {
 
     #[inline(always)]
     fn min_scalar(&self, granule_idx: usize) -> Option<u64> {
-        self.marks.get(granule_idx).and_then(|m| {
-            (m.flags & MARK_FLAG_HAS_NON_NULL != 0).then_some(m.min_vaddr)
-        })
+        self.marks
+            .get(granule_idx)
+            .and_then(|m| (m.flags & MARK_FLAG_HAS_NON_NULL != 0).then_some(m.min_vaddr))
     }
 
     #[inline(always)]
     fn max_scalar(&self, granule_idx: usize) -> Option<u64> {
-        self.marks.get(granule_idx).and_then(|m| {
-            (m.flags & MARK_FLAG_HAS_NON_NULL != 0).then_some(m.max_vaddr)
-        })
+        self.marks
+            .get(granule_idx)
+            .and_then(|m| (m.flags & MARK_FLAG_HAS_NON_NULL != 0).then_some(m.max_vaddr))
     }
 
     fn is_valid(&self, row_idx: u64) -> ExoResult<bool> {
         if row_idx >= self.total_rows() {
-            return Err(ExoError::InvalidSlotIndex { slot: row_idx as u32, total_rows: self.total_rows() });
+            return Err(ExoError::InvalidSlotIndex {
+                slot: row_idx as u32,
+                total_rows: self.total_rows(),
+            });
         }
         let granule_idx = (row_idx as usize) / self.granule_size();
         let offset = (row_idx as usize) % self.granule_size();
@@ -811,7 +877,10 @@ impl AddressReader for ExoAddressReader {
         let bitmap = mark.byte_offset as usize;
         let end = bitmap + mark.validity_len as usize;
         if end > self.data.len() || offset / 8 >= mark.validity_len as usize {
-            return Err(ExoError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Validity bitmap exceeds buffer boundary")));
+            return Err(ExoError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Validity bitmap exceeds buffer boundary",
+            )));
         }
         Ok(self.data[bitmap + offset / 8] & (1 << (offset % 8)) != 0)
     }
@@ -1004,7 +1073,10 @@ mod tests {
         // FoR must disallow direct raw &[u64] slice access
         match reader.scan_granule_slice(0) {
             Err(ExoError::CodecError(_)) => {} // Expected!
-            res => panic!("Expected CodecError for scan_granule_slice on FoR, got: {:?}", res),
+            res => panic!(
+                "Expected CodecError for scan_granule_slice on FoR, got: {:?}",
+                res
+            ),
         }
 
         // Decode each granule via read_granule
@@ -1054,7 +1126,10 @@ mod tests {
 
         // Attempting to read granule 0 must return InvalidGranuleIndex
         match reader.scan_granule_slice(0) {
-            Err(ExoError::InvalidGranuleIndex { index, total_granules }) => {
+            Err(ExoError::InvalidGranuleIndex {
+                index,
+                total_granules,
+            }) => {
                 assert_eq!(index, 0);
                 assert_eq!(total_granules, 0);
             }

@@ -361,7 +361,7 @@ impl ExecutorDaemon {
                                         let encoder = ArrowIpcOutputEncoder::new();
                                         let mut sequence = 0u64;
                                         while let Ok(batch) = output_receiver.recv_async().await {
-                                            let payload = match encoder.encode_batch(&batch) {
+                                            let payload = match encoder.encode_batch_vec(&batch) {
                                                 Ok(payload) => payload,
                                                 Err(e) => {
                                                     error!(
@@ -376,7 +376,7 @@ impl ExecutorDaemon {
                                                 query_id,
                                                 attempt,
                                                 sequence,
-                                                result_bytes: payload.to_vec(),
+                                                result_bytes: payload,
                                             };
                                             let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(
                                                 &event,

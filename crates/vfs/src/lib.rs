@@ -15,6 +15,9 @@ pub mod topology;
 pub use block::{BlockKey, PlaneType, SegmentKey};
 pub use config::VfsConfig;
 pub use error::{Result, VfsError};
-pub use table::{ExchangeFrameReader, VfsPartitionSummary, VfsTablePublication, VfsTableStore};
+pub use table::{
+    ExchangeFrameReader, StreamingPartitionWriter, VfsPartitionSummary, VfsTablePublication,
+    VfsTableStore,
+};
 /// Abstract traits defining the system architecture.
 pub mod traits;

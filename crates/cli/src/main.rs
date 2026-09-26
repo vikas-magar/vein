@@ -250,8 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| std::path::PathBuf::from("./vein_data"));
             let executor_id = bind.replace(':', "_").replace('/', "_");
             let vfs_config = vfs::VfsConfig::for_executor(&data_root, &executor_id);
-            let vfs_store = Arc::new(vfs::VfsTableStore::init(&vfs_config).await?);
-            vfs::VfsTableStore::set_shared(vfs_store);
+            let _vfs_store = vfs::VfsTableStore::shared_for_config(&vfs_config)?;
 
             let mut builder = ExecutorDaemon::builder()
                 .bind(addr)

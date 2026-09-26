@@ -1,7 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::arrow::AsyncIpcDecoder;
@@ -19,6 +21,65 @@ use crate::executor::NodeInfo;
 use crate::traits::{TaskCompletion, TaskDispatcher};
 
 const DEFAULT_CERT_PATH: &str = "certs/server.crt";
+
+struct SharedArchivedSlice {
+    owner: Arc<rkyv::util::AlignedVec<16>>,
+    range: Range<usize>,
+}
+
+impl AsRef<[u8]> for SharedArchivedSlice {
+    fn as_ref(&self) -> &[u8] {
+        &self.owner[self.range.clone()]
+    }
+}
+
+fn archived_slice_range(owner: &[u8], slice: &[u8]) -> Result<Range<usize>, VeinError> {
+    let owner_start = owner.as_ptr() as usize;
+    let slice_start = slice.as_ptr() as usize;
+    let start = slice_start
+        .checked_sub(owner_start)
+        .ok_or_else(|| VeinError::internal("result IPC payload is outside its archived frame"))?;
+    let end = start
+        .checked_add(slice.len())
+        .filter(|&end| end <= owner.len())
+        .ok_or_else(|| VeinError::internal("result IPC payload exceeds its archived frame"))?;
+    Ok(start..end)
+}
+
+async fn send_result_batch(
+    schema_state: &tokio::sync::Mutex<Option<SchemaRef>>,
+    sender: &ResultChannelSender,
+    task_id: TaskId,
+    attempt: u32,
+    sequence: u64,
+    batch: arrow::record_batch::RecordBatch,
+) -> Result<(), VeinError> {
+    let schema = batch.schema();
+    let mut current_schema = schema_state.lock().await;
+    match current_schema.as_ref() {
+        Some(expected) if expected.as_ref() != schema.as_ref() => {
+            return Err(VeinError::internal(
+                "task result schema differs from the query result schema",
+            ));
+        }
+        Some(_) => {}
+        None => {
+            sender
+                .send(Ok(ResultEvent::Start {
+                    schema: schema.clone(),
+                }))
+                .await
+                .map_err(|_| VeinError::internal("result stream consumer dropped"))?;
+            *current_schema = Some(schema);
+        }
+    }
+    sender
+        .send(Ok(ResultEvent::Batch(ResultBatch::new(
+            task_id, attempt, sequence, batch,
+        ))))
+        .await
+        .map_err(|_| VeinError::internal("result stream consumer dropped"))
+}
 
 fn validate_result_identity(
     event_task_id: TaskId,
@@ -55,7 +116,7 @@ pub struct QuicTaskDispatcher {
         >,
     >,
     result_senders: Arc<Mutex<HashMap<QueryId, ResultChannelSender>>>,
-    result_started: Arc<Mutex<HashSet<QueryId>>>,
+    result_schemas: Arc<Mutex<HashMap<QueryId, Arc<tokio::sync::Mutex<Option<SchemaRef>>>>>>,
 }
 
 impl Default for QuicTaskDispatcher {
@@ -77,7 +138,7 @@ impl QuicTaskDispatcher {
             client: Mutex::new(None),
             completions: Arc::new(Mutex::new(HashMap::new())),
             result_senders: Arc::new(Mutex::new(HashMap::new())),
-            result_started: Arc::new(Mutex::new(HashSet::new())),
+            result_schemas: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -88,7 +149,7 @@ impl QuicTaskDispatcher {
             client: Mutex::new(Some(client)),
             completions: Arc::new(Mutex::new(HashMap::new())),
             result_senders: Arc::new(Mutex::new(HashMap::new())),
-            result_started: Arc::new(Mutex::new(HashSet::new())),
+            result_schemas: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -98,8 +159,8 @@ impl QuicTaskDispatcher {
         if let Ok(mut senders) = self.result_senders.lock() {
             senders.insert(query_id, sender);
         }
-        if let Ok(mut started) = self.result_started.lock() {
-            started.remove(&query_id);
+        if let Ok(mut schemas) = self.result_schemas.lock() {
+            schemas.insert(query_id, Arc::new(tokio::sync::Mutex::new(None)));
         }
         stream
     }
@@ -109,8 +170,8 @@ impl QuicTaskDispatcher {
         if let Ok(mut senders) = self.result_senders.lock() {
             senders.remove(&query_id);
         }
-        if let Ok(mut started) = self.result_started.lock() {
-            started.remove(&query_id);
+        if let Ok(mut schemas) = self.result_schemas.lock() {
+            schemas.remove(&query_id);
         }
     }
 
@@ -202,13 +263,12 @@ impl TaskDispatcher for QuicTaskDispatcher {
         }
 
         let result_senders = self.result_senders.clone();
-        let result_started = self.result_started.clone();
+        let result_schemas = self.result_schemas.clone();
         tokio::spawn(async move {
             let mut frame_decoder = ControlFrameDecoder::new();
             let mut saw_frame = false;
             let mut saw_start = false;
             let mut sequence = 0u64;
-            let mut seen_sequences = HashSet::new();
             let mut received_rows = 0u64;
             let mut response_bytes = 0u64;
 
@@ -237,8 +297,9 @@ impl TaskDispatcher for QuicTaskDispatcher {
                     saw_frame = true;
                     let mut aligned = rkyv::util::AlignedVec::<16>::new();
                     aligned.extend_from_slice(&payload);
+                    let aligned = Arc::new(aligned);
                     let archived = match rkyv::access::<ArchivedVeinControlEvent, rkyv::rancor::Error>(
-                        &aligned,
+                        &aligned[..],
                     ) {
                         Ok(event) => event,
                         Err(error) => {
@@ -299,22 +360,21 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                 return;
                             }
                             let frame_sequence = frame_sequence.to_native();
-                            if !seen_sequences.insert(frame_sequence) {
-                                let _ = tx.send(Err(VeinError::internal(
-                                    "duplicate result batch sequence",
-                                )));
-                                return;
-                            }
                             if frame_sequence != sequence {
                                 let _ = tx.send(Err(VeinError::internal(
                                     "result batch sequence is not monotonic",
                                 )));
                                 return;
                             }
-                            let sender = result_senders
-                                .lock()
-                                .ok()
-                                .and_then(|senders| senders.get(&query_id).cloned());
+                            let sender = match result_senders.lock() {
+                                Ok(senders) => senders.get(&query_id).cloned(),
+                                Err(_) => {
+                                    let _ = tx.send(Err(VeinError::internal(
+                                        "result sender registry mutex poisoned",
+                                    )));
+                                    return;
+                                }
+                            };
                             let Some(sender) = sender else {
                                 let _ = tx.send(Err(VeinError::internal(
                                     "query result stream was not opened before task dispatch",
@@ -322,10 +382,19 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                 return;
                             };
 
+                            let ipc_range = match archived_slice_range(&aligned, result_bytes) {
+                                Ok(range) => range,
+                                Err(error) => {
+                                    let _ = tx.send(Err(error));
+                                    return;
+                                }
+                            };
+                            let ipc_payload = Bytes::from_owner(SharedArchivedSlice {
+                                owner: aligned.clone(),
+                                range: ipc_range,
+                            });
                             let mut decoder = AsyncIpcDecoder::new();
-                            let batches = match decoder
-                                .push_chunk(Bytes::copy_from_slice(result_bytes.as_slice()))
-                            {
+                            let batches = match decoder.push_chunk(ipc_payload) {
                                 Ok(batches) if batches.len() == 1 => batches,
                                 Ok(_) => {
                                     let _ = tx.send(Err(VeinError::internal(
@@ -345,36 +414,32 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                 return;
                             };
                             received_rows = received_rows.saturating_add(batch.num_rows() as u64);
-                            let should_start = result_started
+                            let schema_state = result_schemas
                                 .lock()
-                                .map(|mut started| started.insert(query_id))
-                                .unwrap_or(false);
-                            if should_start
-                                && sender
-                                    .send(Ok(ResultEvent::Start {
-                                        schema: batch.schema(),
-                                    }))
-                                    .await
-                                    .is_err()
+                                .map_err(|_| VeinError::internal("result schema mutex poisoned"))
+                                .and_then(|schemas| {
+                                    schemas.get(&query_id).cloned().ok_or_else(|| {
+                                        VeinError::internal("query result schema state is missing")
+                                    })
+                                });
+                            let schema_state = match schema_state {
+                                Ok(state) => state,
+                                Err(error) => {
+                                    let _ = tx.send(Err(error));
+                                    return;
+                                }
+                            };
+                            if let Err(error) = send_result_batch(
+                                &schema_state,
+                                &sender,
+                                task_id,
+                                expected_attempt,
+                                frame_sequence,
+                                batch,
+                            )
+                            .await
                             {
-                                let _ = tx.send(Err(VeinError::internal(
-                                    "result stream consumer dropped",
-                                )));
-                                return;
-                            }
-                            if sender
-                                .send(Ok(ResultEvent::Batch(ResultBatch::new(
-                                    task_id,
-                                    expected_attempt,
-                                    frame_sequence,
-                                    batch,
-                                ))))
-                                .await
-                                .is_err()
-                            {
-                                let _ = tx.send(Err(VeinError::internal(
-                                    "result stream consumer dropped",
-                                )));
+                                let _ = tx.send(Err(error));
                                 return;
                             }
                             sequence += 1;
@@ -456,10 +521,15 @@ impl TaskDispatcher for QuicTaskDispatcher {
                             let has_result_bytes =
                                 matches!(&result_bytes, rkyv::option::ArchivedOption::Some(_));
                             let mut decoded_rows = 0u64;
-                            let sender = result_senders
-                                .lock()
-                                .ok()
-                                .and_then(|senders| senders.get(&query_id).cloned());
+                            let sender = match result_senders.lock() {
+                                Ok(senders) => senders.get(&query_id).cloned(),
+                                Err(_) => {
+                                    let _ = tx.send(Err(VeinError::internal(
+                                        "result sender registry mutex poisoned",
+                                    )));
+                                    return;
+                                }
+                            };
                             let Some(sender) = sender else {
                                 let _ = tx.send(Err(VeinError::internal(
                                     "query result stream was not opened before task dispatch",
@@ -467,10 +537,19 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                 return;
                             };
                             if let rkyv::option::ArchivedOption::Some(batch_bytes) = result_bytes {
+                                let ipc_range = match archived_slice_range(&aligned, batch_bytes) {
+                                    Ok(range) => range,
+                                    Err(error) => {
+                                        let _ = tx.send(Err(error));
+                                        return;
+                                    }
+                                };
+                                let ipc_payload = Bytes::from_owner(SharedArchivedSlice {
+                                    owner: aligned.clone(),
+                                    range: ipc_range,
+                                });
                                 let mut decoder = AsyncIpcDecoder::new();
-                                let batches = match decoder
-                                    .push_chunk(Bytes::copy_from_slice(batch_bytes.as_slice()))
-                                {
+                                let batches = match decoder.push_chunk(ipc_payload) {
                                     Ok(batches) => batches,
                                     Err(error) => {
                                         let _ = tx.send(Err(error));
@@ -480,36 +559,36 @@ impl TaskDispatcher for QuicTaskDispatcher {
                                 for batch in batches {
                                     decoded_rows =
                                         decoded_rows.saturating_add(batch.num_rows() as u64);
-                                    let should_start = result_started
+                                    let schema_state = result_schemas
                                         .lock()
-                                        .map(|mut started| started.insert(query_id))
-                                        .unwrap_or(false);
-                                    if should_start
-                                        && sender
-                                            .send(Ok(ResultEvent::Start {
-                                                schema: batch.schema(),
-                                            }))
-                                            .await
-                                            .is_err()
+                                        .map_err(|_| {
+                                            VeinError::internal("result schema mutex poisoned")
+                                        })
+                                        .and_then(|schemas| {
+                                            schemas.get(&query_id).cloned().ok_or_else(|| {
+                                                VeinError::internal(
+                                                    "query result schema state is missing",
+                                                )
+                                            })
+                                        });
+                                    let schema_state = match schema_state {
+                                        Ok(state) => state,
+                                        Err(error) => {
+                                            let _ = tx.send(Err(error));
+                                            return;
+                                        }
+                                    };
+                                    if let Err(error) = send_result_batch(
+                                        &schema_state,
+                                        &sender,
+                                        task_id,
+                                        expected_attempt,
+                                        sequence,
+                                        batch,
+                                    )
+                                    .await
                                     {
-                                        let _ = tx.send(Err(VeinError::internal(
-                                            "result stream consumer dropped",
-                                        )));
-                                        return;
-                                    }
-                                    if sender
-                                        .send(Ok(ResultEvent::Batch(ResultBatch::new(
-                                            task_id,
-                                            expected_attempt,
-                                            sequence,
-                                            batch,
-                                        ))))
-                                        .await
-                                        .is_err()
-                                    {
-                                        let _ = tx.send(Err(VeinError::internal(
-                                            "result stream consumer dropped",
-                                        )));
+                                        let _ = tx.send(Err(error));
                                         return;
                                     }
                                     sequence += 1;
@@ -666,8 +745,78 @@ impl TaskDispatcher for QuicTaskDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_result_identity;
+    use super::{
+        SharedArchivedSlice, archived_slice_range, send_result_batch, validate_result_identity,
+    };
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use bytes::Bytes;
+    use common::ResultEvent;
     use common::identifiers::{QueryId, TaskId};
+    use futures::StreamExt;
+    use std::sync::Arc;
+
+    #[test]
+    fn archived_ipc_slice_keeps_frame_allocation_without_copying() {
+        let mut frame = rkyv::util::AlignedVec::<16>::new();
+        frame.extend_from_slice(b"header-arrow-payload-tail");
+        let payload_range = archived_slice_range(&frame, &frame[7..20]).unwrap();
+        let owner = Arc::new(frame);
+        let payload = Bytes::from_owner(SharedArchivedSlice {
+            owner: owner.clone(),
+            range: payload_range,
+        });
+
+        assert_eq!(&payload[..], b"arrow-payload");
+        assert!(Arc::strong_count(&owner) > 1);
+    }
+
+    #[test]
+    fn archived_ipc_slice_rejects_foreign_memory() {
+        let frame = rkyv::util::AlignedVec::<16>::new();
+        assert!(archived_slice_range(&frame, b"not in frame").is_err());
+    }
+
+    #[tokio::test]
+    async fn result_batches_emit_one_ordered_schema_and_reject_schema_drift() {
+        let (sender, mut stream) = common::bounded_result_channel(4);
+        let state = tokio::sync::Mutex::new(None);
+        let task = TaskId::from_raw(5);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let first = RecordBatch::new_empty(schema.clone());
+        send_result_batch(&state, &sender, task, 0, 0, first)
+            .await
+            .expect("first result batch");
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ResultEvent::Start { .. }
+        ));
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ResultEvent::Batch(_)
+        ));
+
+        let second = RecordBatch::new_empty(schema);
+        send_result_batch(&state, &sender, task, 0, 1, second)
+            .await
+            .expect("matching schema accepted");
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            ResultEvent::Batch(_)
+        ));
+
+        let changed_schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let changed = RecordBatch::new_empty(changed_schema);
+        assert!(
+            send_result_batch(&state, &sender, task, 0, 2, changed)
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn accepts_matching_result_identity() {

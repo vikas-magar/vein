@@ -73,9 +73,31 @@ impl JoinMemoryBudget {
         }
     }
 
+    /// Reserves bytes and returns an ownership guard that releases them on drop.
+    pub fn reserve_owned(&self, bytes: usize) -> Result<JoinMemoryReservation> {
+        self.try_reserve(bytes)?;
+        Ok(JoinMemoryReservation {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+
     /// Returns previously reserved bytes to the budget.
     pub fn release(&self, bytes: usize) {
         self.state.used.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
+
+/// RAII reservation for memory retained by join build state.
+#[derive(Debug)]
+pub struct JoinMemoryReservation {
+    budget: JoinMemoryBudget,
+    bytes: usize,
+}
+
+impl Drop for JoinMemoryReservation {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
     }
 }
 
@@ -88,6 +110,15 @@ impl Default for JoinMemoryBudget {
 #[cfg(test)]
 mod tests {
     use super::JoinMemoryBudget;
+
+    #[test]
+    fn owned_reservations_release_automatically() {
+        let budget = JoinMemoryBudget::with_limit(10);
+        let reservation = budget.reserve_owned(7).expect("reservation fits");
+        assert_eq!(budget.used(), 7);
+        drop(reservation);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn enforces_limit_and_releases_reservations() {

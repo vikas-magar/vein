@@ -45,7 +45,7 @@ impl AsyncFileReader for OpendalParquetReader {
                 .range(range.start..range.end)
                 .await
                 .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
-            Ok(Bytes::from(data.to_vec()))
+            Ok(Bytes::from(data))
         })
     }
 
@@ -62,7 +62,7 @@ impl AsyncFileReader for OpendalParquetReader {
                     .range(range.start..range.end)
                     .await
                     .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
-                result.push(bytes::Bytes::from(data.to_vec()));
+                result.push(Bytes::from(data));
             }
             Ok(result)
         })

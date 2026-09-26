@@ -22,8 +22,10 @@ use crate::job::{StageEdge, StageInputPort};
 use crate::stage::Stage;
 use crate::task::Task;
 
-/// Maximum exchange partitions used when statistics are unavailable or very large.
-pub const DEFAULT_JOIN_PARTITIONS: u16 = 32;
+/// Maximum exchange partitions used when catalog statistics call for more parallelism.
+pub const MAX_JOIN_PARTITIONS: u16 = 32;
+/// Conservative fanout when the catalog has no usable size statistics.
+pub const DEFAULT_JOIN_PARTITIONS: u16 = 4;
 
 const TARGET_ROWS_PER_PARTITION: u64 = 250_000;
 const TARGET_BYTES_PER_PARTITION: u64 = 128 * 1024 * 1024;
@@ -290,7 +292,7 @@ fn choose_join_partition_count(left: &LogicalPlan, right: &LogicalPlan) -> u16 {
     let byte_partitions = ceil_div(max_bytes, TARGET_BYTES_PER_PARTITION);
     row_partitions
         .max(byte_partitions)
-        .clamp(1, DEFAULT_JOIN_PARTITIONS as u64) as u16
+        .clamp(1, MAX_JOIN_PARTITIONS as u64) as u16
 }
 
 fn join_statistics(left: &LogicalPlan, right: &LogicalPlan) -> Option<(u64, u64)> {
@@ -593,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_default_partitions_without_statistics() {
+    fn uses_conservative_fanout_without_statistics() {
         let left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Exo));
         let right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Exo));
 
@@ -604,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_when_catalog_statistics_are_empty() {
+    fn uses_conservative_fanout_when_catalog_statistics_are_empty() {
         let mut left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Exo));
         let mut right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Exo));
         if let LogicalPlan::Scan { table, .. } = &mut left {
@@ -621,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn caps_large_statistics_at_default_partition_limit() {
+    fn caps_large_statistics_at_maximum_partition_limit() {
         let stats = TableStatistics {
             num_rows: Some(u64::MAX),
             total_bytes: Some(u64::MAX),
@@ -638,7 +640,7 @@ mod tests {
 
         assert_eq!(
             choose_join_partition_count(&left, &right),
-            DEFAULT_JOIN_PARTITIONS
+            MAX_JOIN_PARTITIONS
         );
     }
 

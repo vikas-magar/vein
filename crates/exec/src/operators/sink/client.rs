@@ -71,12 +71,14 @@ impl PipelineNode<DataChunk> for CollectSink {
             return Ok(());
         }
 
-        // Build the index array selecting the surviving rows.
-        let mut idx = UInt32Array::builder(selected);
-        for i in 0..selected {
-            idx.append_value(chunk.selection.get_index(i) as u32);
-        }
-        let indices = idx.finish();
+        let contiguous = chunk.selection.contiguous_range();
+        let indices = contiguous.is_none().then(|| {
+            let mut indices = UInt32Array::builder(selected);
+            for i in 0..selected {
+                indices.append_value(chunk.selection.get_index(i) as u32);
+            }
+            indices.finish()
+        });
 
         let mut fields = Vec::with_capacity(chunk.vectors.len());
         let mut columns = Vec::with_capacity(chunk.vectors.len());
@@ -87,8 +89,16 @@ impl PipelineNode<DataChunk> for CollectSink {
                 .cloned()
                 .unwrap_or_else(|| format!("col_{i}"));
             fields.push(Field::new(col_name, vec.data_type().clone(), true));
-            let array = take(vec.as_ref(), &indices, None)
-                .map_err(|e| VeinError::internal(format!("client sink take failed: {e}")))?;
+            let array = match (&contiguous, &indices) {
+                (Some(range), _) => vec.slice(range.start, range.len()),
+                (None, Some(indices)) => take(vec.as_ref(), indices, None)
+                    .map_err(|e| VeinError::internal(format!("client sink take failed: {e}")))?,
+                (None, None) => {
+                    return Err(VeinError::internal(
+                        "client sink selection indices were not materialized",
+                    ));
+                }
+            };
             columns.push(array);
         }
 

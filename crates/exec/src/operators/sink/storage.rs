@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::*;
 use arrow::compute::take;
@@ -19,7 +19,8 @@ use crate::pipeline::{DataChunk, PipelineNode, Sink};
 /// A terminal pipeline sink writing rows to storage (.exo or .parquet).
 pub struct StorageSink {
     target: StorageTarget,
-    batches: Vec<RecordBatch>,
+    exo_writer: Option<vfs::StreamingPartitionWriter>,
+    parquet_writer: Option<Mutex<ArrowWriter<File>>>,
     field_names: Vec<String>,
     vfs_store: Option<Arc<vfs::VfsTableStore>>,
     rows_written: u64,
@@ -40,7 +41,8 @@ impl StorageSink {
         let field_names = target.schema.iter().map(|f| f.name.clone()).collect();
         Self {
             target,
-            batches: Vec::new(),
+            exo_writer: None,
+            parquet_writer: None,
             field_names,
             vfs_store,
             rows_written: 0,
@@ -56,11 +58,14 @@ impl PipelineNode<DataChunk> for StorageSink {
             return Ok(());
         }
 
-        let mut idx = UInt32Array::builder(selected);
-        for i in 0..selected {
-            idx.append_value(chunk.selection.get_index(i) as u32);
-        }
-        let indices = idx.finish();
+        let contiguous = chunk.selection.contiguous_range();
+        let indices = contiguous.is_none().then(|| {
+            let mut builder = UInt32Array::builder(selected);
+            for i in 0..selected {
+                builder.append_value(chunk.selection.get_index(i) as u32);
+            }
+            builder.finish()
+        });
 
         let mut fields = Vec::with_capacity(chunk.vectors.len());
         let mut columns = Vec::with_capacity(chunk.vectors.len());
@@ -71,105 +76,160 @@ impl PipelineNode<DataChunk> for StorageSink {
                 .cloned()
                 .unwrap_or_else(|| format!("col_{i}"));
             fields.push(Field::new(col_name, vec.data_type().clone(), true));
-            let array = take(vec.as_ref(), &indices, None)
-                .map_err(|e| VeinError::internal(format!("storage sink take failed: {e}")))?;
+            let array = match (&contiguous, &indices) {
+                (Some(range), _) => vec.slice(range.start, range.len()),
+                (None, Some(indices)) => take(vec.as_ref(), indices, None)
+                    .map_err(|e| VeinError::internal(format!("storage sink take failed: {e}")))?,
+                (None, None) => {
+                    return Err(VeinError::internal(
+                        "storage sink selection indices were not materialized",
+                    ));
+                }
+            };
             columns.push(array);
         }
 
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema, columns)
             .map_err(|e| VeinError::internal(format!("storage sink record batch failed: {e}")))?;
-        self.rows_written += batch.num_rows() as u64;
-        self.batches.push(batch);
+        if self.output_format() == "parquet" {
+            self.write_parquet_batch(&batch)?;
+        } else {
+            if self.exo_writer.is_none() {
+                let dest_uri = self
+                    .target
+                    .get_option("staging_table")
+                    .unwrap_or(&self.target.destination_uri)
+                    .to_string();
+                let partition_id = self
+                    .target
+                    .get_option("partition_id")
+                    .map(|value| {
+                        value.parse::<u32>().map_err(|error| {
+                            VeinError::internal(format!("invalid storage partition_id: {error}"))
+                        })
+                    })
+                    .transpose()?;
+                let store = match &self.vfs_store {
+                    Some(store) => store.clone(),
+                    None => vfs::VfsTableStore::shared_or_default().map_err(|error| {
+                        VeinError::internal(format!("Failed to get VfsTableStore: {error}"))
+                    })?,
+                };
+                self.exo_writer = Some(
+                    store
+                        .begin_partition_writer(&dest_uri, partition_id, batch.schema())
+                        .map_err(|error| {
+                            VeinError::internal(format!(
+                                "Failed to initialize VFS partition writer for '{dest_uri}': {error}"
+                            ))
+                        })?,
+                );
+            }
+            self.exo_writer
+                .as_mut()
+                .ok_or_else(|| VeinError::internal("EXO partition writer was not initialized"))?
+                .append_batch(&batch)
+                .map_err(|error| {
+                    VeinError::internal(format!("Failed to append EXO output batch: {error}"))
+                })?;
+        }
+        self.rows_written = self
+            .rows_written
+            .checked_add(batch.num_rows() as u64)
+            .ok_or_else(|| VeinError::internal("storage sink row count overflow"))?;
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        if self.batches.is_empty() {
-            tracing::info!(target: "storage_sink", "No batches to persist");
+        if let Some(writer) = self.parquet_writer.take() {
+            let writer = writer.into_inner().map_err(|error| {
+                VeinError::internal(format!("Parquet writer lock poisoned: {error}"))
+            })?;
+            let metadata = writer.close().map_err(|error| {
+                VeinError::internal(format!("Failed to close Parquet writer: {error}"))
+            })?;
+            tracing::info!(
+                rows = self.rows_written,
+                row_groups = metadata.num_row_groups(),
+                "Successfully wrote Parquet dataset"
+            );
             return Ok(());
         }
 
-        let schema = self.batches[0].schema();
-        let combined_batch =
-            arrow::compute::concat_batches(&schema, &self.batches).map_err(|e| {
-                VeinError::internal(format!("Failed to concatenate record batches: {e}"))
-            })?;
-
+        let Some(writer) = self.exo_writer.take() else {
+            tracing::info!(target: "storage_sink", "No batches to persist");
+            return Ok(());
+        };
         let dest_uri = self
             .target
             .get_option("staging_table")
             .unwrap_or(&self.target.destination_uri)
             .to_string();
-        let format = self
-            .target
-            .get_option("format")
-            .unwrap_or("exo")
-            .to_ascii_lowercase();
-
-        if format == "parquet" {
-            self.write_parquet(&dest_uri, &combined_batch)?;
-        } else {
-            self.write_exo(&dest_uri, &combined_batch)?;
-        }
-
-        self.batches.clear();
+        let summary = writer.finish_sync().map_err(|error| {
+            VeinError::internal(format!(
+                "Failed to commit VFS partition '{dest_uri}': {error}"
+            ))
+        })?;
+        self.write_exo(&dest_uri, summary)?;
         Ok(())
     }
 }
 
 impl StorageSink {
-    fn write_parquet(&self, dest_uri: &str, batch: &RecordBatch) -> Result<()> {
-        let file_path = if dest_uri.ends_with(".parquet") {
-            PathBuf::from(dest_uri)
-        } else {
-            PathBuf::from(format!("data/{dest_uri}.parquet"))
-        };
-
-        if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                VeinError::io(
-                    format!("Failed to create directory '{}'", parent.display()),
-                    e,
-                )
-            })?;
-        }
-
-        let file = File::create(&file_path).map_err(|e| {
-            VeinError::io(
-                format!("Failed to create Parquet file '{}'", file_path.display()),
-                e,
-            )
-        })?;
-
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).map_err(|e| {
-            VeinError::internal(format!("Failed to initialize Parquet writer: {e}"))
-        })?;
-
-        writer.write(batch).map_err(|e| {
-            VeinError::internal(format!("Failed to write Parquet record batch: {e}"))
-        })?;
-
-        writer
-            .close()
-            .map_err(|e| VeinError::internal(format!("Failed to close Parquet writer: {e}")))?;
-
-        tracing::info!(
-            path = %file_path.display(),
-            rows = batch.num_rows(),
-            "Successfully wrote Parquet dataset"
-        );
-        Ok(())
+    fn output_format(&self) -> String {
+        self.target
+            .get_option("format")
+            .unwrap_or("exo")
+            .to_ascii_lowercase()
     }
 
-    fn write_exo(&mut self, dest_uri: &str, batch: &RecordBatch) -> Result<()> {
-        let store = match &self.vfs_store {
-            Some(s) => s.clone(),
-            None => vfs::VfsTableStore::shared_or_default()
-                .map_err(|e| VeinError::internal(format!("Failed to get VfsTableStore: {e}")))?,
-        };
+    fn write_parquet_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self.parquet_writer.is_none() {
+            let dest_uri = self
+                .target
+                .get_option("staging_table")
+                .unwrap_or(&self.target.destination_uri);
+            let file_path = if dest_uri.ends_with(".parquet") {
+                PathBuf::from(dest_uri)
+            } else {
+                PathBuf::from(format!("data/{dest_uri}.parquet"))
+            };
 
-        let staged_partition_id = self
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    VeinError::io(
+                        format!("Failed to create directory '{}'", parent.display()),
+                        error,
+                    )
+                })?;
+            }
+            let file = File::create(&file_path).map_err(|error| {
+                VeinError::io(
+                    format!("Failed to create Parquet file '{}'", file_path.display()),
+                    error,
+                )
+            })?;
+            self.parquet_writer = Some(Mutex::new(
+                ArrowWriter::try_new(file, batch.schema(), None).map_err(|error| {
+                    VeinError::internal(format!("Failed to initialize Parquet writer: {error}"))
+                })?,
+            ));
+        }
+
+        self.parquet_writer
+            .as_ref()
+            .ok_or_else(|| VeinError::internal("Parquet writer was not initialized"))?
+            .lock()
+            .map_err(|error| VeinError::internal(format!("Parquet writer lock poisoned: {error}")))?
+            .write(batch)
+            .map_err(|error| {
+                VeinError::internal(format!("Failed to write Parquet record batch: {error}"))
+            })
+    }
+
+    fn write_exo(&mut self, dest_uri: &str, summary: vfs::VfsPartitionSummary) -> Result<()> {
+        if let Some(partition_id) = self
             .target
             .get_option("partition_id")
             .map(|value| {
@@ -177,17 +237,14 @@ impl StorageSink {
                     VeinError::internal(format!("invalid storage partition_id: {error}"))
                 })
             })
-            .transpose()?;
-
-        let summary = match staged_partition_id {
-            Some(partition_id) => store.write_table_sync(dest_uri, partition_id, batch),
-            None => store.append_partition_sync(dest_uri, batch),
-        }
-        .map_err(|e| {
-            VeinError::internal(format!("Failed to write table '{dest_uri}' to VFS: {e}"))
-        })?;
-
-        if let Some(partition_id) = staged_partition_id {
+            .transpose()?
+        {
+            if summary.part_id != partition_id {
+                return Err(VeinError::internal(format!(
+                    "VFS committed partition {}, expected staged partition {partition_id}",
+                    summary.part_id
+                )));
+            }
             let write_id = self
                 .target
                 .get_option("write_id")
@@ -217,7 +274,7 @@ impl StorageSink {
             part_id = summary.part_id,
             rows = summary.total_rows,
             extents = summary.extents.len(),
-            "Successfully wrote native table into VFS memory-mapped blocks"
+            "Successfully committed streamed EXO partition into VFS"
         );
         Ok(())
     }
@@ -293,6 +350,15 @@ mod tests {
             address_columns: vec![None, None],
         })
         .unwrap();
+        sink.push(DataChunk {
+            vectors: vec![
+                Arc::new(Int64Array::from(vec![4, 5])),
+                Arc::new(StringArray::from(vec!["dave", "eve"])),
+            ],
+            selection: SelectionVector::new_dense(2),
+            address_columns: vec![None, None],
+        })
+        .unwrap();
         sink.flush().unwrap();
 
         // ── second flush → part_id = 1  (multi-partition append) ─────────────
@@ -326,7 +392,11 @@ mod tests {
         assert_eq!(parts, vec![0, 1], "expected two partitions [0, 1]");
 
         let reader0 = store.open_partition_reader_sync(table_id, 0).unwrap();
-        assert_eq!(reader0.total_rows(), 3, "part 0 should have 3 rows");
+        assert_eq!(
+            reader0.total_rows(),
+            5,
+            "part 0 should contain rows from both input batches"
+        );
 
         let reader1 = store.open_partition_reader_sync(table_id, 1).unwrap();
         assert_eq!(reader1.total_rows(), 2, "part 1 should have 2 rows");

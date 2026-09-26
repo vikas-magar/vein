@@ -19,8 +19,8 @@ use exo::AddressBatch;
 use crate::exchange::SharedExchangeMetadata;
 use crate::operators::join::{
     ArrowJoinKeyExtractor, HashJoinTable, JoinKeyBatch, JoinKeyExtractor, JoinKeyRow,
-    JoinSpillIdentity, JoinSpillWriter, VfsJoinSpillWriter, new_attempt_spill_path, new_spill_path,
-    try_extract_address_keys,
+    JoinMemoryBudget, JoinMemoryReservation, JoinSpillIdentity, JoinSpillWriter,
+    VfsJoinSpillWriter, new_attempt_spill_path, new_spill_path, try_extract_address_keys,
 };
 use crate::operators::source::exchange::{DecodedExchangeBatch, decode_exchange_frame};
 use crate::pipeline::{DataChunk, PipelineNode, Source};
@@ -422,8 +422,10 @@ impl Source<DataChunk> for HashJoinSource {
 
         // Build state is retained for the current partition; the probe side is
         // decoded and processed one exchange frame at a time.
+        let build_memory = JoinMemoryBudget::default();
         let mut left_batches = Vec::new();
-        let mut table = HashJoinTable::new();
+        let mut left_batch_reservations: Vec<JoinMemoryReservation> = Vec::new();
+        let mut table = HashJoinTable::with_budget(build_memory.clone());
         let spill_writer = VfsJoinSpillWriter::new(self.store.clone());
         let mut spill_paths = vec![None; SPILL_PARTITION_COUNT];
         let mut spill_stats = HashMap::new();
@@ -444,13 +446,29 @@ impl Source<DataChunk> for HashJoinSource {
                 VeinError::internal(format!("failed to read exchange '{path}': {e}"))
             })? {
                 self.bytes_read = self.bytes_read.saturating_add(frame.len() as u64);
-                let batch = decode_exchange_frame(&frame, &self.source.left_schema, &path)?;
+                let batch = decode_exchange_frame(frame, &self.source.left_schema, &path)?;
+                let batch_bytes = batch.record_batch.get_array_memory_size();
+                let reservation = build_memory.reserve_owned(batch_bytes);
                 let chunk = Self::chunk_for_batch(&batch)?;
                 let batch_id = left_batches.len() as u32;
                 let keys = Self::extract_keys(&chunk, &left_columns, &self.source.left_keys)?;
                 build_rows = build_rows.saturating_add(keys.len() as u64);
-                match table.insert_batch(batch_id, &keys) {
-                    Ok(()) => left_batches.push(batch),
+                let table_result: Result<()> = match reservation {
+                    Ok(reservation) => match table.insert_batch(batch_id, &keys) {
+                        Ok(()) => {
+                            left_batches.push(batch);
+                            left_batch_reservations.push(reservation);
+                            continue;
+                        }
+                        Err(error) => {
+                            drop(reservation);
+                            Err(error)
+                        }
+                    },
+                    Err(error) => Err(error),
+                };
+                match table_result {
+                    Ok(()) => continue,
                     Err(error @ VeinError::ResourceExhausted { .. }) => {
                         spill_frames = spill_frames.saturating_add(1);
                         Self::spill_build_batch(
@@ -490,7 +508,7 @@ impl Source<DataChunk> for HashJoinSource {
                 VeinError::internal(format!("failed to read exchange '{path}': {e}"))
             })? {
                 self.bytes_read = self.bytes_read.saturating_add(frame.len() as u64);
-                let right_batch = decode_exchange_frame(&frame, &self.source.right_schema, &path)?;
+                let right_batch = decode_exchange_frame(frame, &self.source.right_schema, &path)?;
                 let probe_chunk = Self::chunk_for_batch(&right_batch)?;
                 let probe_keys =
                     Self::extract_keys(&probe_chunk, &right_columns, &self.source.right_keys)?;
@@ -534,7 +552,7 @@ impl Source<DataChunk> for HashJoinSource {
                         ))
                     })? {
                         let spilled_batch = decode_exchange_frame(
-                            &spill_frame,
+                            spill_frame,
                             &self.source.left_schema,
                             spill_path,
                         )?;
@@ -548,7 +566,8 @@ impl Source<DataChunk> for HashJoinSource {
                         spilled_table.insert_batch(0, &spilled_keys)?;
                         let spilled_matches =
                             spilled_table.probe_batch(current_probe_id, &probe_partition);
-                        matches_emitted = matches_emitted.saturating_add(spilled_matches.len() as u64);
+                        matches_emitted =
+                            matches_emitted.saturating_add(spilled_matches.len() as u64);
                         Self::emit_matches(
                             next,
                             std::slice::from_ref(&spilled_batch),

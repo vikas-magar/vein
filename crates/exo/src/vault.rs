@@ -11,6 +11,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{ExoError, ExoResult};
+use crate::mark_spool::MarkSpool;
 use crate::traits::{StorageBuffer, VaultReader, VaultWriter};
 
 pub const VAULT_HEADER_MAGIC: &[u8; 4] = b"EXOV";
@@ -138,6 +139,8 @@ pub struct ExoVaultWriter<W: Write + Seek = File> {
     payload_arena: Vec<u8>,
     validity: Vec<bool>,
     marks: Vec<VaultGranuleMark>,
+    mark_spool: Option<MarkSpool>,
+    mark_count: u32,
     total_rows: u64,
 }
 
@@ -156,6 +159,8 @@ impl ExoVaultWriter<File> {
             payload_arena: Vec::with_capacity(granule_size * 64),
             validity: Vec::with_capacity(granule_size),
             marks: Vec::new(),
+            mark_spool: Some(MarkSpool::create_near(path, "vault-marks")?),
+            mark_count: 0,
             total_rows: 0,
         })
     }
@@ -181,6 +186,8 @@ impl ExoVaultWriter<std::io::Cursor<Vec<u8>>> {
             payload_arena: Vec::with_capacity(granule_size * 64),
             validity: Vec::with_capacity(granule_size),
             marks: Vec::new(),
+            mark_spool: None,
+            mark_count: 0,
             total_rows: 0,
         })
     }
@@ -216,7 +223,8 @@ impl<W: Write + Seek> ExoVaultWriter<W> {
 
         let offsets_bytes_len = (num_rows * 4) as u32;
         let payload_bytes_len = self.payload_arena.len() as u32;
-        let total_uncompressed_len = (validity_bytes_len as u32) + offsets_bytes_len + payload_bytes_len;
+        let total_uncompressed_len =
+            (validity_bytes_len as u32) + offsets_bytes_len + payload_bytes_len;
 
         // 3. Write 16-byte Granule Block Header
         let mut granule_header = [0u8; GRANULE_HEADER_SIZE];
@@ -254,15 +262,29 @@ impl<W: Write + Seek> ExoVaultWriter<W> {
 
         let block_disk_len = (GRANULE_HEADER_SIZE as u32) + total_uncompressed_len;
 
-        self.marks.push(VaultGranuleMark {
+        let mark = VaultGranuleMark {
             byte_offset,
             compressed_len: block_disk_len,
             uncompressed_len: total_uncompressed_len,
-        });
+        };
+        self.append_mark(mark)?;
 
         self.offsets.clear();
         self.payload_arena.clear();
         self.validity.clear();
+        Ok(())
+    }
+
+    fn append_mark(&mut self, mark: VaultGranuleMark) -> ExoResult<()> {
+        if let Some(spool) = &mut self.mark_spool {
+            spool.append(&mark.encode())?;
+        } else {
+            self.marks.push(mark);
+        }
+        self.mark_count = self
+            .mark_count
+            .checked_add(1)
+            .ok_or_else(|| ExoError::CodecError("Vault granule mark count exceeds u32".into()))?;
         Ok(())
     }
 
@@ -271,11 +293,15 @@ impl<W: Write + Seek> ExoVaultWriter<W> {
 
         let marks_offset = self.writer.stream_position()?;
 
-        for mark in &self.marks {
-            self.writer.write_all(&mark.encode())?;
+        if let Some(spool) = &mut self.mark_spool {
+            spool.copy_to(&mut self.writer)?;
+        } else {
+            for mark in &self.marks {
+                self.writer.write_all(&mark.encode())?;
+            }
         }
 
-        let marks_count = self.marks.len() as u32;
+        let marks_count = self.mark_count;
         self.writer.write_all(&marks_count.to_le_bytes())?;
         self.writer.write_all(VAULT_TRAILER_MAGIC)?;
 
@@ -287,7 +313,7 @@ impl<W: Write + Seek> ExoVaultWriter<W> {
             codec_flags: 0,
             total_rows: self.total_rows,
             granule_size: self.granule_size as u32,
-            total_granules: self.marks.len() as u32,
+            total_granules: self.mark_count,
             marks_offset,
             checksum: 0,
         };
@@ -471,8 +497,10 @@ impl ExoVaultReader {
 
         let flags = g_hdr[1];
         let has_nulls = (flags & 1) != 0;
-        let offsets_bytes_len = u32::from_le_bytes(g_hdr[4..8].try_into().unwrap_or([0u8; 4])) as usize;
-        let payload_bytes_len = u32::from_le_bytes(g_hdr[8..12].try_into().unwrap_or([0u8; 4])) as usize;
+        let offsets_bytes_len =
+            u32::from_le_bytes(g_hdr[4..8].try_into().unwrap_or([0u8; 4])) as usize;
+        let payload_bytes_len =
+            u32::from_le_bytes(g_hdr[8..12].try_into().unwrap_or([0u8; 4])) as usize;
         let expected_crc = u32::from_le_bytes(g_hdr[12..16].try_into().unwrap_or([0u8; 4]));
 
         let num_rows = offsets_bytes_len / 4;
@@ -603,7 +631,9 @@ impl VaultReader for ExoVaultReader {
         };
 
         if end > cached.payload.len() || start > end {
-            return Err(ExoError::CodecError("Corrupted offset boundaries in granule".to_string()));
+            return Err(ExoError::CodecError(
+                "Corrupted offset boundaries in granule".to_string(),
+            ));
         }
 
         Ok(&cached.payload[start..end])
@@ -611,9 +641,8 @@ impl VaultReader for ExoVaultReader {
 
     fn read_str_slot(&mut self, slot_id: u32) -> ExoResult<&str> {
         let bytes = self.read_bytes_slot(slot_id)?;
-        std::str::from_utf8(bytes).map_err(|e| {
-            ExoError::CodecError(format!("Invalid UTF-8 at slot {}: {}", slot_id, e))
-        })
+        std::str::from_utf8(bytes)
+            .map_err(|e| ExoError::CodecError(format!("Invalid UTF-8 at slot {}: {}", slot_id, e)))
     }
 
     fn read_opt_bytes_slot(&mut self, slot_id: u32) -> ExoResult<Option<&[u8]>> {
@@ -775,7 +804,11 @@ mod tests {
                     assert!(array.is_null(i), "Arrow array index {} should be null", i);
                 }
                 Some(s) => {
-                    assert!(!array.is_null(i), "Arrow array index {} should not be null", i);
+                    assert!(
+                        !array.is_null(i),
+                        "Arrow array index {} should not be null",
+                        i
+                    );
                     assert_eq!(array.value(i), s.as_str());
                 }
             }
@@ -806,7 +839,10 @@ mod tests {
         assert_eq!(reader.read_opt_str_slot(0)?, Some("alpha"));
         assert_eq!(reader.read_opt_str_slot(1)?, None);
         assert_eq!(reader.read_opt_str_slot(2)?, Some("beta"));
-        assert_eq!(reader.read_opt_str_slot(3)?, Some("gamma long string that exceeds standard sizes 1234567890"));
+        assert_eq!(
+            reader.read_opt_str_slot(3)?,
+            Some("gamma long string that exceeds standard sizes 1234567890")
+        );
         assert_eq!(reader.read_opt_str_slot(4)?, None);
 
         Ok(())

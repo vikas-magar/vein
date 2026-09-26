@@ -38,8 +38,8 @@ pub trait MetadataEngine: Send + Sync {
     /// Replaces all extents for `path` with a fresh set.
     ///
     /// This is the correct operation for manifest files (`_partitions.json`,
-    /// `_schema.json`) that are overwritten on every update. The default
-    /// implementation deletes the existing extents then appends the new ones.
+    /// `_schema.json`) that are overwritten on every update. Implementations
+    /// must replace their extents atomically.
     async fn replace_file(&self, path: &str, extents: Vec<Extent>) -> Result<()> {
         self.replace_files_atomically(vec![MetadataFileUpdate {
             path: path.to_string(),
@@ -48,21 +48,14 @@ pub trait MetadataEngine: Send + Sync {
         .await
     }
 
-    /// Atomically replaces multiple logical metadata files.
-    async fn replace_files_atomically(&self, updates: Vec<MetadataFileUpdate>) -> Result<()> {
-        for update in updates {
-            self.replace_file_sequentially(&update.path, update.extents).await?;
-        }
-        Ok(())
-    }
-
-    /// Fallback for metadata backends without transactional batch support.
-    async fn replace_file_sequentially(&self, path: &str, extents: Vec<Extent>) -> Result<()> {
-        let _ = self.delete_file(path).await;
-        for extent in extents {
-            self.append_extent(path, extent).await?;
-        }
-        Ok(())
+    /// Atomically replaces every updated logical file in one metadata transaction.
+    ///
+    /// A backend that cannot provide this guarantee must reject the commit rather
+    /// than exposing a partially published partition.
+    async fn replace_files_atomically(&self, _updates: Vec<MetadataFileUpdate>) -> Result<()> {
+        Err(crate::VfsError::Internal(
+            "metadata backend does not support atomic multi-file replacement".to_string(),
+        ))
     }
 
     /// Persists a consensus proposal to storage.

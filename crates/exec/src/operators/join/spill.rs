@@ -41,7 +41,7 @@ impl VfsJoinSpillWriter {
 impl JoinSpillWriter for VfsJoinSpillWriter {
     fn append_frame(&self, path: &str, frame: &[u8]) -> Result<()> {
         self.store
-            .append_exchange_frame_sync(path, frame)
+            .append_exchange_frame_sync(path, frame.to_vec())
             .map_err(|error| {
                 VeinError::internal(format!(
                     "failed to append join spill frame '{path}': {error}"

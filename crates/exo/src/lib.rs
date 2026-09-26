@@ -12,6 +12,7 @@ pub mod codec;
 pub mod compactor;
 pub mod coord;
 pub mod error;
+pub mod mark_spool;
 pub mod part;
 pub mod predicate;
 pub mod storage_class;

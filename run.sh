@@ -6,4 +6,4 @@ VEIN_DATA_DIR=./vein_data ./target/debug/cli executor --bind 127.0.0.1:8081 --ma
 
 ./target/debug/vein "FROM './data/input' |> WRITE input"
 
-./target/debug/vein "FROM input AS a |> JOIN input AS b ON a.id = b.id |> WHERE a.id < 10 |> SELECT *"
+./target/debug/vein "FROM input AS a |> JOIN input AS b ON a.id = b.id |> WHERE a.id < 10 |> SELECT a.id, a.random_float, a.random_int"

@@ -36,6 +36,19 @@ pub trait BlockManager: Send + Sync {
         let bytes = self.read_extent(extent).await?;
         Ok(bytes[offset as usize..(offset + length) as usize].to_vec())
     }
+
+    /// Appends an extent range directly to the destination buffer.
+    async fn read_extent_range_into(
+        &self,
+        extent: &Extent,
+        offset: u64,
+        length: u64,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        let bytes = self.read_extent_range(extent, offset, length).await?;
+        output.extend_from_slice(&bytes);
+        Ok(())
+    }
 }
 
 pub mod key;

@@ -151,9 +151,14 @@ impl ArrowIpcOutputEncoder {
     /// Result frames use this unit so the receiver can decode each batch
     /// independently while preserving bounded transport memory.
     pub fn encode_batch(&self, batch: &RecordBatch) -> Result<Bytes> {
+        self.encode_batch_vec(batch).map(Bytes::from)
+    }
+
+    /// Encodes one batch into an owned IPC buffer for ownership transfer to RPC.
+    pub fn encode_batch_vec(&self, batch: &RecordBatch) -> Result<Vec<u8>> {
         let mut encoder = common::arrow::IpcStreamEncoder::new();
         encoder.encode(batch)?;
-        Ok(Bytes::from(encoder.finalize()?))
+        encoder.finalize()
     }
 }
 
