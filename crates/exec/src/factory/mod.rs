@@ -3,14 +3,13 @@
 //! Maps the wire protocol (`common::protocol::{DataSource, MicroProgram, DataSink}`)
 //! onto the executor's concrete stages and Vector VM execution engine.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::exchange::SharedExchangeMetadata;
-use crate::operators::join::{HashJoinSource, JoinSpillIdentity};
-use crate::operators::sink::{CollectSink, DiscardSink, ShuffleSink, StorageSink};
-use crate::operators::source::{MemorySource, ScanSource, VfsExchangeSource};
+use crate::operators::sink::{CollectSink, DiscardSink};
+use crate::operators::source::{MemorySource, ScanSource};
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use crate::runtime::ExecutorBuilder;
 use crate::udf::FunctionRegistry;
@@ -19,7 +18,6 @@ use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, MicroProgram};
 use error::VeinError;
-use vcs::{CatalogReader, RemoteVcsCatalog};
 
 /// Builds a [`TaskExecutor`](crate::runtime::TaskExecutor) with configurable
 /// stages and Vector VM execution engine.
@@ -30,8 +28,6 @@ use vcs::{CatalogReader, RemoteVcsCatalog};
 pub struct TaskExecutorBuilder {
     builder: Arc<dyn ExecutorBuilder>,
     registry: Arc<FunctionRegistry>,
-    metadata: Option<SharedExchangeMetadata>,
-    catalog: Option<Arc<RemoteVcsCatalog>>,
 }
 
 impl TaskExecutorBuilder {
@@ -41,8 +37,6 @@ impl TaskExecutorBuilder {
         Self {
             builder: Arc::new(DefaultExecutorBuilder::new(registry.clone())),
             registry,
-            metadata: None,
-            catalog: None,
         }
     }
 
@@ -53,26 +47,8 @@ impl TaskExecutorBuilder {
         self
     }
 
-    /// Configure VCS-backed exchange metadata for shuffle and join stages.
-    pub fn with_exchange_metadata(mut self, metadata: SharedExchangeMetadata) -> Self {
-        self.metadata = Some(metadata);
-        self.rebuild_default();
-        self
-    }
-
-    /// Configure the authoritative VCS used to validate pinned table snapshots.
-    pub fn with_catalog_validator(mut self, catalog: Arc<RemoteVcsCatalog>) -> Self {
-        self.catalog = Some(catalog);
-        self.rebuild_default();
-        self
-    }
-
     fn rebuild_default(&mut self) {
-        self.builder = Arc::new(DefaultExecutorBuilder::with_configuration(
-            self.registry.clone(),
-            self.metadata.clone(),
-            self.catalog.clone(),
-        ));
+        self.builder = Arc::new(DefaultExecutorBuilder::new(self.registry.clone()));
     }
 
     /// Override the executor builder (which maps the wire protocol to stages) entirely.
@@ -97,116 +73,38 @@ impl Default for TaskExecutorBuilder {
 /// [`VectorVmExecutor`] from a wire task description.
 pub struct DefaultExecutorBuilder {
     registry: Arc<FunctionRegistry>,
-    metadata: Option<SharedExchangeMetadata>,
-    catalog: Option<Arc<RemoteVcsCatalog>>,
 }
 
 impl DefaultExecutorBuilder {
     /// Create a builder with the given UDF function registry for the Vector VM.
     pub fn new(registry: Arc<FunctionRegistry>) -> Self {
-        Self::with_exchange_metadata(registry, None)
-    }
-
-    /// Creates a builder with optional VCS-backed exchange metadata.
-    pub fn with_exchange_metadata(
-        registry: Arc<FunctionRegistry>,
-        metadata: Option<SharedExchangeMetadata>,
-    ) -> Self {
-        Self::with_configuration(registry, metadata, None)
-    }
-
-    /// Creates a builder with exchange metadata and catalog snapshot validation.
-    pub fn with_configuration(
-        registry: Arc<FunctionRegistry>,
-        metadata: Option<SharedExchangeMetadata>,
-        catalog: Option<Arc<RemoteVcsCatalog>>,
-    ) -> Self {
-        Self { registry, metadata, catalog }
+        Self { registry }
     }
 }
 
 #[async_trait::async_trait(?Send)]
 impl ExecutorBuilder for DefaultExecutorBuilder {
-    async fn validate_task(&self, task: &common::protocol::ExecuteTask) -> Result<()> {
-        let Some(catalog) = &self.catalog else {
-            return Ok(());
-        };
-        if let DataSource::File(scan) = &task.source
-            && let Some(snapshot) = &scan.catalog_snapshot
-        {
-            catalog.validate_snapshot(snapshot).await?;
-        }
-        Ok(())
-    }
-
     fn build_source(
         &self,
         source: &DataSource,
-        task_id: TaskId,
-        attempt: u32,
+        _task_id: TaskId,
+        _attempt: u32,
     ) -> Result<Box<dyn Source<DataChunk>>> {
         match source {
             DataSource::Memory => Ok(Box::new(MemorySource::dummy())),
             DataSource::File(scan) => {
-                // TODO(storage): pick the OpenDAL service from the scan URI scheme
-                // (e.g. s3://, fs://) instead of always mounting local filesystem.
+                let (root, paths) = local_scan_paths(&scan.files)?;
                 use opendal::services::Fs;
                 let mut builder = Fs::default();
-                builder.root("./");
+                builder.root(&root.to_string_lossy());
                 let op = opendal::Operator::new(builder)
                     .map_err(|e| VeinError::internal(format!("build fs operator: {e}")))?
                     .finish();
-                let projection = if scan.projected_schema.is_empty() {
-                    None
-                } else {
-                    Some(scan.projected_schema.clone())
-                };
-                Ok(Box::new(
-                    ScanSource::new(op, scan.files.clone(), scan.format.clone())
-                        .with_projection(projection)
-                        .with_scan_predicates(&scan.scan_predicates),
-                ))
+                Ok(Box::new(ScanSource::new(op, paths, scan.format.clone())))
             }
-            DataSource::Exchange(exchange) => {
-                if exchange.partition_count == 0
-                    || exchange.partition_id >= exchange.partition_count as u32
-                {
-                    return Err(VeinError::internal("exchange partition is out of range"));
-                }
-                let store = vfs::VfsTableStore::shared_or_default()
-                    .map_err(|e| VeinError::internal(format!("open VFS exchange store: {e}")))?;
-                let path = format!(
-                    "{}/partition_{:05}",
-                    exchange.path_prefix, exchange.partition_id
-                );
-                let source = VfsExchangeSource::new(store, path, exchange.schema.clone());
-                let source = match &self.metadata {
-                    Some(metadata) => source.with_exchange_metadata(
-                        exchange.exchange_key,
-                        common::identifiers::PartitionId::from_raw(exchange.partition_id as u16),
-                        metadata.clone(),
-                    ),
-                    None => source,
-                };
-                Ok(Box::new(source))
-            }
-            DataSource::Join(join) => {
-                let store = vfs::VfsTableStore::shared_or_default()
-                    .map_err(|e| VeinError::internal(format!("open VFS join store: {e}")))?;
-                let source = match &self.metadata {
-                    Some(metadata) => HashJoinSource::with_store_and_metadata(
-                        join.clone(),
-                        store,
-                        metadata.clone(),
-                    ),
-                    None => HashJoinSource::with_store(join.clone(), store),
-                }
-                .with_spill_identity(JoinSpillIdentity { task_id, attempt });
-                Ok(Box::new(source))
-            }
-            DataSource::Stream(_) => {
-                Err(VeinError::internal("Stream source is not yet implemented"))
-            }
+            DataSource::Exchange(_) | DataSource::Join(_) | DataSource::Stream(_) => Err(
+                VeinError::internal("this local executor supports only memory and Parquet sources"),
+            ),
         }
     }
 
@@ -229,12 +127,9 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                 let field_names = schema.iter().map(|f| f.name.clone()).collect();
                 Ok(Box::new(CollectSink::with_field_names(field_names)))
             }
-            DataSink::Shuffle(target) => Ok(Box::new(ShuffleSink::with_vfs_store_and_metadata(
-                target.clone(),
-                None,
-                self.metadata.clone(),
-            ))),
-            DataSink::Storage(target) => Ok(Box::new(StorageSink::new(target.clone()))),
+            DataSink::Shuffle(_) | DataSink::Storage(_) => Err(VeinError::internal(
+                "this local executor supports only client and discard sinks",
+            )),
         }
     }
 
@@ -254,4 +149,34 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
             _ => self.build_sink(sink),
         }
     }
+}
+
+fn local_scan_paths(files: &[String]) -> Result<(PathBuf, Vec<String>)> {
+    let paths = files
+        .iter()
+        .map(|file| {
+            std::fs::canonicalize(file)
+                .map_err(|error| VeinError::io(format!("resolve local scan file '{file}'"), error))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let first = paths
+        .first()
+        .ok_or_else(|| VeinError::internal("file scan contains no files"))?;
+    let root = first
+        .ancestors()
+        .skip(1)
+        .find(|candidate| paths.iter().all(|path| path.starts_with(candidate)))
+        .ok_or_else(|| VeinError::internal("local scan files have no common directory"))?
+        .to_path_buf();
+    let relative = paths
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .map(|path| path.to_string_lossy().into_owned())
+                .map_err(|error| {
+                    VeinError::internal(format!("local scan path is outside its root: {error}"))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((root, relative))
 }

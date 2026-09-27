@@ -103,17 +103,3 @@ pub enum MasterCommand {
         task_id: TaskId,
     },
 }
-
-/// Requests sent to the Virtual File System (VFS).
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-pub enum VfsRequest {
-    /// Read a block of data, applying the provided eBPF bytecode in the kernel.
-    ReadWithFilter {
-        /// The file path to read.
-        file_path: String,
-        /// The raw eBPF ELF bytecode.
-        ebpf_bytecode: Vec<u8>,
-    },
-}

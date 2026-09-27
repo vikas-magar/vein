@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use error::Result;
 use parser::ast::query::QueryNode;
-use plan::{LogicalPlan, VeinDataType, Volatility};
-use vcs::CatalogRevision;
+use plan::{CatalogRevision, CatalogProvider, LogicalPlan, VeinDataType, Volatility};
 
 /// Supported runtimes for User-Defined Functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +78,7 @@ pub trait LogicalBinder: Send + Sync {
     }
 
     /// Returns the underlying catalog, if available.
-    fn catalog(&self) -> Option<&std::sync::Arc<dyn vcs::CatalogReader>> {
+    fn catalog(&self) -> Option<&std::sync::Arc<dyn CatalogProvider>> {
         None
     }
 }

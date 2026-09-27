@@ -1,6 +1,5 @@
 use crate::pipeline::{DataChunk, PipelineNode, Source};
 use arrow::record_batch::RecordBatch;
-use common::arrow::SelectionVector;
 use common::Result;
 
 /// An in-memory data source for testing.
@@ -29,17 +28,10 @@ impl MemorySource {
 impl Source<DataChunk> for MemorySource {
     async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunk>) -> Result<()> {
         if let Some(batch) = self.batch.take() {
-            let num_rows = batch.num_rows();
-            let vectors = batch.columns().to_vec();
-            let chunk = DataChunk {
-                address_columns: vec![None; vectors.len()],
-                vectors,
-                selection: SelectionVector::new_dense(num_rows),
-            };
+            let chunk = DataChunk::from_record_batch(batch);
             next.push(chunk)?;
         }
         next.flush()?;
         Ok(())
     }
 }
-

@@ -5,8 +5,6 @@
 //! - [`transform`]: Processes data chunks ([`LimitTransform`](transform::LimitTransform), [`VectorVmExecutor`](crate::vm::VectorVmExecutor)).
 //! - [`sink`]: Terminates data streams ([`CollectSink`](sink::CollectSink), [`DiscardSink`](sink::DiscardSink)).
 
-/// Join operators and source-independent join key extraction.
-pub mod join;
 /// Sink operators that consume data batches
 pub mod sink;
 /// Source operators that generate data batches
@@ -14,12 +12,6 @@ pub mod source;
 /// Transform operators that mutate data batches
 pub mod transform;
 
-pub use join::{
-    ArrowJoinKeyExtractor, DEFAULT_JOIN_MEMORY_LIMIT, HashJoinTable, JoinKey, JoinKeyBatch,
-    JoinKeyExtractor, JoinKeyPart, JoinKeyRow, JoinMatch, JoinMemoryBudget, JoinPartitioner,
-    JoinRowRef, JoinSpillIdentity, JoinSpillWriter, VfsJoinSpillWriter, new_attempt_spill_path,
-    new_spill_path,
-};
 pub use sink::{CollectSink, DiscardSink};
 pub use source::{MemorySource, ScanSource};
 pub use transform::LimitTransform;

@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 thiserror = { workspace = true }
 arrow = { workspace = true }
-iceberg = { workspace = true }
 parser = { path = "../parser" }
 
 [dev-dependencies]

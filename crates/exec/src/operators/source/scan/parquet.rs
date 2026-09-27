@@ -1,7 +1,6 @@
 use crate::pipeline::{DataChunk, PipelineNode};
 use bytes::Bytes;
 use common::Result;
-use common::arrow::SelectionVector;
 use error::VeinError;
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
@@ -141,14 +140,7 @@ pub async fn execute_parquet_scan(
             batches += 1;
 
             tracing::trace!(rows = batch.num_rows(), "Pushing batch down pipeline");
-            let num_rows = batch.num_rows();
-            let vectors = batch.columns().to_vec();
-            let address_columns = vec![None; vectors.len()];
-            let chunk = DataChunk {
-                vectors,
-                selection: SelectionVector::new_dense(num_rows),
-                address_columns,
-            };
+            let chunk = DataChunk::from_record_batch(batch);
             let downstream_started = Instant::now();
             next.push(chunk)?;
             downstream_time += downstream_started.elapsed();

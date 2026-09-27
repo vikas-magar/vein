@@ -20,7 +20,11 @@ pub mod schema;
 /// Standard table metadata, storage formats, and statistics.
 pub mod metadata;
 
+/// Read-only catalog contracts used during query planning.
+pub mod catalog;
+
 pub use expr::{LogicalExpr, LogicalLiteral, Volatility};
+pub use catalog::{CatalogProvider, CatalogRevision, PlanningSession};
 pub use metadata::{
     ColumnStatistics, TableFormat, TableMetadata, TableMetadataRef, TableStatistics, TableType,
 };

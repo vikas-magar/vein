@@ -140,7 +140,6 @@ mod tests {
             byte_range: None,
             column_ids: vec![0],
             projected_schema: Vec::new(),
-            scan_predicates: Vec::new(),
             task_id: TaskId::new(),
             catalog_snapshot: None,
             shuffle_target_path: None,

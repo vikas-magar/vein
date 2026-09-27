@@ -12,7 +12,7 @@ use error::VeinError;
 use parser::ast::expr::BinaryOp;
 use parser::ast::pipe_op::JoinType;
 use plan::{
-    LogicalExpr, LogicalPlan, PlanTraversal, ResolvedColumn, TableFormat, VeinDataType, VeinSchema,
+    LogicalExpr, LogicalPlan, PlanTraversal, ResolvedColumn, VeinSchema,
 };
 
 use crate::builder::pipeline::{
@@ -123,18 +123,7 @@ impl JoinStageBuilder for DefaultJoinStageBuilder {
             ));
         }
 
-        let address_native = key_pairs.iter().all(|(left_column, right_column)| {
-            left_column.data_type == right_column.data_type
-                && supports_address_key(left_column, left.schema())
-                && supports_address_key(right_column, right.schema())
-                && address_key_available(left.as_ref(), left_column)
-                && address_key_available(right.as_ref(), right_column)
-        });
-        let key_mode = if address_native {
-            JoinKeyMode::AddressNative
-        } else {
-            JoinKeyMode::ValueNative
-        };
+        let key_mode = JoinKeyMode::ValueNative;
         let left_keys: Vec<JoinKeySpec> = key_pairs
             .iter()
             .map(|(left, _)| key_spec(left, key_mode))
@@ -410,64 +399,6 @@ fn key_spec(column: &ResolvedColumn, mode: JoinKeyMode) -> JoinKeySpec {
     }
 }
 
-fn supports_address_key(column: &ResolvedColumn, schema: &VeinSchema) -> bool {
-    schema.fields.iter().any(|field| field.id == column.id)
-        && matches!(
-            column.data_type,
-            VeinDataType::Boolean
-                | VeinDataType::Int8
-                | VeinDataType::Int16
-                | VeinDataType::Int32
-                | VeinDataType::Int64
-                | VeinDataType::UInt8
-                | VeinDataType::UInt16
-                | VeinDataType::UInt32
-                | VeinDataType::UInt64
-                | VeinDataType::Float32
-                | VeinDataType::Float64
-                | VeinDataType::Utf8
-                | VeinDataType::LargeUtf8
-                | VeinDataType::StringView
-                | VeinDataType::Binary
-                | VeinDataType::LargeBinary
-                | VeinDataType::BinaryView
-                | VeinDataType::Date32
-                | VeinDataType::Timestamp(_)
-        )
-}
-
-fn address_key_available(plan: &LogicalPlan, column: &ResolvedColumn) -> bool {
-    match plan {
-        LogicalPlan::Scan { table, schema, .. } => {
-            matches!(table.format.as_ref(), Some(TableFormat::Exo))
-                && supports_address_key(column, schema)
-        }
-        LogicalPlan::Filter { input, .. } | LogicalPlan::Write { input, .. } => {
-            address_key_available(input, column)
-        }
-        LogicalPlan::Project {
-            input,
-            exprs,
-            schema,
-        } => {
-            let Some(expression) = schema
-                .fields
-                .iter()
-                .zip(exprs.iter())
-                .find_map(|(field, expression)| (field.id == column.id).then_some(expression))
-            else {
-                return false;
-            };
-            let LogicalExpr::Column(source_column) = expression else {
-                return false;
-            };
-            address_key_available(input, source_column)
-        }
-        LogicalPlan::SubqueryAlias { input, .. } => address_key_available(input, column),
-        _ => false,
-    }
-}
-
 fn extract_equi_keys(
     predicate: &LogicalExpr,
     left_schema: &VeinSchema,
@@ -548,7 +479,7 @@ fn collect_equi_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plan::{ColumnId, TableMetadata, TableStatistics};
+    use plan::{ColumnId, TableFormat, TableMetadata, TableStatistics, VeinDataType};
     use std::sync::Arc;
 
     fn scan(column: ResolvedColumn, format: Option<TableFormat>) -> LogicalPlan {
@@ -576,8 +507,8 @@ mod tests {
             total_bytes: Some(64 * 1024),
             ..Default::default()
         };
-        let mut left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Exo));
-        let mut right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Exo));
+        let mut left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Parquet));
+        let mut right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Parquet));
         if let LogicalPlan::Scan { table, .. } = &mut left {
             Arc::make_mut(table).statistics = Some(stats.clone());
         }
@@ -590,8 +521,8 @@ mod tests {
 
     #[test]
     fn uses_conservative_fanout_without_statistics() {
-        let left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Exo));
-        let right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Exo));
+        let left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Parquet));
+        let right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Parquet));
 
         assert_eq!(
             choose_join_partition_count(&left, &right),
@@ -601,8 +532,8 @@ mod tests {
 
     #[test]
     fn uses_conservative_fanout_when_catalog_statistics_are_empty() {
-        let mut left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Exo));
-        let mut right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Exo));
+        let mut left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Parquet));
+        let mut right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Parquet));
         if let LogicalPlan::Scan { table, .. } = &mut left {
             Arc::make_mut(table).statistics = Some(TableStatistics::default());
         }
@@ -623,8 +554,8 @@ mod tests {
             total_bytes: Some(u64::MAX),
             ..Default::default()
         };
-        let mut left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Exo));
-        let mut right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Exo));
+        let mut left = scan(column(1, VeinDataType::Int64), Some(TableFormat::Parquet));
+        let mut right = scan(column(2, VeinDataType::Int64), Some(TableFormat::Parquet));
         if let LogicalPlan::Scan { table, .. } = &mut left {
             Arc::make_mut(table).statistics = Some(stats.clone());
         }
@@ -635,36 +566,6 @@ mod tests {
         assert_eq!(
             choose_join_partition_count(&left, &right),
             MAX_JOIN_PARTITIONS
-        );
-    }
-
-    #[test]
-    fn selects_address_native_only_for_exo_keys() {
-        let left_column = column(1, VeinDataType::Int64);
-        let right_column = column(2, VeinDataType::Int64);
-        let left = scan(left_column.clone(), Some(TableFormat::Exo));
-        let right = scan(right_column.clone(), Some(TableFormat::Exo));
-
-        assert!(address_key_available(&left, &left_column));
-        assert!(address_key_available(&right, &right_column));
-        assert_eq!(
-            key_spec(&left_column, JoinKeyMode::AddressNative).mode,
-            JoinKeyMode::AddressNative
-        );
-    }
-
-    #[test]
-    fn falls_back_to_value_native_when_one_side_lacks_addresses() {
-        let left_column = column(1, VeinDataType::Int64);
-        let right_column = column(2, VeinDataType::Int64);
-        let left = scan(left_column.clone(), Some(TableFormat::Exo));
-        let right = scan(right_column.clone(), Some(TableFormat::Parquet));
-
-        assert!(address_key_available(&left, &left_column));
-        assert!(!address_key_available(&right, &right_column));
-        assert_eq!(
-            key_spec(&right_column, JoinKeyMode::ValueNative).mode,
-            JoinKeyMode::ValueNative
         );
     }
 }

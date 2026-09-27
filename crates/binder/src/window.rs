@@ -226,8 +226,8 @@ mod tests {
 
     #[test]
     fn lifts_and_replaces() {
-        let catalog = vcs::InMemoryCatalog::new();
-        let registry = crate::testing::MockFunctionRegistry::new();
+        let catalog = crate::testing::TestCatalog::default();
+        let registry = crate::BuiltinFunctionRegistry::new();
         let mut ctx = crate::context::BinderContext::new(&catalog, &registry);
         let mut scopes = ScopeStack::new();
         let items = vec![(call(), Some("total".to_string()))];
@@ -243,8 +243,8 @@ mod tests {
 
     #[test]
     fn keeps_plain_items_untouched() {
-        let catalog = vcs::InMemoryCatalog::new();
-        let registry = crate::testing::MockFunctionRegistry::new();
+        let catalog = crate::testing::TestCatalog::default();
+        let registry = crate::BuiltinFunctionRegistry::new();
         let mut ctx = crate::context::BinderContext::new(&catalog, &registry);
         let mut scopes = ScopeStack::new();
         let items = vec![(col(7), None), (call(), None), (col(8), None)];

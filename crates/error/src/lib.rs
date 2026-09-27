@@ -32,10 +32,6 @@ pub enum VeinError {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
 
-    /// An Iceberg catalog error.
-    #[error("Iceberg error: {0}")]
-    Iceberg(#[from] iceberg::Error),
-
     /// Serialization or deserialization failure.
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -331,15 +327,6 @@ mod tests {
     fn test_internal_from_str() {
         let err: VeinError = "something broke".into();
         assert!(matches!(err, VeinError::Internal { .. }));
-    }
-
-    #[test]
-    fn test_from_iceberg() {
-        // Iceberg's own error type — verify the From path compiles
-        let _vein: VeinError = VeinError::Iceberg(iceberg::Error::new(
-            iceberg::ErrorKind::Unexpected,
-            "catalog error",
-        ));
     }
 
     #[test]

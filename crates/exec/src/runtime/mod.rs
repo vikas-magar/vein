@@ -19,7 +19,6 @@ use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, ExecuteTask, MicroProgram, VeinControlEvent};
-use distributed::TableWritePart;
 use error::VeinError;
 
 /// Operator telemetry and profiling.
@@ -44,8 +43,6 @@ pub struct TaskResult {
     pub output: Vec<RecordBatch>,
     /// Execution metrics (bytes read, duration).
     pub metrics: TaskMetrics,
-    /// Immutable physical parts produced by a storage sink.
-    pub write_parts: Vec<TableWritePart>,
 }
 
 /// Builds pipeline stages for a task from the wire protocol.
@@ -307,7 +304,6 @@ impl DefaultTaskExecutor {
                 bytes_read: source.bytes_read(),
                 duration_ns,
             },
-            write_parts: sink.write_parts(),
         })
     }
 }
@@ -409,100 +405,4 @@ mod tests {
         assert!(matches!(err, VeinError::Cancelled));
     }
 
-    #[tokio::test]
-    async fn runs_exo_native_table_scan_to_client() {
-        use common::protocol::{FieldSchema, FileFormat, FileScanTask};
-        use exo::PartWriter;
-        use tempfile::tempdir;
-
-        let dir = tempdir().unwrap();
-        let table_path = dir.path();
-
-        // Write a partition with "id" and "amount"
-        {
-            let mut writer = PartWriter::create(table_path, 0, 256).unwrap();
-            let ids: Vec<i64> = (1..=10).collect();
-            let amounts: Vec<f64> = (1..=10).map(|i| (i * 10) as f64).collect();
-            writer.write_primitive_column("id", &ids).unwrap();
-            writer.write_primitive_column("amount", &amounts).unwrap();
-            writer.finish().unwrap();
-        }
-
-        let scan_task = FileScanTask {
-            files: vec![table_path.to_string_lossy().to_string()],
-            format: FileFormat::Exo,
-            byte_range: None,
-            column_ids: vec![0, 1],
-            projected_schema: vec![
-                FieldSchema {
-                    field_id: 0,
-                    name: "id".to_string(),
-                    data_type: "Int64".to_string(),
-                },
-                FieldSchema {
-                    field_id: 1,
-                    name: "amount".to_string(),
-                    data_type: "Float64".to_string(),
-                },
-            ],
-            scan_predicates: Vec::new(),
-            task_id: TaskId::new(),
-            catalog_snapshot: None,
-            shuffle_target_path: None,
-        };
-
-        let task = ExecuteTask {
-            request_id: RequestId::new(),
-            mode: ExecutionMode::Batch,
-            task_id: TaskId::new(),
-            attempt: 0,
-            query_id: QueryId::new(),
-            stage_id: StageId::new(),
-            source: DataSource::File(scan_task),
-            program: MicroProgram {
-                register_count: 3,
-                instructions: vec![
-                    // Filter: amount > 50.0 (reg 1 is amount, reg 2 is const)
-                    MicroOp::LoadConstant {
-                        dst: 2,
-                        value: ScalarConstant::Float64(50.0),
-                    },
-                    MicroOp::CmpGt {
-                        dst: 2,
-                        src1: 1,
-                        src2: 2,
-                    },
-                    MicroOp::FilterMask { bool_reg: 2 },
-                    MicroOp::ProjectRegisters {
-                        out_regs: vec![0, 1],
-                    },
-                ],
-            },
-            sink: DataSink::Client { schema: vec![] },
-        };
-
-        let result = runner()
-            .execute(&task, CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(result.row_count, 5); // 60.0, 70.0, 80.0, 90.0, 100.0
-        assert_eq!(result.output.len(), 1);
-        let batch = &result.output[0];
-        assert_eq!(batch.num_columns(), 2);
-        assert_eq!(batch.num_rows(), 5);
-
-        let id_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        assert_eq!(id_col.values(), &[6, 7, 8, 9, 10]);
-
-        let amount_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
-            .unwrap();
-        assert_eq!(amount_col.values(), &[60.0, 70.0, 80.0, 90.0, 100.0]);
-    }
 }

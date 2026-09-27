@@ -31,8 +31,6 @@ pub enum TableType {
 /// The physical storage format of a table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TableFormat {
-    /// Native Vein Dual-Plane VFS table format (`exo`).
-    Exo,
     /// Apache Parquet columnar format.
     Parquet,
     /// Comma-separated values format.
@@ -53,7 +51,6 @@ impl TableFormat {
     /// Returns the canonical string representation of this format.
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Exo => "exo",
             Self::Parquet => "parquet",
             Self::Csv => "csv",
             Self::Json => "json",
@@ -74,7 +71,6 @@ impl std::fmt::Display for TableFormat {
 impl From<&str> for TableFormat {
     fn from(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "exo" => Self::Exo,
             "parquet" => Self::Parquet,
             "csv" => Self::Csv,
             "json" => Self::Json,

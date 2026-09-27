@@ -23,10 +23,9 @@ use super::join::{
 use super::task::{
     ArchivedCatalogSnapshotToken, ArchivedDataSink, ArchivedDataSource, ArchivedExecuteTask,
     ArchivedExecutionMode, ArchivedFieldSchema, ArchivedFileFormat, ArchivedFileScanTask,
-    ArchivedScanPredicate,
-    ArchivedScanPredicateValue, CatalogSnapshotToken, DataSink, DataSource, ExchangeSource,
+    CatalogSnapshotToken, DataSink, DataSource, ExchangeSource,
     ExecuteTask, ExecutionMode,
-    FieldSchema, FileFormat, FileScanTask, KeyValue, ScanPredicate, ScanPredicateValue,
+    FieldSchema, FileFormat, FileScanTask, KeyValue,
     ShuffleTarget, StorageTarget, StreamSource,
 };
 use crate::identifiers::{NodeId, QueryId, RequestId, StageId, TaskId};
@@ -275,7 +274,6 @@ impl From<&ArchivedFileFormat> for FileFormat {
             ArchivedFileFormat::Parquet => FileFormat::Parquet,
             ArchivedFileFormat::Csv => FileFormat::Csv,
             ArchivedFileFormat::Json => FileFormat::Json,
-            ArchivedFileFormat::Exo => FileFormat::Exo,
         }
     }
 }
@@ -286,43 +284,6 @@ impl From<&ArchivedFieldSchema> for FieldSchema {
             field_id: archived.field_id.to_native(),
             name: archived.name.as_str().to_string(),
             data_type: archived.data_type.as_str().to_string(),
-        }
-    }
-}
-
-impl From<&ArchivedScanPredicateValue> for ScanPredicateValue {
-    fn from(archived: &ArchivedScanPredicateValue) -> Self {
-        match archived {
-            ArchivedScanPredicateValue::Boolean(value) => Self::Boolean(*value),
-            ArchivedScanPredicateValue::Int64(value) => Self::Int64(value.to_native()),
-            ArchivedScanPredicateValue::Float64(value) => Self::Float64(value.to_native()),
-            ArchivedScanPredicateValue::String(value) => Self::String(value.as_str().to_string()),
-            ArchivedScanPredicateValue::Date(value) => Self::Date(value.to_native()),
-            ArchivedScanPredicateValue::Timestamp(value) => Self::Timestamp(value.to_native()),
-        }
-    }
-}
-
-impl From<&ArchivedScanPredicate> for ScanPredicate {
-    fn from(archived: &ArchivedScanPredicate) -> Self {
-        match archived {
-            ArchivedScanPredicate::Address {
-                column,
-                operator,
-                value,
-            } => Self::Address {
-                column: column.as_str().to_string(),
-                operator: operator.as_str().to_string(),
-                value: ScanPredicateValue::from(value),
-            },
-            ArchivedScanPredicate::AddressNull { column, is_null } => Self::AddressNull {
-                column: column.as_str().to_string(),
-                is_null: *is_null,
-            },
-            ArchivedScanPredicate::AddressIn { column, values } => Self::AddressIn {
-                column: column.as_str().to_string(),
-                values: values.iter().map(ScanPredicateValue::from).collect(),
-            },
         }
     }
 }
@@ -356,11 +317,6 @@ impl From<&ArchivedFileScanTask> for FileScanTask {
                 .projected_schema
                 .iter()
                 .map(FieldSchema::from)
-                .collect(),
-            scan_predicates: archived
-                .scan_predicates
-                .iter()
-                .map(ScanPredicate::from)
                 .collect(),
             task_id: TaskId::from_raw(archived.task_id.0.to_native()),
             catalog_snapshot: archived
@@ -400,7 +356,6 @@ impl From<&ArchivedJoinKeyMode> for JoinKeyMode {
     fn from(archived: &ArchivedJoinKeyMode) -> Self {
         match archived {
             ArchivedJoinKeyMode::Auto => Self::Auto,
-            ArchivedJoinKeyMode::AddressNative => Self::AddressNative,
             ArchivedJoinKeyMode::ValueNative => Self::ValueNative,
         }
     }

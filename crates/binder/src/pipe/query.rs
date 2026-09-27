@@ -2,7 +2,7 @@ use crate::context::BinderContext;
 use crate::scope::ScopeStack;
 use error::Result;
 use parser::ast::query::{Query, QueryNode};
-use plan::{LogicalPlan, PlanTraversal};
+use plan::{CatalogProvider, LogicalPlan, PlanTraversal};
 
 use crate::scope::Scope;
 use parser::ast::pipe_op::PipeOperator;
@@ -25,25 +25,25 @@ use std::sync::Arc;
 
 /// Binds SQL query clauses into LogicalPlans
 pub struct QueryBinder {
-    catalog: Arc<dyn vcs::CatalogReader>,
+    catalog: Arc<dyn CatalogProvider>,
     functions: Arc<dyn FunctionRegistry>,
 }
 
 impl QueryBinder {
     /// Creates a new QueryBinder with the required dependencies
-    pub fn new(catalog: Arc<dyn vcs::CatalogReader>, functions: Arc<dyn FunctionRegistry>) -> Self {
+    pub fn new(catalog: Arc<dyn CatalogProvider>, functions: Arc<dyn FunctionRegistry>) -> Self {
         Self { catalog, functions }
     }
 
     /// Access the underlying table catalog.
-    pub fn catalog(&self) -> &Arc<dyn vcs::CatalogReader> {
+    pub fn catalog(&self) -> &Arc<dyn CatalogProvider> {
         &self.catalog
     }
 }
 
 #[async_trait]
 impl LogicalBinder for QueryBinder {
-    fn catalog(&self) -> Option<&Arc<dyn vcs::CatalogReader>> {
+    fn catalog(&self) -> Option<&Arc<dyn CatalogProvider>> {
         Some(&self.catalog)
     }
 
@@ -79,7 +79,7 @@ impl LogicalBinder for QueryBinder {
 
         Ok(BoundQuery {
             plan,
-            catalog_revision: context.planning_session.catalog_revision,
+            catalog_revision: context.planning_session.revision,
         })
     }
 }

@@ -4,10 +4,41 @@ use crate::traits::{
 };
 use error::VeinError;
 use parser::parser::Parser;
-use plan::{LogicalPlan, VeinDataType, Volatility};
+use plan::{CatalogProvider, LogicalPlan, ResolvedColumn, TableMetadata, VeinDataType, VeinSchema, Volatility};
 use std::collections::HashMap;
 use std::sync::Arc;
-use vcs::InMemoryCatalog;
+use async_trait::async_trait;
+
+/// Minimal fixture catalog used by binder unit tests.
+#[derive(Default)]
+pub(crate) struct TestCatalog {
+    tables: HashMap<String, Arc<TableMetadata>>,
+}
+
+impl TestCatalog {
+    fn with_fixtures() -> Self {
+        let mut catalog = Self::default();
+        catalog.add_table("users", &[("id", VeinDataType::Int64), ("name", VeinDataType::Utf8), ("age", VeinDataType::Int64)]);
+        catalog.add_table("orders", &[("id", VeinDataType::Int64), ("user_id", VeinDataType::Int64), ("amount", VeinDataType::Float64)]);
+        catalog
+    }
+
+    fn add_table(&mut self, name: &str, columns: &[(&str, VeinDataType)]) {
+        let schema = VeinSchema::new(columns.iter().enumerate().map(|(id, (column, data_type))| {
+            ResolvedColumn::new(plan::ColumnId(id), *column, Some(name.to_owned()), data_type.clone())
+        }).collect());
+        self.tables.insert(name.to_owned(), Arc::new(TableMetadata::new(name, Arc::new(schema))));
+    }
+}
+
+#[async_trait]
+impl CatalogProvider for TestCatalog {
+    async fn get_table(&self, name: &str) -> error::Result<Arc<TableMetadata>> {
+        self.tables.get(name).cloned().ok_or_else(|| {
+            VeinError::not_found(format!("table '{name}' is not registered in test catalog"))
+        })
+    }
+}
 
 /// Defines the built-in functions a fresh [`MockFunctionRegistry`] knows.
 fn builtin(
@@ -132,7 +163,7 @@ pub async fn plan(sql: &str) -> error::Result<LogicalPlan> {
         .map_err(|e| VeinError::semantic(format!("parse error: {e}"), parse_error_span(&e)))?;
 
     QueryBinder::new(
-        Arc::new(InMemoryCatalog::new()),
+        Arc::new(TestCatalog::with_fixtures()),
         Arc::new(MockFunctionRegistry::new()),
     )
     .bind(&node)

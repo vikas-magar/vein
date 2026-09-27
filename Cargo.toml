@@ -1,50 +1,24 @@
-[package]
-name = "vein"
-version = "0.1.0"
-edition = "2024"
-
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/types", "crates/vcs", "crates/distributed", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/orchestrator", "crates/cli", "crates/vfs", "crates/ebpf", "crates/plan", "crates/physical", "crates/optimizer", "crates/exo"]
+members = ["crates/common", "crates/types", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/cli", "crates/plan", "crates/optimizer", "crates/physical"]
+default-members = ["crates/cli"]
 
 [workspace.dependencies]
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["full"] }
-arrow = "59.1.0"
-parquet = { version = "59.1.0", features = ["async", "arrow"] }
+arrow = "60.0.0"
+parquet = { version = "60.0.0", features = ["async", "arrow"] }
 opendal = "0.45"
-s2n-quic = { version = "1.83.0", features = ["provider-tls-rustls"] }
 bytes = "1.0"
-libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2.0.19"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 rkyv = { version = "=0.8.17", features = ["alloc", "bytecheck"] }
 futures = "0.3"
 rand = "0.8"
-moka = { version = "0.12", features = ["future"] }
-iceberg = "0.10.0"
-iceberg-storage-opendal = { version = "0.10.0", features = ["opendal-fs", "opendal-s3"] }
-strum = { version = "0.28.0", features = ["derive"] }
 ordered-float = "5.3.0"
-openraft = { version = "0.9.25", features = ["serde"] }
-
-[dependencies]
-common = { path = "crates/common" }
-exo = { path = "crates/exo" }
-tokio = { workspace = true, features = ["full"] }
-s2n-quic = { workspace = true }
-bytes = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rkyv = { workspace = true }
-arrow = { workspace = true, features = ["prettyprint"] }
-vfs = { path = "crates/vfs" }
-exec = { path = "crates/exec" }
-parquet = { workspace = true }
-opendal = { workspace = true }
-tempfile = "3"
+strum = { version = "0.28.0", features = ["derive"] }
 
 [profile.release]
 opt-level = 3

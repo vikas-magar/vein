@@ -8,7 +8,6 @@ missing_docs = "deny"
 
 [dependencies]
 plan = { path = "../plan" }
-vcs = { path = "../vcs" }
 error = { path = "../error" }
 parser = { path = "../parser" }
 async-trait = { workspace = true }

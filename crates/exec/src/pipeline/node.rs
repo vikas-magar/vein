@@ -2,7 +2,6 @@
 
 use arrow::record_batch::RecordBatch;
 use common::Result;
-use distributed::TableWritePart;
 
 /// The synchronous trait implemented by all CPU-bound operators (Transforms
 /// and Sinks).
@@ -54,8 +53,4 @@ pub trait Sink<B>: PipelineNode<B> {
         0
     }
 
-    /// Returns immutable table-write descriptors produced by this sink.
-    fn write_parts(&mut self) -> Vec<TableWritePart> {
-        Vec::new()
-    }
 }

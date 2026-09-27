@@ -10,6 +10,9 @@
 /// Core traits for binder and function registry.
 pub mod traits;
 
+/// Built-in and user-registered function signatures.
+pub mod functions;
+
 /// Evaluation semantics for pipe operators over bound plans.
 pub mod pipe;
 
@@ -35,9 +38,11 @@ pub mod window;
 pub mod context;
 
 /// Testing utilities (mock function registry, end-to-end bind helper).
+#[cfg(test)]
 pub mod testing;
 
 pub use pipe::query::QueryBinder;
+pub use functions::BuiltinFunctionRegistry;
 pub use traits::{FunctionKind, FunctionRegistry, FunctionSignature, LogicalBinder, RuntimeKind};
 
 #[cfg(test)]

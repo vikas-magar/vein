@@ -28,7 +28,6 @@ pub use vcs_exchange::{VcsExchangeRequest, VcsExchangeResponse};
 pub use task::{
     ArchivedCatalogSnapshotToken, ArchivedExecuteTask, CatalogSnapshotToken, DataSink, DataSource,
     ExchangeSource, ExecuteTask, ExecutionMode, FieldSchema, FileFormat, FileScanTask, KeyValue,
-    ScanPredicate, ScanPredicateValue,
     ShuffleTarget, StorageTarget, StreamSource,
 };
 
@@ -41,7 +40,7 @@ pub use control::{
 // Re-export RPC types
 pub use rpc::{
     ArchivedProtocolRequest, ArchivedProtocolResponse, MasterCommand, PreemptResponse,
-    ProtocolRequest, ProtocolResponse, VfsRequest,
+    ProtocolRequest, ProtocolResponse,
 };
 
 #[cfg(test)]
@@ -104,7 +103,6 @@ mod tests {
                 byte_range: None,
                 column_ids: vec![0, 1],
                 projected_schema: vec![],
-                scan_predicates: Vec::new(),
                 task_id: TaskId::new(),
                 catalog_snapshot: None,
                 shuffle_target_path: None,

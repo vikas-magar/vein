@@ -1,12 +1,11 @@
 use crate::traits::FunctionRegistry;
-use plan::{ColumnId, LogicalPlan};
+use plan::{CatalogProvider, ColumnId, LogicalPlan, PlanningSession};
 use std::collections::HashMap;
-use vcs::{CatalogReader, PlanningSession};
 
 /// Context for the binder, holding references to external catalogs and functions.
 pub struct BinderContext<'a> {
     /// The global catalog for resolving table schemas
-    pub catalog: &'a dyn CatalogReader,
+    pub catalog: &'a dyn CatalogProvider,
     /// The registry for resolving functions
     pub functions: &'a dyn FunctionRegistry,
     /// Immutable catalog metadata pinned for the current query.
@@ -19,17 +18,17 @@ pub struct BinderContext<'a> {
 
 impl<'a> BinderContext<'a> {
     /// Creates a binder context at the initial catalog revision.
-    pub fn new(catalog: &'a dyn CatalogReader, functions: &'a dyn FunctionRegistry) -> Self {
+    pub fn new(catalog: &'a dyn CatalogProvider, functions: &'a dyn FunctionRegistry) -> Self {
         Self::with_planning_session(
             catalog,
             functions,
-            PlanningSession::new(vcs::CatalogRevision::default()),
+            PlanningSession::new(plan::CatalogRevision::default()),
         )
     }
 
     /// Creates a binder context with an already pinned planning session.
     pub fn with_planning_session(
-        catalog: &'a dyn CatalogReader,
+        catalog: &'a dyn CatalogProvider,
         functions: &'a dyn FunctionRegistry,
         planning_session: PlanningSession,
     ) -> Self {

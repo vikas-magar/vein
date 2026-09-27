@@ -5,31 +5,20 @@ edition = "2024"
 
 [dependencies]
 common = { path = "../common" }
-distributed = { path = "../distributed" }
-openraft = { workspace = true }
-orchestrator = { path = "../orchestrator" }
 exec = { path = "../exec" }
 error = { path = "../error" }
 binder = { path = "../binder" }
 plan = { path = "../plan" }
 physical = { path = "../physical" }
-vcs = { path = "../vcs" }
 optimizer = { path = "../optimizer" }
 parser = { path = "../parser" }
-
-tokio = { workspace = true, features = ["full", "rt-multi-thread"] }
-tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.4", features = ["derive"] }
-rkyv = { workspace = true }
-s2n-quic = { workspace = true }
-bytes = "1.0"
 async-trait.workspace = true
-arrow = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint"] }
 futures = { workspace = true }
-
-exo = { path = "../exo" }
-vfs = { path = "../vfs" }
+async-stream = "0.3"
+flume = "0.12"
+parquet = { workspace = true }
+tokio = { workspace = true, features = ["full", "rt-multi-thread"] }
 
 [dev-dependencies]
 tempfile = "3"

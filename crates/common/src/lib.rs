@@ -13,11 +13,7 @@ pub mod system;
 
 /// Shared structured logging initialization.
 pub mod logging;
-/// AF_XDP logic for network processing.
-#[cfg(target_os = "linux")]
-pub mod xdp;
-
-/// Inter-node protocol types.
+/// Execution program and task types shared with the local runtime.
 pub mod protocol;
 
 /// Partition set for shuffle stage routing.
@@ -35,6 +31,3 @@ pub use result_stream::{
 
 /// Re-export unified error type from the `error` crate.
 pub use error::{Result, VeinError};
-
-/// Transport layer abstractions and implementations
-pub mod transport;
