@@ -445,7 +445,6 @@ impl From<&ArchivedJoinSource> for JoinSource {
             join_type: PhysicalJoinType::from(&archived.join_type),
             left_keys: archived.left_keys.iter().map(JoinKeySpec::from).collect(),
             right_keys: archived.right_keys.iter().map(JoinKeySpec::from).collect(),
-            requires_exact_verification: archived.requires_exact_verification,
             left_schema: archived.left_schema.iter().map(FieldSchema::from).collect(),
             right_schema: archived
                 .right_schema

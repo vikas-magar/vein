@@ -135,7 +135,7 @@ pub struct ExoVaultWriter<W: Write + Seek = File> {
     writer: W,
     path: Option<PathBuf>,
     granule_size: usize,
-    offsets: Vec<u32>,
+    offsets: Vec<u8>,
     payload_arena: Vec<u8>,
     validity: Vec<bool>,
     marks: Vec<VaultGranuleMark>,
@@ -150,12 +150,15 @@ impl ExoVaultWriter<File> {
         let mut file = File::create(path)?;
         let placeholder = [0u8; HEADER_SIZE];
         file.write_all(&placeholder)?;
+        let offsets_capacity = granule_size.checked_mul(4).ok_or_else(|| {
+            ExoError::CodecError("Vault granule offset capacity overflows usize".to_string())
+        })?;
 
         Ok(Self {
             writer: file,
             path: Some(path.to_path_buf()),
             granule_size,
-            offsets: Vec::with_capacity(granule_size),
+            offsets: Vec::with_capacity(offsets_capacity),
             payload_arena: Vec::with_capacity(granule_size * 64),
             validity: Vec::with_capacity(granule_size),
             marks: Vec::new(),
@@ -177,12 +180,15 @@ impl ExoVaultWriter<std::io::Cursor<Vec<u8>>> {
         let mut cursor = std::io::Cursor::new(Vec::new());
         let placeholder = [0u8; HEADER_SIZE];
         cursor.write_all(&placeholder)?;
+        let offsets_capacity = granule_size.checked_mul(4).ok_or_else(|| {
+            ExoError::CodecError("Vault granule offset capacity overflows usize".to_string())
+        })?;
 
         Ok(Self {
             writer: cursor,
             path: None,
             granule_size,
-            offsets: Vec::with_capacity(granule_size),
+            offsets: Vec::with_capacity(offsets_capacity),
             payload_arena: Vec::with_capacity(granule_size * 64),
             validity: Vec::with_capacity(granule_size),
             marks: Vec::new(),
@@ -202,12 +208,12 @@ impl ExoVaultWriter<std::io::Cursor<Vec<u8>>> {
 impl<W: Write + Seek> ExoVaultWriter<W> {
     /// Flushes the buffered rows for the current granule into a discrete block.
     fn flush_granule(&mut self) -> ExoResult<()> {
-        if self.offsets.len() == 0 {
+        if self.offsets.is_empty() {
             return Ok(());
         }
 
         let byte_offset = self.writer.stream_position()?;
-        let num_rows = self.offsets.len();
+        let num_rows = self.offsets.len() / std::mem::size_of::<u32>();
         let has_nulls = self.validity.iter().any(|&v| !v);
 
         // 1. Build validity bitmask if granule contains nulls
@@ -221,10 +227,21 @@ impl<W: Write + Seek> ExoVaultWriter<W> {
             }
         }
 
-        let offsets_bytes_len = (num_rows * 4) as u32;
-        let payload_bytes_len = self.payload_arena.len() as u32;
-        let total_uncompressed_len =
-            (validity_bytes_len as u32) + offsets_bytes_len + payload_bytes_len;
+        let offsets_bytes_len = u32::try_from(self.offsets.len()).map_err(|_| {
+            ExoError::CodecError("Vault offsets exceed the format's u32 length limit".to_string())
+        })?;
+        let payload_bytes_len = u32::try_from(self.payload_arena.len()).map_err(|_| {
+            ExoError::CodecError("Vault payload exceeds the format's u32 length limit".to_string())
+        })?;
+        let total_uncompressed_len = u32::try_from(validity_bytes_len)
+            .ok()
+            .and_then(|validity_len| validity_len.checked_add(offsets_bytes_len))
+            .and_then(|length| length.checked_add(payload_bytes_len))
+            .ok_or_else(|| {
+                ExoError::CodecError(
+                    "Vault granule exceeds the format's u32 length limit".to_string(),
+                )
+            })?;
 
         // 3. Write 16-byte Granule Block Header
         let mut granule_header = [0u8; GRANULE_HEADER_SIZE];
@@ -238,9 +255,7 @@ impl<W: Write + Seek> ExoVaultWriter<W> {
         if has_nulls {
             hasher.update(&validity_bytes);
         }
-        for off in &self.offsets {
-            hasher.update(&off.to_le_bytes());
-        }
+        hasher.update(&self.offsets);
         hasher.update(&self.payload_arena);
         let crc = hasher.finalize();
         granule_header[12..16].copy_from_slice(&crc.to_le_bytes());
@@ -253,9 +268,7 @@ impl<W: Write + Seek> ExoVaultWriter<W> {
         }
 
         // 5. Write offsets table
-        for off in &self.offsets {
-            self.writer.write_all(&off.to_le_bytes())?;
-        }
+        self.writer.write_all(&self.offsets)?;
 
         // 6. Write raw payload
         self.writer.write_all(&self.payload_arena)?;
@@ -327,7 +340,30 @@ impl<W: Write + Seek> ExoVaultWriter<W> {
 
 impl<W: Write + Seek> VaultWriter for ExoVaultWriter<W> {
     fn append_opt_bytes(&mut self, payload: Option<&[u8]>) -> ExoResult<()> {
-        self.offsets.push(self.payload_arena.len() as u32);
+        let offset = u32::try_from(self.payload_arena.len()).map_err(|_| {
+            ExoError::CodecError("Vault payload offset exceeds the format's u32 limit".to_string())
+        })?;
+        let payload_len = payload.map_or(0, <[u8]>::len);
+        let next_payload_len = self
+            .payload_arena
+            .len()
+            .checked_add(payload_len)
+            .filter(|&len| u32::try_from(len).is_ok())
+            .ok_or_else(|| {
+                ExoError::CodecError(
+                    "Vault granule payload exceeds the format's u32 limit".to_string(),
+                )
+            })?;
+        self.payload_arena
+            .try_reserve(payload_len)
+            .map_err(|error| {
+                ExoError::CodecError(format!("cannot reserve vault granule payload: {error}"))
+            })?;
+        let next_rows = self
+            .total_rows
+            .checked_add(1)
+            .ok_or_else(|| ExoError::CodecError("Vault total row count exceeds u64".to_string()))?;
+        self.offsets.extend_from_slice(&offset.to_le_bytes());
         match payload {
             Some(p) => {
                 self.payload_arena.extend_from_slice(p);
@@ -337,9 +373,10 @@ impl<W: Write + Seek> VaultWriter for ExoVaultWriter<W> {
                 self.validity.push(false);
             }
         }
-        self.total_rows += 1;
+        debug_assert_eq!(self.payload_arena.len(), next_payload_len);
+        self.total_rows = next_rows;
 
-        if self.offsets.len() >= self.granule_size {
+        if self.offsets.len() / std::mem::size_of::<u32>() >= self.granule_size {
             self.flush_granule()?;
         }
         Ok(())

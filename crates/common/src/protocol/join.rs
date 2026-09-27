@@ -84,8 +84,6 @@ pub struct JoinSource {
     pub left_keys: Vec<JoinKeySpec>,
     /// Right join keys, in comparison order.
     pub right_keys: Vec<JoinKeySpec>,
-    /// Whether exact verification is required after candidate-key matching.
-    pub requires_exact_verification: bool,
     /// Schema of the left exchange stream.
     pub left_schema: Vec<FieldSchema>,
     /// Schema of the right exchange stream.

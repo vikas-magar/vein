@@ -15,7 +15,10 @@ pub use streaming::StreamingPartitionWriter;
 
 use ::types::{VeinSchema, VeinSchemaRef};
 use arrow::record_batch::RecordBatch;
-use exo::{AddressGranuleMark, AddressHeader, PartReader, VaultGranuleMark, VaultHeader};
+use exo::{
+    AddressGranuleMark, AddressHeader, PartReader, VaultGranuleMark, VaultHeader,
+    classify_storage,
+};
 
 use crate::block::{BlockKey, BlockManager, MmapBlockManager, PlaneType};
 use crate::metadata::{Extent, MetadataEngine, MetadataFileUpdate, RedbMetadataEngine};
@@ -723,6 +726,11 @@ impl VfsTableStore {
 
         for field in &schema.fields {
             let col_name = &field.name;
+            let storage = classify_storage(&field.data_type.to_arrow()).ok_or_else(|| {
+                VfsError::Internal(format!(
+                    "EXO has no storage classification for column '{col_name}'"
+                ))
+            })?;
 
             // 1. Read address plane bytes from VFS blocks
             let addr_key = BlockKey {
@@ -732,31 +740,33 @@ impl VfsTableStore {
             };
             let addr_path = addr_key.to_canonical_path();
             let addr_extents = self.metadata_engine.get_file(&addr_path).await?;
-            if !addr_extents.is_empty() {
-                let mut addr_bytes = Vec::new();
-                for extent in &addr_extents {
-                    let chunk = self.block_manager.read_extent(extent).await?;
-                    addr_bytes.extend_from_slice(&chunk);
-                }
-                addr_buffers.insert(col_name.clone(), addr_bytes);
+            if addr_extents.is_empty() {
+                return Err(VfsError::NotFound(addr_path));
             }
+            let mut addr_bytes = Vec::new();
+            for extent in &addr_extents {
+                let chunk = self.block_manager.read_extent(extent).await?;
+                addr_bytes.extend_from_slice(&chunk);
+            }
+            addr_buffers.insert(col_name.clone(), addr_bytes);
 
-            // 2. Read payload vault bytes from VFS blocks (if column has variable-length payload)
-            let vault_key = BlockKey {
-                segment: crate::block::SegmentKey::new(table_id, part_id),
-                column_name: col_name.clone(),
-                plane: PlaneType::PayloadVault,
-            };
-            let vault_path = vault_key.to_canonical_path();
-            if let Ok(vault_extents) = self.metadata_engine.get_file(&vault_path).await {
-                if !vault_extents.is_empty() {
-                    let mut vault_bytes = Vec::new();
-                    for extent in &vault_extents {
-                        let chunk = self.block_manager.read_extent(extent).await?;
-                        vault_bytes.extend_from_slice(&chunk);
-                    }
-                    vault_buffers.insert(col_name.clone(), vault_bytes);
+            if storage.uses_vault() {
+                let vault_key = BlockKey {
+                    segment: crate::block::SegmentKey::new(table_id, part_id),
+                    column_name: col_name.clone(),
+                    plane: PlaneType::PayloadVault,
+                };
+                let vault_path = vault_key.to_canonical_path();
+                let vault_extents = self.metadata_engine.get_file(&vault_path).await?;
+                if vault_extents.is_empty() {
+                    return Err(VfsError::NotFound(vault_path));
                 }
+                let mut vault_bytes = Vec::new();
+                for extent in &vault_extents {
+                    let chunk = self.block_manager.read_extent(extent).await?;
+                    vault_bytes.extend_from_slice(&chunk);
+                }
+                vault_buffers.insert(col_name.clone(), vault_bytes);
             }
         }
 
@@ -767,21 +777,17 @@ impl VfsTableStore {
             plane: PlaneType::Tombstone,
         };
         let tomb_path = tomb_key.to_canonical_path();
-        let tomb_extents = self
-            .metadata_engine
-            .get_file(&tomb_path)
-            .await
-            .unwrap_or_default();
-        let tombstones = if !tomb_extents.is_empty() {
-            let mut tomb_bytes = Vec::new();
-            for extent in &tomb_extents {
-                if let Ok(chunk) = self.block_manager.read_extent(extent).await {
+        let tombstones = match self.metadata_engine.get_file(&tomb_path).await {
+            Ok(tomb_extents) if !tomb_extents.is_empty() => {
+                let mut tomb_bytes = Vec::new();
+                for extent in &tomb_extents {
+                    let chunk = self.block_manager.read_extent(extent).await?;
                     tomb_bytes.extend_from_slice(&chunk);
                 }
+                Some(exo::TombstoneMask::from_bytes(&tomb_bytes)?)
             }
-            exo::TombstoneMask::from_bytes(&tomb_bytes).ok()
-        } else {
-            None
+            Ok(_) | Err(VfsError::NotFound(_)) => None,
+            Err(error) => return Err(error),
         };
 
         PartReader::from_buffers(part_id, addr_buffers, vault_buffers, tombstones)
@@ -812,8 +818,13 @@ impl VfsTableStore {
         batch: &RecordBatch,
     ) -> Result<VfsPartitionSummary> {
         let table_id = Self::resolve_table_id(table_name_or_id);
-        let existing = self.resolve_table_parts(table_id).await.unwrap_or_default();
-        let next_part_id = existing.iter().max().map(|m| m + 1).unwrap_or(0);
+        let existing = self.resolve_table_parts(table_id).await?;
+        let next_part_id = match existing.iter().max() {
+            Some(part_id) => part_id
+                .checked_add(1)
+                .ok_or_else(|| VfsError::Internal("partition ID overflow".to_string()))?,
+            None => 0,
+        };
         let started = std::time::Instant::now();
         let result = self.write_partition(table_id, next_part_id, batch).await;
         match &result {
@@ -866,30 +877,89 @@ impl VfsTableStore {
             return Err(VfsError::NotFound(schema_path));
         }
         let schema = self.read_table_schema(staging_id).await?;
+        let mut visible_parts = if overwrite {
+            Vec::new()
+        } else {
+            self.resolve_table_parts(visible_id).await?
+        };
+        if !overwrite {
+            match self.read_table_schema(visible_id).await {
+                Ok(visible_schema) if visible_schema.as_ref() != schema.as_ref() => {
+                    return Err(VfsError::Internal(format!(
+                        "cannot append staged table '{staging_table}' to '{visible_table}' with a different schema"
+                    )));
+                }
+                Ok(_) | Err(VfsError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let mut destination_ids = Vec::with_capacity(staged_parts.len());
+        if overwrite {
+            destination_ids.extend(staged_parts.iter().copied());
+        } else {
+            let first_part_id = match visible_parts.iter().max() {
+                Some(part_id) => part_id
+                    .checked_add(1)
+                    .ok_or_else(|| VfsError::Internal("partition ID overflow".to_string()))?,
+                None => 0,
+            };
+            for offset in 0..staged_parts.len() {
+                let offset = u32::try_from(offset)
+                    .map_err(|_| VfsError::Internal("partition ID overflow".to_string()))?;
+                destination_ids.push(
+                    first_part_id
+                        .checked_add(offset)
+                        .ok_or_else(|| VfsError::Internal("partition ID overflow".to_string()))?,
+                );
+            }
+        }
+
+        let mut total_rows = 0u64;
+        for part_id in &staged_parts {
+            total_rows = total_rows
+                .checked_add(
+                    self.open_partition_reader(staging_id, *part_id)
+                        .await?
+                        .total_rows(),
+                )
+                .ok_or_else(|| VfsError::Internal("published row count overflow".to_string()))?;
+        }
+
         let mut metadata_updates = vec![MetadataFileUpdate {
             path: format!("tbl_{visible_id}/_schema.json"),
             extents: schema_extents.clone(),
         }];
         let mut aliased_extents = schema_extents.len();
-        for part_id in &staged_parts {
+        for (staged_part_id, visible_part_id) in staged_parts.iter().zip(&destination_ids) {
             for field in &schema.fields {
+                let storage = classify_storage(&field.data_type.to_arrow()).ok_or_else(|| {
+                    VfsError::Internal(format!(
+                        "EXO has no storage classification for column '{}'",
+                        field.name
+                    ))
+                })?;
                 for plane in [PlaneType::AddressPlane, PlaneType::PayloadVault] {
                     let source = BlockKey {
-                        segment: crate::block::SegmentKey::new(staging_id, *part_id),
+                        segment: crate::block::SegmentKey::new(staging_id, *staged_part_id),
                         column_name: field.name.clone(),
                         plane,
                     }
                     .to_canonical_path();
                     let destination = BlockKey {
-                        segment: crate::block::SegmentKey::new(visible_id, *part_id),
+                        segment: crate::block::SegmentKey::new(visible_id, *visible_part_id),
                         column_name: field.name.clone(),
                         plane,
                     }
                     .to_canonical_path();
-                    let extents = match self.metadata_engine.get_file(&source).await {
-                        Ok(extents) => extents,
-                        Err(VfsError::NotFound(_)) => Vec::new(),
-                        Err(error) => return Err(error),
+                    let extents = if plane == PlaneType::PayloadVault && !storage.uses_vault() {
+                        Vec::new()
+                    } else {
+                        let extents = self.metadata_engine.get_file(&source).await?;
+                        if extents.is_empty() {
+                            return Err(VfsError::NotFound(source));
+                        }
+                        extents
                     };
                     if !extents.is_empty() {
                         aliased_extents += extents.len();
@@ -902,16 +972,7 @@ impl VfsTableStore {
             }
         }
 
-        let mut visible_parts = if overwrite {
-            Vec::new()
-        } else {
-            match self.resolve_table_parts(visible_id).await {
-                Ok(parts) => parts,
-                Err(VfsError::NotFound(_)) => Vec::new(),
-                Err(error) => return Err(error),
-            }
-        };
-        visible_parts.extend(staged_parts.iter().copied());
+        visible_parts.extend(destination_ids.iter().copied());
         visible_parts.sort_unstable();
         visible_parts.dedup();
         let parts_json = serde_json::to_vec(&visible_parts).map_err(|error| {
@@ -930,20 +991,13 @@ impl VfsTableStore {
             .replace_files_atomically(metadata_updates)
             .await?;
 
-        let mut total_rows = 0;
-        for part_id in &staged_parts {
-            total_rows += self
-                .open_partition_reader(staging_id, *part_id)
-                .await?
-                .total_rows();
-        }
         tracing::info!(
             target: "vein.audit",
             event = "vfs_staged_table_published",
             staging_table = %staging_table,
             visible_table = %visible_table,
             table_id = visible_id,
-            partitions = staged_parts.len(),
+            partitions = destination_ids.len(),
             rows = total_rows,
             extents = aliased_extents,
             overwrite,
@@ -951,7 +1005,7 @@ impl VfsTableStore {
         );
         Ok(VfsTablePublication {
             table_id: visible_id,
-            part_ids: staged_parts,
+            part_ids: destination_ids,
             total_rows,
             extent_count: aliased_extents,
         })
@@ -1176,6 +1230,95 @@ mod tests {
         assert_eq!(payload_reader.read_opt_bytes_slot(0)?, Some(&b"one"[..]));
         assert_eq!(payload_reader.read_opt_bytes_slot(1)?, None);
         assert_eq!(payload_reader.read_opt_bytes_slot(2)?, Some(&b"three"[..]));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_append_allocates_new_visible_partitions_and_overwrite_replaces_them() -> Result<()> {
+        fn int_batch(name: &str, value: i64) -> Result<RecordBatch> {
+            let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+            let values = Arc::new(Int64Array::from(vec![value]));
+            RecordBatch::try_new(schema, vec![values])
+                .map_err(|error| VfsError::Internal(error.to_string()))
+        }
+
+        let dir = tempdir()?;
+        let store = VfsTableStore::init(&create_test_config(dir.path())).await?;
+        let visible_id = VfsTableStore::resolve_table_id("append_target");
+
+        let initial_staging = "append_initial_stage";
+        store
+            .write_partition(
+                VfsTableStore::resolve_table_id(initial_staging),
+                0,
+                &int_batch("id", 10)?,
+            )
+            .await?;
+        store
+            .publish_staged_table(initial_staging, "append_target", true)
+            .await?;
+
+        let append_staging = "append_next_stage";
+        store
+            .write_partition(
+                VfsTableStore::resolve_table_id(append_staging),
+                0,
+                &int_batch("id", 20)?,
+            )
+            .await?;
+        let appended = store
+            .publish_staged_table(append_staging, "append_target", false)
+            .await?;
+
+        assert_eq!(appended.part_ids, vec![1]);
+        assert_eq!(store.resolve_table_parts(visible_id).await?, vec![0, 1]);
+        assert_eq!(
+            exo::i64_from_canonical(
+                store.open_partition_reader(visible_id, 0).await?.read_primitive_slot("id", 0)?
+            ),
+            10
+        );
+        assert_eq!(
+            exo::i64_from_canonical(
+                store.open_partition_reader(visible_id, 1).await?.read_primitive_slot("id", 0)?
+            ),
+            20
+        );
+
+        let incompatible_staging = "append_incompatible_stage";
+        store
+            .write_partition(
+                VfsTableStore::resolve_table_id(incompatible_staging),
+                0,
+                &int_batch("other", 30)?,
+            )
+            .await?;
+        assert!(store
+            .publish_staged_table(incompatible_staging, "append_target", false)
+            .await
+            .is_err());
+        assert_eq!(store.resolve_table_parts(visible_id).await?, vec![0, 1]);
+
+        let replacement_staging = "append_replacement_stage";
+        store
+            .write_partition(
+                VfsTableStore::resolve_table_id(replacement_staging),
+                0,
+                &int_batch("id", 40)?,
+            )
+            .await?;
+        let replacement = store
+            .publish_staged_table(replacement_staging, "append_target", true)
+            .await?;
+        assert_eq!(replacement.part_ids, vec![0]);
+        assert_eq!(store.resolve_table_parts(visible_id).await?, vec![0]);
+        assert_eq!(
+            exo::i64_from_canonical(
+                store.open_partition_reader(visible_id, 0).await?.read_primitive_slot("id", 0)?
+            ),
+            40
+        );
 
         Ok(())
     }

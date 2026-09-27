@@ -185,6 +185,7 @@ impl ColumnWriter {
         T::Native: ExactValueCodec,
     {
         let values = downcast::<PrimitiveArray<T>>(array, &self.name)?;
+        let mut encoded = [0u8; 32];
         for row in 0..values.len() {
             let valid = values.is_valid(row);
             let value = values.value(row);
@@ -192,7 +193,8 @@ impl ColumnWriter {
                 .append_nullable_vaddr(if valid { value.to_canonical() } else { 0 }, valid)?;
             if let Some(vault) = &mut self.vault {
                 if valid {
-                    vault.append_fixed_bytes(&value.encode_exact())?;
+                    value.encode_exact_into(&mut encoded[..T::Native::WIDTH as usize])?;
+                    vault.append_fixed_bytes(&encoded[..T::Native::WIDTH as usize])?;
                 } else {
                     vault.append_null()?;
                 }

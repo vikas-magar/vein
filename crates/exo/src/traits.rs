@@ -13,7 +13,7 @@ use crate::error::ExoResult;
 pub trait ExactValueCodec: ToCanonicalAddress {
     const WIDTH: u8;
 
-    fn encode_exact(&self) -> Vec<u8>;
+    fn encode_exact_into(&self, output: &mut [u8]) -> ExoResult<()>;
 }
 
 macro_rules! impl_exo_value_encoding {
@@ -22,28 +22,53 @@ macro_rules! impl_exo_value_encoding {
             const WIDTH: u8 = $width;
 
             #[inline]
-            fn encode_exact(&self) -> Vec<u8> {
-                $encode(self)
+            fn encode_exact_into(&self, output: &mut [u8]) -> ExoResult<()> {
+                if output.len() != Self::WIDTH as usize {
+                    return Err(crate::error::ExoError::CodecError(format!(
+                        "invalid exact-value output width: expected {}, got {}",
+                        Self::WIDTH,
+                        output.len()
+                    )));
+                }
+                output.copy_from_slice(&$encode(self));
+                Ok(())
             }
         }
     };
 }
 
-impl_exo_value_encoding!(i8, 1, |value: &i8| vec![*value as u8]);
-impl_exo_value_encoding!(u8, 1, |value: &u8| vec![*value]);
-impl_exo_value_encoding!(bool, 1, |value: &bool| vec![u8::from(*value)]);
-impl_exo_value_encoding!(i16, 2, |value: &i16| value.to_le_bytes().to_vec());
-impl_exo_value_encoding!(u16, 2, |value: &u16| value.to_le_bytes().to_vec());
-impl_exo_value_encoding!(i32, 4, |value: &i32| value.to_le_bytes().to_vec());
-impl_exo_value_encoding!(u32, 4, |value: &u32| value.to_le_bytes().to_vec());
-impl_exo_value_encoding!(f32, 4, |value: &f32| value.to_le_bytes().to_vec());
-impl_exo_value_encoding!(i64, 8, |value: &i64| value.to_le_bytes().to_vec());
-impl_exo_value_encoding!(u64, 8, |value: &u64| value.to_le_bytes().to_vec());
-impl_exo_value_encoding!(f64, 8, |value: &f64| value.to_le_bytes().to_vec());
-impl_exo_value_encoding!(i128, 16, |value: &i128| value.to_le_bytes().to_vec());
-impl_exo_value_encoding!(arrow::datatypes::i256, 32, |value: &arrow::datatypes::i256| value
-    .to_le_bytes()
-    .to_vec());
+impl_exo_value_encoding!(i8, 1, |value: &i8| [*value as u8]);
+impl_exo_value_encoding!(u8, 1, |value: &u8| [*value]);
+impl_exo_value_encoding!(i16, 2, |value: &i16| value.to_le_bytes());
+impl_exo_value_encoding!(u16, 2, |value: &u16| value.to_le_bytes());
+impl_exo_value_encoding!(i32, 4, |value: &i32| value.to_le_bytes());
+impl_exo_value_encoding!(u32, 4, |value: &u32| value.to_le_bytes());
+impl_exo_value_encoding!(f32, 4, |value: &f32| value.to_le_bytes());
+impl_exo_value_encoding!(i64, 8, |value: &i64| value.to_le_bytes());
+impl_exo_value_encoding!(u64, 8, |value: &u64| value.to_le_bytes());
+impl_exo_value_encoding!(f64, 8, |value: &f64| value.to_le_bytes());
+impl_exo_value_encoding!(i128, 16, |value: &i128| value.to_le_bytes());
+impl_exo_value_encoding!(
+    arrow::datatypes::i256,
+    32,
+    |value: &arrow::datatypes::i256| value.to_le_bytes()
+);
+
+impl ExactValueCodec for bool {
+    const WIDTH: u8 = 1;
+
+    #[inline]
+    fn encode_exact_into(&self, output: &mut [u8]) -> ExoResult<()> {
+        if output.len() != 1 {
+            return Err(crate::error::ExoError::CodecError(format!(
+                "invalid exact-value output width: expected 1, got {}",
+                output.len()
+            )));
+        }
+        output[0] = u8::from(*self);
+        Ok(())
+    }
+}
 
 /// Unified storage buffer that can be backed either by a zero-copy memory map
 /// or an in-memory byte buffer (e.g. decoded from VFS blocks).

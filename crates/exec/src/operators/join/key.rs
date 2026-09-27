@@ -6,6 +6,7 @@
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+    BinaryViewArray, StringViewArray,
     TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use common::Result;
@@ -13,6 +14,7 @@ use error::VeinError;
 use exo::{
     AddressBatch, canonical_from_f32_native, canonical_from_f64, canonical_from_i8_native,
     canonical_from_i16_native, canonical_from_i32, canonical_from_i32_native, canonical_from_i64,
+    classify_storage,
 };
 use std::hash::{Hash, Hasher};
 
@@ -253,11 +255,10 @@ pub fn try_extract_address_keys(
                 is_null = true;
                 break;
             }
-            let part =
-                match exact_variable_bytes(chunk.vectors[column].as_ref(), row_index as usize) {
-                    Some(value) => JoinKeyPart::CanonicalWithVerification { address, value },
-                    None => JoinKeyPart::Canonical(address),
-                };
+            let array = chunk.vectors.get(column).ok_or_else(|| {
+                VeinError::internal(format!("join key column {column} is out of bounds"))
+            })?;
+            let part = address_key_part(array.as_ref(), row_index as usize, address)?;
             parts.push(part);
         }
         let key = (!is_null).then(|| JoinKey::new(parts));
@@ -271,6 +272,30 @@ pub fn try_extract_address_keys(
     Ok(Some(JoinKeyBatch::new(rows)))
 }
 
+fn address_key_part(array: &dyn Array, row: usize, address: u64) -> Result<JoinKeyPart> {
+    let storage = classify_storage(array.data_type()).ok_or_else(|| {
+        VeinError::internal(format!(
+            "EXO has no storage classification for address join key type {:?}",
+            array.data_type()
+        ))
+    })?;
+    if !storage.requires_collision_verification() {
+        return Ok(JoinKeyPart::Canonical(address));
+    }
+    if array.is_null(row) {
+        return Err(VeinError::internal(
+            "EXO address sidecar marks a null join value as valid",
+        ));
+    }
+    let value = exact_variable_bytes(array, row).ok_or_else(|| {
+        VeinError::internal(format!(
+            "EXO join key type {:?} requires collision verification but has no exact-value codec",
+            array.data_type()
+        ))
+    })?;
+    Ok(JoinKeyPart::CanonicalWithVerification { address, value })
+}
+
 fn exact_variable_bytes(array: &dyn Array, row: usize) -> Option<Vec<u8>> {
     if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
         return Some(values.value(row).as_bytes().to_vec());
@@ -282,6 +307,12 @@ fn exact_variable_bytes(array: &dyn Array, row: usize) -> Option<Vec<u8>> {
         return Some(values.value(row).to_vec());
     }
     if let Some(values) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Some(values.value(row).to_vec());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Some(values.value(row).as_bytes().to_vec());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<BinaryViewArray>() {
         return Some(values.value(row).to_vec());
     }
     None
@@ -340,6 +371,10 @@ fn extract_part(array: &dyn Array, row: usize) -> Result<Option<JoinKeyPart>> {
         return Ok(None);
     }
 
+    if let Some(value) = exact_variable_bytes(array, row) {
+        return Ok(Some(JoinKeyPart::Bytes(value)));
+    }
+
     if let Some(values) = array.as_any().downcast_ref::<Int8Array>() {
         return Ok(Some(JoinKeyPart::Canonical(
             canonical_from_i8_native(values.value(row)) as u64,
@@ -395,23 +430,6 @@ fn extract_part(array: &dyn Array, row: usize) -> Result<Option<JoinKeyPart>> {
             values.value(row),
         ))));
     }
-    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(Some(JoinKeyPart::Bytes(
-            values.value(row).as_bytes().to_vec(),
-        )));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return Ok(Some(JoinKeyPart::Bytes(
-            values.value(row).as_bytes().to_vec(),
-        )));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(Some(JoinKeyPart::Bytes(values.value(row).to_vec())));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Ok(Some(JoinKeyPart::Bytes(values.value(row).to_vec())));
-    }
-
     Err(VeinError::internal(format!(
         "unsupported Arrow join key type: {:?}",
         array.data_type()
@@ -441,10 +459,11 @@ impl Hasher for StableKeyHasher {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArrowJoinKeyExtractor, JoinKeyExtractor, JoinKeyPart};
+    use super::{ArrowJoinKeyExtractor, JoinKeyExtractor, JoinKeyPart, try_extract_address_keys};
     use crate::pipeline::DataChunk;
-    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Decimal128Array, Int64Array, StringArray, StringViewArray};
     use common::arrow::SelectionVector;
+    use exo::AddressBatch;
     use std::sync::Arc;
 
     #[test]
@@ -479,6 +498,64 @@ mod tests {
             vec![JoinKeyPart::Bytes(b"alpha".to_vec())]
         );
         assert_ne!(batch.rows()[0].hash, batch.rows()[1].hash);
+    }
+
+    #[test]
+    fn verifies_string_view_address_candidates_with_exact_values() {
+        let values: ArrayRef = Arc::new(StringViewArray::from(vec![Some("alpha"), Some("omega")]));
+        let chunk = DataChunk::from_vectors_with_addresses(
+            vec![values],
+            vec![Some(AddressBatch::from_addresses(vec![17, 17]))],
+        )
+        .expect("aligned address sidecar");
+
+        let batch = try_extract_address_keys(&chunk, &[0])
+            .expect("address key extraction succeeds")
+            .expect("EXO address sidecar is present");
+
+        let first = batch.rows()[0].key.as_ref().expect("non-null first key");
+        let second = batch.rows()[1].key.as_ref().expect("non-null second key");
+        assert_ne!(first, second);
+        assert_eq!(first.parts[0], JoinKeyPart::CanonicalWithVerification {
+            address: 17,
+            value: b"alpha".to_vec(),
+        });
+        assert_eq!(second.parts[0], JoinKeyPart::CanonicalWithVerification {
+            address: 17,
+            value: b"omega".to_vec(),
+        });
+        assert_eq!(batch.rows()[0].hash, batch.rows()[1].hash);
+    }
+
+    #[test]
+    fn address_extraction_fails_closed_for_unimplemented_collision_verifier() {
+        let values: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(123_i128)])
+                .with_precision_and_scale(22, 1)
+                .expect("valid decimal type"),
+        );
+        let chunk = DataChunk::from_vectors_with_addresses(
+            vec![values],
+            vec![Some(AddressBatch::from_addresses(vec![17]))],
+        )
+        .expect("aligned address sidecar");
+
+        assert!(try_extract_address_keys(&chunk, &[0]).is_err());
+    }
+
+    #[test]
+    fn extracts_string_view_values_on_the_value_native_path() {
+        let values: ArrayRef = Arc::new(StringViewArray::from(vec![Some("alpha"), Some("beta")]));
+        let chunk = DataChunk::from_vectors(vec![values]);
+
+        let batch = ArrowJoinKeyExtractor
+            .extract(&chunk, &[0])
+            .expect("view key extraction succeeds");
+
+        assert_eq!(
+            batch.rows()[0].key.as_ref().unwrap().parts,
+            vec![JoinKeyPart::Bytes(b"alpha".to_vec())]
+        );
     }
 
     #[test]

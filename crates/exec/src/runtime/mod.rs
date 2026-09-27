@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tracing::Instrument;
 
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use common::Result;
@@ -266,14 +267,29 @@ impl DefaultTaskExecutor {
             self.builder.build_sink(&task.sink)?
         };
         let sink: Arc<Mutex<Box<dyn Sink<DataChunk>>>> = Arc::new(Mutex::new(sink));
-        let head: Box<dyn PipelineNode<DataChunk>> =
-            Box::new(CancelGuard::new(Box::new(SinkHandle(sink.clone())), cancel));
+        let head: Box<dyn PipelineNode<DataChunk>> = Box::new(CancelGuard::new(
+            Box::new(SinkHandle(sink.clone())),
+            cancel.clone(),
+        ));
 
         let mut vm = self.builder.build_vm(&task.program, head)?;
         let mut source: Box<dyn Source<DataChunk>> =
             self.builder
                 .build_source(&task.source, task.task_id, task.attempt)?;
-        source.execute(&mut *vm).await?;
+        let task_span = tracing::info_span!(
+            target: "vein.audit",
+            "task_execution",
+            request_id = %task.request_id,
+            query_id = %task.query_id,
+            stage_id = %task.stage_id,
+            task_id = %task.task_id,
+            attempt = task.attempt,
+        );
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(VeinError::cancelled()),
+            result = source.execute(&mut *vm).instrument(task_span) => result?,
+        }
 
         let mut sink = sink
             .lock()

@@ -8,7 +8,7 @@
 //! Strict zero-unwrap policy is enforced.
 
 use std::collections::HashSet;
-use std::fs::{create_dir_all, read_dir, rename, File};
+use std::fs::{File, create_dir_all, read_dir, rename};
 use std::path::{Path, PathBuf};
 
 use crate::addr::{ExoAddressReader, ExoAddressWriter};
@@ -140,7 +140,11 @@ impl PartWriter {
         match &mut self.mode {
             PartWriterMode::Disk { tmp_path, .. } => {
                 let addr_path = tmp_path.join(format!("{col_name}.exo.addr"));
-                let mut addr_writer = ExoAddressWriter::create_with_slot_width(&addr_path, self.granule_size, slot_width)?;
+                let mut addr_writer = ExoAddressWriter::create_with_slot_width(
+                    &addr_path,
+                    self.granule_size,
+                    slot_width,
+                )?;
                 write_addr(&mut addr_writer)?;
                 addr_writer.finish()?;
 
@@ -151,8 +155,12 @@ impl PartWriter {
                     vault_writer.finish()?;
                 }
             }
-            PartWriterMode::Memory { addr_buffers, vault_buffers } => {
-                let mut addr_writer = ExoAddressWriter::create_in_memory(self.granule_size, slot_width)?;
+            PartWriterMode::Memory {
+                addr_buffers,
+                vault_buffers,
+            } => {
+                let mut addr_writer =
+                    ExoAddressWriter::create_in_memory(self.granule_size, slot_width)?;
                 write_addr(&mut addr_writer)?;
                 let (_, addr_bytes) = addr_writer.finish_into_bytes()?;
                 addr_buffers.insert(col_name.to_string(), addr_bytes);
@@ -170,11 +178,7 @@ impl PartWriter {
     }
 
     /// Writes both `.exo.addr` and `.exo.vault` for a string column.
-    pub fn write_string_column(
-        &mut self,
-        col_name: &str,
-        values: &[String],
-    ) -> ExoResult<()> {
+    pub fn write_string_column(&mut self, col_name: &str, values: &[String]) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
         self.write_column_data(
             col_name,
@@ -185,9 +189,7 @@ impl PartWriter {
                 }
                 Ok(())
             },
-            Some(|vault: &mut dyn VaultWriter| {
-                vault.append_batch_strings(values)
-            }),
+            Some(|vault: &mut dyn VaultWriter| vault.append_batch_strings(values)),
         )
     }
 
@@ -209,18 +211,12 @@ impl PartWriter {
                 let validity: Vec<bool> = values.iter().map(Option::is_some).collect();
                 addr.append_nullable_batch(&vaddrs, &validity)
             },
-            Some(|vault: &mut dyn VaultWriter| {
-                vault.append_batch_opt_strings(values)
-            }),
+            Some(|vault: &mut dyn VaultWriter| vault.append_batch_opt_strings(values)),
         )
     }
 
     /// Writes a binary blob column without UTF-8 constraints.
-    pub fn write_bytes_column(
-        &mut self,
-        col_name: &str,
-        values: &[Vec<u8>],
-    ) -> ExoResult<()> {
+    pub fn write_bytes_column(&mut self, col_name: &str, values: &[Vec<u8>]) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
         self.write_column_data(
             col_name,
@@ -270,11 +266,7 @@ impl PartWriter {
     }
 
     /// Writes an address-only column directly from pre-computed canonical addresses with no vault.
-    pub fn write_raw_address_column(
-        &mut self,
-        col_name: &str,
-        vaddrs: &[u64],
-    ) -> ExoResult<()> {
+    pub fn write_raw_address_column(&mut self, col_name: &str, vaddrs: &[u64]) -> ExoResult<()> {
         self.write_raw_address_column_with_slot_width(col_name, vaddrs, 8)
     }
 
@@ -305,7 +297,8 @@ impl PartWriter {
         if vaddrs.len() != validity.len() {
             return Err(ExoError::CodecError(format!(
                 "write_raw_address_column_with_validity mismatch: {} values != {} validity bits",
-                vaddrs.len(), validity.len()
+                vaddrs.len(),
+                validity.len()
             )));
         }
         self.check_or_set_total_rows(col_name, vaddrs.len() as u64)?;
@@ -334,9 +327,7 @@ impl PartWriter {
                 }
                 Ok(())
             },
-            Some(|vault: &mut dyn VaultWriter| {
-                vault.append_batch_strings(&string_values)
-            }),
+            Some(|vault: &mut dyn VaultWriter| vault.append_batch_strings(&string_values)),
         )
     }
 
@@ -363,8 +354,10 @@ impl PartWriter {
                     Ok(())
                 },
                 Some(|vault: &mut dyn VaultWriter| {
+                    let mut encoded = [0u8; 32];
                     for val in values {
-                        vault.append_fixed_bytes(&val.encode_exact())?;
+                        val.encode_exact_into(&mut encoded[..T::WIDTH as usize])?;
+                        vault.append_fixed_bytes(&encoded[..T::WIDTH as usize])?;
                     }
                     Ok(())
                 }),
@@ -403,8 +396,15 @@ impl PartWriter {
                 slot_width,
                 |addr| addr.append_nullable_batch(&vaddrs, &validity),
                 Some(|vault: &mut dyn VaultWriter| {
+                    let mut encoded = [0u8; 32];
                     for value in values {
-                        vault.append_opt_fixed_bytes(value.as_ref().map(ExactValueCodec::encode_exact).as_deref())?;
+                        match value {
+                            Some(value) => {
+                                value.encode_exact_into(&mut encoded[..T::WIDTH as usize])?;
+                                vault.append_fixed_bytes(&encoded[..T::WIDTH as usize])?;
+                            }
+                            None => vault.append_null()?,
+                        }
                     }
                     Ok(())
                 }),
@@ -430,11 +430,7 @@ impl PartWriter {
     }
 
     /// Writes an i32 column directly to `.exo.addr` with 4-byte native slot width.
-    pub fn write_i32_column(
-        &mut self,
-        col_name: &str,
-        values: &[i32],
-    ) -> ExoResult<()> {
+    pub fn write_i32_column(&mut self, col_name: &str, values: &[i32]) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
         self.write_column_data(
             col_name,
@@ -450,11 +446,7 @@ impl PartWriter {
     }
 
     /// Writes a u32 column directly to `.exo.addr` with 4-byte native slot width.
-    pub fn write_u32_column(
-        &mut self,
-        col_name: &str,
-        values: &[u32],
-    ) -> ExoResult<()> {
+    pub fn write_u32_column(&mut self, col_name: &str, values: &[u32]) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
         self.write_column_data(
             col_name,
@@ -470,11 +462,7 @@ impl PartWriter {
     }
 
     /// Writes an f32 column directly to `.exo.addr` with 4-byte native slot width.
-    pub fn write_f32_column(
-        &mut self,
-        col_name: &str,
-        values: &[f32],
-    ) -> ExoResult<()> {
+    pub fn write_f32_column(&mut self, col_name: &str, values: &[f32]) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
         self.write_column_data(
             col_name,
@@ -490,11 +478,7 @@ impl PartWriter {
     }
 
     /// Writes an i16 column directly to `.exo.addr` with 2-byte native slot width.
-    pub fn write_i16_column(
-        &mut self,
-        col_name: &str,
-        values: &[i16],
-    ) -> ExoResult<()> {
+    pub fn write_i16_column(&mut self, col_name: &str, values: &[i16]) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
         self.write_column_data(
             col_name,
@@ -510,11 +494,7 @@ impl PartWriter {
     }
 
     /// Writes a u16 column directly to `.exo.addr` with 2-byte native slot width.
-    pub fn write_u16_column(
-        &mut self,
-        col_name: &str,
-        values: &[u16],
-    ) -> ExoResult<()> {
+    pub fn write_u16_column(&mut self, col_name: &str, values: &[u16]) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
         self.write_column_data(
             col_name,
@@ -530,11 +510,7 @@ impl PartWriter {
     }
 
     /// Writes an i8 column directly to `.exo.addr` with 1-byte native slot width.
-    pub fn write_i8_column(
-        &mut self,
-        col_name: &str,
-        values: &[i8],
-    ) -> ExoResult<()> {
+    pub fn write_i8_column(&mut self, col_name: &str, values: &[i8]) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
         self.write_column_data(
             col_name,
@@ -550,11 +526,7 @@ impl PartWriter {
     }
 
     /// Writes a u8 column directly to `.exo.addr` with 1-byte native slot width.
-    pub fn write_u8_column(
-        &mut self,
-        col_name: &str,
-        values: &[u8],
-    ) -> ExoResult<()> {
+    pub fn write_u8_column(&mut self, col_name: &str, values: &[u8]) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
         self.write_column_data(
             col_name,
@@ -570,11 +542,7 @@ impl PartWriter {
     }
 
     /// Writes a boolean column directly to `.exo.addr` with 1-byte native slot width.
-    pub fn write_bool_column(
-        &mut self,
-        col_name: &str,
-        values: &[bool],
-    ) -> ExoResult<()> {
+    pub fn write_bool_column(&mut self, col_name: &str, values: &[bool]) -> ExoResult<()> {
         self.check_or_set_total_rows(col_name, values.len() as u64)?;
         self.write_column_data(
             col_name,
@@ -598,7 +566,11 @@ impl PartWriter {
         }
 
         match self.mode {
-            PartWriterMode::Disk { tmp_path, final_path, .. } => {
+            PartWriterMode::Disk {
+                tmp_path,
+                final_path,
+                ..
+            } => {
                 if final_path.exists() {
                     let _ = std::fs::remove_dir_all(&final_path);
                 }
@@ -629,11 +601,10 @@ impl PartWriter {
                     granule_size: self.granule_size,
                 })
             }
-            PartWriterMode::Memory { .. } => {
-                Err(ExoError::CodecError(
-                    "PartWriter created in memory must be finished using finish_in_memory()".to_string(),
-                ))
-            }
+            PartWriterMode::Memory { .. } => Err(ExoError::CodecError(
+                "PartWriter created in memory must be finished using finish_in_memory()"
+                    .to_string(),
+            )),
         }
     }
 
@@ -646,7 +617,10 @@ impl PartWriter {
         }
 
         match self.mode {
-            PartWriterMode::Memory { addr_buffers, vault_buffers } => {
+            PartWriterMode::Memory {
+                addr_buffers,
+                vault_buffers,
+            } => {
                 let mut column_names: Vec<String> = self.columns_written.into_iter().collect();
                 column_names.sort();
 
@@ -659,11 +633,9 @@ impl PartWriter {
                     vault_buffers,
                 })
             }
-            PartWriterMode::Disk { .. } => {
-                Err(ExoError::CodecError(
-                    "PartWriter created on disk must be finished using finish()".to_string(),
-                ))
-            }
+            PartWriterMode::Disk { .. } => Err(ExoError::CodecError(
+                "PartWriter created on disk must be finished using finish()".to_string(),
+            )),
         }
     }
 }
@@ -790,7 +762,8 @@ impl PartReader {
     /// Number of active (non-deleted) rows in this Part.
     #[inline(always)]
     pub fn active_rows(&self) -> u64 {
-        self.total_rows.saturating_sub(self.tombstones.deleted_count())
+        self.total_rows
+            .saturating_sub(self.tombstones.deleted_count())
     }
 
     #[inline(always)]
@@ -833,7 +806,10 @@ impl PartReader {
                 let bytes = addr_buffers.get(col_name).ok_or_else(|| {
                     ExoError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("Column '{col_name}.exo.addr' not found in Part {}", self.part_id),
+                        format!(
+                            "Column '{col_name}.exo.addr' not found in Part {}",
+                            self.part_id
+                        ),
                     ))
                 })?;
                 ExoAddressReader::from_bytes(bytes.clone())
@@ -852,7 +828,10 @@ impl PartReader {
                 let bytes = vault_buffers.get(col_name).ok_or_else(|| {
                     ExoError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("Column '{col_name}.exo.vault' not found in Part {}", self.part_id),
+                        format!(
+                            "Column '{col_name}.exo.vault' not found in Part {}",
+                            self.part_id
+                        ),
                     ))
                 })?;
                 ExoVaultReader::from_bytes(bytes.clone())
@@ -940,7 +919,9 @@ mod tests {
         const NUM_ROWS: usize = 1500;
 
         let ids: Vec<i64> = (0..NUM_ROWS as i64).collect();
-        let codes: Vec<String> = (0..NUM_ROWS).map(|i| format!("CUST_{:05}", i % 100)).collect();
+        let codes: Vec<String> = (0..NUM_ROWS)
+            .map(|i| format!("CUST_{:05}", i % 100))
+            .collect();
         let amounts: Vec<f64> = (0..NUM_ROWS).map(|i| 10.0 + (i as f64) * 0.5).collect();
 
         // 1. Write multi-column Part
@@ -954,7 +935,10 @@ mod tests {
 
         assert_eq!(descriptor.part_id, 42);
         assert_eq!(descriptor.total_rows, NUM_ROWS as u64);
-        assert_eq!(descriptor.column_names, vec!["amount", "customer_code", "order_id"]);
+        assert_eq!(
+            descriptor.column_names,
+            vec!["amount", "customer_code", "order_id"]
+        );
 
         // 2. Open PartReader
         let mut reader = PartReader::open(&descriptor.path, 42)?;
@@ -1041,8 +1025,14 @@ mod tests {
         assert_eq!(value_vault.read_bytes_slot(0)?, &values[0].to_le_bytes());
         let mut decimal128_vault = reader.open_vault_reader("decimal128")?;
         let mut decimal256_vault = reader.open_vault_reader("decimal256")?;
-        assert_eq!(decimal128_vault.read_bytes_slot(0)?, &decimals128[0].to_le_bytes());
-        assert_eq!(decimal256_vault.read_bytes_slot(0)?, &decimals256[0].to_le_bytes());
+        assert_eq!(
+            decimal128_vault.read_bytes_slot(0)?,
+            &decimals128[0].to_le_bytes()
+        );
+        assert_eq!(
+            decimal256_vault.read_bytes_slot(0)?,
+            &decimals256[0].to_le_bytes()
+        );
 
         // Direct reading from address plane:
         for (i, &expected_id) in ids.iter().enumerate() {
@@ -1066,7 +1056,16 @@ mod tests {
         let mut writer = PartWriter::create(dir.path(), 100, 256)?;
 
         let i32_vals = vec![i32::MIN, -1000, -1, 0, 1, 42, 999999, i32::MAX];
-        let f32_vals = vec![-100.5f32, -0.001f32, 0.0f32, 1.25f32, 42.0f32, 1000.5f32, 99999.0f32, f32::MAX];
+        let f32_vals = vec![
+            -100.5f32,
+            -0.001f32,
+            0.0f32,
+            1.25f32,
+            42.0f32,
+            1000.5f32,
+            99999.0f32,
+            f32::MAX,
+        ];
         let i16_vals = vec![i16::MIN, -500, -1, 0, 1, 100, 5000, i16::MAX];
         let i8_vals = vec![i8::MIN, -10, -1, 0, 1, 50, 100, i8::MAX];
         let bool_vals = vec![false, true, false, false, true, true, false, true];
@@ -1156,7 +1155,10 @@ mod tests {
         }
         let mut vault_reader = reader.open_vault_reader("name")?;
         for (i, expected_name) in names.iter().enumerate() {
-            assert_eq!(vault_reader.read_str_slot(i as u32)?, expected_name.as_str());
+            assert_eq!(
+                vault_reader.read_str_slot(i as u32)?,
+                expected_name.as_str()
+            );
         }
         for (i, &expected_score) in scores.iter().enumerate() {
             assert_eq!(reader.read_i32_slot("score", i as u64)?, expected_score);

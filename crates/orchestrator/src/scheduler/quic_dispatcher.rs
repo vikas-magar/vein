@@ -728,8 +728,12 @@ impl TaskDispatcher for QuicTaskDispatcher {
             .map_err(|e| VeinError::internal(format!("Failed to serialize CancelTask: {e}")))?;
 
         let wire = frame_control_message(&bytes);
-        let _ = stream.send(wire).await;
-        let _ = stream.finish();
+        stream.send(wire).await.map_err(|error| {
+            VeinError::internal(format!("Failed to send task cancellation: {error}"))
+        })?;
+        stream
+            .finish()
+            .map_err(|error| VeinError::internal(format!("Failed to finish cancellation stream: {error}")))?;
 
         Ok(())
     }

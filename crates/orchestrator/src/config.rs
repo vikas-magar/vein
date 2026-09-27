@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+pub const DEFAULT_TASK_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Debug, Clone)]
 pub struct MasterConfig {
     pub listen_addr: SocketAddr,
@@ -16,7 +18,7 @@ impl Default for MasterConfig {
             listen_addr: "0.0.0.0:8080".parse().unwrap(),
             max_concurrent_queries: 64,
             default_shuffle_partitions: 32,
-            task_timeout: Duration::from_secs(300),
+            task_timeout: Duration::from_secs(DEFAULT_TASK_TIMEOUT_SECS),
             vcs_addr: "127.0.0.1:9090".parse().unwrap(),
         }
     }

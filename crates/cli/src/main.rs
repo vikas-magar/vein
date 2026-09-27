@@ -57,6 +57,10 @@ enum Commands {
         /// Remote VCS catalog endpoint used by production master mode.
         #[arg(long)]
         vcs: String,
+        /// Maximum time allowed for one task attempt, in seconds.
+        #[arg(long, default_value_t = orchestrator::config::DEFAULT_TASK_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        task_timeout_secs: u64,
     },
     /// Start an Executor node (Compute Daemon)
     Executor {
@@ -87,12 +91,17 @@ enum Commands {
         vcs: String,
         #[arg(short, long, default_value_t = 4)]
         workers: usize,
+        /// Maximum time allowed for one task attempt, in seconds.
+        #[arg(long, default_value_t = orchestrator::config::DEFAULT_TASK_TIMEOUT_SECS, value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        task_timeout_secs: u64,
     },
 }
 
 async fn build_default_coordinator(
     vcs_endpoint: Option<&str>,
     ca_cert: &str,
+    task_timeout: std::time::Duration,
 ) -> Result<Arc<engine::DistributedCoordinator>, String> {
     debug!(target: "vein_server", "Initializing Master subsystems and Scheduler");
     let registry = Arc::new(orchestrator::executor::registry::ExecutorRegistry::new());
@@ -101,7 +110,7 @@ async fn build_default_coordinator(
         registry,
         dispatcher,
         3,
-        std::time::Duration::from_secs(30),
+        task_timeout,
     ));
 
     debug!(target: "vein_server", "Building DistributedCoordinator with catalog authority");
@@ -167,8 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cluster_name: "vein-vcs".to_string(),
                     ..Default::default()
                 }
-                .validate()
-                .map_err(|e| format!("Invalid VCS Raft configuration: {e}"))?,
+                    .validate()
+                    .map_err(|e| format!("Invalid VCS Raft configuration: {e}"))?,
             );
             let raft_client = Arc::new(common::transport::QuicClient::new(
                 common::transport::build_quic_client(&cert)?,
@@ -211,10 +220,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cert,
             key,
             vcs,
+            task_timeout_secs,
         } => {
             info!(target: "vein_server", %bind, %cert, "Starting Vein Master node");
 
-            let coordinator = build_default_coordinator(Some(&vcs), &cert).await?;
+            let coordinator = build_default_coordinator(
+                Some(&vcs),
+                &cert,
+                std::time::Duration::from_secs(task_timeout_secs),
+            )
+                .await?;
 
             // Start the Master Daemon
             let addr: std::net::SocketAddr = bind
@@ -267,6 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key,
             vcs,
             workers,
+            task_timeout_secs,
         } => {
             info!(
                 target: "vein_server",
@@ -282,7 +298,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .parse()
                 .map_err(|e| format!("Invalid executor bind address '{executor_bind}': {e}"))?;
 
-            let coordinator = build_default_coordinator(Some(&vcs), &cert).await?;
+            let coordinator = build_default_coordinator(
+                Some(&vcs),
+                &cert,
+                std::time::Duration::from_secs(task_timeout_secs),
+            )
+                .await?;
             let master_daemon = daemon::MasterDaemon::new(coordinator);
             let cert_m = cert.clone();
             let key_m = key.clone();

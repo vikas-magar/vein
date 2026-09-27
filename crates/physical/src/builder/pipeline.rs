@@ -6,6 +6,7 @@ use crate::task::Task;
 use common::Result;
 use common::identifiers::{PartitionId, QueryId, StageId, TaskId};
 use common::protocol::{DataSink, DataSource, FieldSchema, MicroProgram};
+use error::VeinError;
 use plan::LogicalPlan;
 use plan::schema::VeinSchema;
 
@@ -37,6 +38,31 @@ impl DefaultPipelineStageBuilder {
     }
 }
 
+pub(crate) fn split_file_scan_source(source: DataSource) -> Result<Vec<(PartitionId, DataSource)>> {
+    let DataSource::File(scan) = source else {
+        return Ok(vec![(PartitionId::from_raw(0), source)]);
+    };
+
+    if scan.files.len() <= 1 {
+        return Ok(vec![(PartitionId::from_raw(0), DataSource::File(scan))]);
+    }
+
+    scan.files
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, file)| {
+            let partition = u16::try_from(index)
+                .map(PartitionId::from_raw)
+                .map_err(|_| VeinError::planning("file scan has more than u16::MAX files", None))?;
+            let mut file_scan = scan.clone();
+            file_scan.files = vec![file];
+            file_scan.task_id = TaskId::new();
+            Ok((partition, DataSource::File(file_scan)))
+        })
+        .collect()
+}
+
 impl PipelineStageBuilder for DefaultPipelineStageBuilder {
     fn build(
         &self,
@@ -54,7 +80,6 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                 data_type: format!("{:?}", f.data_type),
             })
             .collect();
-        let task_id = TaskId::new();
         let sink = match plan {
             LogicalPlan::Write {
                 target, options, ..
@@ -79,8 +104,16 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
             },
         };
         let stage_id = StageId::new();
-        let task = Task::new(task_id, PartitionId::from_raw(0), source, program, sink);
-        let stage = Stage::new(stage_id).with_task(task);
+        let mut stage = Stage::new(stage_id);
+        for (partition, source) in split_file_scan_source(source)? {
+            stage.tasks.push(Task::new(
+                TaskId::new(),
+                partition,
+                source,
+                program.clone(),
+                sink.clone(),
+            ));
+        }
         stages.push(stage);
         Ok(stage_id)
     }
@@ -90,5 +123,39 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         plan: &LogicalPlan,
     ) -> Result<(DataSource, MicroProgram, VeinSchema)> {
         PipelineCompiler::compile(plan)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_file_scan_source;
+    use common::identifiers::TaskId;
+    use common::protocol::{DataSource, FileFormat, FileScanTask};
+
+    #[test]
+    fn splits_multi_file_scan_into_stable_single_file_units() {
+        let source = DataSource::File(FileScanTask {
+            files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+            format: FileFormat::Parquet,
+            byte_range: None,
+            column_ids: vec![0],
+            projected_schema: Vec::new(),
+            scan_predicates: Vec::new(),
+            task_id: TaskId::new(),
+            catalog_snapshot: None,
+            shuffle_target_path: None,
+        });
+
+        let units = split_file_scan_source(source).expect("file scan should split");
+
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].0.into_raw(), 0);
+        assert_eq!(units[1].0.into_raw(), 1);
+        for ((_, source), expected_path) in units.iter().zip(["a.parquet", "b.parquet"]) {
+            let DataSource::File(scan) = source else {
+                panic!("split scan should remain a file source");
+            };
+            assert_eq!(scan.files, vec![expected_path]);
+        }
     }
 }

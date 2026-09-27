@@ -4,6 +4,7 @@ pub mod quic_dispatcher;
 use crate::executor::ExecutorRegistry;
 use crate::traits::{TaskCompletion, TaskDispatcher};
 use common::cancellation::CancellationToken;
+use common::identifiers::NodeId;
 use common::protocol::ExecutionMode;
 use error::VeinError;
 use physical::Job;
@@ -42,6 +43,20 @@ async fn wait_for_queue_admission(
         _ = cancel.cancelled() => Err(VeinError::Cancelled),
         _ = tokio::time::sleep(QUEUE_ADMISSION_RETRY_DELAY) => Ok(()),
     }
+}
+
+async fn retry_executor(
+    registry: &ExecutorRegistry,
+    attempted: &[NodeId],
+    current: &crate::executor::registry::NodeInfo,
+) -> crate::executor::registry::NodeInfo {
+    let available = registry.available(Duration::from_secs(15)).await;
+    available
+        .iter()
+        .find(|executor| !attempted.contains(&executor.node_id))
+        .or_else(|| available.first())
+        .cloned()
+        .unwrap_or_else(|| current.clone())
 }
 
 /// Orchestrates the execution of a [`Job`] across the cluster.
@@ -134,6 +149,7 @@ impl Scheduler {
 
                 // Pick the least-loaded executor (executors are already sorted by load).
                 let executor = executors[i % executors.len()].clone();
+                let registry = self.registry.clone();
                 let dispatcher = self.dispatcher.clone();
                 let cancel = cancel.clone();
                 let timeout = self.timeout;
@@ -144,9 +160,16 @@ impl Scheduler {
                     let stage_id = task_template.stage_id;
                     let mut attempts = 0;
                     let task_started = Instant::now();
+                    let mut executor = executor;
+                    let mut attempted_executors = vec![executor.node_id];
                     loop {
                         let mut execute_task = task_template.clone();
                         execute_task.attempt = attempts;
+                        if let common::protocol::DataSink::Shuffle(target) = &mut execute_task.sink
+                        {
+                            target.attempt = attempts;
+                        }
+                        let attempt_started = Instant::now();
 
                         // 1. Dispatch
                         let dispatch_started = Instant::now();
@@ -177,6 +200,8 @@ impl Scheduler {
                             if attempts > max_retries {
                                 return Err(e);
                             }
+                            executor = retry_executor(&registry, &attempted_executors, &executor).await;
+                            attempted_executors.push(executor.node_id);
                             continue; // Retry dispatch
                         }
 
@@ -186,11 +211,28 @@ impl Scheduler {
                         let wait_result = tokio::select! {
                             res = d.wait_for_completion(query_id, task_id, attempts) => res,
                             _ = c.cancelled() => {
-                                let _ = d.cancel_task(&executor, query_id, task_id, attempts).await;
+                                if let Err(error) = d.cancel_task(&executor, query_id, task_id, attempts).await {
+                                    tracing::warn!(
+                                        target: "vein.audit",
+                                        event = "task_cancel_delivery_failed",
+                                        %query_id,
+                                        %stage_id,
+                                        %task_id,
+                                        executor = %executor.node_id,
+                                        attempt = attempts,
+                                        error = %error,
+                                        "failed to deliver task cancellation"
+                                    );
+                                }
                                 return Err(VeinError::Cancelled);
                             }
                             _ = tokio::time::sleep(timeout) => {
-                                let _ = d.cancel_task(&executor, query_id, task_id, attempts).await;
+                                if let Err(error) = d.cancel_task(&executor, query_id, task_id, attempts).await {
+                                    return Err(VeinError::TaskFailed {
+                                        task_id: task_id.to_string(),
+                                        message: format!("task timed out and cancellation delivery failed: {error}"),
+                                    });
+                                }
                                 tracing::warn!(
                                     target: "vein.audit",
                                     event = "task_attempt_timeout",
@@ -199,7 +241,7 @@ impl Scheduler {
                                     %task_id,
                                     executor = %executor.node_id,
                                     attempt = attempts,
-                                    duration_ms = task_started.elapsed().as_millis() as u64,
+                                    duration_ms = attempt_started.elapsed().as_millis() as u64,
                                     "task_attempt_timeout"
                                 );
                                 attempts += 1;
@@ -209,6 +251,8 @@ impl Scheduler {
                                         message: "Task timeout".to_string(),
                                     });
                                 }
+                                executor = retry_executor(&registry, &attempted_executors, &executor).await;
+                                attempted_executors.push(executor.node_id);
                                 continue;
                             }
                         };
@@ -270,6 +314,8 @@ impl Scheduler {
                                 if attempts > max_retries {
                                     return Err(e);
                                 }
+                                executor = retry_executor(&registry, &attempted_executors, &executor).await;
+                                attempted_executors.push(executor.node_id);
                             }
                         }
                     }
@@ -380,8 +426,14 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::{QUEUE_ADMISSION_TIMEOUT, is_executor_queue_full, wait_for_queue_admission};
+    use super::{
+        QUEUE_ADMISSION_TIMEOUT, is_executor_queue_full, retry_executor,
+        wait_for_queue_admission,
+    };
+    use crate::executor::ExecutorRegistry;
     use common::cancellation::CancellationToken;
+    use common::identifiers::NodeId;
+    use common::protocol::{NodeKind, NodeLoad};
     use error::VeinError;
     use std::time::Duration;
 
@@ -434,5 +486,41 @@ mod tests {
         }
 
         producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_prefers_a_different_healthy_executor() {
+        let registry = ExecutorRegistry::new();
+        let first = NodeId::new();
+        let second = NodeId::new();
+        registry
+            .record_heartbeat(
+                first,
+                "127.0.0.1:8081".parse().unwrap(),
+                NodeKind::Executor,
+                NodeLoad {
+                    active_tasks: 0,
+                    cpu_percent: 0.0,
+                    memory_bytes: 0,
+                },
+            )
+            .await;
+        registry
+            .record_heartbeat(
+                second,
+                "127.0.0.1:8082".parse().unwrap(),
+                NodeKind::Executor,
+                NodeLoad {
+                    active_tasks: 1,
+                    cpu_percent: 0.0,
+                    memory_bytes: 0,
+                },
+            )
+            .await;
+        let current = registry.available(Duration::from_secs(15)).await[0].clone();
+
+        let retry = retry_executor(&registry, &[current.node_id], &current).await;
+
+        assert_ne!(retry.node_id, current.node_id);
     }
 }

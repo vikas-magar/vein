@@ -91,26 +91,7 @@ impl TableCatalog for VcsCatalog {
             .read_view()
             .await
             .map_err(|error| VeinError::internal(error.to_string()))?;
-        let table_id = view.table_names.get(name).cloned().ok_or_else(|| {
-            VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
-        })?;
-        let record = view.table(&table_id).ok_or_else(|| {
-            VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
-        })?;
-        let metadata = decode_table_metadata(&record.latest.metadata_payload)?;
-        if metadata.name != name {
-            return Err(VeinError::internal(format!(
-                "table metadata name '{}' does not match requested table '{}'",
-                metadata.name, name
-            )));
-        }
-        let metadata = metadata.with_catalog_snapshot(common::protocol::CatalogSnapshotToken::new(
-            table_id.as_str(),
-            view.revision.value().to_string(),
-            record.latest.id.as_str(),
-            record.latest.schema_version,
-        ));
-        Ok(Arc::new(metadata))
+        Ok(Self::table_snapshot_from_view(&view, name)?.metadata.clone())
     }
 
     async fn resolve_table_snapshot(
@@ -121,7 +102,20 @@ impl TableCatalog for VcsCatalog {
         if let Some(snapshot) = session.table(name) {
             return Ok(snapshot);
         }
-        let snapshot = VcsCatalog::resolve_table_snapshot(self, name).await?;
+        let view = self
+            .writer
+            .read_view()
+            .await
+            .map_err(|error| VeinError::internal(error.to_string()))?;
+        let actual_revision = CatalogRevision::new(view.revision.value().to_string());
+        if actual_revision != session.catalog_revision {
+            return Err(VeinError::internal(format!(
+                "catalog changed during planning: session revision '{}', current revision '{}'; restart planning",
+                session.catalog_revision.as_str(),
+                actual_revision.as_str()
+            )));
+        }
+        let snapshot = Self::table_snapshot_from_view(&view, name)?;
         session
             .insert(snapshot.clone())
             .map_err(|error| VeinError::internal(error.to_string()))?;
@@ -444,6 +438,41 @@ fn metadata_command(
 }
 
 impl VcsCatalog {
+    fn table_snapshot_from_view(
+        view: &distributed::CatalogView,
+        name: &str,
+    ) -> Result<Arc<crate::model::TableSnapshot>> {
+        let table_id = view.table_names.get(name).ok_or_else(|| {
+            VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
+        })?;
+        let record = view.table(table_id).ok_or_else(|| {
+            VeinError::internal(format!(
+                "catalog table-name index for '{name}' references missing table '{table_id}'"
+            ))
+        })?;
+        let metadata = decode_table_metadata(&record.latest.metadata_payload)?;
+        if metadata.name != name {
+            return Err(VeinError::internal(format!(
+                "table metadata name '{}' does not match requested table '{}'",
+                metadata.name, name
+            )));
+        }
+
+        let revision = CatalogRevision::new(view.revision.value().to_string());
+        let metadata = metadata.with_catalog_snapshot(common::protocol::CatalogSnapshotToken::new(
+            table_id.as_str(),
+            revision.as_str(),
+            record.latest.id.as_str(),
+            record.latest.schema_version,
+        ));
+        let mut snapshot = crate::model::TableSnapshot::from_metadata(Arc::new(metadata), revision);
+        snapshot.table_id = TableId::new(table_id.as_str());
+        snapshot.snapshot_id = SnapshotId::new(record.latest.id.as_str());
+        snapshot.schema_version = SchemaVersion::new(record.latest.schema_version);
+        snapshot.manifest_uri = Some(record.latest.manifest.uri.clone());
+        Ok(Arc::new(snapshot))
+    }
+
     async fn authoritative_revision(&self) -> Result<CatalogRevision> {
         let view = self
             .writer
@@ -603,53 +632,98 @@ impl VcsCatalog {
         &self,
         name: &str,
     ) -> Result<Arc<crate::model::TableSnapshot>> {
-        let session = crate::catalog::TableCatalog::begin_planning_session(self).await?;
-        let metadata = <Self as crate::catalog::TableCatalog>::get_table(self, name).await?;
-        let mut snapshot = crate::model::TableSnapshot::from_metadata(
-            metadata.clone(),
-            session.catalog_revision.clone(),
-        );
-
-        {
-            let view = self
-                .writer
-                .read_view()
-                .await
-                .map_err(|error| VeinError::internal(error.to_string()))?;
-            let table_id = view.table_names.get(name).cloned().ok_or_else(|| {
-                VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
-            })?;
-            let record = view.table(&table_id).ok_or_else(|| {
-                VeinError::not_found(format!("Table '{name}' is not registered in VCS Catalog"))
-            })?;
-            let metadata = decode_table_metadata(&record.latest.metadata_payload)?;
-            if metadata.name != name {
-                return Err(VeinError::internal(format!(
-                    "table snapshot metadata name '{}' does not match '{}'",
-                    metadata.name, name
-                )));
-            }
-            let metadata =
-                metadata.with_catalog_snapshot(common::protocol::CatalogSnapshotToken::new(
-                    table_id.as_str(),
-                    view.revision.value().to_string(),
-                    record.latest.id.as_str(),
-                    record.latest.schema_version,
-                ));
-            snapshot.table_id = TableId::new(table_id.as_str());
-            snapshot.snapshot_id = SnapshotId::new(record.latest.id.as_str());
-            snapshot.schema_version = SchemaVersion::new(record.latest.schema_version);
-            snapshot.manifest_uri = Some(record.latest.manifest.uri.clone());
-            snapshot.metadata = Arc::new(metadata);
-        }
-
-        Ok(Arc::new(snapshot))
+        let mut session = crate::catalog::TableCatalog::begin_planning_session(self).await?;
+        <Self as TableCatalog>::resolve_table_snapshot(self, &mut session, name).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestMetadataWriter {
+        view: std::sync::RwLock<distributed::CatalogView>,
+    }
+
+    #[async_trait]
+    impl ReplicatedMetadataWriter for TestMetadataWriter {
+        async fn propose(
+            &self,
+            _command: MetadataCommand,
+        ) -> distributed::Result<distributed::CommitReceipt> {
+            Err(distributed::DistributedError::StorePoisoned)
+        }
+
+        async fn read_view(&self) -> distributed::Result<distributed::CatalogView> {
+            self.view
+                .read()
+                .map(|view| view.clone())
+                .map_err(|_| distributed::DistributedError::StorePoisoned)
+        }
+    }
+
+    fn test_catalog_view(revision: u64, names: &[&str]) -> distributed::CatalogView {
+        let mut view = distributed::CatalogView {
+            revision: distributed::CatalogRevision::new(revision),
+            ..Default::default()
+        };
+        for name in names {
+            let metadata = plan::TableMetadata::new(
+                *name,
+                Arc::new(plan::VeinSchema::empty()),
+            );
+            let table_id = DistributedTableId::from(format!("table:{name}"));
+            let snapshot_id = DistributedSnapshotId::from(format!("snapshot:{name}:{revision}"));
+            let snapshot = DistributedTableSnapshot {
+                id: snapshot_id.clone(),
+                table_name: (*name).to_string(),
+                schema_version: 1,
+                manifest: DistributedArtifactRef {
+                    id: DistributedArtifactId::from(format!("manifest:{name}:{revision}")),
+                    uri: format!("vfs://tables/{name}"),
+                    checksum: "test-checksum".to_string(),
+                    size_bytes: 0,
+                },
+                schema_fingerprint: "test-schema".to_string(),
+                metadata_payload: encode_table_metadata(&metadata).expect("metadata encodes"),
+            };
+            view.table_names.insert((*name).to_string(), table_id.clone());
+            view.tables.insert(
+                table_id.clone(),
+                distributed::TableRecord {
+                    table_id,
+                    latest: snapshot,
+                },
+            );
+        }
+        view
+    }
+
+    #[tokio::test]
+    async fn planning_resolution_fails_closed_if_catalog_advances_between_tables() {
+        let writer = Arc::new(TestMetadataWriter {
+            view: std::sync::RwLock::new(test_catalog_view(1, &["orders", "customers"])),
+        });
+        let catalog = VcsCatalog {
+            writer: writer.clone(),
+            exchange_catalog: Arc::new(crate::InMemoryExchangeCatalog::default()),
+        };
+        let mut session = PlanningSession::new(CatalogRevision::new("1"));
+
+        let orders = TableCatalog::resolve_table_snapshot(&catalog, &mut session, "orders")
+            .await
+            .expect("table resolves at pinned revision");
+        assert_eq!(orders.catalog_revision.as_str(), "1");
+
+        *writer.view.write().expect("test view lock") = test_catalog_view(2, &["orders", "customers"]);
+        let error = TableCatalog::resolve_table_snapshot(&catalog, &mut session, "customers")
+            .await
+            .expect_err("a changed catalog must not mix revisions in one plan");
+
+        assert!(error.to_string().contains("restart planning"));
+        assert!(session.table("customers").is_none());
+        assert_eq!(session.table("orders").unwrap().catalog_revision.as_str(), "1");
+    }
 
     #[test]
     fn physical_manifest_uses_real_location_and_content_checksum() {

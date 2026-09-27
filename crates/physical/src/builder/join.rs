@@ -15,7 +15,9 @@ use plan::{
     LogicalExpr, LogicalPlan, PlanTraversal, ResolvedColumn, TableFormat, VeinDataType, VeinSchema,
 };
 
-use crate::builder::pipeline::{DefaultPipelineStageBuilder, PipelineStageBuilder};
+use crate::builder::pipeline::{
+    DefaultPipelineStageBuilder, PipelineStageBuilder, split_file_scan_source,
+};
 use crate::compiler::BytecodeCompiler;
 use crate::distribution::{Distribution, HashPartitioning};
 use crate::job::{StageEdge, StageInputPort};
@@ -157,8 +159,10 @@ impl JoinStageBuilder for DefaultJoinStageBuilder {
             partition_count,
             "selected adaptive join partition count"
         );
-        let left_task_id = TaskId::new();
-        let right_task_id = TaskId::new();
+        let left_sources = split_file_scan_source(left_source)?;
+        let right_sources = split_file_scan_source(right_source)?;
+        let left_task_ids: Vec<_> = left_sources.iter().map(|_| TaskId::new()).collect();
+        let right_task_ids: Vec<_> = right_sources.iter().map(|_| TaskId::new()).collect();
         let left_exchange_key = common::protocol::ExchangeKey {
             query_id,
             stage_id: left_stage_id,
@@ -172,43 +176,49 @@ impl JoinStageBuilder for DefaultJoinStageBuilder {
         let left_path = format!("shuffle/{query_id}/{join_stage_id}/left");
         let right_path = format!("shuffle/{query_id}/{join_stage_id}/right");
 
-        let left_task = Task::new(
-            left_task_id,
-            PartitionId::new(),
-            left_source,
-            left_program,
-            DataSink::Shuffle(ShuffleTarget {
-                exchange_key: left_exchange_key,
-                vfs_path_prefix: left_path.clone(),
-                producer_task_id: left_task_id,
-                attempt: 0,
-                expected_tasks: vec![left_task_id],
-                schema_fingerprint: schema_fingerprint(&left_schema_fields),
-                num_partitions: partition_count,
-                partition_keys: left_keys.clone(),
-                schema: left_schema_fields.clone(),
-            }),
-        );
-        let right_task = Task::new(
-            right_task_id,
-            PartitionId::new(),
-            right_source,
-            right_program,
-            DataSink::Shuffle(ShuffleTarget {
-                exchange_key: right_exchange_key,
-                vfs_path_prefix: right_path.clone(),
-                producer_task_id: right_task_id,
-                attempt: 0,
-                expected_tasks: vec![right_task_id],
-                schema_fingerprint: schema_fingerprint(&right_schema_fields),
-                num_partitions: partition_count,
-                partition_keys: right_keys.clone(),
-                schema: right_schema_fields.clone(),
-            }),
-        );
+        let mut left_stage = Stage::new(left_stage_id);
+        for ((partition, source), task_id) in left_sources.into_iter().zip(&left_task_ids) {
+            left_stage.tasks.push(Task::new(
+                *task_id,
+                partition,
+                source,
+                left_program.clone(),
+                DataSink::Shuffle(ShuffleTarget {
+                    exchange_key: left_exchange_key,
+                    vfs_path_prefix: left_path.clone(),
+                    producer_task_id: *task_id,
+                    attempt: 0,
+                    expected_tasks: left_task_ids.clone(),
+                    schema_fingerprint: schema_fingerprint(&left_schema_fields),
+                    num_partitions: partition_count,
+                    partition_keys: left_keys.clone(),
+                    schema: left_schema_fields.clone(),
+                }),
+            ));
+        }
+        let mut right_stage = Stage::new(right_stage_id);
+        for ((partition, source), task_id) in right_sources.into_iter().zip(&right_task_ids) {
+            right_stage.tasks.push(Task::new(
+                *task_id,
+                partition,
+                source,
+                right_program.clone(),
+                DataSink::Shuffle(ShuffleTarget {
+                    exchange_key: right_exchange_key,
+                    vfs_path_prefix: right_path.clone(),
+                    producer_task_id: *task_id,
+                    attempt: 0,
+                    expected_tasks: right_task_ids.clone(),
+                    schema_fingerprint: schema_fingerprint(&right_schema_fields),
+                    num_partitions: partition_count,
+                    partition_keys: right_keys.clone(),
+                    schema: right_schema_fields.clone(),
+                }),
+            ));
+        }
 
-        stages.push(Stage::new(left_stage_id).with_task(left_task));
-        stages.push(Stage::new(right_stage_id).with_task(right_task));
+        stages.push(left_stage);
+        stages.push(right_stage);
 
         let left_distribution =
             Distribution::Hash(HashPartitioning::new(left_keys.clone(), partition_count));
@@ -247,10 +257,6 @@ impl JoinStageBuilder for DefaultJoinStageBuilder {
                 join_type: PhysicalJoinType::Inner,
                 left_keys: left_keys.clone(),
                 right_keys: right_keys.clone(),
-                requires_exact_verification: address_native
-                    && key_pairs
-                        .iter()
-                        .any(|(left, _)| is_variable_width(&left.data_type)),
                 left_schema: left_schema_fields.clone(),
                 right_schema: right_schema_fields.clone(),
             });
@@ -402,18 +408,6 @@ fn key_spec(column: &ResolvedColumn, mode: JoinKeyMode) -> JoinKeySpec {
         column_name: column.name.clone(),
         mode,
     }
-}
-
-fn is_variable_width(data_type: &VeinDataType) -> bool {
-    matches!(
-        data_type,
-        VeinDataType::Utf8
-            | VeinDataType::LargeUtf8
-            | VeinDataType::StringView
-            | VeinDataType::Binary
-            | VeinDataType::LargeBinary
-            | VeinDataType::BinaryView
-    )
 }
 
 fn supports_address_key(column: &ResolvedColumn, schema: &VeinSchema) -> bool {
@@ -672,12 +666,5 @@ mod tests {
             key_spec(&right_column, JoinKeyMode::ValueNative).mode,
             JoinKeyMode::ValueNative
         );
-    }
-
-    #[test]
-    fn variable_width_address_keys_require_exact_verification() {
-        assert!(is_variable_width(&VeinDataType::Utf8));
-        assert!(is_variable_width(&VeinDataType::Binary));
-        assert!(!is_variable_width(&VeinDataType::Int64));
     }
 }
