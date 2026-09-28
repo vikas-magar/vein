@@ -52,16 +52,7 @@ impl LocalQueryEngine {
         let request_id = RequestId::new();
         let job = self.planner.create_physical_plan(request_id, optimized)?;
 
-        if !job.edges().is_empty() {
-            return Err(VeinError::planning(
-                "local execution does not support shuffle stages yet",
-                None,
-            ));
-        }
-
-        let stage = job
-            .get_stage(job.output_stage_id())
-            .ok_or_else(|| VeinError::internal("physical plan output stage is missing"))?;
+        let stage = job.stage();
         let mut tasks = Vec::with_capacity(stage.tasks().len());
         for task in stage.tasks() {
             if !matches!(task.sink, DataSink::Client { .. }) {

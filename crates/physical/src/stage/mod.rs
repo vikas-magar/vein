@@ -1,14 +1,9 @@
-//! A group of parallel tasks between shuffle barriers.
+//! Parallel file tasks belonging to one local query plan.
 
 use crate::task::Task;
 use common::identifiers::StageId;
 
-/// A set of [`Task`]s that execute together, separated from other stages by a
-/// shuffle barrier.
-///
-/// Every task in a stage is independent of its siblings and can run in
-/// parallel on different executors; a stage completes only when all of its
-/// tasks have finished.
+/// A set of independent tasks that together produce one query result.
 #[derive(Debug, Clone)]
 pub struct Stage {
     /// The unique identifier of this stage.

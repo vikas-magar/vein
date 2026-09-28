@@ -22,12 +22,5 @@ pub mod partition;
 /// Apache Arrow data handling.
 pub mod arrow;
 
-/// Bounded-query result stream primitives shared by execution boundaries.
-pub mod result_stream;
-pub use result_stream::{
-    bounded_result_channel, ResultBatch, ResultChannelSender, ResultEvent, ResultStream,
-    SendableResultStream,
-};
-
 /// Re-export unified error type from the `error` crate.
 pub use error::{Result, VeinError};

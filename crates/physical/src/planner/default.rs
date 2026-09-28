@@ -1,4 +1,4 @@
-//! Default distributed physical planner implementation.
+//! Default single-node physical planner implementation.
 
 use std::sync::Arc;
 
@@ -9,17 +9,13 @@ use error::VeinError;
 use plan::LogicalPlan;
 
 use super::PhysicalPlanner;
-use crate::builder::aggregate::{AggregateStageBuilder, DefaultAggregateStageBuilder};
 use crate::builder::pipeline::{DefaultPipelineStageBuilder, PipelineStageBuilder};
-use crate::builder::join::{DefaultJoinStageBuilder, JoinStageBuilder};
 use crate::job::Job;
 
 /// The default distributed physical planner lowering [`LogicalPlan`] into a [`Job`].
 #[derive(Clone)]
 pub struct DefaultPhysicalPlanner {
     pipeline_builder: Arc<dyn PipelineStageBuilder>,
-    aggregate_builder: Arc<dyn AggregateStageBuilder>,
-    join_builder: Arc<dyn JoinStageBuilder>,
 }
 
 impl DefaultPhysicalPlanner {
@@ -27,8 +23,6 @@ impl DefaultPhysicalPlanner {
     pub fn new() -> Self {
         Self {
             pipeline_builder: Arc::new(DefaultPipelineStageBuilder::new()),
-            aggregate_builder: Arc::new(DefaultAggregateStageBuilder::new()),
-            join_builder: Arc::new(DefaultJoinStageBuilder::new()),
         }
     }
 
@@ -38,32 +32,11 @@ impl DefaultPhysicalPlanner {
         self
     }
 
-    /// Override the distributed aggregation stage builder.
-    pub fn with_aggregate_builder(mut self, builder: Arc<dyn AggregateStageBuilder>) -> Self {
-        self.aggregate_builder = builder;
-        self
-    }
-
-    /// Override the distributed join stage builder.
-    pub fn with_join_builder(mut self, builder: Arc<dyn JoinStageBuilder>) -> Self {
-        self.join_builder = builder;
-        self
-    }
-
     /// Borrows the linear pipeline stage builder.
     pub fn pipeline_builder(&self) -> &Arc<dyn PipelineStageBuilder> {
         &self.pipeline_builder
     }
 
-    /// Borrows the aggregation stage builder.
-    pub fn aggregate_builder(&self) -> &Arc<dyn AggregateStageBuilder> {
-        &self.aggregate_builder
-    }
-
-    /// Borrows the distributed join stage builder.
-    pub fn join_builder(&self) -> &Arc<dyn JoinStageBuilder> {
-        &self.join_builder
-    }
 }
 
 impl Default for DefaultPhysicalPlanner {
@@ -78,16 +51,6 @@ impl std::fmt::Debug for DefaultPhysicalPlanner {
     }
 }
 
-fn contains_linear_join(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Join { .. } => true,
-        LogicalPlan::Project { input, .. } | LogicalPlan::Filter { input, .. } => {
-            contains_linear_join(input)
-        }
-        _ => false,
-    }
-}
-
 impl PhysicalPlanner for DefaultPhysicalPlanner {
     fn create_physical_plan(&self, request_id: RequestId, logical_plan: LogicalPlan) -> Result<Job> {
         let query_id = QueryId::new();
@@ -98,52 +61,23 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
             "physical_planning_started"
         );
 
-        if contains_linear_join(&logical_plan) {
-            let mut stages = Vec::new();
-            let mut edges = Vec::new();
-            let output_stage = self.join_builder.build(
-                query_id,
-                &logical_plan,
-                &mut stages,
-                &mut edges,
-            )?;
-            return Job::new(request_id, query_id, stages, edges, output_stage, ExecutionMode::Batch);
-        }
-
         match &logical_plan {
             LogicalPlan::Scan { .. }
             | LogicalPlan::ExternalScan { .. }
             | LogicalPlan::Filter { .. }
             | LogicalPlan::Project { .. }
             | LogicalPlan::Write { .. } => {
-                let mut stages = Vec::new();
-                let output_stage = self
-                    .pipeline_builder
-                    .build(query_id, &logical_plan, &mut stages)?;
-                Job::new(request_id, query_id, stages, vec![], output_stage, ExecutionMode::Batch)
+                let stage = self.pipeline_builder.build(&logical_plan)?;
+                Ok(Job::new(request_id, query_id, stage, ExecutionMode::Batch))
             }
-            LogicalPlan::Aggregate { .. } => {
-                let mut stages = Vec::new();
-                let mut edges = Vec::new();
-                let output_stage = self.aggregate_builder.build(
-                    query_id,
-                    &logical_plan,
-                    &mut stages,
-                    &mut edges,
-                )?;
-                Job::new(request_id, query_id, stages, edges, output_stage, ExecutionMode::Batch)
-            }
-            LogicalPlan::Join { .. } => {
-                let mut stages = Vec::new();
-                let mut edges = Vec::new();
-                let output_stage = self.join_builder.build(
-                    query_id,
-                    &logical_plan,
-                    &mut stages,
-                    &mut edges,
-                )?;
-                Job::new(request_id, query_id, stages, edges, output_stage, ExecutionMode::Batch)
-            }
+            LogicalPlan::Aggregate { .. } => Err(VeinError::planning(
+                "aggregations are not supported by the single-node execution engine yet",
+                None,
+            )),
+            LogicalPlan::Join { .. } => Err(VeinError::planning(
+                "JOIN is not supported by the single-node execution engine yet",
+                None,
+            )),
             other => Err(VeinError::planning(
                 format!("Logical plan node not yet supported by physical planner: {other:?}"),
                 None,
@@ -182,12 +116,55 @@ mod tests {
             .create_physical_plan(RequestId::new(), plan)
             .expect("plan should succeed");
 
-        assert_eq!(job.topological_order().len(), 1);
-        let stage_id = job.output_stage_id();
-        let stage = job.get_stage(stage_id).expect("output stage exists");
+        let stage = job.stage();
         assert_eq!(stage.tasks().len(), 1);
 
         let task = &stage.tasks()[0];
         assert_eq!(task.program.register_count, 2);
+    }
+
+    #[test]
+    fn rejects_aggregate_without_creating_a_distributed_plan() {
+        let input = mock_scan_plan();
+        let schema = match &input {
+            LogicalPlan::Scan { schema, .. } => schema.clone(),
+            _ => unreachable!(),
+        };
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(input),
+            grouping_sets: vec![],
+            aggs: vec![],
+            schema,
+        };
+
+        let error = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), aggregate)
+            .expect_err("aggregate is not implemented by the local engine");
+
+        assert!(error.to_string().contains("aggregations are not supported"));
+    }
+
+    #[test]
+    fn rejects_join_without_creating_shuffle_stages() {
+        let left = mock_scan_plan();
+        let right = mock_scan_plan();
+        let schema = match &left {
+            LogicalPlan::Scan { schema, .. } => schema.clone(),
+            _ => unreachable!(),
+        };
+        let join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(left),
+            right: Box::new(right),
+            on: None,
+            using: vec![],
+            schema,
+        };
+
+        let error = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), join)
+            .expect_err("join is not implemented by the local engine");
+
+        assert!(error.to_string().contains("JOIN is not supported"));
     }
 }

@@ -3,9 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
-use super::exchange::ExchangeKey;
 use super::ir::MicroProgram;
-use super::join::{JoinKeySpec, JoinSource};
 use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
 
 /// Supported file formats for storage scans.
@@ -101,27 +99,6 @@ pub struct FileScanTask {
     pub task_id: TaskId,
     /// Catalog snapshot pinned by the planning session.
     pub catalog_snapshot: Option<CatalogSnapshotToken>,
-    /// VFS path prefix to send output to, if applicable.
-    pub shuffle_target_path: Option<String>,
-}
-
-/// Read from VFS Exchange.
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-pub struct ExchangeSource {
-    /// Authoritative VCS exchange identity.
-    pub exchange_key: ExchangeKey,
-    /// The upstream stage ID that produced the data.
-    pub upstream_stage_id: StageId,
-    /// Canonical VFS prefix written by the producing shuffle sink.
-    pub path_prefix: String,
-    /// Partition assigned to this task.
-    pub partition_id: u32,
-    /// Total number of partitions in the exchange.
-    pub partition_count: u16,
-    /// Schema of the exchange rows.
-    pub schema: Vec<FieldSchema>,
 }
 
 /// Read from an infinite stream.
@@ -140,39 +117,10 @@ pub struct StreamSource {
 pub enum DataSource {
     /// Read from static storage (e.g., Parquet).
     File(FileScanTask),
-    /// Read from VFS (Exchange).
-    Exchange(ExchangeSource),
-    /// Consume two partition-aligned exchange inputs with a physical join.
-    Join(JoinSource),
     /// Read from an infinite event stream (e.g., Kafka).
     Stream(StreamSource),
     /// A source that generates data directly (e.g. VALUES).
     Memory,
-}
-
-/// Target for shuffle output (VFS path prefix + partition info).
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-pub struct ShuffleTarget {
-    /// Authoritative VCS exchange identity.
-    pub exchange_key: ExchangeKey,
-    /// VFS path prefix used as the exchange data namespace.
-    pub vfs_path_prefix: String,
-    /// Producer task that owns the immutable fragment paths.
-    pub producer_task_id: TaskId,
-    /// Retry attempt for this producer task.
-    pub attempt: u32,
-    /// Producer tasks expected to publish fragments.
-    pub expected_tasks: Vec<TaskId>,
-    /// Fingerprint of the exchanged schema and key contract.
-    pub schema_fingerprint: String,
-    /// Number of shuffle partitions.
-    pub num_partitions: u16,
-    /// Keys used to compute the stable partition hash.
-    pub partition_keys: Vec<JoinKeySpec>,
-    /// Schema of the rows written to the exchange.
-    pub schema: Vec<FieldSchema>,
 }
 
 /// Key-value option pair for storage and scan configurations.
@@ -259,8 +207,6 @@ impl StorageTarget {
     Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub enum DataSink {
-    /// Push data to VFS for the next stage.
-    Shuffle(ShuffleTarget),
     /// Stream data directly back to the Query Coordinator/Client.
     Client {
         /// Schema of the columns expected at the client.

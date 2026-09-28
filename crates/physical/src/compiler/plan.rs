@@ -94,7 +94,6 @@ impl PipelineCompiler {
                 projected_schema,
                 task_id: TaskId::new(),
                 catalog_snapshot: None,
-                shuffle_target_path: None,
             }),
             schema.clone(),
         ))

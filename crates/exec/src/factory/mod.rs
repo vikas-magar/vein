@@ -1,7 +1,6 @@
 //! The default [`ExecutorBuilder`] implementation.
 //!
-//! Maps the wire protocol (`common::protocol::{DataSource, MicroProgram, DataSink}`)
-//! onto the executor's concrete stages and Vector VM execution engine.
+//! Maps task descriptions onto concrete sources, sinks, and Vector VM execution.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,7 +101,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                     .finish();
                 Ok(Box::new(ScanSource::new(op, paths, scan.format.clone())))
             }
-            DataSource::Exchange(_) | DataSource::Join(_) | DataSource::Stream(_) => Err(
+            DataSource::Stream(_) => Err(
                 VeinError::internal("this local executor supports only memory and Parquet sources"),
             ),
         }
@@ -127,7 +126,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                 let field_names = schema.iter().map(|f| f.name.clone()).collect();
                 Ok(Box::new(CollectSink::with_field_names(field_names)))
             }
-            DataSink::Shuffle(_) | DataSink::Storage(_) => Err(VeinError::internal(
+            DataSink::Storage(_) => Err(VeinError::internal(
                 "this local executor supports only client and discard sinks",
             )),
         }

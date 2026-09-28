@@ -8,10 +8,8 @@ use local::LocalQueryEngine;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let query = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
-    if query.is_empty() {
-        return Err("usage: cli \"FROM table |> SELECT column\"".into());
-    }
+    // let query = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let query = "FROM './input' |> WHERE id < 10 |> SELECT *";
 
     let data_root = std::env::var_os("VEIN_DATA_DIR")
         .map(std::path::PathBuf::from)
@@ -33,6 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !saw_batch {
         println!("Query returned 0 rows");
     }
-    eprintln!("Query completed: {row_count} rows in {} ms", started.elapsed().as_millis());
+    eprintln!(
+        "Query completed: {row_count} rows in {} ms",
+        started.elapsed().as_millis()
+    );
     Ok(())
 }

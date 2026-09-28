@@ -3,50 +3,27 @@
 // which triggers missing_docs warnings even when all user-facing items are fully documented.
 #![allow(missing_docs)]
 
-pub mod control;
 pub mod convert;
-pub mod exchange;
 pub mod ir;
-pub mod join;
-pub mod rpc;
 pub mod task;
-pub mod vcs_exchange;
 
 // Re-export Micro-IR definitions
-pub use exchange::{
-    ExchangeAddressColumn, ExchangeBatch, ExchangeFragment, ExchangeKey, ExchangeManifest,
-    ExchangeState, SpillRun, SpillRunState,
-};
 pub use ir::constant::ScalarConstant;
 pub use ir::op::MicroOp;
 pub use ir::program::{MicroProgram, RegId};
 pub use ir::state::{AggOpCode, JoinKind, StateMode};
-pub use join::{ExchangeInput, JoinKeyMode, JoinKeySpec, JoinSource, PhysicalJoinType};
-pub use vcs_exchange::{VcsExchangeRequest, VcsExchangeResponse};
 
 // Re-export task & pipeline definitions
 pub use task::{
     ArchivedCatalogSnapshotToken, ArchivedExecuteTask, CatalogSnapshotToken, DataSink, DataSource,
-    ExchangeSource, ExecuteTask, ExecutionMode, FieldSchema, FileFormat, FileScanTask, KeyValue,
-    ShuffleTarget, StorageTarget, StreamSource,
-};
-
-// Re-export control-plane events and telemetry
-pub use control::{
-    ArchivedRaftRpcEnvelope, ArchivedRaftRpcKind, ArchivedVeinControlEvent, NodeKind, NodeLoad,
-    QueryTelemetry, RaftRpcEnvelope, RaftRpcKind, TableWritePartDescriptor, TaskTelemetry, VeinControlEvent,
-};
-
-// Re-export RPC types
-pub use rpc::{
-    ArchivedProtocolRequest, ArchivedProtocolResponse, MasterCommand, PreemptResponse,
-    ProtocolRequest, ProtocolResponse,
+    ExecuteTask, ExecutionMode, FieldSchema, FileFormat, FileScanTask, KeyValue, StorageTarget,
+    StreamSource,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identifiers::{NodeId, QueryId, RequestId, StageId, TaskId};
+    use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
     use rkyv::rancor::Error;
 
     #[test]
@@ -105,7 +82,6 @@ mod tests {
                 projected_schema: vec![],
                 task_id: TaskId::new(),
                 catalog_snapshot: None,
-                shuffle_target_path: None,
             }),
             program: MicroProgram::new(
                 4,
@@ -137,80 +113,4 @@ mod tests {
         assert_eq!(roundtrip.program.instructions.len(), 2);
     }
 
-    #[test]
-    fn test_control_event_zero_copy_in_place() {
-        let task_id = TaskId::new();
-        let query_id = QueryId::new();
-        let event = VeinControlEvent::CancelTask {
-            task_id,
-            query_id,
-            attempt: 3,
-        };
-        let bytes = rkyv::to_bytes::<Error>(&event).expect("CancelTask serialization failed");
-
-        let mut aligned = rkyv::util::AlignedVec::<16>::new();
-        aligned.extend_from_slice(&bytes);
-
-        let archived = rkyv::access::<control::ArchivedVeinControlEvent, Error>(&aligned)
-            .expect("CancelTask access failed");
-
-        match archived {
-            control::ArchivedVeinControlEvent::CancelTask {
-                task_id: archived_tid,
-                query_id: archived_qid,
-                attempt,
-            } => {
-                assert_eq!(TaskId::from_raw(archived_tid.0.to_native()), task_id);
-                assert_eq!(QueryId::from_raw(archived_qid.0.to_native()), query_id);
-                assert_eq!(attempt.to_native(), 3);
-            }
-            _ => panic!("expected CancelTask"),
-        }
-
-        let node_id = NodeId::new();
-        let hb = VeinControlEvent::Heartbeat {
-            node_id,
-            node_kind: NodeKind::Executor,
-            timestamp_ms: 999888777,
-            load: NodeLoad {
-                active_tasks: 3,
-                cpu_percent: 25.0,
-                memory_bytes: 8192,
-            },
-            advertise_addr: "127.0.0.1:8081".to_string(),
-        };
-        let hb_bytes = rkyv::to_bytes::<Error>(&hb).expect("Heartbeat serialization failed");
-        let mut hb_aligned = rkyv::util::AlignedVec::<16>::new();
-        hb_aligned.extend_from_slice(&hb_bytes);
-
-        let archived_hb = rkyv::access::<control::ArchivedVeinControlEvent, Error>(&hb_aligned)
-            .expect("Heartbeat access failed");
-
-        match archived_hb {
-            control::ArchivedVeinControlEvent::Heartbeat {
-                node_id: archived_nid,
-                timestamp_ms,
-                advertise_addr,
-                ..
-            } => {
-                assert_eq!(NodeId::from_raw(archived_nid.0.to_native()), node_id);
-                assert_eq!(timestamp_ms.to_native(), 999888777);
-                assert_eq!(advertise_addr.as_str(), "127.0.0.1:8081");
-            }
-            _ => panic!("expected Heartbeat"),
-        }
-
-        let from_archived = VeinControlEvent::from(archived_hb);
-        if let VeinControlEvent::Heartbeat {
-            node_id: nid,
-            advertise_addr: addr,
-            ..
-        } = from_archived
-        {
-            assert_eq!(nid, node_id);
-            assert_eq!(addr, "127.0.0.1:8081");
-        } else {
-            panic!("expected Heartbeat");
-        }
-    }
 }

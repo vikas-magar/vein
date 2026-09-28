@@ -1,19 +1,18 @@
-//! The atomic unit of work dispatched to a single executor.
+//! The atomic unit of work executed by the local engine.
 
 use common::identifiers::{PartitionId, QueryId, RequestId, StageId, TaskId};
 use common::protocol::{DataSink, DataSource, ExecuteTask, ExecutionMode, MicroProgram};
 
-/// The smallest schedulable unit of a physical plan.
+/// The smallest executable unit of a physical plan.
 ///
 /// A [`Task`] describes one self-contained slice of work — a [`DataSource`],
 /// a [`MicroProgram`], and a [`DataSink`] — that a single executor runs
-/// to completion. It maps directly onto the wire [`ExecuteTask`] the master
-/// dispatches.
+/// to completion. The local runtime converts it into an [`ExecuteTask`].
 #[derive(Debug, Clone)]
 pub struct Task {
     /// The unique identifier of this task.
     pub task_id: TaskId,
-    /// The shuffle partition this task produces or consumes.
+    /// Stable partition identity for this input task.
     pub partition: PartitionId,
     /// The data source this task reads from.
     pub source: DataSource,

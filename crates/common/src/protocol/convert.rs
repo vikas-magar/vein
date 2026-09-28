@@ -3,32 +3,21 @@
 //! Provides fast O(1) in-place extraction from validated rkyv buffers without
 //! lifetime infection or rkyv::Deserialize Pool strategy mismatches.
 
-use super::control::{
-    TableWritePartDescriptor,
-    ArchivedNodeKind, ArchivedNodeLoad, ArchivedRaftRpcEnvelope, ArchivedRaftRpcKind,
-    ArchivedVeinControlEvent, NodeKind, NodeLoad, RaftRpcEnvelope, RaftRpcKind, VeinControlEvent,
-};
-use super::exchange::{ArchivedExchangeKey, ExchangeKey};
 use super::ir::constant::{ArchivedScalarConstant, ScalarConstant};
 use super::ir::op::{ArchivedMicroOp, MicroOp};
 use super::ir::program::{ArchivedMicroProgram, MicroProgram};
 use super::ir::state::{
     AggOpCode, ArchivedAggOpCode, ArchivedJoinKind, ArchivedStateMode, JoinKind, StateMode,
 };
-use super::join::{
-    ArchivedExchangeInput, ArchivedJoinKeyMode, ArchivedJoinKeySpec, ArchivedJoinSource,
-    ArchivedPhysicalJoinType, ExchangeInput, JoinKeyMode, JoinKeySpec, JoinSource,
-    PhysicalJoinType,
-};
 use super::task::{
     ArchivedCatalogSnapshotToken, ArchivedDataSink, ArchivedDataSource, ArchivedExecuteTask,
     ArchivedExecutionMode, ArchivedFieldSchema, ArchivedFileFormat, ArchivedFileScanTask,
-    CatalogSnapshotToken, DataSink, DataSource, ExchangeSource,
+    CatalogSnapshotToken, DataSink, DataSource,
     ExecuteTask, ExecutionMode,
     FieldSchema, FileFormat, FileScanTask, KeyValue,
-    ShuffleTarget, StorageTarget, StreamSource,
+    StorageTarget, StreamSource,
 };
-use crate::identifiers::{NodeId, QueryId, RequestId, StageId, TaskId};
+use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
 
 // ── Micro-IR Conversions ──────────────────────────────────────────
 
@@ -323,10 +312,6 @@ impl From<&ArchivedFileScanTask> for FileScanTask {
                 .catalog_snapshot
                 .as_ref()
                 .map(CatalogSnapshotToken::from),
-            shuffle_target_path: archived
-                .shuffle_target_path
-                .as_ref()
-                .map(|p| p.as_str().to_string()),
         }
     }
 }
@@ -340,90 +325,11 @@ impl From<&ArchivedExecutionMode> for ExecutionMode {
     }
 }
 
-impl From<&ArchivedPhysicalJoinType> for PhysicalJoinType {
-    fn from(archived: &ArchivedPhysicalJoinType) -> Self {
-        match archived {
-            ArchivedPhysicalJoinType::Inner => Self::Inner,
-            ArchivedPhysicalJoinType::Left => Self::Left,
-            ArchivedPhysicalJoinType::Right => Self::Right,
-            ArchivedPhysicalJoinType::Full => Self::Full,
-            ArchivedPhysicalJoinType::Cross => Self::Cross,
-        }
-    }
-}
-
-impl From<&ArchivedJoinKeyMode> for JoinKeyMode {
-    fn from(archived: &ArchivedJoinKeyMode) -> Self {
-        match archived {
-            ArchivedJoinKeyMode::Auto => Self::Auto,
-            ArchivedJoinKeyMode::ValueNative => Self::ValueNative,
-        }
-    }
-}
-
-impl From<&ArchivedJoinKeySpec> for JoinKeySpec {
-    fn from(archived: &ArchivedJoinKeySpec) -> Self {
-        Self {
-            field_id: archived.field_id.to_native(),
-            column_name: archived.column_name.as_str().to_string(),
-            mode: JoinKeyMode::from(&archived.mode),
-        }
-    }
-}
-
-impl From<&ArchivedExchangeKey> for ExchangeKey {
-    fn from(archived: &ArchivedExchangeKey) -> Self {
-        Self {
-            query_id: QueryId::from_raw(archived.query_id.0.to_native()),
-            stage_id: StageId::from_raw(archived.stage_id.0.to_native()),
-        }
-    }
-}
-
-impl From<&ArchivedExchangeInput> for ExchangeInput {
-    fn from(archived: &ArchivedExchangeInput) -> Self {
-        Self {
-            exchange_key: ExchangeKey::from(&archived.exchange_key),
-            upstream_stage_id: StageId::from_raw(archived.upstream_stage_id.0.to_native()),
-            path_prefix: archived.path_prefix.as_str().to_string(),
-            partition_id: archived.partition_id.to_native(),
-            partition_count: archived.partition_count.to_native(),
-        }
-    }
-}
-
-impl From<&ArchivedJoinSource> for JoinSource {
-    fn from(archived: &ArchivedJoinSource) -> Self {
-        Self {
-            left: ExchangeInput::from(&archived.left),
-            right: ExchangeInput::from(&archived.right),
-            join_type: PhysicalJoinType::from(&archived.join_type),
-            left_keys: archived.left_keys.iter().map(JoinKeySpec::from).collect(),
-            right_keys: archived.right_keys.iter().map(JoinKeySpec::from).collect(),
-            left_schema: archived.left_schema.iter().map(FieldSchema::from).collect(),
-            right_schema: archived
-                .right_schema
-                .iter()
-                .map(FieldSchema::from)
-                .collect(),
-        }
-    }
-}
-
 impl From<&ArchivedDataSource> for DataSource {
     fn from(archived: &ArchivedDataSource) -> Self {
         match archived {
             ArchivedDataSource::Memory => DataSource::Memory,
             ArchivedDataSource::File(scan) => DataSource::File(FileScanTask::from(scan)),
-            ArchivedDataSource::Exchange(e) => DataSource::Exchange(ExchangeSource {
-                exchange_key: ExchangeKey::from(&e.exchange_key),
-                upstream_stage_id: StageId::from_raw(e.upstream_stage_id.0.to_native()),
-                path_prefix: e.path_prefix.as_str().to_string(),
-                partition_id: e.partition_id.to_native(),
-                partition_count: e.partition_count.to_native(),
-                schema: e.schema.iter().map(FieldSchema::from).collect(),
-            }),
-            ArchivedDataSource::Join(join) => DataSource::Join(JoinSource::from(join)),
             ArchivedDataSource::Stream(s) => DataSource::Stream(StreamSource {
                 topic: s.topic.as_str().to_string(),
             }),
@@ -438,21 +344,6 @@ impl From<&ArchivedDataSink> for DataSink {
                 schema: schema.iter().map(FieldSchema::from).collect(),
             },
             ArchivedDataSink::Discard => DataSink::Discard,
-            ArchivedDataSink::Shuffle(s) => DataSink::Shuffle(ShuffleTarget {
-                exchange_key: ExchangeKey::from(&s.exchange_key),
-                vfs_path_prefix: s.vfs_path_prefix.as_str().to_string(),
-                producer_task_id: TaskId::from_raw(s.producer_task_id.0.to_native()),
-                attempt: s.attempt.to_native(),
-                expected_tasks: s
-                    .expected_tasks
-                    .iter()
-                    .map(|task| TaskId::from_raw(task.0.to_native()))
-                    .collect(),
-                schema_fingerprint: s.schema_fingerprint.as_str().to_string(),
-                num_partitions: s.num_partitions.to_native(),
-                partition_keys: s.partition_keys.iter().map(JoinKeySpec::from).collect(),
-                schema: s.schema.iter().map(FieldSchema::from).collect(),
-            }),
             ArchivedDataSink::Storage(s) => DataSink::Storage(StorageTarget {
                 destination_uri: s.destination_uri.as_str().to_string(),
                 options: s
@@ -481,197 +372,6 @@ impl From<&ArchivedExecuteTask> for ExecuteTask {
             source: DataSource::from(&archived.source),
             program: MicroProgram::from(&archived.program),
             sink: DataSink::from(&archived.sink),
-        }
-    }
-}
-
-// ── Control-Plane Conversions ──────────────────────────────────────
-
-impl From<&ArchivedNodeKind> for NodeKind {
-    fn from(archived: &ArchivedNodeKind) -> Self {
-        match archived {
-            ArchivedNodeKind::Master => NodeKind::Master,
-            ArchivedNodeKind::Executor => NodeKind::Executor,
-            ArchivedNodeKind::Vcs => NodeKind::Vcs,
-        }
-    }
-}
-
-impl From<&ArchivedNodeLoad> for NodeLoad {
-    fn from(archived: &ArchivedNodeLoad) -> Self {
-        Self {
-            active_tasks: archived.active_tasks.to_native(),
-            cpu_percent: archived.cpu_percent.to_native(),
-            memory_bytes: archived.memory_bytes.to_native(),
-        }
-    }
-}
-
-impl From<&ArchivedRaftRpcKind> for RaftRpcKind {
-    fn from(archived: &ArchivedRaftRpcKind) -> Self {
-        match archived {
-            ArchivedRaftRpcKind::Vote => RaftRpcKind::Vote,
-            ArchivedRaftRpcKind::AppendEntries => RaftRpcKind::AppendEntries,
-            ArchivedRaftRpcKind::InstallSnapshot => RaftRpcKind::InstallSnapshot,
-        }
-    }
-}
-
-impl From<&ArchivedRaftRpcEnvelope> for RaftRpcEnvelope {
-    fn from(archived: &ArchivedRaftRpcEnvelope) -> Self {
-        Self {
-            request_id: archived.request_id.to_native(),
-            kind: RaftRpcKind::from(&archived.kind),
-            payload: archived.payload.as_slice().to_vec(),
-        }
-    }
-}
-
-impl From<&ArchivedVeinControlEvent> for VeinControlEvent {
-    fn from(archived: &ArchivedVeinControlEvent) -> Self {
-        match archived {
-            ArchivedVeinControlEvent::TableInvalidated {
-                namespace,
-                table_name,
-                new_snapshot_id,
-            } => VeinControlEvent::TableInvalidated {
-                namespace: namespace.iter().map(|s| s.as_str().to_string()).collect(),
-                table_name: table_name.as_str().to_string(),
-                new_snapshot_id: new_snapshot_id.to_native(),
-            },
-            ArchivedVeinControlEvent::CatalogReady => VeinControlEvent::CatalogReady,
-            ArchivedVeinControlEvent::TaskCompleted {
-                task_id,
-                query_id,
-                attempt,
-                row_count,
-                bytes_read,
-                duration_ns,
-                result_bytes,
-                write_parts,
-            } => VeinControlEvent::TaskCompleted {
-                task_id: TaskId::from_raw(task_id.0.to_native()),
-                query_id: QueryId::from_raw(query_id.0.to_native()),
-                attempt: attempt.to_native(),
-                row_count: row_count.to_native(),
-                bytes_read: bytes_read.to_native(),
-                duration_ns: duration_ns.to_native(),
-                result_bytes: result_bytes.as_ref().map(|b| b.as_slice().to_vec()),
-                write_parts: write_parts.iter().map(|part| TableWritePartDescriptor {
-                    partition_id: part.partition_id.to_native(),
-                    artifact_id: part.artifact_id.as_str().to_owned(),
-                    artifact_uri: part.artifact_uri.as_str().to_owned(),
-                    checksum: part.checksum.as_str().to_owned(),
-                    size_bytes: part.size_bytes.to_native(),
-                    row_count: part.row_count.to_native(),
-                }).collect(),
-            },
-            ArchivedVeinControlEvent::TaskResultStart {
-                task_id,
-                query_id,
-                attempt,
-            } => VeinControlEvent::TaskResultStart {
-                task_id: TaskId::from_raw(task_id.0.to_native()),
-                query_id: QueryId::from_raw(query_id.0.to_native()),
-                attempt: attempt.to_native(),
-            },
-            ArchivedVeinControlEvent::TaskResultBatch {
-                task_id,
-                query_id,
-                attempt,
-                sequence,
-                result_bytes,
-            } => VeinControlEvent::TaskResultBatch {
-                task_id: TaskId::from_raw(task_id.0.to_native()),
-                query_id: QueryId::from_raw(query_id.0.to_native()),
-                attempt: attempt.to_native(),
-                sequence: sequence.to_native(),
-                result_bytes: result_bytes.as_slice().to_vec(),
-            },
-            ArchivedVeinControlEvent::TaskResultEnd {
-                task_id,
-                query_id,
-                attempt,
-                row_count,
-                bytes_read,
-                duration_ns,
-            } => VeinControlEvent::TaskResultEnd {
-                task_id: TaskId::from_raw(task_id.0.to_native()),
-                query_id: QueryId::from_raw(query_id.0.to_native()),
-                attempt: attempt.to_native(),
-                row_count: row_count.to_native(),
-                bytes_read: bytes_read.to_native(),
-                duration_ns: duration_ns.to_native(),
-            },
-            ArchivedVeinControlEvent::RaftRpcRequest(envelope) => {
-                VeinControlEvent::RaftRpcRequest(RaftRpcEnvelope::from(envelope))
-            }
-            ArchivedVeinControlEvent::RaftRpcResponse { envelope, error } => {
-                VeinControlEvent::RaftRpcResponse {
-                    envelope: RaftRpcEnvelope::from(envelope),
-                    error: error.as_ref().map(|value| value.as_str().to_string()),
-                }
-            }
-            ArchivedVeinControlEvent::DispatchTask(task) => {
-                VeinControlEvent::DispatchTask(ExecuteTask::from(task))
-            }
-            ArchivedVeinControlEvent::TaskFailed {
-                task_id,
-                query_id,
-                attempt,
-                error,
-            } => VeinControlEvent::TaskFailed {
-                task_id: TaskId::from_raw(task_id.0.to_native()),
-                query_id: QueryId::from_raw(query_id.0.to_native()),
-                attempt: attempt.to_native(),
-                error: error.as_str().to_string(),
-            },
-            ArchivedVeinControlEvent::CancelTask {
-                task_id,
-                query_id,
-                attempt,
-            } => {
-                VeinControlEvent::CancelTask {
-                    task_id: TaskId::from_raw(task_id.0.to_native()),
-                    query_id: QueryId::from_raw(query_id.0.to_native()),
-                    attempt: attempt.to_native(),
-                }
-            }
-            ArchivedVeinControlEvent::ExplicitDrain { query_id, stage_id } => {
-                VeinControlEvent::ExplicitDrain {
-                    query_id: QueryId::from_raw(query_id.0.to_native()),
-                    stage_id: StageId::from_raw(stage_id.0.to_native()),
-                }
-            }
-            ArchivedVeinControlEvent::Heartbeat {
-                node_id,
-                node_kind,
-                timestamp_ms,
-                load,
-                advertise_addr,
-            } => VeinControlEvent::Heartbeat {
-                node_id: NodeId::from_raw(node_id.0.to_native()),
-                node_kind: NodeKind::from(node_kind),
-                timestamp_ms: timestamp_ms.to_native(),
-                load: NodeLoad::from(load),
-                advertise_addr: advertise_addr.as_str().to_string(),
-            },
-            ArchivedVeinControlEvent::HeartbeatAck => VeinControlEvent::HeartbeatAck,
-            ArchivedVeinControlEvent::StageReady {
-                query_id,
-                stage_id,
-                num_partitions,
-            } => VeinControlEvent::StageReady {
-                query_id: QueryId::from_raw(query_id.0.to_native()),
-                stage_id: StageId::from_raw(stage_id.0.to_native()),
-                num_partitions: num_partitions.to_native(),
-            },
-            ArchivedVeinControlEvent::DrainCompleted { query_id, stage_id } => {
-                VeinControlEvent::DrainCompleted {
-                    query_id: QueryId::from_raw(query_id.0.to_native()),
-                    stage_id: StageId::from_raw(stage_id.0.to_native()),
-                }
-            }
         }
     }
 }

@@ -9,7 +9,6 @@
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
@@ -18,12 +17,8 @@ use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
-use common::protocol::{DataSink, DataSource, ExecuteTask, MicroProgram, VeinControlEvent};
+use common::protocol::{DataSink, DataSource, ExecuteTask, MicroProgram};
 use error::VeinError;
-
-/// Operator telemetry and profiling.
-pub mod profile;
-pub use profile::{OperatorMetrics, OperatorProfile, OperatorSnapshot, ProfileNode};
 
 /// Per-task execution metrics, reported to the master on completion.
 #[derive(Debug, Clone, Copy, Default)]
@@ -125,60 +120,6 @@ pub trait TaskExecutor: Send + Sync {
         }
         Ok(result)
     }
-}
-
-/// Serializes produced [`RecordBatch`]es into wire bytes for the data plane
-/// (e.g. Arrow IPC). Backs `DataSink::Client` when results cross the network.
-pub trait OutputEncoder: Send + Sync {
-    /// Encode a slice of batches into a single byte payload.
-    fn encode(&self, batches: &[RecordBatch]) -> Result<Bytes>;
-}
-
-/// Default [`OutputEncoder`] backed by the Arrow IPC streaming format.
-#[derive(Debug, Default, Clone)]
-pub struct ArrowIpcOutputEncoder;
-
-impl ArrowIpcOutputEncoder {
-    /// Create a new [`ArrowIpcOutputEncoder`].
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Encodes exactly one batch as a self-contained IPC stream.
-    ///
-    /// Result frames use this unit so the receiver can decode each batch
-    /// independently while preserving bounded transport memory.
-    pub fn encode_batch(&self, batch: &RecordBatch) -> Result<Bytes> {
-        self.encode_batch_vec(batch).map(Bytes::from)
-    }
-
-    /// Encodes one batch into an owned IPC buffer for ownership transfer to RPC.
-    pub fn encode_batch_vec(&self, batch: &RecordBatch) -> Result<Vec<u8>> {
-        let mut encoder = common::arrow::IpcStreamEncoder::new();
-        encoder.encode(batch)?;
-        encoder.finalize()
-    }
-}
-
-impl OutputEncoder for ArrowIpcOutputEncoder {
-    fn encode(&self, batches: &[RecordBatch]) -> Result<Bytes> {
-        if batches.is_empty() {
-            return Ok(Bytes::new());
-        }
-        let mut encoder = common::arrow::IpcStreamEncoder::new();
-        for batch in batches {
-            encoder.encode(batch)?;
-        }
-        let bytes = encoder.finalize()?;
-        Ok(Bytes::from(bytes))
-    }
-}
-
-/// Sends control-plane events (completion, failure, cancel) to the master.
-#[async_trait]
-pub trait ControlTransport: Send + Sync {
-    /// Send one control event to the master.
-    async fn send(&self, event: VeinControlEvent) -> Result<()>;
 }
 
 /// A [`PipelineNode`] wrapper that aborts the pipeline if cancellation has been

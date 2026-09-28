@@ -4,7 +4,7 @@ use crate::compiler::PipelineCompiler;
 use crate::stage::Stage;
 use crate::task::Task;
 use common::Result;
-use common::identifiers::{PartitionId, QueryId, StageId, TaskId};
+use common::identifiers::{PartitionId, StageId, TaskId};
 use common::protocol::{DataSink, DataSource, FieldSchema, MicroProgram};
 use error::VeinError;
 use plan::LogicalPlan;
@@ -15,10 +15,8 @@ pub trait PipelineStageBuilder: Send + Sync {
     /// Translates a linear logical plan into a single physical stage with `DataSink::Client`.
     fn build(
         &self,
-        query_id: QueryId,
         plan: &LogicalPlan,
-        stages: &mut Vec<Stage>,
-    ) -> Result<StageId>;
+    ) -> Result<Stage>;
 
     /// Compiles the linear pipeline into a leaf data source, a [`MicroProgram`], and an output schema.
     fn compile_pipeline(
@@ -66,10 +64,8 @@ pub(crate) fn split_file_scan_source(source: DataSource) -> Result<Vec<(Partitio
 impl PipelineStageBuilder for DefaultPipelineStageBuilder {
     fn build(
         &self,
-        _query_id: QueryId,
         plan: &LogicalPlan,
-        stages: &mut Vec<Stage>,
-    ) -> Result<StageId> {
+    ) -> Result<Stage> {
         let (source, program, out_schema) = self.compile_pipeline(plan)?;
         let client_schema = out_schema
             .fields
@@ -114,8 +110,7 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                 sink.clone(),
             ));
         }
-        stages.push(stage);
-        Ok(stage_id)
+        Ok(stage)
     }
 
     fn compile_pipeline(
@@ -142,7 +137,6 @@ mod tests {
             projected_schema: Vec::new(),
             task_id: TaskId::new(),
             catalog_snapshot: None,
-            shuffle_target_path: None,
         });
 
         let units = split_file_scan_source(source).expect("file scan should split");
