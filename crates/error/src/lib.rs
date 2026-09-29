@@ -111,6 +111,15 @@ pub enum VeinError {
         limit: usize,
     },
 
+    /// A metadata publication became visible, but durable directory sync failed.
+    #[error("Commit outcome unknown for {entity}: {message}")]
+    CommitOutcomeUnknown {
+        /// Resource whose commit may already be visible.
+        entity: String,
+        /// Reason durability could not be confirmed.
+        message: String,
+    },
+
     // ── Shuffle ──────────────────────────────────────────────
     /// A partition was drained more than once.
     #[error("Partition {0} already drained")]
@@ -200,6 +209,14 @@ impl VeinError {
             resource: resource.into(),
             requested,
             limit,
+        }
+    }
+
+    /// Create an error for a commit whose visibility is known but durability is uncertain.
+    pub fn commit_outcome_unknown(message: impl Into<String>) -> Self {
+        Self::CommitOutcomeUnknown {
+            entity: "metadata manifest".to_owned(),
+            message: message.into(),
         }
     }
 

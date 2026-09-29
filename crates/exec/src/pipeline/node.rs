@@ -53,4 +53,8 @@ pub trait Sink<B>: PipelineNode<B> {
         0
     }
 
+    /// Receipt for a successfully committed storage write, if this is a write sink.
+    fn write_receipt(&self) -> Option<&super::super::operators::sink::WriteReceipt> {
+        None
+    }
 }

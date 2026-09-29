@@ -14,6 +14,7 @@ use std::time::Instant;
 use tracing::Instrument;
 
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
+use crate::operators::sink::WriteReceipt;
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
@@ -38,6 +39,8 @@ pub struct TaskResult {
     pub output: Vec<RecordBatch>,
     /// Execution metrics (bytes read, duration).
     pub metrics: TaskMetrics,
+    /// Present only after a storage sink has committed successfully.
+    pub write_receipt: Option<WriteReceipt>,
 }
 
 /// Builds pipeline stages for a task from the wire protocol.
@@ -145,6 +148,9 @@ impl<B> PipelineNode<B> for CancelGuard<B> {
     }
 
     fn flush(&mut self) -> Result<()> {
+        if self.cancel.is_cancelled() {
+            return Err(VeinError::cancelled());
+        }
         self.inner.flush()
     }
 }
@@ -236,11 +242,13 @@ impl DefaultTaskExecutor {
         let row_count = sink
             .row_count()
             .max(output.iter().map(|batch| batch.num_rows() as u64).sum());
+        let write_receipt = sink.write_receipt().cloned();
         let duration_ns = start.elapsed().as_nanos() as u64;
 
         Ok(TaskResult {
             row_count,
             output,
+            write_receipt,
             metrics: TaskMetrics {
                 bytes_read: source.bytes_read(),
                 duration_ns,
@@ -345,5 +353,4 @@ mod tests {
         let err = runner().execute(&task, cancel).await.unwrap_err();
         assert!(matches!(err, VeinError::Cancelled));
     }
-
 }

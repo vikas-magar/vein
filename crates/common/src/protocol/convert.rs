@@ -355,6 +355,7 @@ impl From<&ArchivedDataSink> for DataSink {
                     })
                     .collect(),
                 schema: s.schema.iter().map(FieldSchema::from).collect(),
+                schema_ipc: s.schema_ipc.iter().map(|byte| *byte).collect(),
             }),
         }
     }

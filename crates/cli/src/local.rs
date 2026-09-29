@@ -8,11 +8,13 @@ use common::identifiers::RequestId;
 use common::protocol::{DataSink, ExecuteTask};
 use common::{Result, VeinError};
 use exec::runtime::TaskExecutor;
+use exec::operators::sink::WriteReceipt;
 use futures::Stream;
 use optimizer::Optimizer;
 use physical::PhysicalPlanner;
 
 use super::parquet_catalog::ParquetCatalog;
+use super::parquet_storage::ParquetStorage;
 
 const OUTPUT_BUFFER_BATCHES: usize = 2;
 
@@ -27,11 +29,15 @@ pub struct LocalQueryEngine {
 impl LocalQueryEngine {
     /// Creates an engine whose table names resolve beneath `data_root`.
     pub fn new(data_root: impl Into<std::path::PathBuf>) -> Self {
-        let catalog = Arc::new(ParquetCatalog::new(data_root));
+        let data_root = data_root.into();
+        let catalog = Arc::new(ParquetCatalog::new(data_root.clone()));
         let catalog: Arc<dyn plan::CatalogProvider> = catalog;
         let functions = Arc::new(binder::BuiltinFunctionRegistry::new());
         let functions: Arc<dyn binder::FunctionRegistry> = functions;
-        let executor = Arc::new(exec::factory::TaskExecutorBuilder::new().build());
+        let storage = Arc::new(ParquetStorage::new(data_root));
+        let executor = Arc::new(exec::factory::TaskExecutorBuilder::new()
+            .with_write_storage(storage)
+            .build());
 
         Self {
             binder: binder::QueryBinder::new(catalog, functions),
@@ -54,12 +60,14 @@ impl LocalQueryEngine {
 
         let stage = job.stage();
         let mut tasks = Vec::with_capacity(stage.tasks().len());
+        let is_write = stage.tasks().first().is_some_and(|task| matches!(task.sink, DataSink::Storage(_)));
+        if is_write && stage.tasks().len() != 1 {
+            return Err(VeinError::planning("a local WRITE must execute as one atomic task", None));
+        }
         for task in stage.tasks() {
-            if !matches!(task.sink, DataSink::Client { .. }) {
-                return Err(VeinError::planning(
-                    "local query execution currently supports read results only",
-                    None,
-                ));
+            match (&task.sink, is_write) {
+                (DataSink::Client { .. }, false) | (DataSink::Storage(_), true) => {}
+                _ => return Err(VeinError::planning("physical stage contains inconsistent sink types", None)),
             }
             tasks.push(task.clone().into_execute_task(
                 job.request_id,
@@ -72,6 +80,7 @@ impl LocalQueryEngine {
         Ok(LocalQuery {
             tasks,
             executor: self.executor.clone(),
+            is_write,
         })
     }
 }
@@ -80,9 +89,24 @@ impl LocalQueryEngine {
 pub struct LocalQuery {
     tasks: Vec<ExecuteTask>,
     executor: Arc<dyn TaskExecutor>,
+    is_write: bool,
 }
 
 impl LocalQuery {
+    /// Whether this prepared query commits data to a storage target.
+    pub fn is_write(&self) -> bool {
+        self.is_write
+    }
+
+    /// Execute a storage write and return only after its commit is confirmed.
+    pub async fn execute_write(self) -> Result<WriteReceipt> {
+        if !self.is_write || self.tasks.len() != 1 {
+            return Err(VeinError::planning("prepared query is not a single-task WRITE", None));
+        }
+        let result = self.executor.execute(&self.tasks[0], CancellationToken::new()).await?;
+        result.write_receipt.ok_or_else(|| VeinError::internal("WRITE task completed without a commit receipt"))
+    }
+
     /// Runs the query and yields Arrow batches through a bounded channel.
     pub fn into_stream(self) -> LocalResultStream {
         Box::pin(async_stream::stream! {
@@ -126,7 +150,7 @@ impl LocalQuery {
 }
 
 /// A streamed sequence of local query batches.
-pub type LocalResultStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>>>>;
+pub type LocalResultStream = Pin<Box<dyn Stream<Item=Result<RecordBatch>>>>;
 
 #[cfg(test)]
 mod tests {
@@ -151,7 +175,7 @@ mod tests {
             schema.clone(),
             vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
         )
-        .expect("valid batch");
+            .expect("valid batch");
         let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
         writer.write(&batch).expect("write batch");
@@ -175,5 +199,39 @@ mod tests {
         }
 
         assert_eq!(rows, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn executes_pipe_write_and_exposes_only_committed_rows() {
+        let root = tempfile::tempdir().expect("temporary data root");
+        let table_dir = root.path().join("source");
+        std::fs::create_dir_all(&table_dir).expect("create source directory");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![4, 5, 6]))],
+        )
+            .expect("valid source batch");
+        let file = File::create(table_dir.join("part.parquet")).expect("create source Parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("create source writer");
+        writer.write(&batch).expect("write source batch");
+        writer.close().expect("close source writer");
+
+        let engine = LocalQueryEngine::new(root.path());
+        let query = engine
+            .prepare("FROM source |> WHERE id > 4 |> SELECT id |> WRITE archived")
+            .await
+            .expect("prepare WRITE query");
+        assert!(query.is_write());
+        let receipt = query.execute_write().await.expect("commit WRITE query");
+        assert_eq!(receipt.destination, "archived");
+        assert_eq!(receipt.row_count, 2);
+
+        let catalog = ParquetCatalog::new(root.path());
+        let metadata = plan::CatalogProvider::get_table(&catalog, "archived")
+            .await
+            .expect("read committed output table");
+        assert_eq!(metadata.files.len(), 1);
+        assert_eq!(metadata.schema.fields[0].name, "id");
     }
 }

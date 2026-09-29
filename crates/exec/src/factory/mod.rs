@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::operators::sink::{CollectSink, DiscardSink};
+use crate::operators::sink::{CollectSink, DiscardSink, WriteSink, WriteStorage};
 use crate::operators::source::{MemorySource, ScanSource};
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use crate::runtime::ExecutorBuilder;
@@ -27,6 +27,7 @@ use error::VeinError;
 pub struct TaskExecutorBuilder {
     builder: Arc<dyn ExecutorBuilder>,
     registry: Arc<FunctionRegistry>,
+    storage: Option<Arc<dyn WriteStorage>>,
 }
 
 impl TaskExecutorBuilder {
@@ -36,6 +37,7 @@ impl TaskExecutorBuilder {
         Self {
             builder: Arc::new(DefaultExecutorBuilder::new(registry.clone())),
             registry,
+            storage: None,
         }
     }
 
@@ -46,8 +48,19 @@ impl TaskExecutorBuilder {
         self
     }
 
+    /// Inject the transactional destination backend used by `WRITE` sinks.
+    pub fn with_write_storage(mut self, storage: Arc<dyn WriteStorage>) -> Self {
+        self.storage = Some(storage);
+        self.rebuild_default();
+        self
+    }
+
     fn rebuild_default(&mut self) {
-        self.builder = Arc::new(DefaultExecutorBuilder::new(self.registry.clone()));
+        let mut builder = DefaultExecutorBuilder::new(self.registry.clone());
+        if let Some(storage) = &self.storage {
+            builder = builder.with_write_storage(storage.clone());
+        }
+        self.builder = Arc::new(builder);
     }
 
     /// Override the executor builder (which maps the wire protocol to stages) entirely.
@@ -72,12 +85,19 @@ impl Default for TaskExecutorBuilder {
 /// [`VectorVmExecutor`] from a wire task description.
 pub struct DefaultExecutorBuilder {
     registry: Arc<FunctionRegistry>,
+    storage: Option<Arc<dyn WriteStorage>>,
 }
 
 impl DefaultExecutorBuilder {
     /// Create a builder with the given UDF function registry for the Vector VM.
     pub fn new(registry: Arc<FunctionRegistry>) -> Self {
-        Self { registry }
+        Self { registry, storage: None }
+    }
+
+    /// Attach a transactional table storage implementation.
+    pub fn with_write_storage(mut self, storage: Arc<dyn WriteStorage>) -> Self {
+        self.storage = Some(storage);
+        self
     }
 }
 
@@ -126,9 +146,12 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                 let field_names = schema.iter().map(|f| f.name.clone()).collect();
                 Ok(Box::new(CollectSink::with_field_names(field_names)))
             }
-            DataSink::Storage(_) => Err(VeinError::internal(
-                "this local executor supports only client and discard sinks",
-            )),
+            DataSink::Storage(target) => {
+                let storage = self.storage.as_ref().ok_or_else(|| {
+                    VeinError::internal("WRITE requires a configured table storage backend")
+                })?;
+                Ok(Box::new(WriteSink::new(target.clone(), storage.clone())?))
+            }
         }
     }
 

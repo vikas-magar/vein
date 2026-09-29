@@ -67,6 +67,7 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         plan: &LogicalPlan,
     ) -> Result<Stage> {
         let (source, program, out_schema) = self.compile_pipeline(plan)?;
+        let arrow_schema = out_schema.to_arrow();
         let client_schema = out_schema
             .fields
             .into_iter()
@@ -88,11 +89,19 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                         value: v.clone(),
                     })
                     .collect();
+                let mut schema_bytes = Vec::new();
+                {
+                    let mut writer = arrow::ipc::writer::StreamWriter::try_new(
+                        &mut schema_bytes,
+                        &arrow_schema,
+                    ).map_err(|error| VeinError::internal(format!("encode WRITE schema: {error}")))?;
+                    writer.finish().map_err(|error| VeinError::internal(format!("finish WRITE schema: {error}")))?;
+                }
                 let target_obj = common::protocol::StorageTarget::new(
                     target.clone(),
                     key_values,
                     storage_schema,
-                );
+                ).with_schema_ipc(schema_bytes);
                 DataSink::Storage(target_obj)
             }
             _ => DataSink::Client {
@@ -101,7 +110,12 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         };
         let stage_id = StageId::new();
         let mut stage = Stage::new(stage_id);
-        for (partition, source) in split_file_scan_source(source)? {
+        let sources = if matches!(sink, DataSink::Storage(_)) {
+            vec![(PartitionId::from_raw(0), source)]
+        } else {
+            split_file_scan_source(source)?
+        };
+        for (partition, source) in sources {
             stage.tasks.push(Task::new(
                 TaskId::new(),
                 partition,

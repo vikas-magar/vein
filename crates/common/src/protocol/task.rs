@@ -163,6 +163,9 @@ pub struct StorageTarget {
     pub options: Vec<KeyValue>,
     /// Authoritative schema of columns to write.
     pub schema: Vec<FieldSchema>,
+    /// Arrow IPC stream containing the complete authoritative output schema.
+    /// This preserves nested types and allows sinks to initialize empty writes.
+    pub schema_ipc: Vec<u8>,
 }
 
 impl StorageTarget {
@@ -176,7 +179,14 @@ impl StorageTarget {
             destination_uri: destination_uri.into(),
             options,
             schema,
+            schema_ipc: Vec::new(),
         }
+    }
+
+    /// Sets the canonical Arrow IPC schema used by storage sinks.
+    pub fn with_schema_ipc(mut self, schema_ipc: Vec<u8>) -> Self {
+        self.schema_ipc = schema_ipc;
+        self
     }
 
     /// Helper to find an option value by key (case-insensitive).

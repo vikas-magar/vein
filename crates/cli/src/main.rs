@@ -1,5 +1,6 @@
 mod local;
 mod parquet_catalog;
+mod parquet_storage;
 
 use std::time::Instant;
 
@@ -8,8 +9,10 @@ use local::LocalQueryEngine;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let query = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
-    let query = "FROM './input' |> WHERE id < 10 |> SELECT *";
+    let query = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    if query.is_empty() {
+        return Err("usage: vein \"FROM table |> SELECT *\"".into());
+    }
 
     let data_root = std::env::var_os("VEIN_DATA_DIR")
         .map(std::path::PathBuf::from)
@@ -17,6 +20,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = LocalQueryEngine::new(data_root);
     let started = Instant::now();
     let query = engine.prepare(&query).await?;
+    if query.is_write() {
+        let receipt = query.execute_write().await?;
+        println!("WRITE OK: table '{}' ({} rows)", receipt.destination, receipt.row_count);
+        eprintln!("Query completed in {} ms", started.elapsed().as_millis());
+        return Ok(());
+    }
     let mut batches = query.into_stream();
     let mut row_count = 0u64;
     let mut saw_batch = false;

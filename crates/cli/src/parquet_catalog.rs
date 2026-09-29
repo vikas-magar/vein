@@ -8,19 +8,20 @@ use async_trait::async_trait;
 use error::{Result, VeinError};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use plan::{CatalogProvider, TableFormat, TableMetadata, VeinSchema};
+use crate::parquet_storage::{ParquetStorage, resolve_manifest_file};
 
 /// Catalog which resolves table names beneath a local data root.
 #[derive(Debug, Clone)]
 pub struct ParquetCatalog {
     root: Arc<PathBuf>,
+    storage: ParquetStorage,
 }
 
 impl ParquetCatalog {
     /// Creates a catalog rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: Arc::new(root.into()),
-        }
+        let root = root.into();
+        Self { storage: ParquetStorage::new(root.clone()), root: Arc::new(root) }
     }
 
     fn resolve_path(&self, name: &str) -> PathBuf {
@@ -38,7 +39,18 @@ impl CatalogProvider for ParquetCatalog {
     async fn get_table(&self, name: &str) -> Result<Arc<TableMetadata>> {
         let name = name.to_owned();
         let path = self.resolve_path(&name);
-        tokio::task::spawn_blocking(move || inspect_table(&name, &path))
+        let storage = self.storage.clone();
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(manifest) = storage.read_manifest(&name)? {
+                let files = manifest.files.iter()
+                    .map(|file| resolve_manifest_file(&root, file))
+                    .collect::<Result<Vec<_>>>()?;
+                inspect_table_files(&name, &path, files)
+            } else {
+                inspect_table(&name, &path)
+            }
+        })
             .await
             .map_err(|error| {
                 VeinError::internal(format!("Parquet metadata worker failed: {error}"))
@@ -65,6 +77,19 @@ fn inspect_table(name: &str, path: &Path) -> Result<TableMetadata> {
         )));
     }
 
+    inspect_table_files(name, path, files)
+}
+
+fn inspect_table_files(name: &str, path: &Path, mut files: Vec<PathBuf>) -> Result<TableMetadata> {
+    files.sort();
+    if files.is_empty() {
+        return Err(VeinError::not_found(format!("no committed Parquet files found for table '{name}'")));
+    }
+    for file in &files {
+        if !file.is_file() {
+            return Err(VeinError::not_found(format!("committed Parquet artifact '{}' is missing", file.display())));
+        }
+    }
     let expected_schema = parquet_schema(&files[0])?;
     for file in files.iter().skip(1) {
         let schema = parquet_schema(file)?;
