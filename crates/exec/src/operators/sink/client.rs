@@ -1,9 +1,7 @@
 //! Client collect sink materializing surviving rows into Arrow record batches.
 
 use crate::pipeline::{DataChunk, PipelineNode, Sink};
-use arrow::array::UInt32Array;
-use arrow::compute::take;
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use common::Result;
 use error::VeinError;
@@ -21,6 +19,7 @@ pub struct CollectSink {
     field_names: Vec<String>,
     output_sender: Option<flume::Sender<RecordBatch>>,
     rows_emitted: u64,
+    schema: Option<SchemaRef>,
 }
 
 impl CollectSink {
@@ -31,6 +30,7 @@ impl CollectSink {
             field_names: Vec::new(),
             output_sender: None,
             rows_emitted: 0,
+            schema: None,
         }
     }
 
@@ -41,6 +41,7 @@ impl CollectSink {
             field_names,
             output_sender: None,
             rows_emitted: 0,
+            schema: None,
         }
     }
 
@@ -54,7 +55,43 @@ impl CollectSink {
             field_names,
             output_sender: Some(output_sender),
             rows_emitted: 0,
+            schema: None,
         }
+    }
+
+    /// Returns the output schema, building it once and reusing it for later batches.
+    ///
+    /// The pipeline's output schema is fixed for the life of the query; the
+    /// fields are only rebuilt if a batch ever reports a different shape.
+    fn schema_for(&mut self, chunk: &DataChunk) -> SchemaRef {
+        if let Some(schema) = &self.schema {
+            let same_shape = schema.fields().len() == chunk.vectors.len()
+                && schema
+                    .fields()
+                    .iter()
+                    .zip(&chunk.vectors)
+                    .all(|(field, vector)| field.data_type() == vector.data_type());
+            if same_shape {
+                return schema.clone();
+            }
+        }
+
+        let fields: Vec<Field> = chunk
+            .vectors
+            .iter()
+            .enumerate()
+            .map(|(i, vector)| {
+                let name = self
+                    .field_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("col_{i}"));
+                Field::new(name, vector.data_type().clone(), true)
+            })
+            .collect();
+        let schema: SchemaRef = Arc::new(Schema::new(fields));
+        self.schema = Some(schema.clone());
+        schema
     }
 }
 
@@ -66,45 +103,12 @@ impl Default for CollectSink {
 
 impl PipelineNode<DataChunk> for CollectSink {
     fn push(&mut self, chunk: DataChunk) -> Result<()> {
-        let selected = chunk.selection.size();
-        if selected == 0 {
+        if chunk.selection.is_empty() {
             return Ok(());
         }
 
-        let contiguous = chunk.selection.contiguous_range();
-        let indices = contiguous.is_none().then(|| {
-            let mut indices = UInt32Array::builder(selected);
-            for i in 0..selected {
-                indices.append_value(chunk.selection.get_index(i) as u32);
-            }
-            indices.finish()
-        });
-
-        let mut fields = Vec::with_capacity(chunk.vectors.len());
-        let mut columns = Vec::with_capacity(chunk.vectors.len());
-        for (i, vec) in chunk.vectors.iter().enumerate() {
-            let col_name = self
-                .field_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("col_{i}"));
-            fields.push(Field::new(col_name, vec.data_type().clone(), true));
-            let array = match (&contiguous, &indices) {
-                (Some(range), _) => vec.slice(range.start, range.len()),
-                (None, Some(indices)) => take(vec.as_ref(), indices, None)
-                    .map_err(|e| VeinError::internal(format!("client sink take failed: {e}")))?,
-                (None, None) => {
-                    return Err(VeinError::internal(
-                        "client sink selection indices were not materialized",
-                    ));
-                }
-            };
-            columns.push(array);
-        }
-
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, columns)
-            .map_err(|e| VeinError::internal(format!("client sink record batch failed: {e}")))?;
+        let schema = self.schema_for(&chunk);
+        let batch = chunk.materialize(schema)?;
         self.rows_emitted += batch.num_rows() as u64;
         if let Some(sender) = &self.output_sender {
             sender

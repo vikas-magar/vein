@@ -20,21 +20,30 @@ pub(crate) fn substitute_columns(
     expr: &LogicalExpr,
     mapping: &HashMap<plan::ColumnId, LogicalExpr>,
 ) -> Option<LogicalExpr> {
-    if let LogicalExpr::Column(column) = expr {
+    substitute_columns_owned(expr.clone(), mapping)
+}
+
+/// Owned recursion for [`substitute_columns`]. Consuming each node keeps the
+/// traversal clone-free; the by-reference entry point above clones once per call.
+fn substitute_columns_owned(
+    expr: LogicalExpr,
+    mapping: &HashMap<plan::ColumnId, LogicalExpr>,
+) -> Option<LogicalExpr> {
+    if let LogicalExpr::Column(column) = &expr {
         return mapping.get(&column.id).cloned();
     }
     if matches!(
-        expr,
+        &expr,
         LogicalExpr::OuterColumn(_) | LogicalExpr::ScalarSubquery(_) | LogicalExpr::Exists { .. }
     ) {
         return None;
     }
 
     expr.map_children(&mut |child| {
-        substitute_columns(&child, mapping)
+        substitute_columns_owned(child, mapping)
             .ok_or_else(|| error::VeinError::internal("predicate substitution failed"))
     })
-    .ok()
+        .ok()
 }
 
 fn collect_referenced_columns(

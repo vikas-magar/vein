@@ -258,17 +258,21 @@ impl LogicalExpr {
         }
     }
 
-    /// Maps children using a mutable function
-    pub fn map_children<F>(&self, f: &mut F) -> Result<LogicalExpr, error::VeinError>
+    /// Maps children using a mutable function, consuming the expression.
+    ///
+    /// Taking `self` by value is what keeps recursion clone-free: a rewriter
+    /// that owns each node moves it into the mapper instead of deep-cloning the
+    /// whole subtree at every level.
+    pub fn map_children<F>(self, f: &mut F) -> Result<LogicalExpr, error::VeinError>
     where
         F: FnMut(LogicalExpr) -> Result<LogicalExpr, error::VeinError>,
     {
-        match self.clone() {
-            LogicalExpr::Column(_)
-            | LogicalExpr::OuterColumn(_)
-            | LogicalExpr::Literal(_)
-            | LogicalExpr::ScalarSubquery(_)
-            | LogicalExpr::Exists { .. } => Ok(self.clone()),
+        match self {
+            other @ LogicalExpr::Column(_)
+            | other @ LogicalExpr::OuterColumn(_)
+            | other @ LogicalExpr::Literal(_)
+            | other @ LogicalExpr::ScalarSubquery(_)
+            | other @ LogicalExpr::Exists { .. } => Ok(other),
             LogicalExpr::BinaryOp {
                 left,
                 op,
@@ -618,19 +622,19 @@ mod tests {
             frame: None,
             return_type: VeinDataType::Int64,
         }
-        .is_volatile());
+            .is_volatile());
         assert!(LogicalExpr::AiOperator {
             name: "llm_classify".to_string(),
             args: vec![],
             return_type: VeinDataType::Utf8,
         }
-        .is_volatile());
+            .is_volatile());
         assert!(LogicalExpr::WasmUdf {
             bytecode_ref: None,
             args: vec![],
             return_type: VeinDataType::Int64,
         }
-        .is_volatile());
+            .is_volatile());
     }
 
     /// A pathologically deep expression must not overflow the stack while

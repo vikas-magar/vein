@@ -9,6 +9,7 @@ use common::protocol::{DataSink, DataSource, FieldSchema, MicroProgram};
 use error::VeinError;
 use plan::LogicalPlan;
 use plan::schema::VeinSchema;
+use std::sync::Arc;
 
 /// Trait for translating linear, non-blocking logical plans into a single physical [`Stage`].
 pub trait PipelineStageBuilder: Send + Sync {
@@ -115,13 +116,15 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         } else {
             split_file_scan_source(source)?
         };
+        let program = Arc::new(program);
+        let sink = Arc::new(sink);
         for (partition, source) in sources {
             stage.tasks.push(Task::new(
                 TaskId::new(),
                 partition,
                 source,
-                program.clone(),
-                sink.clone(),
+                Arc::clone(&program),
+                Arc::clone(&sink),
             ));
         }
         Ok(stage)

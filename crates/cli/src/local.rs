@@ -58,23 +58,22 @@ impl LocalQueryEngine {
         let request_id = RequestId::new();
         let job = self.planner.create_physical_plan(request_id, optimized)?;
 
-        let stage = job.stage();
-        let mut tasks = Vec::with_capacity(stage.tasks().len());
-        let is_write = stage.tasks().first().is_some_and(|task| matches!(task.sink, DataSink::Storage(_)));
-        if is_write && stage.tasks().len() != 1 {
+        let (request_id, query_id, mode, stage) = job.into_parts();
+        let is_write = stage
+            .tasks
+            .first()
+            .is_some_and(|task| matches!(&*task.sink, DataSink::Storage(_)));
+        if is_write && stage.tasks.len() != 1 {
             return Err(VeinError::planning("a local WRITE must execute as one atomic task", None));
         }
-        for task in stage.tasks() {
-            match (&task.sink, is_write) {
+        let stage_id = stage.stage_id;
+        let mut tasks = Vec::with_capacity(stage.tasks.len());
+        for task in stage.tasks {
+            match (&*task.sink, is_write) {
                 (DataSink::Client { .. }, false) | (DataSink::Storage(_), true) => {}
                 _ => return Err(VeinError::planning("physical stage contains inconsistent sink types", None)),
             }
-            tasks.push(task.clone().into_execute_task(
-                job.request_id,
-                job.query_id,
-                stage.stage_id,
-                job.mode().clone(),
-            ));
+            tasks.push(task.into_execute_task(request_id, query_id, stage_id, mode));
         }
 
         Ok(LocalQuery {
@@ -156,7 +155,7 @@ pub type LocalResultStream = Pin<Box<dyn Stream<Item=Result<RecordBatch>>>>;
 mod tests {
     use std::fs::File;
 
-    use arrow::array::Int64Array;
+    use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use futures::StreamExt;
@@ -199,6 +198,76 @@ mod tests {
         }
 
         assert_eq!(rows, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn parquet_projection_keeps_filter_columns_and_compacts_vm_registers() {
+        let root = tempfile::tempdir().expect("temporary data root");
+        let table_dir = root.path().join("wide");
+        std::fs::create_dir_all(&table_dir).expect("create table directory");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("unused", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["discard-a", "discard-b"])),
+                Arc::new(Int64Array::from(vec![10, 42])),
+            ],
+        )
+            .expect("valid batch");
+        let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let engine = LocalQueryEngine::new(root.path());
+        let query = engine
+            .prepare("FROM wide |> WHERE id = 2 |> SELECT value")
+            .await
+            .expect("prepare projected scan");
+        let common::protocol::DataSource::File(scan) = &query.tasks[0].source else {
+            panic!("expected a Parquet file scan");
+        };
+        assert_eq!(
+            scan.projected_schema
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "value"],
+        );
+
+        let mut stream = query.into_stream();
+        let batch = stream
+            .next()
+            .await
+            .expect("query batch")
+            .expect("successful scan");
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 output");
+        assert_eq!(values.values(), &[42]);
+        assert!(stream.next().await.is_none());
+
+        let write = engine
+            .prepare("FROM wide |> WHERE id = 2 |> SELECT value |> WRITE narrowed")
+            .await
+            .expect("prepare projected WRITE");
+        let receipt = write.execute_write().await.expect("commit projected WRITE");
+        assert_eq!(receipt.row_count, 1);
+
+        let catalog = ParquetCatalog::new(root.path());
+        let metadata = plan::CatalogProvider::get_table(&catalog, "narrowed")
+            .await
+            .expect("read projected output metadata");
+        assert_eq!(metadata.schema.fields.len(), 1);
+        assert_eq!(metadata.schema.fields[0].name, "value");
     }
 
     #[tokio::test]

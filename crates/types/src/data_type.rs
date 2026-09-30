@@ -13,7 +13,29 @@ use crate::column::ResolvedColumn;
 ///
 /// Supports standard SQL primitives, Arrow columnar formats, high-dimensional AI vectors,
 /// and semi-structured eBPF network variants.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+// `VeinDataType` is recursive (and mutually recursive with `ResolvedColumn`),
+// so the derived `Archive`/`Serialize`/`Deserialize`/`CheckBytes` bounds cannot
+// be resolved by the trait solver. The recursive fields opt out with
+// `#[rkyv(omit_bounds)]` below, and the container re-states exactly the bounds
+// those containers need.
+#[rkyv(serialize_bounds(
+    __S: rkyv::ser::Writer + rkyv::ser::Allocator,
+    __S::Error: rkyv::rancor::Source,
+))]
+#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
+#[rkyv(bytecheck(bounds(__C: rkyv::validation::ArchiveContext)))]
 pub enum VeinDataType {
     // ── Primitives ────────────────────────────────────────
     /// A Null type.
@@ -72,7 +94,7 @@ pub enum VeinDataType {
     Timestamp(Option<String>),
     /// A duration in the given time unit.
     #[serde(with = "time_unit_serde")]
-    Duration(TimeUnit),
+    Duration(#[rkyv(with = TimeUnitRkyv)] TimeUnit),
     /// Time-series interval (Month, Day, Nanosecond).
     Interval,
 
@@ -84,29 +106,38 @@ pub enum VeinDataType {
 
     // ── Nested & Collections ──────────────────────────────
     /// A variable length list of another type.
-    List(Box<VeinDataType>),
+    List(#[rkyv(omit_bounds)] Box<VeinDataType>),
     /// A large (64-bit offset) variable length list.
-    LargeList(Box<VeinDataType>),
+    LargeList(#[rkyv(omit_bounds)] Box<VeinDataType>),
     /// Fixed-size list of another type.
-    FixedSizeList(Box<VeinDataType>, i32),
+    FixedSizeList(#[rkyv(omit_bounds)] Box<VeinDataType>, i32),
     /// High-dimensional vector for AI embeddings.
     Vector(u32),
     /// A nested struct of named fields.
-    Struct(Vec<ResolvedColumn>),
+    Struct(#[rkyv(omit_bounds)] Vec<ResolvedColumn>),
     /// A map of key-value pairs.
-    Map(Box<VeinDataType>, Box<VeinDataType>),
+    Map(
+        #[rkyv(omit_bounds)] Box<VeinDataType>,
+        #[rkyv(omit_bounds)] Box<VeinDataType>,
+    ),
     /// A union of mutually exclusive member types.
-    Union(Vec<VeinDataType>),
+    Union(#[rkyv(omit_bounds)] Vec<VeinDataType>),
     /// A dictionary-encoded (key, value) pair.
-    Dictionary(Box<VeinDataType>, Box<VeinDataType>),
+    Dictionary(
+        #[rkyv(omit_bounds)] Box<VeinDataType>,
+        #[rkyv(omit_bounds)] Box<VeinDataType>,
+    ),
     /// A run-end-encoded (run_end, value) pair.
-    RunEndEncoded(Box<VeinDataType>, Box<VeinDataType>),
+    RunEndEncoded(
+        #[rkyv(omit_bounds)] Box<VeinDataType>,
+        #[rkyv(omit_bounds)] Box<VeinDataType>,
+    ),
 
     // ── Microservice & Ecosystem Extensions ───────────────
     /// Semi-structured JSON payload targeted for zero-copy eBPF socket extraction.
     Variant,
     /// Custom User-Defined Type (UDT). Name + underlying physical fallback type.
-    Extension(String, Box<VeinDataType>),
+    Extension(String, #[rkyv(omit_bounds)] Box<VeinDataType>),
 }
 
 impl VeinDataType {
@@ -339,6 +370,75 @@ mod time_unit_serde {
     }
 }
 
+/// rkyv adapter that archives Arrow's [`TimeUnit`] as a single byte.
+///
+/// Mirrors [`time_unit_serde`] so that [`VeinDataType`] can travel inside
+/// zero-copy protocol messages without depending on Arrow's own types, which
+/// implement neither `rkyv` nor `serde` traits.
+pub struct TimeUnitRkyv;
+
+/// Encodes a [`TimeUnit`] into its stable one-byte wire tag.
+fn encode_time_unit(unit: TimeUnit) -> u8 {
+    match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 1,
+        TimeUnit::Microsecond => 2,
+        TimeUnit::Nanosecond => 3,
+    }
+}
+
+/// Decodes the one-byte wire tag produced by [`encode_time_unit`].
+fn decode_time_unit(tag: u8) -> Option<TimeUnit> {
+    match tag {
+        0 => Some(TimeUnit::Second),
+        1 => Some(TimeUnit::Millisecond),
+        2 => Some(TimeUnit::Microsecond),
+        3 => Some(TimeUnit::Nanosecond),
+        _ => None,
+    }
+}
+
+impl rkyv::with::ArchiveWith<TimeUnit> for TimeUnitRkyv {
+    type Archived = u8;
+    type Resolver = ();
+
+    fn resolve_with(unit: &TimeUnit, _resolver: Self::Resolver, out: rkyv::Place<u8>) {
+        out.write(encode_time_unit(*unit));
+    }
+}
+
+impl<S> rkyv::with::SerializeWith<TimeUnit, S> for TimeUnitRkyv
+where
+    S: rkyv::rancor::Fallible + ?Sized,
+{
+    fn serialize_with(_unit: &TimeUnit, _serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+        Ok(())
+    }
+}
+
+impl<D> rkyv::with::DeserializeWith<u8, TimeUnit, D> for TimeUnitRkyv
+where
+    D: rkyv::rancor::Fallible + ?Sized,
+    D::Error: rkyv::rancor::Source,
+{
+    fn deserialize_with(tag: &u8, _deserializer: &mut D) -> Result<TimeUnit, D::Error> {
+        decode_time_unit(*tag)
+            .ok_or_else(|| <D::Error as rkyv::rancor::Source>::new(InvalidTimeUnitTag(*tag)))
+    }
+}
+
+/// Error for an archived [`TimeUnit`] tag outside the four known values.
+#[derive(Debug)]
+struct InvalidTimeUnitTag(u8);
+
+impl std::fmt::Display for InvalidTimeUnitTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid archived TimeUnit tag: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidTimeUnitTag {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,4 +485,3 @@ mod tests {
         assert_eq!("float64".parse::<VeinDataType>().unwrap(), VeinDataType::Float64);
     }
 }
-

@@ -2,9 +2,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow::array::UInt32Array;
-use arrow::compute::take;
-use arrow::datatypes::Schema;
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use common::Result;
@@ -94,30 +91,7 @@ impl WriteSink {
                 )));
             }
         }
-        let range = chunk.selection.contiguous_range();
-        let indices = range.is_none().then(|| {
-            let mut indices = UInt32Array::builder(selected);
-            for row in 0..selected {
-                indices.append_value(chunk.selection.get_index(row) as u32);
-            }
-            indices.finish()
-        });
-        let mut fields = Vec::with_capacity(chunk.vectors.len());
-        let mut columns = Vec::with_capacity(chunk.vectors.len());
-        for (field, array) in self.expected_schema.fields().iter().zip(&chunk.vectors) {
-            fields.push(field.as_ref().clone());
-            let selected_array = match (&range, &indices) {
-                (Some(range), _) => array.slice(range.start, range.len()),
-                (None, Some(indices)) => take(array.as_ref(), indices, None)
-                    .map_err(|error| VeinError::internal(format!("storage sink selection failed: {error}")))?,
-                (None, None) => return Err(VeinError::internal("storage sink selection is missing")),
-            };
-            columns.push(selected_array);
-        }
-        let schema = Arc::new(Schema::new(fields));
-        RecordBatch::try_new(schema, columns)
-            .map(Some)
-            .map_err(|error| VeinError::internal(format!("storage sink batch is invalid: {error}")))
+        chunk.materialize(self.expected_schema.clone()).map(Some)
     }
 }
 

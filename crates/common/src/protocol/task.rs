@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
+use std::sync::Arc;
 
 use super::ir::MicroProgram;
 use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
@@ -267,7 +268,10 @@ pub struct ExecuteTask {
     /// Data source for this task.
     pub source: DataSource,
     /// The Micro-IR program to apply to the data stream.
-    pub program: MicroProgram,
+    ///
+    /// Shared so every task split from one stage refers to a single compiled
+    /// program instead of deep-cloning the instruction vector per partition.
+    pub program: Arc<MicroProgram>,
     /// Where to send the output.
-    pub sink: DataSink,
+    pub sink: Arc<DataSink>,
 }

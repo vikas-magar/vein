@@ -14,7 +14,18 @@ use arrow::datatypes::{DataType, Field};
 use common::protocol::ScalarConstant;
 use common::Result;
 
+/// Constructs a length-1 Arrow array holding `constant`, for a broadcast scalar register.
+///
+/// Element-wise kernels broadcast this single value across the chunk, so a
+/// literal costs one element per program instead of one element per row per batch.
+pub fn scalar_constant_to_scalar(constant: &ScalarConstant) -> Result<ArrayRef> {
+    scalar_constant_to_array(constant, 1)
+}
+
 /// Constructs an Arrow [`ArrayRef`] of length `row_count` holding copies of `constant`.
+///
+/// Only used where a constant genuinely has to become a full column, such as the
+/// input to a UDF or a projected output column.
 pub fn scalar_constant_to_array(constant: &ScalarConstant, row_count: usize) -> Result<ArrayRef> {
     let array: ArrayRef = match constant {
         ScalarConstant::Null => Arc::new(NullArray::new(row_count)),

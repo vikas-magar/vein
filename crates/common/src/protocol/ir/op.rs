@@ -1,6 +1,7 @@
 //! Vectorized micro-instruction definitions for Micro-IR.
 
 use serde::{Deserialize, Serialize};
+use types::VeinDataType;
 
 use super::constant::ScalarConstant;
 use super::program::RegId;
@@ -25,6 +26,21 @@ pub enum MicroOp {
         dst: RegId,
         /// Source register.
         src: RegId,
+    },
+
+    // ── Type Conversion ──────────────────────────────────────────
+    /// Convert a register to another logical type: `dst = cast(src AS target)`.
+    ///
+    /// The conversion is checked: values that cannot be represented in `target`
+    /// (an out-of-range integer, an unparsable string) fail the task rather than
+    /// wrapping or truncating silently.
+    Cast {
+        /// Destination register.
+        dst: RegId,
+        /// Source register.
+        src: RegId,
+        /// Logical type to convert the source array to.
+        target: VeinDataType,
     },
 
     // ── Arithmetic Operations (SIMD Vectorized) ──────────────────

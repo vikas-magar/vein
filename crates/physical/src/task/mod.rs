@@ -2,6 +2,7 @@
 
 use common::identifiers::{PartitionId, QueryId, RequestId, StageId, TaskId};
 use common::protocol::{DataSink, DataSource, ExecuteTask, ExecutionMode, MicroProgram};
+use std::sync::Arc;
 
 /// The smallest executable unit of a physical plan.
 ///
@@ -17,9 +18,9 @@ pub struct Task {
     /// The data source this task reads from.
     pub source: DataSource,
     /// The micro-IR bytecode program executed by the Vector VM.
-    pub program: MicroProgram,
+    pub program: Arc<MicroProgram>,
     /// Where the task's output is written.
-    pub sink: DataSink,
+    pub sink: Arc<DataSink>,
 }
 
 impl Task {
@@ -28,8 +29,8 @@ impl Task {
         task_id: TaskId,
         partition: PartitionId,
         source: DataSource,
-        program: MicroProgram,
-        sink: DataSink,
+        program: Arc<MicroProgram>,
+        sink: Arc<DataSink>,
     ) -> Self {
         Self {
             task_id,
@@ -49,10 +50,14 @@ impl Task {
         stage_id: StageId,
         mode: ExecutionMode,
     ) -> ExecuteTask {
-        let mut sink = self.sink;
-        if let DataSink::Storage(target) = &mut sink {
-            target.set_option("partition_id", self.partition.into_raw().to_string());
-        }
+        let sink = match &*self.sink {
+            DataSink::Storage(target) => {
+                let mut target = target.clone();
+                target.set_option("partition_id", self.partition.into_raw().to_string());
+                Arc::new(DataSink::Storage(target))
+            }
+            _ => self.sink.clone(),
+        };
 
         ExecuteTask {
             request_id,

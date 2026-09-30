@@ -192,8 +192,14 @@ fn simplify_sort_keys(keys: &[SortKey]) -> Vec<SortKey> {
 
 /// Recursively applies identity rewrites after simplifying all children.
 fn simplify_expr(expr: &LogicalExpr) -> LogicalExpr {
+    simplify_expr_owned(expr.clone())
+}
+
+/// Owned recursion for [`simplify_expr`]. Consuming each node keeps the
+/// traversal clone-free; the by-reference entry point above clones once per call.
+fn simplify_expr_owned(expr: LogicalExpr) -> LogicalExpr {
     let rewritten = expr
-        .map_children(&mut |child| Ok(simplify_expr(&child)))
+        .map_children(&mut |child| Ok(simplify_expr_owned(child)))
         .expect("expression simplification child traversal is infallible");
 
     match rewritten {
@@ -295,15 +301,15 @@ fn simplify_boolean_comparison(
 ) -> Option<LogicalExpr> {
     let (expr, value) = match (left, right) {
         (expr, LogicalExpr::Literal(LogicalLiteral::Boolean(value)))
-            if expr.data_type() == VeinDataType::Boolean =>
-        {
-            (expr, *value)
-        }
+        if expr.data_type() == VeinDataType::Boolean =>
+            {
+                (expr, *value)
+            }
         (LogicalExpr::Literal(LogicalLiteral::Boolean(value)), expr)
-            if expr.data_type() == VeinDataType::Boolean =>
-        {
-            (expr, *value)
-        }
+        if expr.data_type() == VeinDataType::Boolean =>
+            {
+                (expr, *value)
+            }
         _ => return None,
     };
 

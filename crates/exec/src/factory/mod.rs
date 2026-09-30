@@ -114,12 +114,15 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
             DataSource::File(scan) => {
                 let (root, paths) = local_scan_paths(&scan.files)?;
                 use opendal::services::Fs;
-                let mut builder = Fs::default();
-                builder.root(&root.to_string_lossy());
+                let builder = Fs::default().root(&root.to_string_lossy());
                 let op = opendal::Operator::new(builder)
-                    .map_err(|e| VeinError::internal(format!("build fs operator: {e}")))?
-                    .finish();
-                Ok(Box::new(ScanSource::new(op, paths, scan.format.clone())))
+                    .map_err(|e| VeinError::internal(format!("build fs operator: {e}")))?;
+                Ok(Box::new(ScanSource::new(
+                    op,
+                    paths,
+                    scan.format.clone(),
+                    scan.projected_schema.clone(),
+                )))
             }
             DataSource::Stream(_) => Err(
                 VeinError::internal("this local executor supports only memory and Parquet sources"),
@@ -129,7 +132,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
 
     fn build_vm(
         &self,
-        program: &MicroProgram,
+        program: &Arc<MicroProgram>,
         next: Box<dyn PipelineNode<DataChunk>>,
     ) -> Result<Box<dyn Transform<DataChunk>>> {
         Ok(Box::new(VectorVmExecutor::new(

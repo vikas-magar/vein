@@ -8,8 +8,12 @@ pub trait PlanTraversal {
     fn schema(&self) -> &VeinSchema;
     /// Returns a list of child plans for traversal
     fn children(&self) -> Vec<&LogicalPlan>;
-    /// Maps children using a mutable function
-    fn map_children<F>(&self, f: &mut F) -> Result<LogicalPlan, VeinError>
+    /// Maps children using a mutable function, consuming the node.
+    ///
+    /// Taking `self` by value is what keeps recursion clone-free: a rewriter
+    /// that owns each node moves it into the mapper instead of deep-cloning the
+    /// whole subtree at every level.
+    fn map_children<F>(self, f: &mut F) -> Result<LogicalPlan, VeinError>
     where
         F: FnMut(Box<LogicalPlan>) -> Result<Box<LogicalPlan>, VeinError>;
     /// Checks if the plan contains semantic nodes (which blocks relational sharing rules)
@@ -83,12 +87,12 @@ impl PlanTraversal for LogicalPlan {
         }
     }
 
-    fn map_children<F>(&self, f: &mut F) -> Result<LogicalPlan, VeinError>
+    fn map_children<F>(self, f: &mut F) -> Result<LogicalPlan, VeinError>
     where
         F: FnMut(Box<LogicalPlan>) -> Result<Box<LogicalPlan>, VeinError>,
     {
-        match self.clone() {
-            LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. } => Ok(self.clone()),
+        match self {
+            node @ (LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. }) => Ok(node),
             LogicalPlan::Filter { input, predicate } => Ok(LogicalPlan::Filter {
                 input: f(input)?,
                 predicate,
@@ -343,9 +347,9 @@ impl PlanTraversal for LogicalPlan {
             _ => {
                 self.children().iter().any(|c| c.contains_semantic())
                     || self
-                        .subquery_plans()
-                        .iter()
-                        .any(|p| p.contains_semantic())
+                    .subquery_plans()
+                    .iter()
+                    .any(|p| p.contains_semantic())
             }
         }
     }

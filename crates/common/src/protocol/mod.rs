@@ -25,6 +25,7 @@ mod tests {
     use super::*;
     use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
     use rkyv::rancor::Error;
+    use std::sync::Arc;
 
     #[test]
     fn test_micro_program_rkyv_zero_copy_roundtrip() {
@@ -83,7 +84,7 @@ mod tests {
                 task_id: TaskId::new(),
                 catalog_snapshot: None,
             }),
-            program: MicroProgram::new(
+            program: Arc::new(MicroProgram::new(
                 4,
                 vec![
                     MicroOp::VectorCosineDistance {
@@ -93,8 +94,8 @@ mod tests {
                     },
                     MicroOp::FilterMask { bool_reg: 2 },
                 ],
-            ),
-            sink: DataSink::Discard,
+            )),
+            sink: Arc::new(DataSink::Discard),
         };
 
         let bytes = rkyv::to_bytes::<Error>(&task).expect("ExecuteTask serialization failed");
@@ -112,5 +113,4 @@ mod tests {
         assert_eq!(roundtrip.program.register_count, 4);
         assert_eq!(roundtrip.program.instructions.len(), 2);
     }
-
 }

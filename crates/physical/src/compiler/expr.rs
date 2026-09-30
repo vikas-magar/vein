@@ -158,9 +158,15 @@ impl BytecodeCompiler {
                 });
                 Ok(dst)
             }
-            LogicalExpr::Cast { expr, .. } => {
-                // Cast passes through underlying expression for zero-copy register representation
-                self.compile_expr(expr, schema)
+            LogicalExpr::Cast { expr, target_type } => {
+                let src = self.compile_expr(expr, schema)?;
+                let dst = self.allocator.allocate()?;
+                self.instructions.push(MicroOp::Cast {
+                    dst,
+                    src,
+                    target: target_type.clone(),
+                });
+                Ok(dst)
             }
             other => Err(VeinError::planning(
                 format!("Logical expression lowering not yet implemented: {other:?}"),
@@ -248,5 +254,36 @@ mod tests {
             MicroOp::FilterMask { bool_reg: 3 }
         ));
         assert_eq!(program.register_count, 4);
+    }
+
+    /// `CAST(col AS Float64)` must emit a real conversion instruction rather
+    /// than passing the source register through unchanged.
+    #[test]
+    fn test_compile_cast_emits_cast_instruction() {
+        let schema = test_schema();
+        let mut compiler = BytecodeCompiler::new(2);
+
+        let cast = LogicalExpr::Cast {
+            expr: Box::new(LogicalExpr::Column(ResolvedColumn::new(
+                ColumnId(1),
+                "age",
+                None,
+                VeinDataType::Int64,
+            ))),
+            target_type: VeinDataType::Float64,
+        };
+
+        compiler.compile_expr(&cast, &schema).unwrap();
+        let program = compiler.finish();
+
+        assert_eq!(
+            program.instructions,
+            vec![MicroOp::Cast {
+                dst: 2,
+                src: 0,
+                target: VeinDataType::Float64,
+            }]
+        );
+        assert_eq!(program.register_count, 3);
     }
 }

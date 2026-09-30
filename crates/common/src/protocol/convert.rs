@@ -18,6 +18,8 @@ use super::task::{
     StorageTarget, StreamSource,
 };
 use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
+use types::VeinDataType;
+use std::sync::Arc;
 
 // ── Micro-IR Conversions ──────────────────────────────────────────
 
@@ -97,6 +99,12 @@ impl From<&ArchivedMicroOp> for MicroOp {
             ArchivedMicroOp::CopyRegister { dst, src } => MicroOp::CopyRegister {
                 dst: *dst,
                 src: *src,
+            },
+            ArchivedMicroOp::Cast { dst, src, target } => MicroOp::Cast {
+                dst: *dst,
+                src: *src,
+                target: rkyv::deserialize::<VeinDataType, rkyv::rancor::Error>(target)
+                    .expect("archived VeinDataType is always decodable"),
             },
             ArchivedMicroOp::Add { dst, src1, src2 } => MicroOp::Add {
                 dst: *dst,
@@ -371,8 +379,8 @@ impl From<&ArchivedExecuteTask> for ExecuteTask {
             query_id: QueryId::from_raw(archived.query_id.0.to_native()),
             stage_id: StageId::from_raw(archived.stage_id.0.to_native()),
             source: DataSource::from(&archived.source),
-            program: MicroProgram::from(&archived.program),
-            sink: DataSink::from(&archived.sink),
+            program: Arc::new(MicroProgram::from(archived.program.get())),
+            sink: Arc::new(DataSink::from(archived.sink.get())),
         }
     }
 }

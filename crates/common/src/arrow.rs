@@ -12,8 +12,11 @@ use error::{Result, VeinError};
 /// A mask indicating which row indices in a ValueVector are valid.
 #[derive(Debug, Clone)]
 pub struct SelectionVector {
-    /// Array of valid indices. If None, all rows [0..size) are valid.
+    /// Sparse physical indices. When `None`, the selection is the dense
+    /// physical range `offset..offset + size`.
     indices: Option<Vec<u32>>,
+    /// Physical row at which a dense selection starts.
+    offset: usize,
     /// Number of valid rows currently selected.
     size: usize,
 }
@@ -23,6 +26,7 @@ impl SelectionVector {
     pub fn new_dense(size: usize) -> Self {
         Self {
             indices: None,
+            offset: 0,
             size,
         }
     }
@@ -32,16 +36,16 @@ impl SelectionVector {
         Self {
             size: indices.len(),
             indices: Some(indices),
+            offset: 0,
         }
     }
 
     /// Returns the true physical index for a given logical index.
     #[inline(always)]
     pub fn get_index(&self, logical_idx: usize) -> usize {
-        if let Some(indices) = &self.indices {
-            indices[logical_idx] as usize
-        } else {
-            logical_idx
+        match &self.indices {
+            Some(indices) => indices[logical_idx] as usize,
+            None => self.offset + logical_idx,
         }
     }
 
@@ -53,7 +57,7 @@ impl SelectionVector {
     /// Returns the selected rows as one contiguous physical range when possible.
     pub fn contiguous_range(&self) -> Option<std::ops::Range<usize>> {
         if self.indices.is_none() {
-            return Some(0..self.size);
+            return Some(self.offset..self.offset.checked_add(self.size)?);
         }
         let first = *self.indices.as_ref()?.first()? as usize;
         let end = first.checked_add(self.size)?;
@@ -70,32 +74,53 @@ impl SelectionVector {
         self.size == 0
     }
 
-    /// Returns a new sparse [`SelectionVector`] by testing each currently selected
-    /// physical row index against `predicate`.
+    /// Returns a [`SelectionVector`] of the currently selected rows that satisfy
+    /// `predicate`.
     ///
     /// Preserves prior filter decisions: only previously surviving rows are evaluated.
+    /// A sparse index list is materialized only once a row is actually rejected, so a
+    /// dense selection whose rows all survive stays dense and allocation-free.
     pub fn filter(&self, mut predicate: impl FnMut(usize) -> bool) -> Self {
-        let mut surviving = Vec::with_capacity(self.size);
+        let mut surviving: Option<Vec<u32>> = None;
         for i in 0..self.size {
             let row_idx = self.get_index(i);
             if predicate(row_idx) {
-                surviving.push(row_idx as u32);
+                if let Some(surviving) = &mut surviving {
+                    surviving.push(row_idx as u32);
+                }
+            } else if surviving.is_none() {
+                let mut kept = Vec::with_capacity(self.size);
+                kept.extend((0..i).map(|j| self.get_index(j) as u32));
+                surviving = Some(kept);
             }
         }
-        Self::new_sparse(surviving)
+        match surviving {
+            None => self.clone(),
+            Some(surviving) => Self::new_sparse(surviving),
+        }
     }
 
     /// Returns a new [`SelectionVector`] sliced by `offset` and taking up to `limit` rows.
     pub fn slice(&self, offset: usize, limit: usize) -> Self {
         if offset >= self.size || limit == 0 {
-            return Self::new_sparse(Vec::new());
+            return Self::new_dense(0);
         }
         let count = limit.min(self.size - offset);
-        let mut sliced = Vec::with_capacity(count);
-        for i in offset..(offset + count) {
-            sliced.push(self.get_index(i) as u32);
+        match &self.indices {
+            // Contiguous selections stay contiguous: just move the window.
+            None => Self {
+                indices: None,
+                offset: self.offset + offset,
+                size: count,
+            },
+            Some(_) => {
+                let mut sliced = Vec::with_capacity(count);
+                for i in offset..(offset + count) {
+                    sliced.push(self.get_index(i) as u32);
+                }
+                Self::new_sparse(sliced)
+            }
         }
-        Self::new_sparse(sliced)
     }
 }
 
@@ -327,9 +352,25 @@ mod tests {
         assert_eq!(sliced.get_index(1), 4);
         assert_eq!(sliced.get_index(2), 5);
         assert_eq!(sliced.get_index(3), 6);
+        // A dense selection stays a contiguous range; no index list is materialized.
+        assert_eq!(sliced.contiguous_range(), Some(3..7));
 
         // Slice beyond bounds
         let empty = sv.slice(15, 5);
         assert!(empty.is_empty());
+        assert_eq!(empty.contiguous_range(), Some(0..0));
+    }
+
+    #[test]
+    fn dense_filter_that_keeps_every_row_stays_contiguous() {
+        let sv = SelectionVector::new_dense(5);
+        assert_eq!(sv.filter(|_| true).contiguous_range(), Some(0..5));
+
+        // A window that survives filtering intact keeps its physical offset.
+        let windowed = sv.slice(2, 3);
+        assert_eq!(windowed.filter(|_| true).contiguous_range(), Some(2..5));
+
+        // Dropping a row still falls back to a sparse index list.
+        assert_eq!(sv.filter(|row| row != 2).contiguous_range(), None);
     }
 }

@@ -68,7 +68,7 @@ pub trait ExecutorBuilder: Send + Sync {
     /// Build a Vector VM transform interpreting the task's [`MicroProgram`].
     fn build_vm(
         &self,
-        program: &MicroProgram,
+        program: &Arc<MicroProgram>,
         next: Box<dyn PipelineNode<DataChunk>>,
     ) -> Result<Box<dyn Transform<DataChunk>>>;
 
@@ -293,7 +293,7 @@ mod tests {
             query_id: QueryId::new(),
             stage_id: StageId::new(),
             source: DataSource::Memory, // dummy: Int64 [1,2,3,4,5]
-            program: MicroProgram {
+            program: Arc::new(MicroProgram {
                 register_count: 3,
                 instructions: vec![
                     MicroOp::LoadConstant {
@@ -308,8 +308,8 @@ mod tests {
                     MicroOp::FilterMask { bool_reg: 2 },
                     MicroOp::ProjectRegisters { out_regs: vec![0] },
                 ],
-            },
-            sink: DataSink::Client { schema: vec![] },
+            }),
+            sink: Arc::new(DataSink::Client { schema: vec![] }),
         }
     }
 
@@ -347,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_aborts() {
         let mut task = task();
-        task.program = MicroProgram::empty();
+        task.program = Arc::new(MicroProgram::empty());
         let cancel = CancellationToken::new();
         cancel.cancel();
         let err = runner().execute(&task, cancel).await.unwrap_err();

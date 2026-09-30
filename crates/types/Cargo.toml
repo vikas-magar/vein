@@ -10,7 +10,7 @@ missing_docs = "deny"
 error = { path = "../error" }
 arrow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+rkyv = { workspace = true }
 
 [dev-dependencies]
 serde_json = "1.0"
-

@@ -1,10 +1,12 @@
 use crate::pipeline::{DataChunk, PipelineNode};
 use bytes::Bytes;
 use common::Result;
+use common::protocol::FieldSchema;
 use error::VeinError;
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
 use opendal::Operator;
+use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use std::sync::Arc;
@@ -53,7 +55,7 @@ impl AsyncFileReader for OpendalParquetReader {
                 .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
             self.bytes_read
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
-            Ok(Bytes::from(data))
+            Ok(data.to_bytes())
         })
     }
 
@@ -72,7 +74,7 @@ impl AsyncFileReader for OpendalParquetReader {
                     .await
                     .map_err(|error| parquet::errors::ParquetError::General(error.to_string()))?;
                 bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
-                Ok(Bytes::from(data))
+                Ok(data.to_bytes())
             }
         });
 
@@ -104,6 +106,7 @@ impl AsyncFileReader for OpendalParquetReader {
 pub async fn execute_parquet_scan(
     operator: &Operator,
     paths: &[String],
+    projected_schema: &[FieldSchema],
     next: &mut dyn PipelineNode<DataChunk>,
 ) -> Result<()> {
     for path in paths {
@@ -114,9 +117,42 @@ pub async fn execute_parquet_scan(
         let file_size_bytes = reader.size_bytes;
         let bytes_read = reader.bytes_read.clone();
 
-        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .map_err(|e| VeinError::internal(format!("Failed to build parquet stream: {}", e)))?;
+
+        if !projected_schema.is_empty() {
+            let arrow_schema = builder.schema();
+            let mut root_indices = Vec::with_capacity(projected_schema.len());
+            for field in projected_schema {
+                let mut matches = arrow_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| candidate.name() == &field.name);
+                let Some((index, _)) = matches.next() else {
+                    return Err(VeinError::internal(format!(
+                        "projected Parquet column '{}' is missing from '{}'",
+                        field.name, path
+                    )));
+                };
+                if matches.next().is_some() {
+                    return Err(VeinError::internal(format!(
+                        "projected Parquet column '{}' is ambiguous in '{}'",
+                        field.name, path
+                    )));
+                }
+                root_indices.push(index);
+            }
+            if root_indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(VeinError::internal(format!(
+                    "projected columns are not in source schema order for '{}'",
+                    path
+                )));
+            }
+            let mask = ProjectionMask::roots(builder.parquet_schema(), root_indices);
+            builder = builder.with_projection(mask);
+        }
 
         let mut stream = builder
             .build()

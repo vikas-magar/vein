@@ -1,6 +1,8 @@
 //! In-flight columnar data chunk representation.
 
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, UInt32Array};
+use arrow::compute::take;
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use common::arrow::SelectionVector;
 use common::Result;
@@ -39,29 +41,53 @@ impl DataChunk {
     }
 
     /// Creates a [`DataChunk`] from an Arrow [`RecordBatch`] with an initially dense selection.
+    ///
+    /// Takes ownership of the batch's columns rather than copying them: the
+    /// [`RecordBatch`] is decomposed with [`RecordBatch::into_parts`], so the
+    /// vector of column references moves into the chunk for free.
     pub fn from_record_batch(batch: RecordBatch) -> Self {
-        let num_rows = batch.num_rows();
-        let vectors = batch.columns().to_vec();
+        let (_, vectors, num_rows) = batch.into_parts();
         Self {
             vectors,
             selection: SelectionVector::new_dense(num_rows),
         }
     }
 
-    /// Constructs an ephemeral Arrow [`RecordBatch`] from chunk vectors.
-    /// Used for interoperability with Arrow compute kernels that require schema metadata.
-    pub fn to_record_batch(&self) -> Result<RecordBatch> {
-        let fields: Vec<arrow::datatypes::Field> = self
-            .vectors
-            .iter()
-            .enumerate()
-            .map(|(i, vec)| {
-                arrow::datatypes::Field::new(format!("col_{i}"), vec.data_type().clone(), true)
-            })
-            .collect();
-        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-        RecordBatch::try_new(schema, self.vectors.clone())
-            .map_err(|e| VeinError::internal(format!("Failed to create RecordBatch from DataChunk: {e}")))
+    /// Materializes the selected rows into an Arrow [`RecordBatch`] under `schema`.
+    ///
+    /// The selection vector is honoured: a contiguous physical range is
+    /// `slice`d zero-copy, and only a sparse selection falls back to
+    /// [`take`]. `schema` is supplied by the caller so it can be built once per
+    /// query rather than once per batch.
+    pub fn materialize(&self, schema: SchemaRef) -> Result<RecordBatch> {
+        let selected = self.selection.size();
+        let range = self.selection.contiguous_range();
+        let indices = range.is_none().then(|| {
+            let mut indices = UInt32Array::builder(selected);
+            for row in 0..selected {
+                indices.append_value(self.selection.get_index(row) as u32);
+            }
+            indices.finish()
+        });
+
+        let mut columns = Vec::with_capacity(self.vectors.len());
+        for array in &self.vectors {
+            let materialized = match (&range, &indices) {
+                (Some(range), _) => array.slice(range.start, range.len()),
+                (None, Some(indices)) => take(array.as_ref(), indices, None).map_err(|error| {
+                    VeinError::internal(format!("materialize selection failed: {error}"))
+                })?,
+                (None, None) => {
+                    return Err(VeinError::internal(
+                        "materialize requires indices for a sparse selection",
+                    ));
+                }
+            };
+            columns.push(materialized);
+        }
+
+        RecordBatch::try_new(schema, columns)
+            .map_err(|error| VeinError::internal(format!("materialize record batch failed: {error}")))
     }
 
     /// Total surviving rows in this chunk.

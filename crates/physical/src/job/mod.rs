@@ -35,4 +35,10 @@ impl Job {
     pub fn stage(&self) -> &Stage {
         &self.stage
     }
+
+    /// Consumes the job, returning its identity and stage so the caller can
+    /// move each task into execution without cloning it.
+    pub fn into_parts(self) -> (RequestId, QueryId, ExecutionMode, Stage) {
+        (self.request_id, self.query_id, self.mode, self.stage)
+    }
 }

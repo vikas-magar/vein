@@ -199,11 +199,17 @@ fn fold_sort_keys(keys: &[SortKey]) -> Vec<SortKey> {
 
 /// Recursively folds constant sub-expressions inside `expr`.
 fn fold_expr(expr: &LogicalExpr) -> LogicalExpr {
+    fold_expr_owned(expr.clone())
+}
+
+/// Owned recursion for [`fold_expr`]. Consuming each node keeps the traversal
+/// clone-free; the by-reference entry point above clones once per call.
+fn fold_expr_owned(expr: LogicalExpr) -> LogicalExpr {
     // The logical expression owns one canonical child-mapping API. Using it
     // here keeps folding aligned with every expression variant emitted by the
     // pipe binder, including CASE, lists, windows, lambdas, and function args.
     let rewritten = expr
-        .map_children(&mut |child| Ok(fold_expr(&child)))
+        .map_children(&mut |child| Ok(fold_expr_owned(child)))
         .expect("constant folding child traversal is infallible");
 
     match rewritten {
@@ -271,12 +277,12 @@ fn fold_cast(expr: Box<LogicalExpr>, target_type: VeinDataType) -> LogicalExpr {
                 Some(LogicalLiteral::Float64(*value as f64))
             }
             (LogicalLiteral::Float64(value), VeinDataType::Int64)
-                if value.is_finite()
-                    && *value >= i64::MIN as f64
-                    && *value < (i64::MAX as f64) + 1.0 =>
-            {
-                Some(LogicalLiteral::Int64(value.trunc() as i64))
-            }
+            if value.is_finite()
+                && *value >= i64::MIN as f64
+                && *value < (i64::MAX as f64) + 1.0 =>
+                {
+                    Some(LogicalLiteral::Int64(value.trunc() as i64))
+                }
             (LogicalLiteral::String(value), VeinDataType::Int64) => {
                 value.parse().ok().map(LogicalLiteral::Int64)
             }
@@ -342,7 +348,7 @@ fn like_matches(value: &str, pattern: &str) -> bool {
                 '%' => {
                     visit(value, pattern, value_index, pattern_index + 1, memo)
                         || (value_index < value.len()
-                            && visit(value, pattern, value_index + 1, pattern_index, memo))
+                        && visit(value, pattern, value_index + 1, pattern_index, memo))
                 }
                 '_' => {
                     value_index < value.len()
@@ -551,10 +557,10 @@ fn fold_literals(
             fold_ordered_scalars(op, *l, *r)
         }
         (LogicalLiteral::Decimal(l, lp, ls), LogicalLiteral::Decimal(r, rp, rs))
-            if lp == rp && ls == rs =>
-        {
-            fold_ordered_scalars(op, *l, *r)
-        }
+        if lp == rp && ls == rs =>
+            {
+                fold_ordered_scalars(op, *l, *r)
+            }
         _ => None,
     }
 }
@@ -578,10 +584,10 @@ fn fold_nullable_boolean(
             Some(LogicalLiteral::Boolean(true))
         }
         (BinaryOp::And | BinaryOp::Or, _, _)
-            if left_null || right_null =>
-        {
-            Some(LogicalLiteral::Null(VeinDataType::Boolean))
-        }
+        if left_null || right_null =>
+            {
+                Some(LogicalLiteral::Null(VeinDataType::Boolean))
+            }
         _ => None,
     }
 }
@@ -981,4 +987,3 @@ mod tests {
         );
     }
 }
-

@@ -3,44 +3,50 @@
 //! Evaluates [`MicroOp::Add`], [`MicroOp::Sub`], [`MicroOp::Mul`], and [`MicroOp::Div`]
 //! using Arrow's SIMD-accelerated compute kernels.
 
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, Datum};
 use arrow::compute::kernels::numeric;
 use common::Result;
 use error::VeinError;
 
 /// Performs element-wise vector addition between `lhs` and `rhs`.
-pub fn eval_add(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef> {
+///
+/// Operands are [`Datum`]s, so a broadcast scalar operand is never expanded to a full column.
+pub fn eval_add(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<ArrayRef> {
     numeric::add(lhs, rhs)
         .map_err(|e| VeinError::internal(format!("Vector VM Add error: {e}")))
 }
 
 /// Performs element-wise vector subtraction (`lhs - rhs`).
-pub fn eval_sub(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef> {
+pub fn eval_sub(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<ArrayRef> {
     numeric::sub(lhs, rhs)
         .map_err(|e| VeinError::internal(format!("Vector VM Sub error: {e}")))
 }
 
 /// Performs element-wise vector multiplication (`lhs * rhs`).
-pub fn eval_mul(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef> {
+pub fn eval_mul(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<ArrayRef> {
     numeric::mul(lhs, rhs)
         .map_err(|e| VeinError::internal(format!("Vector VM Mul error: {e}")))
 }
 
 /// Performs element-wise vector division (`lhs / rhs`).
-pub fn eval_div(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef> {
+pub fn eval_div(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<ArrayRef> {
     numeric::div(lhs, rhs)
         .map_err(|e| VeinError::internal(format!("Vector VM Div error: {e}")))
 }
 
 /// Performs element-wise vector modulo (`lhs % rhs`).
-pub fn eval_mod(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef> {
+pub fn eval_mod(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<ArrayRef> {
     numeric::rem(lhs, rhs)
         .map_err(|e| VeinError::internal(format!("Vector VM Mod error: {e}")))
 }
 
 /// Performs element-wise unary negation (`-src`).
+///
+/// Arrow's negation kernel takes a materialized `Array` rather than a [`Datum`],
+/// but this costs nothing for the zero-copy path: negating a length-1 broadcast
+/// scalar yields another length-1 array, so the register stays a scalar.
 pub fn eval_neg(src: &ArrayRef) -> Result<ArrayRef> {
-    numeric::neg(src.as_ref())
+    numeric::neg(src)
         .map_err(|e| VeinError::internal(format!("Vector VM Neg error: {e}")))
 }
 

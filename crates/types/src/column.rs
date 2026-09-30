@@ -5,7 +5,21 @@ use serde::{Deserialize, Serialize};
 
 /// Query-local, monotonically assigned column identity.
 /// Stable across optimizer rewrites (pushdown/reordering never invalidates ids).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct ColumnId(pub usize);
 
 impl std::fmt::Display for ColumnId {
@@ -15,7 +29,18 @@ impl std::fmt::Display for ColumnId {
 }
 
 /// A column as visible in a scope or produced by an operator.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct ResolvedColumn {
     /// Unique identifier for this column in the query.
     pub id: ColumnId,
