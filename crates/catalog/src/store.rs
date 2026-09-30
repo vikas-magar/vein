@@ -58,10 +58,25 @@ impl MetadataKey {
     /// Builds the key for `path`, or `None` when the file cannot be stat'ed.
     ///
     /// The path is canonicalized so that the catalog and the executor agree on
-    /// the identity of a file they reached through different spellings.
+    /// the identity of a file they reached through different spellings. A caller
+    /// that already holds a resolved path uses [`Self::for_canonical_file`]
+    /// instead, and saves the resolution.
     pub fn for_file(kind: MetadataKind, path: &Path) -> Option<Self> {
-        let metadata = std::fs::metadata(path).ok()?;
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        Self::for_canonical_file(kind, &canonical)
+    }
+
+    /// Builds the key for a path the caller has already canonicalized.
+    ///
+    /// Skipping the resolution is the point of this entry point: a scan reads the
+    /// path the catalog resolved, and resolving it again, once per file per
+    /// query, only repeats work the catalog has already done. The caller must
+    /// pass a canonical path, because the key this builds has to equal the key
+    /// the catalog published — a key built from another spelling of the same file
+    /// names it correctly but is not the one the other side stored it under, so
+    /// the handoff between planning and execution would silently miss.
+    pub fn for_canonical_file(kind: MetadataKind, canonical_path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(canonical_path).ok()?;
         let modified_nanos = metadata
             .modified()
             .ok()
@@ -69,10 +84,19 @@ impl MetadataKey {
             .map_or(0, |elapsed| elapsed.as_nanos());
         Some(Self {
             kind,
-            path: canonical,
+            path: canonical_path.to_path_buf(),
             size_bytes: metadata.len(),
             modified_nanos,
         })
+    }
+
+    /// Byte length of the file this key identifies.
+    ///
+    /// A consumer that already holds a key holds the size too, so it never has
+    /// to ask storage for it again: a Parquet reader needs only this length to
+    /// locate a footer, and the publisher recorded it when it built the key.
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
     }
 }
 
@@ -231,6 +255,24 @@ mod tests {
 
     fn key(path: &Path) -> MetadataKey {
         MetadataKey::for_file(TEST_KIND, path).expect("file exists")
+    }
+
+    /// The scan builds its key with [`MetadataKey::for_canonical_file`] from a
+    /// path the catalog resolved, so a resolved path must key the same entry as
+    /// the unresolved spelling it was resolved from. If these ever disagree, the
+    /// catalog's parsed footers stop reaching execution and every scan silently
+    /// re-parses what planning already read.
+    #[test]
+    fn resolved_and_unresolved_spellings_name_the_same_file() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("part.parquet");
+        write_file(&path, b"metadata");
+
+        let canonical = std::fs::canonicalize(&path).expect("resolve file");
+        let resolved =
+            MetadataKey::for_canonical_file(TEST_KIND, &canonical).expect("file exists");
+
+        assert_eq!(resolved, key(&path));
     }
 
     #[test]

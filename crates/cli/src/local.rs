@@ -1,5 +1,6 @@
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
@@ -139,46 +140,129 @@ impl LocalQuery {
         result.write_receipt.ok_or_else(|| VeinError::internal("WRITE task completed without a commit receipt"))
     }
 
-    /// Runs the query and yields Arrow batches through a bounded channel.
+    /// Runs the query and yields Arrow batches through bounded per-task channels.
+    ///
+    /// Tasks execute concurrently, yet their batches are drained in planning
+    /// order, so the result is identical to sequential execution. Every task owns
+    /// a bounded channel, which caps buffering at `workers * OUTPUT_BUFFER_BATCHES`
+    /// batches no matter how large the result is.
     pub fn into_stream(self) -> LocalResultStream {
         Box::pin(async_stream::stream! {
-            for task in self.tasks {
-                let (sender, receiver) = flume::bounded(OUTPUT_BUFFER_BATCHES);
-                let mut execution = Box::pin(self.executor.execute_streaming(
-                    &task,
-                    CancellationToken::new(),
-                    sender,
-                ));
+            let tasks = Arc::new(self.tasks);
+            let task_count = tasks.len();
+            if task_count == 0 {
+                return;
+            }
 
-                loop {
-                    tokio::select! {
-                        result = &mut execution => {
-                            match result {
-                                Ok(_) => {
-                                    while let Ok(batch) = receiver.try_recv() {
-                                        yield Ok(batch);
-                                    }
-                                }
-                                Err(error) => yield Err(error),
+            // As in DuckDB's `TryGetMaxThreads`, the machine's parallelism caps
+            // how wide a single stage may fan out.
+            let workers = std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get())
+                .unwrap_or(1)
+                .min(task_count);
+
+            tracing::info!(
+                target: "vein.audit",
+                event = "task_dispatch",
+                task_count,
+                workers,
+                "task_dispatch"
+            );
+
+            // One bounded channel per task, in planning order: the consumer
+            // drains them in order, so a slow early task throttles the later ones
+            // instead of reordering the result.
+            let mut senders = Vec::with_capacity(task_count);
+            let mut receivers = Vec::with_capacity(task_count);
+            for _ in 0..task_count {
+                let (sender, receiver) = flume::bounded(OUTPUT_BUFFER_BATCHES);
+                senders.push(Mutex::new(Some(sender)));
+                receivers.push(receiver);
+            }
+            let senders = Arc::new(senders);
+            // Written once per task; the consumer reads it after that task's
+            // channel disconnects to learn whether the task failed.
+            let outcomes: Arc<Mutex<Vec<Option<Result<()>>>>> =
+                Arc::new(Mutex::new((0..task_count).map(|_| None).collect()));
+
+            if task_count == 1 {
+                // A stage of a single morsel is cheaper to run inline than to
+                // dispatch: no spawn and no channel hop.
+                run_task(&self.executor, &tasks[0], &senders, &outcomes, 0).await;
+            } else {
+                // The first `workers` tasks are claimed up front; afterwards a
+                // worker pulls the next unclaimed index, so a straggler is
+                // absorbed by whichever worker finishes first.
+                let next = Arc::new(AtomicUsize::new(workers));
+                for worker in 0..workers {
+                    let executor = self.executor.clone();
+                    let tasks = Arc::clone(&tasks);
+                    let senders = Arc::clone(&senders);
+                    let outcomes = Arc::clone(&outcomes);
+                    let next = Arc::clone(&next);
+                    tokio::spawn(async move {
+                        let mut index = worker;
+                        loop {
+                            run_task(&executor, &tasks[index], &senders, &outcomes, index).await;
+                            index = next.fetch_add(1, Ordering::Relaxed);
+                            if index >= tasks.len() {
+                                return;
                             }
-                            break;
                         }
-                        received = receiver.recv_async() => {
-                            match received {
-                                Ok(batch) => yield Ok(batch),
-                                Err(_) => {
-                                    if let Err(error) = execution.await {
-                                        yield Err(error);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
+                    });
+                }
+            }
+
+            for (index, receiver) in receivers.into_iter().enumerate() {
+                while let Ok(batch) = receiver.recv_async().await {
+                    yield Ok(batch);
+                }
+                let outcome = outcomes
+                    .lock()
+                    .ok()
+                    .and_then(|mut outcomes| outcomes.get_mut(index).and_then(Option::take));
+                match outcome {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => {
+                        yield Err(error);
+                        return;
+                    }
+                    None => {
+                        yield Err(VeinError::internal(
+                            "task worker stopped without reporting an outcome",
+                        ));
+                        return;
                     }
                 }
             }
         })
     }
+}
+
+/// Executes one task into its own channel and records the outcome.
+///
+/// The channel's last sender is dropped only after the outcome is recorded, so
+/// the consumer never observes a disconnected channel whose outcome is unset.
+async fn run_task(
+    executor: &Arc<dyn TaskExecutor>,
+    task: &ExecuteTask,
+    senders: &[Mutex<Option<flume::Sender<RecordBatch>>>],
+    outcomes: &Mutex<Vec<Option<Result<()>>>>,
+    index: usize,
+) {
+    let Some(sender) = senders[index].lock().ok().and_then(|mut slot| slot.take()) else {
+        return;
+    };
+    let outcome = executor
+        .execute_streaming(task, CancellationToken::new(), sender.clone())
+        .await
+        .map(|_| ());
+    if let Ok(mut outcomes) = outcomes.lock()
+        && let Some(slot) = outcomes.get_mut(index)
+    {
+        *slot = Some(outcome);
+    }
+    drop(sender);
 }
 
 /// A streamed sequence of local query batches.

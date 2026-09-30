@@ -808,6 +808,7 @@ dependencies = [
  "error",
  "flume",
  "futures",
+ "libc",
  "opendal",
  "parquet",
  "tempfile",

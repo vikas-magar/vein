@@ -22,8 +22,11 @@ pub trait PipelineNode<B>: Send + Sync {
 ///
 /// Generic over the batch unit `B` it produces. Sources read data and push it
 /// into the execution pipeline.
-#[async_trait::async_trait(?Send)]
-pub trait Source<B> {
+///
+/// Sources are `Send`: a task's whole pipeline must be movable across threads
+/// so independent tasks can be executed concurrently.
+#[async_trait::async_trait]
+pub trait Source<B>: Send {
     /// Execute the source, pushing all batches into the `next` pipeline node.
     async fn execute(&mut self, next: &mut dyn PipelineNode<B>) -> Result<()>;
 

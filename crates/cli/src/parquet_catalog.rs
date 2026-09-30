@@ -2,7 +2,8 @@
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::parquet_storage::{ParquetStorage, resolve_manifest_file};
@@ -142,16 +143,17 @@ fn inspect_table_files(
     let stat_us = stat_started.elapsed().as_micros() as u64;
 
     let footer_started = Instant::now();
-    let (expected_schema, first_served_from_store) = parquet_schema(&files[0], metadata_store)?;
-    let mut footer_hits = u64::from(first_served_from_store);
-    let mut footer_misses = u64::from(!first_served_from_store);
-    for file in files.iter().skip(1) {
-        let (schema, served_from_store) = parquet_schema(file, metadata_store)?;
-        if served_from_store {
-            footer_hits += 1;
-        } else {
-            footer_misses += 1;
-        }
+    let schemas = parquet_schemas(&files, metadata_store)?;
+    let footer_us = footer_started.elapsed().as_micros() as u64;
+
+    let footer_hits = schemas
+        .iter()
+        .filter(|(_, served_from_store)| *served_from_store)
+        .count() as u64;
+    let footer_misses = schemas.len() as u64 - footer_hits;
+
+    let expected_schema = Arc::clone(&schemas[0].0);
+    for (file, (schema, _)) in files.iter().zip(schemas.iter()).skip(1) {
         if schema.as_ref() != expected_schema.as_ref() {
             return Err(VeinError::internal(format!(
                 "Parquet schema mismatch in '{}'; all files in one table must have identical schemas",
@@ -159,7 +161,6 @@ fn inspect_table_files(
             )));
         }
     }
-    let footer_us = footer_started.elapsed().as_micros() as u64;
     let file_count = files.len();
 
     let table_schema = Arc::new(VeinSchema::from(expected_schema.as_ref()));
@@ -185,6 +186,66 @@ fn inspect_table_files(
         "catalog_schema"
     );
     Ok(metadata)
+}
+
+/// Parses every file's footer concurrently, returning each file's schema and
+/// whether the catalog's store already held the parsed metadata.
+///
+/// Reading a footer opens and decodes one file, which costs hundreds of
+/// microseconds and depends on no other file. Reading them one after another
+/// made a table's planning time grow with its file count — on the order of a
+/// second per three thousand files — for work that is entirely independent, so
+/// files are claimed from a shared cursor by as many workers as the machine can
+/// run.
+///
+/// Results come back in file order and the first file to fail is the one
+/// reported, so a table with an unreadable file fails the same way it did when
+/// the footers were read one at a time.
+fn parquet_schemas(
+    files: &[PathBuf],
+    metadata_store: &MetadataStore,
+) -> Result<Vec<(Arc<arrow::datatypes::Schema>, bool)>> {
+    let slots: Mutex<Vec<Option<Result<(Arc<arrow::datatypes::Schema>, bool)>>>> =
+        Mutex::new((0..files.len()).map(|_| None).collect());
+    let next = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .min(files.len())
+        .max(1);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = files.get(index) else {
+                        return;
+                    };
+                    let parsed = parquet_schema(file, metadata_store);
+                    let Ok(mut slots) = slots.lock() else {
+                        return;
+                    };
+                    slots[index] = Some(parsed);
+                }
+            });
+        }
+    });
+
+    slots
+        .into_inner()
+        .map_err(|_| VeinError::internal("Parquet footer parse panicked"))?
+        .into_iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            slot.unwrap_or_else(|| {
+                Err(VeinError::internal(format!(
+                    "Parquet footer for '{}' was never parsed",
+                    files[index].display()
+                )))
+            })
+        })
+        .collect()
 }
 
 /// Returns the Arrow schema of `path` and whether the catalog's store served it.

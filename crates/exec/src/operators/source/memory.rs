@@ -24,7 +24,7 @@ impl MemorySource {
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl Source<DataChunk> for MemorySource {
     async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunk>) -> Result<()> {
         if let Some(batch) = self.batch.take() {

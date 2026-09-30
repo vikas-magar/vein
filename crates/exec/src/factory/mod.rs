@@ -2,8 +2,9 @@
 //!
 //! Maps task descriptions onto concrete sources, sinks, and Vector VM execution.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
 
@@ -19,6 +20,7 @@ use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, MicroProgram};
 use error::VeinError;
+use opendal::Operator;
 
 /// Builds a [`TaskExecutor`](crate::runtime::TaskExecutor) with configurable
 /// stages and Vector VM execution engine.
@@ -97,12 +99,27 @@ impl Default for TaskExecutorBuilder {
     }
 }
 
+/// How many storage handles one executor keeps before it starts over.
+///
+/// A query resolves one root per stage, so this is far more than a single query
+/// needs; the bound only stops a long-lived executor from growing the map
+/// without limit.
+const OPERATOR_CACHE_CAPACITY: usize = 64;
+
 /// The default executor builder: builds concrete sources, sinks, and the
 /// [`VectorVmExecutor`] from a wire task description.
 pub struct DefaultExecutorBuilder {
     registry: Arc<FunctionRegistry>,
     storage: Option<Arc<dyn WriteStorage>>,
     metadata_store: MetadataStore,
+    /// Storage handles, keyed by the root they were opened on.
+    ///
+    /// Opening a handle resolves the root and wires up the service behind it,
+    /// which costs more than the first read it serves, and every task of a
+    /// stage scans files under the same root. Keeping the handle here — rather
+    /// than in the task, which is a serializable description crossing the wire —
+    /// lets a stage's tasks share one.
+    operators: Mutex<HashMap<PathBuf, Operator>>,
 }
 
 impl DefaultExecutorBuilder {
@@ -112,6 +129,7 @@ impl DefaultExecutorBuilder {
             registry,
             storage: None,
             metadata_store: MetadataStore::new(),
+            operators: Mutex::new(HashMap::new()),
         }
     }
 
@@ -126,9 +144,33 @@ impl DefaultExecutorBuilder {
         self.metadata_store = metadata_store;
         self
     }
+
+    /// Returns a storage handle rooted at `root`, opening one only the first time.
+    ///
+    /// The lock is deliberately held across the build: a stage's tasks ask for
+    /// the same root at the same instant, and one build with the rest waiting
+    /// costs less than a build per task racing to publish the same handle.
+    fn local_operator(&self, root: &Path) -> Result<Operator> {
+        let mut operators = self
+            .operators
+            .lock()
+            .map_err(|_| VeinError::internal("operator cache mutex poisoned"))?;
+        if let Some(operator) = operators.get(root) {
+            return Ok(operator.clone());
+        }
+        if operators.len() >= OPERATOR_CACHE_CAPACITY {
+            operators.clear();
+        }
+        use opendal::services::Fs;
+        let builder = Fs::default().root(&root.to_string_lossy());
+        let operator = Operator::new(builder)
+            .map_err(|error| VeinError::internal(format!("build fs operator: {error}")))?;
+        operators.insert(root.to_path_buf(), operator.clone());
+        Ok(operator)
+    }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl ExecutorBuilder for DefaultExecutorBuilder {
     fn build_source(
         &self,
@@ -147,10 +189,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                         relative,
                     })
                     .collect();
-                use opendal::services::Fs;
-                let builder = Fs::default().root(&root.to_string_lossy());
-                let op = opendal::Operator::new(builder)
-                    .map_err(|e| VeinError::internal(format!("build fs operator: {e}")))?;
+                let op = self.local_operator(&root)?;
                 Ok(Box::new(ScanSource::new(
                     op,
                     files,

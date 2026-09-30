@@ -89,7 +89,7 @@ impl SelectionVector {
                     surviving.push(row_idx as u32);
                 }
             } else if surviving.is_none() {
-                let mut kept = Vec::with_capacity(self.size);
+                let mut kept = Vec::with_capacity(i + 1);
                 kept.extend((0..i).map(|j| self.get_index(j) as u32));
                 surviving = Some(kept);
             }
@@ -125,7 +125,7 @@ impl SelectionVector {
 }
 
 /// A pinned, boxed, sendable stream of `Result<RecordBatch>`.
-pub type SendableRecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
+pub type SendableRecordBatchStream = Pin<Box<dyn Stream<Item=Result<RecordBatch>> + Send>>;
 
 /// Encodes Arrow `RecordBatch`es into the Arrow IPC streaming format.
 pub struct IpcStreamEncoder {
@@ -256,7 +256,7 @@ pub fn make_mock_batch(rows: usize) -> RecordBatch {
         ("age", Arc::new(ages.finish()) as _),
         ("score", Arc::new(scores.finish()) as _),
     ])
-    .expect("mock batch should always build")
+        .expect("mock batch should always build")
 }
 
 #[cfg(test)]

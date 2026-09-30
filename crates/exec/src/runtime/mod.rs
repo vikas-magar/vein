@@ -48,7 +48,7 @@ pub struct TaskResult {
 /// Decouples `exec` from `common::protocol`: the executor's own
 /// [`Source`], [`Transform`], and [`Sink`] implementations are selected here
 /// from the self-contained task description a worker receives.
-#[async_trait(?Send)]
+#[async_trait]
 pub trait ExecutorBuilder: Send + Sync {
     /// Validates all authoritative catalog tokens carried by a task before
     /// opening any physical source.
@@ -96,10 +96,10 @@ pub trait ExecutorBuilder: Send + Sync {
 /// This is the unit of work the distributed master schedules: the executor
 /// receives a self-contained [`ExecuteTask`] and runs it, returning its result.
 ///
-/// Marked `?Send` because driving a [`Source`] awaits `Source::execute`, whose
-/// future is `!Send`; the executor runs these on a Tokio `LocalSet`, which
-/// supports `!Send` tasks.
-#[async_trait(?Send)]
+/// Every future here is `Send`, so tasks can be dispatched onto a multi-threaded
+/// runtime and executed concurrently; nothing in the pipeline holds `!Send`
+/// state.
+#[async_trait]
 pub trait TaskExecutor: Send + Sync {
     /// Run one task, driving its source through the operator chain.
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult>;
@@ -290,7 +290,7 @@ impl DefaultTaskExecutor {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl TaskExecutor for DefaultTaskExecutor {
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult> {
         self.execute_with_output(task, cancel, None).await
