@@ -6,14 +6,26 @@ use error::VeinError;
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
 use opendal::Operator;
-use parquet::arrow::ProjectionMask;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::ProjectionMask;
+use parquet::file::metadata::ParquetMetaData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use super::ScanFile;
+use catalog::{MetadataKey, MetadataKind, MetadataStore};
+
 const MAX_CONCURRENT_RANGE_READS: usize = 8;
+
+/// Metadata kind under which this format publishes parsed Parquet footers.
+///
+/// The catalog that plans a scan and the scan itself must both use this
+/// constant, so a footer parsed once is found by the other side. It moves to a
+/// dedicated Parquet catalog crate together with the rest of this format.
+pub const PARQUET_FOOTER: MetadataKind = MetadataKind::new("parquet.footer");
 
 /// An adapter to use OpenDAL's Operator as a Parquet AsyncFileReader
 struct OpendalParquetReader {
@@ -105,21 +117,56 @@ impl AsyncFileReader for OpendalParquetReader {
 /// Executes a scan over a list of Parquet files
 pub async fn execute_parquet_scan(
     operator: &Operator,
-    paths: &[String],
+    files: &[ScanFile],
     projected_schema: &[FieldSchema],
+    metadata_store: &MetadataStore,
     next: &mut dyn PipelineNode<DataChunk>,
 ) -> Result<()> {
-    for path in paths {
+    for file in files {
+        let path = file.relative.as_str();
         let scan_started = Instant::now();
         tracing::info!(target: "vein.audit", event = "scan_started", path = %path, format = "parquet", "scan_started");
 
+        let stat_started = Instant::now();
         let reader = OpendalParquetReader::new(operator, path).await?;
+        let stat_us = stat_started.elapsed().as_micros() as u64;
         let file_size_bytes = reader.size_bytes;
         let bytes_read = reader.bytes_read.clone();
 
-        let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(|e| VeinError::internal(format!("Failed to build parquet stream: {}", e)))?;
+        let metadata_started = Instant::now();
+        let footer_key = MetadataKey::for_file(PARQUET_FOOTER, &file.absolute);
+        let cached_footer = footer_key
+            .as_ref()
+            .and_then(|key| metadata_store.get::<ParquetMetaData>(key));
+        let footer_hit = cached_footer.is_some();
+        let mut builder = match cached_footer {
+            Some(metadata) => {
+                let metadata = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
+                    .map_err(|error| {
+                        VeinError::internal(format!(
+                            "Failed to reuse Parquet metadata for '{path}': {error}"
+                        ))
+                    })?;
+                ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
+            }
+            None => {
+                let builder = ParquetRecordBatchStreamBuilder::new(reader)
+                    .await
+                    .map_err(|e| {
+                        VeinError::internal(format!("Failed to build parquet stream: {}", e))
+                    })?;
+                if let Some(key) = footer_key {
+                    metadata_store.insert(key, Arc::clone(builder.metadata()));
+                }
+                tracing::debug!(
+                    target: "vein.audit",
+                    event = "parquet_footer_miss",
+                    path = %path,
+                    "parquet_footer_miss"
+                );
+                builder
+            }
+        };
 
         if !projected_schema.is_empty() {
             let arrow_schema = builder.schema();
@@ -153,15 +200,36 @@ pub async fn execute_parquet_scan(
             let mask = ProjectionMask::roots(builder.parquet_schema(), root_indices);
             builder = builder.with_projection(mask);
         }
+        let metadata_us = metadata_started.elapsed().as_micros() as u64;
+        let row_groups = builder.metadata().num_row_groups();
+        let file_rows = builder.metadata().file_metadata().num_rows();
 
+        let build_started = Instant::now();
         let mut stream = builder
             .build()
             .map_err(|e| VeinError::internal(format!("Failed to build parquet stream: {}", e)))?;
+        let build_us = build_started.elapsed().as_micros() as u64;
+
+        tracing::info!(
+            target: "vein.audit",
+            event = "scan_ready",
+            path = %path,
+            format = "parquet",
+            footer_hit,
+            file_size_bytes,
+            row_groups,
+            file_rows,
+            stat_us,
+            metadata_us,
+            build_us,
+            "scan_ready"
+        );
 
         let mut total_rows = 0;
         let mut batches = 0u64;
         let mut parquet_read_time = Duration::ZERO;
         let mut downstream_time = Duration::ZERO;
+        let mut first_batch_us = 0u64;
         let mut last_progress = Instant::now();
         loop {
             let read_started = Instant::now();
@@ -172,6 +240,9 @@ pub async fn execute_parquet_scan(
             };
             let batch = batch_result
                 .map_err(|e| VeinError::internal(format!("Parquet read error: {}", e)))?;
+            if batches == 0 {
+                first_batch_us = scan_started.elapsed().as_micros() as u64;
+            }
             total_rows += batch.num_rows();
             batches += 1;
 
@@ -190,27 +261,38 @@ pub async fn execute_parquet_scan(
                     batches,
                     bytes_read = bytes_read.load(Ordering::Relaxed),
                     file_size_bytes,
-                    parquet_read_ms = parquet_read_time.as_millis() as u64,
-                    downstream_ms = downstream_time.as_millis() as u64,
-                    elapsed_ms = scan_started.elapsed().as_millis() as u64,
+                    parquet_read_us = parquet_read_time.as_micros() as u64,
+                    downstream_us = downstream_time.as_micros() as u64,
+                    elapsed_us = scan_started.elapsed().as_micros() as u64,
                     "parquet_scan_progress"
                 );
                 last_progress = Instant::now();
             }
         }
 
+        let elapsed = scan_started.elapsed();
+        let bytes_read_total = bytes_read.load(Ordering::Relaxed);
         tracing::info!(
             target: "vein.audit",
             event = "scan_completed",
             path = %path,
             format = "parquet",
+            footer_hit,
             rows = total_rows,
+            file_rows,
             batches,
-            bytes_read = bytes_read.load(Ordering::Relaxed),
+            row_groups,
+            bytes_read = bytes_read_total,
             file_size_bytes,
-            parquet_read_ms = parquet_read_time.as_millis() as u64,
-            downstream_ms = downstream_time.as_millis() as u64,
-            elapsed_ms = scan_started.elapsed().as_millis() as u64,
+            stat_us,
+            metadata_us,
+            build_us,
+            first_batch_us,
+            parquet_read_us = parquet_read_time.as_micros() as u64,
+            downstream_us = downstream_time.as_micros() as u64,
+            elapsed_us = elapsed.as_micros() as u64,
+            rows_per_sec = (total_rows as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE))
+                as u64,
             "scan_completed"
         );
     }

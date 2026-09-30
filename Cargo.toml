@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/types", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/cli", "crates/plan", "crates/optimizer", "crates/physical"]
+members = ["crates/common", "crates/types", "crates/catalog", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/cli", "crates/plan", "crates/optimizer", "crates/physical"]
 default-members = ["crates/cli"]
 
 [workspace.dependencies]

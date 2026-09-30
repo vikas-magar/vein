@@ -3,25 +3,36 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
-use async_trait::async_trait;
-use error::{Result, VeinError};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use plan::{CatalogProvider, TableFormat, TableMetadata, VeinSchema};
 use crate::parquet_storage::{ParquetStorage, resolve_manifest_file};
+use async_trait::async_trait;
+use catalog::{MetadataKey, MetadataStore};
+use error::{Result, VeinError};
+use exec::operators::source::scan::PARQUET_FOOTER;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use parquet::file::metadata::ParquetMetaData;
+use plan::{CatalogProvider, TableFormat, TableMetadata, VeinSchema};
 
 /// Catalog which resolves table names beneath a local data root.
 #[derive(Debug, Clone)]
 pub struct ParquetCatalog {
     root: Arc<PathBuf>,
     storage: ParquetStorage,
+    metadata_store: MetadataStore,
 }
 
 impl ParquetCatalog {
     /// Creates a catalog rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        Self { storage: ParquetStorage::new(root.clone()), root: Arc::new(root) }
+        Self {
+            storage: ParquetStorage::new(root.clone()),
+            root: Arc::new(root),
+            metadata_store: MetadataStore::new(),
+        }
     }
 
     fn resolve_path(&self, name: &str) -> PathBuf {
@@ -41,25 +52,41 @@ impl CatalogProvider for ParquetCatalog {
         let path = self.resolve_path(&name);
         let storage = self.storage.clone();
         let root = self.root.clone();
+        let metadata_store = self.metadata_store.clone();
         tokio::task::spawn_blocking(move || {
             if let Some(manifest) = storage.read_manifest(&name)? {
-                let files = manifest.files.iter()
+                let discover_started = Instant::now();
+                let files = manifest
+                    .files
+                    .iter()
                     .map(|file| resolve_manifest_file(&root, file))
                     .collect::<Result<Vec<_>>>()?;
-                inspect_table_files(&name, &path, files)
+                tracing::info!(
+                    target: "vein.audit",
+                    event = "catalog_discovery",
+                    table = %name,
+                    source = "manifest",
+                    file_count = files.len(),
+                    discover_us = discover_started.elapsed().as_micros() as u64,
+                    "catalog_discovery"
+                );
+                inspect_table_files(&name, &path, files, &metadata_store)
             } else {
-                inspect_table(&name, &path)
+                inspect_table(&name, &path, &metadata_store)
             }
         })
             .await
-            .map_err(|error| {
-                VeinError::internal(format!("Parquet metadata worker failed: {error}"))
-            })?
+            .map_err(|error| VeinError::internal(format!("Parquet metadata worker failed: {error}")))?
             .map(Arc::new)
+    }
+
+    fn metadata_store(&self) -> MetadataStore {
+        self.metadata_store.clone()
     }
 }
 
-fn inspect_table(name: &str, path: &Path) -> Result<TableMetadata> {
+fn inspect_table(name: &str, path: &Path, metadata_store: &MetadataStore) -> Result<TableMetadata> {
+    let discover_started = Instant::now();
     if !path.exists() {
         return Err(VeinError::not_found(format!(
             "Parquet table '{name}' does not exist at '{}'",
@@ -76,23 +103,55 @@ fn inspect_table(name: &str, path: &Path) -> Result<TableMetadata> {
             path.display()
         )));
     }
+    tracing::info!(
+        target: "vein.audit",
+        event = "catalog_discovery",
+        table = %name,
+        source = "directory",
+        file_count = files.len(),
+        discover_us = discover_started.elapsed().as_micros() as u64,
+        "catalog_discovery"
+    );
 
-    inspect_table_files(name, path, files)
+    inspect_table_files(name, path, files, metadata_store)
 }
 
-fn inspect_table_files(name: &str, path: &Path, mut files: Vec<PathBuf>) -> Result<TableMetadata> {
+fn inspect_table_files(
+    name: &str,
+    path: &Path,
+    mut files: Vec<PathBuf>,
+    metadata_store: &MetadataStore,
+) -> Result<TableMetadata> {
+    let started = Instant::now();
     files.sort();
     if files.is_empty() {
-        return Err(VeinError::not_found(format!("no committed Parquet files found for table '{name}'")));
+        return Err(VeinError::not_found(format!(
+            "no committed Parquet files found for table '{name}'"
+        )));
     }
+
+    let stat_started = Instant::now();
     for file in &files {
         if !file.is_file() {
-            return Err(VeinError::not_found(format!("committed Parquet artifact '{}' is missing", file.display())));
+            return Err(VeinError::not_found(format!(
+                "committed Parquet artifact '{}' is missing",
+                file.display()
+            )));
         }
     }
-    let expected_schema = parquet_schema(&files[0])?;
+    let stat_us = stat_started.elapsed().as_micros() as u64;
+
+    let footer_started = Instant::now();
+    let (expected_schema, first_served_from_store) = parquet_schema(&files[0], metadata_store)?;
+    let mut footer_hits = u64::from(first_served_from_store);
+    let mut footer_misses = u64::from(!first_served_from_store);
     for file in files.iter().skip(1) {
-        let schema = parquet_schema(file)?;
+        let (schema, served_from_store) = parquet_schema(file, metadata_store)?;
+        if served_from_store {
+            footer_hits += 1;
+        } else {
+            footer_misses += 1;
+        }
         if schema.as_ref() != expected_schema.as_ref() {
             return Err(VeinError::internal(format!(
                 "Parquet schema mismatch in '{}'; all files in one table must have identical schemas",
@@ -100,19 +159,56 @@ fn inspect_table_files(name: &str, path: &Path, mut files: Vec<PathBuf>) -> Resu
             )));
         }
     }
+    let footer_us = footer_started.elapsed().as_micros() as u64;
+    let file_count = files.len();
 
     let table_schema = Arc::new(VeinSchema::from(expected_schema.as_ref()));
     let files = files
         .into_iter()
         .map(|file| file.to_string_lossy().into_owned())
         .collect();
-    Ok(TableMetadata::new(name, table_schema)
+    let metadata = TableMetadata::new(name, table_schema)
         .with_location(path.to_string_lossy())
         .with_format(TableFormat::Parquet)
-        .with_files(files))
+        .with_files(files);
+
+    tracing::info!(
+        target: "vein.audit",
+        event = "catalog_schema",
+        table = %name,
+        file_count,
+        stat_us,
+        footer_us,
+        footer_hits,
+        footer_misses,
+        total_us = started.elapsed().as_micros() as u64,
+        "catalog_schema"
+    );
+    Ok(metadata)
 }
 
-fn parquet_schema(path: &Path) -> Result<Arc<arrow::datatypes::Schema>> {
+/// Returns the Arrow schema of `path` and whether the catalog's store served it.
+///
+/// The parsed footer is published under [`PARQUET_FOOTER`] so the scan reading
+/// the same file reuses it instead of parsing the footer a second time.
+fn parquet_schema(
+    path: &Path,
+    metadata_store: &MetadataStore,
+) -> Result<(Arc<arrow::datatypes::Schema>, bool)> {
+    let key = MetadataKey::for_file(PARQUET_FOOTER, path);
+    if let Some(key) = &key {
+        if let Some(metadata) = metadata_store.get::<ParquetMetaData>(key) {
+            let reader = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
+                .map_err(|error| {
+                    VeinError::internal(format!(
+                        "derive Arrow schema from '{}': {error}",
+                        path.display()
+                    ))
+                })?;
+            return Ok((reader.schema().clone(), true));
+        }
+    }
+
     let file = File::open(path)
         .map_err(|error| VeinError::io(format!("open Parquet file '{}'", path.display()), error))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
@@ -121,7 +217,17 @@ fn parquet_schema(path: &Path) -> Result<Arc<arrow::datatypes::Schema>> {
             path.display()
         ))
     })?;
-    Ok(reader.schema().clone())
+    let schema = reader.schema().clone();
+    if let Some(key) = key {
+        metadata_store.insert(key, Arc::clone(reader.metadata()));
+        tracing::debug!(
+            target: "vein.audit",
+            event = "parquet_footer_parsed",
+            path = %path.display(),
+            "parquet_footer_parsed"
+        );
+    }
+    Ok((schema, false))
 }
 
 fn collect_parquet_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {

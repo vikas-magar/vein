@@ -1,6 +1,14 @@
-use crate::schema::VeinDataType;
+//! Literal values of the engine's data types.
 
-/// A literal value inside a logical expression
+use crate::data_type::VeinDataType;
+
+/// A literal value of a known [`VeinDataType`].
+///
+/// Literals are the constant leaves of logical expressions and the payload type
+/// for statistics, such as a column's minimum and maximum. They live beside
+/// [`VeinDataType`] rather than in the logical-expression crate so that both the
+/// expression layer and the metadata layer can name a constant without either
+/// depending on the other.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LogicalLiteral {
     /// A null value of a specific type

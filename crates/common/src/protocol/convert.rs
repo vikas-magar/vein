@@ -9,13 +9,12 @@ use super::ir::program::{ArchivedMicroProgram, MicroProgram};
 use super::ir::state::{
     AggOpCode, ArchivedAggOpCode, ArchivedJoinKind, ArchivedStateMode, JoinKind, StateMode,
 };
+use catalog::CatalogSnapshotToken;
 use super::task::{
-    ArchivedCatalogSnapshotToken, ArchivedDataSink, ArchivedDataSource, ArchivedExecuteTask,
-    ArchivedExecutionMode, ArchivedFieldSchema, ArchivedFileFormat, ArchivedFileScanTask,
-    CatalogSnapshotToken, DataSink, DataSource,
-    ExecuteTask, ExecutionMode,
-    FieldSchema, FileFormat, FileScanTask, KeyValue,
-    StorageTarget, StreamSource,
+    ArchivedDataSink, ArchivedDataSource, ArchivedExecuteTask, ArchivedExecutionMode,
+    ArchivedFieldSchema, ArchivedFileFormat, ArchivedFileScanTask, DataSink, DataSource,
+    ExecuteTask, ExecutionMode, FieldSchema, FileFormat, FileScanTask, KeyValue, StorageTarget,
+    StreamSource,
 };
 use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
 use types::VeinDataType;
@@ -282,17 +281,6 @@ impl From<&ArchivedFieldSchema> for FieldSchema {
             name: archived.name.as_str().to_string(),
             data_type: archived.data_type.as_str().to_string(),
         }
-    }
-}
-
-impl From<&ArchivedCatalogSnapshotToken> for CatalogSnapshotToken {
-    fn from(archived: &ArchivedCatalogSnapshotToken) -> Self {
-        Self::new(
-            archived.table_id.as_str(),
-            archived.catalog_revision.as_str(),
-            archived.snapshot_id.as_str(),
-            archived.schema_version.to_native(),
-        )
     }
 }
 

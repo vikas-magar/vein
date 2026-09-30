@@ -21,7 +21,7 @@ pub enum LogicalPlan {
     /// A table scan
     Scan {
         /// The authoritative table metadata from the catalog.
-        table: std::sync::Arc<crate::metadata::TableMetadata>,
+        table: std::sync::Arc<catalog::TableMetadata>,
         /// The projection of column IDs to read
         projection: Option<Vec<ColumnId>>,
         /// The filters to push down

@@ -1,18 +1,17 @@
-//! Standard table metadata abstraction for the Vein database engine.
+//! Standard table metadata contract shared by every catalog.
 //!
-//! Encapsulates schema, storage layout, physical format, partitioning specifications,
-//! clustering/sort ordering, table and column statistics, and extensible properties.
-//! This comprehensive metadata is produced by catalogs (e.g. VCS, Iceberg, Delta Lake)
-//! and consumed by the Binder, Cost-Based Optimizer (CBO), and Physical Planner.
+//! `TableMetadata` is what catalogs hand to the binder, the cost-based
+//! optimizer, and the physical planner: schema, storage layout, physical
+//! format, partitioning, clustering/sort ordering, statistics, and extensible
+//! properties. Nothing here knows about a specific catalog implementation, so a
+//! local file catalog, Iceberg, and Delta all describe a table the same way.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common::protocol::CatalogSnapshotToken;
+use types::{LogicalLiteral, ResolvedColumn, VeinSchemaRef};
 
-use crate::expr::LogicalLiteral;
-use crate::plan::SortKey;
-use crate::schema::VeinSchemaRef;
+use crate::snapshot::CatalogSnapshotToken;
 
 /// The kind of table represented in the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -113,6 +112,22 @@ pub struct TableStatistics {
     pub column_statistics: HashMap<String, ColumnStatistics>,
 }
 
+/// One column of a table's physical sort or clustering order.
+///
+/// The order is recorded against resolved columns rather than planner
+/// expressions: clustering is a property of the stored data, and keeping the
+/// expression tree out of the contract lets a catalog describe layout without
+/// depending on the planner.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ColumnSortKey {
+    /// The sorted column.
+    pub column: ResolvedColumn,
+    /// Whether the column is sorted ascending (`true`) or descending (`false`).
+    pub ascending: bool,
+    /// Whether nulls sort before (`true`) or after (`false`) the non-null values.
+    pub nulls_first: bool,
+}
+
 /// Authoritative metadata for a table in the catalog.
 ///
 /// Encapsulates all relational, physical, partitioning, and statistical properties
@@ -134,7 +149,7 @@ pub struct TableMetadata {
     /// Partition column names used for partition pruning in the optimizer.
     pub partition_columns: Vec<String>,
     /// Physical sort or clustering order for sort elimination and streaming execution.
-    pub sort_order: Vec<SortKey>,
+    pub sort_order: Vec<ColumnSortKey>,
     /// Statistical metadata for Cost-Based Optimization (CBO).
     pub statistics: Option<TableStatistics>,
     /// Catalog snapshot pinned for planning and execution.
@@ -204,7 +219,7 @@ impl TableMetadata {
     }
 
     /// Sets the physical sort order for sort elimination.
-    pub fn with_sort_order(mut self, sort_order: Vec<SortKey>) -> Self {
+    pub fn with_sort_order(mut self, sort_order: Vec<ColumnSortKey>) -> Self {
         self.sort_order = sort_order;
         self
     }

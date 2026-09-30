@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatch;
 use common::Result;
 use error::VeinError;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// A [`Sink`] that captures the pipeline's output and returns it via
 /// [`Sink::collect`].
@@ -20,6 +21,11 @@ pub struct CollectSink {
     output_sender: Option<flume::Sender<RecordBatch>>,
     rows_emitted: u64,
     schema: Option<SchemaRef>,
+    chunks_in: u64,
+    chunks_skipped: u64,
+    batches_out: u64,
+    schema_build_us: u64,
+    materialize_us: u64,
 }
 
 impl CollectSink {
@@ -31,6 +37,11 @@ impl CollectSink {
             output_sender: None,
             rows_emitted: 0,
             schema: None,
+            chunks_in: 0,
+            chunks_skipped: 0,
+            batches_out: 0,
+            schema_build_us: 0,
+            materialize_us: 0,
         }
     }
 
@@ -42,6 +53,11 @@ impl CollectSink {
             output_sender: None,
             rows_emitted: 0,
             schema: None,
+            chunks_in: 0,
+            chunks_skipped: 0,
+            batches_out: 0,
+            schema_build_us: 0,
+            materialize_us: 0,
         }
     }
 
@@ -56,6 +72,11 @@ impl CollectSink {
             output_sender: Some(output_sender),
             rows_emitted: 0,
             schema: None,
+            chunks_in: 0,
+            chunks_skipped: 0,
+            batches_out: 0,
+            schema_build_us: 0,
+            materialize_us: 0,
         }
     }
 
@@ -67,10 +88,10 @@ impl CollectSink {
         if let Some(schema) = &self.schema {
             let same_shape = schema.fields().len() == chunk.vectors.len()
                 && schema
-                    .fields()
-                    .iter()
-                    .zip(&chunk.vectors)
-                    .all(|(field, vector)| field.data_type() == vector.data_type());
+                .fields()
+                .iter()
+                .zip(&chunk.vectors)
+                .all(|(field, vector)| field.data_type() == vector.data_type());
             if same_shape {
                 return schema.clone();
             }
@@ -103,13 +124,22 @@ impl Default for CollectSink {
 
 impl PipelineNode<DataChunk> for CollectSink {
     fn push(&mut self, chunk: DataChunk) -> Result<()> {
+        self.chunks_in += 1;
         if chunk.selection.is_empty() {
+            self.chunks_skipped += 1;
             return Ok(());
         }
 
+        let schema_started = Instant::now();
         let schema = self.schema_for(&chunk);
+        self.schema_build_us += schema_started.elapsed().as_micros() as u64;
+
+        let materialize_started = Instant::now();
         let batch = chunk.materialize(schema)?;
+        self.materialize_us += materialize_started.elapsed().as_micros() as u64;
+
         self.rows_emitted += batch.num_rows() as u64;
+        self.batches_out += 1;
         if let Some(sender) = &self.output_sender {
             sender
                 .send(batch)
@@ -121,6 +151,17 @@ impl PipelineNode<DataChunk> for CollectSink {
     }
 
     fn flush(&mut self) -> Result<()> {
+        tracing::info!(
+            target: "vein.audit",
+            event = "client_sink_finished",
+            chunks_in = self.chunks_in,
+            chunks_skipped = self.chunks_skipped,
+            batches_out = self.batches_out,
+            rows = self.rows_emitted,
+            schema_build_us = self.schema_build_us,
+            materialize_us = self.materialize_us,
+            "client_sink_finished"
+        );
         Ok(())
     }
 }

@@ -13,11 +13,13 @@ pub use ir::op::MicroOp;
 pub use ir::program::{MicroProgram, RegId};
 pub use ir::state::{AggOpCode, JoinKind, StateMode};
 
+// The catalog owns table-identity types; the protocol carries them on the wire.
+pub use catalog::{ArchivedCatalogSnapshotToken, CatalogSnapshotToken};
+
 // Re-export task & pipeline definitions
 pub use task::{
-    ArchivedCatalogSnapshotToken, ArchivedExecuteTask, CatalogSnapshotToken, DataSink, DataSource,
-    ExecuteTask, ExecutionMode, FieldSchema, FileFormat, FileScanTask, KeyValue, StorageTarget,
-    StreamSource,
+    ArchivedExecuteTask, DataSink, DataSource, ExecuteTask, ExecutionMode, FieldSchema, FileFormat,
+    FileScanTask, KeyValue, StorageTarget, StreamSource,
 };
 
 #[cfg(test)]

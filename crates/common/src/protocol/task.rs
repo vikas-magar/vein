@@ -1,5 +1,6 @@
 //! Physical task definitions, execution modes, sources, and sinks.
 
+use catalog::CatalogSnapshotToken;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::sync::Arc;
@@ -39,46 +40,6 @@ pub struct FieldSchema {
     pub name: String,
     /// Data type string (e.g. "INT", "STRING").
     pub data_type: String,
-}
-
-/// Immutable catalog snapshot token carried with a physical scan.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
-pub struct CatalogSnapshotToken {
-    /// Stable table identity in the catalog.
-    pub table_id: String,
-    /// Catalog revision used to plan the query.
-    pub catalog_revision: String,
-    /// Committed table snapshot selected by the planner.
-    pub snapshot_id: String,
-    /// Schema version selected by the planner.
-    pub schema_version: u64,
-}
-
-impl CatalogSnapshotToken {
-    /// Creates a catalog snapshot token.
-    pub fn new(
-        table_id: impl Into<String>,
-        catalog_revision: impl Into<String>,
-        snapshot_id: impl Into<String>,
-        schema_version: u64,
-    ) -> Self {
-        Self {
-            table_id: table_id.into(),
-            catalog_revision: catalog_revision.into(),
-            snapshot_id: snapshot_id.into(),
-            schema_version,
-        }
-    }
 }
 
 /// Self-contained file scan instruction for an Executor.

@@ -11,6 +11,20 @@ use arrow::array::ArrayRef;
 use common::Result;
 use common::protocol::{MicroOp, MicroProgram, RegId};
 use std::sync::Arc;
+use std::time::Instant;
+
+/// Aggregated execution statistics for one VM pipeline run.
+#[derive(Debug, Default)]
+struct VmStats {
+    /// Chunks evaluated by the VM.
+    chunks: u64,
+    /// Rows entering the VM.
+    rows_in: u64,
+    /// Rows leaving the VM after filtering.
+    rows_out: u64,
+    /// Time spent evaluating instructions.
+    eval_us: u64,
+}
 
 /// Vector VM Executor node in the physical execution pipeline.
 ///
@@ -21,6 +35,7 @@ pub struct VectorVmExecutor {
     registers: RegisterFile,
     registry: Arc<FunctionRegistry>,
     next: Box<dyn PipelineNode<DataChunk>>,
+    stats: VmStats,
 }
 
 impl VectorVmExecutor {
@@ -37,6 +52,7 @@ impl VectorVmExecutor {
             registers,
             registry,
             next,
+            stats: VmStats::default(),
         }
     }
 
@@ -69,13 +85,10 @@ fn store_result(registers: &mut RegisterFile, dst: RegId, array: ArrayRef) -> Re
     }
 }
 
-impl PipelineNode<DataChunk> for VectorVmExecutor {
-    fn push(&mut self, mut chunk: DataChunk) -> Result<()> {
-        if chunk.selection.is_empty() {
-            return Ok(());
-        }
-
-        self.registers.mount_chunk(&chunk)?;
+impl VectorVmExecutor {
+    /// Evaluates `chunk` through the program, leaving results in the registers.
+    fn eval_chunk(&mut self, chunk: &mut DataChunk) -> Result<()> {
+        self.registers.mount_chunk(chunk)?;
         for op in &self.program.instructions {
             match op {
                 MicroOp::LoadConstant { dst, value } => {
@@ -231,10 +244,45 @@ impl PipelineNode<DataChunk> for VectorVmExecutor {
             }
         }
 
+        Ok(())
+    }
+}
+
+impl PipelineNode<DataChunk> for VectorVmExecutor {
+    fn push(&mut self, mut chunk: DataChunk) -> Result<()> {
+        if chunk.selection.is_empty() {
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        let rows_in = chunk.selection.size();
+        let outcome = self.eval_chunk(&mut chunk);
+        self.stats.chunks += 1;
+        self.stats.rows_in += rows_in as u64;
+        self.stats.eval_us += started.elapsed().as_micros() as u64;
+        outcome?;
+
+        if chunk.selection.is_empty() {
+            return Ok(());
+        }
+        self.stats.rows_out += chunk.selection.size() as u64;
+
         self.next.push(chunk)
     }
 
     fn flush(&mut self) -> Result<()> {
+        let stats = std::mem::take(&mut self.stats);
+        if stats.chunks > 0 {
+            tracing::info!(
+                target: "vein.audit",
+                event = "vm_finished",
+                chunks = stats.chunks,
+                rows_in = stats.rows_in,
+                rows_out = stats.rows_out,
+                eval_us = stats.eval_us,
+                "vm_finished"
+            );
+        }
         self.next.flush()
     }
 }

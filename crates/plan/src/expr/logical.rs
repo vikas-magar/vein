@@ -1,4 +1,4 @@
-use crate::expr::literal::LogicalLiteral;
+use crate::expr::LogicalLiteral;
 use crate::plan::LogicalPlan;
 use crate::plan::types::SortKey;
 use crate::schema::{ResolvedColumn, VeinDataType};

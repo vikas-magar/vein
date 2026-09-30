@@ -203,8 +203,11 @@ impl DefaultTaskExecutor {
             return Err(VeinError::cancelled());
         }
 
+        let validate_started = Instant::now();
         self.builder.validate_task(task).await?;
+        let validate_us = validate_started.elapsed().as_micros() as u64;
 
+        let sink_started = Instant::now();
         let sink = if let Some(sender) = output_sender {
             self.builder.build_streaming_sink(&task.sink, sender)?
         } else {
@@ -215,11 +218,18 @@ impl DefaultTaskExecutor {
             Box::new(SinkHandle(sink.clone())),
             cancel.clone(),
         ));
+        let sink_build_us = sink_started.elapsed().as_micros() as u64;
 
+        let vm_started = Instant::now();
         let mut vm = self.builder.build_vm(&task.program, head)?;
+        let vm_build_us = vm_started.elapsed().as_micros() as u64;
+
+        let source_started = Instant::now();
         let mut source: Box<dyn Source<DataChunk>> =
             self.builder
                 .build_source(&task.source, task.task_id, task.attempt)?;
+        let source_build_us = source_started.elapsed().as_micros() as u64;
+
         let task_span = tracing::info_span!(
             target: "vein.audit",
             "task_execution",
@@ -229,12 +239,15 @@ impl DefaultTaskExecutor {
             task_id = %task.task_id,
             attempt = task.attempt,
         );
+        let run_started = Instant::now();
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(VeinError::cancelled()),
             result = source.execute(&mut *vm).instrument(task_span) => result?,
         }
+        let run_us = run_started.elapsed().as_micros() as u64;
 
+        let collect_started = Instant::now();
         let mut sink = sink
             .lock()
             .map_err(|_| VeinError::internal("sink mutex poisoned"))?;
@@ -243,14 +256,34 @@ impl DefaultTaskExecutor {
             .row_count()
             .max(output.iter().map(|batch| batch.num_rows() as u64).sum());
         let write_receipt = sink.write_receipt().cloned();
+        let collect_us = collect_started.elapsed().as_micros() as u64;
+
+        let bytes_read = source.bytes_read();
         let duration_ns = start.elapsed().as_nanos() as u64;
+
+        tracing::info!(
+            target: "vein.audit",
+            event = "task_finished",
+            task_id = %task.task_id,
+            validate_us,
+            sink_build_us,
+            vm_build_us,
+            source_build_us,
+            run_us,
+            collect_us,
+            rows = row_count,
+            output_batches = output.len(),
+            bytes_read,
+            total_us = duration_ns / 1000,
+            "task_finished"
+        );
 
         Ok(TaskResult {
             row_count,
             output,
             write_receipt,
             metrics: TaskMetrics {
-                bytes_read: source.bytes_read(),
+                bytes_read,
                 duration_ns,
             },
         })

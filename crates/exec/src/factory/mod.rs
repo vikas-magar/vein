@@ -8,11 +8,13 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 
 use crate::operators::sink::{CollectSink, DiscardSink, WriteSink, WriteStorage};
+use crate::operators::source::scan::ScanFile;
 use crate::operators::source::{MemorySource, ScanSource};
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use crate::runtime::ExecutorBuilder;
 use crate::udf::FunctionRegistry;
 use crate::vm::VectorVmExecutor;
+use catalog::MetadataStore;
 use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, MicroProgram};
@@ -28,6 +30,7 @@ pub struct TaskExecutorBuilder {
     builder: Arc<dyn ExecutorBuilder>,
     registry: Arc<FunctionRegistry>,
     storage: Option<Arc<dyn WriteStorage>>,
+    metadata_store: MetadataStore,
 }
 
 impl TaskExecutorBuilder {
@@ -38,7 +41,19 @@ impl TaskExecutorBuilder {
             builder: Arc::new(DefaultExecutorBuilder::new(registry.clone())),
             registry,
             storage: None,
+            metadata_store: MetadataStore::new(),
         }
+    }
+
+    /// Share the catalog's parsed-metadata store with the executor.
+    ///
+    /// The catalog that resolves tables fills the store; handing it to the
+    /// executor lets scans reuse file metadata the catalog already parsed
+    /// instead of reading the same files again.
+    pub fn with_metadata_store(mut self, metadata_store: MetadataStore) -> Self {
+        self.metadata_store = metadata_store;
+        self.rebuild_default();
+        self
     }
 
     /// Override the UDF function registry used by the Vector VM.
@@ -60,6 +75,7 @@ impl TaskExecutorBuilder {
         if let Some(storage) = &self.storage {
             builder = builder.with_write_storage(storage.clone());
         }
+        builder = builder.with_metadata_store(self.metadata_store.clone());
         self.builder = Arc::new(builder);
     }
 
@@ -86,17 +102,28 @@ impl Default for TaskExecutorBuilder {
 pub struct DefaultExecutorBuilder {
     registry: Arc<FunctionRegistry>,
     storage: Option<Arc<dyn WriteStorage>>,
+    metadata_store: MetadataStore,
 }
 
 impl DefaultExecutorBuilder {
     /// Create a builder with the given UDF function registry for the Vector VM.
     pub fn new(registry: Arc<FunctionRegistry>) -> Self {
-        Self { registry, storage: None }
+        Self {
+            registry,
+            storage: None,
+            metadata_store: MetadataStore::new(),
+        }
     }
 
     /// Attach a transactional table storage implementation.
     pub fn with_write_storage(mut self, storage: Arc<dyn WriteStorage>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Share a parsed-metadata store with scans built by this executor.
+    pub fn with_metadata_store(mut self, metadata_store: MetadataStore) -> Self {
+        self.metadata_store = metadata_store;
         self
     }
 }
@@ -112,16 +139,24 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         match source {
             DataSource::Memory => Ok(Box::new(MemorySource::dummy())),
             DataSource::File(scan) => {
-                let (root, paths) = local_scan_paths(&scan.files)?;
+                let (root, relative) = local_scan_paths(&scan.files)?;
+                let files = relative
+                    .into_iter()
+                    .map(|relative| ScanFile {
+                        absolute: root.join(&relative),
+                        relative,
+                    })
+                    .collect();
                 use opendal::services::Fs;
                 let builder = Fs::default().root(&root.to_string_lossy());
                 let op = opendal::Operator::new(builder)
                     .map_err(|e| VeinError::internal(format!("build fs operator: {e}")))?;
                 Ok(Box::new(ScanSource::new(
                     op,
-                    paths,
+                    files,
                     scan.format.clone(),
                     scan.projected_schema.clone(),
+                    self.metadata_store.clone(),
                 )))
             }
             DataSource::Stream(_) => Err(

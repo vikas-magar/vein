@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+catalog = { path = "../catalog" }
 common = { path = "../common" }
 error = { path = "../error" }
 tokio = { workspace = true }

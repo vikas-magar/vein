@@ -7,9 +7,12 @@
 pub mod column;
 /// Data types and arrow conversions.
 pub mod data_type;
+/// Literal values of the engine's data types.
+pub mod literal;
 /// Schemas and column layouts.
 pub mod schema;
 
 pub use column::{ColumnId, ResolvedColumn};
 pub use data_type::VeinDataType;
+pub use literal::LogicalLiteral;
 pub use schema::{VeinSchema, VeinSchemaRef};

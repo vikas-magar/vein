@@ -9,6 +9,7 @@ tokio   = { workspace = true }
 arrow   = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+catalog = { path = "../catalog" }
 error   = { path = "../error" }
 types   = { path = "../types" }
 rand    = { workspace = true }

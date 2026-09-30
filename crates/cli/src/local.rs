@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use binder::LogicalBinder;
@@ -12,6 +13,7 @@ use exec::operators::sink::WriteReceipt;
 use futures::Stream;
 use optimizer::Optimizer;
 use physical::PhysicalPlanner;
+use plan::CatalogProvider;
 
 use super::parquet_catalog::ParquetCatalog;
 use super::parquet_storage::ParquetStorage;
@@ -31,11 +33,13 @@ impl LocalQueryEngine {
     pub fn new(data_root: impl Into<std::path::PathBuf>) -> Self {
         let data_root = data_root.into();
         let catalog = Arc::new(ParquetCatalog::new(data_root.clone()));
-        let catalog: Arc<dyn plan::CatalogProvider> = catalog;
+        let metadata_store = catalog.metadata_store();
+        let catalog: Arc<dyn CatalogProvider> = catalog;
         let functions = Arc::new(binder::BuiltinFunctionRegistry::new());
         let functions: Arc<dyn binder::FunctionRegistry> = functions;
         let storage = Arc::new(ParquetStorage::new(data_root));
         let executor = Arc::new(exec::factory::TaskExecutorBuilder::new()
+            .with_metadata_store(metadata_store)
             .with_write_storage(storage)
             .build());
 
@@ -49,15 +53,29 @@ impl LocalQueryEngine {
 
     /// Parses, binds, optimizes, and plans a Pipe query for local execution.
     pub async fn prepare(&self, query: &str) -> Result<LocalQuery> {
+        let prepare_started = Instant::now();
+
+        let parse_started = Instant::now();
         let mut parser = parser::Parser::new(query);
         let statement = parser
             .parse_statement()
             .map_err(|error| VeinError::planning(format!("query parse failed: {error}"), None))?;
+        let parse_us = parse_started.elapsed().as_micros() as u64;
+
+        let bind_started = Instant::now();
         let bound = self.binder.bind_with_catalog_revision(&statement).await?;
+        let bind_us = bind_started.elapsed().as_micros() as u64;
+
+        let optimize_started = Instant::now();
         let optimized = self.optimizer.optimize(bound.plan)?;
+        let optimize_us = optimize_started.elapsed().as_micros() as u64;
+
+        let plan_started = Instant::now();
         let request_id = RequestId::new();
         let job = self.planner.create_physical_plan(request_id, optimized)?;
+        let plan_us = plan_started.elapsed().as_micros() as u64;
 
+        let task_started = Instant::now();
         let (request_id, query_id, mode, stage) = job.into_parts();
         let is_write = stage
             .tasks
@@ -75,6 +93,21 @@ impl LocalQueryEngine {
             }
             tasks.push(task.into_execute_task(request_id, query_id, stage_id, mode));
         }
+        let task_build_us = task_started.elapsed().as_micros() as u64;
+
+        tracing::info!(
+            target: "vein.audit",
+            event = "prepare_finished",
+            parse_us,
+            bind_us,
+            optimize_us,
+            plan_us,
+            task_build_us,
+            total_us = prepare_started.elapsed().as_micros() as u64,
+            task_count = tasks.len(),
+            is_write,
+            "prepare_finished"
+        );
 
         Ok(LocalQuery {
             tasks,
@@ -263,7 +296,7 @@ mod tests {
         assert_eq!(receipt.row_count, 1);
 
         let catalog = ParquetCatalog::new(root.path());
-        let metadata = plan::CatalogProvider::get_table(&catalog, "narrowed")
+        let metadata = CatalogProvider::get_table(&catalog, "narrowed")
             .await
             .expect("read projected output metadata");
         assert_eq!(metadata.schema.fields.len(), 1);
@@ -297,7 +330,7 @@ mod tests {
         assert_eq!(receipt.row_count, 2);
 
         let catalog = ParquetCatalog::new(root.path());
-        let metadata = plan::CatalogProvider::get_table(&catalog, "archived")
+        let metadata = CatalogProvider::get_table(&catalog, "archived")
             .await
             .expect("read committed output table");
         assert_eq!(metadata.files.len(), 1);

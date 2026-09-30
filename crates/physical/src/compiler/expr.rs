@@ -7,8 +7,8 @@ use common::protocol::{MicroOp, MicroProgram, RegId, ScalarConstant};
 use common::Result;
 use error::VeinError;
 use parser::ast::expr::BinaryOp;
-use plan::expr::literal::LogicalLiteral;
 use plan::expr::logical::LogicalExpr;
+use plan::LogicalLiteral;
 use plan::schema::VeinSchema;
 
 use super::allocator::RegisterAllocator;

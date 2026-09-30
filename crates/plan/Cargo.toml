@@ -7,7 +7,7 @@ edition = "2024"
 missing_docs = "deny"
 
 [dependencies]
-common = { path = "../common" }
+catalog = { path = "../catalog" }
 error = { path = "../error" }
 parser = { path = "../parser" }
 arrow = { workspace = true }

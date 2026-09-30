@@ -1,0 +1,18 @@
+[package]
+name = "catalog"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+missing_docs = "deny"
+
+[dependencies]
+async-trait = { workspace = true }
+error = { path = "../error" }
+rkyv = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+types = { path = "../types" }
+
+[dev-dependencies]
+tempfile = "3"

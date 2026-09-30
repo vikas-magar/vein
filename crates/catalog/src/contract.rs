@@ -6,7 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use error::Result;
 
-use crate::TableMetadata;
+use crate::metadata::TableMetadata;
+use crate::store::MetadataStore;
 
 /// Opaque revision identifying the metadata view used by a query plan.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -62,6 +63,14 @@ impl PlanningSession {
 pub trait CatalogProvider: Send + Sync {
     /// Looks up a table by name.
     async fn get_table(&self, name: &str) -> Result<Arc<TableMetadata>>;
+
+    /// Returns the process-local store of parsed file metadata this catalog fills.
+    ///
+    /// Execution reads through the same handle so a file's metadata is parsed
+    /// once per process instead of once per component. A catalog that parses no
+    /// file metadata returns an empty store; the method is required so that
+    /// sharing the handle is a deliberate choice rather than a silent omission.
+    fn metadata_store(&self) -> MetadataStore;
 
     /// Returns the metadata revision used for a new planning session.
     async fn catalog_revision(&self) -> Result<CatalogRevision> {

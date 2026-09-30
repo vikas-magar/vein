@@ -4,7 +4,7 @@ use crate::traits::{
 };
 use error::VeinError;
 use parser::parser::Parser;
-use plan::{CatalogProvider, LogicalPlan, ResolvedColumn, TableMetadata, VeinDataType, VeinSchema, Volatility};
+use plan::{CatalogProvider, LogicalPlan, MetadataStore, ResolvedColumn, TableMetadata, VeinDataType, VeinSchema, Volatility};
 use std::collections::HashMap;
 use std::sync::Arc;
 use async_trait::async_trait;
@@ -37,6 +37,10 @@ impl CatalogProvider for TestCatalog {
         self.tables.get(name).cloned().ok_or_else(|| {
             VeinError::not_found(format!("table '{name}' is not registered in test catalog"))
         })
+    }
+
+    fn metadata_store(&self) -> MetadataStore {
+        MetadataStore::new()
     }
 }
 
@@ -166,8 +170,8 @@ pub async fn plan(sql: &str) -> error::Result<LogicalPlan> {
         Arc::new(TestCatalog::with_fixtures()),
         Arc::new(MockFunctionRegistry::new()),
     )
-    .bind(&node)
-    .await
+        .bind(&node)
+        .await
 }
 
 /// Extracts the source span of a parse error, when the variant carries one.
