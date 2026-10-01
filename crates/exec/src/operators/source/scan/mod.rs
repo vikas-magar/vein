@@ -3,8 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::pipeline::{DataChunk, PipelineNode, Source};
+use crate::udf::FunctionRegistry;
 use catalog::MetadataStore;
 use common::protocol::FileFormat;
+use common::protocol::ScanPredicate;
 use common::Result;
 use error::VeinError;
 use opendal::Operator;
@@ -35,7 +37,11 @@ pub struct ScanSource {
     files: Vec<ScanFile>,
     format: FileFormat,
     projected: VeinSchemaRef,
+    /// Predicate the reader evaluates before materializing rows.
+    pushdown: Option<Arc<ScanPredicate>>,
     metadata_store: MetadataStore,
+    /// Function registry the compiled predicate program runs against.
+    registry: Arc<FunctionRegistry>,
     /// Bytes this scan has read from storage, shared with the Parquet reader so
     /// the runtime can report real I/O volume in execution metrics.
     bytes_read: Arc<AtomicU64>,
@@ -48,14 +54,18 @@ impl ScanSource {
         files: Vec<ScanFile>,
         format: FileFormat,
         projected: VeinSchemaRef,
+        pushdown: Option<Arc<ScanPredicate>>,
         metadata_store: MetadataStore,
+        registry: Arc<FunctionRegistry>,
     ) -> Self {
         Self {
             operator,
             files,
             format,
             projected,
+            pushdown,
             metadata_store,
+            registry,
             bytes_read: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -70,7 +80,9 @@ impl Source<DataChunk> for ScanSource {
                     &self.operator,
                     &self.files,
                     &self.projected,
+                    self.pushdown.as_deref(),
                     &self.metadata_store,
+                    &self.registry,
                     &self.bytes_read,
                     next,
                 )
@@ -125,7 +137,9 @@ mod tests {
             files,
             FileFormat::Parquet,
             Arc::new(types::VeinSchema::empty()),
+            None,
             MetadataStore::new(),
+            Arc::new(FunctionRegistry::new()),
         )
     }
 

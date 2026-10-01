@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use common::Result;
 use common::identifiers::TaskId;
-use common::protocol::{DataSource, FileFormat, FileScanTask, MicroProgram};
+use common::protocol::{DataSource, FileFormat, FileScanTask, MicroProgram, ScanPredicate};
 use error::VeinError;
 use plan::schema::VeinSchema;
 use plan::{LogicalExpr, LogicalPlan};
@@ -52,7 +52,8 @@ impl PipelineCompiler {
                 };
                 let scan_schema =
                     Self::projected_scan_schema(schema, projection.as_deref(), filters)?;
-                Self::file_source(files, scan_schema)
+                let pushdown = Self::scan_predicate(filters, schema)?;
+                Self::file_source(files, scan_schema, pushdown)
             }
             LogicalPlan::ExternalScan {
                 url,
@@ -73,7 +74,7 @@ impl PipelineCompiler {
                 } else {
                     files.clone()
                 };
-                Self::file_source(paths, (**schema).clone())
+                Self::file_source(paths, (**schema).clone(), None)
             }
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
@@ -85,7 +86,11 @@ impl PipelineCompiler {
         }
     }
 
-    fn file_source(files: Vec<String>, schema: VeinSchema) -> Result<(DataSource, VeinSchema)> {
+    fn file_source(
+        files: Vec<String>,
+        schema: VeinSchema,
+        pushdown: Option<Arc<ScanPredicate>>,
+    ) -> Result<(DataSource, VeinSchema)> {
         if files.is_empty() {
             return Err(VeinError::planning("Parquet scan has no input files", None));
         }
@@ -98,11 +103,55 @@ impl PipelineCompiler {
                 format: FileFormat::Parquet,
                 byte_range: None,
                 projected,
+                pushdown,
                 task_id: TaskId::new(),
                 catalog_snapshot: None,
             }),
             schema,
         ))
+    }
+
+    /// Compiles the scan's filters into the predicate a source evaluates before
+    /// materializing rows, over only the columns those filters read.
+    ///
+    /// The predicate is compiled against its own narrow input schema — input
+    /// column `i` lands in VM register `i` — so the reader mounts a batch of just
+    /// those columns and never touches the wider projected schema.
+    fn scan_predicate(
+        filters: &[LogicalExpr],
+        schema: &VeinSchema,
+    ) -> Result<Option<Arc<ScanPredicate>>> {
+        if filters.is_empty() {
+            return Ok(None);
+        }
+        let mut required = HashSet::new();
+        for filter in filters {
+            Self::collect_column_ids(filter, &mut required);
+        }
+        let input = VeinSchema {
+            fields: schema
+                .fields
+                .iter()
+                .filter(|field| required.contains(&field.id))
+                .cloned()
+                .collect(),
+        };
+        if input.fields.len() != required.len() {
+            return Err(VeinError::planning(
+                "scan predicate references a column that is absent from the scan schema",
+                None,
+            ));
+        }
+        let register_count = u8::try_from(input.fields.len()).map_err(|_| {
+            VeinError::planning("scan predicate input exceeds VM register capacity", None)
+        })?;
+        let mut compiler = BytecodeCompiler::new(register_count);
+        let result = compiler.compile_predicate(filters, &input)?;
+        Ok(Some(Arc::new(ScanPredicate {
+            input: Arc::new(input),
+            program: Arc::new(compiler.finish()),
+            result,
+        })))
     }
 
     fn projected_scan_schema(

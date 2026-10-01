@@ -1,6 +1,12 @@
 use crate::pipeline::{DataChunk, PipelineNode};
+use crate::udf::FunctionRegistry;
+use crate::vm::VectorVmExecutor;
+use arrow::array::BooleanArray;
+use arrow::error::ArrowError;
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use common::Result;
+use common::protocol::ScanPredicate;
 use error::VeinError;
 use futures::future::BoxFuture;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -8,12 +14,14 @@ use opendal::Operator;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::ParquetMetaData;
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::Arc;
 use types::VeinSchema;
+use types::ResolvedColumnRef;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -21,6 +29,47 @@ use super::ScanFile;
 use catalog::{MetadataKey, MetadataKind, MetadataStore};
 
 const MAX_CONCURRENT_RANGE_READS: usize = 8;
+
+/// Maps `fields` onto their Parquet root column indices, in source order.
+///
+/// Both the output projection and a push-down predicate address columns the same
+/// way, so both go through here: a column the file does not carry, one that is
+/// ambiguous, or a set that is not in source order is a planning bug, not a
+/// partial read.
+fn root_indices(
+    arrow_schema: &arrow::datatypes::Schema,
+    fields: &[ResolvedColumnRef],
+    path: &str,
+) -> Result<Vec<usize>> {
+    let mut root_indices = Vec::with_capacity(fields.len());
+    for field in fields {
+        let mut matches = arrow_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.name() == &field.name);
+        let Some((index, _)) = matches.next() else {
+            return Err(VeinError::internal(format!(
+                "projected Parquet column '{}' is missing from '{}'",
+                field.name, path
+            )));
+        };
+        if matches.next().is_some() {
+            return Err(VeinError::internal(format!(
+                "projected Parquet column '{}' is ambiguous in '{}'",
+                field.name, path
+            )));
+        }
+        root_indices.push(index);
+    }
+    if root_indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(VeinError::internal(format!(
+            "projected columns are not in source schema order for '{}'",
+            path
+        )));
+    }
+    Ok(root_indices)
+}
 
 /// Metadata kind under which this format publishes parsed Parquet footers.
 ///
@@ -205,7 +254,9 @@ pub async fn execute_parquet_scan(
     operator: &Operator,
     files: &[ScanFile],
     projected: &VeinSchema,
+    pushdown: Option<&ScanPredicate>,
     metadata_store: &MetadataStore,
+    registry: &Arc<FunctionRegistry>,
     bytes_read: &Arc<AtomicU64>,
     next: &mut dyn PipelineNode<DataChunk>,
 ) -> Result<()> {
@@ -277,36 +328,42 @@ pub async fn execute_parquet_scan(
         };
 
         if !projected.fields.is_empty() {
-            let arrow_schema = builder.schema();
-            let mut root_indices = Vec::with_capacity(projected.fields.len());
-            for field in &projected.fields {
-                let mut matches = arrow_schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, candidate)| candidate.name() == &field.name);
-                let Some((index, _)) = matches.next() else {
-                    return Err(VeinError::internal(format!(
-                        "projected Parquet column '{}' is missing from '{}'",
-                        field.name, path
-                    )));
-                };
-                if matches.next().is_some() {
-                    return Err(VeinError::internal(format!(
-                        "projected Parquet column '{}' is ambiguous in '{}'",
-                        field.name, path
-                    )));
-                }
-                root_indices.push(index);
-            }
-            if root_indices.windows(2).any(|pair| pair[0] >= pair[1]) {
-                return Err(VeinError::internal(format!(
-                    "projected columns are not in source schema order for '{}'",
-                    path
-                )));
-            }
-            let mask = ProjectionMask::roots(builder.parquet_schema(), root_indices);
+            let mask = ProjectionMask::roots(
+                builder.parquet_schema(),
+                root_indices(builder.schema(), &projected.fields, path)?,
+            );
             builder = builder.with_projection(mask);
+        }
+
+        // The predicate runs before the projected columns are materialized: the
+        // reader decodes only the predicate's own columns, evaluates the compiled
+        // program on them, and then reads the surviving rows' projected columns.
+        if let Some(pushdown) = pushdown {
+            let mask = ProjectionMask::roots(
+                builder.parquet_schema(),
+                root_indices(builder.schema(), &pushdown.input.fields, path)?,
+            );
+            let mut evaluator = VectorVmExecutor::for_evaluation(
+                Arc::clone(&pushdown.program),
+                Arc::clone(registry),
+            );
+            let result = pushdown.result;
+            let predicate = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
+                let mut chunk = DataChunk::from_record_batch(batch);
+                let boolean = evaluator
+                    .evaluate(&mut chunk, result)
+                    .map_err(|error| ArrowError::ComputeError(error.to_string()))?
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .cloned()
+                    .ok_or_else(|| {
+                        ArrowError::ComputeError(
+                            "scan predicate did not evaluate to a boolean column".to_string(),
+                        )
+                    })?;
+                Ok(boolean)
+            });
+            builder = builder.with_row_filter(RowFilter::new(vec![Box::new(predicate)]));
         }
         let metadata_us = metadata_started.elapsed().as_micros() as u64;
         let row_groups = builder.metadata().num_row_groups();

@@ -161,6 +161,36 @@ impl BytecodeCompiler {
         Ok(())
     }
 
+    /// Compiles a conjunction of predicates into one boolean register.
+    ///
+    /// This is the push-down form of [`Self::compile_filter`]: a source can
+    /// evaluate just this prefix over the predicate's own input columns to decide
+    /// which rows to materialize, while the residual program keeps the filters
+    /// themselves.
+    pub fn compile_predicate(
+        &mut self,
+        predicates: &[LogicalExpr],
+        schema: &VeinSchema,
+    ) -> Result<RegId> {
+        let mut combined = None;
+        for predicate in predicates {
+            let reg = self.compile_expr(predicate, schema)?;
+            combined = Some(match combined {
+                None => reg,
+                Some(previous) => {
+                    let dst = self.allocator.allocate()?;
+                    self.instructions.push(MicroOp::And {
+                        dst,
+                        src1: previous,
+                        src2: reg,
+                    });
+                    dst
+                }
+            });
+        }
+        combined.ok_or_else(|| VeinError::planning("scan predicate has no expressions", None))
+    }
+
     /// Compiles a projection list, emitting a [`MicroOp::ProjectRegisters`] instruction.
     pub fn compile_projection(
         &mut self,

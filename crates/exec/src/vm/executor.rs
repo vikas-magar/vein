@@ -5,6 +5,7 @@
 
 use super::ops;
 use super::register::RegisterFile;
+use crate::operators::sink::DiscardSink;
 use crate::pipeline::{DataChunk, PipelineNode, Transform};
 use crate::udf::FunctionRegistry;
 use arrow::array::ArrayRef;
@@ -69,6 +70,22 @@ impl VectorVmExecutor {
     /// Borrows the [`RegisterFile`] holding the most recently executed chunk's registers.
     pub fn registers(&self) -> &RegisterFile {
         &self.registers
+    }
+
+    /// Builds an evaluator with no downstream node.
+    ///
+    /// Sources use this to evaluate a push-down predicate over a batch of the
+    /// predicate's own input columns through the same VM that runs the residual
+    /// pipeline: one predicate implementation, one set of kernels.
+    pub fn for_evaluation(program: Arc<MicroProgram>, registry: Arc<FunctionRegistry>) -> Self {
+        Self::new(program, registry, Box::new(DiscardSink::new()))
+    }
+
+    /// Evaluates the mounted program over `chunk` and returns register `reg`,
+    /// broadcast to the chunk's row count.
+    pub fn evaluate(&mut self, chunk: &mut DataChunk, reg: RegId) -> Result<ArrayRef> {
+        self.eval_chunk(chunk)?;
+        self.registers.to_array(reg)
     }
 }
 

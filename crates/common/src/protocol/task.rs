@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use types::VeinSchemaRef;
 
-use super::ir::MicroProgram;
+use super::ir::{MicroProgram, RegId};
 use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
 
 /// Supported file formats for storage scans.
@@ -18,6 +18,22 @@ pub enum FileFormat {
     Csv,
     /// JavaScript Object Notation
     Json,
+}
+
+/// A predicate a source evaluates before rows are materialized.
+///
+/// Held as compiled Micro-IR rather than a planner expression so an executor can
+/// evaluate it through the same VM that runs the residual pipeline — no planner
+/// and no logical plan are involved on the reading side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanPredicate {
+    /// The predicate's input columns, in register order: input column `i` is
+    /// mounted into VM register `i`.
+    pub input: VeinSchemaRef,
+    /// Program computing the predicate's boolean for one input batch.
+    pub program: Arc<MicroProgram>,
+    /// Register holding the boolean result.
+    pub result: RegId,
 }
 
 /// Self-contained file scan instruction for an Executor.
@@ -34,6 +50,13 @@ pub struct FileScanTask {
     /// Refcounted so splitting one file scan into per-file tasks copies a
     /// handle rather than the schema.
     pub projected: VeinSchemaRef,
+    /// Push-down predicate the source evaluates before materializing rows.
+    ///
+    /// Refcounted for the same reason as `projected`: splitting a scan into
+    /// per-file tasks must not duplicate the predicate. `None` means the source
+    /// returns every projected row and the residual program filters them, so a
+    /// source that ignores this only forgoes an optimization.
+    pub pushdown: Option<Arc<ScanPredicate>>,
     /// Task identifier for reporting.
     pub task_id: TaskId,
     /// Catalog snapshot pinned by the planning session.
