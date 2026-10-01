@@ -415,19 +415,19 @@ mod tests {
     use super::*;
     use crate::expr::logical::LogicalExpr;
     use crate::expr::LogicalLiteral;
-    use crate::schema::{ColumnId, ResolvedColumn, VeinSchema};
+    use crate::schema::{ColumnId, ResolvedColumn, ResolvedColumnRef, VeinSchema};
     use crate::VeinDataType;
     use parser::ast::expr::BinaryOp;
 
-    fn col(id: u64, name: &str) -> ResolvedColumn {
-        ResolvedColumn {
+    fn col(id: u64, name: &str) -> ResolvedColumnRef {
+        std::sync::Arc::new(ResolvedColumn {
             id: ColumnId(id as usize),
             name: name.to_string(),
             qualifier: Some("users".to_string()),
             data_type: VeinDataType::Int64,
             is_factorized: false,
             nullable: false,
-        }
+        })
     }
 
     fn scan_plan() -> LogicalPlan {

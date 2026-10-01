@@ -195,7 +195,7 @@ fn schema_ids(schema: &VeinSchema) -> HashSet<plan::ColumnId> {
     schema.fields.iter().map(|field| field.id).collect()
 }
 
-fn column_for_id(id: &plan::ColumnId, schema: &VeinSchema) -> Option<plan::ResolvedColumn> {
+fn column_for_id(id: &plan::ColumnId, schema: &VeinSchema) -> Option<plan::ResolvedColumnRef> {
     schema.fields.iter().find(|field| field.id == *id).cloned()
 }
 
@@ -203,18 +203,18 @@ fn column_for_id(id: &plan::ColumnId, schema: &VeinSchema) -> Option<plan::Resol
 mod tests {
     use super::*;
     use parser::ast::expr::BinaryOp;
-    use plan::{ColumnId, LogicalLiteral, ResolvedColumn, TableMetadata};
+    use plan::{ColumnId, LogicalLiteral, ResolvedColumn, ResolvedColumnRef, TableMetadata};
 
-    fn field(id: usize, name: &str) -> ResolvedColumn {
-        ResolvedColumn::new(
+    fn field(id: usize, name: &str) -> ResolvedColumnRef {
+        std::sync::Arc::new(ResolvedColumn::new(
             ColumnId(id),
             name,
             Some("t".to_string()),
             plan::VeinDataType::Int64,
-        )
+        ))
     }
 
-    fn scan(fields: Vec<ResolvedColumn>) -> LogicalPlan {
+    fn scan(fields: Vec<ResolvedColumnRef>) -> LogicalPlan {
         let schema = std::sync::Arc::new(VeinSchema {
             fields: fields.clone(),
         });
@@ -226,7 +226,7 @@ mod tests {
         }
     }
 
-    fn column(field: &ResolvedColumn) -> LogicalExpr {
+    fn column(field: &ResolvedColumnRef) -> LogicalExpr {
         LogicalExpr::Column(field.clone())
     }
 
@@ -239,7 +239,11 @@ mod tests {
         }
     }
 
-    fn join(left: &ResolvedColumn, right: &ResolvedColumn, join_type: JoinType) -> LogicalPlan {
+    fn join(
+        left: &ResolvedColumnRef,
+        right: &ResolvedColumnRef,
+        join_type: JoinType,
+    ) -> LogicalPlan {
         let left_plan = scan(vec![left.clone()]);
         let right_plan = scan(vec![right.clone()]);
         LogicalPlan::Join {
@@ -288,7 +292,7 @@ mod tests {
         );
     }
 
-    fn right_field() -> ResolvedColumn {
+    fn right_field() -> ResolvedColumnRef {
         field(2, "b_id")
     }
 

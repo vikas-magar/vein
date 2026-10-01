@@ -185,14 +185,14 @@ mod tests {
     }
 
     fn bool_column(id: usize, name: &str) -> LogicalExpr {
-        LogicalExpr::Column(ResolvedColumn {
+        LogicalExpr::Column(std::sync::Arc::new(ResolvedColumn {
             id: ColumnId(id),
             name: name.to_string(),
             qualifier: None,
             data_type: VeinDataType::Boolean,
             is_factorized: false,
             nullable: true,
-        })
+        }))
     }
 
     fn and(left: LogicalExpr, right: LogicalExpr) -> LogicalExpr {

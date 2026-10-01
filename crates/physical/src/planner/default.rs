@@ -93,8 +93,18 @@ mod tests {
 
     fn mock_scan_plan() -> LogicalPlan {
         let schema = Box::new(VeinSchema::new(vec![
-            ResolvedColumn::new(ColumnId(0), "id", None, VeinDataType::Int64),
-            ResolvedColumn::new(ColumnId(1), "name", None, VeinDataType::Utf8),
+            std::sync::Arc::new(ResolvedColumn::new(
+                ColumnId(0),
+                "id",
+                None,
+                VeinDataType::Int64,
+            )),
+            std::sync::Arc::new(ResolvedColumn::new(
+                ColumnId(1),
+                "name",
+                None,
+                VeinDataType::Utf8,
+            )),
         ]));
         let table = std::sync::Arc::new(
             plan::TableMetadata::new("users", std::sync::Arc::new(*schema.clone()))

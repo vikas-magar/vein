@@ -6,7 +6,7 @@ use crate::star::expand_projection_items;
 use crate::window::{expr_contains_window_call, split_window_items, wrap_window};
 use plan::LogicalPlan;
 use plan::PlanTraversal;
-use plan::{LogicalExpr, ResolvedColumn, VeinDataType, VeinSchema};
+use plan::{LogicalExpr, ResolvedColumn, ResolvedColumnRef, VeinDataType, VeinSchema};
 use error::{Result, VeinError};
 use parser::ast::expr::{BinaryOp, SpannedExpr};
 use parser::ast::pipe_op::{AggregateExpr, JoinClause, SelectItem};
@@ -92,12 +92,12 @@ pub async fn bind_select<'a>(
     let mut bound_exprs = Vec::with_capacity(plain_items.len());
     let mut new_fields = Vec::with_capacity(plain_items.len());
     for (expr, name) in plain_items {
-        new_fields.push(ResolvedColumn::new(
+        new_fields.push(std::sync::Arc::new(ResolvedColumn::new(
             context.next_id(),
             name.unwrap_or_else(|| "_col".to_string()),
             None,
             expr.data_type(),
-        ));
+        )));
         bound_exprs.push(expr);
     }
 
@@ -120,7 +120,7 @@ pub async fn bind_aggregate<'a>(
     scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
     let mut bound_group_by = Vec::new();
-    let mut new_fields = Vec::new();
+    let mut new_fields: Vec<ResolvedColumnRef> = Vec::new();
 
     for gb in group_by {
         let bound_expr = ExprBinder::new(context, scopes).bind(&gb.expr).await?;
@@ -133,12 +133,12 @@ pub async fn bind_aggregate<'a>(
             ));
         }
         let name = derive_column_name(&gb.expr.node);
-        new_fields.push(ResolvedColumn::new(
+        new_fields.push(std::sync::Arc::new(ResolvedColumn::new(
             context.next_id(),
             name,
             None,
             bound_expr.data_type(),
-        ));
+        )));
         bound_group_by.push(bound_expr);
     }
 
@@ -156,12 +156,12 @@ pub async fn bind_aggregate<'a>(
             .map(|a| a.to_string())
             .unwrap_or_else(|| derive_column_name(&agg.expr.node));
 
-        new_fields.push(ResolvedColumn::new(
+        new_fields.push(std::sync::Arc::new(ResolvedColumn::new(
             context.next_id(),
             col_name,
             None,
             bound_expr.data_type(),
-        ));
+        )));
         bound_aggs.push(bound_expr);
     }
 

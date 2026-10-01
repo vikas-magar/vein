@@ -7,18 +7,21 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema};
 use serde::{Deserialize, Serialize};
 
-use crate::column::{ColumnId, ResolvedColumn};
+use crate::column::{ColumnId, ResolvedColumn, ResolvedColumnRef};
 
 /// Query schema representing an ordered sequence of resolved columns.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VeinSchema {
     /// The fields making up this schema.
-    pub fields: Vec<ResolvedColumn>,
+    ///
+    /// Columns are reference-counted, so duplicating a schema copies pointers
+    /// rather than names and type trees.
+    pub fields: Vec<ResolvedColumnRef>,
 }
 
 impl VeinSchema {
     /// Creates a new [`VeinSchema`] from a vector of resolved columns.
-    pub fn new(fields: Vec<ResolvedColumn>) -> Self {
+    pub fn new(fields: Vec<ResolvedColumnRef>) -> Self {
         Self { fields }
     }
 
@@ -38,7 +41,7 @@ impl VeinSchema {
     }
 
     /// Returns a reference to the column with the given name, if present.
-    pub fn field_by_name(&self, name: &str) -> Option<&ResolvedColumn> {
+    pub fn field_by_name(&self, name: &str) -> Option<&ResolvedColumnRef> {
         self.fields.iter().find(|field| field.name == name)
     }
 
@@ -60,13 +63,13 @@ impl From<&Schema> for VeinSchema {
             .iter()
             .enumerate()
             .map(|(i, f)| {
-                ResolvedColumn::new(
+                Arc::new(ResolvedColumn::new(
                     ColumnId(i),
                     f.name().clone(),
                     None,
                     f.data_type().into(),
                 )
-                .with_nullable(f.is_nullable())
+                .with_nullable(f.is_nullable()))
             })
             .collect();
         Self { fields }
@@ -102,8 +105,11 @@ mod tests {
     #[test]
     fn test_schema_arrow_roundtrip() {
         let schema = VeinSchema::new(vec![
-            ResolvedColumn::new(ColumnId(0), "id", None, VeinDataType::Int64),
-            ResolvedColumn::new(ColumnId(1), "name", None, VeinDataType::Utf8).with_nullable(true),
+            Arc::new(ResolvedColumn::new(ColumnId(0), "id", None, VeinDataType::Int64)),
+            Arc::new(
+                ResolvedColumn::new(ColumnId(1), "name", None, VeinDataType::Utf8)
+                    .with_nullable(true),
+            ),
         ]);
 
         let arrow_schema: Schema = (&schema).into();

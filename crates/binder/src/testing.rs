@@ -25,7 +25,12 @@ impl TestCatalog {
 
     fn add_table(&mut self, name: &str, columns: &[(&str, VeinDataType)]) {
         let schema = VeinSchema::new(columns.iter().enumerate().map(|(id, (column, data_type))| {
-            ResolvedColumn::new(plan::ColumnId(id), *column, Some(name.to_owned()), data_type.clone())
+            std::sync::Arc::new(ResolvedColumn::new(
+                plan::ColumnId(id),
+                *column,
+                Some(name.to_owned()),
+                data_type.clone(),
+            ))
         }).collect());
         self.tables.insert(name.to_owned(), Arc::new(TableMetadata::new(name, Arc::new(schema))));
     }

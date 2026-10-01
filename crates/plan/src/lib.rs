@@ -29,4 +29,6 @@ pub use ::catalog::{
 pub use expr::{LogicalExpr, LogicalLiteral, Volatility};
 pub use plan::display;
 pub use plan::{LogicalPlan, PlanTraversal, SortKey, WindowExpr};
-pub use schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema, VeinSchemaRef};
+pub use schema::{
+    ColumnId, ResolvedColumn, ResolvedColumnRef, VeinDataType, VeinSchema, VeinSchemaRef,
+};

@@ -192,8 +192,18 @@ mod tests {
 
     fn test_schema() -> VeinSchema {
         VeinSchema::new(vec![
-            ResolvedColumn::new(ColumnId(1), "age", None, VeinDataType::Int64),
-            ResolvedColumn::new(ColumnId(2), "salary", None, VeinDataType::Int64),
+            std::sync::Arc::new(ResolvedColumn::new(
+                ColumnId(1),
+                "age",
+                None,
+                VeinDataType::Int64,
+            )),
+            std::sync::Arc::new(ResolvedColumn::new(
+                ColumnId(2),
+                "salary",
+                None,
+                VeinDataType::Int64,
+            )),
         ])
     }
 
@@ -203,12 +213,12 @@ mod tests {
         let mut compiler = BytecodeCompiler::new(2);
 
         // Filter: age > 30 AND salary > 50000
-        let age_col = LogicalExpr::Column(ResolvedColumn::new(
+        let age_col = LogicalExpr::Column(std::sync::Arc::new(ResolvedColumn::new(
             ColumnId(1),
             "age",
             None,
             VeinDataType::Int64,
-        ));
+        )));
         let age_lit = LogicalExpr::Literal(LogicalLiteral::Int64(30));
         let age_cmp = LogicalExpr::BinaryOp {
             left: Box::new(age_col),
@@ -244,12 +254,12 @@ mod tests {
         let mut compiler = BytecodeCompiler::new(2);
 
         let cast = LogicalExpr::Cast {
-            expr: Box::new(LogicalExpr::Column(ResolvedColumn::new(
+            expr: Box::new(LogicalExpr::Column(std::sync::Arc::new(ResolvedColumn::new(
                 ColumnId(1),
                 "age",
                 None,
                 VeinDataType::Int64,
-            ))),
+            )))),
             target_type: VeinDataType::Float64,
         };
 

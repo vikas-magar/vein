@@ -172,13 +172,13 @@ fn compare(left: &LogicalLiteral, right: &LogicalLiteral) -> Option<Ordering> {
 mod tests {
     use super::*;
     use plan::{
-        ColumnId, ColumnStatistics, ResolvedColumn, TableMetadata, TableStatistics, VeinDataType,
-        VeinSchema,
+        ColumnId, ColumnStatistics, ResolvedColumn, ResolvedColumnRef, TableMetadata,
+        TableStatistics, VeinDataType, VeinSchema,
     };
     use std::sync::Arc;
 
-    fn scan_with_stats() -> (LogicalPlan, ResolvedColumn) {
-        let column = ResolvedColumn::new(ColumnId(1), "id", None, VeinDataType::Int64);
+    fn scan_with_stats() -> (LogicalPlan, ResolvedColumnRef) {
+        let column = Arc::new(ResolvedColumn::new(ColumnId(1), "id", None, VeinDataType::Int64));
         let schema = VeinSchema {
             fields: vec![column.clone()],
         };
@@ -205,7 +205,7 @@ mod tests {
         )
     }
 
-    fn predicate(column: &ResolvedColumn, op: BinaryOp, value: i64) -> LogicalExpr {
+    fn predicate(column: &ResolvedColumnRef, op: BinaryOp, value: i64) -> LogicalExpr {
         LogicalExpr::BinaryOp {
             left: Box::new(LogicalExpr::Column(column.clone())),
             op,

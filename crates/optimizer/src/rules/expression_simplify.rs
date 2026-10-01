@@ -328,25 +328,25 @@ mod tests {
     use plan::{ColumnId, ResolvedColumn};
 
     fn int_column() -> LogicalExpr {
-        LogicalExpr::Column(ResolvedColumn {
+        LogicalExpr::Column(std::sync::Arc::new(ResolvedColumn {
             id: ColumnId(1),
             name: "id".to_string(),
             qualifier: None,
             data_type: VeinDataType::Int64,
             is_factorized: false,
             nullable: true,
-        })
+        }))
     }
 
     fn bool_column() -> LogicalExpr {
-        LogicalExpr::Column(ResolvedColumn {
+        LogicalExpr::Column(std::sync::Arc::new(ResolvedColumn {
             id: ColumnId(2),
             name: "active".to_string(),
             qualifier: None,
             data_type: VeinDataType::Boolean,
             is_factorized: false,
             nullable: true,
-        })
+        }))
     }
 
     fn binary(

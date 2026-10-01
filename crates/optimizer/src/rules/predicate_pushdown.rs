@@ -172,7 +172,7 @@ fn push_through_inner_join(
     left: &LogicalPlan,
     right: &LogicalPlan,
     on: &Option<LogicalExpr>,
-    using: &[plan::ResolvedColumn],
+    using: &[plan::ResolvedColumnRef],
     schema: &VeinSchema,
     predicate: &LogicalExpr,
 ) -> Option<LogicalPlan> {
@@ -267,13 +267,18 @@ fn schema_ids(schema: &VeinSchema) -> HashSet<plan::ColumnId> {
 mod tests {
     use super::*;
     use parser::ast::expr::BinaryOp;
-    use plan::{ColumnId, LogicalLiteral, ResolvedColumn, TableMetadata};
+    use plan::{ColumnId, LogicalLiteral, ResolvedColumn, ResolvedColumnRef, TableMetadata};
 
-    fn field(id: usize, name: &str, data_type: plan::VeinDataType) -> ResolvedColumn {
-        ResolvedColumn::new(ColumnId(id), name, Some("t".to_string()), data_type)
+    fn field(id: usize, name: &str, data_type: plan::VeinDataType) -> ResolvedColumnRef {
+        std::sync::Arc::new(ResolvedColumn::new(
+            ColumnId(id),
+            name,
+            Some("t".to_string()),
+            data_type,
+        ))
     }
 
-    fn scan(fields: Vec<ResolvedColumn>) -> LogicalPlan {
+    fn scan(fields: Vec<ResolvedColumnRef>) -> LogicalPlan {
         let schema = std::sync::Arc::new(VeinSchema {
             fields: fields.clone(),
         });
@@ -285,11 +290,11 @@ mod tests {
         }
     }
 
-    fn column(field: &ResolvedColumn) -> LogicalExpr {
+    fn column(field: &ResolvedColumnRef) -> LogicalExpr {
         LogicalExpr::Column(field.clone())
     }
 
-    fn bool_predicate(field: &ResolvedColumn) -> LogicalExpr {
+    fn bool_predicate(field: &ResolvedColumnRef) -> LogicalExpr {
         LogicalExpr::BinaryOp {
             left: Box::new(column(field)),
             op: BinaryOp::Gt,

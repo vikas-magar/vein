@@ -321,11 +321,13 @@ mod tests {
         StorageTarget::new(
             "events",
             options,
-            Arc::new(plan::VeinSchema::new(vec![plan::ResolvedColumn::new(
-                plan::ColumnId(0),
-                "id",
-                None,
-                plan::VeinDataType::Int64,
+            Arc::new(plan::VeinSchema::new(vec![Arc::new(
+                plan::ResolvedColumn::new(
+                    plan::ColumnId(0),
+                    "id",
+                    None,
+                    plan::VeinDataType::Int64,
+                ),
             )])),
         )
         .with_schema_ipc(schema_ipc)

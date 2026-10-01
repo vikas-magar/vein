@@ -513,15 +513,15 @@ fn collect_columns(expr: &LogicalExpr, output: &mut RequiredColumns) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plan::{ColumnId, ResolvedColumn, TableMetadata, VeinDataType};
+    use plan::{ColumnId, ResolvedColumn, ResolvedColumnRef, TableMetadata, VeinDataType};
 
-    fn field(id: usize, name: &str) -> ResolvedColumn {
-        ResolvedColumn::new(
+    fn field(id: usize, name: &str) -> ResolvedColumnRef {
+        std::sync::Arc::new(ResolvedColumn::new(
             ColumnId(id),
             name,
             Some("t".to_string()),
             VeinDataType::Int64,
-        )
+        ))
     }
 
     fn scan() -> LogicalPlan {

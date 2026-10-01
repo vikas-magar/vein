@@ -2,6 +2,7 @@
 
 use crate::data_type::VeinDataType;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Query-local, monotonically assigned column identity.
 /// Stable across optimizer rewrites (pushdown/reordering never invalidates ids).
@@ -87,4 +88,32 @@ impl ResolvedColumn {
             None => self.name.clone(),
         }
     }
+
+    /// Derives a new shared column with the given identity and name.
+    ///
+    /// Columns are immutable once visible, so renaming or requalifying produces
+    /// a new column rather than mutating a shared one. The data type and flags
+    /// carry over without copying.
+    pub fn derived(
+        &self,
+        id: ColumnId,
+        name: impl Into<String>,
+        qualifier: Option<String>,
+    ) -> ResolvedColumnRef {
+        Arc::new(ResolvedColumn {
+            id,
+            name: name.into(),
+            qualifier,
+            data_type: self.data_type.clone(),
+            is_factorized: self.is_factorized,
+            nullable: self.nullable,
+        })
+    }
 }
+
+/// A reference-counted column.
+///
+/// The only way a column travels: cloning is one atomic increment, so a schema,
+/// a plan node, or a column reference inside an expression costs a pointer
+/// rather than a name and a type tree.
+pub type ResolvedColumnRef = Arc<ResolvedColumn>;

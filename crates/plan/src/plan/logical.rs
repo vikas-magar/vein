@@ -1,6 +1,6 @@
 use super::types::SortKey;
 use crate::expr::logical::LogicalExpr;
-use crate::schema::{ColumnId, ResolvedColumn, VeinSchema};
+use crate::schema::{ColumnId, ResolvedColumnRef, VeinSchema};
 use parser::ast::pipe_op::JoinType;
 use parser::ast::query::SetOpKind;
 
@@ -11,7 +11,7 @@ pub struct WindowExpr {
     /// The bound window function call (`fn(args) OVER (...)`).
     pub call: LogicalExpr,
     /// The output column holding this window expression's result.
-    pub output_column: ResolvedColumn,
+    pub output_column: ResolvedColumnRef,
 }
 
 /// A node in the logical query plan tree
@@ -103,7 +103,7 @@ pub enum LogicalPlan {
         /// The join predicate (`None` for a CROSS join).
         on: Option<LogicalExpr>,
         /// The `USING` columns, kept for schema de-duplication and display.
-        using: Vec<ResolvedColumn>,
+        using: Vec<ResolvedColumnRef>,
         /// The resulting schema (left ++ right; `USING` merges the join column).
         schema: Box<VeinSchema>,
     },
@@ -199,7 +199,7 @@ pub enum LogicalPlan {
         /// The optional output alias for the pivoted column(s).
         alias: Option<String>,
         /// The column whose distinct values become new columns.
-        value_column: ResolvedColumn,
+        value_column: ResolvedColumnRef,
         /// The explicit pivot values.
         values: Vec<LogicalExpr>,
         /// The resulting schema.
@@ -214,7 +214,7 @@ pub enum LogicalPlan {
         /// The generated name column name.
         name_name: String,
         /// The columns to unpivot.
-        columns: Vec<ResolvedColumn>,
+        columns: Vec<ResolvedColumnRef>,
         /// Whether nulls are retained (`ALL`).
         include_nulls: bool,
         /// The resulting schema.
@@ -243,7 +243,7 @@ pub enum LogicalPlan {
         /// The natural language predicate
         predicate: String,
         /// The target features passed to the LLM
-        targets: Vec<ResolvedColumn>,
+        targets: Vec<ResolvedColumnRef>,
         /// The conformal prediction confidence bound
         alpha: f64,
         /// The resulting schema
@@ -258,9 +258,9 @@ pub enum LogicalPlan {
         /// The natural language join condition
         condition: String,
         /// The bounding equi-join condition to prevent Cartesian explosion
-        bounding_equi: Vec<(ResolvedColumn, ResolvedColumn)>,
+        bounding_equi: Vec<(ResolvedColumnRef, ResolvedColumnRef)>,
         /// The dependent columns passed to the LLM
-        depends_on: (Vec<ResolvedColumn>, Vec<ResolvedColumn>),
+        depends_on: (Vec<ResolvedColumnRef>, Vec<ResolvedColumnRef>),
         /// The conformal prediction confidence bound
         alpha: f64,
         /// The resulting schema
@@ -271,9 +271,9 @@ pub enum LogicalPlan {
         /// The input plan containing features and ground truth labels
         input: Box<LogicalPlan>,
         /// The target features used by the reference model
-        target_features: Vec<ResolvedColumn>,
+        target_features: Vec<ResolvedColumnRef>,
         /// The ground truth label column
-        ground_truth_label: ResolvedColumn,
+        ground_truth_label: ResolvedColumnRef,
         /// The target alpha level
         alpha: f64,
         /// The resulting schema

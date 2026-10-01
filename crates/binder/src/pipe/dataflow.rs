@@ -44,9 +44,9 @@ pub async fn bind_set_op<'a>(
     for (lf, rf) in left_fields.iter().zip(right_fields.iter()) {
         match unify_types(&lf.data_type, &rf.data_type) {
             Ok(common) => {
-                let mut col = lf.clone();
+                let mut col = lf.as_ref().clone();
                 col.data_type = common;
-                fields.push(col);
+                fields.push(std::sync::Arc::new(col));
             }
             Err(e) => {
                 return Err(VeinError::semantic(

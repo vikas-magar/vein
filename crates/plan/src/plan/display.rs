@@ -7,7 +7,7 @@
 use crate::expr::LogicalExpr;
 use crate::plan::logical::{LogicalPlan, WindowExpr};
 use crate::plan::traversal::PlanTraversal;
-use crate::schema::{ResolvedColumn, VeinDataType};
+use crate::schema::{ResolvedColumn, ResolvedColumnRef, VeinDataType};
 use parser::ast::expr::BinaryOp;
 use parser::ast::pipe_op::{WindowFrame, WindowFrameBound, WindowFrameKind};
 use std::cell::Cell;
@@ -186,7 +186,7 @@ fn format_expr_inner(expr: &LogicalExpr) -> String {
 }
 
 /// Renders a schema as `[name:Type, ...]`.
-pub fn format_schema(fields: &[ResolvedColumn]) -> String {
+pub fn format_schema(fields: &[ResolvedColumnRef]) -> String {
     let cols = fields
         .iter()
         .map(|f| format!("{}:{}", f.name, type_str(&f.data_type)))
@@ -603,15 +603,15 @@ mod tests {
     use crate::{ColumnId, ResolvedColumn};
     use crate::VeinDataType;
 
-    fn col(id: u64, name: &str) -> ResolvedColumn {
-        ResolvedColumn {
+    fn col(id: u64, name: &str) -> ResolvedColumnRef {
+        std::sync::Arc::new(ResolvedColumn {
             id: ColumnId(id as usize),
             name: name.to_string(),
             qualifier: Some("users".to_string()),
             data_type: VeinDataType::Int64,
             is_factorized: false,
             nullable: false,
-        }
+        })
     }
 
     fn scan_plan() -> LogicalPlan {
@@ -730,15 +730,15 @@ mod coverage {
     use parser::ast::pipe_op::JoinType;
     use parser::ast::query::SetOpKind;
 
-    fn col(id: u64, name: &str) -> ResolvedColumn {
-        ResolvedColumn {
+    fn col(id: u64, name: &str) -> ResolvedColumnRef {
+        std::sync::Arc::new(ResolvedColumn {
             id: ColumnId(id as usize),
             name: name.to_string(),
             qualifier: Some("users".to_string()),
             data_type: VeinDataType::Int64,
             is_factorized: false,
             nullable: false,
-        }
+        })
     }
 
     fn lit(v: i64) -> LogicalExpr {
@@ -757,7 +757,7 @@ mod coverage {
         }
     }
 
-    fn schema(cols: Vec<ResolvedColumn>) -> Box<crate::VeinSchema> {
+    fn schema(cols: Vec<ResolvedColumnRef>) -> Box<crate::VeinSchema> {
         Box::new(crate::VeinSchema { fields: cols })
     }
 

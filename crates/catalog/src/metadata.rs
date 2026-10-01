@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use types::{LogicalLiteral, ResolvedColumn, VeinSchemaRef};
+use types::{LogicalLiteral, ResolvedColumnRef, VeinSchemaRef};
 
 use crate::snapshot::CatalogSnapshotToken;
 
@@ -121,7 +121,7 @@ pub struct TableStatistics {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ColumnSortKey {
     /// The sorted column.
-    pub column: ResolvedColumn,
+    pub column: ResolvedColumnRef,
     /// Whether the column is sorted ascending (`true`) or descending (`false`).
     pub ascending: bool,
     /// Whether nulls sort before (`true`) or after (`false`) the non-null values.

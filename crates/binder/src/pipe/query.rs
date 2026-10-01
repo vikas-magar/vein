@@ -119,11 +119,7 @@ pub async fn bind_source<'a>(
                     .schema()
                     .fields
                     .iter()
-                    .map(|f| {
-                        let mut b = f.clone();
-                        b.qualifier = alias.map(|a| a.to_string());
-                        b
-                    })
+                    .map(|f| f.derived(f.id, f.name.as_str(), alias.map(|a| a.to_string())))
                     .collect::<Vec<_>>();
                 let plan = LogicalPlan::SubqueryAlias {
                     input: cte.clone(),
@@ -143,12 +139,13 @@ pub async fn bind_source<'a>(
 
             let mut columns = Vec::new();
             for field in &table.schema.fields {
-                let mut bound_field = field.clone();
-                bound_field.id = context.next_id();
-                bound_field.qualifier = alias
-                    .map(|a| a.to_string())
-                    .or_else(|| Some(name.to_string()));
-                columns.push(bound_field);
+                columns.push(field.derived(
+                    context.next_id(),
+                    field.name.as_str(),
+                    alias
+                        .map(|a| a.to_string())
+                        .or_else(|| Some(name.to_string())),
+                ));
             }
 
             let qualifier = alias
@@ -174,10 +171,11 @@ pub async fn bind_source<'a>(
             // then expose them under the subquery's alias.
             let mut fields = Vec::with_capacity(inner.schema().fields.len());
             for field in &inner.schema().fields {
-                let mut bound = field.clone();
-                bound.id = context.next_id();
-                bound.qualifier = alias.map(|a| a.to_string());
-                fields.push(bound);
+                fields.push(field.derived(
+                    context.next_id(),
+                    field.name.as_str(),
+                    alias.map(|a| a.to_string()),
+                ));
             }
 
             let qualifier = alias.map(|a| a.to_string()).unwrap_or_default();
@@ -225,12 +223,12 @@ pub async fn bind_source<'a>(
 
             let mut columns = Vec::with_capacity(schema.fields.len());
             for field in &schema.fields {
-                let mut bound_field = field.clone();
+                let mut bound_field = field.as_ref().clone();
                 bound_field.id = context.next_id();
                 bound_field.qualifier = alias
                     .map(|a| a.to_string())
                     .or_else(|| Some(url.to_string()));
-                columns.push(bound_field);
+                columns.push(std::sync::Arc::new(bound_field));
             }
 
             let qualifier = alias

@@ -12,7 +12,7 @@ pub mod literal;
 /// Schemas and column layouts.
 pub mod schema;
 
-pub use column::{ColumnId, ResolvedColumn};
+pub use column::{ColumnId, ResolvedColumn, ResolvedColumnRef};
 pub use data_type::VeinDataType;
 pub use literal::LogicalLiteral;
 pub use schema::{VeinSchema, VeinSchemaRef};

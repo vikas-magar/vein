@@ -1,7 +1,7 @@
 use crate::expr::LogicalLiteral;
 use crate::plan::LogicalPlan;
 use crate::plan::types::SortKey;
-use crate::schema::{ResolvedColumn, VeinDataType};
+use crate::schema::{ResolvedColumnRef, VeinDataType};
 use parser::ast::expr::BinaryOp;
 use parser::ast::pipe_op::WindowFrame;
 
@@ -10,9 +10,9 @@ use parser::ast::pipe_op::WindowFrame;
 pub enum LogicalExpr {
     // ── Atoms ─────────────────────────────────────────────
     /// A reference to a column in the current scope
-    Column(ResolvedColumn),
+    Column(ResolvedColumnRef),
     /// A reference to a column in an outer scope (Correlated subquery)
-    OuterColumn(ResolvedColumn),
+    OuterColumn(ResolvedColumnRef),
     /// A literal value
     Literal(LogicalLiteral),
 
@@ -166,11 +166,11 @@ pub enum LogicalExpr {
     /// A lambda expression for higher-order functions
     Lambda {
         /// The parameters bound by the lambda
-        params: Vec<ResolvedColumn>,
+        params: Vec<ResolvedColumnRef>,
         /// The body of the lambda
         body: Box<LogicalExpr>,
         /// The variables captured from the outer scope
-        captures: Vec<ResolvedColumn>,
+        captures: Vec<ResolvedColumnRef>,
     },
 
     // ── Subqueries ────────────────────────────────────────

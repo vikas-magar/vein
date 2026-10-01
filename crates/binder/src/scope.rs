@@ -1,4 +1,4 @@
-use plan::ResolvedColumn;
+use plan::ResolvedColumnRef;
 use error::VeinError;
 
 /// A single lexical scope containing available columns plus the alias names
@@ -6,7 +6,7 @@ use error::VeinError;
 #[derive(Clone)]
 pub struct Scope {
     /// Columns available in this scope
-    pub columns: Vec<ResolvedColumn>,
+    pub columns: Vec<ResolvedColumnRef>,
     /// Alias names this scope resolves under (`AS`-derived qualifiers).
     /// An empty list makes every qualified reference miss (SELECT output).
     pub aliases: Vec<String>,
@@ -15,7 +15,7 @@ pub struct Scope {
 impl Scope {
     /// Creates a scope that only answers to unqualified references
     /// (SELECT/EXTEND/AGGREGATE output columns lose their table qualifiers).
-    pub fn unqualified(columns: Vec<ResolvedColumn>) -> Self {
+    pub fn unqualified(columns: Vec<ResolvedColumnRef>) -> Self {
         Self {
             columns,
             aliases: Vec::new(),
@@ -97,7 +97,7 @@ impl ScopeStack {
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Result<(ResolvedColumn, bool), VeinError> {
+    ) -> Result<(ResolvedColumnRef, bool), VeinError> {
         for (correlated, scopes) in
             [(false, &self.scopes[..]), (true, &self.correlation_scopes[..])]
         {
@@ -178,7 +178,7 @@ impl ScopeStack {
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Result<ResolvedColumn, VeinError> {
+    ) -> Result<ResolvedColumnRef, VeinError> {
         self.resolve_correlated(qualifier, name).map(|(col, _)| col)
     }
 }

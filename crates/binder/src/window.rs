@@ -141,6 +141,7 @@ fn lift_window_calls(
                 None,
                 return_type.clone(),
             );
+            let output_column = std::sync::Arc::new(output_column);
             window_exprs.push(WindowExpr {
                 call: mapped.clone(),
                 output_column: output_column.clone(),
@@ -216,12 +217,12 @@ mod tests {
     }
 
     fn col(id: usize) -> LogicalExpr {
-        LogicalExpr::Column(ResolvedColumn::new(
+        LogicalExpr::Column(std::sync::Arc::new(ResolvedColumn::new(
             ColumnId(id),
             format!("c{id}"),
             None,
             VeinDataType::Int64,
-        ))
+        )))
     }
 
     #[test]

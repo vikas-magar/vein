@@ -76,15 +76,15 @@ mod tests {
     use super::*;
     use parser::ast::expr::BinaryOp;
     use plan::{
-        ColumnId, LogicalExpr, LogicalLiteral, ResolvedColumn, TableMetadata, VeinDataType,
-        VeinSchema,
+        ColumnId, LogicalExpr, LogicalLiteral, ResolvedColumn, ResolvedColumnRef, TableMetadata,
+        VeinDataType, VeinSchema,
     };
 
-    fn field(id: usize, name: &str) -> ResolvedColumn {
-        ResolvedColumn::new(ColumnId(id), name, None, VeinDataType::Int64)
+    fn field(id: usize, name: &str) -> ResolvedColumnRef {
+        std::sync::Arc::new(ResolvedColumn::new(ColumnId(id), name, None, VeinDataType::Int64))
     }
 
-    fn scan(field: ResolvedColumn) -> LogicalPlan {
+    fn scan(field: ResolvedColumnRef) -> LogicalPlan {
         let schema = VeinSchema {
             fields: vec![field.clone()],
         };
@@ -99,7 +99,7 @@ mod tests {
         }
     }
 
-    fn predicate(field: &ResolvedColumn) -> LogicalExpr {
+    fn predicate(field: &ResolvedColumnRef) -> LogicalExpr {
         LogicalExpr::BinaryOp {
             left: Box::new(LogicalExpr::Column(field.clone())),
             op: BinaryOp::Gt,
