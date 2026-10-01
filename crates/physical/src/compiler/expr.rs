@@ -3,34 +3,14 @@
 //! Lowers arbitrary [`LogicalExpr`] AST trees into a linear sequence of [`MicroOp`]
 //! virtual machine instructions using a [`RegisterAllocator`].
 
-use common::protocol::{MicroOp, MicroProgram, RegId, ScalarConstant};
+use common::protocol::{MicroOp, MicroProgram, RegId};
 use common::Result;
 use error::VeinError;
 use parser::ast::expr::BinaryOp;
 use plan::expr::logical::LogicalExpr;
-use plan::LogicalLiteral;
 use plan::schema::VeinSchema;
 
 use super::allocator::RegisterAllocator;
-
-/// Converts a planning [`LogicalLiteral`] into a wire [`ScalarConstant`].
-pub fn literal_to_constant(literal: &LogicalLiteral) -> Result<ScalarConstant> {
-    match literal {
-        LogicalLiteral::Null(_) => Ok(ScalarConstant::Null),
-        LogicalLiteral::Boolean(b) => Ok(ScalarConstant::Boolean(*b)),
-        LogicalLiteral::Int64(i) => Ok(ScalarConstant::Int64(*i)),
-        LogicalLiteral::Float64(f) => Ok(ScalarConstant::Float64(*f)),
-        LogicalLiteral::String(s) => Ok(ScalarConstant::Utf8(s.clone())),
-        LogicalLiteral::Date(d) => Ok(ScalarConstant::Int32(*d)),
-        LogicalLiteral::Timestamp(ts) => Ok(ScalarConstant::Int64(*ts)),
-        LogicalLiteral::Time(t) => Ok(ScalarConstant::Int64(*t)),
-        LogicalLiteral::Vector(v) => Ok(ScalarConstant::Vector(v.clone())),
-        other => Err(VeinError::planning(
-            format!("Literal type not yet supported in scalar constant: {other:?}"),
-            None,
-        )),
-    }
-}
 
 /// Recursive AST-to-bytecode compiler.
 pub struct BytecodeCompiler {
@@ -83,10 +63,9 @@ impl BytecodeCompiler {
             }
             LogicalExpr::Literal(lit) => {
                 let dst = self.allocator.allocate()?;
-                let val = literal_to_constant(lit)?;
                 self.instructions.push(MicroOp::LoadConstant {
                     dst,
-                    value: val,
+                    value: lit.clone(),
                 });
                 Ok(dst)
             }
@@ -208,6 +187,7 @@ impl BytecodeCompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plan::LogicalLiteral;
     use plan::schema::{ColumnId, ResolvedColumn, VeinDataType};
 
     fn test_schema() -> VeinSchema {

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::coerce::{coerce_types, unify_types};
 use crate::context::BinderContext;
 use crate::date_time::{parse_date, parse_interval, parse_time, parse_timestamp};
@@ -550,7 +552,7 @@ pub fn ast_type_to_vein(data_type: &DataType<'_>) -> Result<VeinDataType> {
             }
         }
         DataType::Interval { .. } => VeinDataType::Interval,
-        DataType::Array(inner) => VeinDataType::List(Box::new(ast_type_to_vein(inner)?)),
+        DataType::Array(inner) => VeinDataType::List(Arc::new(ast_type_to_vein(inner)?)),
         DataType::Vector(dim) => VeinDataType::Vector(*dim),
         DataType::Struct(fields) => {
             let mut cols = Vec::with_capacity(fields.len());
@@ -562,11 +564,11 @@ pub fn ast_type_to_vein(data_type: &DataType<'_>) -> Result<VeinDataType> {
                     ast_type_to_vein(ty)?,
                 ));
             }
-            VeinDataType::Struct(cols)
+            VeinDataType::Struct(cols.into())
         }
         DataType::Map { key, value } => VeinDataType::Map(
-            Box::new(ast_type_to_vein(key)?),
-            Box::new(ast_type_to_vein(value)?),
+            Arc::new(ast_type_to_vein(key)?),
+            Arc::new(ast_type_to_vein(value)?),
         ),
     })
 }

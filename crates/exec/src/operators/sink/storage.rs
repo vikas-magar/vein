@@ -50,8 +50,8 @@ impl WriteSink {
         let schema_reader = StreamReader::try_new(std::io::Cursor::new(target.schema_ipc.as_slice()), None)
             .map_err(|error| VeinError::planning(format!("invalid WRITE Arrow schema: {error}"), None))?;
         let expected_schema = schema_reader.schema();
-        if expected_schema.fields().len() != target.schema.len()
-            || expected_schema.fields().iter().zip(&target.schema).any(|(field, planned)| {
+        if expected_schema.fields().len() != target.schema.fields.len()
+            || expected_schema.fields().iter().zip(&target.schema.fields).any(|(field, planned)| {
             field.name() != &planned.name
         })
         {

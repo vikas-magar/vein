@@ -4,6 +4,7 @@ use catalog::CatalogSnapshotToken;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::sync::Arc;
+use types::VeinSchemaRef;
 
 use super::ir::MicroProgram;
 use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
@@ -19,17 +20,6 @@ pub enum FileFormat {
     Json,
 }
 
-/// Minimal field schema for protocol serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FieldSchema {
-    /// Iceberg field ID.
-    pub field_id: i32,
-    /// Column name.
-    pub name: String,
-    /// Data type string (e.g. "INT", "STRING").
-    pub data_type: String,
-}
-
 /// Self-contained file scan instruction for an Executor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileScanTask {
@@ -39,10 +29,11 @@ pub struct FileScanTask {
     pub format: FileFormat,
     /// Optional byte range within the file.
     pub byte_range: Option<Range<u64>>,
-    /// Column IDs to read (projection pushdown).
-    pub column_ids: Vec<i32>,
-    /// Schema of the projected columns.
-    pub projected_schema: Vec<FieldSchema>,
+    /// The projected columns, in the engine's own schema vocabulary.
+    ///
+    /// Refcounted so splitting one file scan into per-file tasks copies a
+    /// handle rather than the schema.
+    pub projected: VeinSchemaRef,
     /// Task identifier for reporting.
     pub task_id: TaskId,
     /// Catalog snapshot pinned by the planning session.
@@ -94,7 +85,7 @@ pub struct StorageTarget {
     /// Storage format and execution options.
     pub options: Vec<KeyValue>,
     /// Authoritative schema of columns to write.
-    pub schema: Vec<FieldSchema>,
+    pub schema: VeinSchemaRef,
     /// Arrow IPC stream containing the complete authoritative output schema.
     /// This preserves nested types and allows sinks to initialize empty writes.
     pub schema_ipc: Vec<u8>,
@@ -105,7 +96,7 @@ impl StorageTarget {
     pub fn new(
         destination_uri: impl Into<String>,
         options: Vec<KeyValue>,
-        schema: Vec<FieldSchema>,
+        schema: VeinSchemaRef,
     ) -> Self {
         Self {
             destination_uri: destination_uri.into(),
@@ -150,7 +141,7 @@ pub enum DataSink {
     /// Stream data directly back to the Query Coordinator/Client.
     Client {
         /// Schema of the columns expected at the client.
-        schema: Vec<FieldSchema>,
+        schema: VeinSchemaRef,
     },
     /// Write data out to storage (e.g., Iceberg commit).
     Storage(StorageTarget),

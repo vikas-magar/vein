@@ -5,7 +5,7 @@ use crate::stage::Stage;
 use crate::task::Task;
 use common::Result;
 use common::identifiers::{PartitionId, StageId, TaskId};
-use common::protocol::{DataSink, DataSource, FieldSchema, MicroProgram};
+use common::protocol::{DataSink, DataSource, MicroProgram};
 use error::VeinError;
 use plan::LogicalPlan;
 use plan::schema::VeinSchema;
@@ -68,20 +68,10 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         plan: &LogicalPlan,
     ) -> Result<Stage> {
         let (source, program, out_schema) = self.compile_pipeline(plan)?;
-        let client_schema: Vec<FieldSchema> = out_schema
-            .fields
-            .iter()
-            .map(|f| FieldSchema {
-                field_id: f.id.0 as i32,
-                name: f.name.clone(),
-                data_type: format!("{:?}", f.data_type),
-            })
-            .collect();
         let sink = match plan {
             LogicalPlan::Write {
                 target, options, ..
             } => {
-                let storage_schema = client_schema;
                 let key_values: Vec<common::protocol::KeyValue> = options
                     .iter()
                     .map(|(k, v)| common::protocol::KeyValue {
@@ -89,6 +79,8 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                         value: v.clone(),
                     })
                     .collect();
+                // The Arrow schema exists only to encode the WRITE target's
+                // schema IPC, so a read never pays to build it.
                 let arrow_schema = out_schema.to_arrow();
                 let mut schema_bytes = Vec::new();
                 {
@@ -101,12 +93,12 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                 let target_obj = common::protocol::StorageTarget::new(
                     target.clone(),
                     key_values,
-                    storage_schema,
+                    Arc::new(out_schema),
                 ).with_schema_ipc(schema_bytes);
                 DataSink::Storage(target_obj)
             }
             _ => DataSink::Client {
-                schema: client_schema,
+                schema: Arc::new(out_schema),
             },
         };
         let stage_id = StageId::new();
@@ -143,6 +135,8 @@ mod tests {
     use super::split_file_scan_source;
     use common::identifiers::TaskId;
     use common::protocol::{DataSource, FileFormat, FileScanTask};
+    use plan::schema::VeinSchema;
+    use std::sync::Arc;
 
     #[test]
     fn splits_multi_file_scan_into_stable_single_file_units() {
@@ -150,8 +144,7 @@ mod tests {
             files: vec!["a.parquet".to_string(), "b.parquet".to_string()],
             format: FileFormat::Parquet,
             byte_range: None,
-            column_ids: vec![0],
-            projected_schema: Vec::new(),
+            projected: Arc::new(VeinSchema::empty()),
             task_id: TaskId::new(),
             catalog_snapshot: None,
         });

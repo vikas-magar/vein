@@ -318,11 +318,17 @@ mod tests {
         let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut schema_ipc, &schema)
             .expect("create schema IPC stream");
         writer.finish().expect("finish schema IPC stream");
-        StorageTarget::new("events", options, vec![common::protocol::FieldSchema {
-            field_id: 0,
-            name: "id".to_owned(),
-            data_type: "Int64".to_owned(),
-        }]).with_schema_ipc(schema_ipc)
+        StorageTarget::new(
+            "events",
+            options,
+            Arc::new(plan::VeinSchema::new(vec![plan::ResolvedColumn::new(
+                plan::ColumnId(0),
+                "id",
+                None,
+                plan::VeinDataType::Int64,
+            )])),
+        )
+        .with_schema_ipc(schema_ipc)
     }
 
     fn batch(values: Vec<i64>) -> RecordBatch {

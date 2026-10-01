@@ -1,9 +1,10 @@
 //! Compiles Parquet-backed linear query plans into the vector program.
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use common::Result;
 use common::identifiers::TaskId;
-use common::protocol::{DataSource, FieldSchema, FileFormat, FileScanTask, MicroProgram};
+use common::protocol::{DataSource, FileFormat, FileScanTask, MicroProgram};
 use error::VeinError;
 use plan::schema::VeinSchema;
 use plan::{LogicalExpr, LogicalPlan};
@@ -88,26 +89,15 @@ impl PipelineCompiler {
         if files.is_empty() {
             return Err(VeinError::planning("Parquet scan has no input files", None));
         }
-        let projected_schema = schema
-            .fields
-            .iter()
-            .map(|field| FieldSchema {
-                field_id: field.id.0 as i32,
-                name: field.name.clone(),
-                data_type: format!("{:?}", field.data_type),
-            })
-            .collect();
+        // One handle to the projected schema: splitting this scan into
+        // per-file tasks then copies a refcount instead of the schema.
+        let projected = Arc::new(schema.clone());
         Ok((
             DataSource::File(FileScanTask {
                 files,
                 format: FileFormat::Parquet,
                 byte_range: None,
-                column_ids: schema
-                    .fields
-                    .iter()
-                    .map(|field| field.id.0 as i32)
-                    .collect(),
-                projected_schema,
+                projected,
                 task_id: TaskId::new(),
                 catalog_snapshot: None,
             }),

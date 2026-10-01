@@ -92,38 +92,38 @@ pub enum VeinDataType {
 
     // ── Nested & Collections ──────────────────────────────
     /// A variable length list of another type.
-    List(Box<VeinDataType>),
+    List(Arc<VeinDataType>),
     /// A large (64-bit offset) variable length list.
-    LargeList(Box<VeinDataType>),
+    LargeList(Arc<VeinDataType>),
     /// Fixed-size list of another type.
-    FixedSizeList(Box<VeinDataType>, i32),
+    FixedSizeList(Arc<VeinDataType>, i32),
     /// High-dimensional vector for AI embeddings.
     Vector(u32),
     /// A nested struct of named fields.
-    Struct(Vec<ResolvedColumn>),
+    Struct(Arc<[ResolvedColumn]>),
     /// A map of key-value pairs.
     Map(
-        Box<VeinDataType>,
-        Box<VeinDataType>,
+        Arc<VeinDataType>,
+        Arc<VeinDataType>,
     ),
     /// A union of mutually exclusive member types.
-    Union(Vec<VeinDataType>),
+    Union(Arc<[VeinDataType]>),
     /// A dictionary-encoded (key, value) pair.
     Dictionary(
-        Box<VeinDataType>,
-        Box<VeinDataType>,
+        Arc<VeinDataType>,
+        Arc<VeinDataType>,
     ),
     /// A run-end-encoded (run_end, value) pair.
     RunEndEncoded(
-        Box<VeinDataType>,
-        Box<VeinDataType>,
+        Arc<VeinDataType>,
+        Arc<VeinDataType>,
     ),
 
     // ── Microservice & Ecosystem Extensions ───────────────
     /// Semi-structured JSON payload targeted for zero-copy eBPF socket extraction.
     Variant,
     /// Custom User-Defined Type (UDT). Name + underlying physical fallback type.
-    Extension(String, Box<VeinDataType>),
+    Extension(String, Arc<VeinDataType>),
 }
 
 impl VeinDataType {
@@ -250,12 +250,12 @@ impl From<&DataType> for VeinDataType {
             DataType::Interval(_) => VeinDataType::Interval,
             DataType::Decimal128(p, s) => VeinDataType::Decimal128(*p, *s),
             DataType::Decimal256(p, s) => VeinDataType::Decimal256(*p, *s),
-            DataType::List(inner) => VeinDataType::List(Box::new(Self::from(inner.data_type()))),
+            DataType::List(inner) => VeinDataType::List(Arc::new(Self::from(inner.data_type()))),
             DataType::LargeList(inner) => {
-                VeinDataType::LargeList(Box::new(Self::from(inner.data_type())))
+                VeinDataType::LargeList(Arc::new(Self::from(inner.data_type())))
             }
             DataType::FixedSizeList(inner, size) => {
-                VeinDataType::FixedSizeList(Box::new(Self::from(inner.data_type())), *size)
+                VeinDataType::FixedSizeList(Arc::new(Self::from(inner.data_type())), *size)
             }
             DataType::Struct(fields) => {
                 let vein_fields = fields
@@ -269,8 +269,8 @@ impl From<&DataType> for VeinDataType {
                             Self::from(f.data_type()),
                         )
                     })
-                    .collect();
-                VeinDataType::Struct(vein_fields)
+                    .collect::<Vec<_>>();
+                VeinDataType::Struct(vein_fields.into())
             }
             _ => VeinDataType::Utf8,
         }

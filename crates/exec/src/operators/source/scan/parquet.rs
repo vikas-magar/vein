@@ -1,7 +1,6 @@
 use crate::pipeline::{DataChunk, PipelineNode};
 use bytes::Bytes;
 use common::Result;
-use common::protocol::FieldSchema;
 use error::VeinError;
 use futures::future::BoxFuture;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -14,6 +13,7 @@ use parquet::file::metadata::ParquetMetaData;
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::Arc;
+use types::VeinSchema;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -204,7 +204,7 @@ impl AsyncFileReader for OpendalParquetReader {
 pub async fn execute_parquet_scan(
     operator: &Operator,
     files: &[ScanFile],
-    projected_schema: &[FieldSchema],
+    projected: &VeinSchema,
     metadata_store: &MetadataStore,
     bytes_read: &Arc<AtomicU64>,
     next: &mut dyn PipelineNode<DataChunk>,
@@ -276,10 +276,10 @@ pub async fn execute_parquet_scan(
             }
         };
 
-        if !projected_schema.is_empty() {
+        if !projected.fields.is_empty() {
             let arrow_schema = builder.schema();
-            let mut root_indices = Vec::with_capacity(projected_schema.len());
-            for field in projected_schema {
+            let mut root_indices = Vec::with_capacity(projected.fields.len());
+            for field in &projected.fields {
                 let mut matches = arrow_schema
                     .fields()
                     .iter()

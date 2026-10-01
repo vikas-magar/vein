@@ -351,9 +351,10 @@ mod tests {
             panic!("expected a Parquet file scan");
         };
         assert_eq!(
-            scan.projected_schema
+            scan.projected
+                .fields
                 .iter()
-                .map(|field| field.name.as_str())
+                .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["id", "value"],
         );

@@ -17,7 +17,7 @@ pub use cast::eval_cast;
 pub use comparison::{
     eval_cmp_eq, eval_cmp_gt, eval_cmp_gte, eval_cmp_lt, eval_cmp_lte, eval_cmp_neq,
 };
-pub use constant::{scalar_constant_to_array, scalar_constant_to_scalar};
+pub use constant::{literal_to_array, literal_to_scalar};
 pub use logic::{eval_and, eval_is_not_null, eval_is_null, eval_not, eval_or};
 pub use mask::apply_filter_mask;
 pub use udf::eval_call_udf;

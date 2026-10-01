@@ -196,7 +196,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                     op,
                     files,
                     scan.format.clone(),
-                    scan.projected_schema.clone(),
+                    scan.projected.clone(),
                     self.metadata_store.clone(),
                 )))
             }
@@ -222,7 +222,11 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         match sink {
             DataSink::Discard => Ok(Box::new(DiscardSink::new())),
             DataSink::Client { schema } => {
-                let field_names = schema.iter().map(|f| f.name.clone()).collect();
+                let field_names = schema
+                    .fields
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect();
                 Ok(Box::new(CollectSink::with_field_names(field_names)))
             }
             DataSink::Storage(target) => {
@@ -241,7 +245,11 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
     ) -> Result<Box<dyn Sink<DataChunk>>> {
         match sink {
             DataSink::Client { schema } => {
-                let field_names = schema.iter().map(|field| field.name.clone()).collect();
+                let field_names = schema
+                    .fields
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect();
                 Ok(Box::new(CollectSink::with_field_names_and_sender(
                     field_names,
                     output,

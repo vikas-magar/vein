@@ -3,20 +3,20 @@
 use serde::{Deserialize, Serialize};
 use types::VeinDataType;
 
-use super::constant::ScalarConstant;
 use super::program::RegId;
 use super::state::{AggOpCode, JoinKind, StateMode};
+use types::LogicalLiteral;
 
 /// A compact, zero-copy instruction operating on columnar vector registers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MicroOp {
     // ── Scalar & Register Constants ──────────────────────────────
-    /// Load a scalar constant into a register across all active rows.
+    /// Load a constant into a register across all active rows.
     LoadConstant {
         /// Destination register.
         dst: RegId,
-        /// Scalar constant value.
-        value: ScalarConstant,
+        /// The constant, in the engine's own literal vocabulary.
+        value: LogicalLiteral,
     },
     /// Copy reference from one register to another.
     CopyRegister {

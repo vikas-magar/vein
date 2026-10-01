@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::expr::{LogicalExpr, LogicalLiteral};
 use crate::plan::traversal::PlanTraversal;
 use crate::schema::{ResolvedColumn, VeinDataType};
@@ -60,7 +62,7 @@ pub fn literal_type(lit: &LogicalLiteral) -> VeinDataType {
         LogicalLiteral::Interval { .. } => VeinDataType::Interval,
         LogicalLiteral::Decimal(_, precision, scale) => VeinDataType::Decimal128(*precision, *scale),
         LogicalLiteral::List(items) => {
-            VeinDataType::List(Box::new(common_element_type(items)))
+            VeinDataType::List(Arc::new(common_element_type(items)))
         }
         LogicalLiteral::Struct(entries) => {
             let fields = entries
@@ -73,8 +75,8 @@ pub fn literal_type(lit: &LogicalLiteral) -> VeinDataType {
                     is_factorized: false,
                     nullable: true,
                 })
-                .collect();
-            VeinDataType::Struct(fields)
+                .collect::<Vec<_>>();
+            VeinDataType::Struct(fields.into())
         }
         LogicalLiteral::Map(entries) => {
             let key = entries
@@ -85,7 +87,7 @@ pub fn literal_type(lit: &LogicalLiteral) -> VeinDataType {
                 .first()
                 .map(|(_, v)| literal_type(v))
                 .unwrap_or(VeinDataType::Null);
-            VeinDataType::Map(Box::new(key), Box::new(value))
+            VeinDataType::Map(Arc::new(key), Arc::new(value))
         }
         LogicalLiteral::Vector(v) => VeinDataType::Vector(v.len() as u32),
     }
@@ -132,7 +134,7 @@ mod tests {
     fn list_infers_homogeneous_element_type() {
         assert_eq!(
             literal_type(&Lit::List(vec![Lit::Int64(1), Lit::Int64(2)])),
-            VeinDataType::List(Box::new(VeinDataType::Int64))
+            VeinDataType::List(Arc::new(VeinDataType::Int64))
         );
     }
 
@@ -140,7 +142,7 @@ mod tests {
     fn list_skips_null_elements_for_element_type() {
         assert_eq!(
             literal_type(&Lit::List(vec![Lit::Null(VeinDataType::Int64), Lit::String("x".into())])),
-            VeinDataType::List(Box::new(VeinDataType::Utf8))
+            VeinDataType::List(Arc::new(VeinDataType::Utf8))
         );
     }
 
@@ -148,7 +150,7 @@ mod tests {
     fn empty_list_falls_back_to_null() {
         assert_eq!(
             literal_type(&Lit::List(vec![])),
-            VeinDataType::List(Box::new(VeinDataType::Null))
+            VeinDataType::List(Arc::new(VeinDataType::Null))
         );
     }
 
@@ -176,8 +178,8 @@ mod tests {
                 Lit::Float64(1.5)
             )])),
             VeinDataType::Map(
-                Box::new(VeinDataType::Utf8),
-                Box::new(VeinDataType::Float64)
+                Arc::new(VeinDataType::Utf8),
+                Arc::new(VeinDataType::Float64)
             )
         );
     }

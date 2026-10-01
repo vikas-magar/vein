@@ -298,7 +298,7 @@ mod tests {
     use super::*;
     use crate::operators::source::MemorySource;
     use common::identifiers::{QueryId, RequestId, StageId, TaskId};
-    use common::protocol::{ExecutionMode, MicroOp, ScalarConstant};
+    use common::protocol::{ExecutionMode, MicroOp};
 
     /// A builder whose only difference from the default is that it can
     /// materialize a `DataSource::Memory` task, which the default builder
@@ -374,7 +374,7 @@ mod tests {
                 instructions: vec![
                     MicroOp::LoadConstant {
                         dst: 1,
-                        value: ScalarConstant::Int64(2),
+                        value: types::LogicalLiteral::Int64(2),
                     },
                     MicroOp::CmpGt {
                         dst: 2,
@@ -385,7 +385,9 @@ mod tests {
                     MicroOp::ProjectRegisters { out_regs: vec![0] },
                 ],
             }),
-            sink: Arc::new(DataSink::Client { schema: vec![] }),
+            sink: Arc::new(DataSink::Client {
+                schema: Arc::new(types::VeinSchema::empty()),
+            }),
         }
     }
 

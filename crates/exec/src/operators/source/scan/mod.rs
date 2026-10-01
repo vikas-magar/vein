@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::pipeline::{DataChunk, PipelineNode, Source};
 use catalog::MetadataStore;
-use common::protocol::{FieldSchema, FileFormat};
+use common::protocol::FileFormat;
 use common::Result;
 use error::VeinError;
 use opendal::Operator;
+use types::VeinSchemaRef;
 
 /// Parquet source backed by a local-filesystem OpenDAL operator.
 pub mod parquet;
@@ -33,7 +34,7 @@ pub struct ScanSource {
     operator: Operator,
     files: Vec<ScanFile>,
     format: FileFormat,
-    projected_schema: Vec<FieldSchema>,
+    projected: VeinSchemaRef,
     metadata_store: MetadataStore,
     /// Bytes this scan has read from storage, shared with the Parquet reader so
     /// the runtime can report real I/O volume in execution metrics.
@@ -46,14 +47,14 @@ impl ScanSource {
         operator: Operator,
         files: Vec<ScanFile>,
         format: FileFormat,
-        projected_schema: Vec<FieldSchema>,
+        projected: VeinSchemaRef,
         metadata_store: MetadataStore,
     ) -> Self {
         Self {
             operator,
             files,
             format,
-            projected_schema,
+            projected,
             metadata_store,
             bytes_read: Arc::new(AtomicU64::new(0)),
         }
@@ -68,7 +69,7 @@ impl Source<DataChunk> for ScanSource {
                 parquet::execute_parquet_scan(
                     &self.operator,
                     &self.files,
-                    &self.projected_schema,
+                    &self.projected,
                     &self.metadata_store,
                     &self.bytes_read,
                     next,
@@ -123,7 +124,7 @@ mod tests {
             operator,
             files,
             FileFormat::Parquet,
-            Vec::new(),
+            Arc::new(types::VeinSchema::empty()),
             MetadataStore::new(),
         )
     }

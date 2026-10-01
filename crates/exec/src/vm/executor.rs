@@ -92,7 +92,7 @@ impl VectorVmExecutor {
         for op in &self.program.instructions {
             match op {
                 MicroOp::LoadConstant { dst, value } => {
-                    let scalar = ops::scalar_constant_to_scalar(value)?;
+                    let scalar = ops::literal_to_scalar(value)?;
                     store_result(&mut self.registers, *dst, scalar)?;
                 }
                 MicroOp::CopyRegister { dst, src } => {
@@ -293,7 +293,7 @@ impl Transform<DataChunk> for VectorVmExecutor {}
 mod tests {
     use super::*;
     use arrow::array::{ArrayRef, Float64Array, Int64Array};
-    use common::protocol::ScalarConstant;
+    use types::LogicalLiteral;
     use std::sync::Mutex;
     use types::VeinDataType;
 
@@ -330,7 +330,7 @@ mod tests {
             instructions: vec![
                 MicroOp::LoadConstant {
                     dst: 1,
-                    value: ScalarConstant::Int64(25),
+                    value: LogicalLiteral::Int64(25),
                 },
                 MicroOp::CmpGt {
                     dst: 2,
@@ -340,7 +340,7 @@ mod tests {
                 MicroOp::FilterMask { bool_reg: 2 },
                 MicroOp::LoadConstant {
                     dst: 3,
-                    value: ScalarConstant::Int64(1),
+                    value: LogicalLiteral::Int64(1),
                 },
                 MicroOp::Add {
                     dst: 4,
@@ -388,7 +388,7 @@ mod tests {
             register_count: 2,
             instructions: vec![MicroOp::LoadConstant {
                 dst: 1,
-                value: ScalarConstant::Int64(7),
+                value: LogicalLiteral::Int64(7),
             }],
         };
 
