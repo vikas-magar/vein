@@ -16,9 +16,6 @@ use serde::{Deserialize, Serialize};
     Hash,
     Serialize,
     Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
 )]
 pub struct ColumnId(pub usize);
 
@@ -37,9 +34,6 @@ impl std::fmt::Display for ColumnId {
     Hash,
     Serialize,
     Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
 )]
 pub struct ResolvedColumn {
     /// Unique identifier for this column in the query.

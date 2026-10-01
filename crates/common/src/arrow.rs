@@ -1,11 +1,9 @@
-use arrow::array::{Float64Builder, Int32Builder, StringBuilder};
 use arrow::buffer::Buffer;
 use arrow::ipc::reader::StreamDecoder;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use futures::stream::Stream;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use error::{Result, VeinError};
 
@@ -241,28 +239,30 @@ pub fn receiver_to_stream(
     })
 }
 
-/// Build a mock `RecordBatch` with `name`, `age`, and `score` columns.
-pub fn make_mock_batch(rows: usize) -> RecordBatch {
-    let mut names = StringBuilder::new();
-    let mut ages = Int32Builder::new();
-    let mut scores = Float64Builder::new();
-    for i in 0..rows {
-        names.append_value(format!("User{i}"));
-        ages.append_value((i % 100) as i32);
-        scores.append_value(i as f64 * 1.5);
-    }
-    RecordBatch::try_from_iter(vec![
-        ("name", Arc::new(names.finish()) as _),
-        ("age", Arc::new(ages.finish()) as _),
-        ("score", Arc::new(scores.finish()) as _),
-    ])
-        .expect("mock batch should always build")
-}
-
 #[cfg(test)]
 #[allow(missing_docs)]
 mod tests {
     use super::*;
+    use arrow::array::{Float64Builder, Int32Builder, StringBuilder};
+    use std::sync::Arc;
+
+    /// Build a mock `RecordBatch` with `name`, `age`, and `score` columns.
+    fn make_mock_batch(rows: usize) -> RecordBatch {
+        let mut names = StringBuilder::new();
+        let mut ages = Int32Builder::new();
+        let mut scores = Float64Builder::new();
+        for i in 0..rows {
+            names.append_value(format!("User{i}"));
+            ages.append_value((i % 100) as i32);
+            scores.append_value(i as f64 * 1.5);
+        }
+        RecordBatch::try_from_iter(vec![
+            ("name", Arc::new(names.finish()) as _),
+            ("age", Arc::new(ages.finish()) as _),
+            ("score", Arc::new(scores.finish()) as _),
+        ])
+        .expect("mock batch should always build")
+    }
 
     #[test]
     fn test_ipc_roundtrip() {

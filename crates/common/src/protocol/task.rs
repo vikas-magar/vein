@@ -9,17 +9,7 @@ use super::ir::MicroProgram;
 use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
 
 /// Supported file formats for storage scans.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileFormat {
     /// Apache Parquet
     Parquet,
@@ -30,9 +20,7 @@ pub enum FileFormat {
 }
 
 /// Minimal field schema for protocol serialization.
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldSchema {
     /// Iceberg field ID.
     pub field_id: i32,
@@ -43,9 +31,7 @@ pub struct FieldSchema {
 }
 
 /// Self-contained file scan instruction for an Executor.
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileScanTask {
     /// List of URIs/Paths to the files.
     pub files: Vec<String>,
@@ -64,18 +50,14 @@ pub struct FileScanTask {
 }
 
 /// Read from an infinite stream.
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamSource {
     /// E.g., Kafka topic name.
     pub topic: String,
 }
 
 /// Source of data for a stage.
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DataSource {
     /// Read from static storage (e.g., Parquet).
     File(FileScanTask),
@@ -86,17 +68,7 @@ pub enum DataSource {
 }
 
 /// Key-value option pair for storage and scan configurations.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyValue {
     /// Option key name.
     pub key: String,
@@ -115,9 +87,7 @@ impl KeyValue {
 }
 
 /// Target for persistent storage output.
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageTarget {
     /// The path or table URI.
     pub destination_uri: String,
@@ -175,9 +145,7 @@ impl StorageTarget {
 }
 
 /// Sink for data produced by a stage.
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DataSink {
     /// Stream data directly back to the Query Coordinator/Client.
     Client {
@@ -198,9 +166,6 @@ pub enum DataSink {
     Serialize,
     Deserialize,
     PartialEq,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
 )]
 pub enum ExecutionMode {
     /// Finite batch execution (e.g., reading Parquet files).
@@ -210,9 +175,7 @@ pub enum ExecutionMode {
 }
 
 /// Task dispatched from Master to Executor.
-#[derive(
-    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteTask {
     /// Stable request lineage identifier shared by coordinator, scheduler, and executors.
     pub request_id: RequestId,

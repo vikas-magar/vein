@@ -7,9 +7,7 @@ use super::op::MicroOp;
 pub type RegId = u8;
 
 /// A complete, self-contained vectorized program executed on in-flight DataChunks.
-#[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MicroProgram {
     /// Number of total registers required (input columns + intermediate scratch + projections).
     pub register_count: u8,

@@ -9,7 +9,6 @@ missing_docs = "deny"
 [dependencies]
 async-trait = { workspace = true }
 error = { path = "../error" }
-rkyv = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 types = { path = "../types" }

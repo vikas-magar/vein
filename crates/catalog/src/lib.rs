@@ -43,5 +43,5 @@ pub use metadata::{
     ColumnSortKey, ColumnStatistics, TableFormat, TableMetadata, TableMetadataRef, TableStatistics,
     TableType,
 };
-pub use snapshot::{ArchivedCatalogSnapshotToken, CatalogSnapshotToken};
+pub use snapshot::CatalogSnapshotToken;
 pub use store::{DEFAULT_CAPACITY, MetadataKey, MetadataKind, MetadataStore};

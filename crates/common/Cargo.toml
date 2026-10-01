@@ -14,7 +14,6 @@ error   = { path = "../error" }
 types   = { path = "../types" }
 rand    = { workspace = true }
 serde   = { workspace = true }
-rkyv    = { workspace = true }
 futures = { workspace = true }
 async-stream = "0.3"
 

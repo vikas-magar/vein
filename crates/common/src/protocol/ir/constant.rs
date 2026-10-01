@@ -3,9 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Literal scalar constant that can be loaded into a register.
-#[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ScalarConstant {
     /// Null scalar value.
     Null,

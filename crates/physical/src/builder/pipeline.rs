@@ -68,13 +68,12 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         plan: &LogicalPlan,
     ) -> Result<Stage> {
         let (source, program, out_schema) = self.compile_pipeline(plan)?;
-        let arrow_schema = out_schema.to_arrow();
-        let client_schema = out_schema
+        let client_schema: Vec<FieldSchema> = out_schema
             .fields
-            .into_iter()
+            .iter()
             .map(|f| FieldSchema {
                 field_id: f.id.0 as i32,
-                name: f.name,
+                name: f.name.clone(),
                 data_type: format!("{:?}", f.data_type),
             })
             .collect();
@@ -90,6 +89,7 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                         value: v.clone(),
                     })
                     .collect();
+                let arrow_schema = out_schema.to_arrow();
                 let mut schema_bytes = Vec::new();
                 {
                     let mut writer = arrow::ipc::writer::StreamWriter::try_new(

@@ -48,15 +48,7 @@ pub struct TaskResult {
 /// Decouples `exec` from `common::protocol`: the executor's own
 /// [`Source`], [`Transform`], and [`Sink`] implementations are selected here
 /// from the self-contained task description a worker receives.
-#[async_trait]
 pub trait ExecutorBuilder: Send + Sync {
-    /// Validates all authoritative catalog tokens carried by a task before
-    /// opening any physical source.
-    async fn validate_task(&self, task: &ExecuteTask) -> Result<()> {
-        let _ = task;
-        Ok(())
-    }
-
     /// Build a source from the task's [`DataSource`] and attempt identity.
     fn build_source(
         &self,
@@ -203,10 +195,6 @@ impl DefaultTaskExecutor {
             return Err(VeinError::cancelled());
         }
 
-        let validate_started = Instant::now();
-        self.builder.validate_task(task).await?;
-        let validate_us = validate_started.elapsed().as_micros() as u64;
-
         let sink_started = Instant::now();
         let sink = if let Some(sender) = output_sender {
             self.builder.build_streaming_sink(&task.sink, sender)?
@@ -265,7 +253,6 @@ impl DefaultTaskExecutor {
             target: "vein.audit",
             event = "task_finished",
             task_id = %task.task_id,
-            validate_us,
             sink_build_us,
             vm_build_us,
             source_build_us,
@@ -309,12 +296,68 @@ impl TaskExecutor for DefaultTaskExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::factory::TaskExecutorBuilder;
+    use crate::operators::source::MemorySource;
     use common::identifiers::{QueryId, RequestId, StageId, TaskId};
     use common::protocol::{ExecutionMode, MicroOp, ScalarConstant};
 
+    /// A builder whose only difference from the default is that it can
+    /// materialize a `DataSource::Memory` task, which the default builder
+    /// rejects because the wire variant carries no payload.
+    struct MemoryFeedBuilder {
+        inner: crate::factory::DefaultExecutorBuilder,
+    }
+
+    impl MemoryFeedBuilder {
+        fn new() -> Self {
+            Self {
+                inner: crate::factory::DefaultExecutorBuilder::new(Arc::new(
+                    crate::udf::FunctionRegistry::new(),
+                )),
+            }
+        }
+    }
+
+    impl ExecutorBuilder for MemoryFeedBuilder {
+        fn build_source(
+            &self,
+            source: &DataSource,
+            task_id: TaskId,
+            attempt: u32,
+        ) -> Result<Box<dyn Source<DataChunk>>> {
+            if !matches!(source, DataSource::Memory) {
+                return self.inner.build_source(source, task_id, attempt);
+            }
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("dummy", arrow::datatypes::DataType::Int64, false),
+            ]));
+            let values = Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3, 4, 5]));
+            let batch = RecordBatch::try_new(schema, vec![values]).expect("valid test batch");
+            Ok(Box::new(MemorySource::new(batch)))
+        }
+
+        fn build_vm(
+            &self,
+            program: &Arc<MicroProgram>,
+            next: Box<dyn PipelineNode<DataChunk>>,
+        ) -> Result<Box<dyn Transform<DataChunk>>> {
+            self.inner.build_vm(program, next)
+        }
+
+        fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>> {
+            self.inner.build_sink(sink)
+        }
+
+        fn build_streaming_sink(
+            &self,
+            sink: &DataSink,
+            output: flume::Sender<RecordBatch>,
+        ) -> Result<Box<dyn Sink<DataChunk>>> {
+            self.inner.build_streaming_sink(sink, output)
+        }
+    }
+
     fn runner() -> DefaultTaskExecutor {
-        TaskExecutorBuilder::new().build()
+        DefaultTaskExecutor::new(Arc::new(MemoryFeedBuilder::new()))
     }
 
     fn task() -> ExecuteTask {
@@ -325,7 +368,7 @@ mod tests {
             attempt: 0,
             query_id: QueryId::new(),
             stage_id: StageId::new(),
-            source: DataSource::Memory, // dummy: Int64 [1,2,3,4,5]
+            source: DataSource::Memory, // supplied by MemoryFeedBuilder: Int64 [1,2,3,4,5]
             program: Arc::new(MicroProgram {
                 register_count: 3,
                 instructions: vec![

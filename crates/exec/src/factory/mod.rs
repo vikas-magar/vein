@@ -10,7 +10,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::operators::sink::{CollectSink, DiscardSink, WriteSink, WriteStorage};
 use crate::operators::source::scan::ScanFile;
-use crate::operators::source::{MemorySource, ScanSource};
+use crate::operators::source::ScanSource;
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use crate::runtime::ExecutorBuilder;
 use crate::udf::FunctionRegistry;
@@ -179,7 +179,9 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         _attempt: u32,
     ) -> Result<Box<dyn Source<DataChunk>>> {
         match source {
-            DataSource::Memory => Ok(Box::new(MemorySource::dummy())),
+            DataSource::Memory => Err(VeinError::internal(
+                "a DataSource::Memory task carries no payload to materialize",
+            )),
             DataSource::File(scan) => {
                 let (root, relative) = local_scan_paths(&scan.files)?;
                 let files = relative
