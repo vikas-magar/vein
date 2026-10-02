@@ -126,6 +126,11 @@ impl HashJoin {
         self.table.probe(&chunk, &mut pairs)?;
         self.probe_us += probe_started.elapsed().as_micros() as u64;
         let matches = pairs;
+        // Only the flavours that emit unmatched build rows need this, and only
+        // they may mutate the table — which is what keeps `probe` shareable.
+        if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+            self.table.record_matched(&matches);
+        }
         self.probed_rows += probe_rows.len() as u64;
         self.matched_rows += matches.len() as u64;
 

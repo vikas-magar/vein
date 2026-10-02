@@ -10,6 +10,8 @@
 //! `(probe row, build entry)` pairs, which the join operator turns into columns
 //! with `take`. That is the only materialisation a join causes.
 
+use std::collections::HashSet;
+
 use arrow::array::{Array, Int64Array, StringArray};
 
 use crate::pipeline::DataChunk;
@@ -170,7 +172,12 @@ pub struct HashTable {
     entries: Vec<Entry>,
     hashes: Vec<u64>,
     buckets: Vec<u32>,
-    matched: Vec<u64>,
+    /// The build rows a probe has consumed, recorded only when the join flavour
+    /// needs to know which rows went unmatched. A set rather than a bitset over
+    /// entries because probing no longer has an entry index in hand — it reports
+    /// `(chunk, row)`, and that is what lets `probe` borrow the table immutably
+    /// and several probe tasks share one table.
+    matched: HashSet<(u32, u32)>,
     /// Build rows whose key is null: entered, but never bucketed, because no
     /// probe row may match them and an outer join still has to emit them.
     null_keyed: Vec<(u32, u32)>,
@@ -200,7 +207,7 @@ impl HashTable {
             entries: Vec::new(),
             hashes: Vec::new(),
             buckets: vec![NONE; INITIAL_BUCKETS],
-            matched: Vec::new(),
+            matched: HashSet::new(),
             null_keyed: Vec::new(),
             keys: Vec::new(),
         }
@@ -265,7 +272,6 @@ impl HashTable {
             self.keys.clear();
         }
         self.keys_by_chunk.push(keys);
-        self.matched.resize(self.entries.len().div_ceil(64), 0);
         Ok(())
     }
 
@@ -341,8 +347,13 @@ impl HashTable {
             self.keys.clear();
         }
 
+        self.matched.extend(
+            other
+                .matched
+                .into_iter()
+                .map(|(chunk, row)| (chunk + offset, row)),
+        );
         self.rebucket(self.buckets.len().max(self.entries.len() * 2).max(INITIAL_BUCKETS));
-        self.matched.resize(self.entries.len().div_ceil(64), 0);
         Ok(())
     }
 
@@ -355,7 +366,7 @@ impl HashTable {
     /// per row of scratch.
     ///
     /// A probe row with a null key contributes nothing.
-    pub fn probe(&mut self, probe: &DataChunk, matches: &mut Vec<(u32, (u32, u32))>) -> Result<()> {
+    pub fn probe(&self, probe: &DataChunk, matches: &mut Vec<(u32, (u32, u32))>) -> Result<()> {
         let probe_keys = ChunkKeys::resolve(&self.probe_keys, probe)?;
         let inline = self.inline_keys() && probe_keys.is_single_i64();
         for position in 0..probe.selection.size() {
@@ -380,7 +391,6 @@ impl HashTable {
                 if same
                 {
                     matches.push((row, (entry.chunk, entry.row)));
-                    self.mark_matched(head as usize);
                 }
                 head = entry.next;
             }
@@ -388,14 +398,23 @@ impl HashTable {
         Ok(())
     }
 
+    /// Records the build rows `matches` consumed.
+    ///
+    /// Deliberately separate from [`Self::probe`]: probing must borrow the table
+    /// immutably so it can be shared by concurrent tasks, and only the right and
+    /// full flavours need to know what went unmatched.
+    pub fn record_matched(&mut self, matches: &[(u32, (u32, u32))]) {
+        self.matched
+            .extend(matches.iter().map(|(_, build)| *build));
+    }
+
     /// The build rows no probe row matched, as `(chunk, row)`.
     ///
     /// An outer join emits these with the probe columns null.
     pub fn unmatched_build_rows(&self) -> Vec<(u32, u32)> {
         let mut unmatched = Vec::new();
-        for index in 0..self.entries.len() {
-            if !self.is_matched(index) {
-                let entry = self.entries[index];
+        for entry in &self.entries {
+            if !self.matched.contains(&(entry.chunk, entry.row)) {
                 unmatched.push((entry.chunk, entry.row));
             }
         }
@@ -419,15 +438,6 @@ impl HashTable {
         (entry.chunk, entry.row)
     }
 
-    fn mark_matched(&mut self, entry: usize) {
-        self.matched[entry / 64] |= 1u64 << (entry % 64);
-    }
-
-    fn is_matched(&self, entry: usize) -> bool {
-        self.matched
-            .get(entry / 64)
-            .is_some_and(|word| (word >> (entry % 64)) & 1 == 1)
-    }
 }
 
 #[cfg(test)]
@@ -495,6 +505,7 @@ mod tests {
 
         let mut pairs = Vec::new();
         table.probe(&chunk(ints(&[10])), &mut pairs).expect("probe");
+        table.record_matched(&pairs);
 
         assert_eq!(table.unmatched_build_rows(), vec![(0, 1)]);
     }
@@ -607,6 +618,7 @@ mod tests {
         let mut pairs = Vec::new();
         left.probe(&chunk(ints(&[10, 30, 40, 99])), &mut pairs)
             .expect("probe");
+        left.record_matched(&pairs);
         let mut matches: Vec<(u32, u32, u32)> = pairs
             .iter()
             .map(|(probe, (build_chunk, build_row))| (*probe, *build_chunk, *build_row))
