@@ -327,6 +327,16 @@ pub async fn execute_parquet_scan(
             }
         };
 
+        // Rows per scanned batch.
+        //
+        // arrow-parquet defaults to 1024; DataFusion uses 8192 and DuckDB 2048.
+        // Every per-chunk cost in the engine — the index lists a gather builds,
+        // `take`/`interleave`, the channel handoff, the operator chain — is paid
+        // once per batch, so this is the cheapest lever on scan and join
+        // throughput alike.
+        const SCAN_BATCH_ROWS: usize = 8192;
+        builder = builder.with_batch_size(SCAN_BATCH_ROWS);
+
         if !projected.fields.is_empty() {
             let mask = ProjectionMask::roots(
                 builder.parquet_schema(),
