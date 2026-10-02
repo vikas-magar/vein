@@ -13,8 +13,22 @@
 pub mod selection;
 /// Row validity: which rows are non-null.
 pub mod validity;
+/// Ref-counted byte buffers backing vector values.
+pub mod buffer;
+/// Chunks of columnar data in flight.
+pub mod chunk;
+/// Interoperability boundary with Arrow.
+pub mod arrow;
+/// Typed value vectors.
+pub mod vector;
+/// Borrowed views over a vector and a selection.
+pub mod view;
 
+pub use buffer::BufferRef;
+pub use chunk::DataChunk;
 pub use selection::{IndexRef, MaskRef, Selection, SelectionIter};
+pub use vector::{Encoding, Vector, VectorRef};
+pub use view::{I64Values, Utf8Values, VectorView};
 pub use validity::Validity;
 
 /// Counts set bits, ignoring bits at or beyond `row_count`.
@@ -38,6 +52,24 @@ pub(crate) fn popcount_within(words: &[u64], row_count: u32) -> u32 {
         count += word.count_ones();
     }
     count
+}
+
+/// Number of 64-bit words needed to hold `row_count` bits.
+pub fn words_for(row_count: u32) -> usize {
+    (row_count as usize).div_ceil(64)
+}
+
+/// Clears bits at or beyond `row_count`.
+///
+/// Shared by every bitmap in the engine: a mask that is inverted or intersected
+/// can otherwise claim rows that do not exist.
+pub fn trim_words(words: &mut [u64], row_count: u32) {
+    let remainder = row_count % 64;
+    if remainder != 0
+        && let Some(last) = words.last_mut()
+    {
+        *last &= (1u64 << remainder) - 1;
+    }
 }
 
 /// Whether bit `row` is set in a LSB-first bitmap.

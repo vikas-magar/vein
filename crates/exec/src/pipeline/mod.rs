@@ -4,6 +4,7 @@
 //! streaming execution node contracts ([`PipelineNode`], [`Source`], [`Transform`], [`Sink`]).
 
 pub mod chunk;
+pub mod bridge;
 pub mod node;
 
 pub use chunk::DataChunk;
