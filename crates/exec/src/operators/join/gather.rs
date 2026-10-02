@@ -2,18 +2,17 @@
 //!
 //! This is the only place a join materialises anything: an output row has to
 //! exist somewhere. Everything else is references — the probe chunk's columns
-//! and the table's retained build chunks are read, never copied, and a column
-//! that is null for every row of a group becomes one typed null array rather
-//! than a buffer of placeholders.
+//! and the table's retained build chunks are read, never copied, and a side that
+//! is absent for a row becomes one typed null array rather than a placeholder.
 //!
-//! Rows are grouped by the build chunk they reference, so each `take` reads
-//! exactly one source array, and by whether the probe side is present, so `take`
-//! is never handed a null index.
+//! One **output chunk per call**, not one per (probe chunk × build chunk) group.
+//! `interleave` reads several source arrays in a single pass, so a probe chunk
+//! that matched rows in three build chunks still produces one chunk. Emitting a
+//! chunk per group instead shattered the output — 113 batches for 45 input
+//! chunks — and the per-chunk overhead, not the work, dominated the join.
 
-use std::collections::BTreeMap;
-
-use arrow::array::{ArrayRef, UInt32Array, new_null_array};
-use arrow::compute::take;
+use arrow::array::{Array, ArrayRef, new_null_array};
+use arrow::compute::interleave;
 use arrow::datatypes::DataType;
 
 use crate::pipeline::DataChunk;
@@ -32,7 +31,7 @@ pub enum OutputColumn {
     Build(usize),
 }
 
-/// Assembles `rows` into output chunks, in the column order `columns` gives.
+/// Assembles `rows` into one output chunk, in the column order `columns` gives.
 ///
 /// `probe` may be absent: the unmatched build rows a right or full join emits at
 /// flush have no probe chunk. For that reason both `probe_types` and
@@ -46,76 +45,109 @@ pub fn assemble(
     probe_types: &[DataType],
     build_types: &[DataType],
 ) -> Result<Vec<DataChunk>> {
-    // Key: the build chunk this row reads from (`None` = no build side), and
-    // whether the probe side is present.
-    let mut groups: BTreeMap<(Option<u32>, bool), (Vec<u32>, Vec<u32>)> = BTreeMap::new();
-    for row in rows {
-        let key = (row.build.map(|(chunk, _)| chunk), row.probe.is_some());
-        let (probe_rows, build_rows) = groups.entry(key).or_default();
-        if let Some(probe_row) = row.probe {
-            probe_rows.push(probe_row);
-        }
-        if let Some((_, build_row)) = row.build {
-            build_rows.push(build_row);
-        }
+    if rows.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let mut chunks = Vec::with_capacity(groups.len());
-    for ((build_chunk, probe_present), (probe_rows, build_rows)) in groups {
-        let len = if probe_present {
-            probe_rows.len()
-        } else {
-            build_rows.len()
-        };
-
-        let mut arrays = Vec::with_capacity(columns.len());
-        for column in columns {
-            arrays.push(match column {
-                OutputColumn::Probe(index) => {
-                    if probe_present {
-                        let chunk = probe.ok_or_else(|| {
-                            VeinError::internal(
-                                "join output has probe rows but no probe chunk",
-                            )
-                        })?;
-                        gather(chunk.column(*index), &probe_rows)?
-                    } else {
-                        let data_type = probe_types.get(*index).ok_or_else(|| {
-                            VeinError::internal(format!(
-                                "join output needs the data type of probe column {index}"
-                            ))
-                        })?;
-                        new_null_array(data_type, len)
-                    }
-                }
-                OutputColumn::Build(index) => match build_chunk {
-                    Some(chunk) => {
-                        gather(table.build_chunk(chunk).column(*index), &build_rows)?
-                    }
-                    None => {
-                        let data_type = build_types.get(*index).ok_or_else(|| {
-                            VeinError::internal(format!(
-                                "join output needs the data type of build column {index}"
-                            ))
-                        })?;
-                        new_null_array(data_type, len)
-                    }
-                },
-            });
-        }
-        chunks.push(DataChunk::from_vectors(arrays));
+    let mut arrays = Vec::with_capacity(columns.len());
+    for column in columns {
+        arrays.push(match column {
+            OutputColumn::Probe(index) => probe_column(probe, *index, rows, probe_types)?,
+            OutputColumn::Build(index) => build_column(table, *index, rows, build_types)?,
+        });
     }
-    Ok(chunks)
+    Ok(vec![DataChunk::from_vectors(arrays)])
 }
 
-/// Reads `rows` out of `array`.
-///
-/// The indices are never null: a side that is absent for a group is materialised
-/// as a typed null array instead, which is why this can rely on `take`'s plain
-/// behaviour and keep the source array's data type.
-fn gather(array: &ArrayRef, rows: &[u32]) -> Result<ArrayRef> {
-    let indices = UInt32Array::from(rows.to_vec());
-    take(array.as_ref(), &indices, None)
+/// Gathers one column from the probe chunk, or from a typed null when a row has
+/// no probe side.
+fn probe_column(
+    probe: Option<&DataChunk>,
+    index: usize,
+    rows: &[OutputRow],
+    probe_types: &[DataType],
+) -> Result<ArrayRef> {
+    let absent = rows.iter().any(|row| row.probe.is_none());
+    match probe {
+        Some(chunk) => {
+            let source = chunk.column(index);
+            let null = absent.then(|| new_null_array(source.data_type(), 1));
+            let mut values: Vec<&dyn Array> = vec![source.as_ref()];
+            if let Some(null) = &null {
+                values.push(null.as_ref());
+            }
+            let indices: Vec<(usize, usize)> = rows
+                .iter()
+                .map(|row| match row.probe {
+                    Some(row) => (0, row as usize),
+                    None => (1, 0),
+                })
+                .collect();
+            gather(&values, &indices)
+        }
+        // A right or full join emits its unmatched build rows at flush, when
+        // there is no probe chunk left to take a type from.
+        None if absent => {
+            let data_type = probe_types.get(index).ok_or_else(|| {
+                VeinError::internal(format!(
+                    "join output needs the data type of probe column {index}"
+                ))
+            })?;
+            let null = new_null_array(data_type, 1);
+            let values: Vec<&dyn Array> = vec![null.as_ref()];
+            let indices: Vec<(usize, usize)> = rows.iter().map(|_| (0, 0)).collect();
+            gather(&values, &indices)
+        }
+        None => Err(VeinError::internal(
+            "join output has probe rows but no probe chunk",
+        )),
+    }
+}
+
+/// Gathers one column across every retained build chunk, or from a typed null
+/// when a row has no build side.
+fn build_column(
+    table: &HashTable,
+    index: usize,
+    rows: &[OutputRow],
+    build_types: &[DataType],
+) -> Result<ArrayRef> {
+    let chunk_count = table.chunk_count();
+    let chunks: Vec<ArrayRef> = (0..chunk_count)
+        .map(|chunk| std::sync::Arc::clone(table.build_chunk(chunk as u32).column(index)))
+        .collect();
+
+    let null = if rows.iter().any(|row| row.build.is_none()) {
+        let data_type = chunks
+            .first()
+            .map(|chunk| chunk.data_type().clone())
+            .or_else(|| build_types.get(index).cloned())
+            .ok_or_else(|| {
+                VeinError::internal(format!(
+                    "join output needs the data type of build column {index}"
+                ))
+            })?;
+        Some(new_null_array(&data_type, 1))
+    } else {
+        None
+    };
+
+    let mut values: Vec<&dyn Array> = chunks.iter().map(|chunk| chunk.as_ref()).collect();
+    if let Some(null) = &null {
+        values.push(null.as_ref());
+    }
+    let indices: Vec<(usize, usize)> = rows
+        .iter()
+        .map(|row| match row.build {
+            Some((chunk, row)) => (chunk as usize, row as usize),
+            None => (chunk_count, 0),
+        })
+        .collect();
+    gather(&values, &indices)
+}
+
+fn gather(values: &[&dyn Array], indices: &[(usize, usize)]) -> Result<ArrayRef> {
+    interleave(values, indices)
         .map_err(|error| VeinError::internal(format!("join gather failed: {error}")))
 }
 
@@ -153,9 +185,9 @@ mod tests {
             .collect()
     }
 
-    /// Inner: one output row per match, both sides gathered from their source.
+    /// One chunk comes out whatever the grouping, with both sides gathered.
     #[test]
-    fn inner_gathers_both_sides() {
+    fn one_chunk_holds_every_row() {
         // probe [10, 20]; build [20, 30]; probe row 1 matches build row 0.
         let (table, probe) = fixture(&[20, 30], &[10, 20]);
         let rows = output_rows(JoinType::Inner, &[0, 1], &[(1, (0, 0))], &[]);
@@ -170,12 +202,39 @@ mod tests {
         )
         .expect("assemble");
 
-        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks.len(), 1, "a probe chunk yields one output chunk");
         assert_eq!(cells(&chunks[0], 0), vec![Some(20)]);
         assert_eq!(cells(&chunks[0], 1), vec![Some(20)]);
     }
 
-    /// Left: the unmatched probe row is emitted with a typed null build column.
+    /// A probe chunk matching several build chunks still emits one chunk.
+    #[test]
+    fn matches_across_build_chunks_stay_in_one_chunk() {
+        let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        table
+            .insert(DataChunk::from_vectors(vec![ints(&[20])]))
+            .expect("insert");
+        table
+            .insert(DataChunk::from_vectors(vec![ints(&[20])]))
+            .expect("insert");
+        let probe = DataChunk::from_vectors(vec![ints(&[20])]);
+
+        let rows = output_rows(JoinType::Inner, &[0], &[(0, (0, 0)), (0, (1, 0))], &[]);
+        let chunks = assemble(
+            Some(&probe),
+            &table,
+            &rows,
+            &[OutputColumn::Probe(0), OutputColumn::Build(0)],
+            &[DataType::Int64],
+            &[DataType::Int64],
+        )
+        .expect("assemble");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(cells(&chunks[0], 1), vec![Some(20), Some(20)]);
+    }
+
+    /// Left: the unmatched probe row is emitted with a null build column.
     #[test]
     fn left_nulls_the_build_side_for_unmatched_probe_rows() {
         let (table, probe) = fixture(&[20], &[10, 20]);
@@ -191,19 +250,12 @@ mod tests {
         )
         .expect("assemble");
 
-        // Two groups: the match, and the unmatched probe row.
-        assert_eq!(chunks.len(), 2);
-        let matched = chunks.iter().find(|chunk| cells(chunk, 1) == vec![Some(20)]);
-        let unmatched = chunks.iter().find(|chunk| cells(chunk, 1) == vec![None]);
-        assert!(matched.is_some(), "the match must carry a build value");
-        assert_eq!(
-            unmatched.map(|chunk| cells(chunk, 0)),
-            Some(vec![Some(10)]),
-            "the unmatched probe row keeps its probe value"
-        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(cells(&chunks[0], 0), vec![Some(20), Some(10)]);
+        assert_eq!(cells(&chunks[0], 1), vec![Some(20), None]);
     }
 
-    /// Right: an unmatched build row is emitted with a typed null probe column.
+    /// Right: an unmatched build row is emitted with a null probe column.
     #[test]
     fn right_nulls_the_probe_side_for_unmatched_build_rows() {
         let (table, probe) = fixture(&[20, 40], &[20]);
@@ -219,19 +271,17 @@ mod tests {
         )
         .expect("assemble");
 
-        assert_eq!(chunks.len(), 2);
-        let unmatched = chunks
-            .iter()
-            .find(|chunk| cells(chunk, 0) == vec![None])
-            .expect("an unmatched build row must have a null probe column");
-        assert_eq!(cells(unmatched, 1), vec![Some(40)]);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(cells(&chunks[0], 0), vec![Some(20), None]);
+        assert_eq!(cells(&chunks[0], 1), vec![Some(20), Some(40)]);
     }
 
-    /// A build column's type is only needed when the build side is empty, and a
-    /// missing one is refused rather than guessed.
+    /// With nothing built there is no chunk to take a type from, so the caller's
+    /// type is required rather than guessed.
     #[test]
-    fn a_missing_build_type_is_refused() {
-        let (table, probe) = fixture(&[20], &[10]);
+    fn an_empty_build_side_needs_the_caller_type() {
+        let table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        let probe = DataChunk::from_vectors(vec![ints(&[10])]);
         let rows = output_rows(JoinType::Left, &[0], &[], &[]);
 
         let error = assemble(

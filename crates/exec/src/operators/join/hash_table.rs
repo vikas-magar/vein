@@ -307,6 +307,11 @@ impl HashTable {
         &self.chunks[chunk as usize]
     }
 
+    /// How many build chunks the table retains.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
     /// The build row a matched entry refers to.
     pub fn build_row(&self, entry: u32) -> (u32, u32) {
         let entry = self.entries[entry as usize];
