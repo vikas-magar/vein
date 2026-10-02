@@ -10,8 +10,6 @@
 //! `(probe row, build entry)` pairs, which the join operator turns into columns
 //! with `take`. That is the only materialisation a join causes.
 
-use std::collections::HashSet;
-
 use arrow::array::{Array, Int64Array, StringArray};
 
 use crate::pipeline::DataChunk;
@@ -172,12 +170,6 @@ pub struct HashTable {
     entries: Vec<Entry>,
     hashes: Vec<u64>,
     buckets: Vec<u32>,
-    /// The build rows a probe has consumed, recorded only when the join flavour
-    /// needs to know which rows went unmatched. A set rather than a bitset over
-    /// entries because probing no longer has an entry index in hand — it reports
-    /// `(chunk, row)`, and that is what lets `probe` borrow the table immutably
-    /// and several probe tasks share one table.
-    matched: HashSet<(u32, u32)>,
     /// Build rows whose key is null: entered, but never bucketed, because no
     /// probe row may match them and an outer join still has to emit them.
     null_keyed: Vec<(u32, u32)>,
@@ -207,7 +199,6 @@ impl HashTable {
             entries: Vec::new(),
             hashes: Vec::new(),
             buckets: vec![NONE; INITIAL_BUCKETS],
-            matched: HashSet::new(),
             null_keyed: Vec::new(),
             keys: Vec::new(),
         }
@@ -347,12 +338,6 @@ impl HashTable {
             self.keys.clear();
         }
 
-        self.matched.extend(
-            other
-                .matched
-                .into_iter()
-                .map(|(chunk, row)| (chunk + offset, row)),
-        );
         self.rebucket(self.buckets.len().max(self.entries.len() * 2).max(INITIAL_BUCKETS));
         Ok(())
     }
@@ -398,28 +383,20 @@ impl HashTable {
         Ok(())
     }
 
-    /// Records the build rows `matches` consumed.
+    /// Every build row the table holds, as `(chunk, row)`.
     ///
-    /// Deliberately separate from [`Self::probe`]: probing must borrow the table
-    /// immutably so it can be shared by concurrent tasks, and only the right and
-    /// full flavours need to know what went unmatched.
-    pub fn record_matched(&mut self, matches: &[(u32, (u32, u32))]) {
-        self.matched
-            .extend(matches.iter().map(|(_, build)| *build));
-    }
-
-    /// The build rows no probe row matched, as `(chunk, row)`.
-    ///
-    /// An outer join emits these with the probe columns null.
-    pub fn unmatched_build_rows(&self) -> Vec<(u32, u32)> {
-        let mut unmatched = Vec::new();
-        for entry in &self.entries {
-            if !self.matched.contains(&(entry.chunk, entry.row)) {
-                unmatched.push((entry.chunk, entry.row));
-            }
-        }
-        unmatched.extend(self.null_keyed.iter().copied());
-        unmatched
+    /// Which of these went unmatched is the *operator's* business, not the
+    /// table's: a probe fan-out shares one table read-only across tasks, so it
+    /// cannot record what each task consumed. The operator subtracts what it
+    /// saw.
+    pub fn all_build_rows(&self) -> Vec<(u32, u32)> {
+        let mut rows: Vec<(u32, u32)> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.chunk, entry.row))
+            .collect();
+        rows.extend(self.null_keyed.iter().copied());
+        rows
     }
 
     /// The retained chunk an entry belongs to, for gathering build columns.
@@ -497,17 +474,18 @@ mod tests {
         assert_eq!(pairs[0].0, 1, "and it is probe row 1");
     }
 
-    /// Build rows nothing matched are reported, so an outer join can emit them.
+    /// The probe reports what it matched, and the table reports every build row:
+    /// an outer join subtracts one from the other.
     #[test]
-    fn unmatched_build_rows_are_reported() {
+    fn the_probe_reports_its_matches_and_the_table_every_row() {
         let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
         table.insert(chunk(ints(&[10, 20]))).expect("insert");
 
         let mut pairs = Vec::new();
         table.probe(&chunk(ints(&[10])), &mut pairs).expect("probe");
-        table.record_matched(&pairs);
 
-        assert_eq!(table.unmatched_build_rows(), vec![(0, 1)]);
+        assert_eq!(pairs, vec![(0, (0, 0))]);
+        assert_eq!(table.all_build_rows(), vec![(0, 0), (0, 1)]);
     }
 
     /// Several key columns must all agree, and strings compare by value.
@@ -618,7 +596,6 @@ mod tests {
         let mut pairs = Vec::new();
         left.probe(&chunk(ints(&[10, 30, 40, 99])), &mut pairs)
             .expect("probe");
-        left.record_matched(&pairs);
         let mut matches: Vec<(u32, u32, u32)> = pairs
             .iter()
             .map(|(probe, (build_chunk, build_row))| (*probe, *build_chunk, *build_row))
@@ -636,9 +613,9 @@ mod tests {
             "every key must be found across both tables"
         );
         assert_eq!(
-            left.unmatched_build_rows(),
-            vec![(0, 1), (2, 1)],
-            "20 and the null-keyed row are the only unmatched build rows"
+            left.all_build_rows(),
+            vec![(0, 0), (0, 1), (1, 0), (2, 0), (2, 1)],
+            "every row of both tables must survive the rebase, null-keyed included"
         );
     }
 

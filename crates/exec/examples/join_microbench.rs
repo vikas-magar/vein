@@ -70,7 +70,7 @@ fn run(build: &[DataChunk], probe: &[DataChunk]) -> (Duration, Duration, u64) {
     let started = Instant::now();
     let collected = Count::default();
     let mut join = HashJoin::new(
-        table,
+        Arc::new(table),
         JoinType::Inner,
         vec![OutputColumn::Probe(0), OutputColumn::Build(1)],
         vec![DataType::Int64, DataType::Int64],

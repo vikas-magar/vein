@@ -6,6 +6,8 @@
 //! completion, then probe — which is precisely why a join cannot be a VM
 //! instruction: the VM sees one chunk at a time and has no second input.
 
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::datatypes::DataType;
@@ -72,12 +74,17 @@ impl PipelineNode<DataChunk> for BuildSink {
 
 /// Probes a built table and emits the joined columns.
 pub struct HashJoin {
-    table: HashTable,
+    /// Shared rather than owned, so a probe fan-out can give every task the same
+    /// table. Read-only by construction: `probe` takes `&self`.
+    table: Arc<HashTable>,
     join_type: JoinType,
     columns: Vec<OutputColumn>,
     probe_types: Vec<DataType>,
     build_types: Vec<DataType>,
     next: Box<dyn PipelineNode<DataChunk>>,
+    /// The build rows this task consumed, for the flavours that owe unmatched
+    /// ones. Kept here, not in the table, because the table is shared.
+    matched_build: HashSet<(u32, u32)>,
     /// The join's own accounting: rows in, matches found, and the time split
     /// between finding them and assembling the output.
     probed_rows: u64,
@@ -91,7 +98,7 @@ impl HashJoin {
     /// sides. `probe_types` and `build_types` are the output types of each side,
     /// which a null side needs and no data can always supply.
     pub fn new(
-        table: HashTable,
+        table: Arc<HashTable>,
         join_type: JoinType,
         columns: Vec<OutputColumn>,
         probe_types: Vec<DataType>,
@@ -105,6 +112,7 @@ impl HashJoin {
             probe_types,
             build_types,
             next,
+            matched_build: HashSet::new(),
             probed_rows: 0,
             matched_rows: 0,
             probe_us: 0,
@@ -126,10 +134,10 @@ impl HashJoin {
         self.table.probe(&chunk, &mut pairs)?;
         self.probe_us += probe_started.elapsed().as_micros() as u64;
         let matches = pairs;
-        // Only the flavours that emit unmatched build rows need this, and only
-        // they may mutate the table — which is what keeps `probe` shareable.
+        // Only the flavours that owe unmatched build rows need this.
         if matches!(self.join_type, JoinType::Right | JoinType::Full) {
-            self.table.record_matched(&matches);
+            self.matched_build
+                .extend(matches.iter().map(|(_, build)| *build));
         }
         self.probed_rows += probe_rows.len() as u64;
         self.matched_rows += matches.len() as u64;
@@ -170,7 +178,12 @@ impl PipelineNode<DataChunk> for HashJoin {
         // An outer join owes the build rows nothing matched. They are emitted
         // here, once, with the probe side null.
         if matches!(self.join_type, JoinType::Right | JoinType::Full) {
-            let unmatched = self.table.unmatched_build_rows();
+            let unmatched: Vec<(u32, u32)> = self
+                .table
+                .all_build_rows()
+                .into_iter()
+                .filter(|row| !self.matched_build.contains(row))
+                .collect();
             if !unmatched.is_empty() {
                 let rows = output_rows(self.join_type, &[], &[], &unmatched);
                 let mut produced = assemble(
@@ -249,7 +262,7 @@ mod tests {
     fn inner_join_end_to_end() {
         let sink = Collect::default();
         let mut join = HashJoin::new(
-            build(&[20, 30]),
+            Arc::new(build(&[20, 30])),
             JoinType::Inner,
             vec![OutputColumn::Probe(0), OutputColumn::Build(0)],
             vec![DataType::Int64],
@@ -272,7 +285,7 @@ mod tests {
     fn right_join_emits_unmatched_build_rows_at_flush() {
         let sink = Collect::default();
         let mut join = HashJoin::new(
-            build(&[20, 40]),
+            Arc::new(build(&[20, 40])),
             JoinType::Right,
             vec![OutputColumn::Probe(0), OutputColumn::Build(0)],
             vec![DataType::Int64],

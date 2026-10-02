@@ -10,6 +10,8 @@
 //! shape that can be serialised into a task once `ExecuteTask` grows a join
 //! input.
 
+use std::sync::Arc;
+
 use arrow::datatypes::DataType;
 
 use crate::pipeline::{DataChunk, PipelineNode};
@@ -44,7 +46,11 @@ impl JoinSpec {
 
     /// The probe side's node, given the table the build side produced — the
     /// second half.
-    pub fn into_probe(self, table: HashTable, next: Box<dyn PipelineNode<DataChunk>>) -> HashJoin {
+    pub fn into_probe(
+        self,
+        table: Arc<HashTable>,
+        next: Box<dyn PipelineNode<DataChunk>>,
+    ) -> HashJoin {
         HashJoin::new(
             table,
             self.join_type,
@@ -120,7 +126,7 @@ mod tests {
         let table = build.finish();
 
         let sink = Collect::default();
-        let mut probe = spec.into_probe(table, Box::new(sink.clone()));
+        let mut probe = spec.into_probe(Arc::new(table), Box::new(sink.clone()));
         probe
             .push(DataChunk::from_vectors(vec![ints(&[8])]))
             .expect("probe");

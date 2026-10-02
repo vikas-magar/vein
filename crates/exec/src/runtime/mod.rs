@@ -277,7 +277,7 @@ impl DefaultTaskExecutor {
         let vm_started = Instant::now();
         let mut vm: Box<dyn Transform<DataChunk>> = match join {
             Some((table, plan)) => Box::new(HashJoin::new(
-                table,
+                Arc::new(table),
                 join_type(plan.join_type)?,
                 join_outputs(&plan.outputs),
                 join_types(&plan.probe_types),
