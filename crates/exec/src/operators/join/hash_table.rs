@@ -127,6 +127,20 @@ impl ChunkKeys {
             .fold(FNV_OFFSET, |hash, column| column.hash_into(row, hash))
     }
 
+    /// Whether this is a single `Int64` key, the shape that can be compared as a
+    /// plain value instead of through the encoding.
+    fn is_single_i64(&self) -> bool {
+        matches!(self.columns.as_slice(), [KeyArray::Int64(_)])
+    }
+
+    /// The single `Int64` key at `row`; only meaningful when [`Self::is_single_i64`].
+    fn single_i64(&self, row: usize) -> Option<i64> {
+        match self.columns.as_slice() {
+            [KeyArray::Int64(array)] => Some(array.value(row)),
+            _ => None,
+        }
+    }
+
     fn equals(&self, row: usize, other: &Self, other_row: usize) -> bool {
         self.columns
             .iter()
@@ -160,6 +174,13 @@ pub struct HashTable {
     /// Build rows whose key is null: entered, but never bucketed, because no
     /// probe row may match them and an outer join still has to emit them.
     null_keyed: Vec<(u32, u32)>,
+    /// The build key of each entry, when the key is a single `Int64`. Comparing
+    /// these is one array read instead of resolving the key's encoding and
+    /// dereferencing an Arrow array per chain candidate — DuckDB's trick of
+    /// keeping the key beside the hash (`tuple_data_layout.cpp`: "NULL byte +
+    /// fixed-width type"). Only the key is copied; payload columns stay
+    /// columnar and shared.
+    keys: Vec<i64>,
 }
 
 impl HashTable {
@@ -181,7 +202,13 @@ impl HashTable {
             buckets: vec![NONE; INITIAL_BUCKETS],
             matched: Vec::new(),
             null_keyed: Vec::new(),
+            keys: Vec::new(),
         }
+    }
+
+    /// Whether the build key is a single `Int64`, so [`Self::keys`] is usable.
+    fn inline_keys(&self) -> bool {
+        self.keys.len() == self.entries.len()
     }
 
     /// How many build rows are entered, null-keyed ones included.
@@ -228,6 +255,14 @@ impl HashTable {
                 next,
             });
             self.hashes.push(hash);
+            if let Some(value) = keys.single_i64(row as usize) {
+                self.keys.push(value);
+            }
+        }
+        // A chunk whose key is not a single Int64 invalidates the inline array:
+        // drop it rather than leave a partially filled one behind.
+        if self.keys.len() != self.entries.len() {
+            self.keys.clear();
         }
         self.keys_by_chunk.push(keys);
         self.matched.resize(self.entries.len().div_ceil(64), 0);
@@ -267,21 +302,27 @@ impl HashTable {
     /// A probe row with a null key contributes nothing.
     pub fn probe(&mut self, probe: &DataChunk, matches: &mut Vec<(u32, (u32, u32))>) -> Result<()> {
         let probe_keys = ChunkKeys::resolve(&self.probe_keys, probe)?;
+        let inline = self.inline_keys() && probe_keys.is_single_i64();
         for position in 0..probe.selection.size() {
             let row = probe.selection.get_index(position) as u32;
             if probe_keys.any_null(row as usize) {
                 continue;
             }
             let hash = probe_keys.hash(row as usize);
+            let value = inline.then(|| probe_keys.single_i64(row as usize).unwrap_or_default());
             let mut head = self.buckets[(hash as usize) % self.buckets.len()];
             while head != NONE {
                 let entry = self.entries[head as usize];
-                if self.hashes[head as usize] == hash
-                    && self.keys_by_chunk[entry.chunk as usize].equals(
-                        entry.row as usize,
-                        &probe_keys,
-                        row as usize,
-                    )
+                let same = self.hashes[head as usize] == hash
+                    && match value {
+                        Some(value) => self.keys[head as usize] == value,
+                        None => self.keys_by_chunk[entry.chunk as usize].equals(
+                            entry.row as usize,
+                            &probe_keys,
+                            row as usize,
+                        ),
+                    };
+                if same
                 {
                     matches.push((row, (entry.chunk, entry.row)));
                     self.mark_matched(head as usize);
