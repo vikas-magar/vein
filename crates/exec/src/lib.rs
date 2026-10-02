@@ -14,9 +14,6 @@ pub mod udf;
 /// Operators for physical execution.
 pub mod operators;
 
-/// Execution over the engine's own vector representation.
-pub mod execution;
-
 /// Default stage factory mapping the wire protocol onto executor stages.
 pub mod factory;
 /// Execution seam: stage-factory, task-executor, and expression traits.

@@ -1,9 +1,0 @@
-[package]
-name = "vector"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-arrow = { workspace = true }
-smallvec = "1"
-types = { path = "../types" }
