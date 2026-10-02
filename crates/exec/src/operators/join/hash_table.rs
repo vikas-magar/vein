@@ -283,12 +283,67 @@ impl HashTable {
         while size < wanted {
             size *= 2;
         }
+        self.rebucket(size);
+    }
+
+    /// Rebuilds the buckets from the stored hashes.
+    ///
+    /// O(entries) and allocation-free apart from the bucket vector itself: the
+    /// hashes are already computed, so nothing is re-hashed. Null-keyed rows are
+    /// not in `entries`, so they are correctly left out.
+    fn rebucket(&mut self, size: usize) {
         self.buckets = vec![NONE; size];
         for index in 0..self.entries.len() {
             let bucket = (self.hashes[index] as usize) % size;
             self.entries[index].next = self.buckets[bucket];
             self.buckets[bucket] = index as u32;
         }
+    }
+
+    /// Absorbs `other` into this table.
+    ///
+    /// This is what a parallel build needs: each worker fills its own table over
+    /// its own chunks, and the results are combined here. Entries reference their
+    /// chunks by index, so every reference from `other` is rebased, and the
+    /// buckets are rebuilt from the stored hashes rather than re-hashed.
+    ///
+    /// Both tables must have been built on the same key; combining different
+    /// keys would silently compare the wrong columns.
+    pub fn merge(&mut self, other: HashTable) -> Result<()> {
+        if self.build_keys != other.build_keys || self.probe_keys != other.probe_keys {
+            return Err(VeinError::internal(
+                "cannot merge hash tables built on different keys",
+            ));
+        }
+
+        let self_inline = self.inline_keys();
+        let other_inline = other.inline_keys();
+        let offset = self.chunks.len() as u32;
+
+        self.chunks.extend(other.chunks);
+        self.keys_by_chunk.extend(other.keys_by_chunk);
+        self.entries.extend(other.entries.into_iter().map(|entry| Entry {
+            chunk: entry.chunk + offset,
+            row: entry.row,
+            next: NONE,
+        }));
+        self.hashes.extend(other.hashes);
+        self.null_keyed.extend(
+            other
+                .null_keyed
+                .into_iter()
+                .map(|(chunk, row)| (chunk + offset, row)),
+        );
+        // The inline key array is only meaningful if *both* sides kept one.
+        if self_inline && other_inline {
+            self.keys.extend(other.keys);
+        } else {
+            self.keys.clear();
+        }
+
+        self.rebucket(self.buckets.len().max(self.entries.len() * 2).max(INITIAL_BUCKETS));
+        self.matched.resize(self.entries.len().div_ceil(64), 0);
+        Ok(())
     }
 
     /// Appends `(probe row, (build chunk, build row))` for every match.
@@ -530,5 +585,57 @@ mod tests {
 
         assert_eq!(pairs.len(), 1, "key 8 must match the build's second column");
         assert_eq!(pairs[0].1, (0, 1));
+    }
+
+    /// Two tables built independently can be combined, which is what a parallel
+    /// build produces: every row of both sides is still found, and the rebased
+    /// chunk references resolve to the right data.
+    #[test]
+    fn merged_tables_find_every_row_from_both() {
+        let mut left = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        left.insert(chunk(ints(&[10, 20]))).expect("insert");
+        let mut right = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        right.insert(chunk(ints(&[30]))).expect("insert");
+        // A null key on the merged-in side must survive the rebase too.
+        let with_null: ArrayRef = Arc::new(Int64Array::from(vec![Some(40), None]));
+        right
+            .insert(DataChunk::from_vectors(vec![with_null]))
+            .expect("insert");
+
+        left.merge(right).expect("merge");
+
+        let mut pairs = Vec::new();
+        left.probe(&chunk(ints(&[10, 30, 40, 99])), &mut pairs)
+            .expect("probe");
+        let mut matches: Vec<(u32, u32, u32)> = pairs
+            .iter()
+            .map(|(probe, (build_chunk, build_row))| (*probe, *build_chunk, *build_row))
+            .collect();
+        matches.sort();
+        assert_eq!(
+            matches,
+            vec![
+                // 10 is in `left`'s own chunk 0; the merged side contributes two
+                // chunks, so 30 stays chunk 1 and 40 lands in chunk 2.
+                (0, 0, 0),
+                (1, 1, 0),
+                (2, 2, 0),
+            ],
+            "every key must be found across both tables"
+        );
+        assert_eq!(
+            left.unmatched_build_rows(),
+            vec![(0, 1), (2, 1)],
+            "20 and the null-keyed row are the only unmatched build rows"
+        );
+    }
+
+    /// Merging tables built on different keys is refused rather than comparing
+    /// the wrong columns.
+    #[test]
+    fn merging_different_keys_is_refused() {
+        let mut left = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        let right = HashTable::new(JoinKeys::new(vec![1]), JoinKeys::new(vec![1]));
+        assert!(left.merge(right).is_err());
     }
 }
