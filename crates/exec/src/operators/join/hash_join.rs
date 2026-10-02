@@ -6,6 +6,8 @@
 //! completion, then probe — which is precisely why a join cannot be a VM
 //! instruction: the VM sees one chunk at a time and has no second input.
 
+use std::time::Instant;
+
 use arrow::datatypes::DataType;
 
 use crate::pipeline::{DataChunk, PipelineNode};
@@ -18,6 +20,9 @@ use super::rows::{JoinType, output_rows};
 /// Consumes the build side into a hash table.
 pub struct BuildSink {
     table: HashTable,
+    /// Rows absorbed, and the time spent hashing and inserting them.
+    rows: u64,
+    insert_us: u64,
 }
 
 impl BuildSink {
@@ -26,12 +31,14 @@ impl BuildSink {
     pub fn new(probe_keys: JoinKeys, build_keys: JoinKeys) -> Self {
         Self {
             table: HashTable::new(build_keys, probe_keys),
+            rows: 0,
+            insert_us: 0,
         }
     }
 
     /// How many build rows have been absorbed.
     pub fn rows(&self) -> usize {
-        self.table.len()
+        self.rows as usize
     }
 
     /// The finished table, ready to probe.
@@ -42,10 +49,23 @@ impl BuildSink {
 
 impl PipelineNode<DataChunk> for BuildSink {
     fn push(&mut self, chunk: DataChunk) -> Result<()> {
-        self.table.insert(chunk)
+        self.rows += chunk.num_rows() as u64;
+        let started = Instant::now();
+        self.table.insert(chunk)?;
+        self.insert_us += started.elapsed().as_micros() as u64;
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
+        tracing::info!(
+            target: "vein.audit",
+            event = "join_build_finished",
+            rows = self.rows,
+            table_rows = self.table.len(),
+            build_chunks = self.table.chunk_count(),
+            insert_us = self.insert_us,
+            "join_build_finished"
+        );
         Ok(())
     }
 }
@@ -58,6 +78,12 @@ pub struct HashJoin {
     probe_types: Vec<DataType>,
     build_types: Vec<DataType>,
     next: Box<dyn PipelineNode<DataChunk>>,
+    /// The join's own accounting: rows in, matches found, and the time split
+    /// between finding them and assembling the output.
+    probed_rows: u64,
+    matched_rows: u64,
+    probe_us: u64,
+    gather_us: u64,
 }
 
 impl HashJoin {
@@ -79,6 +105,10 @@ impl HashJoin {
             probe_types,
             build_types,
             next,
+            probed_rows: 0,
+            matched_rows: 0,
+            probe_us: 0,
+            gather_us: 0,
         }
     }
 
@@ -92,13 +122,18 @@ impl HashJoin {
             .collect();
 
         let mut pairs = Vec::new();
+        let probe_started = Instant::now();
         self.table.probe(&chunk, &mut pairs)?;
+        self.probe_us += probe_started.elapsed().as_micros() as u64;
         let matches: Vec<(u32, (u32, u32))> = pairs
             .iter()
             .map(|(probe_row, entry)| (*probe_row, self.table.build_row(*entry)))
             .collect();
+        self.probed_rows += probe_rows.len() as u64;
+        self.matched_rows += matches.len() as u64;
 
         // Unmatched *build* rows belong to the flush, not to this chunk.
+        let gather_started = Instant::now();
         let rows = output_rows(self.join_type, &probe_rows, &matches, &[]);
         let mut produced = assemble(
             Some(&chunk),
@@ -108,7 +143,9 @@ impl HashJoin {
             &self.probe_types,
             &self.build_types,
         )?;
-        self.forward(&mut produced)
+        let forwarded = self.forward(&mut produced);
+        self.gather_us += gather_started.elapsed().as_micros() as u64;
+        forwarded
     }
 
     /// Forwards produced chunks, dropping any that carry no rows.
@@ -145,6 +182,15 @@ impl PipelineNode<DataChunk> for HashJoin {
                 self.forward(&mut produced)?;
             }
         }
+        tracing::info!(
+            target: "vein.audit",
+            event = "join_finished",
+            probed_rows = self.probed_rows,
+            matched_rows = self.matched_rows,
+            probe_us = self.probe_us,
+            gather_us = self.gather_us,
+            "join_finished"
+        );
         self.next.flush()
     }
 }

@@ -327,15 +327,20 @@ pub async fn execute_parquet_scan(
             }
         };
 
-        // Rows per scanned batch.
+        // Rows per scanned batch, overridable with `VEIN_SCAN_BATCH_ROWS` so the
+        // value can be measured rather than argued about.
         //
-        // arrow-parquet defaults to 1024; DataFusion uses 8192 and DuckDB 2048.
+        // arrow-parquet defaults to 1024, DuckDB uses 2048 and DataFusion 8192.
         // Every per-chunk cost in the engine — the index lists a gather builds,
         // `take`/`interleave`, the channel handoff, the operator chain — is paid
         // once per batch, so this is the cheapest lever on scan and join
         // throughput alike.
-        const SCAN_BATCH_ROWS: usize = 8192;
-        builder = builder.with_batch_size(SCAN_BATCH_ROWS);
+        const DEFAULT_SCAN_BATCH_ROWS: usize = 8192;
+        let batch_rows = std::env::var("VEIN_SCAN_BATCH_ROWS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(DEFAULT_SCAN_BATCH_ROWS);
+        builder = builder.with_batch_size(batch_rows);
 
         if !projected.fields.is_empty() {
             let mask = ProjectionMask::roots(

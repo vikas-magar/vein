@@ -201,24 +201,23 @@ impl HashTable {
     /// emit it — but is left out of the buckets, so no probe can ever match it.
     pub fn insert(&mut self, chunk: DataChunk) -> Result<()> {
         let keys = ChunkKeys::resolve(&self.build_keys, &chunk)?;
-        let mut planned = Vec::with_capacity(chunk.selection.size());
-        for position in 0..chunk.selection.size() {
-            let row = chunk.selection.get_index(position) as u32;
-            planned.push((row, keys.hash(row as usize), keys.any_null(row as usize)));
-        }
-
         let chunk_index = self.chunks.len() as u32;
+        // The keys stay a local, so the loop below can mutate the table's
+        // vectors while still reading the chunk's resolved keys. Building a
+        // `(row, hash, is_null)` scratch vector instead cost 24 bytes per build
+        // row — three times what the table itself stores.
         self.chunks.push(chunk);
-        self.keys_by_chunk.push(keys);
 
-        let matchable = planned.iter().filter(|(_, _, is_null)| !is_null).count();
-        self.grow_if_needed(matchable);
-
-        for (row, hash, is_null) in planned {
-            if is_null {
+        for position in 0..self.chunks[chunk_index as usize].selection.size() {
+            let row = self.chunks[chunk_index as usize].selection.get_index(position) as u32;
+            if keys.any_null(row as usize) {
                 self.null_keyed.push((chunk_index, row));
                 continue;
             }
+            // Grown per row rather than sized up front, so no count pass is
+            // needed; the doubling makes it amortised constant.
+            self.grow_if_needed(1);
+            let hash = keys.hash(row as usize);
             let index = self.entries.len() as u32;
             let bucket = (hash as usize) % self.buckets.len();
             let next = self.buckets[bucket];
@@ -230,6 +229,7 @@ impl HashTable {
             });
             self.hashes.push(hash);
         }
+        self.keys_by_chunk.push(keys);
         self.matched.resize(self.entries.len().div_ceil(64), 0);
         Ok(())
     }
