@@ -25,12 +25,12 @@ use tracing_subscriber::registry;
 
 use crate::local::LocalQueryEngine;
 
-/// A §2 scan scenario and its DuckDB equivalent.
+/// A scenario and its DuckDB equivalent.
 ///
 /// §4 requires a baseline on the same hardware and dataset with equivalent
 /// semantics, so both engines read the same Parquet files and compute the same
-/// rows. Aggregation, join and sort scenarios are Phase 2/5 work and are
-/// intentionally absent rather than reported as passing.
+/// rows. Aggregation and sort scenarios are Phase 2/5 work and are intentionally
+/// absent rather than reported as passing.
 struct Scenario {
     name: &'static str,
     vein: &'static str,
@@ -62,6 +62,13 @@ const SCENARIOS: &[Scenario] = &[
         name: "scan/no-match",
         vein: "FROM orders\n|> WHERE o_orderkey = 99999999\n|> SELECT o_orderkey",
         duckdb: "SELECT o_orderkey FROM './data/tpch/orders/*.parquet' WHERE o_orderkey = 99999999",
+    },
+    // A self-join, so both sides read the same files: one match per row, which
+    // makes the row count checkable against DuckDB's.
+    Scenario {
+        name: "join/self-key",
+        vein: "FROM orders AS a\n|> JOIN orders AS b ON a.o_orderkey = b.o_orderkey\n|> SELECT a.o_orderkey, b.o_totalprice",
+        duckdb: "SELECT a.o_orderkey, b.o_totalprice FROM './data/tpch/orders/*.parquet' a JOIN './data/tpch/orders/*.parquet' b ON a.o_orderkey = b.o_orderkey",
     },
 ];
 
