@@ -256,11 +256,16 @@ impl HashTable {
         }
     }
 
-    /// Appends `(probe row, build entry)` for every match in `probe`.
+    /// Appends `(probe row, (build chunk, build row))` for every match.
     ///
-    /// Rows are physical indices, so the caller can gather columns by them. A
-    /// probe row with a null key contributes nothing.
-    pub fn probe(&mut self, probe: &DataChunk, pairs: &mut Vec<(u32, u32)>) -> Result<()> {
+    /// Rows are physical indices, so the caller can gather columns by them. The
+    /// build reference is resolved here, where the entry is already in hand:
+    /// returning entry indices and resolving them in the caller was a second
+    /// pass over every match, and the pair list it filled was another ~8 bytes
+    /// per row of scratch.
+    ///
+    /// A probe row with a null key contributes nothing.
+    pub fn probe(&mut self, probe: &DataChunk, matches: &mut Vec<(u32, (u32, u32))>) -> Result<()> {
         let probe_keys = ChunkKeys::resolve(&self.probe_keys, probe)?;
         for position in 0..probe.selection.size() {
             let row = probe.selection.get_index(position) as u32;
@@ -278,7 +283,7 @@ impl HashTable {
                         row as usize,
                     )
                 {
-                    pairs.push((row, head));
+                    matches.push((row, (entry.chunk, entry.row)));
                     self.mark_matched(head as usize);
                 }
                 head = entry.next;
@@ -359,10 +364,7 @@ mod tests {
 
         let mut matches: Vec<(u32, u32, u32)> = pairs
             .iter()
-            .map(|(probe_row, entry)| {
-                let (build_chunk, build_row) = table.build_row(*entry);
-                (*probe_row, build_chunk, build_row)
-            })
+            .map(|(probe_row, (build_chunk, build_row))| (*probe_row, *build_chunk, *build_row))
             .collect();
         matches.sort();
         // Probe row 0 (key 20) matches chunk 0 row 1 and chunk 1 row 0; probe
@@ -423,7 +425,7 @@ mod tests {
             )
             .expect("probe");
         assert_eq!(pairs.len(), 1);
-        assert_eq!(table.build_row(pairs[0].1), (0, 1));
+        assert_eq!(pairs[0].1, (0, 1));
 
         let mut none = Vec::new();
         table
@@ -486,6 +488,6 @@ mod tests {
         table.probe(&chunk(ints(&[8])), &mut pairs).expect("probe");
 
         assert_eq!(pairs.len(), 1, "key 8 must match the build's second column");
-        assert_eq!(table.build_row(pairs[0].1), (0, 1));
+        assert_eq!(pairs[0].1, (0, 1));
     }
 }

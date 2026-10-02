@@ -125,10 +125,7 @@ impl HashJoin {
         let probe_started = Instant::now();
         self.table.probe(&chunk, &mut pairs)?;
         self.probe_us += probe_started.elapsed().as_micros() as u64;
-        let matches: Vec<(u32, (u32, u32))> = pairs
-            .iter()
-            .map(|(probe_row, entry)| (*probe_row, self.table.build_row(*entry)))
-            .collect();
+        let matches = pairs;
         self.probed_rows += probe_rows.len() as u64;
         self.matched_rows += matches.len() as u64;
 
