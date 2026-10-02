@@ -8,18 +8,23 @@
 //! task end-to-end (see `crate::pipeline`).
 
 use arrow::record_batch::RecordBatch;
+use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
 
+use crate::operators::join::{BuildSink, HashJoin, JoinKeys, JoinType, OutputColumn};
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use crate::operators::sink::WriteReceipt;
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
-use common::protocol::{DataSink, DataSource, ExecuteTask, MicroProgram};
+use common::protocol::{
+    DataSink, DataSource, ExecuteTask, JoinKind, JoinOutput, MicroProgram,
+};
 use error::VeinError;
+use types::VeinDataType;
 
 /// Per-task execution metrics, reported to the master on completion.
 #[derive(Debug, Clone, Copy, Default)]
@@ -195,6 +200,22 @@ impl DefaultTaskExecutor {
             return Err(VeinError::cancelled());
         }
 
+        // A join reads its build side to completion before the probe starts.
+        // That ordering is what makes it a pipeline breaker, and it is the
+        // runtime's job because only the runtime knows when a source is done.
+        let join = match (&task.build, &task.join) {
+            (Some(build_source), Some(plan)) => {
+                let mut build_sink =
+                    BuildSink::new(join_keys(&plan.probe_keys), join_keys(&plan.build_keys));
+                let mut source =
+                    self.builder
+                        .build_source(build_source, task.task_id, task.attempt)?;
+                source.execute(&mut build_sink).await?;
+                Some((build_sink.finish(), plan))
+            }
+            _ => None,
+        };
+
         let sink_started = Instant::now();
         let sink = if let Some(sender) = output_sender {
             self.builder.build_streaming_sink(&task.sink, sender)?
@@ -209,7 +230,17 @@ impl DefaultTaskExecutor {
         let sink_build_us = sink_started.elapsed().as_micros() as u64;
 
         let vm_started = Instant::now();
-        let mut vm = self.builder.build_vm(&task.program, head)?;
+        let mut vm: Box<dyn Transform<DataChunk>> = match join {
+            Some((table, plan)) => Box::new(HashJoin::new(
+                table,
+                join_type(plan.join_type)?,
+                join_outputs(&plan.outputs),
+                join_types(&plan.probe_types),
+                join_types(&plan.build_types),
+                head,
+            )),
+            None => self.builder.build_vm(&task.program, head)?,
+        };
         let vm_build_us = vm_started.elapsed().as_micros() as u64;
 
         let source_started = Instant::now();
@@ -293,12 +324,52 @@ impl TaskExecutor for DefaultTaskExecutor {
     }
 }
 
+/// A plan's key columns as chunk column positions.
+fn join_keys(columns: &[u32]) -> JoinKeys {
+    JoinKeys::new(columns.iter().map(|column| *column as usize).collect())
+}
+
+/// A plan's join flavour as the operator's.
+///
+/// The semi and anti flavours are refused rather than mapped onto the nearest
+/// outer join: they emit a probe row *once*, with no build columns, which is a
+/// different output shape, not a variation of this one.
+fn join_type(kind: JoinKind) -> Result<JoinType> {
+    Ok(match kind {
+        JoinKind::Inner => JoinType::Inner,
+        JoinKind::Left => JoinType::Left,
+        JoinKind::Right => JoinType::Right,
+        JoinKind::Full => JoinType::Full,
+        JoinKind::Semi | JoinKind::Anti => {
+            return Err(VeinError::internal(format!(
+                "the hash join does not implement {kind:?} yet"
+            )));
+        }
+    })
+}
+
+/// A plan's output layout as the operator's.
+fn join_outputs(outputs: &[JoinOutput]) -> Vec<OutputColumn> {
+    outputs
+        .iter()
+        .map(|output| match output {
+            JoinOutput::Probe(index) => OutputColumn::Probe(*index as usize),
+            JoinOutput::Build(index) => OutputColumn::Build(*index as usize),
+        })
+        .collect()
+}
+
+/// Arrow types for one side's columns; a joined null column needs one.
+fn join_types(types: &[VeinDataType]) -> Vec<DataType> {
+    types.iter().map(DataType::from).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::operators::source::MemorySource;
     use common::identifiers::{QueryId, RequestId, StageId, TaskId};
-    use common::protocol::{ExecutionMode, MicroOp};
+    use common::protocol::{ExecutionMode, JoinKind, JoinOutput, JoinPlan, MicroOp};
 
     /// A builder whose only difference from the default is that it can
     /// materialize a `DataSource::Memory` task, which the default builder
@@ -388,6 +459,8 @@ mod tests {
             sink: Arc::new(DataSink::Client {
                 schema: Arc::new(types::VeinSchema::empty()),
             }),
+            build: None,
+            join: None,
         }
     }
 
@@ -430,5 +503,48 @@ mod tests {
         cancel.cancel();
         let err = runner().execute(&task, cancel).await.unwrap_err();
         assert!(matches!(err, VeinError::Cancelled));
+    }
+
+    /// A join task runs: the runtime reads the build side to completion, then
+    /// streams the probe side against the table it produced.
+    ///
+    /// Both sides are the same `dummy` batch of `1..=5`, so every row matches
+    /// itself exactly once.
+    #[tokio::test]
+    async fn runs_a_join_task() {
+        let mut task = task();
+        task.program = Arc::new(MicroProgram::empty());
+        task.build = Some(DataSource::Memory);
+        task.join = Some(JoinPlan {
+            join_type: JoinKind::Inner,
+            probe_keys: vec![0],
+            build_keys: vec![0],
+            outputs: vec![JoinOutput::Probe(0)],
+            probe_types: vec![types::VeinDataType::Int64],
+            build_types: vec![types::VeinDataType::Int64],
+        });
+
+        let result = runner()
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("join task");
+
+        assert_eq!(result.row_count, 5);
+        let rows: Vec<i64> = result
+            .output
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("int64 output")
+                    .clone();
+                (0..column.len())
+                    .map(|row| column.value(row))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(rows, vec![1, 2, 3, 4, 5]);
     }
 }

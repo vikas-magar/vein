@@ -1,7 +1,9 @@
 //! The atomic unit of work executed by the local engine.
 
 use common::identifiers::{PartitionId, QueryId, RequestId, StageId, TaskId};
-use common::protocol::{DataSink, DataSource, ExecuteTask, ExecutionMode, MicroProgram};
+use common::protocol::{
+    DataSink, DataSource, ExecuteTask, ExecutionMode, JoinPlan, MicroProgram,
+};
 use std::sync::Arc;
 
 /// The smallest executable unit of a physical plan.
@@ -21,6 +23,10 @@ pub struct Task {
     pub program: Arc<MicroProgram>,
     /// Where the task's output is written.
     pub sink: Arc<DataSink>,
+    /// The build side of a join, when this task joins.
+    pub build: Option<DataSource>,
+    /// How `source` and `build` are joined, when they are.
+    pub join: Option<JoinPlan>,
 }
 
 impl Task {
@@ -38,6 +44,33 @@ impl Task {
             source,
             program,
             sink,
+            build: None,
+            join: None,
+        }
+    }
+
+    /// A task that joins `build` against `source`.
+    ///
+    /// The two halves travel in one task because the executor must sequence
+    /// them: the build side is read to completion, and only then is the probe
+    /// side streamed against the table it produced.
+    pub fn join(
+        task_id: TaskId,
+        partition: PartitionId,
+        source: DataSource,
+        build: DataSource,
+        join: JoinPlan,
+        program: Arc<MicroProgram>,
+        sink: Arc<DataSink>,
+    ) -> Self {
+        Self {
+            task_id,
+            partition,
+            source,
+            program,
+            sink,
+            build: Some(build),
+            join: Some(join),
         }
     }
 
@@ -69,6 +102,8 @@ impl Task {
             source: self.source,
             program: self.program,
             sink,
+            build: self.build,
+            join: self.join,
         }
     }
 }

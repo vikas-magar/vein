@@ -212,4 +212,47 @@ pub struct ExecuteTask {
     pub program: Arc<MicroProgram>,
     /// Where to send the output.
     pub sink: Arc<DataSink>,
+    /// Second input, read to completion before `source` is probed.
+    ///
+    /// `Some` makes this task a join: the build side is absorbed into a hash
+    /// table, and only then does the probe side stream against it. `None` is a
+    /// plain single-input task. The two-input shape is on the task rather than
+    /// in the program because a join is a pipeline breaker — the VM sees one
+    /// chunk at a time and has no second stream.
+    pub build: Option<DataSource>,
+    /// How the two inputs are joined. Set exactly when `build` is.
+    pub join: Option<JoinPlan>,
+}
+
+use super::JoinKind;
+
+/// Where one output column of a join comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinOutput {
+    /// A column of the probe input.
+    Probe(u32),
+    /// A column of the build input.
+    Build(u32),
+}
+
+/// How a task's two inputs are joined.
+///
+/// It travels with the task because the executor must build exactly the table
+/// the planner described: key positions on both sides, join flavour, and the
+/// output column layout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JoinPlan {
+    /// Which flavour of join to perform.
+    pub join_type: JoinKind,
+    /// Key columns of the probe input.
+    pub probe_keys: Vec<u32>,
+    /// Key columns of the build input.
+    pub build_keys: Vec<u32>,
+    /// Output columns, in output order.
+    pub outputs: Vec<JoinOutput>,
+    /// The data type of every probe column the output may reference, so a null
+    /// probe side can still be given a type.
+    pub probe_types: Vec<types::VeinDataType>,
+    /// The data type of every build column the output may reference.
+    pub build_types: Vec<types::VeinDataType>,
 }

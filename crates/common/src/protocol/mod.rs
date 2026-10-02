@@ -14,5 +14,5 @@ pub use catalog::CatalogSnapshotToken;
 // Re-export task & pipeline definitions
 pub use task::{
     DataSink, DataSource, ExecuteTask, ExecutionMode, FileFormat, FileScanTask, KeyValue,
-    ScanPredicate, StorageTarget, StreamSource,
+    JoinOutput, JoinPlan, ScanPredicate, StorageTarget, StreamSource,
 };
