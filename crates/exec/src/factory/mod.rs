@@ -18,9 +18,10 @@ use crate::vm::VectorVmExecutor;
 use catalog::MetadataStore;
 use common::Result;
 use common::identifiers::TaskId;
-use common::protocol::{DataSink, DataSource, MicroProgram};
+use common::protocol::{DataSink, DataSource, MicroOp, MicroProgram};
 use error::VeinError;
 use opendal::Operator;
+use types::LogicalLiteral;
 
 /// Builds a [`TaskExecutor`](crate::runtime::TaskExecutor) with configurable
 /// stages and Vector VM execution engine.
@@ -213,11 +214,19 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         program: &Arc<MicroProgram>,
         next: Box<dyn PipelineNode<DataChunk>>,
     ) -> Result<Box<dyn Transform<DataChunk>>> {
-        Ok(Box::new(VectorVmExecutor::new(
-            program.clone(),
-            self.registry.clone(),
-            next,
-        )))
+        if engine_enabled() && engine_supports(program) {
+            Ok(Box::new(EngineTransform::new(
+                program.clone(),
+                self.registry.clone(),
+                next,
+            )))
+        } else {
+            Ok(Box::new(VectorVmExecutor::new(
+                program.clone(),
+                self.registry.clone(),
+                next,
+            )))
+        }
     }
 
     fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>> {
@@ -262,6 +271,148 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
     }
 }
 
+/// Whether to run a task on the engine representation.
+///
+/// **Off by default.** The engine representation is faster per row, but as wired
+/// it converts every batch `Arrow -> Vein -> Arrow`, and measured against
+/// `VectorVmExecutor` on 500k rows that cost 1207µs versus 910µs — 33% slower.
+/// The conversion, not the engine, is the problem: it disappears only when the
+/// scan and sink speak the engine's representation natively. Until then the
+/// Arrow VM runs by default and this switch keeps the new path measurable.
+fn engine_enabled() -> bool {
+    std::env::var_os("VEIN_ENGINE").is_some_and(|value| value != "0")
+}
+
+/// Whether the engine representation implements every instruction of `program`.
+///
+/// Checked before a chunk is converted, so a program the engine cannot run goes
+/// straight to the Arrow VM instead of paying one `Arrow -> Vein -> Arrow`
+/// round trip to discover the refusal.
+///
+/// The check is deliberately conservative in one direction: it must never claim
+/// support the interpreter does not have, or a query would fail, while refusing
+/// a program the interpreter could in fact run only costs the old path's speed.
+/// It is necessarily incomplete — nothing here knows a column's type, so a
+/// comparison on a non-integer column still reaches [`EngineTransform`] and is
+/// caught by its runtime fallback.
+fn engine_supports(program: &MicroProgram) -> bool {
+    program.instructions.iter().all(|instruction| match instruction {
+        // A literal is materialised through the engine's own constant column, so
+        // only the types that column can carry count as supported.
+        MicroOp::LoadConstant { value, .. } => {
+            matches!(value, LogicalLiteral::Int64(_) | LogicalLiteral::String(_))
+        }
+        MicroOp::CopyRegister { .. }
+        | MicroOp::CmpEq { .. }
+        | MicroOp::CmpNeq { .. }
+        | MicroOp::CmpLt { .. }
+        | MicroOp::CmpLte { .. }
+        | MicroOp::CmpGt { .. }
+        | MicroOp::CmpGte { .. }
+        | MicroOp::Add { .. }
+        | MicroOp::Sub { .. }
+        | MicroOp::Mul { .. }
+        | MicroOp::Div { .. }
+        | MicroOp::Mod { .. }
+        | MicroOp::Neg { .. }
+        | MicroOp::And { .. }
+        | MicroOp::Or { .. }
+        | MicroOp::Not { .. }
+        | MicroOp::IsNull { .. }
+        | MicroOp::IsNotNull { .. }
+        | MicroOp::FilterMask { .. }
+        | MicroOp::ProjectRegisters { .. } => true,
+        _ => false,
+    })
+}
+
+/// Runs a task on the engine's own representation, falling back to the Arrow VM
+/// for anything it refuses.
+///
+/// This is the cutover's seam (`09-testing-and-correctness.md` §4). The engine
+/// representation runs the programs it implements — converting once in and once
+/// out, which ADR 0002 settles as the boundary's cost — and a program it cannot
+/// run is handed to the existing [`VectorVmExecutor`], which still owns the full
+/// instruction set.
+///
+/// Falling back is safe per chunk because `execute_chunk` builds a new chunk and
+/// never mutates the one it was given, so the same chunk can be replayed through
+/// the other VM. Falling back on *any* error is deliberate while the two engines
+/// are compared: a query must not start failing because the new path is less
+/// complete. It also means the new engine's own diagnosis is hidden behind the
+/// old one's, which is the price of the migration and disappears with it.
+struct EngineTransform {
+    program: Arc<MicroProgram>,
+    registry: Arc<FunctionRegistry>,
+    /// The downstream node, until a fallback takes ownership of it.
+    next: Option<Box<dyn PipelineNode<DataChunk>>>,
+    /// The Arrow VM, present once a fallback has happened.
+    fallback: Option<VectorVmExecutor>,
+}
+
+impl EngineTransform {
+    fn new(
+        program: Arc<MicroProgram>,
+        registry: Arc<FunctionRegistry>,
+        next: Box<dyn PipelineNode<DataChunk>>,
+    ) -> Self {
+        Self {
+            program,
+            registry,
+            next: Some(next),
+            fallback: None,
+        }
+    }
+
+    /// Hands the downstream node to a fresh Arrow VM.
+    fn fall_back(&mut self) {
+        let next = self
+            .next
+            .take()
+            .expect("the downstream node is present until a fallback happens");
+        self.fallback = Some(VectorVmExecutor::new(
+            self.program.clone(),
+            self.registry.clone(),
+            next,
+        ));
+    }
+}
+
+impl PipelineNode<DataChunk> for EngineTransform {
+    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+        if let Some(fallback) = &mut self.fallback {
+            return fallback.push(chunk);
+        }
+        let engine_chunk = crate::pipeline::bridge::arrow_chunk_to_vector(&chunk)?;
+        match crate::execution::execute_chunk(&self.program, engine_chunk) {
+            Ok(engine_chunk) => {
+                let chunk = crate::pipeline::bridge::vector_chunk_to_arrow(&engine_chunk)?;
+                self.next
+                    .as_mut()
+                    .expect("the downstream node is present until a fallback happens")
+                    .push(chunk)
+            }
+            Err(_) => {
+                self.fall_back();
+                self.fallback
+                    .as_mut()
+                    .expect("a fallback was just built")
+                    .push(chunk)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        match (&mut self.fallback, &mut self.next) {
+            (Some(fallback), _) => fallback.flush(),
+            (None, Some(next)) => next.flush(),
+            (None, None) => Ok(()),
+        }
+    }
+}
+
+impl Transform<DataChunk> for EngineTransform {}
+
 fn local_scan_paths(files: &[String]) -> Result<(PathBuf, Vec<String>)> {
     let paths = files
         .iter()
@@ -290,4 +441,151 @@ fn local_scan_paths(files: &[String]) -> Result<(PathBuf, Vec<String>)> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok((root, relative))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int64Array};
+    use types::VeinDataType;
+
+    /// Collects the chunks that reach the end of the chain.
+    #[derive(Clone, Default)]
+    struct Collect(Arc<Mutex<Vec<DataChunk>>>);
+
+    impl PipelineNode<DataChunk> for Collect {
+        fn push(&mut self, chunk: DataChunk) -> Result<()> {
+            self.0.lock().expect("collect lock").push(chunk);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn arrow_chunk(values: Vec<i64>) -> DataChunk {
+        let column: ArrayRef = Arc::new(Int64Array::from(values));
+        DataChunk::from_vectors(vec![column])
+    }
+
+    fn build(program: MicroProgram) -> (Box<dyn Transform<DataChunk>>, Collect) {
+        let collect = Collect::default();
+        let builder = DefaultExecutorBuilder::new(Arc::new(FunctionRegistry::new()));
+        let vm = builder
+            .build_vm(&Arc::new(program), Box::new(collect.clone()))
+            .expect("built");
+        (vm, collect)
+    }
+
+    /// A program the engine implements runs on its own representation:
+    /// `id > 2 |> SELECT id`.
+    #[test]
+    fn the_engine_runs_a_supported_program() {
+        let program = MicroProgram {
+            register_count: 3,
+            instructions: vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(2),
+                },
+                MicroOp::CmpGt {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::FilterMask { bool_reg: 2 },
+                MicroOp::ProjectRegisters { out_regs: vec![0] },
+            ],
+        };
+        let (mut vm, collect) = build(program);
+        vm.push(arrow_chunk(vec![1, 2, 3, 4])).expect("push");
+        vm.flush().expect("flush");
+
+        let chunks = collect.0.lock().expect("collect lock");
+        assert_eq!(chunks.len(), 1);
+        let values = chunks[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 output");
+        let selection = &chunks[0].selection;
+        assert_eq!(selection.size(), 2);
+        assert_eq!(values.value(selection.get_index(0)), 3);
+        assert_eq!(values.value(selection.get_index(1)), 4);
+    }
+
+    /// A program the engine refuses still runs, through the Arrow VM.
+    #[test]
+    fn an_unsupported_program_falls_back_to_the_arrow_vm() {
+        let program = MicroProgram {
+            register_count: 2,
+            instructions: vec![
+                MicroOp::Cast {
+                    dst: 1,
+                    src: 0,
+                    target: VeinDataType::Float64,
+                },
+                MicroOp::ProjectRegisters { out_regs: vec![1] },
+            ],
+        };
+        let (mut vm, collect) = build(program);
+        vm.push(arrow_chunk(vec![1, 2, 3])).expect("push");
+        vm.flush().expect("flush");
+
+        let chunks = collect.0.lock().expect("collect lock");
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            chunks[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .is_some(),
+            "the Arrow VM's Cast must produce a Float64 column"
+        );
+    }
+
+    /// The static check never claims more than the interpreter has.
+    #[test]
+    fn the_support_check_matches_the_engine() {
+        let supported = MicroProgram {
+            register_count: 3,
+            instructions: vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(2),
+                },
+                MicroOp::CmpGt {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::FilterMask { bool_reg: 2 },
+                MicroOp::ProjectRegisters { out_regs: vec![0] },
+            ],
+        };
+        assert!(engine_supports(&supported));
+
+        let cast = MicroProgram {
+            register_count: 2,
+            instructions: vec![MicroOp::Cast {
+                dst: 1,
+                src: 0,
+                target: VeinDataType::Float64,
+            }],
+        };
+        assert!(!engine_supports(&cast), "Cast is not implemented");
+
+        let float_literal = MicroProgram {
+            register_count: 2,
+            instructions: vec![MicroOp::LoadConstant {
+                dst: 1,
+                value: LogicalLiteral::Float64(1.0),
+            }],
+        };
+        assert!(
+            !engine_supports(&float_literal),
+            "a Float64 literal cannot be projected as a column yet"
+        );
+    }
 }

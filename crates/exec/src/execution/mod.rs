@@ -31,9 +31,9 @@ pub mod source;
 pub use filter::Filter;
 pub use limit::Limit;
 pub use project::Project;
-pub use register::{BitMask, RegisterFile, RegisterSlot};
+pub use register::{BitMask, ColumnRef, RegisterFile, RegisterSlot};
 pub use source::VectorScanSource;
-pub use vm::ProgramPredicate;
+pub use vm::{ProgramPredicate, execute_chunk};
 
 use common::Result;
 use vector::DataChunk;

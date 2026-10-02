@@ -16,13 +16,16 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, DictionaryArray, Int64Array, StringArray, UInt32Array};
-use arrow::datatypes::UInt32Type;
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, DictionaryArray, Float64Array,
+    Int64Array, PrimitiveArray, StringArray, UInt32Array,
+};
+use arrow::datatypes::{ArrowPrimitiveType, Date32Type, Float64Type, UInt32Type};
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 
 use types::{LogicalLiteral, VeinDataType};
 
-use crate::buffer::BufferRef;
+use crate::buffer::{AlignedValue, BufferRef};
 use crate::validity::Validity;
 use crate::vector::{Encoding, Vector};
 
@@ -47,21 +50,61 @@ pub fn to_arrow(vector: &Vector) -> Option<ArrayRef> {
     }
     match vector.data_type() {
         VeinDataType::Int64 => to_arrow_i64(vector),
+        VeinDataType::Float64 => to_arrow_primitive::<Float64Type>(vector),
+        VeinDataType::Date32 => to_arrow_primitive::<Date32Type>(vector),
         VeinDataType::Utf8 => to_arrow_utf8(vector),
+        VeinDataType::Boolean => to_arrow_boolean(vector),
+        VeinDataType::Decimal128(precision, scale) => {
+            to_arrow_decimal128(vector, *precision, *scale)
+        }
         _ => None,
     }
 }
 
+/// Converts an Int64 vector, resolving its encoding.
+///
+/// Unlike the carried types, an Int64 vector is produced by the engine too and
+/// may be constant-encoded, so this reads through `get_i64` rather than assuming
+/// a flat buffer.
 fn to_arrow_i64(vector: &Vector) -> Option<ArrayRef> {
     let len = vector.len() as usize;
-    // Arrow requires a defined value beside every null bit even though the null
-    // buffer marks it invalid, so null rows carry a placeholder rather than
-    // whatever the encoding happened to hold.
-    let values: Vec<i64> = (0..vector.len())
-        .map(|row| vector.get_i64(row).unwrap_or_default())
-        .collect();
     let nulls = nulls_from_validity(vector.validity(), len);
+    // A flat vector copies its words straight out. Any other encoding is
+    // resolved per row through the accessor, which is the only way to broadcast
+    // a constant without expanding it here. Arrow needs a defined value beside
+    // every null bit either way, and both branches supply one.
+    let values: Vec<i64> = match vector.encoding() {
+        Encoding::Flat { values, .. } => values.as_aligned::<i64>()?.to_vec(),
+        _ => (0..vector.len())
+            .map(|row| vector.get_i64(row).unwrap_or_default())
+            .collect(),
+    };
     Some(Arc::new(Int64Array::new(ScalarBuffer::from(values), nulls)))
+}
+
+/// Converts a flat *carried* fixed-width vector by copying its values through.
+///
+/// A type the engine carries but does not compute on arrives from `from_arrow`
+/// flat and is never constant-encoded, so this reads the buffer directly. It is
+/// shared by every carried type, so a new one costs a line in `to_arrow` (Rule
+/// 38). Arrow requires a defined value beside every null bit, and the buffer
+/// always holds one; `nulls` marks the bit.
+fn to_arrow_primitive<T>(vector: &Vector) -> Option<ArrayRef>
+where
+    T: ArrowPrimitiveType,
+    T::Native: AlignedValue,
+{
+    let Encoding::Flat { values, .. } = vector.encoding() else {
+        // Expanding a constant or dictionary would be a materialisation, so
+        // refuse rather than invent one.
+        return None;
+    };
+    let values: Vec<T::Native> = values.as_aligned::<T::Native>()?.to_vec();
+    let nulls = nulls_from_validity(vector.validity(), vector.len() as usize);
+    Some(Arc::new(PrimitiveArray::<T>::new(
+        ScalarBuffer::from(values),
+        nulls,
+    )))
 }
 
 fn to_arrow_utf8(vector: &Vector) -> Option<ArrayRef> {
@@ -99,12 +142,61 @@ fn to_arrow_utf8(vector: &Vector) -> Option<ArrayRef> {
     )))
 }
 
+/// Converts a boolean vector into an Arrow boolean array.
+///
+/// The bits are already packed LSB-first, which is Arrow's layout, so this is a
+/// byte copy rather than a per-row loop. A row whose bit is unknown is null in
+/// Arrow, which is what keeps a projected condition nullable (ADR 0003).
+fn to_arrow_boolean(vector: &Vector) -> Option<ArrayRef> {
+    let Encoding::Flat { values, .. } = vector.encoding() else {
+        // A constant boolean would have to be expanded to a buffer. That is a
+        // materialisation, so refuse rather than invent one here.
+        return None;
+    };
+    let len = vector.len() as usize;
+    let bits = BooleanBuffer::new(Buffer::from_vec(values.as_slice().to_vec()), 0, len);
+    let nulls = nulls_from_validity(vector.validity(), len);
+    Some(Arc::new(BooleanArray::new(bits, nulls)))
+}
+
+/// Converts a `Decimal128` vector into an Arrow decimal array.
+///
+/// This does **not** go through `as_aligned::<i128>()`: a `BufferRef` guarantees
+/// only `align_of::<u64>()`, so a 16-byte view would be address-dependent (ADR
+/// 0002, Correction 2). Reconstructing each `i128` from its 16 bytes needs no
+/// alignment at all, which keeps the conversion deterministic.
+fn to_arrow_decimal128(vector: &Vector, precision: u8, scale: i8) -> Option<ArrayRef> {
+    let Encoding::Flat { values, .. } = vector.encoding() else {
+        return None;
+    };
+    let bytes = values.as_slice();
+    if !bytes.len().is_multiple_of(16) {
+        return None;
+    }
+    let values: Vec<i128> = bytes
+        .chunks_exact(16)
+        .map(|chunk| {
+            // `chunks_exact(16)` yields exactly 16 bytes, so the conversion
+            // cannot fail.
+            i128::from_ne_bytes(chunk.try_into().expect("16 bytes"))
+        })
+        .collect();
+    let nulls = nulls_from_validity(vector.validity(), vector.len() as usize);
+    Decimal128Array::new(ScalarBuffer::from(values), nulls)
+        .with_precision_and_scale(precision, scale)
+        .ok()
+        .map(|array| Arc::new(array) as ArrayRef)
+}
+
 /// Converts an Arrow array into a Vein vector.
 ///
 /// Returns `None` for an Arrow type the bridge does not yet cover.
 pub fn from_arrow(array: &ArrayRef) -> Option<Vector> {
     if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
         let len = values.len();
+        // Int64 is on the hot path, so it keeps the word-backed constructor: the
+        // values are collected straight into the words the buffer stores, rather
+        // than appended byte by byte and copied again.
         let words: Vec<u64> = values.values().iter().map(|value| *value as u64).collect();
         let validity = validity_from_nulls(values.nulls(), len);
         return Some(Vector::from_parts(
@@ -113,6 +205,48 @@ pub fn from_arrow(array: &ArrayRef) -> Option<Vector> {
             BufferRef::from_words(words, len * 8),
             None,
             validity,
+        ));
+    }
+    if let Some(bools) = array.as_any().downcast_ref::<BooleanArray>() {
+        let len = bools.len();
+        // Buffer 0 is the packed bit buffer; Arrow stores no second value buffer.
+        let bits = BufferRef::from_vec(bools.to_data().buffers()[0].as_slice().to_vec());
+        let validity = validity_from_nulls(bools.nulls(), len);
+        return Some(Vector::from_parts(
+            VeinDataType::Boolean,
+            len as u32,
+            bits,
+            None,
+            validity,
+        ));
+    }
+    // Types the engine carries but does not compute on yet. `value(row)` reads
+    // through the array's own offset, so a sliced batch copies the right rows.
+    if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+        return Some(from_arrow_fixed(
+            values.len(),
+            VeinDataType::Float64,
+            values.nulls(),
+            |row, out| out.extend_from_slice(&values.value(row).to_ne_bytes()),
+        ));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Date32Array>() {
+        return Some(from_arrow_fixed(
+            values.len(),
+            VeinDataType::Date32,
+            values.nulls(),
+            |row, out| out.extend_from_slice(&values.value(row).to_ne_bytes()),
+        ));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Decimal128Array>() {
+        // The precision and scale travel with the type, so a decimal keeps its
+        // meaning rather than becoming a bare 128-bit integer.
+        let data_type = VeinDataType::Decimal128(values.precision(), values.scale());
+        return Some(from_arrow_fixed(
+            values.len(),
+            data_type,
+            values.nulls(),
+            |row, out| out.extend_from_slice(&values.value(row).to_ne_bytes()),
         ));
     }
     if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
@@ -138,6 +272,31 @@ pub fn from_arrow(array: &ArrayRef) -> Option<Vector> {
         return Some(Vector::dictionary(Arc::new(values), &indices).with_validity(validity));
     }
     None
+}
+
+/// Builds a fixed-width vector from an Arrow primitive array.
+///
+/// `write` appends one row's native-endian bytes. Arrow and Vein agree on
+/// native-endian in-memory values — byte order belongs to file formats and is
+/// handled at the storage boundary — so this is a copy, never a reinterpretation.
+/// Shared by every fixed-width type (Rule 38).
+fn from_arrow_fixed(
+    len: usize,
+    data_type: VeinDataType,
+    nulls: Option<&NullBuffer>,
+    mut write: impl FnMut(usize, &mut Vec<u8>),
+) -> Vector {
+    let mut values = Vec::new();
+    for row in 0..len {
+        write(row, &mut values);
+    }
+    Vector::from_parts(
+        data_type,
+        len as u32,
+        BufferRef::from_vec(values),
+        None,
+        validity_from_nulls(nulls, len),
+    )
 }
 
 /// Builds Arrow's null buffer from Vein validity, or `None` when there are no
@@ -271,8 +430,62 @@ mod tests {
         );
         assert!(to_arrow(&floats).is_none());
 
-        let arrows: ArrayRef = Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0]));
+        let arrows: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![1, 2]));
         assert!(from_arrow(&arrows).is_none());
+    }
+
+    /// A type the engine carries but does not compute on round-trips, nulls and
+    /// all: this is what lets a scan project a column it never evaluates.
+    #[test]
+    fn carried_primitive_types_round_trip() {
+        let floats = Vector::from_parts(
+            VeinDataType::Float64,
+            3,
+            BufferRef::from_vec(
+                [1.5f64, 0.0, -2.25]
+                    .iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect(),
+            ),
+            None,
+            Validity::from_bitmap(vec![0b101]),
+        );
+        let array = to_arrow(&floats).expect("convertible");
+        let values = array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("float64");
+        assert_eq!(values.value(0), 1.5);
+        assert_eq!(values.value(2), -2.25);
+        assert!(values.is_null(1));
+        assert_eq!(
+            *from_arrow(&array).expect("back").data_type(),
+            VeinDataType::Float64
+        );
+
+        let dates = Vector::from_parts(
+            VeinDataType::Date32,
+            2,
+            BufferRef::from_vec(
+                [19000i32, 19001]
+                    .iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect(),
+            ),
+            None,
+            Validity::all_valid(),
+        );
+        let array = to_arrow(&dates).expect("convertible");
+        let values = array
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("date32");
+        assert_eq!(values.value(0), 19000);
+        assert_eq!(values.value(1), 19001);
+        assert_eq!(
+            *from_arrow(&array).expect("back").data_type(),
+            VeinDataType::Date32
+        );
     }
 
     #[test]
@@ -382,5 +595,81 @@ mod tests {
         for row in 0..3 {
             assert_eq!(Some(values.value(row)), vector.get_i64(row as u32));
         }
+    }
+
+    /// A boolean vector round-trips through Arrow's own packed layout.
+    #[test]
+    fn boolean_vectors_round_trip() {
+        // Rows: true, false, true.
+        let vector = Vector::from_parts(
+            VeinDataType::Boolean,
+            3,
+            BufferRef::from_words(vec![0b101], 8),
+            None,
+            Validity::all_valid(),
+        );
+        let array = to_arrow(&vector).expect("convertible");
+        let bools = array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("boolean");
+        assert!(bools.value(0));
+        assert!(!bools.value(1));
+        assert!(bools.value(2));
+        assert_eq!(bools.null_count(), 0);
+
+        let back = from_arrow(&array).expect("convertible back");
+        assert_eq!(*back.data_type(), VeinDataType::Boolean);
+        let Encoding::Flat { values, .. } = back.encoding() else {
+            panic!("expected a flat boolean");
+        };
+        assert_eq!(values.as_slice()[0], 0b101);
+    }
+
+    /// An unknown boolean bit must reach Arrow as a null, not as false.
+    #[test]
+    fn an_unknown_boolean_bit_becomes_a_null() {
+        // Row 0 known true, row 1 unknown.
+        let vector = Vector::from_parts(
+            VeinDataType::Boolean,
+            2,
+            BufferRef::from_words(vec![0b01], 8),
+            None,
+            Validity::from_bitmap(vec![0b01]),
+        );
+        let array = to_arrow(&vector).expect("convertible");
+        assert_eq!(array.null_count(), 1);
+        let back = from_arrow(&array).expect("convertible back");
+        assert!(back.is_valid(0));
+        assert!(!back.is_valid(1));
+    }
+
+    /// A decimal is carried with its precision and scale rather than as a bare
+    /// 128-bit integer, and its bytes never need a 16-byte view of Vein storage.
+    #[test]
+    fn decimal_vectors_round_trip() {
+        let mut bytes = Vec::new();
+        for value in [1234i128, -5678] {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        let vector = Vector::from_parts(
+            VeinDataType::Decimal128(15, 2),
+            2,
+            BufferRef::from_vec(bytes),
+            None,
+            Validity::all_valid(),
+        );
+        let array = to_arrow(&vector).expect("convertible");
+        let values = array
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal128");
+        assert_eq!(values.value(0), 1234);
+        assert_eq!(values.value(1), -5678);
+        assert_eq!(values.precision(), 15);
+        assert_eq!(values.scale(), 2);
+
+        let back = from_arrow(&array).expect("convertible back");
+        assert_eq!(*back.data_type(), VeinDataType::Decimal128(15, 2));
     }
 }

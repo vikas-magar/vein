@@ -23,7 +23,34 @@ use common::Result;
 use common::protocol::RegId;
 use error::VeinError;
 use types::LogicalLiteral;
-use vector::{DataChunk, MaskRef, Selection, VectorView, trim_words, words_for};
+use vector::{DataChunk, MaskRef, Selection, VectorRef, VectorView, trim_words, words_for};
+
+/// A column in a register: borrowed from the chunk, or produced and owned here.
+///
+/// Mounting borrows, so a column that already exists is never copied. A column
+/// the program computed exists nowhere else, so the register file owns it
+/// (ADR 0004). Only the view lifetime differs; consumers see a `VectorView`
+/// either way.
+#[derive(Debug, Clone)]
+pub enum ColumnRef<'a> {
+    /// A view of a chunk column.
+    Borrowed(VectorView<'a>),
+    /// A column this register file produced.
+    Owned(VectorRef),
+}
+
+impl ColumnRef<'_> {
+    /// A view of the column, borrowing the slot rather than the chunk.
+    ///
+    /// The register file holds no selection, so a produced column is dense and
+    /// a consumer narrows it with the chunk's selection.
+    pub fn as_view(&self) -> VectorView<'_> {
+        match self {
+            ColumnRef::Borrowed(view) => *view,
+            ColumnRef::Owned(vector) => VectorView::all(vector),
+        }
+    }
+}
 
 /// One virtual register.
 #[derive(Debug, Clone, Default)]
@@ -37,10 +64,10 @@ pub enum RegisterSlot<'a> {
         /// The value.
         value: LogicalLiteral,
     },
-    /// A borrowed column.
+    /// A column, borrowed from the chunk or produced by the program.
     Vector {
-        /// A view of the column, owned by the chunk.
-        view: VectorView<'a>,
+        /// The column.
+        column: ColumnRef<'a>,
     },
     /// A row selection.
     Selection {
@@ -173,7 +200,7 @@ impl<'a> RegisterFile<'a> {
         }
         for (register, column) in chunk.columns().iter().enumerate() {
             self.slots[register] = RegisterSlot::Vector {
-                view: VectorView::all(column),
+                column: ColumnRef::Borrowed(VectorView::all(column)),
             };
         }
         Ok(())
@@ -187,12 +214,26 @@ impl<'a> RegisterFile<'a> {
         }
     }
 
-    /// Borrows a register as a column view.
-    pub fn vector(&self, register: RegId) -> Option<&VectorView<'a>> {
+    /// Borrows a register as a column, borrowed or owned.
+    pub fn column(&self, register: RegId) -> Option<&ColumnRef<'a>> {
         match self.get(register)? {
-            RegisterSlot::Vector { view } => Some(view),
+            RegisterSlot::Vector { column } => Some(column),
             _ => None,
         }
+    }
+
+    /// Writes a produced column into a register, taking ownership of it.
+    ///
+    /// This is the one place ownership enters the register file: a value the
+    /// program computed has no other owner (ADR 0004). A mounted column stays
+    /// borrowed, so the common path still copies nothing.
+    pub fn set_owned(&mut self, register: RegId, vector: VectorRef) -> Result<()> {
+        self.set(
+            register,
+            RegisterSlot::Vector {
+                column: ColumnRef::Owned(vector),
+            },
+        )
     }
 
     /// Borrows a register as a mask.
@@ -236,7 +277,7 @@ mod tests {
         };
         file.set(0, slot).expect("in range");
         assert_eq!(file.scalar(0), Some(&LogicalLiteral::Int64(7)));
-        assert!(file.vector(0).is_none(), "a scalar is not a column");
+        assert!(file.column(0).is_none(), "a scalar is not a column");
     }
 
     #[test]
@@ -278,7 +319,7 @@ mod tests {
         // mount one and check the view reads through to the chunk's buffer.
         let mut file: RegisterFile<'_> = RegisterFile::new(1);
         file.mount(&first).expect("columns fit");
-        let view = file.vector(0).expect("column 0");
+        let view = file.column(0).expect("column 0").as_view();
         assert_eq!(view.len(), 2);
         let values = view.resolve_i64().expect("i64").as_flat().expect("flat");
         assert_eq!(values, &[1, 2]);
@@ -287,8 +328,9 @@ mod tests {
         let mut other: RegisterFile<'_> = RegisterFile::new(1);
         other.mount(&second).expect("columns fit");
         let values = other
-            .vector(0)
+            .column(0)
             .expect("column 0")
+            .as_view()
             .resolve_i64()
             .expect("i64")
             .as_flat()

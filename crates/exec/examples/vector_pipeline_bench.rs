@@ -9,8 +9,12 @@
 //! * the conversion between them, on its own.
 //!
 //! Run with `cargo run -p exec --example vector_pipeline_bench`. The dev profile
-//! is `opt-level = 1`, so absolute numbers are pessimistic; every stage is
-//! compiled identically, so the comparison holds.
+//! is `opt-level = 1`, so absolute numbers are pessimistic and the per-row gap
+//! to Arrow is overstated — `profile.dev` cannot inline the engine's cross-crate
+//! accessors. `--profile perf` (which inherits `release` with thin LTO) is the
+//! build `08-performance-engineering.md` and Rule 41 ask for; every stage is
+//! compiled identically either way, so a stage-by-stage comparison holds in
+//! both.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -22,10 +26,11 @@ use catalog::MetadataStore;
 use common::Result;
 use common::arrow::SelectionVector;
 use common::protocol::{FileFormat, MicroOp, MicroProgram};
-use exec::execution::{Filter, ProgramPredicate};
+use exec::execution::{Filter, ProgramPredicate, execute_chunk};
 use exec::operators::source::scan::{ScanFile, ScanSource};
 use exec::pipeline::{DataChunk, PipelineNode, Source, bridge};
 use exec::udf::FunctionRegistry;
+use exec::vm::VectorVmExecutor;
 use types::LogicalLiteral;
 use types::VeinSchema;
 use vector::DataChunk as VectorChunk;
@@ -116,6 +121,27 @@ fn program() -> MicroProgram {
     }
 }
 
+/// The program shape the planner emits for `WHERE id > t |> SELECT id`, which is
+/// what the executor's engine path actually runs end to end.
+fn wired_program() -> MicroProgram {
+    MicroProgram {
+        register_count: 3,
+        instructions: vec![
+            MicroOp::LoadConstant {
+                dst: 1,
+                value: LogicalLiteral::Int64(THRESHOLD),
+            },
+            MicroOp::CmpGt {
+                dst: 2,
+                src1: 0,
+                src2: 1,
+            },
+            MicroOp::FilterMask { bool_reg: 2 },
+            MicroOp::ProjectRegisters { out_regs: vec![0] },
+        ],
+    }
+}
+
 /// Best-of-N wall time for `work`.
 fn best_of<F: FnMut() -> u64>(iterations: usize, mut work: F) -> (Duration, u64) {
     let mut produced = 0;
@@ -197,10 +223,58 @@ async fn main() -> Result<()> {
     });
     report("convert + VIR filter", elapsed, scanned);
 
+    // --- the wired path: what the executor runs for this program ------------
+    // Convert in, filter, project, convert out — the whole cost the cutover
+    // added to a task, measured against the Arrow path above.
+    let wired = wired_program();
+    let (elapsed, wired_rows) = best_of(20, || {
+        let mut rows = 0u64;
+        for chunk in &chunks {
+            let converted = bridge::arrow_chunk_to_vector(chunk).expect("convertible");
+            let filtered = execute_chunk(&wired, converted).expect("executed");
+            rows += filtered.active_rows() as u64;
+            bridge::vector_chunk_to_arrow(&filtered).expect("convertible back");
+        }
+        rows
+    });
+    report("wired (convert+engine+convert)", elapsed, scanned);
+
+    // --- the Arrow VM: what the executor ran before the cutover -------------
+    // Same chunks, same program, same operator. The comparison that decides
+    // whether the cutover pays for its two boundary conversions.
+    let arrow_vm_program = Arc::new(wired_program());
+    let (elapsed, vm_rows) = best_of(20, || {
+        let sink = CollectArrow::default();
+        let mut vm = VectorVmExecutor::new(
+            Arc::clone(&arrow_vm_program),
+            Arc::new(FunctionRegistry::new()),
+            Box::new(sink.clone()),
+        );
+        for chunk in &chunks {
+            vm.push(chunk.clone()).expect("push");
+        }
+        vm.flush().expect("flush");
+        sink.0
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|chunk| chunk.selection.size() as u64)
+            .sum()
+    });
+    report("arrow VM (pre-cutover path)", elapsed, scanned);
+
     println!("\nrows kept: Arrow {kept}, engine representation {kept_vector}");
     assert_eq!(
         kept, kept_vector,
         "the two paths must agree before their timings mean anything"
+    );
+    assert_eq!(
+        kept, wired_rows,
+        "the wired path must keep the same rows as the others"
+    );
+    assert_eq!(
+        kept, vm_rows,
+        "the Arrow VM must keep the same rows before it is compared"
     );
     Ok(())
 }

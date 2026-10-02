@@ -103,7 +103,7 @@ fn unsupported(index: usize, array: &arrow::array::ArrayRef) -> VeinError {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{ArrayRef, Float64Array, Int64Array};
+    use arrow::array::{ArrayRef, Int64Array};
 
     use super::*;
 
@@ -191,11 +191,11 @@ mod tests {
 
     #[test]
     fn unsupported_types_are_named_not_dropped() {
-        let floats: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
-        let arrow = DataChunk::new(vec![floats], SelectionVector::new_dense(2));
-        let error = arrow_chunk_to_vector(&arrow).expect_err("Float64 is not covered yet");
+        let ints: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![1, 2]));
+        let arrow = DataChunk::new(vec![ints], SelectionVector::new_dense(2));
+        let error = arrow_chunk_to_vector(&arrow).expect_err("Int32 is not covered yet");
         assert!(
-            error.to_string().contains("Float64"),
+            error.to_string().contains("Int32"),
             "the error must name the type: {error}"
         );
     }

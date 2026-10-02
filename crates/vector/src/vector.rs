@@ -102,6 +102,23 @@ impl Vector {
         }
     }
 
+    /// A boolean vector from a packed bitmap: a set bit means `true`.
+    ///
+    /// The bits are LSB-first, the layout Arrow's boolean arrays use and the one
+    /// the engine's conditions already have, so a condition becomes a column by
+    /// moving its bitmap rather than repacking it (ADR 0003). `validity` is the
+    /// condition's own: a row whose bit is unknown is null.
+    pub fn from_boolean(bits: Vec<u64>, validity: Validity, len: u32) -> Self {
+        let bytes = bits.len() * 8;
+        Self::from_parts(
+            VeinDataType::Boolean,
+            len,
+            BufferRef::from_words(bits, bytes),
+            None,
+            validity,
+        )
+    }
+
     /// A vector of `Utf8` values, all valid.
     ///
     /// Values are concatenated into one buffer with `len + 1` end offsets,

@@ -23,11 +23,11 @@ use std::sync::Arc;
 use common::Result;
 use common::protocol::{MicroOp, MicroProgram, RegId};
 use error::VeinError;
-use types::LogicalLiteral;
-use vector::{DataChunk, I64Values, Validity, trim_words, words_for};
+use types::{LogicalLiteral, VeinDataType};
+use vector::{DataChunk, I64Values, Validity, Vector, VectorRef, trim_words, words_for};
 
 use super::Predicate;
-use super::register::{BitMask, RegisterFile, RegisterSlot};
+use super::register::{BitMask, ColumnRef, RegisterFile, RegisterSlot};
 
 /// Evaluates `program` over `chunk` and returns the condition left in `result`.
 pub fn evaluate_condition(
@@ -36,8 +36,7 @@ pub fn evaluate_condition(
     result: RegId,
 ) -> Result<BitMask> {
     let row_count = chunk.row_count();
-    let mut file = RegisterFile::new(program.register_count as usize);
-    file.mount(chunk)?;
+    let mut file = mount(program, chunk)?;
     for instruction in &program.instructions {
         execute(&mut file, instruction, row_count)?;
     }
@@ -48,6 +47,136 @@ pub fn evaluate_condition(
                 "register R{result} does not hold a condition after the program ran"
             ))
         })
+}
+
+/// A register file with `chunk`'s columns mounted, ready to run `program`.
+fn mount<'a>(program: &MicroProgram, chunk: &'a DataChunk) -> Result<RegisterFile<'a>> {
+    let mut file = RegisterFile::new(program.register_count as usize);
+    file.mount(chunk)?;
+    Ok(file)
+}
+
+/// Runs a whole planner program over `chunk`: expressions, the filter, and the
+/// output projection.
+///
+/// [`evaluate_condition`] answers "which rows match"; this is the entry point a
+/// task needs, because a planner program also narrows the selection and picks
+/// the output columns (`02-execution-and-vir-lld.md` §4). The projection shares
+/// the chunk's columns, so it moves handles rather than data (Rule 3).
+///
+/// A `ProjectRegisters` that names something other than a mounted column — a
+/// literal is materialised as a constant column, which stays constant rather
+/// than expanding to one buffer per row. Anything the engine representation
+/// cannot carry is refused by name, the same rule the instruction set follows.
+pub fn execute_chunk(program: &MicroProgram, chunk: DataChunk) -> Result<DataChunk> {
+    let row_count = chunk.row_count();
+    let mut file = mount(program, &chunk)?;
+    let mut selection = chunk.selection().clone();
+    let mut output: Option<Vec<RegId>> = None;
+    for instruction in &program.instructions {
+        match instruction {
+            MicroOp::FilterMask { bool_reg } => {
+                let condition = condition(&file, *bool_reg)?;
+                selection = selection.intersect_keep(row_count, condition.into_keep(row_count));
+            }
+            MicroOp::ProjectRegisters { out_regs } => output = Some(out_regs.clone()),
+            other => execute(&mut file, other, row_count)?,
+        }
+    }
+    // The projection must be resolved while the registers still view the chunk.
+    let projected = match &output {
+        Some(registers) => Some(project(&chunk, &file, registers)?),
+        None => None,
+    };
+    drop(file);
+
+    match projected {
+        Some(columns) => DataChunk::new(row_count, columns, selection)
+            .ok_or_else(|| VeinError::internal("projected columns disagree with the row count")),
+        None => Ok(chunk.with_selection(selection)),
+    }
+}
+
+/// The output columns for `ProjectRegisters`.
+///
+/// A register that still views a chunk column shares it; a literal register is
+/// materialised as a constant column.
+fn project(
+    chunk: &DataChunk,
+    file: &RegisterFile<'_>,
+    registers: &[RegId],
+) -> Result<Vec<VectorRef>> {
+    let mut columns = Vec::with_capacity(registers.len());
+    for register in registers {
+        columns.push(project_register(chunk, file, *register)?);
+    }
+    Ok(columns)
+}
+
+/// One projected column: the chunk column a register views, or a constant.
+///
+/// A mounted register is matched to its column by buffer identity, so an
+/// aliasing `CopyRegister` is accepted and an overwritten register is refused
+/// rather than mis-projected.
+fn project_register(
+    chunk: &DataChunk,
+    file: &RegisterFile<'_>,
+    register: RegId,
+) -> Result<VectorRef> {
+    if let Some(column) = file.column(register) {
+        return match column {
+            ColumnRef::Owned(vector) => Ok(Arc::clone(vector)),
+            ColumnRef::Borrowed(view) => {
+                for index in 0..chunk.num_columns() {
+                    if let Some(source) = chunk.column(index)
+                        && std::ptr::eq(view.vector(), source.as_ref())
+                    {
+                        return Ok(Arc::clone(source));
+                    }
+                }
+                Err(VeinError::internal(format!(
+                    "ProjectRegisters cannot project R{register}: it no longer holds a chunk column"
+                )))
+            }
+        };
+    }
+    if let Some(value) = file.scalar(register) {
+        return Ok(Arc::new(constant_column(value, chunk.row_count())?));
+    }
+    if let Some(mask) = file.mask(register) {
+        return Ok(Arc::new(boolean_column(mask, chunk.row_count())));
+    }
+    Err(VeinError::internal(format!(
+        "ProjectRegisters cannot project R{register}: it holds neither a column, a literal, nor a condition"
+    )))
+}
+
+/// A nullable boolean column for a condition register.
+///
+/// The condition's bits are already packed LSB-first, which is the boolean
+/// layout, so the value buffer is the bitmap itself. `valid` becomes the null
+/// buffer, so a row whose condition is unknown projects as null rather than
+/// false (ADR 0003).
+fn boolean_column(mask: &BitMask, row_count: u32) -> Vector {
+    Vector::from_boolean(
+        mask.values.to_vec(),
+        Validity::from_bitmap(mask.valid.to_vec()),
+        row_count,
+    )
+}
+
+/// A constant column for a literal the engine representation can carry.
+fn constant_column(value: &LogicalLiteral, row_count: u32) -> Result<Vector> {
+    let data_type = match value {
+        LogicalLiteral::Int64(_) => VeinDataType::Int64,
+        LogicalLiteral::String(_) => VeinDataType::Utf8,
+        other => {
+            return Err(VeinError::internal(format!(
+                "a {other:?} literal cannot be projected as a column yet"
+            )));
+        }
+    };
+    Ok(Vector::constant(data_type, value.clone(), row_count))
 }
 
 /// Runs one instruction.
@@ -63,6 +192,22 @@ fn execute(file: &mut RegisterFile, instruction: &MicroOp, row_count: u32) -> Re
             let value = file.get(*src).cloned().ok_or_else(|| absent(*src))?;
             file.set(*dst, value)
         }
+        MicroOp::Add { dst, src1, src2 } => {
+            arithmetic_into::<Add>(file, *dst, *src1, *src2, row_count)
+        }
+        MicroOp::Sub { dst, src1, src2 } => {
+            arithmetic_into::<Sub>(file, *dst, *src1, *src2, row_count)
+        }
+        MicroOp::Mul { dst, src1, src2 } => {
+            arithmetic_into::<Mul>(file, *dst, *src1, *src2, row_count)
+        }
+        MicroOp::Div { dst, src1, src2 } => {
+            arithmetic_into::<Div>(file, *dst, *src1, *src2, row_count)
+        }
+        MicroOp::Mod { dst, src1, src2 } => {
+            arithmetic_into::<Mod>(file, *dst, *src1, *src2, row_count)
+        }
+        MicroOp::Neg { dst, src } => negate_into(file, *dst, *src, row_count),
         MicroOp::CmpEq { dst, src1, src2 } => {
             compare_into::<Equal>(file, *dst, *src1, *src2, row_count)
         }
@@ -204,10 +349,163 @@ fn compare_into<C: Comparison>(
     src2: RegId,
     row_count: u32,
 ) -> Result<()> {
-    let left = operand(file, src1)?;
-    let right = operand(file, src2)?;
-    let mask = compare::<C>(&left, &right, row_count);
+    // The operands borrow the register file, so the comparison is evaluated
+    // before the result is written back into it.
+    let mask = {
+        let left = operand(file, src1)?;
+        let right = operand(file, src2)?;
+        compare::<C>(&left, &right, row_count)
+    };
     file.set(dst, RegisterSlot::Mask { mask })
+}
+
+/// A binary integer operator.
+trait Arithmetic {
+    /// The operator's name, for error messages.
+    const NAME: &'static str;
+    /// `left <op> right`, or `None` on overflow or division by zero.
+    fn eval(left: i64, right: i64) -> Option<i64>;
+}
+
+/// `+`
+struct Add;
+impl Arithmetic for Add {
+    const NAME: &'static str = "Add";
+    #[inline(always)]
+    fn eval(left: i64, right: i64) -> Option<i64> {
+        left.checked_add(right)
+    }
+}
+
+/// `-`
+struct Sub;
+impl Arithmetic for Sub {
+    const NAME: &'static str = "Sub";
+    #[inline(always)]
+    fn eval(left: i64, right: i64) -> Option<i64> {
+        left.checked_sub(right)
+    }
+}
+
+/// `*`
+struct Mul;
+impl Arithmetic for Mul {
+    const NAME: &'static str = "Mul";
+    #[inline(always)]
+    fn eval(left: i64, right: i64) -> Option<i64> {
+        left.checked_mul(right)
+    }
+}
+
+/// `/`
+struct Div;
+impl Arithmetic for Div {
+    const NAME: &'static str = "Div";
+    #[inline(always)]
+    fn eval(left: i64, right: i64) -> Option<i64> {
+        left.checked_div(right)
+    }
+}
+
+/// `%`
+struct Mod;
+impl Arithmetic for Mod {
+    const NAME: &'static str = "Mod";
+    #[inline(always)]
+    fn eval(left: i64, right: i64) -> Option<i64> {
+        left.checked_rem(right)
+    }
+}
+
+/// Evaluates a binary integer operation and writes its column to `dst`.
+fn arithmetic_into<A: Arithmetic>(
+    file: &mut RegisterFile,
+    dst: RegId,
+    src1: RegId,
+    src2: RegId,
+    row_count: u32,
+) -> Result<()> {
+    let column = {
+        let left = operand(file, src1)?;
+        let right = operand(file, src2)?;
+        arithmetic::<A>(&left, &right, row_count)?
+    };
+    file.set_owned(dst, column)
+}
+
+/// Evaluates unary negation and writes its column to `dst`.
+fn negate_into(file: &mut RegisterFile, dst: RegId, src: RegId, row_count: u32) -> Result<()> {
+    let column = {
+        let source = operand(file, src)?;
+        negate(&source, row_count)?
+    };
+    file.set_owned(dst, column)
+}
+
+/// `left <op> right` row by row, as an owned column.
+///
+/// A null on either side makes the row null, so a null marshal never becomes a
+/// value. An overflow or a division by zero fails the query rather than
+/// wrapping, which is what the Arrow path does and what
+/// `09-testing-and-correctness.md` §4 makes the reference. The result is new
+/// data, so the register file owns it (ADR 0004).
+fn arithmetic<A: Arithmetic>(
+    left: &Operand<'_>,
+    right: &Operand<'_>,
+    row_count: u32,
+) -> Result<VectorRef> {
+    computed_column(row_count, |row| {
+        match (value_at(left, row), value_at(right, row)) {
+            (Some(left), Some(right)) => A::eval(left, right).map(Some).ok_or_else(|| {
+                VeinError::internal(format!(
+                    "{} overflowed or divided by zero at row {row}",
+                    A::NAME
+                ))
+            }),
+            _ => Ok(None),
+        }
+    })
+}
+
+/// `-operand` row by row, as an owned column.
+fn negate(operand: &Operand<'_>, row_count: u32) -> Result<VectorRef> {
+    computed_column(row_count, |row| match value_at(operand, row) {
+        Some(value) => value.checked_neg().map(Some).ok_or_else(|| {
+            VeinError::internal(format!("Neg overflowed at row {row}"))
+        }),
+        None => Ok(None),
+    })
+}
+
+/// A dense column from one computed value per row, `None` marking a null.
+///
+/// Every arithmetic kernel shares this: the value loop is the operator's, and
+/// the validity bitmap and buffer are built once, here (Rule 38).
+fn computed_column<F>(row_count: u32, mut value: F) -> Result<VectorRef>
+where
+    F: FnMut(u32) -> Result<Option<i64>>,
+{
+    let mut values = Vec::with_capacity(row_count as usize);
+    let mut valid = vec![0u64; words_for(row_count)];
+    let mut nullable = false;
+    for row in 0..row_count {
+        match value(row)? {
+            Some(value) => {
+                values.push(value);
+                valid[row as usize / 64] |= 1u64 << (row % 64);
+            }
+            None => {
+                nullable = true;
+                values.push(0);
+            }
+        }
+    }
+    let vector = Vector::from_i64(&values);
+    Ok(Arc::new(if nullable {
+        vector.with_validity(Validity::from_bitmap(valid))
+    } else {
+        vector
+    }))
 }
 
 /// One side of a comparison, resolved by encoding once.
@@ -242,17 +540,18 @@ fn value_at(operand: &Operand<'_>, row: u32) -> Option<i64> {
 }
 
 /// Resolves a register as an operand.
-fn operand<'a>(file: &RegisterFile<'a>, register: RegId) -> Result<Operand<'a>> {
+///
+/// The view borrows the register file, which borrows the chunk, so an operand
+/// may read either a mounted column or one the program produced (ADR 0004).
+fn operand<'f>(file: &'f RegisterFile<'_>, register: RegId) -> Result<Operand<'f>> {
     if let Some(value) = file.scalar(register) {
         return Ok(Operand::Scalar(match value {
             LogicalLiteral::Int64(value) => Some(*value),
             _ => None,
         }));
     }
-    if let Some(view) = file.vector(register) {
-        // The view is `Copy`, so this is a pointer copy rather than a borrow of
-        // the register file.
-        let view = *view;
+    if let Some(column) = file.column(register) {
+        let view = column.as_view();
         let values = view.resolve_i64().ok_or_else(|| {
             VeinError::internal(format!(
                 "R{register} holds {:?}, which this VM cannot read as Int64",
@@ -408,7 +707,8 @@ fn null_condition<'a>(file: &RegisterFile<'a>, register: RegId, row_count: u32) 
         if matches!(value, LogicalLiteral::Null(_)) {
             values.fill(u64::MAX);
         }
-    } else if let Some(view) = file.vector(register) {
+    } else if let Some(column) = file.column(register) {
+        let view = column.as_view();
         for row in 0..row_count {
             if !view.is_valid(row) {
                 values[row as usize / 64] |= 1 << (row % 64);
@@ -482,7 +782,7 @@ impl Predicate for ProgramPredicate {
 mod tests {
     use std::sync::Arc;
 
-    use vector::{Selection, Validity, Vector, VectorRef};
+    use vector::{Encoding, Selection, Validity, Vector, VectorRef};
 
     use super::*;
 
@@ -670,17 +970,246 @@ mod tests {
         let chunk = chunk_of(&[1, 2], None);
         let program = program(
             3,
-            vec![MicroOp::Add {
+            vec![MicroOp::CallUdf {
+                name: "missing".to_string(),
+                arg_regs: vec![0],
                 dst: 2,
-                src1: 0,
-                src2: 0,
             }],
         );
-        let error = evaluate_condition(&program, &chunk, 2).expect_err("Add is not implemented");
+        let error =
+            evaluate_condition(&program, &chunk, 2).expect_err("CallUdf is not implemented");
         assert!(
-            error.to_string().contains("Add"),
+            error.to_string().contains("CallUdf"),
             "the error must name the instruction: {error}"
         );
+    }
+
+    /// `SELECT id + 1`: an integer expression becomes an owned column the
+    /// projection can name.
+    #[test]
+    fn execute_chunk_projects_an_arithmetic_expression() {
+        let ids: VectorRef = Arc::new(Vector::from_i64(&[10, 20, 30]));
+        let chunk = DataChunk::new(3, vec![ids], Selection::all()).expect("consistent");
+        let program = program(
+            3,
+            vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(1),
+                },
+                MicroOp::Add {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::ProjectRegisters { out_regs: vec![2] },
+            ],
+        );
+
+        let out = execute_chunk(&program, chunk).expect("executed");
+        let view = out.view(0).expect("column 0");
+        let values = view.resolve_i64().expect("i64");
+        let computed: Vec<i64> = view.rows().filter_map(|row| values.at(row)).collect();
+        assert_eq!(computed, vec![11, 21, 31]);
+    }
+
+    /// A null operand makes the row null; it does not become zero.
+    #[test]
+    fn arithmetic_propagates_nulls() {
+        let chunk = chunk_of(&[10, 20, 30], Some(&[true, false, true]));
+        let program = program(
+            3,
+            vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(5),
+                },
+                MicroOp::Mul {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::ProjectRegisters { out_regs: vec![2] },
+            ],
+        );
+
+        let out = execute_chunk(&program, chunk).expect("executed");
+        let view = out.view(0).expect("column 0");
+        let values = view.resolve_i64().expect("i64");
+        let computed: Vec<Option<i64>> = (0..3)
+            .map(|row| view.is_valid(row).then(|| values.at(row)).flatten())
+            .collect();
+        assert_eq!(computed, vec![Some(50), None, Some(150)]);
+    }
+
+    /// Overflow fails the query instead of wrapping silently.
+    #[test]
+    fn arithmetic_overflow_is_reported() {
+        let chunk = chunk_of(&[i64::MAX, 1], None);
+        let program = program(
+            3,
+            vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(1),
+                },
+                MicroOp::Add {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+            ],
+        );
+
+        let error = execute_chunk(&program, chunk).expect_err("i64::MAX + 1 overflows");
+        assert!(error.to_string().contains("Add"), "{error}");
+    }
+
+    /// Negation is reachable from a program and produces an owned column.
+    #[test]
+    fn execute_chunk_negates() {
+        let chunk = chunk_of(&[1, -2, 3], None);
+        let program = program(
+            3,
+            vec![
+                MicroOp::Neg { dst: 1, src: 0 },
+                MicroOp::ProjectRegisters { out_regs: vec![1] },
+            ],
+        );
+
+        let out = execute_chunk(&program, chunk).expect("executed");
+        let view = out.view(0).expect("column 0");
+        let values = view.resolve_i64().expect("i64");
+        let negated: Vec<i64> = view.rows().filter_map(|row| values.at(row)).collect();
+        assert_eq!(negated, vec![-1, 2, -3]);
+    }
+
+    /// Every integer operator, against Rust's own semantics for the same rows.
+    #[test]
+    fn arithmetic_covers_every_operator() {
+        let chunk = chunk_of(&[10, 20, 7], None);
+        let program = program(
+            7,
+            vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(3),
+                },
+                MicroOp::Sub {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::Div {
+                    dst: 3,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::Mod {
+                    dst: 4,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::Mul {
+                    dst: 5,
+                    src1: 2,
+                    src2: 1,
+                },
+                MicroOp::ProjectRegisters {
+                    out_regs: vec![2, 3, 4, 5],
+                },
+            ],
+        );
+
+        let out = execute_chunk(&program, chunk).expect("executed");
+        let read = |index: usize| -> Vec<i64> {
+            let view = out.view(index).expect("column");
+            let values = view.resolve_i64().expect("i64");
+            view.rows().filter_map(|row| values.at(row)).collect()
+        };
+        assert_eq!(read(0), vec![7, 17, 4], "Sub");
+        assert_eq!(read(1), vec![3, 6, 2], "Div");
+        assert_eq!(read(2), vec![1, 2, 1], "Mod");
+        assert_eq!(read(3), vec![21, 51, 12], "Mul of (Sub, literal)");
+    }
+
+    /// Division by zero is reported rather than producing a value.
+    #[test]
+    fn division_by_zero_is_reported() {
+        let chunk = chunk_of(&[1, 2], None);
+        let program = program(
+            3,
+            vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(0),
+                },
+                MicroOp::Div {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+            ],
+        );
+
+        let error = execute_chunk(&program, chunk).expect_err("division by zero");
+        assert!(error.to_string().contains("Div"), "{error}");
+    }
+
+    /// A condition projects as a boolean column, so `SELECT x > 5` is
+    /// expressible instead of refused.
+    #[test]
+    fn execute_chunk_projects_a_condition() {
+        let chunk = chunk_of(&[1, 9, 3, 8], None);
+        let program = program(
+            3,
+            vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(5),
+                },
+                MicroOp::CmpGt {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::ProjectRegisters { out_regs: vec![2] },
+            ],
+        );
+
+        let out = execute_chunk(&program, chunk).expect("executed");
+        let column = out.column(0).expect("column 0");
+        assert_eq!(*column.data_type(), VeinDataType::Boolean);
+        let Encoding::Flat { values, .. } = column.encoding() else {
+            panic!("expected a flat boolean");
+        };
+        assert_eq!(values.as_slice()[0], 0b0000_1010, "rows 1 and 3 are true");
+    }
+
+    /// A row whose condition is unknown projects as null, not as false.
+    #[test]
+    fn a_projected_condition_keeps_unknown_rows_null() {
+        let chunk = chunk_of(&[1, 9], Some(&[true, false]));
+        let program = program(
+            3,
+            vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(5),
+                },
+                MicroOp::CmpGt {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::ProjectRegisters { out_regs: vec![2] },
+            ],
+        );
+
+        let out = execute_chunk(&program, chunk).expect("executed");
+        let column = out.column(0).expect("column 0");
+        assert!(column.is_valid(0), "1 > 5 is known false");
+        assert!(!column.is_valid(1), "a null operand is unknown");
     }
 
     #[test]
@@ -694,5 +1223,116 @@ mod tests {
             }],
         );
         assert!(evaluate_condition(&program, &chunk, 1).is_err());
+    }
+
+    /// A whole planner-shaped program — expression, filter, projection — on the
+    /// engine's own representation.
+    #[test]
+    fn execute_chunk_filters_and_projects() {
+        let ids: VectorRef = Arc::new(Vector::from_i64(&[10, 20, 30, 40]));
+        let labels: VectorRef = Arc::new(Vector::from_utf8(&["a", "b", "c", "d"]));
+        let chunk = DataChunk::new(4, vec![ids, labels], Selection::all()).expect("consistent");
+        let program = program(
+            3,
+            vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(25),
+                },
+                MicroOp::CmpGt {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::FilterMask { bool_reg: 2 },
+                MicroOp::ProjectRegisters { out_regs: vec![0] },
+            ],
+        );
+
+        let out = execute_chunk(&program, chunk).expect("executed");
+        assert_eq!(out.num_columns(), 1);
+        assert_eq!(out.active_rows(), 2);
+        let view = out.view(0).expect("column 0");
+        let values = view.resolve_i64().expect("i64");
+        let kept: Vec<i64> = view.rows().filter_map(|row| values.at(row)).collect();
+        assert_eq!(kept, vec![30, 40]);
+    }
+
+    /// Projection shares the source column rather than copying it.
+    #[test]
+    fn execute_chunk_projects_by_handle() {
+        let ids: VectorRef = Arc::new(Vector::from_i64(&[1, 2]));
+        let chunk = DataChunk::new(2, vec![ids.clone()], Selection::all()).expect("consistent");
+        let program = program(1, vec![MicroOp::ProjectRegisters { out_regs: vec![0] }]);
+
+        let out = execute_chunk(&program, chunk).expect("executed");
+        assert!(Arc::ptr_eq(out.column(0).expect("column 0"), &ids));
+    }
+
+    /// A literal register projects as a constant column, which stays constant
+    /// instead of expanding to one buffer per row.
+    #[test]
+    fn execute_chunk_materialises_a_literal_projection() {
+        let chunk = chunk_of(&[1, 2, 3], None);
+        let program = program(
+            2,
+            vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(7),
+                },
+                MicroOp::ProjectRegisters { out_regs: vec![1] },
+            ],
+        );
+
+        let out = execute_chunk(&program, chunk).expect("executed");
+        assert_eq!(out.num_columns(), 1);
+        assert_eq!(out.active_rows(), 3);
+        let column = out.column(0).expect("column 0");
+        assert!(
+            matches!(column.encoding(), Encoding::Constant(_)),
+            "a literal must not be expanded into a buffer"
+        );
+        assert_eq!(
+            out.view(0).and_then(|view| view.resolve_i64()).and_then(|values| values.at(2)),
+            Some(7)
+        );
+    }
+
+    /// A literal the engine representation cannot carry is refused by name.
+    #[test]
+    fn execute_chunk_refuses_a_literal_it_cannot_project() {
+        let chunk = chunk_of(&[1, 2], None);
+        let program = program(
+            2,
+            vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Float64(1.0),
+                },
+                MicroOp::ProjectRegisters { out_regs: vec![1] },
+            ],
+        );
+
+        let error = execute_chunk(&program, chunk).expect_err("Float64 is not a column type yet");
+        assert!(error.to_string().contains("Float64"), "{error}");
+    }
+
+    /// A `CopyRegister` alias still names the column it views, matched by buffer
+    /// identity rather than by register number.
+    #[test]
+    fn execute_chunk_projects_an_aliased_column() {
+        let ids: VectorRef = Arc::new(Vector::from_i64(&[1, 2]));
+        let chunk = DataChunk::new(2, vec![ids.clone()], Selection::all()).expect("consistent");
+        let program = program(
+            2,
+            vec![
+                MicroOp::CopyRegister { dst: 1, src: 0 },
+                MicroOp::ProjectRegisters { out_regs: vec![1] },
+            ],
+        );
+
+        let out = execute_chunk(&program, chunk).expect("executed");
+        assert!(Arc::ptr_eq(out.column(0).expect("column 0"), &ids));
     }
 }
