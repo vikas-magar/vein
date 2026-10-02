@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
 
-use crate::operators::join::{BuildSink, HashJoin, JoinKeys, JoinType, OutputColumn};
+use crate::operators::join::{BuildSink, HashTable, HashJoin, JoinKeys, JoinType, OutputColumn};
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use crate::operators::sink::WriteReceipt;
 use common::Result;
@@ -206,24 +206,57 @@ impl DefaultTaskExecutor {
         let join = match (&task.build, &task.join) {
             (Some(build_source), Some(plan)) => {
                 let build_started = Instant::now();
-                let mut build_sink =
-                    BuildSink::new(join_keys(&plan.probe_keys), join_keys(&plan.build_keys));
-                let mut source =
-                    self.builder
-                        .build_source(build_source, task.task_id, task.attempt)?;
-                source.execute(&mut build_sink).await?;
+                let probe_keys = join_keys(&plan.probe_keys);
+                let build_keys = join_keys(&plan.build_keys);
+
+                // One build per file, run concurrently, then merged. Reading the
+                // build side as a single source walked its files one after
+                // another, which is the largest serial cost in a join — an
+                // ordinary scan already spreads a table's files across workers.
+                let sources = split_scan(build_source);
+                let builds_used = sources.len();
+                let mut builds = Vec::with_capacity(sources.len());
+                for source in sources {
+                    let builder = self.builder.clone();
+                    let sink = BuildSink::new(probe_keys.clone(), build_keys.clone());
+                    let task_id = task.task_id;
+                    let attempt = task.attempt;
+                    builds.push(tokio::spawn(async move {
+                        let mut sink = sink;
+                        let mut source = builder.build_source(&source, task_id, attempt)?;
+                        source.execute(&mut sink).await?;
+                        Ok::<_, VeinError>(sink.finish())
+                    }));
+                }
+
+                let mut table: Option<HashTable> = None;
+                for build in builds {
+                    let partial = build
+                        .await
+                        .map_err(|error| {
+                            VeinError::internal(format!("join build task failed: {error}"))
+                        })??;
+                    match &mut table {
+                        Some(table) => table.merge(partial)?,
+                        None => table = Some(partial),
+                    }
+                }
+                let table = table
+                    .ok_or_else(|| VeinError::internal("a join build produced no chunks"))?;
+
                 // The whole build phase — reading it *and* hashing it — so the
                 // join's two halves can be compared without summing scan events.
-                let build_rows = build_sink.rows();
+                let build_rows = table.len() as u64;
                 let build_us = build_started.elapsed().as_micros() as u64;
                 tracing::info!(
                     target: "vein.audit",
                     event = "join_build_phase",
                     rows = build_rows,
+                    builds = builds_used,
                     build_us,
                     "join_build_phase"
                 );
-                Some((build_sink.finish(), plan))
+                Some((table, plan))
             }
             _ => None,
         };
@@ -339,6 +372,30 @@ impl TaskExecutor for DefaultTaskExecutor {
 /// A plan's key columns as chunk column positions.
 fn join_keys(columns: &[u32]) -> JoinKeys {
     JoinKeys::new(columns.iter().map(|column| *column as usize).collect())
+}
+
+/// One source per file, so a join's build side can be read in parallel.
+///
+/// An ordinary scan spreads a table's files across the worker pool; the build
+/// side of a join was read as a single source, so its files were walked one
+/// after another — the largest serial cost in a join. The split mirrors the
+/// physical builder's, which is `pub(crate)` there.
+fn split_scan(source: &DataSource) -> Vec<DataSource> {
+    let DataSource::File(scan) = source else {
+        return vec![source.clone()];
+    };
+    if scan.files.len() <= 1 {
+        return vec![source.clone()];
+    }
+    scan.files
+        .iter()
+        .map(|file| {
+            let mut one = scan.clone();
+            one.files = vec![file.clone()];
+            one.task_id = TaskId::new();
+            DataSource::File(one)
+        })
+        .collect()
 }
 
 /// A plan's join flavour as the operator's.
