@@ -205,12 +205,24 @@ impl DefaultTaskExecutor {
         // runtime's job because only the runtime knows when a source is done.
         let join = match (&task.build, &task.join) {
             (Some(build_source), Some(plan)) => {
+                let build_started = Instant::now();
                 let mut build_sink =
                     BuildSink::new(join_keys(&plan.probe_keys), join_keys(&plan.build_keys));
                 let mut source =
                     self.builder
                         .build_source(build_source, task.task_id, task.attempt)?;
                 source.execute(&mut build_sink).await?;
+                // The whole build phase — reading it *and* hashing it — so the
+                // join's two halves can be compared without summing scan events.
+                let build_rows = build_sink.rows();
+                let build_us = build_started.elapsed().as_micros() as u64;
+                tracing::info!(
+                    target: "vein.audit",
+                    event = "join_build_phase",
+                    rows = build_rows,
+                    build_us,
+                    "join_build_phase"
+                );
                 Some((build_sink.finish(), plan))
             }
             _ => None,
