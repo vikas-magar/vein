@@ -186,9 +186,18 @@ impl LocalQuery {
                 Arc::new(Mutex::new((0..task_count).map(|_| None).collect()));
 
             if task_count == 1 {
-                // A stage of a single morsel is cheaper to run inline than to
-                // dispatch: no spawn and no channel hop.
-                run_task(&self.executor, &tasks[0], &senders, &outcomes, 0).await;
+                // Still dispatched rather than awaited here: the consumer below
+                // only starts draining after this point, so a task that fills
+                // the bounded channel would block forever. A join is the first
+                // operator to emit more chunks than the channel holds, which is
+                // how this surfaced — a scan emits one chunk per file.
+                let executor = self.executor.clone();
+                let tasks = Arc::clone(&tasks);
+                let senders = Arc::clone(&senders);
+                let outcomes = Arc::clone(&outcomes);
+                tokio::spawn(async move {
+                    run_task(&executor, &tasks[0], &senders, &outcomes, 0).await;
+                });
             } else {
                 // The first `workers` tasks are claimed up front; afterwards a
                 // worker pulls the next unclaimed index, so a straggler is

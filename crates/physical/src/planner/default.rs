@@ -66,16 +66,13 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
             | LogicalPlan::ExternalScan { .. }
             | LogicalPlan::Filter { .. }
             | LogicalPlan::Project { .. }
+            | LogicalPlan::Join { .. }
             | LogicalPlan::Write { .. } => {
                 let stage = self.pipeline_builder.build(&logical_plan)?;
                 Ok(Job::new(request_id, query_id, stage, ExecutionMode::Batch))
             }
             LogicalPlan::Aggregate { .. } => Err(VeinError::planning(
                 "aggregations are not supported by the single-node execution engine yet",
-                None,
-            )),
-            LogicalPlan::Join { .. } => Err(VeinError::planning(
-                "JOIN is not supported by the single-node execution engine yet",
                 None,
             )),
             other => Err(VeinError::planning(
@@ -171,10 +168,16 @@ mod tests {
             schema,
         };
 
+        // A join is planned now, so the blanket refusal must be gone. These mock
+        // inputs still cannot compile into a source, so this fails — but for a
+        // reason, not because joins are unsupported.
         let error = DefaultPhysicalPlanner::new()
             .create_physical_plan(RequestId::new(), join)
-            .expect_err("join is not implemented by the local engine");
+            .expect_err("the mock join cannot execute");
 
-        assert!(error.to_string().contains("JOIN is not supported"));
+        assert!(
+            !error.to_string().contains("JOIN is not supported"),
+            "joins must no longer be refused wholesale: {error}"
+        );
     }
 }
