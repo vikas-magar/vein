@@ -58,7 +58,14 @@ impl LogicalBinder for QueryBinder {
     async fn bind_with_catalog_revision<'a>(&self, node: &'a QueryNode<'a>) -> Result<BoundQuery> {
         let catalog_ref = self.catalog.as_ref();
         let functions_ref = self.functions.as_ref();
+        // Opening a planning session is a catalog call, and it happens before a
+        // single operator is bound. For a two-table query `bind` measured 12x the
+        // optimizer and 24x the planner combined, so which half that is decides
+        // whether the cost is metadata or binding.
+        let session_started = std::time::Instant::now();
         let planning_session = self.catalog.begin_planning_session().await?;
+        let session_us = session_started.elapsed().as_micros() as u64;
+        let binding_started = std::time::Instant::now();
         let mut context =
             BinderContext::with_planning_session(catalog_ref, functions_ref, planning_session);
         let mut scopes = ScopeStack::new();
@@ -76,6 +83,14 @@ impl LogicalBinder for QueryBinder {
                 }
             }
         };
+
+        tracing::info!(
+            target: "vein.audit",
+            event = "bind_phases",
+            session_us,
+            bind_us = binding_started.elapsed().as_micros() as u64,
+            "bind_phases"
+        );
 
         Ok(BoundQuery {
             plan,
