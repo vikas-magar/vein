@@ -24,7 +24,7 @@ use common::Result;
 use common::protocol::{MicroOp, MicroProgram, RegId};
 use error::VeinError;
 use types::LogicalLiteral;
-use vector::{DataChunk, I64Values, Vector, VectorView, trim_words, words_for};
+use vector::{DataChunk, I64Values, Validity, trim_words, words_for};
 
 use super::Predicate;
 use super::register::{BitMask, RegisterFile, RegisterSlot};
@@ -63,16 +63,23 @@ fn execute(file: &mut RegisterFile, instruction: &MicroOp, row_count: u32) -> Re
             let value = file.get(*src).cloned().ok_or_else(|| absent(*src))?;
             file.set(*dst, value)
         }
-        MicroOp::CmpEq { dst, src1, src2 }
-        | MicroOp::CmpNeq { dst, src1, src2 }
-        | MicroOp::CmpLt { dst, src1, src2 }
-        | MicroOp::CmpLte { dst, src1, src2 }
-        | MicroOp::CmpGt { dst, src1, src2 }
-        | MicroOp::CmpGte { dst, src1, src2 } => {
-            let left = operand(file, *src1)?;
-            let right = operand(file, *src2)?;
-            let mask = compare(&left, &right, row_count, comparison(instruction));
-            file.set(*dst, RegisterSlot::Mask { mask })
+        MicroOp::CmpEq { dst, src1, src2 } => {
+            compare_into::<Equal>(file, *dst, *src1, *src2, row_count)
+        }
+        MicroOp::CmpNeq { dst, src1, src2 } => {
+            compare_into::<NotEqual>(file, *dst, *src1, *src2, row_count)
+        }
+        MicroOp::CmpLt { dst, src1, src2 } => {
+            compare_into::<Less>(file, *dst, *src1, *src2, row_count)
+        }
+        MicroOp::CmpLte { dst, src1, src2 } => {
+            compare_into::<LessOrEqual>(file, *dst, *src1, *src2, row_count)
+        }
+        MicroOp::CmpGt { dst, src1, src2 } => {
+            compare_into::<Greater>(file, *dst, *src1, *src2, row_count)
+        }
+        MicroOp::CmpGte { dst, src1, src2 } => {
+            compare_into::<GreaterOrEqual>(file, *dst, *src1, *src2, row_count)
         }
         MicroOp::And { dst, src1, src2 } => {
             let left = condition(file, *src1)?;
@@ -124,66 +131,137 @@ fn execute(file: &mut RegisterFile, instruction: &MicroOp, row_count: u32) -> Re
     }
 }
 
-/// Which comparison an instruction denotes.
-fn comparison(instruction: &MicroOp) -> fn(i64, i64) -> bool {
-    match instruction {
-        MicroOp::CmpEq { .. } => |left, right| left == right,
-        MicroOp::CmpNeq { .. } => |left, right| left != right,
-        MicroOp::CmpLt { .. } => |left, right| left < right,
-        MicroOp::CmpLte { .. } => |left, right| left <= right,
-        MicroOp::CmpGt { .. } => |left, right| left > right,
-        _ => |left, right| left >= right,
+/// A comparison operator.
+///
+/// Each operator is a zero-sized type rather than a `fn` pointer, so a kernel
+/// monomorphises per operator and the test inlines. A pointer chosen at run time
+/// is an indirect call in the innermost loop, and it blocks the auto-vectorising
+/// a SIMD kernel needs (Rule 4).
+trait Comparison {
+    /// Whether `left <op> right`.
+    fn test(left: i64, right: i64) -> bool;
+}
+
+/// `=`
+struct Equal;
+impl Comparison for Equal {
+    #[inline(always)]
+    fn test(left: i64, right: i64) -> bool {
+        left == right
     }
 }
 
-/// One side of an operation, resolved by encoding once.
+/// `<>`
+struct NotEqual;
+impl Comparison for NotEqual {
+    #[inline(always)]
+    fn test(left: i64, right: i64) -> bool {
+        left != right
+    }
+}
+
+/// `<`
+struct Less;
+impl Comparison for Less {
+    #[inline(always)]
+    fn test(left: i64, right: i64) -> bool {
+        left < right
+    }
+}
+
+/// `<=`
+struct LessOrEqual;
+impl Comparison for LessOrEqual {
+    #[inline(always)]
+    fn test(left: i64, right: i64) -> bool {
+        left <= right
+    }
+}
+
+/// `>`
+struct Greater;
+impl Comparison for Greater {
+    #[inline(always)]
+    fn test(left: i64, right: i64) -> bool {
+        left > right
+    }
+}
+
+/// `>=`
+struct GreaterOrEqual;
+impl Comparison for GreaterOrEqual {
+    #[inline(always)]
+    fn test(left: i64, right: i64) -> bool {
+        left >= right
+    }
+}
+
+/// Evaluates one comparison instruction and writes its condition to `dst`.
+fn compare_into<C: Comparison>(
+    file: &mut RegisterFile,
+    dst: RegId,
+    src1: RegId,
+    src2: RegId,
+    row_count: u32,
+) -> Result<()> {
+    let left = operand(file, src1)?;
+    let right = operand(file, src2)?;
+    let mask = compare::<C>(&left, &right, row_count);
+    file.set(dst, RegisterSlot::Mask { mask })
+}
+
+/// One side of a comparison, resolved by encoding once.
+///
+/// The encoding and the validity are resolved here, before the row loop, so the
+/// inner loop indexes a slice instead of re-matching the encoding per row
+/// (Rule 4). `02-execution-and-vir-lld.md` §6 states that shape.
 enum Operand<'a> {
     /// A constant, or the absence of one for a null or non-integer literal.
     Scalar(Option<i64>),
-    /// A column with its values already resolved.
+    /// A borrowed column with its values and validity resolved.
     Column {
-        /// The column, needed for its validity.
-        vector: &'a Vector,
         /// The resolved values.
         values: I64Values<'a>,
+        /// Which rows are non-null.
+        validity: &'a Validity,
     },
 }
 
-impl Operand<'_> {
-    /// The value at `row`, or `None` when the row is null.
-    fn at(&self, row: u32) -> Option<i64> {
-        match self {
-            Operand::Scalar(value) => *value,
-            Operand::Column { vector, values } => {
-                if vector.is_valid(row) {
-                    values.at(row)
-                } else {
-                    None
-                }
+/// The value of `operand` at `row`, or `None` when the row is unknown.
+fn value_at(operand: &Operand<'_>, row: u32) -> Option<i64> {
+    match operand {
+        Operand::Scalar(value) => *value,
+        Operand::Column { values, validity } => {
+            if validity.is_valid(row) {
+                values.at(row)
+            } else {
+                None
             }
         }
     }
 }
 
 /// Resolves a register as an operand.
-fn operand(file: &RegisterFile, register: RegId) -> Result<Operand<'_>> {
+fn operand<'a>(file: &RegisterFile<'a>, register: RegId) -> Result<Operand<'a>> {
     if let Some(value) = file.scalar(register) {
         return Ok(Operand::Scalar(match value {
             LogicalLiteral::Int64(value) => Some(*value),
             _ => None,
         }));
     }
-    if let Some(vector) = file.vector(register) {
-        let column: &Vector = vector.as_ref();
-        let values = VectorView::all(column).resolve_i64().ok_or_else(|| {
+    if let Some(view) = file.vector(register) {
+        // The view is `Copy`, so this is a pointer copy rather than a borrow of
+        // the register file.
+        let view = *view;
+        let values = view.resolve_i64().ok_or_else(|| {
             VeinError::internal(format!(
                 "R{register} holds {:?}, which this VM cannot read as Int64",
-                column.data_type()
+                view.data_type()
             ))
         })?;
         return Ok(Operand::Column {
-            vector: column,
             values,
+            validity: view.validity(),
         });
     }
     Err(VeinError::internal(format!(
@@ -193,23 +271,108 @@ fn operand(file: &RegisterFile, register: RegId) -> Result<Operand<'_>> {
 
 /// Compares two operands row by row.
 ///
-/// A null on either side leaves the bit unknown rather than false, so a later
-/// `NOT` cannot turn it into a match.
-fn compare(
+/// The operand shape is matched once, outside the loop, and the operator is a
+/// type parameter, so each comparison compiles to its own inlined loop. A flat
+/// column against an integer literal — the shape a predicate actually hits —
+/// indexes the slice directly; every other shape falls back to the encoding's
+/// own accessor. A null on either side leaves the bit unknown rather than false,
+/// so a later `NOT` cannot turn it into a match.
+fn compare<C: Comparison>(
     left: &Operand<'_>,
     right: &Operand<'_>,
     row_count: u32,
-    test: fn(i64, i64) -> bool,
+) -> BitMask {
+    // A null (or non-integer) literal on either side leaves every row unknown.
+    if matches!(left, Operand::Scalar(None)) || matches!(right, Operand::Scalar(None)) {
+        return unknown_mask(row_count);
+    }
+    match (left, right) {
+        (Operand::Scalar(Some(left)), Operand::Scalar(Some(right))) => {
+            constant_mask(row_count, C::test(*left, *right))
+        }
+        (
+            Operand::Column {
+                values: I64Values::Flat(values),
+                validity,
+            },
+            Operand::Scalar(Some(scalar)),
+        ) => flat_scalar::<C>(values, validity, *scalar, row_count, false),
+        (
+            Operand::Scalar(Some(scalar)),
+            Operand::Column {
+                values: I64Values::Flat(values),
+                validity,
+            },
+        ) => flat_scalar::<C>(values, validity, *scalar, row_count, true),
+        _ => compare_encoded::<C>(left, right, row_count),
+    }
+}
+
+/// `flat column <op> scalar`, written word by word.
+///
+/// `scalar_on_left` selects the operand order without a second loop. Rows past
+/// the buffer stay unknown rather than being read, so a short buffer fails
+/// closed the way [`I64Values::at`] does.
+fn flat_scalar<C: Comparison>(
+    values: &[i64],
+    validity: &Validity,
+    scalar: i64,
+    row_count: u32,
+    scalar_on_left: bool,
+) -> BitMask {
+    let rows = (row_count as usize).min(values.len());
+    let mut bits = vec![0u64; words_for(row_count)];
+    let mut known = vec![0u64; words_for(row_count)];
+    // A column with no nulls skips the validity test entirely. The flag is
+    // loop-invariant, so the branch disappears from the specialised loop.
+    let may_be_null = validity.has_nulls();
+    for (index, word) in bits.iter_mut().enumerate() {
+        let base = index * 64;
+        if base >= rows {
+            break;
+        }
+        let end = (base + 64).min(rows);
+        let mut set = 0u64;
+        let mut valid = 0u64;
+        for row in base..end {
+            if may_be_null && !validity.is_valid(row as u32) {
+                continue;
+            }
+            valid |= 1u64 << (row - base);
+            let value = values[row];
+            let matches = if scalar_on_left {
+                C::test(scalar, value)
+            } else {
+                C::test(value, scalar)
+            };
+            if matches {
+                set |= 1u64 << (row - base);
+            }
+        }
+        *word = set;
+        known[index] = valid;
+    }
+    BitMask {
+        values: bits.into(),
+        valid: known.into(),
+    }
+}
+
+/// The general path: any encoding, read through [`I64Values::at`].
+fn compare_encoded<C: Comparison>(
+    left: &Operand<'_>,
+    right: &Operand<'_>,
+    row_count: u32,
 ) -> BitMask {
     let mut values = vec![0u64; words_for(row_count)];
     let mut valid = vec![0u64; words_for(row_count)];
     for row in 0..row_count {
         let bit = 1u64 << (row % 64);
-        let (Some(left), Some(right)) = (left.at(row), right.at(row)) else {
+        let (Some(left), Some(right)) = (value_at(left, row), value_at(right, row)) else {
             continue;
         };
         valid[row as usize / 64] |= bit;
-        if test(left, right) {
+        if C::test(left, right) {
             values[row as usize / 64] |= bit;
         }
     }
@@ -219,16 +382,35 @@ fn compare(
     }
 }
 
+/// A condition that is the same for every row: the comparison of two constants.
+fn constant_mask(row_count: u32, matches: bool) -> BitMask {
+    let mut values = vec![if matches { u64::MAX } else { 0 }; words_for(row_count)];
+    trim_words(&mut values, row_count);
+    BitMask {
+        values: values.into(),
+        valid: vec![u64::MAX; words_for(row_count)].into(),
+    }
+}
+
+/// A condition no row is known to satisfy.
+fn unknown_mask(row_count: u32) -> BitMask {
+    let words = words_for(row_count);
+    BitMask {
+        values: vec![0u64; words].into(),
+        valid: vec![0u64; words].into(),
+    }
+}
+
 /// Whether each row is null. A null test itself always has an answer.
-fn null_condition(file: &RegisterFile, register: RegId, row_count: u32) -> Result<BitMask> {
+fn null_condition<'a>(file: &RegisterFile<'a>, register: RegId, row_count: u32) -> Result<BitMask> {
     let mut values = vec![0u64; words_for(row_count)];
     if let Some(value) = file.scalar(register) {
         if matches!(value, LogicalLiteral::Null(_)) {
             values.fill(u64::MAX);
         }
-    } else if let Some(vector) = file.vector(register) {
+    } else if let Some(view) = file.vector(register) {
         for row in 0..row_count {
-            if vector.is_null(row) {
+            if !view.is_valid(row) {
                 values[row as usize / 64] |= 1 << (row % 64);
             }
         }
@@ -300,7 +482,7 @@ impl Predicate for ProgramPredicate {
 mod tests {
     use std::sync::Arc;
 
-    use vector::{Selection, Validity, VectorRef};
+    use vector::{Selection, Validity, Vector, VectorRef};
 
     use super::*;
 
@@ -326,7 +508,7 @@ mod tests {
             .expect("consistent")
     }
 
-    fn program(register_count: u8, instructions: Vec<MicroOp>) -> MicroProgram {
+    fn program(register_count: RegId, instructions: Vec<MicroOp>) -> MicroProgram {
         MicroProgram {
             register_count,
             instructions,
@@ -335,7 +517,7 @@ mod tests {
 
     /// Rows a filter would keep for `condition`.
     fn kept(condition: &BitMask, row_count: u32) -> Vec<u32> {
-        let keep = condition.keep(row_count);
+        let keep = condition.clone().into_keep(row_count);
         Selection::from_mask(keep.to_vec())
             .iter(row_count)
             .collect()

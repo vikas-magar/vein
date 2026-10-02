@@ -11,7 +11,7 @@ use error::VeinError;
 ///
 /// Registers `0..input_columns-1` are pre-assigned to the chunk's physical input columns.
 /// Intermediate expressions, loaded constants, and evaluation results are assigned
-/// monotonically increasing register IDs up to `u8::MAX`.
+/// monotonically increasing register IDs up to `u32::MAX`.
 #[derive(Debug, Clone)]
 pub struct RegisterAllocator {
     next_reg: RegId,
@@ -20,7 +20,7 @@ pub struct RegisterAllocator {
 
 impl RegisterAllocator {
     /// Creates a new register allocator with `input_columns` registers pre-allocated.
-    pub fn new(input_columns: u8) -> Self {
+    pub fn new(input_columns: RegId) -> Self {
         Self {
             next_reg: input_columns,
             max_reg: input_columns,
@@ -29,11 +29,11 @@ impl RegisterAllocator {
 
     /// Allocates the next available virtual register.
     ///
-    /// Returns an error if the expression requires more than 255 virtual registers.
+    /// Returns an error if the program exhausts the register identifier space.
     pub fn allocate(&mut self) -> Result<RegId> {
-        if self.next_reg == u8::MAX {
+        if self.next_reg == RegId::MAX {
             return Err(VeinError::planning(
-                "Expression exceeds maximum virtual registers limit (255)",
+                "Expression exceeds the maximum virtual register count",
                 None,
             ));
         }
@@ -57,7 +57,7 @@ impl RegisterAllocator {
 
     /// Total peak register count required by the program for pre-allocation.
     #[inline]
-    pub fn total_registers(&self) -> u8 {
+    pub fn total_registers(&self) -> RegId {
         self.max_reg
     }
 }

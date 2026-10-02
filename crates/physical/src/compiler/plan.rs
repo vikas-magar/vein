@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use common::Result;
 use common::identifiers::TaskId;
-use common::protocol::{DataSource, FileFormat, FileScanTask, MicroProgram, ScanPredicate};
+use common::protocol::{DataSource, FileFormat, FileScanTask, MicroProgram, RegId, ScanPredicate};
 use error::VeinError;
 use plan::schema::VeinSchema;
 use plan::{LogicalExpr, LogicalPlan};
@@ -18,8 +18,9 @@ impl PipelineCompiler {
     /// Compiles a linear logical plan into its Parquet source and vector program.
     pub fn compile(plan: &LogicalPlan) -> Result<(DataSource, MicroProgram, VeinSchema)> {
         let (source, scan_schema) = Self::collect_leaf_source(plan)?;
-        let register_count = u8::try_from(scan_schema.fields.len())
-            .map_err(|_| VeinError::planning("input schema exceeds VM register capacity", None))?;
+        // `RegId` is wide enough for any schema, so the scan no longer has a
+        // column-count ceiling (`02-execution-and-vir-lld.md` §2).
+        let register_count = scan_schema.fields.len() as RegId;
         let mut compiler = BytecodeCompiler::new(register_count);
         let output_schema = Self::compile_node(plan, scan_schema, &mut compiler)?;
         Ok((source, compiler.finish(), output_schema))
@@ -142,9 +143,7 @@ impl PipelineCompiler {
                 None,
             ));
         }
-        let register_count = u8::try_from(input.fields.len()).map_err(|_| {
-            VeinError::planning("scan predicate input exceeds VM register capacity", None)
-        })?;
+        let register_count = input.fields.len() as RegId;
         let mut compiler = BytecodeCompiler::new(register_count);
         let result = compiler.compile_predicate(filters, &input)?;
         Ok(Some(Arc::new(ScanPredicate {

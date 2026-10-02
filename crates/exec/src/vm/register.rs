@@ -77,7 +77,7 @@ impl RegisterFile {
     ///
     /// Each slot is initially populated with a zero-length [`NullArray`] to guarantee
     /// valid references without repeated allocation.
-    pub fn new(register_count: u8) -> Self {
+    pub fn new(register_count: RegId) -> Self {
         let count = register_count as usize;
         let dummy: ArrayRef = Arc::new(NullArray::new(0));
         let slots = vec![RegValue::Array(dummy); count];

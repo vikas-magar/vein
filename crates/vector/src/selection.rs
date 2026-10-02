@@ -142,7 +142,7 @@ impl Selection {
         Selection::from_indices(kept)
     }
 
-    /// Keeps the active rows where `mask` has a set bit.
+    /// Narrows the active rows to those where `mask` has a set bit.
     ///
     /// This is the filter kernel: a predicate evaluates to a bit per row, and
     /// the selection narrows to the rows whose bit is set.
@@ -153,42 +153,34 @@ impl Selection {
     /// `01-final-architecture.md` §11 ranks avoiding materialisation above
     /// avoiding branches. Measured on a 500k-row scan, the row-by-row version
     /// was 4× slower than the Arrow path it replaces.
-    pub fn intersect_mask(&self, row_count: u32, mask: &[u64]) -> Selection {
-        let length = crate::words_for(row_count);
+    ///
+    /// It consumes `mask`, so `All` adopts that buffer and `Mask` folds into it
+    /// in place: the filter that just produced the mask neither allocates a
+    /// second one nor walks the rows twice (Rule 3, Rule 10). A mask that is
+    /// still shared falls back to a copy, so the result is the same either way.
+    pub fn intersect_keep(&self, row_count: u32, mask: MaskRef) -> Selection {
         match self {
             Selection::None => Selection::None,
-            Selection::All => {
-                let mut words = vec![0u64; length];
-                for (index, word) in words.iter_mut().enumerate() {
-                    *word = mask.get(index).copied().unwrap_or(0);
-                }
-                crate::trim_words(&mut words, row_count);
-                mask_selection(words)
-            }
+            Selection::All => mask_selection(mask),
             Selection::Mask(existing) => {
-                let mut words = vec![0u64; length];
-                for (index, word) in words.iter_mut().enumerate() {
-                    let left = existing.get(index).copied().unwrap_or(0);
-                    let right = mask.get(index).copied().unwrap_or(0);
-                    *word = left & right;
+                let mut words = mask;
+                if let Some(slice) = Arc::get_mut(&mut words) {
+                    for (index, word) in slice.iter_mut().enumerate() {
+                        *word &= existing.get(index).copied().unwrap_or(0);
+                    }
+                    crate::trim_words(slice, row_count);
+                } else {
+                    let mut combined = vec![0u64; crate::words_for(row_count)];
+                    for (index, word) in combined.iter_mut().enumerate() {
+                        *word = existing.get(index).copied().unwrap_or(0)
+                            & words.get(index).copied().unwrap_or(0);
+                    }
+                    crate::trim_words(&mut combined, row_count);
+                    words = combined.into();
                 }
-                crate::trim_words(&mut words, row_count);
                 mask_selection(words)
             }
-            Selection::Indices(indices) => {
-                let kept: Vec<u32> = indices
-                    .iter()
-                    .copied()
-                    .filter(|row| crate::bit_is_set(mask, *row))
-                    .collect();
-                if kept.is_empty() {
-                    Selection::None
-                } else if kept.len() == indices.len() {
-                    self.clone()
-                } else {
-                    Selection::from_indices(kept)
-                }
-            }
+            Selection::Indices(indices) => keep_indices(indices, &mask),
         }
     }
 
@@ -217,15 +209,31 @@ impl Selection {
     }
 }
 
-/// A `Mask` selection, or `None` when no bit is set.
+/// Narrows an index list to the rows `mask` keeps, sharing it when none drop.
+fn keep_indices(indices: &IndexRef, mask: &[u64]) -> Selection {
+    let kept: Vec<u32> = indices
+        .iter()
+        .copied()
+        .filter(|row| crate::bit_is_set(mask, *row))
+        .collect();
+    if kept.is_empty() {
+        Selection::None
+    } else if kept.len() == indices.len() {
+        Selection::Indices(Arc::clone(indices))
+    } else {
+        Selection::from_indices(kept)
+    }
+}
+
+/// A `Mask` selection from an owned mask, or `None` when no bit is set.
 ///
 /// Normalising an all-zero mask to `None` keeps "selects nothing" as one state
 /// rather than two, so consumers cannot disagree about it.
-fn mask_selection(words: Vec<u64>) -> Selection {
-    if words.iter().all(|word| *word == 0) {
+fn mask_selection(mask: MaskRef) -> Selection {
+    if mask.iter().all(|word| *word == 0) {
         Selection::None
     } else {
-        Selection::Mask(words.into())
+        Selection::Mask(mask)
     }
 }
 
@@ -440,13 +448,46 @@ mod tests {
         let selection = indices_state();
         assert_eq!(
             selection
-                .intersect_mask(8, &[0b0010_0001])
+                .intersect_keep(8, vec![0b0010_0001].into())
                 .iter(8)
                 .collect::<Vec<_>>(),
             vec![0, 5]
         );
         // An all-zero mask selects nothing.
-        assert!(selection.intersect_mask(8, &[0]).is_empty(8));
+        assert!(selection.intersect_keep(8, vec![0].into()).is_empty(8));
+    }
+
+    #[test]
+    fn intersect_keep_adopts_the_mask_for_an_all_selection() {
+        let mask: MaskRef = vec![0b0010_0001u64].into();
+        let pointer = Arc::as_ptr(&mask);
+        let narrowed = Selection::all().intersect_keep(8, mask);
+        let Selection::Mask(words) = &narrowed else {
+            panic!("expected a mask");
+        };
+        assert_eq!(Arc::as_ptr(words), pointer, "All must adopt the mask");
+        assert_eq!(narrowed.iter(8).collect::<Vec<_>>(), vec![0, 5]);
+    }
+
+    #[test]
+    fn intersect_keep_folds_into_the_owned_mask() {
+        let selection = Selection::from_mask(vec![0b0000_1111]);
+        let mask: MaskRef = vec![0b0010_0001u64].into();
+        let pointer = Arc::as_ptr(&mask);
+        let narrowed = selection.intersect_keep(8, mask);
+        let Selection::Mask(words) = &narrowed else {
+            panic!("expected a mask");
+        };
+        assert_eq!(Arc::as_ptr(words), pointer, "Mask must fold in place");
+        assert_eq!(narrowed.iter(8).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn intersect_keep_normalises_an_empty_mask() {
+        assert_eq!(
+            Selection::all().intersect_keep(8, vec![0u64].into()),
+            Selection::None
+        );
     }
 
     #[test]

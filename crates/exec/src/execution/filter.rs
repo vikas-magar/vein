@@ -28,9 +28,11 @@ impl<P: Predicate> PipelineNode<DataChunk> for Filter<P> {
     fn push(&mut self, chunk: DataChunk) -> Result<()> {
         let condition = self.predicate.evaluate(&chunk)?;
         // Only rows that are definitely true survive: the keep mask is the
-        // condition's true bits intersected with its valid bits.
-        let keep = condition.keep(chunk.row_count());
-        let selection = chunk.selection().intersect_mask(chunk.row_count(), &keep);
+        // condition's true bits intersected with its valid bits, folded in
+        // place, and the chunk's selection narrows to it without a second
+        // buffer (Rule 3).
+        let keep = condition.into_keep(chunk.row_count());
+        let selection = chunk.selection().intersect_keep(chunk.row_count(), keep);
         let chunk = chunk.with_selection(selection);
         if chunk.is_empty() {
             return Ok(());

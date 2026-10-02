@@ -20,7 +20,7 @@ pub struct BytecodeCompiler {
 
 impl BytecodeCompiler {
     /// Creates a new bytecode compiler for an input chunk with `input_columns`.
-    pub fn new(input_columns: u8) -> Self {
+    pub fn new(input_columns: RegId) -> Self {
         Self {
             allocator: RegisterAllocator::new(input_columns),
             instructions: Vec::new(),

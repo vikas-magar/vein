@@ -46,6 +46,7 @@ impl Validity {
     ///
     /// A row beyond the words present is treated as null, so a short bitmap
     /// fails closed rather than reading out of bounds.
+    #[inline]
     pub fn is_valid(&self, row: u32) -> bool {
         match self {
             Validity::AllValid => true,

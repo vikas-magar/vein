@@ -20,6 +20,7 @@
 use types::{LogicalLiteral, VeinDataType};
 
 use crate::selection::{Selection, SelectionIter};
+use crate::validity::Validity;
 use crate::vector::{Encoding, Vector};
 
 /// `All` as a value with `'static` lifetime, so [`VectorView::all`] has
@@ -78,6 +79,14 @@ impl<'a> VectorView<'a> {
     /// The underlying vector.
     pub fn vector(&self) -> &'a Vector {
         self.vector
+    }
+
+    /// The validity of the underlying vector.
+    ///
+    /// Exposed next to the values so a kernel resolves both once, outside its
+    /// inner loop, instead of calling [`VectorView::is_valid`] per row.
+    pub fn validity(&self) -> &'a Validity {
+        self.vector.validity()
     }
 
     /// The selection narrowing this view.
@@ -190,6 +199,7 @@ impl<'a> I64Values<'a> {
     /// `row` is assumed to be within the view's row count: `Flat` and
     /// `Dictionary` report `None` past their own length, `Constant` cannot
     /// detect it because it has no length of its own.
+    #[inline]
     pub fn at(&self, row: u32) -> Option<i64> {
         match self {
             I64Values::Flat(values) => values.get(row as usize).copied(),

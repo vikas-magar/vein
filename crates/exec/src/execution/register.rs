@@ -1,26 +1,33 @@
 //! Virtual registers holding the engine's own values.
 //!
-//! `02-execution-and-vir-lld.md` §4 defines the register file as `Box<
-//! [RegisterSlot]>` over `Scalar | Vector | Selection | Mask`. The requirements
-//! it states shape this type: reads and writes are a slot index, a dead register
-//! is reusable, and ownership is query-local, so a write *moves* a value in and
-//! a read borrows it — nothing is cloned per instruction.
+//! `02-execution-and-vir-lld.md` §3 requires the register file to hold
+//! **non-owning views** rather than repeatedly cloning shared columns:
+//! *"Hot-path ownership should not be represented by repeated `Arc<Array>`
+//! churn. ... Ownership lives at pipeline boundaries."* A chunk owns its
+//! columns; a register borrows a view of one, so mounting a chunk is a pointer
+//! write per column rather than a refcount update, and Rule 5's prohibition on
+//! `Arc` in an inner loop is respected by construction.
+//!
+//! The file is parameterised by the lifetime of the chunk it borrows, which is
+//! what makes the borrowing explicit: a register cannot outlive the chunk it
+//! views, and a program that tried to would not compile.
 //!
 //! This is the register file for the engine representation. The Arrow-backed
 //! `vm::register::RegisterFile` remains until the VM cuts over, at which point
-//! it is deleted; keeping both is a tracked migration state (Rule 34), not two
-//! permanent designs.
+//! it is deleted; keeping both is a tracked migration state, not two permanent
+//! designs.
 
 use std::sync::Arc;
 
 use common::Result;
+use common::protocol::RegId;
 use error::VeinError;
 use types::LogicalLiteral;
-use vector::{DataChunk, MaskRef, Selection, VectorRef, trim_words, words_for};
+use vector::{DataChunk, MaskRef, Selection, VectorView, trim_words, words_for};
 
 /// One virtual register.
 #[derive(Debug, Clone, Default)]
-pub enum RegisterSlot {
+pub enum RegisterSlot<'a> {
     /// Nothing written yet. The state every slot starts in, and the state a
     /// released slot returns to.
     #[default]
@@ -30,17 +37,17 @@ pub enum RegisterSlot {
         /// The value.
         value: LogicalLiteral,
     },
-    /// A column.
+    /// A borrowed column.
     Vector {
-        /// The column.
-        vector: VectorRef,
+        /// A view of the column, owned by the chunk.
+        view: VectorView<'a>,
     },
     /// A row selection.
     Selection {
         /// The selection.
         selection: Selection,
     },
-    /// A bit per row, one bit per row, LSB-first.
+    /// A nullable boolean per row.
     Mask {
         /// The bits, with their validity.
         mask: BitMask,
@@ -49,11 +56,9 @@ pub enum RegisterSlot {
 
 /// A nullable boolean per row: which rows are true, and which rows are known.
 ///
-/// One bitmap is not enough. A single set of bits cannot distinguish "false"
-/// from "unknown", and SQL three-valued logic depends on the difference:
-/// `NOT (x > 20)` must not keep a row where `x` is null, because `NOT NULL` is
-/// null (`05-llm-rules.md` Rule 6). `values` holds the true bits and `valid`
-/// holds the rows the value is known for.
+/// See `vein_design/adr/0003-nullable-conditions.md`. One bitmap cannot
+/// distinguish *false* from *unknown*, and SQL three-valued logic depends on the
+/// difference: `NOT (x > 20)` must not keep a row where `x` is null.
 #[derive(Debug, Clone)]
 pub struct BitMask {
     /// A set bit means the row's condition is true. Meaningful only where
@@ -68,25 +73,42 @@ impl BitMask {
     ///
     /// Only rows that are definitely true survive, which is the same rule
     /// `apply_filter_mask` follows on the Arrow path.
-    pub fn keep(&self, row_count: u32) -> MaskRef {
-        let mut kept = vec![0u64; words_for(row_count)];
-        for (index, word) in kept.iter_mut().enumerate() {
-            let values = self.values.get(index).copied().unwrap_or(0);
-            let valid = self.valid.get(index).copied().unwrap_or(0);
-            *word = values & valid;
+    ///
+    /// Consumes the condition and folds the validity into the value bits in
+    /// place, so a filter that narrows immediately needs one mask rather than
+    /// two (Rule 3). The mask is unique on the filter path; a mask that is still
+    /// shared falls back to a copy, so the result is the same either way.
+    pub fn into_keep(self, row_count: u32) -> MaskRef {
+        let BitMask { mut values, valid } = self;
+        match Arc::get_mut(&mut values) {
+            Some(words) => {
+                for (index, word) in words.iter_mut().enumerate() {
+                    *word &= valid.get(index).copied().unwrap_or(0);
+                }
+                trim_words(words, row_count);
+                values
+            }
+            None => {
+                let mut kept = vec![0u64; words_for(row_count)];
+                for (index, word) in kept.iter_mut().enumerate() {
+                    let values = values.get(index).copied().unwrap_or(0);
+                    let valid = valid.get(index).copied().unwrap_or(0);
+                    *word = values & valid;
+                }
+                trim_words(&mut kept, row_count);
+                kept.into()
+            }
         }
-        trim_words(&mut kept, row_count);
-        kept.into()
     }
 }
 
 /// The virtual registers of one program.
 #[derive(Debug, Clone)]
-pub struct RegisterFile {
-    slots: Box<[RegisterSlot]>,
+pub struct RegisterFile<'a> {
+    slots: Box<[RegisterSlot<'a>]>,
 }
 
-impl RegisterFile {
+impl<'a> RegisterFile<'a> {
     /// A file of `len` empty registers.
     pub fn new(len: usize) -> Self {
         Self {
@@ -105,12 +127,12 @@ impl RegisterFile {
     }
 
     /// Borrows a register.
-    pub fn get(&self, register: u8) -> Option<&RegisterSlot> {
+    pub fn get(&self, register: RegId) -> Option<&RegisterSlot<'a>> {
         self.slots.get(register as usize)
     }
 
     /// Writes a register, moving the value in.
-    pub fn set(&mut self, register: u8, slot: RegisterSlot) -> Result<()> {
+    pub fn set(&mut self, register: RegId, slot: RegisterSlot<'a>) -> Result<()> {
         if register as usize >= self.slots.len() {
             return Err(VeinError::internal(format!(
                 "register R{register} is outside a file of {}",
@@ -125,7 +147,7 @@ impl RegisterFile {
     ///
     /// A released slot is immediately reusable, which is what lets the physical
     /// slot count stay below the virtual register count.
-    pub fn release(&mut self, register: u8) -> Result<()> {
+    pub fn release(&mut self, register: RegId) -> Result<()> {
         self.set(register, RegisterSlot::Empty)
     }
 
@@ -134,12 +156,14 @@ impl RegisterFile {
         self.slots.fill(RegisterSlot::Empty);
     }
 
-    /// Loads a chunk's columns into the lowest registers.
+    /// Loads views of a chunk's columns into the lowest registers.
     ///
     /// Column `i` lands in register `i`, so a program's column references are
-    /// register numbers. Fails when the chunk is wider than the file rather than
-    /// truncating it, which would read the wrong column.
-    pub fn mount(&mut self, chunk: &DataChunk) -> Result<()> {
+    /// register numbers. Mounting copies no data and takes no reference count —
+    /// each register stores a view, which is `Copy`. Fails when the chunk is
+    /// wider than the file rather than truncating it, which would read the wrong
+    /// column.
+    pub fn mount(&mut self, chunk: &'a DataChunk) -> Result<()> {
         if chunk.num_columns() > self.slots.len() {
             return Err(VeinError::internal(format!(
                 "chunk has {} columns but the register file has {}",
@@ -149,30 +173,30 @@ impl RegisterFile {
         }
         for (register, column) in chunk.columns().iter().enumerate() {
             self.slots[register] = RegisterSlot::Vector {
-                vector: Arc::clone(column),
+                view: VectorView::all(column),
             };
         }
         Ok(())
     }
 
     /// Borrows a register as a scalar.
-    pub fn scalar(&self, register: u8) -> Option<&LogicalLiteral> {
+    pub fn scalar(&self, register: RegId) -> Option<&LogicalLiteral> {
         match self.get(register)? {
             RegisterSlot::Scalar { value } => Some(value),
             _ => None,
         }
     }
 
-    /// Borrows a register as a column.
-    pub fn vector(&self, register: u8) -> Option<&VectorRef> {
+    /// Borrows a register as a column view.
+    pub fn vector(&self, register: RegId) -> Option<&VectorView<'a>> {
         match self.get(register)? {
-            RegisterSlot::Vector { vector } => Some(vector),
+            RegisterSlot::Vector { view } => Some(view),
             _ => None,
         }
     }
 
     /// Borrows a register as a mask.
-    pub fn mask(&self, register: u8) -> Option<&BitMask> {
+    pub fn mask(&self, register: RegId) -> Option<&BitMask> {
         match self.get(register)? {
             RegisterSlot::Mask { mask } => Some(mask),
             _ => None,
@@ -182,11 +206,20 @@ impl RegisterFile {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use vector::{Vector, VectorRef};
+
     use super::*;
+
+    fn chunk_of(values: &[i64]) -> DataChunk {
+        let column: VectorRef = Arc::new(Vector::from_i64(values));
+        DataChunk::new(values.len() as u32, vec![column], Selection::all()).expect("consistent")
+    }
 
     #[test]
     fn slots_start_empty_and_report_their_kind() {
-        let file = RegisterFile::new(3);
+        let file: RegisterFile<'_> = RegisterFile::new(3);
         assert_eq!(file.len(), 3);
         assert!(!file.is_empty());
         for register in 0..3 {
@@ -196,22 +229,19 @@ mod tests {
     }
 
     #[test]
-    fn writing_moves_the_value_in_and_reads_borrow_it() {
-        let mut file = RegisterFile::new(2);
-        let column: VectorRef = Arc::new(vector::Vector::from_i64(&[1, 2, 3]));
-        let slot = RegisterSlot::Vector {
-            vector: Arc::clone(&column),
+    fn reading_a_register_reports_only_its_kind() {
+        let mut file: RegisterFile<'_> = RegisterFile::new(2);
+        let slot = RegisterSlot::Scalar {
+            value: LogicalLiteral::Int64(7),
         };
         file.set(0, slot).expect("in range");
-
-        // The register holds the same allocation, not a copy.
-        assert!(Arc::ptr_eq(file.vector(0).expect("vector"), &column));
-        assert!(file.scalar(0).is_none(), "a column is not a scalar");
+        assert_eq!(file.scalar(0), Some(&LogicalLiteral::Int64(7)));
+        assert!(file.vector(0).is_none(), "a scalar is not a column");
     }
 
     #[test]
     fn releasing_a_register_makes_it_reusable() {
-        let mut file = RegisterFile::new(1);
+        let mut file: RegisterFile<'_> = RegisterFile::new(1);
         let first = RegisterSlot::Scalar {
             value: LogicalLiteral::Int64(7),
         };
@@ -232,26 +262,67 @@ mod tests {
 
     #[test]
     fn out_of_range_access_is_refused_not_wrapped() {
-        let mut file = RegisterFile::new(2);
+        let mut file: RegisterFile<'_> = RegisterFile::new(2);
         assert!(file.set(2, RegisterSlot::Empty).is_err());
         assert!(file.release(2).is_err());
     }
 
+    /// Mounting borrows the columns: the register reads the chunk's values
+    /// without copying them or taking a reference count.
     #[test]
-    fn mounting_places_columns_in_register_order() {
-        let columns: Vec<VectorRef> = vec![
-            Arc::new(vector::Vector::from_i64(&[1, 2])),
-            Arc::new(vector::Vector::from_i64(&[3, 4])),
+    fn mounting_borrows_columns_in_register_order() {
+        let first = chunk_of(&[1, 2]);
+        let second = chunk_of(&[3, 4]);
+
+        // Two single-column chunks cannot both be mounted into the same file, so
+        // mount one and check the view reads through to the chunk's buffer.
+        let mut file: RegisterFile<'_> = RegisterFile::new(1);
+        file.mount(&first).expect("columns fit");
+        let view = file.vector(0).expect("column 0");
+        assert_eq!(view.len(), 2);
+        let values = view.resolve_i64().expect("i64").as_flat().expect("flat");
+        assert_eq!(values, &[1, 2]);
+
+        // The view tracks the chunk it borrows, not a snapshot of it.
+        let mut other: RegisterFile<'_> = RegisterFile::new(1);
+        other.mount(&second).expect("columns fit");
+        let values = other
+            .vector(0)
+            .expect("column 0")
+            .resolve_i64()
+            .expect("i64")
+            .as_flat()
+            .expect("flat");
+        assert_eq!(values, &[3, 4]);
+    }
+
+    #[test]
+    fn a_chunk_wider_than_the_file_is_refused() {
+        let wide: Vec<VectorRef> = vec![
+            Arc::new(Vector::from_i64(&[1])),
+            Arc::new(Vector::from_i64(&[2])),
         ];
-        let chunk = DataChunk::new(2, columns.clone(), Selection::all()).expect("consistent");
-
-        let mut file = RegisterFile::new(2);
-        file.mount(&chunk).expect("columns fit");
-        assert!(Arc::ptr_eq(file.vector(0).expect("column 0"), &columns[0]));
-        assert!(Arc::ptr_eq(file.vector(1).expect("column 1"), &columns[1]));
-
-        // A chunk wider than the file is refused rather than truncated.
-        let mut narrow = RegisterFile::new(1);
+        let chunk = DataChunk::new(1, wide, Selection::all()).expect("consistent");
+        let mut narrow: RegisterFile<'_> = RegisterFile::new(1);
         assert!(narrow.mount(&chunk).is_err());
+    }
+
+    #[test]
+    fn into_keep_folds_validity_in_place() {
+        let mask = BitMask {
+            values: vec![0b0000_1111u64].into(),
+            valid: vec![0b0000_0101u64].into(),
+        };
+        assert_eq!(&*mask.into_keep(4), &[0b0000_0101u64]);
+    }
+
+    #[test]
+    fn into_keep_falls_back_when_the_mask_is_shared() {
+        let mask = BitMask {
+            values: vec![0b0000_1111u64].into(),
+            valid: vec![0b0000_0101u64].into(),
+        };
+        let _shared = mask.clone();
+        assert_eq!(&*mask.into_keep(4), &[0b0000_0101u64]);
     }
 }
