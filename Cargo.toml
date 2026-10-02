@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/types", "crates/catalog", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/cli", "crates/plan", "crates/optimizer", "crates/physical"]
+members = ["crates/common", "crates/types", "crates/catalog", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/cli", "crates/plan", "crates/optimizer", "crates/physical", "crates/vector"]
 default-members = ["crates/cli"]
 
 [workspace.dependencies]
@@ -28,3 +28,15 @@ strip = true
 
 [profile.dev]
 opt-level = 1
+
+# Benchmarking and profiling profile.
+#
+# `08-performance-engineering.md` §5 requires benchmark hygiene on an optimized
+# build. This derives from `release` but is invoked as `--profile perf`, so no
+# `--release` build is ever needed. `debug = 1` keeps line tables for `perf` and
+# flamegraphs; `lto = "thin"` trades a little peak throughput for build time.
+[profile.perf]
+inherits = "release"
+lto = "thin"
+debug = 1
+strip = false

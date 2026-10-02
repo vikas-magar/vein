@@ -1,3 +1,4 @@
+mod bench;
 mod local;
 mod parquet_catalog;
 mod parquet_storage;
@@ -18,9 +19,22 @@ const DISPLAY_ROWS: usize = 1_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1).peekable();
+
+    // Benchmark mode runs without the audit subscriber: the report must not be
+    // interleaved with per-task trace events.
+    if args.peek().map(String::as_str) == Some("--bench") {
+        args.next();
+        let iterations = args
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10);
+        return bench::run(iterations).await;
+    }
+
     common::logging::init("cli")?;
 
-    let query = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let query = args.collect::<Vec<_>>().join(" ");
     if query.is_empty() {
         return Err("usage: vein \"FROM table |> SELECT *\"".into());
     }
