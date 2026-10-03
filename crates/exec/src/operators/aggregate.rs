@@ -14,8 +14,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{
-    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, StringArray,
+    Array, ArrayRef, Decimal128Array, Float16Array, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 
 use crate::pipeline::{DataChunk, PipelineNode};
@@ -34,14 +35,14 @@ enum KeyValue {
 
 /// Operations shared by every numeric accumulator type.
 trait AggregateValue: Copy + PartialOrd {
-    fn checked_add(self, other: Self) -> Option<Self>;
+    fn checked_add(self, other: Self, decimal_precision_limit: bool) -> Option<Self>;
     fn minimum(self, other: Self) -> Self;
     fn maximum(self, other: Self) -> Self;
     fn to_f64(self, scale: i8) -> f64;
 }
 
 impl AggregateValue for i64 {
-    fn checked_add(self, other: Self) -> Option<Self> {
+    fn checked_add(self, other: Self, _decimal_precision_limit: bool) -> Option<Self> {
         i64::checked_add(self, other)
     }
 
@@ -59,10 +60,12 @@ impl AggregateValue for i64 {
 }
 
 impl AggregateValue for i128 {
-    fn checked_add(self, other: Self) -> Option<Self> {
+    fn checked_add(self, other: Self, decimal_precision_limit: bool) -> Option<Self> {
         i128::checked_add(self, other).filter(|sum| {
-            let max_decimal_38 = 10_i128.pow(38) - 1;
-            (-max_decimal_38..=max_decimal_38).contains(sum)
+            !decimal_precision_limit || {
+                let max_decimal_38 = 10_i128.pow(38) - 1;
+                (-max_decimal_38..=max_decimal_38).contains(sum)
+            }
         })
     }
 
@@ -79,8 +82,44 @@ impl AggregateValue for i128 {
     }
 }
 
+impl AggregateValue for u64 {
+    fn checked_add(self, other: Self, _decimal_precision_limit: bool) -> Option<Self> {
+        u64::checked_add(self, other)
+    }
+
+    fn minimum(self, other: Self) -> Self {
+        self.min(other)
+    }
+
+    fn maximum(self, other: Self) -> Self {
+        self.max(other)
+    }
+
+    fn to_f64(self, _scale: i8) -> f64 {
+        self as f64
+    }
+}
+
+impl AggregateValue for u128 {
+    fn checked_add(self, other: Self, _decimal_precision_limit: bool) -> Option<Self> {
+        u128::checked_add(self, other)
+    }
+
+    fn minimum(self, other: Self) -> Self {
+        self.min(other)
+    }
+
+    fn maximum(self, other: Self) -> Self {
+        self.max(other)
+    }
+
+    fn to_f64(self, _scale: i8) -> f64 {
+        self as f64
+    }
+}
+
 impl AggregateValue for f64 {
-    fn checked_add(self, other: Self) -> Option<Self> {
+    fn checked_add(self, other: Self, _decimal_precision_limit: bool) -> Option<Self> {
         Some(self + other)
     }
 
@@ -98,7 +137,7 @@ impl AggregateValue for f64 {
 }
 
 impl AggregateValue for f32 {
-    fn checked_add(self, other: Self) -> Option<Self> {
+    fn checked_add(self, other: Self, _decimal_precision_limit: bool) -> Option<Self> {
         Some(self + other)
     }
 
@@ -120,19 +159,19 @@ impl AggregateValue for f32 {
 struct NumericAccumulator<T> {
     op: AggOpCode,
     value: Option<T>,
-    avg_sum: f64,
     count: i64,
     scale: i8,
+    decimal_precision_limit: bool,
 }
 
 impl<T: AggregateValue> NumericAccumulator<T> {
-    fn new(op: AggOpCode, scale: i8) -> Self {
+    fn new(op: AggOpCode, scale: i8, decimal_precision_limit: bool) -> Self {
         Self {
             op,
             value: None,
-            avg_sum: 0.0,
             count: 0,
             scale,
+            decimal_precision_limit,
         }
     }
 
@@ -142,23 +181,32 @@ impl<T: AggregateValue> NumericAccumulator<T> {
         };
         match self.op {
             AggOpCode::Count => self.count += 1,
-            AggOpCode::Sum => {
-                self.value = Some(match self.value {
-                    Some(current) => current.checked_add(value).ok_or_else(|| {
-                        VeinError::internal("numeric overflow while computing SUM")
-                    })?,
+            AggOpCode::Sum | AggOpCode::Avg => {
+                let total = match self.value {
+                    Some(current) => current
+                        .checked_add(value, self.decimal_precision_limit)
+                        .ok_or_else(|| {
+                            let operation = match self.op {
+                                AggOpCode::Sum => "SUM",
+                                AggOpCode::Avg => "AVG",
+                                _ => unreachable!("only additive aggregates reach this arm"),
+                            };
+                            VeinError::internal(format!(
+                                "numeric overflow while computing {operation}"
+                            ))
+                        })?,
                     None => value,
-                });
+                };
+                self.value = Some(total);
+                if self.op == AggOpCode::Avg {
+                    self.count += 1;
+                }
             }
             AggOpCode::Min => {
                 self.value = Some(self.value.map_or(value, |current| current.minimum(value)));
             }
             AggOpCode::Max => {
                 self.value = Some(self.value.map_or(value, |current| current.maximum(value)));
-            }
-            AggOpCode::Avg => {
-                self.avg_sum += value.to_f64(self.scale);
-                self.count += 1;
             }
         }
         Ok(())
@@ -176,6 +224,11 @@ enum AggregateInput<'a> {
     Int16(&'a Int16Array),
     Int32(&'a Int32Array),
     Int64(&'a Int64Array),
+    UInt8(&'a UInt8Array),
+    UInt16(&'a UInt16Array),
+    UInt32(&'a UInt32Array),
+    UInt64(&'a UInt64Array),
+    Float16(&'a Float16Array),
     Float32(&'a Float32Array),
     Float64(&'a Float64Array),
     Decimal128(&'a Decimal128Array),
@@ -219,6 +272,31 @@ impl<'a> AggregateInput<'a> {
                 .downcast_ref::<Int64Array>()
                 .map(Self::Int64)
                 .ok_or_else(mismatch),
+            VeinDataType::UInt8 => array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .map(Self::UInt8)
+                .ok_or_else(mismatch),
+            VeinDataType::UInt16 => array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .map(Self::UInt16)
+                .ok_or_else(mismatch),
+            VeinDataType::UInt32 => array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .map(Self::UInt32)
+                .ok_or_else(mismatch),
+            VeinDataType::UInt64 => array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .map(Self::UInt64)
+                .ok_or_else(mismatch),
+            VeinDataType::Float16 => array
+                .as_any()
+                .downcast_ref::<Float16Array>()
+                .map(Self::Float16)
+                .ok_or_else(mismatch),
             VeinDataType::Float32 => array
                 .as_any()
                 .downcast_ref::<Float32Array>()
@@ -257,10 +335,15 @@ fn numeric_values<T: Copy>(states: &[NumericAccumulator<T>]) -> Vec<Option<T>> {
     states.iter().map(|state| state.value).collect()
 }
 
-fn average_values<T>(states: &[NumericAccumulator<T>]) -> Vec<Option<f64>> {
+fn average_values<T: AggregateValue>(states: &[NumericAccumulator<T>]) -> Vec<Option<f64>> {
     states
         .iter()
-        .map(|state| (state.count > 0).then(|| state.avg_sum / state.count as f64))
+        .map(|state| {
+            (state.count > 0).then(|| {
+                state.value.expect("a non-empty average has a sum").to_f64(state.scale)
+                    / state.count as f64
+            })
+        })
         .collect()
 }
 
@@ -270,6 +353,16 @@ enum AggregateStateColumn {
     Int64 {
         op: AggOpCode,
         states: Vec<NumericAccumulator<i64>>,
+    },
+    Int128Avg {
+        states: Vec<NumericAccumulator<i128>>,
+    },
+    UInt64 {
+        op: AggOpCode,
+        states: Vec<NumericAccumulator<u64>>,
+    },
+    UInt128Avg {
+        states: Vec<NumericAccumulator<u128>>,
     },
     Float32 {
         op: AggOpCode,
@@ -295,8 +388,8 @@ impl AggregateStateColumn {
         if op == AggOpCode::Count {
             return Ok(Self::Count(Vec::new()));
         }
-        // Signed integer operations share an Int64 state, while AVG follows
-        // its input layout and other operations follow their bound result.
+        // Integer SUM/MIN/MAX use an Int64 state; integer AVG needs a wide
+        // exact sum so cancellation and large values are preserved until finish.
         if matches!(
             input_type,
             VeinDataType::Int8
@@ -304,13 +397,49 @@ impl AggregateStateColumn {
                 | VeinDataType::Int32
                 | VeinDataType::Int64
         ) {
+            if op == AggOpCode::Avg {
+                return Ok(Self::Int128Avg {
+                    states: Vec::new(),
+                });
+            }
             return Ok(Self::Int64 {
                 op,
                 states: Vec::new(),
             });
         }
+        if matches!(
+            input_type,
+            VeinDataType::UInt8
+                | VeinDataType::UInt16
+                | VeinDataType::UInt32
+                | VeinDataType::UInt64
+        ) {
+            if op == AggOpCode::Avg {
+                return Ok(Self::UInt128Avg {
+                    states: Vec::new(),
+                });
+            }
+            return Ok(Self::UInt64 {
+                op,
+                states: Vec::new(),
+            });
+        }
+        if input_type == &VeinDataType::Float16 && matches!(op, AggOpCode::Min | AggOpCode::Max) {
+            return Ok(Self::Float32 {
+                op,
+                states: Vec::new(),
+            });
+        }
         let state_type = if op == AggOpCode::Avg {
-            input_type
+            match input_type {
+                VeinDataType::Float16 | VeinDataType::Float32 => {
+                    return Ok(Self::Float64 {
+                        op,
+                        states: Vec::new(),
+                    });
+                }
+                input_type => input_type,
+            }
         } else {
             result_type
         };
@@ -343,11 +472,22 @@ impl AggregateStateColumn {
     fn push_group(&mut self) {
         match self {
             Self::Count(states) => states.push(0),
-            Self::Int64 { op, states } => states.push(NumericAccumulator::new(*op, 0)),
-            Self::Float32 { op, states } => states.push(NumericAccumulator::new(*op, 0)),
-            Self::Float64 { op, states } => states.push(NumericAccumulator::new(*op, 0)),
+            Self::Int64 { op, states } => states.push(NumericAccumulator::new(*op, 0, false)),
+            Self::Int128Avg { states } => {
+                states.push(NumericAccumulator::new(AggOpCode::Avg, 0, false))
+            }
+            Self::UInt64 { op, states } => states.push(NumericAccumulator::new(*op, 0, false)),
+            Self::UInt128Avg { states } => {
+                states.push(NumericAccumulator::new(AggOpCode::Avg, 0, false))
+            }
+            Self::Float32 { op, states } => states.push(NumericAccumulator::new(*op, 0, false)),
+            Self::Float64 { op, states } => states.push(NumericAccumulator::new(*op, 0, false)),
             Self::Decimal128 { op, scale, states } => {
-                states.push(NumericAccumulator::new(*op, *scale))
+                states.push(NumericAccumulator::new(
+                    *op,
+                    *scale,
+                    *op == AggOpCode::Sum,
+                ))
             }
         }
     }
@@ -384,6 +524,76 @@ impl AggregateStateColumn {
             (Self::Int64 { states, .. }, AggregateInput::Int64(array)) => {
                 update_numeric_states(states, group_rows, |row| {
                     (!array.is_null(row)).then(|| array.value(row))
+                })
+            }
+            (Self::Int128Avg { states }, AggregateInput::Int8(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as i128)
+                })
+            }
+            (Self::Int128Avg { states }, AggregateInput::Int16(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as i128)
+                })
+            }
+            (Self::Int128Avg { states }, AggregateInput::Int32(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as i128)
+                })
+            }
+            (Self::Int128Avg { states }, AggregateInput::Int64(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as i128)
+                })
+            }
+            (Self::UInt64 { states, .. }, AggregateInput::UInt8(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as u64)
+                })
+            }
+            (Self::UInt64 { states, .. }, AggregateInput::UInt16(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as u64)
+                })
+            }
+            (Self::UInt64 { states, .. }, AggregateInput::UInt32(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as u64)
+                })
+            }
+            (Self::UInt64 { states, .. }, AggregateInput::UInt64(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row))
+                })
+            }
+            (Self::UInt128Avg { states }, AggregateInput::UInt8(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as u128)
+                })
+            }
+            (Self::UInt128Avg { states }, AggregateInput::UInt16(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as u128)
+                })
+            }
+            (Self::UInt128Avg { states }, AggregateInput::UInt32(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as u128)
+                })
+            }
+            (Self::UInt128Avg { states }, AggregateInput::UInt64(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row) as u128)
+                })
+            }
+            (Self::Float32 { states, .. }, AggregateInput::Float16(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row).to_f32())
+                })
+            }
+            (Self::Float64 { states, .. }, AggregateInput::Float16(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row).to_f64())
                 })
             }
             (Self::Float32 { states, .. }, AggregateInput::Float32(array)) => {
@@ -444,8 +654,29 @@ impl AggregateStateColumn {
                         .collect::<Vec<_>>(),
                 ))
             }
+            (Self::UInt64 { states, .. }, AggOpCode::Sum, VeinDataType::UInt64) => {
+                Arc::new(UInt64Array::from(numeric_values(states)))
+            }
+            (Self::UInt64 { states, .. }, AggOpCode::Min | AggOpCode::Max, VeinDataType::UInt8) => {
+                Arc::new(UInt8Array::from(numeric_values(states).into_iter().map(|value| value.map(|value| value as u8)).collect::<Vec<_>>()))
+            }
+            (Self::UInt64 { states, .. }, AggOpCode::Min | AggOpCode::Max, VeinDataType::UInt16) => {
+                Arc::new(UInt16Array::from(numeric_values(states).into_iter().map(|value| value.map(|value| value as u16)).collect::<Vec<_>>()))
+            }
+            (Self::UInt64 { states, .. }, AggOpCode::Min | AggOpCode::Max, VeinDataType::UInt32) => {
+                Arc::new(UInt32Array::from(numeric_values(states).into_iter().map(|value| value.map(|value| value as u32)).collect::<Vec<_>>()))
+            }
+            (Self::UInt64 { states, .. }, AggOpCode::Min | AggOpCode::Max, VeinDataType::UInt64) => {
+                Arc::new(UInt64Array::from(numeric_values(states)))
+            }
             (Self::Float32 { states, .. }, AggOpCode::Sum | AggOpCode::Min | AggOpCode::Max, VeinDataType::Float32) => {
                 Arc::new(Float32Array::from(numeric_values(states)))
+            }
+            (Self::Float32 { states, .. }, AggOpCode::Min | AggOpCode::Max, VeinDataType::Float16) => {
+                let values: ArrayRef = Arc::new(Float32Array::from(numeric_values(states)));
+                arrow::compute::cast(&values, &data_type.to_arrow()).map_err(|error| {
+                    VeinError::internal(format!("cannot emit Float16 aggregate result: {error}"))
+                })?
             }
             (Self::Float64 { states, .. }, AggOpCode::Sum | AggOpCode::Min | AggOpCode::Max, VeinDataType::Float64) => {
                 Arc::new(Float64Array::from(numeric_values(states)))
@@ -461,10 +692,10 @@ impl AggregateStateColumn {
                         })?,
                 )
             }
-            (Self::Int64 { states, .. }, AggOpCode::Avg, VeinDataType::Float64) => {
+            (Self::Int128Avg { states }, AggOpCode::Avg, VeinDataType::Float64) => {
                 Arc::new(Float64Array::from(average_values(states)))
             }
-            (Self::Float32 { states, .. }, AggOpCode::Avg, VeinDataType::Float64) => {
+            (Self::UInt128Avg { states }, AggOpCode::Avg, VeinDataType::Float64) => {
                 Arc::new(Float64Array::from(average_values(states)))
             }
             (Self::Float64 { states, .. }, AggOpCode::Avg, VeinDataType::Float64) => {
@@ -725,10 +956,191 @@ fn key_column(groups: &[Group], column: usize, data_type: &VeinDataType) -> Resu
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Float64Array, Int32Array, Int64Array};
+    use arrow::array::{
+        Float16Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt16Array, UInt32Array,
+        UInt64Array, UInt8Array,
+    };
     use common::arrow::SelectionVector;
 
     use super::*;
+
+    #[test]
+    fn float16_aggregates_use_wide_fold_and_preserve_min_max_layout() {
+        let source: ArrayRef = Arc::new(Float32Array::from(vec![Some(1.5), None, Some(2.5)]));
+        let input = arrow::compute::cast(
+            &source,
+            &VeinDataType::Float16.to_arrow(),
+        )
+            .unwrap();
+        assert!(input.as_any().is::<Float16Array>());
+
+        let plan = AggregatePlan {
+            groups: 0,
+            aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
+            aggregate_input_types: vec![VeinDataType::Float16; 4],
+            types: vec![
+                VeinDataType::Float64,
+                VeinDataType::Float16,
+                VeinDataType::Float16,
+                VeinDataType::Float64,
+            ],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+        sink.accumulate(DataChunk::from_vectors(vec![
+            input.clone(),
+            input.clone(),
+            input.clone(),
+            input,
+        ]))
+            .unwrap();
+        let output = sink.finish().unwrap();
+
+        assert_eq!(
+            output[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            4.0
+        );
+        for (column, expected) in [(1, 1.5), (2, 2.5)] {
+            let value = arrow::compute::cast(
+                output[0].column(column),
+                &VeinDataType::Float32.to_arrow(),
+            )
+                .unwrap();
+            assert_eq!(
+                value
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+        assert_eq!(
+            output[0]
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            2.0
+        );
+    }
+
+    macro_rules! assert_unsigned_layout {
+        ($array:ty, $data_type:expr, $sum_type:expr, $sum:expr, $min:expr, $max:expr) => {{
+            let input: ArrayRef = Arc::new(<$array>::from(vec![Some(2), None, Some(5)]));
+            let plan = AggregatePlan {
+                groups: 0,
+                aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
+                aggregate_input_types: vec![$data_type.clone(); 4],
+                types: vec![
+                    $sum_type,
+                    $data_type.clone(),
+                    $data_type.clone(),
+                    VeinDataType::Float64,
+                ],
+            };
+            let mut sink = AggregateSink::new(plan).unwrap();
+            sink.accumulate(DataChunk::from_vectors(vec![
+                input.clone(),
+                input.clone(),
+                input.clone(),
+                input,
+            ]))
+            .unwrap();
+            let output = sink.finish().unwrap();
+            assert_eq!(
+                output[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0),
+                $sum
+            );
+            assert_eq!(
+                output[0]
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<$array>()
+                    .unwrap()
+                    .value(0),
+                $min
+            );
+            assert_eq!(
+                output[0]
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<$array>()
+                    .unwrap()
+                    .value(0),
+                $max
+            );
+            assert_eq!(
+                output[0]
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(0),
+                3.5
+            );
+        }};
+    }
+
+    #[test]
+    fn unsigned_layouts_share_typed_states_and_ignore_nulls() {
+        assert_unsigned_layout!(UInt8Array, VeinDataType::UInt8, VeinDataType::UInt64, 7, 2, 5);
+        assert_unsigned_layout!(UInt16Array, VeinDataType::UInt16, VeinDataType::UInt64, 7, 2, 5);
+        assert_unsigned_layout!(UInt32Array, VeinDataType::UInt32, VeinDataType::UInt64, 7, 2, 5);
+        assert_unsigned_layout!(UInt64Array, VeinDataType::UInt64, VeinDataType::UInt64, 7, 2, 5);
+    }
+
+    #[test]
+    fn uint64_sum_checks_overflow_and_average_uses_wide_exact_state() {
+        let sum_plan = AggregatePlan {
+            groups: 0,
+            aggs: vec![AggOpCode::Sum],
+            aggregate_input_types: vec![VeinDataType::UInt64],
+            types: vec![VeinDataType::UInt64],
+        };
+        let mut sum_sink = AggregateSink::new(sum_plan).unwrap();
+        let overflow = sum_sink
+            .accumulate(DataChunk::from_vectors(vec![Arc::new(UInt64Array::from(
+                vec![u64::MAX, 1],
+            ))]))
+            .unwrap_err();
+        assert!(overflow.to_string().contains("overflow while computing SUM"));
+
+        let avg_plan = AggregatePlan {
+            groups: 0,
+            aggs: vec![AggOpCode::Avg],
+            aggregate_input_types: vec![VeinDataType::UInt64],
+            types: vec![VeinDataType::Float64],
+        };
+        let mut avg_sink = AggregateSink::new(avg_plan).unwrap();
+        avg_sink
+            .accumulate(DataChunk::from_vectors(vec![Arc::new(UInt64Array::from(vec![
+                u64::MAX,
+            ]))]))
+            .unwrap();
+        avg_sink
+            .accumulate(DataChunk::from_vectors(vec![Arc::new(UInt64Array::from(vec![
+                u64::MAX,
+            ]))]))
+            .unwrap();
+        let output = avg_sink.finish().unwrap();
+        let average = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(average.value(0), u64::MAX as f64);
+    }
 
     #[test]
     fn accumulation_reads_only_selected_physical_rows() {
@@ -857,6 +1269,85 @@ mod tests {
             .unwrap();
 
         assert_eq!(average.value(0), 17.5);
+    }
+
+    #[test]
+    fn int64_average_accumulates_exactly_across_batches() {
+        let plan = AggregatePlan {
+            groups: 0,
+            aggs: vec![AggOpCode::Avg],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Float64],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+
+        sink.accumulate(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(
+            vec![9_007_199_254_740_993_i64],
+        ))]))
+            .unwrap();
+        sink.accumulate(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(
+            vec![-9_007_199_254_740_992_i64],
+        ))]))
+            .unwrap();
+
+        let output = sink.finish().unwrap();
+        let average = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(average.value(0), 0.5);
+    }
+
+    #[test]
+    fn decimal_average_accumulates_unscaled_values_exactly() {
+        let input = Decimal128Array::from(vec![
+            9_007_199_254_740_993_i128,
+            -9_007_199_254_740_992_i128,
+        ])
+            .with_precision_and_scale(19, 0)
+            .unwrap();
+        let plan = AggregatePlan {
+            groups: 0,
+            aggs: vec![AggOpCode::Avg],
+            aggregate_input_types: vec![VeinDataType::Decimal128(19, 0)],
+            types: vec![VeinDataType::Float64],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+
+        sink.accumulate(DataChunk::from_vectors(vec![Arc::new(input)]))
+            .unwrap();
+
+        let output = sink.finish().unwrap();
+        let average = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(average.value(0), 0.5);
+    }
+
+    #[test]
+    fn float32_average_accumulates_in_float64_state() {
+        let input = Float32Array::from(vec![100_000_000.0_f32, 1.0, -100_000_000.0]);
+        let plan = AggregatePlan {
+            groups: 0,
+            aggs: vec![AggOpCode::Avg],
+            aggregate_input_types: vec![VeinDataType::Float32],
+            types: vec![VeinDataType::Float64],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+
+        sink.accumulate(DataChunk::from_vectors(vec![Arc::new(input)]))
+            .unwrap();
+
+        let output = sink.finish().unwrap();
+        let average = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(average.value(0), 1.0 / 3.0);
     }
 
     #[test]

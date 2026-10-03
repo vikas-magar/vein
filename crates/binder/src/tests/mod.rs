@@ -640,17 +640,54 @@ mod extended_features {
         }
     }
 
-    /// `DISTINCT` aggregate is preserved on the lifted `FunctionCall`.
+    /// `COUNT(*)` is lowered to a non-null literal for ordinary aggregates.
     #[tokio::test]
-    async fn distinct_aggregate_is_carried_on_call() {
-        let plan = bind("FROM users |> AGGREGATE SUM(DISTINCT age) GROUP BY name").await;
-        assert_chain(&plan, &["Aggregate", "Scan"]);
-        let LogicalPlan::Aggregate { aggs, .. } = &plan else {
-            panic!("expected aggregate");
-        };
-        match &aggs[0] {
-            LogicalExpr::FunctionCall { distinct, .. } => assert!(*distinct),
-            other => panic!("unexpected agg expr: {other:?}"),
+    async fn aggregate_count_star_binds_as_one() {
+        for query in [
+            "FROM users |> AGGREGATE COUNT(*) AS n",
+            "FROM users |> AGGREGATE COUNT(*) AS n GROUP BY name",
+        ] {
+            let plan = bind(query).await;
+            let LogicalPlan::Aggregate { aggs, .. } = plan else {
+                panic!("expected aggregate plan");
+            };
+            assert!(matches!(
+                &aggs[0],
+                LogicalExpr::FunctionCall { name, args, .. }
+                    if name.eq_ignore_ascii_case("count")
+                        && matches!(args.as_slice(), [LogicalExpr::Literal(LogicalLiteral::Int64(1))])
+            ));
+        }
+    }
+
+    /// Until distinct state is carried to execution, reject it instead of
+    /// silently executing a regular aggregate.
+    #[tokio::test]
+    async fn aggregate_distinct_is_rejected() {
+        for query in [
+            "FROM users |> AGGREGATE COUNT(DISTINCT age)",
+            "FROM users |> AGGREGATE SUM(DISTINCT age)",
+            "FROM users |> AGGREGATE COUNT(DISTINCT *)",
+        ] {
+            let error = bind_err(query).await;
+            assert!(
+                error.to_string().contains("DISTINCT inside aggregate function"),
+                "got {error} for {query}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_argument_count_is_validated_during_binding() {
+        for query in [
+            "FROM users |> AGGREGATE COUNT()",
+            "FROM users |> AGGREGATE SUM(age, id)",
+        ] {
+            let error = bind_err(query).await;
+            assert!(
+                error.to_string().contains("expects exactly one argument"),
+                "got {error} for {query}"
+            );
         }
     }
 

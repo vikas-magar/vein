@@ -269,13 +269,36 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         name: &str,
         args: &[SpannedExpr<'_>],
         distinct: bool,
-        _span: parser::token::Span,
+        span: parser::token::Span,
     ) -> Result<LogicalExpr> {
         let signature = self.context.functions.resolve(name)?;
+        let is_aggregate = signature.kind == FunctionKind::Aggregate;
+
+        if is_aggregate && distinct {
+            return Err(VeinError::semantic(
+                format!("DISTINCT inside aggregate function '{name}' is not supported yet"),
+                Some(span),
+            ));
+        }
+        if is_aggregate && args.len() != 1 {
+            return Err(VeinError::semantic(
+                format!("aggregate function '{name}' expects exactly one argument"),
+                Some(span),
+            ));
+        }
 
         let mut bound_args = Vec::with_capacity(args.len());
         for arg in args {
-            bound_args.push(Box::pin(self.bind(arg)).await?);
+            // COUNT(*) counts rows, so bind it as a non-null constant argument.
+            // Other aggregate wildcards remain invalid ordinary expressions.
+            if is_aggregate
+                && name.eq_ignore_ascii_case("count")
+                && matches!(arg.node, Expr::Wildcard { .. })
+            {
+                bound_args.push(LogicalExpr::Literal(LogicalLiteral::Int64(1)));
+            } else {
+                bound_args.push(Box::pin(self.bind(arg)).await?);
+            }
         }
 
         match signature.kind {
@@ -305,7 +328,6 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 }),
             },
             FunctionKind::Scalar | FunctionKind::Aggregate => {
-                let is_aggregate = signature.kind == FunctionKind::Aggregate;
                 let return_type = if is_aggregate {
                     let argument_type = bound_args.first().map(LogicalExpr::data_type);
                     aggregate_return_type(name, argument_type.as_ref(), signature.return_type)

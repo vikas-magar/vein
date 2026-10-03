@@ -15,28 +15,28 @@ something with no IDE equivalent.
 
 ### Task → tool
 
-| Task | Tool |
-| --- | --- |
-| Read a file | `read_file` |
-| Explore a directory | `list_directory_tree` |
-| Find files (glob) | `search_file` |
-| Find text / regex | `search_text`, `search_regex` |
-| Find a symbol | `search_symbol`; then `get_symbol_info` for signature/docs |
-| Call graph (callers / callees) | `analyze_calls` with `INCOMING_CALLS` / `OUTGOING_CALLS` |
-| Jump the editor to a location | `open_file_in_editor` via `execute_tool "<file> --filePath <rel> --line <n>"` |
-| Edit / create a file | `apply_patch`, `create_new_file` |
-| Rename a symbol | `rename_refactoring` (never hand-edit references) |
-| Format | `reformat_file` |
-| Build / compile-check | `build_project` with `rebuild: false` (incremental); `filesToRebuild` for a single file |
-| Discover run configs / tests | `get_run_configurations` (pass `filePath` to list run points) |
-| Run a test or binary | `execute_run_configuration` (`configurationName`, or `filePath` + `line`) |
-| Lint / inspections | `lint_files`, `get_file_problems` |
-| Git status | `git_status` |
-| Dependencies / modules | `get_project_dependencies`, `get_project_modules` |
-| Changelists | `get_changelists`, `create_changelist`, `set_active_changelist`, `move_changes_to_changelist` |
-| Debugging | `xdebug_*` family (breakpoints, session control, stack, frame values, evaluate, variables) |
-| Database | `list_database_connections` → `list_database_schemas` → `execute_sql_query` / `preview_table_data` |
-| Escape hatch for any other MCP tool | `execute_tool "<tool_name> --arg value"` |
+| Task                                | Tool                                                                                               |
+|-------------------------------------|----------------------------------------------------------------------------------------------------|
+| Read a file                         | `read_file`                                                                                        |
+| Explore a directory                 | `list_directory_tree`                                                                              |
+| Find files (glob)                   | `search_file`                                                                                      |
+| Find text / regex                   | `search_text`, `search_regex`                                                                      |
+| Find a symbol                       | `search_symbol`; then `get_symbol_info` for signature/docs                                         |
+| Call graph (callers / callees)      | `analyze_calls` with `INCOMING_CALLS` / `OUTGOING_CALLS`                                           |
+| Jump the editor to a location       | `open_file_in_editor` via `execute_tool "<file> --filePath <rel> --line <n>"`                      |
+| Edit / create a file                | `apply_patch`, `create_new_file`                                                                   |
+| Rename a symbol                     | `rename_refactoring` (never hand-edit references)                                                  |
+| Format                              | `reformat_file`                                                                                    |
+| Build / compile-check               | `build_project` with `rebuild: false` (incremental); `filesToRebuild` for a single file            |
+| Discover run configs / tests        | `get_run_configurations` (pass `filePath` to list run points)                                      |
+| Run a test or binary                | `execute_run_configuration` (`configurationName`, or `filePath` + `line`)                          |
+| Lint / inspections                  | `lint_files`, `get_file_problems`                                                                  |
+| Git status                          | `git_status`                                                                                       |
+| Dependencies / modules              | `get_project_dependencies`, `get_project_modules`                                                  |
+| Changelists                         | `get_changelists`, `create_changelist`, `set_active_changelist`, `move_changes_to_changelist`      |
+| Debugging                           | `xdebug_*` family (breakpoints, session control, stack, frame values, evaluate, variables)         |
+| Database                            | `list_database_connections` → `list_database_schemas` → `execute_sql_query` / `preview_table_data` |
+| Escape hatch for any other MCP tool | `execute_tool "<tool_name> --arg value"`                                                           |
 
 ### Rules
 
@@ -45,7 +45,6 @@ something with no IDE equivalent.
   `execute_run_configuration` — not `cargo` in a terminal.
 - Always call `build_project` with `rebuild: false` (incremental). Never pass `rebuild: true`
   unless explicitly requested — a full rebuild is slow and is not part of the normal loop.
-- Set the Air session title to the current task with `air_set_session_title`.
 - `get_project_modules` currently reports `EMPTY_MODULE`; rely on `list_directory_tree` and
   `get_project_dependencies` for structure instead.
 
