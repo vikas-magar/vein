@@ -508,18 +508,8 @@ fn aggregate_return_type(
         return fallback;
     };
     match name.to_ascii_uppercase().as_str() {
-        "SUM" => match &argument_type {
-            VeinDataType::Int64 => VeinDataType::Int64,
-            VeinDataType::Decimal128(_, scale) => VeinDataType::Decimal128(38, *scale),
-            VeinDataType::Float64 => VeinDataType::Float64,
-            _ => fallback,
-        },
-        "MIN" | "MAX" => match &argument_type {
-            VeinDataType::Int64 | VeinDataType::Float64 | VeinDataType::Decimal128(_, _) => {
-                argument_type
-            }
-            _ => fallback,
-        },
+        "SUM" => argument_type.sum_result_type().unwrap_or(fallback),
+        "MIN" | "MAX" if argument_type.is_numeric() => argument_type,
         _ => fallback,
     }
 }

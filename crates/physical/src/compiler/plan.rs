@@ -75,18 +75,19 @@ impl PipelineCompiler {
                         None,
                     ));
                 };
+                let (aggs, aggregate_input_types): (Vec<_>, Vec<_>) = aggs
+                    .iter()
+                    .map(|agg| {
+                        let (name, argument) = aggregate_argument(agg)?;
+                        Ok((agg_op(name)?, argument.data_type()))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .unzip();
                 Ok(Some(AggregatePlan {
                     groups: keys.len() as u32,
-                    aggs: aggs
-                        .iter()
-                        .map(|agg| match agg {
-                            LogicalExpr::FunctionCall { name, .. } => agg_op(name),
-                            other => Err(VeinError::planning(
-                                format!("an aggregate must be a function call, found {other:?}"),
-                                None,
-                            )),
-                        })
-                        .collect::<Result<_>>()?,
+                    aggs,
+                    aggregate_input_types,
                     types: schema.fields.iter().map(|f| f.data_type.clone()).collect(),
                 }))
             }
@@ -95,6 +96,7 @@ impl PipelineCompiler {
             LogicalPlan::Distinct { schema, .. } => Ok(Some(AggregatePlan {
                 groups: schema.fields.len() as u32,
                 aggs: Vec::new(),
+                aggregate_input_types: Vec::new(),
                 types: schema.fields.iter().map(|f| f.data_type.clone()).collect(),
             })),
             LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
@@ -345,19 +347,8 @@ impl PipelineCompiler {
                 };
                 let mut projected = keys.clone();
                 for agg in aggs {
-                    let LogicalExpr::FunctionCall { name, args, .. } = agg else {
-                        return Err(VeinError::planning(
-                            format!("an aggregate must be a function call, found {agg:?}"),
-                            None,
-                        ));
-                    };
+                    let (name, argument) = aggregate_argument(agg)?;
                     agg_op(name)?;
-                    let [argument] = args.as_slice() else {
-                        return Err(VeinError::planning(
-                            format!("{name} takes exactly one argument in this engine"),
-                            None,
-                        ));
-                    };
                     projected.push(argument.clone());
                 }
                 compiler.compile_projection(&projected, &input_schema)?;
@@ -412,7 +403,24 @@ fn agg_op(name: &str) -> Result<AggOpCode> {
             return Err(VeinError::planning(
                 format!("aggregate {other} is not implemented"),
                 None,
-            ))
+            ));
         }
     })
+}
+
+/// Returns the single input argument for an aggregate expression.
+fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr)> {
+    let LogicalExpr::FunctionCall { name, args, .. } = agg else {
+        return Err(VeinError::planning(
+            format!("an aggregate must be a function call, found {agg:?}"),
+            None,
+        ));
+    };
+    let [argument] = args.as_slice() else {
+        return Err(VeinError::planning(
+            format!("{name} takes exactly one argument in this engine"),
+            None,
+        ));
+    };
+    Ok((name, argument))
 }

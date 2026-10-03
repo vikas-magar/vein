@@ -728,4 +728,32 @@ mod aggregate_types {
         assert_eq!(schema.fields[1].data_type, VeinDataType::Decimal128(15, 2));
         assert_eq!(schema.fields[2].data_type, VeinDataType::Float64);
     }
+
+    #[tokio::test]
+    async fn sum_result_types_cover_numeric_layouts() {
+        let plan = bind(
+            "FROM numeric_values |> AGGREGATE SUM(i8_value), SUM(i16_value), SUM(i32_value), SUM(u8_value), SUM(u16_value), SUM(u32_value), SUM(u64_value), SUM(f16_value), SUM(f32_value), SUM(decimal256_value)",
+        )
+        .await;
+        let LogicalPlan::Aggregate { schema, .. } = plan else {
+            panic!("expected Aggregate plan");
+        };
+
+        let expected = [
+            VeinDataType::Int64,
+            VeinDataType::Int64,
+            VeinDataType::Int64,
+            VeinDataType::UInt64,
+            VeinDataType::UInt64,
+            VeinDataType::UInt64,
+            VeinDataType::UInt64,
+            VeinDataType::Float64,
+            VeinDataType::Float64,
+            VeinDataType::Decimal256(76, 3),
+        ];
+        assert_eq!(
+            schema.fields.iter().map(|field| field.data_type.clone()).collect::<Vec<_>>(),
+            expected
+        );
+    }
 }

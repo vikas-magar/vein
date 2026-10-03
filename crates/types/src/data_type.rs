@@ -127,6 +127,41 @@ pub enum VeinDataType {
 }
 
 impl VeinDataType {
+    /// Whether this type has a numeric Arrow layout supported by arithmetic.
+    pub fn is_numeric(&self) -> bool {
+        matches!(
+            self,
+            Self::Int8
+                | Self::Int16
+                | Self::Int32
+                | Self::Int64
+                | Self::UInt8
+                | Self::UInt16
+                | Self::UInt32
+                | Self::UInt64
+                | Self::Float16
+                | Self::Float32
+                | Self::Float64
+                | Self::Decimal128(_, _)
+                | Self::Decimal256(_, _)
+        )
+    }
+
+    /// Result layout selected for `SUM` over this numeric input layout.
+    ///
+    /// Narrow integers widen to 64 bits, floating point widens to Float64, and
+    /// decimals widen precision while preserving their scale.
+    pub fn sum_result_type(&self) -> Option<Self> {
+        Some(match self {
+            Self::Int8 | Self::Int16 | Self::Int32 | Self::Int64 => Self::Int64,
+            Self::UInt8 | Self::UInt16 | Self::UInt32 | Self::UInt64 => Self::UInt64,
+            Self::Float16 | Self::Float32 | Self::Float64 => Self::Float64,
+            Self::Decimal128(_, scale) => Self::Decimal128(38, *scale),
+            Self::Decimal256(_, scale) => Self::Decimal256(76, *scale),
+            _ => return None,
+        })
+    }
+
     /// Converts to Apache Arrow memory layout.
     pub fn to_arrow(&self) -> DataType {
         match self {
@@ -379,8 +414,11 @@ mod tests {
             VeinDataType::UInt16,
             VeinDataType::UInt32,
             VeinDataType::UInt64,
+            VeinDataType::Float16,
             VeinDataType::Float32,
             VeinDataType::Float64,
+            VeinDataType::Decimal128(38, 4),
+            VeinDataType::Decimal256(76, 4),
             VeinDataType::Utf8,
             VeinDataType::Boolean,
             VeinDataType::Date32,
@@ -392,6 +430,32 @@ mod tests {
             let back: VeinDataType = (&arrow_dt).into();
             assert_eq!(t, back);
         }
+    }
+
+    #[test]
+    fn numeric_aggregate_types_are_centralized() {
+        let cases = [
+            (VeinDataType::Int8, VeinDataType::Int64),
+            (VeinDataType::Int16, VeinDataType::Int64),
+            (VeinDataType::Int32, VeinDataType::Int64),
+            (VeinDataType::Int64, VeinDataType::Int64),
+            (VeinDataType::UInt8, VeinDataType::UInt64),
+            (VeinDataType::UInt16, VeinDataType::UInt64),
+            (VeinDataType::UInt32, VeinDataType::UInt64),
+            (VeinDataType::UInt64, VeinDataType::UInt64),
+            (VeinDataType::Float16, VeinDataType::Float64),
+            (VeinDataType::Float32, VeinDataType::Float64),
+            (VeinDataType::Float64, VeinDataType::Float64),
+            (VeinDataType::Decimal128(12, 3), VeinDataType::Decimal128(38, 3)),
+            (VeinDataType::Decimal256(20, 3), VeinDataType::Decimal256(76, 3)),
+        ];
+
+        for (input, expected_sum) in cases {
+            assert!(input.is_numeric());
+            assert_eq!(input.sum_result_type(), Some(expected_sum));
+        }
+        assert!(!VeinDataType::Utf8.is_numeric());
+        assert_eq!(VeinDataType::Utf8.sum_result_type(), None);
     }
 
     #[test]

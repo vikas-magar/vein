@@ -24,6 +24,21 @@ impl TestCatalog {
             "decimal_values",
             &[("amount", VeinDataType::Decimal128(15, 2))],
         );
+        catalog.add_table(
+            "numeric_values",
+            &[
+                ("i8_value", VeinDataType::Int8),
+                ("i16_value", VeinDataType::Int16),
+                ("i32_value", VeinDataType::Int32),
+                ("u8_value", VeinDataType::UInt8),
+                ("u16_value", VeinDataType::UInt16),
+                ("u32_value", VeinDataType::UInt32),
+                ("u64_value", VeinDataType::UInt64),
+                ("f16_value", VeinDataType::Float16),
+                ("f32_value", VeinDataType::Float32),
+                ("decimal256_value", VeinDataType::Decimal256(20, 3)),
+            ],
+        );
         catalog
     }
 

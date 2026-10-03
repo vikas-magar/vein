@@ -173,14 +173,7 @@ pub enum DataSink {
 }
 
 /// Mode of execution for a task.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Serialize,
-    Deserialize,
-    PartialEq,
-)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum ExecutionMode {
     /// Finite batch execution (e.g., reading Parquet files).
     Batch,
@@ -293,6 +286,8 @@ pub struct AggregatePlan {
     pub groups: u32,
     /// One op per column after the keys, in column order.
     pub aggs: Vec<AggOpCode>,
+    /// The physical input type for each aggregate argument, in aggregate order.
+    pub aggregate_input_types: Vec<types::VeinDataType>,
     /// The type of every output column: the keys first, then one per aggregate.
     pub types: Vec<types::VeinDataType>,
 }

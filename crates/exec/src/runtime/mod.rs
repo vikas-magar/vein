@@ -7,18 +7,18 @@
 //! implementations from a wire task, and a [`TaskExecutor`] runs a single
 //! task end-to-end (see `crate::pipeline`).
 
-use arrow::record_batch::RecordBatch;
 use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
 
-use crate::operators::aggregate;
-use crate::operators::join::{BuildSink, HashTable, HashJoin, JoinKeys, JoinType, OutputColumn};
 use crate::operators::LimitTransform;
-use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
+use crate::operators::aggregate;
+use crate::operators::join::{BuildSink, HashJoin, HashTable, JoinKeys, JoinType, OutputColumn};
 use crate::operators::sink::WriteReceipt;
+use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
@@ -284,9 +284,9 @@ impl DefaultTaskExecutor {
             vm_build_us += vm_started.elapsed().as_micros() as u64;
 
             let source_started = Instant::now();
-            let mut source =
-                self.builder
-                    .build_source(&source, task.task_id, task.attempt)?;
+            let mut source = self
+                .builder
+                .build_source(&source, task.task_id, task.attempt)?;
             source_build_us += source_started.elapsed().as_micros() as u64;
 
             let cancel = cancel.clone();
@@ -303,9 +303,9 @@ impl DefaultTaskExecutor {
 
         let mut bytes_read = 0u64;
         for chain in chains {
-            bytes_read += chain
-                .await
-                .map_err(|error| VeinError::internal(format!("join probe task failed: {error}")))??;
+            bytes_read += chain.await.map_err(|error| {
+                VeinError::internal(format!("join probe task failed: {error}"))
+            })??;
         }
 
         // The chains suppressed their own flushes, so the sink is flushed once
@@ -421,18 +421,16 @@ impl DefaultTaskExecutor {
 
                 let mut table: Option<HashTable> = None;
                 for build in builds {
-                    let partial = build
-                        .await
-                        .map_err(|error| {
-                            VeinError::internal(format!("join build task failed: {error}"))
-                        })??;
+                    let partial = build.await.map_err(|error| {
+                        VeinError::internal(format!("join build task failed: {error}"))
+                    })??;
                     match &mut table {
                         Some(table) => table.merge(partial)?,
                         None => table = Some(partial),
                     }
                 }
-                let table = table
-                    .ok_or_else(|| VeinError::internal("a join build produced no chunks"))?;
+                let table =
+                    table.ok_or_else(|| VeinError::internal("a join build produced no chunks"))?;
 
                 // The whole build phase — reading it *and* hashing it — so the
                 // join's two halves can be compared without summing scan events.
@@ -474,52 +472,54 @@ impl DefaultTaskExecutor {
         // emitted until every row has been folded — so it is the runtime's job,
         // and it takes precedence over the join path a task can never also be on.
         let aggregate_timing = match task.aggregate.clone() {
-            Some(plan) => {
-                Some(
-                    self.run_aggregate(task, plan, &sink, &cancel, &task_span)
-                        .await?,
-                )
-            }
+            Some(plan) => Some(
+                self.run_aggregate(task, plan, &sink, &cancel, &task_span)
+                    .await?,
+            ),
             None => None,
         };
 
         let (bytes_read, vm_build_us, source_build_us) = match aggregate_timing {
-            Some(timing) => (timing.bytes_read, timing.vm_build_us, timing.source_build_us),
+            Some(timing) => (
+                timing.bytes_read,
+                timing.vm_build_us,
+                timing.source_build_us,
+            ),
             None => match join {
-            // A join probes with the table the build phase produced. Its probe
-            // source is fanned out over its files, all sharing that one table.
-            Some((table, plan)) => {
-                let probe = self
-                    .probe_join(task, table, plan, sink.clone(), cancel.clone(), &task_span)
-                    .await?;
-                (probe.bytes_read, probe.vm_build_us, probe.source_build_us)
-            }
-            None => {
-                let head = with_window(
-                    Box::new(CancelGuard::new(
-                        Box::new(SinkHandle(sink.clone())),
-                        cancel.clone(),
-                    )),
-                    task.limit,
-                );
-                let vm_started = Instant::now();
-                let mut vm: Box<dyn Transform<DataChunk>> =
-                    self.builder.build_vm(&task.program, head)?;
-                let vm_build_us = vm_started.elapsed().as_micros() as u64;
-
-                let source_started = Instant::now();
-                let mut source: Box<dyn Source<DataChunk>> =
-                    self.builder
-                        .build_source(&task.source, task.task_id, task.attempt)?;
-                let source_build_us = source_started.elapsed().as_micros() as u64;
-
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(VeinError::cancelled()),
-                    result = source.execute(&mut *vm).instrument(task_span.clone()) => result?,
+                // A join probes with the table the build phase produced. Its probe
+                // source is fanned out over its files, all sharing that one table.
+                Some((table, plan)) => {
+                    let probe = self
+                        .probe_join(task, table, plan, sink.clone(), cancel.clone(), &task_span)
+                        .await?;
+                    (probe.bytes_read, probe.vm_build_us, probe.source_build_us)
                 }
-                (source.bytes_read(), vm_build_us, source_build_us)
-            }
+                None => {
+                    let head = with_window(
+                        Box::new(CancelGuard::new(
+                            Box::new(SinkHandle(sink.clone())),
+                            cancel.clone(),
+                        )),
+                        task.limit,
+                    );
+                    let vm_started = Instant::now();
+                    let mut vm: Box<dyn Transform<DataChunk>> =
+                        self.builder.build_vm(&task.program, head)?;
+                    let vm_build_us = vm_started.elapsed().as_micros() as u64;
+
+                    let source_started = Instant::now();
+                    let mut source: Box<dyn Source<DataChunk>> =
+                        self.builder
+                            .build_source(&task.source, task.task_id, task.attempt)?;
+                    let source_build_us = source_started.elapsed().as_micros() as u64;
+
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(VeinError::cancelled()),
+                        result = source.execute(&mut *vm).instrument(task_span.clone()) => result?,
+                    }
+                    (source.bytes_read(), vm_build_us, source_build_us)
+                }
             },
         };
         let run_us = run_started.elapsed().as_micros() as u64;
@@ -794,6 +794,7 @@ mod tests {
         task.aggregate = Some(AggregatePlan {
             groups: 0,
             aggs: vec![common::protocol::AggOpCode::Count],
+            aggregate_input_types: vec![types::VeinDataType::Int64],
             types: vec![types::VeinDataType::Int64],
         });
 
