@@ -82,6 +82,16 @@ const SCENARIOS: &[Scenario] = &[
         vein: "FROM orders\n|> AGGREGATE count(o_orderkey) AS order_count GROUP BY o_orderstatus\n|> WHERE order_count > 50000",
         duckdb: "SELECT o_orderstatus, count(o_orderkey) AS order_count FROM './data/tpch/orders/*.parquet' GROUP BY o_orderstatus HAVING count(o_orderkey) > 50000",
     },
+    Scenario {
+        name: "order/multi-key-limit",
+        vein: "FROM orders\n|> SELECT o_orderkey, o_totalprice\n|> ORDER o_totalprice DESC, o_orderkey ASC\n|> LIMIT 100",
+        duckdb: "SELECT o_orderkey, o_totalprice FROM './data/tpch/orders/*.parquet' ORDER BY o_totalprice DESC, o_orderkey ASC LIMIT 100",
+    },
+    Scenario {
+        name: "order/computed-key-limit",
+        vein: "FROM orders\n|> SELECT o_orderkey, o_totalprice\n|> ORDER o_orderkey + 1 DESC\n|> LIMIT 100",
+        duckdb: "SELECT o_orderkey, o_totalprice FROM './data/tpch/orders/*.parquet' ORDER BY o_orderkey + 1 DESC LIMIT 100",
+    },
 ];
 
 /// One scenario's samples.
@@ -167,25 +177,27 @@ pub async fn run(iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
         let duckdb = duckdb_millis(scenario.duckdb, iterations)
             .map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.2}ms"));
         match measure(&data_root, scenario.vein, iterations, &counters).await {
-            Ok(sample) => {
-                let p50 = percentile(&sample.execute, 0.50);
-                println!(
-                    "{:<16} {:>9.2}ms {:>9.2}ms {:>9.2}ms {:>10} {:>10} {:>12} {:>12.0}",
-                    scenario.name,
-                    millis(percentile(&sample.prepare, 0.50)),
-                    millis(p50),
-                    millis(percentile(&sample.execute, 0.95)),
-                    sample.rows,
-                    sample.bytes_read,
-                    duckdb,
-                    sample.rows as f64 / p50.as_secs_f64().max(f64::MIN_POSITIVE),
-                );
-            }
+            Ok(sample) => print_sample(scenario.name, &sample, &duckdb),
             // An unsupported scenario is reported, never silently skipped.
             Err(error) => println!("{:<16} unsupported: {error}", scenario.name),
         }
     }
     Ok(())
+}
+
+fn print_sample(name: &str, sample: &Measurement, duckdb: &str) {
+    let p50 = percentile(&sample.execute, 0.50);
+    println!(
+        "{:<16} {:>9.2}ms {:>9.2}ms {:>9.2}ms {:>10} {:>10} {:>12} {:>12.0}",
+        name,
+        millis(percentile(&sample.prepare, 0.50)),
+        millis(p50),
+        millis(percentile(&sample.execute, 0.95)),
+        sample.rows,
+        sample.bytes_read,
+        duckdb,
+        sample.rows as f64 / p50.as_secs_f64().max(f64::MIN_POSITIVE),
+    );
 }
 
 /// DuckDB's own measured execution time for the equivalent query.

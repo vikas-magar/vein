@@ -778,6 +778,7 @@ name = "exec"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-row",
  "async-trait",
  "bytes",
  "catalog",

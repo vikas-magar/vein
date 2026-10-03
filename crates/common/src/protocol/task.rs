@@ -221,6 +221,15 @@ pub struct ExecuteTask {
     /// has to *stop the source*: the VM sees one chunk at a time, and dropping
     /// rows and knowing when to stop reading are one decision.
     pub limit: Option<LimitSpec>,
+    /// Global row ordering, applied before the output window.
+    #[serde(default)]
+    pub sort: Option<SortPlan>,
+    /// VM program that appends computed sort keys after the main row program.
+    #[serde(default)]
+    pub sort_key_program: Option<Arc<MicroProgram>>,
+    /// Number of user-visible columns before helper sort keys are appended.
+    #[serde(default)]
+    pub sort_output_columns: Option<u32>,
     /// How to aggregate, when the query has a `GROUP BY` or a `DISTINCT`.
     pub aggregate: Option<AggregatePlan>,
     /// Vector VM program applied to aggregate output, after the aggregate has
@@ -274,6 +283,24 @@ pub struct LimitSpec {
     pub count: u64,
 }
 
+/// A sort key over one column produced by the task's vector program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortKey {
+    /// Zero-based column position in each input batch.
+    pub column: u32,
+    /// Whether values are ordered from low to high.
+    pub ascending: bool,
+    /// Whether null values precede non-null values.
+    pub nulls_first: bool,
+}
+
+/// The ordering applied to the complete task input before its output window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortPlan {
+    /// Sort keys in lexicographic priority order.
+    pub keys: Vec<SortKey>,
+}
+
 /// How a task aggregates its input, when the query groups or deduplicates.
 ///
 /// The columns the executor sees are the program's output registers: the first
@@ -299,4 +326,32 @@ pub struct AggregatePlan {
     pub aggregate_input_types: Vec<types::VeinDataType>,
     /// The type of every output column: the keys first, then one per aggregate.
     pub types: Vec<types::VeinDataType>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SortKey, SortPlan};
+
+    #[test]
+    fn sort_plan_preserves_key_priority_and_null_order_over_wire_format() {
+        let plan = SortPlan {
+            keys: vec![
+                SortKey {
+                    column: 3,
+                    ascending: false,
+                    nulls_first: true,
+                },
+                SortKey {
+                    column: 1,
+                    ascending: true,
+                    nulls_first: false,
+                },
+            ],
+        };
+
+        let encoded = serde_json::to_vec(&plan).expect("serialize sort plan");
+        let decoded: SortPlan = serde_json::from_slice(&encoded).expect("deserialize sort plan");
+
+        assert_eq!(decoded, plan);
+    }
 }

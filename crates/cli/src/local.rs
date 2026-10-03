@@ -290,27 +290,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn executes_a_local_parquet_query_incrementally() {
+    async fn executes_ordered_local_parquet_query_across_files() {
         let root = tempfile::tempdir().expect("temporary data root");
         let table_dir = root.path().join("flights");
         std::fs::create_dir_all(&table_dir).expect("create table directory");
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        )
-            .expect("valid batch");
-        let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
-        let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
+        for (part, values) in [("part-1.parquet", vec![1, 4]), ("part-2.parquet", vec![5, 2, 3])] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values))],
+            )
+                .expect("valid batch");
+            let file = File::create(table_dir.join(part)).expect("create Parquet file");
+            let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("create writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
 
         let engine = LocalQueryEngine::new(root.path());
         let query = engine
-            .prepare("FROM flights |> WHERE id > 1 |> SELECT id")
+            .prepare("FROM flights |> WHERE id > 1 |> SELECT id |> ORDER id DESC")
             .await
-            .expect("prepare local query");
+            .expect("prepare ordered local query");
+        assert_eq!(query.tasks.len(), 1, "a global sort must read all files in one task");
+        assert!(query.tasks[0].sort.is_some());
         let mut stream = query.into_stream();
         let mut rows = Vec::new();
         while let Some(batch) = stream.next().await {
@@ -323,7 +327,43 @@ mod tests {
             rows.extend(ids.values().iter().copied());
         }
 
-        assert_eq!(rows, vec![2, 3]);
+        assert_eq!(rows, vec![5, 4, 3, 2]);
+
+        let query = engine
+            .prepare("FROM flights |> SELECT id |> ORDER id + 1 DESC")
+            .await
+            .expect("prepare computed ORDER BY query");
+        let mut stream = query.into_stream();
+        let mut computed_order_ids = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("computed ORDER BY batch");
+            assert_eq!(batch.num_columns(), 1, "temporary sort key must not escape");
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 projected output");
+            computed_order_ids.extend(ids.values().iter().copied());
+        }
+        assert_eq!(computed_order_ids, vec![5, 4, 3, 2, 1]);
+
+        let query = engine
+            .prepare("FROM flights |> AGGREGATE count(id) AS flight_count GROUP BY id |> ORDER id DESC")
+            .await
+            .expect("prepare ordered aggregate query");
+        let mut stream = query.into_stream();
+        let mut grouped_ids = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("aggregate query batch");
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 grouping key");
+            grouped_ids.extend(ids.values().iter().copied());
+        }
+
+        assert_eq!(grouped_ids, vec![5, 4, 3, 2, 1]);
     }
 
     #[tokio::test]

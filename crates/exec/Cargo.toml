@@ -9,6 +9,7 @@ common = { path = "../common" }
 error = { path = "../error" }
 tokio = { workspace = true }
 arrow = { workspace = true }
+arrow-row = { workspace = true }
 parquet = { workspace = true }
 opendal = { workspace = true }
 bytes = { workspace = true }

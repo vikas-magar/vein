@@ -2,16 +2,16 @@
 
 This document tracks the path from syntax accepted by the parser through binding, logical planning, physical planning, and execution.
 
-“Complete” means a supported query shape has an end-to-end execution path. Parser or binder support alone does not count. “Partial” means an execution path exists for a restricted subset, or depends on another supported operator/backend. “Not implemented” means the operator is represented in the parser/logical plan but has no executable local physical implementation.
+“Complete” means the operator's supported semantics have an end-to-end execution path across the documented query shapes. Parser or binder support alone does not count. “Partial” means an execution path exists for a restricted subset, or depends on another supported operator/backend. “Not implemented” means the operator is represented in the parser/logical plan but has no executable local physical implementation.
 
 ## Pipe operators
 
 | Parser operator | Status | Current implementation and remaining work |
 |---|---|---|
 | `SELECT` | Partial | Binds to `Project` and compiles supported expressions. Expression forms without bytecode lowering/runtime kernels remain unsupported. |
-| `WHERE` | Partial | Binds to `Filter`; VM filtering and scan predicate pushdown work for supported expressions and plan shapes. |
+| `WHERE` | Partial | Binds to `Filter`; VM filtering and scan predicate pushdown work for supported expressions and plan shapes. A post-aggregate `WHERE` also runs against aggregate output for supported predicates. |
 | `QUALIFY` | Not implemented | Binder creates window computation plus a filter. Physical planning does not support `Window`. |
-| `AGGREGATE` | Partial | One grouping set is executable when no operator follows it. Shared generic fold logic currently dispatches `Int64`, `Float64`, and `Decimal128` inputs; integer and decimal sums preserve exact values with checked overflow, `MIN`/`MAX` preserve their input type, and `AVG` returns `Float64`. Group keys currently support `Int64` and `Utf8`; other numeric layouts, post-aggregate operators, and multiple grouping sets remain unsupported. |
+| `AGGREGATE` | Partial | Multiple grouping sets execute, including empty sets; omitted grouping columns are emitted as `NULL`, and empty input produces rows for empty grouping sets. Shared fold logic handles supported integer, floating-point, and decimal layouts; decimal sums preserve scaled integer values with checked overflow, and `AVG` uses floating-point output. Group-key and aggregate input/result type combinations remain limited. A post-aggregate `WHERE` is supported for supported predicates; post-aggregate projection/`SELECT` and other operator placements remain incomplete. |
 | `ORDER BY` | Not implemented | Binder creates `Sort`; no local physical sort implementation. |
 | `LIMIT` | Partial | Runtime limit exists, but some placements are rejected where current pipeline placement would change pipe semantics. |
 | `EXTEND` | Partial | Lowers to projection; inherits expression lowering/runtime limits. |
@@ -19,7 +19,7 @@ This document tracks the path from syntax accepted by the parser through binding
 | `DROP` | Partial | Lowers to projection; inherits expression lowering/runtime limits. |
 | `RENAME` | Partial | Lowers to projection; inherits expression lowering/runtime limits. |
 | `AS` | Partial | Lowers to an alias node; executable only when the wrapped plan is supported. |
-| `DISTINCT` | Partial | Reuses aggregate/grouping machinery; inherits its selection and supported-key limitations. |
+| `DISTINCT` | Partial | Reuses aggregate/grouping machinery; inherits its supported-key and execution limitations. |
 | `JOIN` | Partial | Local hash join supports restricted join types and key predicates. Cross joins and broader key expressions are unsupported; equality operand order can prevent planning. |
 | `CALL` | Not implemented | Binder creates `LogicalPlan::Call`; no physical implementation. |
 | `TABLESAMPLE` | Not implemented | Binder creates `Sample`; no physical implementation. |
@@ -33,6 +33,18 @@ This document tracks the path from syntax accepted by the parser through binding
 | `WRITE` | Partial | Transactional sink exists, but requires a configured backend and inherits pipeline/operator limits. |
 | `FORK` | Not implemented | Binder creates branch plans; no branch execution path. |
 | `TEE` | Not implemented | Binder creates branch plans; no fan-out execution path. |
+
+## Implemented end-to-end paths
+
+No pipe operator is complete across its full syntax and semantics yet. These operator paths do execute end to end for the supported subsets described above:
+
+- Parquet scan with supported column projection and filter pushdown.
+- `WHERE` before aggregation and supported `WHERE` predicates after aggregation.
+- `SELECT` and projection-backed `EXTEND`, `SET`, `DROP`, and `RENAME` with expressions the VM can compile and run.
+- `LIMIT` in placements the physical pipeline can preserve, including above aggregation.
+- `AGGREGATE` with supported aggregate functions and type combinations, including multiple grouping sets and empty grouping sets.
+- `DISTINCT` through the aggregate grouping machinery for supported key types.
+- Restricted local hash joins for supported join types and equality/`USING` key forms.
 
 ## Query sources and statement forms
 

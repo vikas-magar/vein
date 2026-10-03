@@ -6,7 +6,7 @@ use crate::task::Task;
 use common::Result;
 use common::identifiers::{PartitionId, StageId, TaskId};
 use common::protocol::{
-    DataSink, DataSource, JoinKind, JoinOutput, JoinPlan, LimitSpec, MicroProgram,
+    DataSink, DataSource, JoinKind, JoinOutput, JoinPlan, LimitSpec, MicroProgram, SortPlan,
 };
 use error::VeinError;
 use parser::ast::expr::BinaryOp;
@@ -52,6 +52,8 @@ impl DefaultPipelineStageBuilder {
         schema: &VeinSchema,
         outputs: Option<&[LogicalExpr]>,
         limit: Option<LimitSpec>,
+        sort: Option<SortPlan>,
+        sort_key_program: Option<Arc<MicroProgram>>,
     ) -> Result<Stage> {
         let LogicalPlan::Join {
             join_type,
@@ -113,7 +115,12 @@ impl DefaultPipelineStageBuilder {
                     schema: Arc::new(schema.clone()),
                 }),
             )
-            .with_limit(limit),
+                .with_limit(limit)
+                .with_sort(sort)
+                .with_sort_key_program(
+                    sort_key_program,
+                    Some(schema.fields.len() as u32),
+                ),
         );
         Ok(stage)
     }
@@ -124,8 +131,8 @@ impl DefaultPipelineStageBuilder {
 ///
 /// A projection above the join is not a second operator: the join is where the
 /// pipeline breaks, so the projection is the join's output column list. Its
-    /// **expressions** are what identify the source columns — its schema holds fresh
-    /// output ids that match neither input, which is why they cannot be used.
+/// **expressions** are what identify the source columns — its schema holds fresh
+/// output ids that match neither input, which is why they cannot be used.
 fn join_root(plan: &LogicalPlan) -> Option<(&LogicalPlan, &VeinSchema, Option<&[LogicalExpr]>)> {
     match plan {
         LogicalPlan::Join { schema, .. } => Some((plan, schema.as_ref(), None)),
@@ -139,6 +146,7 @@ fn join_root(plan: &LogicalPlan) -> Option<(&LogicalPlan, &VeinSchema, Option<&[
         // A limit sits above whatever it windows, so the join beneath it is still
         // the pipeline breaker that has to be built.
         LogicalPlan::Limit { input, .. } => join_root(input),
+        LogicalPlan::Sort { input, .. } => join_root(input),
         _ => None,
     }
 }
@@ -171,11 +179,11 @@ fn equality_keys(
     build: &VeinSchema,
 ) -> Result<(u32, u32)> {
     let Some(LogicalExpr::BinaryOp {
-        left,
-        right,
-        op: BinaryOp::Eq,
-        ..
-    }) = on
+                 left,
+                 right,
+                 op: BinaryOp::Eq,
+                 ..
+             }) = on
     else {
         return Err(VeinError::planning(
             "a join needs a single equality ON predicate, or USING columns",
@@ -316,11 +324,16 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
     ) -> Result<Stage> {
         let limit = PipelineCompiler::window(plan)?;
         let aggregate = PipelineCompiler::aggregate(plan)?;
+        let sort = PipelineCompiler::sort(plan)?;
+        let sort_key_program = PipelineCompiler::sort_key_program(plan)?.map(Arc::new);
         let post_aggregate_program = PipelineCompiler::post_aggregate_program(plan)?.map(Arc::new);
         if let Some((join, schema, outputs)) = join_root(plan) {
-            return self.build_join(join, schema, outputs, limit);
+            return self.build_join(join, schema, outputs, limit, sort, sort_key_program);
         }
         let (source, program, out_schema) = self.compile_pipeline(plan)?;
+        let sort_output_columns = sort_key_program
+            .as_ref()
+            .map(|_| out_schema.fields.len() as u32);
         let sink = match plan {
             LogicalPlan::Write {
                 target, options, ..
@@ -359,7 +372,10 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         // A limit counts rows globally and an aggregate groups them globally, so
         // a plan with either stays one task: the per-file split below would apply
         // the window, or the grouping, once per file.
-        let sources = if limit.is_some() || aggregate.is_some() || matches!(sink, DataSink::Storage(_))
+        let sources = if limit.is_some()
+            || aggregate.is_some()
+            || sort.is_some()
+            || matches!(sink, DataSink::Storage(_))
         {
             vec![(PartitionId::from_raw(0), source)]
         } else {
@@ -377,6 +393,8 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                     Arc::clone(&sink),
                 )
                     .with_limit(limit)
+                    .with_sort(sort.clone())
+                    .with_sort_key_program(sort_key_program.clone(), sort_output_columns)
                     .with_aggregate(aggregate.clone())
                     .with_post_aggregate_program(post_aggregate_program.clone()),
             );

@@ -19,3 +19,4 @@ pub mod transform;
 pub use sink::{CollectSink, DiscardSink};
 pub use source::{MemorySource, ScanSource};
 pub use transform::LimitTransform;
+pub use transform::SortTransform;

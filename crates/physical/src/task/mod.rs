@@ -3,7 +3,7 @@
 use common::identifiers::{PartitionId, QueryId, RequestId, StageId, TaskId};
 use common::protocol::{
     AggregatePlan, DataSink, DataSource, ExecuteTask, ExecutionMode, JoinPlan, LimitSpec,
-    MicroProgram,
+    MicroProgram, SortPlan,
 };
 use std::sync::Arc;
 
@@ -30,6 +30,12 @@ pub struct Task {
     pub join: Option<JoinPlan>,
     /// The row window this task emits, when the query has a `LIMIT`.
     pub limit: Option<LimitSpec>,
+    /// Global row ordering, applied before the task's output window.
+    pub sort: Option<SortPlan>,
+    /// VM program that appends computed sort keys after the main row program.
+    pub sort_key_program: Option<Arc<MicroProgram>>,
+    /// Number of user-visible columns before helper sort keys are appended.
+    pub sort_output_columns: Option<u32>,
     /// How this task aggregates, when the query has a `GROUP BY` or `DISTINCT`.
     pub aggregate: Option<AggregatePlan>,
     /// VM program applied to aggregate output, when the plan has post-aggregate filters.
@@ -54,6 +60,9 @@ impl Task {
             build: None,
             join: None,
             limit: None,
+            sort: None,
+            sort_key_program: None,
+            sort_output_columns: None,
             aggregate: None,
             post_aggregate_program: None,
         }
@@ -82,6 +91,9 @@ impl Task {
             build: Some(build),
             join: Some(join),
             limit: None,
+            sort: None,
+            sort_key_program: None,
+            sort_output_columns: None,
             aggregate: None,
             post_aggregate_program: None,
         }
@@ -94,6 +106,23 @@ impl Task {
     /// globally, so a per-file task would emit the limit once per file.
     pub fn with_limit(mut self, limit: Option<LimitSpec>) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Orders the complete input before applying its output window.
+    pub fn with_sort(mut self, sort: Option<SortPlan>) -> Self {
+        self.sort = sort;
+        self
+    }
+
+    /// Appends computed sort keys and records the visible output width.
+    pub fn with_sort_key_program(
+        mut self,
+        program: Option<Arc<MicroProgram>>,
+        output_columns: Option<u32>,
+    ) -> Self {
+        self.sort_key_program = program;
+        self.sort_output_columns = output_columns;
         self
     }
 
@@ -144,8 +173,52 @@ impl Task {
             build: self.build,
             join: self.join,
             limit: self.limit,
+            sort: self.sort,
+            sort_key_program: self.sort_key_program,
+            sort_output_columns: self.sort_output_columns,
             aggregate: self.aggregate,
             post_aggregate_program: self.post_aggregate_program,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Task;
+    use common::identifiers::{PartitionId, QueryId, RequestId, StageId, TaskId};
+    use common::protocol::{
+        DataSink, DataSource, ExecutionMode, MicroProgram, SortKey, SortPlan,
+    };
+    use plan::schema::VeinSchema;
+    use std::sync::Arc;
+
+    #[test]
+    fn carries_sort_plan_into_execute_task() {
+        let sort = SortPlan {
+            keys: vec![SortKey {
+                column: 2,
+                ascending: false,
+                nulls_first: true,
+            }],
+        };
+        let task = Task::new(
+            TaskId::new(),
+            PartitionId::from_raw(0),
+            DataSource::Memory,
+            Arc::new(MicroProgram::empty()),
+            Arc::new(DataSink::Client {
+                schema: Arc::new(VeinSchema::empty()),
+            }),
+        )
+            .with_sort(Some(sort.clone()));
+
+        let execute_task = task.into_execute_task(
+            RequestId::new(),
+            QueryId::new(),
+            StageId::new(),
+            ExecutionMode::Batch,
+        );
+
+        assert_eq!(execute_task.sort, Some(sort));
     }
 }

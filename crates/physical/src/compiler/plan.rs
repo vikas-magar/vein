@@ -6,11 +6,11 @@ use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{
     AggOpCode, AggregatePlan, DataSource, FileFormat, FileScanTask, LimitSpec, MicroProgram, RegId,
-    ScanPredicate,
+    ScanPredicate, SortKey as PhysicalSortKey, SortPlan,
 };
 use error::VeinError;
 use plan::schema::VeinSchema;
-use plan::{LogicalExpr, LogicalPlan};
+use plan::{LogicalExpr, LogicalPlan, SortKey as LogicalSortKey};
 
 use super::expr::BytecodeCompiler;
 
@@ -60,7 +60,9 @@ impl PipelineCompiler {
     /// output schema through the post-aggregate pipeline.
     pub fn aggregate(plan: &LogicalPlan) -> Result<Option<AggregatePlan>> {
         match plan {
-            LogicalPlan::Limit { input, .. } => Self::aggregate(input),
+            LogicalPlan::Limit { input, .. } | LogicalPlan::Sort { input, .. } => {
+                Self::aggregate(input)
+            }
             LogicalPlan::Aggregate {
                 grouping_sets,
                 aggs,
@@ -109,6 +111,75 @@ impl PipelineCompiler {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Builds the row ordering for a root `ORDER`, optionally under a `LIMIT`.
+    ///
+    /// The current task output already contains each sort key, so this metadata
+    /// can point directly at its column without adding a second expression path.
+    pub fn sort(plan: &LogicalPlan) -> Result<Option<SortPlan>> {
+        let Some((sort_keys, schema)) = root_sort(plan)? else {
+            return Ok(None);
+        };
+        let mut computed_index = 0usize;
+        let keys = sort_keys.iter()
+            .map(|key| {
+                let position = match &key.expr {
+                    LogicalExpr::Column(column) => schema
+                        .position_of_id(column.id)
+                        .or_else(|| schema.fields.iter().position(|field| field.name == column.name))
+                        .ok_or_else(|| {
+                            VeinError::planning(
+                                format!("ORDER BY column '{}' is absent from its output schema", column.name),
+                                None,
+                            )
+                        })?,
+                    _ => {
+                        let position = schema.fields.len() + computed_index;
+                        computed_index += 1;
+                        position
+                    }
+                };
+                let column = u32::try_from(position).map_err(|_| {
+                    VeinError::planning("ORDER BY has too many output columns", None)
+                })?;
+                Ok(PhysicalSortKey {
+                    column,
+                    ascending: key.asc,
+                    nulls_first: key.nulls_first,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if keys.is_empty() {
+            return Err(VeinError::planning("ORDER requires at least one sort key", None));
+        }
+        Ok(Some(SortPlan { keys }))
+    }
+
+    /// Evaluates computed ORDER expressions once and appends them as temporary
+    /// columns after the visible pipeline output.
+    pub fn sort_key_program(plan: &LogicalPlan) -> Result<Option<MicroProgram>> {
+        let Some((sort_keys, schema)) = root_sort(plan)? else {
+            return Ok(None);
+        };
+        if sort_keys
+            .iter()
+            .all(|key| matches!(&key.expr, LogicalExpr::Column(_)))
+        {
+            return Ok(None);
+        }
+
+        let mut compiler = BytecodeCompiler::new(schema.fields.len() as RegId);
+        let mut output_registers = (0..schema.fields.len())
+            .map(|index| index as RegId)
+            .collect::<Vec<_>>();
+        for key in sort_keys {
+            if !matches!(&key.expr, LogicalExpr::Column(_)) {
+                output_registers.push(compiler.compile_expr(&key.expr, schema)?);
+            }
+        }
+        compiler.compile_projection_registers(output_registers);
+        Ok(Some(compiler.finish()))
     }
 
     /// Compiles a linear logical plan into its Parquet source and vector program.
@@ -187,6 +258,7 @@ impl PipelineCompiler {
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. }
             | LogicalPlan::SubqueryAlias { input, .. }
             | LogicalPlan::Write { input, .. }
             | LogicalPlan::Aggregate { input, .. }
@@ -328,6 +400,10 @@ impl PipelineCompiler {
             // A limit changes no column, only how many rows come out: the window
             // is applied by the executor, so the program sees straight through.
             LogicalPlan::Limit { input, .. } => Self::compile_node(input, input_schema, compiler),
+            LogicalPlan::Sort { input, schema, .. } => {
+                Self::compile_node(input, input_schema, compiler)?;
+                Ok((**schema).clone())
+            }
             // An alias compiles its input but reports *its own* schema: the
             // columns are the same, and it is the alias's field ids and
             // qualifiers that everything above it was resolved against.
@@ -424,6 +500,7 @@ fn compile_post_aggregate_node(
         LogicalPlan::Limit { input, .. } | LogicalPlan::Write { input, .. } => {
             compile_post_aggregate_node(input, compiler)
         }
+        LogicalPlan::Sort { input, .. } => compile_post_aggregate_node(input, compiler),
         LogicalPlan::SubqueryAlias { input, schema, .. } => {
             compile_post_aggregate_node(input, compiler)?;
             Ok((**schema).clone())
@@ -436,6 +513,64 @@ fn compile_post_aggregate_node(
             format!("unsupported operator above an aggregate: {other:?}"),
             None,
         )),
+    }
+}
+
+fn contains_sort(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Sort { .. } => true,
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::SubqueryAlias { input, .. }
+        | LogicalPlan::Write { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Distinct { input, .. } => contains_sort(input),
+        _ => false,
+    }
+}
+
+fn root_sort(plan: &LogicalPlan) -> Result<Option<(&[LogicalSortKey], &VeinSchema)>> {
+    match plan {
+        LogicalPlan::Limit { input, .. } => root_sort(input),
+        LogicalPlan::Sort {
+            input,
+            sort_keys,
+            schema,
+        } => {
+            if contains_limit(input) {
+                return Err(VeinError::planning(
+                    "LIMIT before ORDER is not supported; move LIMIT after ORDER",
+                    None,
+                ));
+            }
+            if contains_sort(input) {
+                return Err(VeinError::planning(
+                    "multiple ORDER operators in one pipeline are not supported yet",
+                    None,
+                ));
+            }
+            Ok(Some((sort_keys, schema)))
+        }
+        other if contains_sort(other) => Err(VeinError::planning(
+            "ORDER is currently supported at the end of a pipeline, optionally followed by LIMIT",
+            None,
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn contains_limit(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Limit { .. } => true,
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::SubqueryAlias { input, .. }
+        | LogicalPlan::Write { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Distinct { input, .. } => contains_limit(input),
+        _ => false,
     }
 }
 
@@ -506,4 +641,129 @@ fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr)> {
         ));
     };
     Ok((name, argument))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common::protocol::{SortKey as PhysicalSortKey, SortPlan};
+    use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
+    use plan::{LogicalExpr, LogicalLiteral, LogicalPlan, SortKey as LogicalSortKey};
+
+    use super::PipelineCompiler;
+
+    fn schema() -> (VeinSchema, Arc<ResolvedColumn>) {
+        let first = Arc::new(ResolvedColumn::new(
+            ColumnId(1),
+            "name",
+            None,
+            VeinDataType::Utf8,
+        ));
+        let second = Arc::new(ResolvedColumn::new(
+            ColumnId(2),
+            "price",
+            None,
+            VeinDataType::Int64,
+        ));
+        (VeinSchema::new(vec![first, second.clone()]), second)
+    }
+
+    fn external_scan(schema: &VeinSchema) -> LogicalPlan {
+        LogicalPlan::ExternalScan {
+            url: "memory://sort-test".to_owned(),
+            options: Vec::new(),
+            files: Vec::new(),
+            schema: Box::new(schema.clone()),
+        }
+    }
+
+    #[test]
+    fn compiles_sort_columns_from_the_output_schema() {
+        let (schema, column) = schema();
+        let plan = LogicalPlan::Sort {
+            input: Box::new(external_scan(&schema)),
+            sort_keys: vec![LogicalSortKey {
+                expr: LogicalExpr::Column(column),
+                asc: false,
+                nulls_first: true,
+            }],
+            schema: Box::new(schema),
+        };
+
+        assert_eq!(
+            PipelineCompiler::sort(&plan).expect("sort metadata"),
+            Some(SortPlan {
+                keys: vec![PhysicalSortKey {
+                    column: 1,
+                    ascending: false,
+                    nulls_first: true,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn compiles_computed_sort_keys_as_temporary_vm_columns() {
+        let (schema, column) = schema();
+        let expression = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(column)),
+            op: parser::ast::expr::BinaryOp::Plus,
+            right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(1))),
+            return_type: VeinDataType::Int64,
+        };
+        let plan = LogicalPlan::Sort {
+            input: Box::new(external_scan(&schema)),
+            sort_keys: vec![LogicalSortKey {
+                expr: expression,
+                asc: false,
+                nulls_first: false,
+            }],
+            schema: Box::new(schema),
+        };
+
+        assert_eq!(
+            PipelineCompiler::sort(&plan)
+                .expect("sort metadata")
+                .expect("sort exists")
+                .keys[0]
+                .column,
+            2,
+        );
+        let program = PipelineCompiler::sort_key_program(&plan)
+            .expect("sort key program")
+            .expect("computed key needs a program");
+        assert!(program
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, common::protocol::MicroOp::Add { .. })));
+        assert!(matches!(
+            program.instructions.last(),
+            Some(common::protocol::MicroOp::ProjectRegisters { out_regs })
+                if out_regs.len() == 3
+        ));
+    }
+
+    #[test]
+    fn rejects_limit_below_sort_instead_of_reordering_it() {
+        let (schema, column) = schema();
+        let input = LogicalPlan::Limit {
+            input: Box::new(external_scan(&schema)),
+            offset: 0,
+            count: 1,
+            schema: Box::new(schema.clone()),
+        };
+        let plan = LogicalPlan::Sort {
+            input: Box::new(input),
+            sort_keys: vec![LogicalSortKey {
+                expr: LogicalExpr::Column(column),
+                asc: true,
+                nulls_first: false,
+            }],
+            schema: Box::new(schema),
+        };
+
+        let error = PipelineCompiler::sort(&plan).expect_err("pre-sort LIMIT is unsupported");
+        assert!(error.to_string().contains("LIMIT before ORDER"));
+    }
 }

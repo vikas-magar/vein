@@ -201,8 +201,16 @@ impl BytecodeCompiler {
         for expr in exprs {
             out_regs.push(self.compile_expr(expr, schema)?);
         }
-        self.instructions.push(MicroOp::ProjectRegisters { out_regs });
+        self.compile_projection_registers(out_regs);
         Ok(())
+    }
+
+    /// Projects registers already evaluated by this program.
+    ///
+    /// This lets a caller retain source columns alongside computed helper
+    /// columns without recompiling those expressions during projection.
+    pub fn compile_projection_registers(&mut self, out_regs: Vec<RegId>) {
+        self.instructions.push(MicroOp::ProjectRegisters { out_regs });
     }
 
     /// Finalizes compilation into a self-contained [`MicroProgram`].

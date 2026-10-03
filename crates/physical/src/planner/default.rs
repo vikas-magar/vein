@@ -67,6 +67,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
             | LogicalPlan::Project { .. }
             | LogicalPlan::Join { .. }
             | LogicalPlan::Limit { .. }
+            | LogicalPlan::Sort { .. }
             | LogicalPlan::SubqueryAlias { .. }
             | LogicalPlan::Aggregate { .. }
             | LogicalPlan::Distinct { .. }

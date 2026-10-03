@@ -146,7 +146,7 @@ fn build_column(
     gather(&values, &indices)
 }
 
-fn gather(values: &[&dyn Array], indices: &[(usize, usize)]) -> Result<ArrayRef> {
+pub(crate) fn gather(values: &[&dyn Array], indices: &[(usize, usize)]) -> Result<ArrayRef> {
     interleave(values, indices)
         .map_err(|error| VeinError::internal(format!("join gather failed: {error}")))
 }
@@ -200,7 +200,7 @@ mod tests {
             &[DataType::Int64],
             &[DataType::Int64],
         )
-        .expect("assemble");
+            .expect("assemble");
 
         assert_eq!(chunks.len(), 1, "a probe chunk yields one output chunk");
         assert_eq!(cells(&chunks[0], 0), vec![Some(20)]);
@@ -228,7 +228,7 @@ mod tests {
             &[DataType::Int64],
             &[DataType::Int64],
         )
-        .expect("assemble");
+            .expect("assemble");
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(cells(&chunks[0], 1), vec![Some(20), Some(20)]);
@@ -248,7 +248,7 @@ mod tests {
             &[DataType::Int64],
             &[DataType::Int64],
         )
-        .expect("assemble");
+            .expect("assemble");
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(cells(&chunks[0], 0), vec![Some(20), Some(10)]);
@@ -269,7 +269,7 @@ mod tests {
             &[DataType::Int64],
             &[DataType::Int64],
         )
-        .expect("assemble");
+            .expect("assemble");
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(cells(&chunks[0], 0), vec![Some(20), None]);
@@ -292,7 +292,7 @@ mod tests {
             &[DataType::Int64],
             &[],
         )
-        .expect_err("the build type is required for a null build column");
+            .expect_err("the build type is required for a null build column");
         assert!(error.to_string().contains("build column 0"), "{error}");
     }
 }

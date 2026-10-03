@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
 
-use crate::operators::LimitTransform;
+use crate::operators::{LimitTransform, SortTransform};
 use crate::operators::aggregate;
 use crate::operators::join::{BuildSink, HashJoin, HashTable, JoinKeys, JoinType, OutputColumn};
 use crate::operators::sink::WriteReceipt;
@@ -24,7 +24,7 @@ use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
 use common::protocol::{
     AggregatePlan, DataSink, DataSource, ExecuteTask, JoinKind, JoinOutput, JoinPlan, LimitSpec,
-    MicroProgram,
+    MicroProgram, SortPlan,
 };
 use error::VeinError;
 use types::VeinDataType;
@@ -175,6 +175,23 @@ impl<B> PipelineNode<B> for SinkHandle<B> {
     }
 }
 
+/// Adapts an already-built transform so another pipeline stage can own it as a node.
+struct TransformHandle(Box<dyn Transform<DataChunk>>);
+
+impl PipelineNode<DataChunk> for TransformHandle {
+    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+        self.0.push(chunk)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.0.flush()
+    }
+
+    fn finished(&self) -> bool {
+        self.0.finished()
+    }
+}
+
 /// A [`PipelineNode`] adapter that forwards pushes and swallows the flush.
 ///
 /// A join's probe side is split into one chain per file, all feeding the one
@@ -254,7 +271,10 @@ impl DefaultTaskExecutor {
 
         // A window counts rows for the whole task, so a limited probe is not
         // fanned out: every chain would otherwise emit the window on its own.
-        let sources = if task.limit.is_none() && matches!(kind, JoinType::Inner | JoinType::Left) {
+        let sources = if task.limit.is_none()
+            && task.sort.is_none()
+            && matches!(kind, JoinType::Inner | JoinType::Left)
+        {
             split_scan(&task.source)
         } else {
             vec![task.source.clone()]
@@ -271,6 +291,12 @@ impl DefaultTaskExecutor {
                 )),
                 task.limit,
             );
+            let head = ordered_head(task.sort.clone(), task.sort_output_columns, head);
+            let head = sort_key_head(
+                self.builder.as_ref(),
+                task.sort_key_program.as_ref(),
+                head,
+            )?;
 
             let vm_started = Instant::now();
             let mut vm = HashJoin::new(
@@ -350,13 +376,19 @@ impl DefaultTaskExecutor {
         let source_build_us = source_started.elapsed().as_micros() as u64;
 
         // The window applies to the groups, not to the rows that produced them.
-        let mut head: Box<dyn PipelineNode<DataChunk>> = with_window(
+        let head: Box<dyn PipelineNode<DataChunk>> = with_window(
             Box::new(CancelGuard::new(
                 Box::new(SinkHandle(sink.clone())),
                 cancel.clone(),
             )),
             task.limit,
         );
+        let mut head = ordered_head(task.sort.clone(), task.sort_output_columns, head);
+        head = sort_key_head(
+            self.builder.as_ref(),
+            task.sort_key_program.as_ref(),
+            head,
+        )?;
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(VeinError::cancelled()),
@@ -512,6 +544,12 @@ impl DefaultTaskExecutor {
                         )),
                         task.limit,
                     );
+                    let head = ordered_head(task.sort.clone(), task.sort_output_columns, head);
+                    let head = sort_key_head(
+                        self.builder.as_ref(),
+                        task.sort_key_program.as_ref(),
+                        head,
+                    )?;
                     let vm_started = Instant::now();
                     let mut vm: Box<dyn Transform<DataChunk>> =
                         self.builder.build_vm(&task.program, head)?;
@@ -607,6 +645,35 @@ fn with_window(
     match limit {
         Some(limit) => Box::new(LimitTransform::new(limit.offset, limit.count, next)),
         None => next,
+    }
+}
+
+/// Places a blocking global sort before the task's output window.
+fn ordered_head(
+    sort: Option<SortPlan>,
+    output_columns: Option<u32>,
+    next: Box<dyn PipelineNode<DataChunk>>,
+) -> Box<dyn PipelineNode<DataChunk>> {
+    match sort {
+        Some(plan) => Box::new(SortTransform::with_output_columns(
+            plan,
+            output_columns.map(|columns| columns as usize),
+            next,
+        )),
+        None => next,
+    }
+}
+
+fn sort_key_head(
+    builder: &dyn ExecutorBuilder,
+    program: Option<&Arc<MicroProgram>>,
+    next: Box<dyn PipelineNode<DataChunk>>,
+) -> Result<Box<dyn PipelineNode<DataChunk>>> {
+    match program {
+        Some(program) => Ok(Box::new(TransformHandle(
+            builder.build_vm(program, next)?,
+        ))),
+        None => Ok(next),
     }
 }
 
@@ -779,6 +846,9 @@ mod tests {
             build: None,
             join: None,
             limit: None,
+            sort: None,
+            sort_key_program: None,
+            sort_output_columns: None,
             aggregate: None,
             post_aggregate_program: None,
         }
@@ -842,6 +912,36 @@ mod tests {
 
         assert_eq!(result.row_count, 0);
         assert!(result.output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sorts_task_output_before_applying_limit() {
+        let mut task = task();
+        task.program = Arc::new(MicroProgram {
+            register_count: 1,
+            instructions: vec![MicroOp::ProjectRegisters { out_regs: vec![0] }],
+        });
+        task.sort = Some(SortPlan {
+            keys: vec![common::protocol::SortKey {
+                column: 0,
+                ascending: false,
+                nulls_first: false,
+            }],
+        });
+        task.limit = Some(LimitSpec { offset: 1, count: 2 });
+
+        let result = runner_with_values(vec![4, 1, 3, 2])
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("sort before limit");
+
+        assert_eq!(result.row_count, 2);
+        let values = result.output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("sorted int64 output");
+        assert_eq!(values.values(), &[3, 2]);
     }
 
     #[tokio::test]
@@ -929,6 +1029,13 @@ mod tests {
             probe_types: vec![types::VeinDataType::Int64],
             build_types: vec![types::VeinDataType::Int64],
         });
+        task.sort = Some(SortPlan {
+            keys: vec![common::protocol::SortKey {
+                column: 0,
+                ascending: false,
+                nulls_first: false,
+            }],
+        });
 
         let result = runner()
             .execute(&task, CancellationToken::new())
@@ -951,6 +1058,6 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert_eq!(rows, vec![1, 2, 3, 4, 5]);
+        assert_eq!(rows, vec![5, 4, 3, 2, 1]);
     }
 }
