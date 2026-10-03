@@ -31,6 +31,7 @@ use types::VeinDataType;
 enum KeyValue {
     Null,
     Int64(i64),
+    UInt64(u64),
     Utf8(String),
 }
 
@@ -960,6 +961,18 @@ fn key_value(array: &ArrayRef, row: usize) -> Result<KeyValue> {
     if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
         return Ok(KeyValue::Int64(values.value(row)));
     }
+    if let Some(values) = array.as_any().downcast_ref::<UInt8Array>() {
+        return Ok(KeyValue::UInt64(values.value(row) as u64));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt16Array>() {
+        return Ok(KeyValue::UInt64(values.value(row) as u64));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt32Array>() {
+        return Ok(KeyValue::UInt64(values.value(row) as u64));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
+        return Ok(KeyValue::UInt64(values.value(row)));
+    }
     if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
         return Ok(KeyValue::Utf8(values.value(row).to_string()));
     }
@@ -981,6 +994,10 @@ fn encode(value: &KeyValue, out: &mut Vec<u8>) {
             out.push(1);
             out.extend_from_slice(&value.to_le_bytes());
         }
+        KeyValue::UInt64(value) => {
+            out.push(3);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
         KeyValue::Utf8(value) => {
             out.push(2);
             out.extend_from_slice(&(value.len() as u32).to_le_bytes());
@@ -998,18 +1015,41 @@ fn key_column(groups: &[Group], column: usize, data_type: &VeinDataType) -> Resu
                 .map(|group| match group.key[column] {
                     KeyValue::Int64(value) => Some(value),
                     KeyValue::Null => None,
-                    KeyValue::Utf8(_) => unreachable!("an int64 key column holds int64 keys"),
+                    KeyValue::UInt64(_) | KeyValue::Utf8(_) => {
+                        unreachable!("an int64 key column holds int64 keys")
+                    }
                 })
                 .collect();
             Arc::new(Int64Array::from(values))
         }
+        VeinDataType::UInt8 => Arc::new(UInt8Array::from(
+            unsigned_key_values(groups, column)
+                .into_iter()
+                .map(|value| value.map(|value| value as u8))
+                .collect::<Vec<_>>(),
+        )),
+        VeinDataType::UInt16 => Arc::new(UInt16Array::from(
+            unsigned_key_values(groups, column)
+                .into_iter()
+                .map(|value| value.map(|value| value as u16))
+                .collect::<Vec<_>>(),
+        )),
+        VeinDataType::UInt32 => Arc::new(UInt32Array::from(
+            unsigned_key_values(groups, column)
+                .into_iter()
+                .map(|value| value.map(|value| value as u32))
+                .collect::<Vec<_>>(),
+        )),
+        VeinDataType::UInt64 => Arc::new(UInt64Array::from(unsigned_key_values(groups, column))),
         VeinDataType::Utf8 => {
             let values: Vec<Option<&str>> = groups
                 .iter()
                 .map(|group| match &group.key[column] {
                     KeyValue::Utf8(value) => Some(value.as_str()),
                     KeyValue::Null => None,
-                    KeyValue::Int64(_) => unreachable!("a string key column holds string keys"),
+                    KeyValue::Int64(_) | KeyValue::UInt64(_) => {
+                        unreachable!("a string key column holds string keys")
+                    }
                 })
                 .collect();
             Arc::new(StringArray::from(values))
@@ -1020,6 +1060,19 @@ fn key_column(groups: &[Group], column: usize, data_type: &VeinDataType) -> Resu
             )));
         }
     })
+}
+
+fn unsigned_key_values(groups: &[Group], column: usize) -> Vec<Option<u64>> {
+    groups
+        .iter()
+        .map(|group| match group.key[column] {
+            KeyValue::UInt64(value) => Some(value),
+            KeyValue::Null => None,
+            KeyValue::Int64(_) | KeyValue::Utf8(_) => {
+                unreachable!("an unsigned key column holds unsigned keys")
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1260,6 +1313,55 @@ mod tests {
         assert_unsigned_layout!(UInt16Array, VeinDataType::UInt16, VeinDataType::UInt64, 7, 2, 5);
         assert_unsigned_layout!(UInt32Array, VeinDataType::UInt32, VeinDataType::UInt64, 7, 2, 5);
         assert_unsigned_layout!(UInt64Array, VeinDataType::UInt64, VeinDataType::UInt64, 7, 2, 5);
+    }
+
+    macro_rules! assert_unsigned_group_key_layout {
+        ($array:ty, $data_type:expr) => {{
+            let plan = AggregatePlan {
+                groups: 1,
+                aggs: vec![AggOpCode::Sum],
+                aggregate_input_types: vec![VeinDataType::Int64],
+                types: vec![$data_type, VeinDataType::Int64],
+            };
+            let mut sink = AggregateSink::new(plan).unwrap();
+
+            sink.accumulate(DataChunk::from_vectors(vec![
+                Arc::new(<$array>::from(vec![Some(2), None])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ]))
+            .unwrap();
+            sink.accumulate(DataChunk::from_vectors(vec![
+                Arc::new(<$array>::from(vec![Some(2), Some(5)])),
+                Arc::new(Int64Array::from(vec![3, 4])),
+            ]))
+            .unwrap();
+
+            let output = sink.finish().unwrap();
+            let keys = output[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<$array>()
+                .unwrap();
+            let sums = output[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+
+            assert_eq!(keys.len(), 3);
+            assert_eq!(keys.value(0), 2);
+            assert!(keys.is_null(1));
+            assert_eq!(keys.value(2), 5);
+            assert_eq!(sums.values(), &[4, 2, 4]);
+        }};
+    }
+
+    #[test]
+    fn unsigned_group_keys_preserve_width_nulls_and_cross_batch_groups() {
+        assert_unsigned_group_key_layout!(UInt8Array, VeinDataType::UInt8);
+        assert_unsigned_group_key_layout!(UInt16Array, VeinDataType::UInt16);
+        assert_unsigned_group_key_layout!(UInt32Array, VeinDataType::UInt32);
+        assert_unsigned_group_key_layout!(UInt64Array, VeinDataType::UInt64);
     }
 
     #[test]
