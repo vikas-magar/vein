@@ -1,5 +1,8 @@
 //! Literal values of the engine's data types.
 
+use std::sync::Arc;
+
+use crate::column::{ColumnId, ResolvedColumn};
 use crate::data_type::VeinDataType;
 
 /// A literal value of a known [`VeinDataType`].
@@ -46,4 +49,151 @@ pub enum LogicalLiteral {
     Map(Vec<(LogicalLiteral, LogicalLiteral)>),
     /// A vector literal for AI embeddings (`Vector`).
     Vector(Vec<f32>),
+}
+
+/// Returns the logical data type represented by a literal value.
+pub fn literal_type(literal: &LogicalLiteral) -> VeinDataType {
+    match literal {
+        LogicalLiteral::Null(data_type) => data_type.clone(),
+        LogicalLiteral::Boolean(_) => VeinDataType::Boolean,
+        LogicalLiteral::Int64(_) => VeinDataType::Int64,
+        LogicalLiteral::Float64(_) => VeinDataType::Float64,
+        LogicalLiteral::String(_) => VeinDataType::Utf8,
+        LogicalLiteral::Date(_) => VeinDataType::Date32,
+        LogicalLiteral::Timestamp(_) => VeinDataType::Timestamp(None),
+        LogicalLiteral::Time(_) => VeinDataType::Time64,
+        LogicalLiteral::Interval { .. } => VeinDataType::Interval,
+        LogicalLiteral::Decimal(_, precision, scale) => {
+            VeinDataType::Decimal128(*precision, *scale)
+        }
+        LogicalLiteral::List(items) => VeinDataType::List(Arc::new(common_element_type(items))),
+        LogicalLiteral::Struct(entries) => {
+            let fields = entries
+                .iter()
+                .map(|(name, literal)| ResolvedColumn {
+                    id: ColumnId(0),
+                    name: name.clone(),
+                    qualifier: None,
+                    data_type: literal_type(literal),
+                    is_factorized: false,
+                    nullable: true,
+                })
+                .collect::<Vec<_>>();
+            VeinDataType::Struct(fields.into())
+        }
+        LogicalLiteral::Map(entries) => {
+            let key_type = entries
+                .first()
+                .map(|(key, _)| literal_type(key))
+                .unwrap_or(VeinDataType::Null);
+            let value_type = entries
+                .first()
+                .map(|(_, value)| literal_type(value))
+                .unwrap_or(VeinDataType::Null);
+            VeinDataType::Map(Arc::new(key_type), Arc::new(value_type))
+        }
+        LogicalLiteral::Vector(values) => VeinDataType::Vector(values.len() as u32),
+    }
+}
+
+/// Returns the first non-null element type, or `Null` for an empty or all-null list.
+fn common_element_type(items: &[LogicalLiteral]) -> VeinDataType {
+    items
+        .iter()
+        .find_map(|literal| {
+            if matches!(literal, LogicalLiteral::Null(_)) {
+                None
+            } else {
+                Some(literal_type(literal))
+            }
+        })
+        .unwrap_or(VeinDataType::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn time_interval_and_decimal_infer_their_types() {
+        assert_eq!(literal_type(&LogicalLiteral::Time(1_000)), VeinDataType::Time64);
+        assert_eq!(
+            literal_type(&LogicalLiteral::Interval {
+                months: 1,
+                days: 2,
+                nanos: 3
+            }),
+            VeinDataType::Interval
+        );
+        assert_eq!(
+            literal_type(&LogicalLiteral::Decimal(123, 76, 20)),
+            VeinDataType::Decimal128(76, 20)
+        );
+    }
+
+    #[test]
+    fn list_infers_element_type_and_skips_nulls() {
+        assert_eq!(
+            literal_type(&LogicalLiteral::List(vec![
+                LogicalLiteral::Int64(1),
+                LogicalLiteral::Int64(2)
+            ])),
+            VeinDataType::List(Arc::new(VeinDataType::Int64))
+        );
+        assert_eq!(
+            literal_type(&LogicalLiteral::List(vec![
+                LogicalLiteral::Null(VeinDataType::Int64),
+                LogicalLiteral::String("x".into())
+            ])),
+            VeinDataType::List(Arc::new(VeinDataType::Utf8))
+        );
+    }
+
+    #[test]
+    fn empty_list_falls_back_to_null() {
+        assert_eq!(
+            literal_type(&LogicalLiteral::List(vec![])),
+            VeinDataType::List(Arc::new(VeinDataType::Null))
+        );
+    }
+
+    #[test]
+    fn struct_infers_named_fields() {
+        let ty = literal_type(&LogicalLiteral::Struct(vec![
+            ("id".to_string(), LogicalLiteral::Int64(1)),
+            ("name".to_string(), LogicalLiteral::String("vein".into())),
+        ]));
+        let VeinDataType::Struct(fields) = ty else {
+            panic!("expected struct");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "id");
+        assert_eq!(fields[0].data_type, VeinDataType::Int64);
+        assert_eq!(fields[1].name, "name");
+        assert_eq!(fields[1].data_type, VeinDataType::Utf8);
+    }
+
+    #[test]
+    fn map_infers_key_and_value_types() {
+        assert_eq!(
+            literal_type(&LogicalLiteral::Map(vec![(
+                LogicalLiteral::String("k".into()),
+                LogicalLiteral::Float64(1.5)
+            )])),
+            VeinDataType::Map(
+                Arc::new(VeinDataType::Utf8),
+                Arc::new(VeinDataType::Float64)
+            )
+        );
+    }
+
+    #[test]
+    fn vector_infers_embedding_dimension() {
+        assert_eq!(
+            literal_type(&LogicalLiteral::Vector(vec![1.0, 2.0, 3.0, 4.0])),
+            VeinDataType::Vector(4)
+        );
+    }
 }

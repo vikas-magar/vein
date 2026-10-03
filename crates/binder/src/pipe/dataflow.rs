@@ -3,7 +3,7 @@ use plan::PlanTraversal;
 use error::{Result, VeinError};
 use parser::ast::query::{Query, SetOpKind};
 
-use crate::coerce::unify_types;
+use types::unify_types;
 use crate::context::BinderContext;
 use crate::pipe::query::{bind_pipeline, bind_query_internal};
 use crate::scope::ScopeStack;
@@ -88,7 +88,7 @@ async fn bind_branches<'a>(
             context,
             &mut branch_scopes,
         ))
-        .await?;
+            .await?;
         branches.push(Box::new(branch_plan));
     }
     Ok(branches)

@@ -10,6 +10,7 @@ missing_docs = "deny"
 plan = { path = "../plan" }
 error = { path = "../error" }
 parser = { path = "../parser" }
+types = { path = "../types" }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 

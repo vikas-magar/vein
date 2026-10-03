@@ -318,6 +318,30 @@ impl From<&VeinDataType> for DataType {
     }
 }
 
+/// Selects the result type for a supported aggregate from its argument type.
+///
+/// `fallback` preserves the registry's declared result type for aggregates
+/// without arguments and for aggregate rules not specialized here.
+pub fn aggregate_return_type(
+    name: &str,
+    argument_type: Option<&VeinDataType>,
+    fallback: VeinDataType,
+) -> VeinDataType {
+    let Some(argument_type) = argument_type else {
+        return fallback;
+    };
+
+    if name.eq_ignore_ascii_case("SUM") {
+        argument_type.sum_result_type().unwrap_or(fallback)
+    } else if (name.eq_ignore_ascii_case("MIN") || name.eq_ignore_ascii_case("MAX"))
+        && argument_type.is_numeric()
+    {
+        argument_type.clone()
+    } else {
+        fallback
+    }
+}
+
 impl std::str::FromStr for VeinDataType {
     type Err = error::VeinError;
 
@@ -456,6 +480,32 @@ mod tests {
         }
         assert!(!VeinDataType::Utf8.is_numeric());
         assert_eq!(VeinDataType::Utf8.sum_result_type(), None);
+    }
+
+    #[test]
+    fn aggregate_return_types_use_argument_layout_or_fallback() {
+        let fallback = VeinDataType::Float64;
+        assert_eq!(
+            aggregate_return_type("sum", Some(&VeinDataType::Int32), fallback.clone()),
+            VeinDataType::Int64
+        );
+        assert_eq!(
+            aggregate_return_type("MIN", Some(&VeinDataType::Decimal128(15, 2)), fallback.clone()),
+            VeinDataType::Decimal128(15, 2)
+        );
+        assert_eq!(
+            aggregate_return_type("max", Some(&VeinDataType::Int16), fallback.clone()),
+            VeinDataType::Int16
+        );
+        assert_eq!(
+            aggregate_return_type("sum", Some(&VeinDataType::Utf8), fallback.clone()),
+            fallback
+        );
+        assert_eq!(
+            aggregate_return_type("count", Some(&VeinDataType::Int64), fallback.clone()),
+            fallback
+        );
+        assert_eq!(aggregate_return_type("sum", None, fallback.clone()), fallback);
     }
 
     #[test]

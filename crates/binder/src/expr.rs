@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::coerce::{coerce_types, unify_types};
+use crate::coerce::coerce_types;
 use crate::context::BinderContext;
 use crate::date_time::{parse_date, parse_interval, parse_time, parse_timestamp};
 use crate::pipe::query::bind_query_internal;
@@ -9,6 +9,7 @@ use plan::{LogicalExpr, LogicalLiteral};
 use plan::SortKey;
 use plan::PlanTraversal;
 use plan::{ResolvedColumn, VeinDataType};
+use types::{aggregate_return_type, unify_types};
 use crate::traits::{FunctionKind, RuntimeKind};
 use error::{Result, VeinError};
 use parser::ast::data_type::DataType;
@@ -306,7 +307,8 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
             FunctionKind::Scalar | FunctionKind::Aggregate => {
                 let is_aggregate = signature.kind == FunctionKind::Aggregate;
                 let return_type = if is_aggregate {
-                    aggregate_return_type(name, &bound_args, signature.return_type)
+                    let argument_type = bound_args.first().map(LogicalExpr::data_type);
+                    aggregate_return_type(name, argument_type.as_ref(), signature.return_type)
                 } else {
                     signature.return_type
                 };
@@ -494,23 +496,6 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         }
 
         Ok(())
-    }
-}
-
-/// Resolves aggregate output types from their bound argument rather than the
-/// registry's fallback type. Exact numeric inputs stay exact through planning.
-fn aggregate_return_type(
-    name: &str,
-    args: &[LogicalExpr],
-    fallback: VeinDataType,
-) -> VeinDataType {
-    let Some(argument_type) = args.first().map(LogicalExpr::data_type) else {
-        return fallback;
-    };
-    match name.to_ascii_uppercase().as_str() {
-        "SUM" => argument_type.sum_result_type().unwrap_or(fallback),
-        "MIN" | "MAX" if argument_type.is_numeric() => argument_type,
-        _ => fallback,
     }
 }
 

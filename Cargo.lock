@@ -401,6 +401,7 @@ dependencies = [
  "plan",
  "tokio",
  "tracing",
+ "types",
 ]
 
 [[package]]

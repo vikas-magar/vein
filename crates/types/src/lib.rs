@@ -5,6 +5,8 @@
 
 /// Column identities and resolved columns.
 pub mod column;
+/// Type-level coercion and common-supertype rules.
+pub mod coercion;
 /// Data types and arrow conversions.
 pub mod data_type;
 /// Literal values of the engine's data types.
@@ -13,6 +15,7 @@ pub mod literal;
 pub mod schema;
 
 pub use column::{ColumnId, ResolvedColumn, ResolvedColumnRef};
-pub use data_type::VeinDataType;
-pub use literal::LogicalLiteral;
+pub use coercion::unify_types;
+pub use data_type::{VeinDataType, aggregate_return_type};
+pub use literal::{LogicalLiteral, literal_type};
 pub use schema::{VeinSchema, VeinSchemaRef};
