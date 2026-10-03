@@ -16,8 +16,9 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{
     Array, ArrayRef, Decimal128Array, Float16Array, Float32Array, Float64Array, Int16Array,
     Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    UInt8Array, Decimal256Array,
 };
+use arrow::datatypes::i256;
 
 use crate::pipeline::{DataChunk, PipelineNode};
 use common::Result;
@@ -79,6 +80,35 @@ impl AggregateValue for i128 {
 
     fn to_f64(self, scale: i8) -> f64 {
         self as f64 / 10_f64.powi(scale as i32)
+    }
+}
+
+impl AggregateValue for i256 {
+    fn checked_add(self, other: Self, decimal_precision_limit: bool) -> Option<Self> {
+        i256::checked_add(self, other).filter(|sum| {
+            !decimal_precision_limit || {
+                let max_decimal_76 = i256::from(10_i8)
+                    .checked_pow(76)
+                    .and_then(|limit| limit.checked_sub(i256::ONE))
+                    .expect("decimal precision limit fits in i256");
+                (-max_decimal_76..=max_decimal_76).contains(sum)
+            }
+        })
+    }
+
+    fn minimum(self, other: Self) -> Self {
+        self.min(other)
+    }
+
+    fn maximum(self, other: Self) -> Self {
+        self.max(other)
+    }
+
+    fn to_f64(self, scale: i8) -> f64 {
+        self.to_string()
+            .parse::<f64>()
+            .expect("i256 decimal representation parses as f64")
+            / 10_f64.powi(scale as i32)
     }
 }
 
@@ -232,6 +262,7 @@ enum AggregateInput<'a> {
     Float32(&'a Float32Array),
     Float64(&'a Float64Array),
     Decimal128(&'a Decimal128Array),
+    Decimal256(&'a Decimal256Array),
 }
 
 impl<'a> AggregateInput<'a> {
@@ -312,6 +343,11 @@ impl<'a> AggregateInput<'a> {
                 .downcast_ref::<Decimal128Array>()
                 .map(Self::Decimal128)
                 .ok_or_else(mismatch),
+            VeinDataType::Decimal256(_, _) => array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .map(Self::Decimal256)
+                .ok_or_else(mismatch),
             other => Err(VeinError::internal(format!(
                 "aggregate input type {other:?} is not supported yet"
             ))),
@@ -376,6 +412,11 @@ enum AggregateStateColumn {
         op: AggOpCode,
         scale: i8,
         states: Vec<NumericAccumulator<i128>>,
+    },
+    Decimal256 {
+        op: AggOpCode,
+        scale: i8,
+        states: Vec<NumericAccumulator<i256>>,
     },
 }
 
@@ -461,6 +502,11 @@ impl AggregateStateColumn {
                 scale: *scale,
                 states: Vec::new(),
             },
+            VeinDataType::Decimal256(_, scale) => Self::Decimal256 {
+                op,
+                scale: *scale,
+                states: Vec::new(),
+            },
             other => {
                 return Err(VeinError::internal(format!(
                     "aggregate state type {other:?} is not supported yet"
@@ -489,6 +535,11 @@ impl AggregateStateColumn {
                     *op == AggOpCode::Sum,
                 ))
             }
+            Self::Decimal256 { op, scale, states } => states.push(NumericAccumulator::new(
+                *op,
+                *scale,
+                *op == AggOpCode::Sum,
+            )),
         }
     }
 
@@ -616,6 +667,11 @@ impl AggregateStateColumn {
                     (!array.is_null(row)).then(|| array.value(row))
                 })
             }
+            (Self::Decimal256 { states, .. }, AggregateInput::Decimal256(array)) => {
+                update_numeric_states(states, group_rows, |row| {
+                    (!array.is_null(row)).then(|| array.value(row))
+                })
+            }
             _ => Err(VeinError::internal(
                 "aggregate input layout does not match its typed state column",
             )),
@@ -692,6 +748,17 @@ impl AggregateStateColumn {
                         })?,
                 )
             }
+            (Self::Decimal256 { states, .. }, AggOpCode::Sum | AggOpCode::Min | AggOpCode::Max, VeinDataType::Decimal256(precision, scale)) => {
+                Arc::new(
+                    Decimal256Array::from(numeric_values(states))
+                        .with_precision_and_scale(*precision, *scale)
+                        .map_err(|error| {
+                            VeinError::internal(format!(
+                                "invalid decimal aggregate type: {error}"
+                            ))
+                        })?,
+                )
+            }
             (Self::Int128Avg { states }, AggOpCode::Avg, VeinDataType::Float64) => {
                 Arc::new(Float64Array::from(average_values(states)))
             }
@@ -702,6 +769,9 @@ impl AggregateStateColumn {
                 Arc::new(Float64Array::from(average_values(states)))
             }
             (Self::Decimal128 { states, .. }, AggOpCode::Avg, VeinDataType::Float64) => {
+                Arc::new(Float64Array::from(average_values(states)))
+            }
+            (Self::Decimal256 { states, .. }, AggOpCode::Avg, VeinDataType::Float64) => {
                 Arc::new(Float64Array::from(average_values(states)))
             }
             _ => {
@@ -957,12 +1027,104 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        Float16Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt16Array, UInt32Array,
-        UInt64Array, UInt8Array,
+        Decimal256Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array,
+        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
+    use arrow::datatypes::i256;
     use common::arrow::SelectionVector;
 
     use super::*;
+
+    #[test]
+    fn decimal256_sum_and_extrema_preserve_wide_values_and_nulls() {
+        let large = i256::from(10_i8).checked_pow(40).unwrap();
+        let input = Decimal256Array::from(vec![Some(large), None, Some(i256::ONE)])
+            .with_precision_and_scale(76, 0)
+            .unwrap();
+        let plan = AggregatePlan {
+            groups: 0,
+            aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max],
+            aggregate_input_types: vec![VeinDataType::Decimal256(76, 0); 3],
+            types: vec![VeinDataType::Decimal256(76, 0); 3],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+        sink.accumulate(DataChunk::from_vectors(vec![
+            Arc::new(input.clone()),
+            Arc::new(input.clone()),
+            Arc::new(input),
+        ]))
+            .unwrap();
+        let output = sink.finish().unwrap();
+
+        let sum = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal256Array>()
+            .unwrap();
+        let minimum = output[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal256Array>()
+            .unwrap();
+        let maximum = output[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Decimal256Array>()
+            .unwrap();
+        assert_eq!(sum.value(0), large.checked_add(i256::ONE).unwrap());
+        assert_eq!(minimum.value(0), i256::ONE);
+        assert_eq!(maximum.value(0), large);
+    }
+
+    #[test]
+    fn decimal256_average_accumulates_exactly_across_batches_and_applies_scale() {
+        let large = i256::from(10_i8).checked_pow(40).unwrap();
+        let negative_large = i256::ZERO.checked_sub(large).unwrap();
+        let plan = AggregatePlan {
+            groups: 0,
+            aggs: vec![AggOpCode::Avg],
+            aggregate_input_types: vec![VeinDataType::Decimal256(76, 2)],
+            types: vec![VeinDataType::Float64],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+        for value in [large, i256::ONE, negative_large] {
+            let input = Decimal256Array::from(vec![value])
+                .with_precision_and_scale(76, 2)
+                .unwrap();
+            sink.accumulate(DataChunk::from_vectors(vec![Arc::new(input)]))
+                .unwrap();
+        }
+        let output = sink.finish().unwrap();
+        let average = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(average.value(0), 1.0 / 300.0);
+    }
+
+    #[test]
+    fn decimal256_sum_enforces_76_digit_precision() {
+        let max_decimal_76 = i256::from(10_i8)
+            .checked_pow(76)
+            .unwrap()
+            .checked_sub(i256::ONE)
+            .unwrap();
+        let input = Decimal256Array::from(vec![max_decimal_76, i256::ONE])
+            .with_precision_and_scale(76, 0)
+            .unwrap();
+        let plan = AggregatePlan {
+            groups: 0,
+            aggs: vec![AggOpCode::Sum],
+            aggregate_input_types: vec![VeinDataType::Decimal256(76, 0)],
+            types: vec![VeinDataType::Decimal256(76, 0)],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+        let error = sink
+            .accumulate(DataChunk::from_vectors(vec![Arc::new(input)]))
+            .unwrap_err();
+        assert!(error.to_string().contains("overflow while computing SUM"));
+    }
 
     #[test]
     fn float16_aggregates_use_wide_fold_and_preserve_min_max_layout() {
