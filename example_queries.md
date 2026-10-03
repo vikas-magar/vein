@@ -69,6 +69,30 @@ FROM customer
 "
 ```
 
+Global aggregate over a matching order:
+
+```bash
+VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "
+FROM orders
+|> WHERE o_orderkey = 1
+|> AGGREGATE count(o_orderkey) AS order_count, sum(o_totalprice) AS total_price
+"
+```
+
+Expected result: one row with `order_count = 1` and `total_price = 172799.49`.
+
+Empty global aggregate over no matching rows:
+
+```bash
+VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "
+FROM orders
+|> WHERE o_orderkey = 1
+|> AGGREGATE count(o_orderkey) AS order_count, sum(o_totalprice) AS total_price
+"
+```
+
+Expected result: one row with `order_count = 0` and `total_price = NULL`.
+
 Equivalent CLI invocation:
 
 ```bash
@@ -77,10 +101,10 @@ VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "FROM lineitem
 
 ## Current Execution Scope
 
-These examples exercise TPC-H Parquet table discovery, filtering, and projection, which are supported by the current
-local engine. They are not full official TPC-H benchmark queries: the local physical execution path currently rejects
-aggregation and joins, so queries such as TPC-H Q1 and Q3 cannot yet run end to end. `LIMIT` is also not currently
-supported by the local physical path.
+These examples exercise TPC-H Parquet table discovery, filtering, projection, and a limited aggregate shape. They are
+not full official TPC-H benchmark queries: aggregate support currently requires one grouping set and no operators
+above the aggregate, while joins support only restricted equality-key forms. Queries such as TPC-H Q1 and Q3 still
+contain unsupported combinations. `LIMIT` is supported only in placements that preserve pipe semantics.
 
 ## TPC-H Query Suite (Q1-Q22)
 

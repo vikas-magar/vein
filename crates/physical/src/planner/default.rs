@@ -87,6 +87,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
 mod tests {
     use super::*;
     use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
+    use plan::LogicalExpr;
 
     fn mock_scan_plan() -> LogicalPlan {
         let schema = Box::new(VeinSchema::new(vec![
@@ -131,24 +132,66 @@ mod tests {
     }
 
     #[test]
-    fn rejects_aggregate_without_creating_a_distributed_plan() {
+    fn plans_global_aggregate_from_a_scan_source() {
+        let input = mock_scan_plan();
+        let argument = match &input {
+            LogicalPlan::Scan { schema, .. } => schema.fields[0].clone(),
+            _ => unreachable!(),
+        };
+        let schema = Box::new(VeinSchema::new(vec![Arc::new(ResolvedColumn::new(
+            ColumnId(2),
+            "order_count",
+            None,
+            VeinDataType::Int64,
+        ))]));
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(input),
+            grouping_sets: vec![vec![]],
+            aggs: vec![LogicalExpr::FunctionCall {
+                name: "count".to_string(),
+                args: vec![LogicalExpr::Column(argument)],
+                is_aggregate: true,
+                distinct: false,
+                return_type: VeinDataType::Int64,
+            }],
+            schema,
+        };
+
+        let job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), aggregate)
+            .expect("aggregate should compile back to its scan source");
+
+        assert_eq!(job.stage().tasks().len(), 1);
+        let task = &job.stage().tasks()[0];
+        assert!(matches!(&task.source, common::protocol::DataSource::File(_)));
+        let aggregate = task.aggregate.as_ref().expect("aggregate task metadata");
+        assert_eq!(aggregate.groups, 0);
+        assert_eq!(aggregate.aggs, vec![common::protocol::AggOpCode::Count]);
+        assert_eq!(aggregate.types, vec![VeinDataType::Int64]);
+    }
+
+    #[test]
+    fn plans_distinct_from_a_scan_source() {
         let input = mock_scan_plan();
         let schema = match &input {
             LogicalPlan::Scan { schema, .. } => schema.clone(),
             _ => unreachable!(),
         };
-        let aggregate = LogicalPlan::Aggregate {
+        let distinct = LogicalPlan::Distinct {
             input: Box::new(input),
-            grouping_sets: vec![],
-            aggs: vec![],
             schema,
         };
 
-        let error = DefaultPhysicalPlanner::new()
-            .create_physical_plan(RequestId::new(), aggregate)
-            .expect_err("aggregate is not implemented by the local engine");
+        let job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), distinct)
+            .expect("distinct should compile back to its scan source");
 
-        assert!(error.to_string().contains("aggregations are not supported"));
+        assert_eq!(job.stage().tasks().len(), 1);
+        let task = &job.stage().tasks()[0];
+        assert!(matches!(&task.source, common::protocol::DataSource::File(_)));
+        let aggregate = task.aggregate.as_ref().expect("distinct aggregate metadata");
+        assert_eq!(aggregate.groups, 2);
+        assert!(aggregate.aggs.is_empty());
     }
 
     #[test]

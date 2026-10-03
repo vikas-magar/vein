@@ -671,14 +671,20 @@ mod tests {
     /// rejects because the wire variant carries no payload.
     struct MemoryFeedBuilder {
         inner: crate::factory::DefaultExecutorBuilder,
+        values: Vec<i64>,
     }
 
     impl MemoryFeedBuilder {
         fn new() -> Self {
+            Self::with_values(vec![1, 2, 3, 4, 5])
+        }
+
+        fn with_values(values: Vec<i64>) -> Self {
             Self {
                 inner: crate::factory::DefaultExecutorBuilder::new(Arc::new(
                     crate::udf::FunctionRegistry::new(),
                 )),
+                values,
             }
         }
     }
@@ -696,7 +702,7 @@ mod tests {
             let schema = Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("dummy", arrow::datatypes::DataType::Int64, false),
             ]));
-            let values = Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3, 4, 5]));
+            let values = Arc::new(arrow::array::Int64Array::from(self.values.clone()));
             let batch = RecordBatch::try_new(schema, vec![values]).expect("valid test batch");
             Ok(Box::new(MemorySource::new(batch)))
         }
@@ -724,6 +730,10 @@ mod tests {
 
     fn runner() -> DefaultTaskExecutor {
         DefaultTaskExecutor::new(Arc::new(MemoryFeedBuilder::new()))
+    }
+
+    fn runner_with_values(values: Vec<i64>) -> DefaultTaskExecutor {
+        DefaultTaskExecutor::new(Arc::new(MemoryFeedBuilder::with_values(values)))
     }
 
     fn task() -> ExecuteTask {
@@ -776,6 +786,30 @@ mod tests {
             .unwrap();
         assert_eq!(col.values(), &[3, 4, 5]);
         assert!(result.metrics.duration_ns > 0);
+    }
+
+    #[tokio::test]
+    async fn runs_empty_global_count_as_one_zero_row() {
+        let mut task = task();
+        task.aggregate = Some(AggregatePlan {
+            groups: 0,
+            aggs: vec![common::protocol::AggOpCode::Count],
+            types: vec![types::VeinDataType::Int64],
+        });
+
+        let result = runner_with_values(Vec::new())
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("empty global aggregate should execute");
+
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.output.len(), 1);
+        let count = result.output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("count output");
+        assert_eq!(count.values(), &[0]);
     }
 
     #[tokio::test]

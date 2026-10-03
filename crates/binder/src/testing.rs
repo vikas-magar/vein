@@ -20,6 +20,10 @@ impl TestCatalog {
         let mut catalog = Self::default();
         catalog.add_table("users", &[("id", VeinDataType::Int64), ("name", VeinDataType::Utf8), ("age", VeinDataType::Int64)]);
         catalog.add_table("orders", &[("id", VeinDataType::Int64), ("user_id", VeinDataType::Int64), ("amount", VeinDataType::Float64)]);
+        catalog.add_table(
+            "decimal_values",
+            &[("amount", VeinDataType::Decimal128(15, 2))],
+        );
         catalog
     }
 

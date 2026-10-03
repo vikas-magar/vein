@@ -179,7 +179,9 @@ impl PipelineCompiler {
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::SubqueryAlias { input, .. }
-            | LogicalPlan::Write { input, .. } => Self::collect_leaf_source(input),
+            | LogicalPlan::Write { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. } => Self::collect_leaf_source(input),
             other => Err(VeinError::planning(
                 format!("unsupported source node in Parquet pipeline: {other:?}"),
                 None,

@@ -82,7 +82,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                     window_frame.as_ref(),
                     ast.span,
                 )
-                .await
+                    .await
             }
             Expr::BinaryOp { left, op, right } => {
                 let bound_left = Box::pin(self.bind(left)).await?;
@@ -303,13 +303,21 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                     return_type: signature.return_type,
                 }),
             },
-            FunctionKind::Scalar | FunctionKind::Aggregate => Ok(LogicalExpr::FunctionCall {
-                name: name.to_string(),
-                args: bound_args,
-                is_aggregate: signature.kind == FunctionKind::Aggregate,
-                distinct,
-                return_type: signature.return_type,
-            }),
+            FunctionKind::Scalar | FunctionKind::Aggregate => {
+                let is_aggregate = signature.kind == FunctionKind::Aggregate;
+                let return_type = if is_aggregate {
+                    aggregate_return_type(name, &bound_args, signature.return_type)
+                } else {
+                    signature.return_type
+                };
+                Ok(LogicalExpr::FunctionCall {
+                    name: name.to_string(),
+                    args: bound_args,
+                    is_aggregate,
+                    distinct,
+                    return_type,
+                })
+            }
         }
     }
 
@@ -332,7 +340,8 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 format!("DISTINCT inside window function '{name}' is not supported yet"),
                 Some(span),
             ));
-        }        let signature = self.context.functions.resolve(name)?;
+        }
+        let signature = self.context.functions.resolve(name)?;
 
         let mut bound_args = Vec::with_capacity(args.len());
         for arg in args {
@@ -485,6 +494,33 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         }
 
         Ok(())
+    }
+}
+
+/// Resolves aggregate output types from their bound argument rather than the
+/// registry's fallback type. Exact numeric inputs stay exact through planning.
+fn aggregate_return_type(
+    name: &str,
+    args: &[LogicalExpr],
+    fallback: VeinDataType,
+) -> VeinDataType {
+    let Some(argument_type) = args.first().map(LogicalExpr::data_type) else {
+        return fallback;
+    };
+    match name.to_ascii_uppercase().as_str() {
+        "SUM" => match &argument_type {
+            VeinDataType::Int64 => VeinDataType::Int64,
+            VeinDataType::Decimal128(_, scale) => VeinDataType::Decimal128(38, *scale),
+            VeinDataType::Float64 => VeinDataType::Float64,
+            _ => fallback,
+        },
+        "MIN" | "MAX" => match &argument_type {
+            VeinDataType::Int64 | VeinDataType::Float64 | VeinDataType::Decimal128(_, _) => {
+                argument_type
+            }
+            _ => fallback,
+        },
+        _ => fallback,
     }
 }
 

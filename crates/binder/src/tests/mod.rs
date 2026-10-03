@@ -268,7 +268,7 @@ mod window {
         let err = bind_err(
             "FROM users |> SELECT SUM(age) OVER () AS a, SUM(age) OVER (PARTITION BY id) AS b",
         )
-        .await;
+            .await;
         assert!(err.to_string().contains("same PARTITION BY"), "got {err}");
     }
 }
@@ -308,7 +308,7 @@ mod subquery {
         let plan = bind(
             "FROM users |> WHERE EXISTS (FROM orders |> WHERE orders.user_id = users.id |> SELECT user_id)",
         )
-        .await;
+            .await;
         // Binding succeeded => `users.id` resolved via the correlation snapshot.
         assert_chain(&plan, &["Filter", "Scan"]);
     }
@@ -327,7 +327,7 @@ mod subquery {
         let err = bind_err(
             "FROM users |> WHERE EXISTS (FROM orders |> WHERE orders.user_id = users.id |> SELECT nope)",
         )
-        .await;
+            .await;
         assert!(matches!(err, error::VeinError::Semantic { .. }), "got {err}");
     }
 
@@ -342,7 +342,7 @@ mod subquery {
         let err = bind_err(
             "FROM users |> WHERE EXISTS (FROM orders |> WHERE age > 18 |> SELECT id)",
         )
-        .await;
+            .await;
         assert!(matches!(err, error::VeinError::Semantic { .. }), "got {err}");
         assert!(
             err.to_string().contains("Hint: 'age' exists in outer scope 'users'"),
@@ -357,7 +357,7 @@ mod subquery {
         let plan = bind(
             "FROM users |> WHERE EXISTS (FROM orders |> WHERE users.age > 18 |> SELECT id)",
         )
-        .await;
+            .await;
         assert_chain(&plan, &["Filter", "Scan"]);
     }
 }
@@ -441,7 +441,7 @@ mod join_and_sources {
         let plan = bind("FROM users AS a |> JOIN users AS b ON a.id = b.id").await;
         let LogicalPlan::Join {
             on:
-                Some(LogicalExpr::BinaryOp { left, right, .. }),
+            Some(LogicalExpr::BinaryOp { left, right, .. }),
             ..
         } = plan
         else {
@@ -561,7 +561,7 @@ mod pivot_unpivot {
         let plan = bind(
             "FROM orders |> PIVOT SUM(amount) AS total BY user_id IN (1, 2)",
         )
-        .await;
+            .await;
         let LogicalPlan::Pivot {
             alias,
             value_column,
@@ -691,5 +691,41 @@ mod extended_features {
                 .contains("QUALIFY predicate must contain a window function"),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod aggregate_types {
+    use super::*;
+    use plan::VeinDataType;
+
+    #[tokio::test]
+    async fn aggregate_output_types_follow_numeric_input_types() {
+        let plan = bind(
+            "FROM users |> AGGREGATE SUM(id) AS total, MIN(age) AS youngest, AVG(age) AS mean_age",
+        )
+            .await;
+        let LogicalPlan::Aggregate { schema, .. } = plan else {
+            panic!("expected Aggregate plan");
+        };
+
+        assert_eq!(schema.fields[0].data_type, VeinDataType::Int64);
+        assert_eq!(schema.fields[1].data_type, VeinDataType::Int64);
+        assert_eq!(schema.fields[2].data_type, VeinDataType::Float64);
+    }
+
+    #[tokio::test]
+    async fn decimal_aggregate_types_preserve_scale_and_widen_sum_precision() {
+        let plan = bind(
+            "FROM decimal_values |> AGGREGATE SUM(amount) AS total, MIN(amount) AS smallest, AVG(amount) AS mean",
+        )
+            .await;
+        let LogicalPlan::Aggregate { schema, .. } = plan else {
+            panic!("expected Aggregate plan");
+        };
+
+        assert_eq!(schema.fields[0].data_type, VeinDataType::Decimal128(38, 2));
+        assert_eq!(schema.fields[1].data_type, VeinDataType::Decimal128(15, 2));
+        assert_eq!(schema.fields[2].data_type, VeinDataType::Float64);
     }
 }
