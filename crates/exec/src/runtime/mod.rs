@@ -14,14 +14,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
 
+use crate::operators::aggregate;
 use crate::operators::join::{BuildSink, HashTable, HashJoin, JoinKeys, JoinType, OutputColumn};
+use crate::operators::LimitTransform;
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use crate::operators::sink::WriteReceipt;
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
 use common::protocol::{
-    DataSink, DataSource, ExecuteTask, JoinKind, JoinOutput, MicroProgram,
+    AggregatePlan, DataSink, DataSource, ExecuteTask, JoinKind, JoinOutput, JoinPlan, LimitSpec,
+    MicroProgram,
 };
 use error::VeinError;
 use types::VeinDataType;
@@ -172,6 +175,32 @@ impl<B> PipelineNode<B> for SinkHandle<B> {
     }
 }
 
+/// A [`PipelineNode`] adapter that forwards pushes and swallows the flush.
+///
+/// A join's probe side is split into one chain per file, all feeding the one
+/// shared sink, so each chain's flush is swallowed and the task flushes the sink
+/// exactly once — rather than once per file, which would commit a write sink
+/// repeatedly.
+struct SuppressFlush<B> {
+    inner: Box<dyn PipelineNode<B>>,
+}
+
+impl<B> SuppressFlush<B> {
+    fn new(inner: Box<dyn PipelineNode<B>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<B> PipelineNode<B> for SuppressFlush<B> {
+    fn push(&mut self, batch: B) -> Result<()> {
+        self.inner.push(batch)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// The default [`TaskExecutor`]: builds a task's pipeline via an injected
 /// [`ExecutorBuilder`] and drives the source through the operator chain.
 ///
@@ -183,10 +212,171 @@ pub struct DefaultTaskExecutor {
     builder: Arc<dyn ExecutorBuilder>,
 }
 
+/// What the second half of a breaker task — a join's probe or an aggregate —
+/// cost to build and how much it read.
+struct StageTiming {
+    bytes_read: u64,
+    vm_build_us: u64,
+    source_build_us: u64,
+}
+
 impl DefaultTaskExecutor {
     /// Create a task executor that builds pipelines with `builder`.
     pub fn new(builder: Arc<dyn ExecutorBuilder>) -> Self {
         Self { builder }
+    }
+
+    /// The probe half of a join: one chain per file of the probe source, sharing
+    /// the table the build phase produced.
+    ///
+    /// A join compiles to a single task, so without this its probe files would be
+    /// read and probed one after another — while an ordinary scan already spreads
+    /// a table's files across the worker pool. The chain construction is
+    /// sequential, so the per-chain build times are summed rather than sampled.
+    ///
+    /// Only the probe-local flavours fan out. A right or full join owes unmatched
+    /// *build* rows, which each chain tracks in its own table; splitting the
+    /// probe would make every chain emit the same unmatched rows.
+    async fn probe_join(
+        &self,
+        task: &ExecuteTask,
+        table: HashTable,
+        plan: &JoinPlan,
+        sink: Arc<Mutex<Box<dyn Sink<DataChunk>>>>,
+        cancel: CancellationToken,
+        span: &tracing::Span,
+    ) -> Result<StageTiming> {
+        let kind = join_type(plan.join_type)?;
+        let columns = join_outputs(&plan.outputs);
+        let probe_types = join_types(&plan.probe_types);
+        let build_types = join_types(&plan.build_types);
+        let table = Arc::new(table);
+
+        // A window counts rows for the whole task, so a limited probe is not
+        // fanned out: every chain would otherwise emit the window on its own.
+        let sources = if task.limit.is_none() && matches!(kind, JoinType::Inner | JoinType::Left) {
+            split_scan(&task.source)
+        } else {
+            vec![task.source.clone()]
+        };
+
+        let mut vm_build_us = 0u64;
+        let mut source_build_us = 0u64;
+        let mut chains = Vec::with_capacity(sources.len());
+        for source in sources {
+            let head = with_window(
+                Box::new(CancelGuard::new(
+                    Box::new(SuppressFlush::new(Box::new(SinkHandle(sink.clone())))),
+                    cancel.clone(),
+                )),
+                task.limit,
+            );
+
+            let vm_started = Instant::now();
+            let mut vm = HashJoin::new(
+                Arc::clone(&table),
+                kind,
+                columns.clone(),
+                probe_types.clone(),
+                build_types.clone(),
+                head,
+            );
+            vm_build_us += vm_started.elapsed().as_micros() as u64;
+
+            let source_started = Instant::now();
+            let mut source =
+                self.builder
+                    .build_source(&source, task.task_id, task.attempt)?;
+            source_build_us += source_started.elapsed().as_micros() as u64;
+
+            let cancel = cancel.clone();
+            let span = span.clone();
+            chains.push(tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(VeinError::cancelled()),
+                    result = source.execute(&mut vm).instrument(span) => result?,
+                }
+                Ok::<_, VeinError>(source.bytes_read())
+            }));
+        }
+
+        let mut bytes_read = 0u64;
+        for chain in chains {
+            bytes_read += chain
+                .await
+                .map_err(|error| VeinError::internal(format!("join probe task failed: {error}")))??;
+        }
+
+        // The chains suppressed their own flushes, so the sink is flushed once
+        // here, after every file has been probed.
+        sink.lock()
+            .map_err(|_| VeinError::internal("sink mutex poisoned"))?
+            .flush()?;
+
+        Ok(StageTiming {
+            bytes_read,
+            vm_build_us,
+            source_build_us,
+        })
+    }
+
+    /// The aggregate half of a task: fold the whole program into the
+    /// accumulator, then emit the groups.
+    ///
+    /// The program still runs, so the filters and the projections below the
+    /// aggregate happen in the VM; what the accumulator receives are the
+    /// program's output registers, which the compiler laid out as the group keys
+    /// followed by one column per aggregate argument.
+    async fn run_aggregate(
+        &self,
+        task: &ExecuteTask,
+        plan: AggregatePlan,
+        sink: &Arc<Mutex<Box<dyn Sink<DataChunk>>>>,
+        cancel: &CancellationToken,
+        span: &tracing::Span,
+    ) -> Result<StageTiming> {
+        let (accumulator, handle) = aggregate::shared(plan)?;
+
+        let vm_started = Instant::now();
+        let mut vm = self.builder.build_vm(&task.program, handle)?;
+        let vm_build_us = vm_started.elapsed().as_micros() as u64;
+
+        let source_started = Instant::now();
+        let mut source = self
+            .builder
+            .build_source(&task.source, task.task_id, task.attempt)?;
+        let source_build_us = source_started.elapsed().as_micros() as u64;
+
+        // The window applies to the groups, not to the rows that produced them.
+        let mut head = with_window(
+            Box::new(CancelGuard::new(
+                Box::new(SinkHandle(sink.clone())),
+                cancel.clone(),
+            )),
+            task.limit,
+        );
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(VeinError::cancelled()),
+            result = source.execute(&mut *vm).instrument(span.clone()) => result?,
+        }
+
+        let groups = accumulator
+            .lock()
+            .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?
+            .finish()?;
+        for chunk in groups {
+            head.push(chunk)?;
+        }
+        head.flush()?;
+
+        Ok(StageTiming {
+            bytes_read: source.bytes_read(),
+            vm_build_us,
+            source_build_us,
+        })
     }
 
     async fn execute_with_output(
@@ -268,31 +458,7 @@ impl DefaultTaskExecutor {
             self.builder.build_sink(&task.sink)?
         };
         let sink: Arc<Mutex<Box<dyn Sink<DataChunk>>>> = Arc::new(Mutex::new(sink));
-        let head: Box<dyn PipelineNode<DataChunk>> = Box::new(CancelGuard::new(
-            Box::new(SinkHandle(sink.clone())),
-            cancel.clone(),
-        ));
         let sink_build_us = sink_started.elapsed().as_micros() as u64;
-
-        let vm_started = Instant::now();
-        let mut vm: Box<dyn Transform<DataChunk>> = match join {
-            Some((table, plan)) => Box::new(HashJoin::new(
-                Arc::new(table),
-                join_type(plan.join_type)?,
-                join_outputs(&plan.outputs),
-                join_types(&plan.probe_types),
-                join_types(&plan.build_types),
-                head,
-            )),
-            None => self.builder.build_vm(&task.program, head)?,
-        };
-        let vm_build_us = vm_started.elapsed().as_micros() as u64;
-
-        let source_started = Instant::now();
-        let mut source: Box<dyn Source<DataChunk>> =
-            self.builder
-                .build_source(&task.source, task.task_id, task.attempt)?;
-        let source_build_us = source_started.elapsed().as_micros() as u64;
 
         let task_span = tracing::info_span!(
             target: "vein.audit",
@@ -304,11 +470,58 @@ impl DefaultTaskExecutor {
             attempt = task.attempt,
         );
         let run_started = Instant::now();
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(VeinError::cancelled()),
-            result = source.execute(&mut *vm).instrument(task_span) => result?,
-        }
+        // A group by breaks the pipeline the way a join does — nothing can be
+        // emitted until every row has been folded — so it is the runtime's job,
+        // and it takes precedence over the join path a task can never also be on.
+        let aggregate_timing = match task.aggregate.clone() {
+            Some(plan) => {
+                Some(
+                    self.run_aggregate(task, plan, &sink, &cancel, &task_span)
+                        .await?,
+                )
+            }
+            None => None,
+        };
+
+        let (bytes_read, vm_build_us, source_build_us) = match aggregate_timing {
+            Some(timing) => (timing.bytes_read, timing.vm_build_us, timing.source_build_us),
+            None => match join {
+            // A join probes with the table the build phase produced. Its probe
+            // source is fanned out over its files, all sharing that one table.
+            Some((table, plan)) => {
+                let probe = self
+                    .probe_join(task, table, plan, sink.clone(), cancel.clone(), &task_span)
+                    .await?;
+                (probe.bytes_read, probe.vm_build_us, probe.source_build_us)
+            }
+            None => {
+                let head = with_window(
+                    Box::new(CancelGuard::new(
+                        Box::new(SinkHandle(sink.clone())),
+                        cancel.clone(),
+                    )),
+                    task.limit,
+                );
+                let vm_started = Instant::now();
+                let mut vm: Box<dyn Transform<DataChunk>> =
+                    self.builder.build_vm(&task.program, head)?;
+                let vm_build_us = vm_started.elapsed().as_micros() as u64;
+
+                let source_started = Instant::now();
+                let mut source: Box<dyn Source<DataChunk>> =
+                    self.builder
+                        .build_source(&task.source, task.task_id, task.attempt)?;
+                let source_build_us = source_started.elapsed().as_micros() as u64;
+
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(VeinError::cancelled()),
+                    result = source.execute(&mut *vm).instrument(task_span.clone()) => result?,
+                }
+                (source.bytes_read(), vm_build_us, source_build_us)
+            }
+            },
+        };
         let run_us = run_started.elapsed().as_micros() as u64;
 
         let collect_started = Instant::now();
@@ -322,7 +535,6 @@ impl DefaultTaskExecutor {
         let write_receipt = sink.write_receipt().cloned();
         let collect_us = collect_started.elapsed().as_micros() as u64;
 
-        let bytes_read = source.bytes_read();
         let duration_ns = start.elapsed().as_nanos() as u64;
 
         tracing::info!(
@@ -372,6 +584,20 @@ impl TaskExecutor for DefaultTaskExecutor {
 /// A plan's key columns as chunk column positions.
 fn join_keys(columns: &[u32]) -> JoinKeys {
     JoinKeys::new(columns.iter().map(|column| *column as usize).collect())
+}
+
+/// Wraps a task's terminal chain in its row window, when it has one.
+///
+/// The window sits immediately below the program so it counts rows the query
+/// actually emits, and above the sink so a single window covers the whole task.
+fn with_window(
+    next: Box<dyn PipelineNode<DataChunk>>,
+    limit: Option<LimitSpec>,
+) -> Box<dyn PipelineNode<DataChunk>> {
+    match limit {
+        Some(limit) => Box::new(LimitTransform::new(limit.offset, limit.count, next)),
+        None => next,
+    }
 }
 
 /// One source per file, so a join's build side can be read in parallel.
@@ -530,6 +756,8 @@ mod tests {
             }),
             build: None,
             join: None,
+            limit: None,
+            aggregate: None,
         }
     }
 

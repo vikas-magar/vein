@@ -16,6 +16,18 @@ pub trait PipelineNode<B>: Send + Sync {
 
     /// Signals that no more data will be pushed.
     fn flush(&mut self) -> Result<()>;
+
+    /// Whether this node has all the data it will ever need, so the source
+    /// feeding it may stop reading.
+    ///
+    /// A limit is the only node that says yes today: once it has emitted its
+    /// rows, everything the source would read next is discarded anyway, and at
+    /// scan batch sizes that is the difference between reading one batch and
+    /// reading the table. The default is `false` so a node that cannot finish
+    /// early never has to say so.
+    fn finished(&self) -> bool {
+        false
+    }
 }
 
 /// The trait implemented by all data sources.

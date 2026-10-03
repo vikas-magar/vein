@@ -69,6 +69,11 @@ impl PipelineNode<DataChunk> for LimitTransform {
     fn flush(&mut self) -> Result<()> {
         self.next.flush()
     }
+
+    /// Once the window is full, nothing further down can matter.
+    fn finished(&self) -> bool {
+        self.rows_emitted >= self.count
+    }
 }
 
 impl Transform<DataChunk> for LimitTransform {}

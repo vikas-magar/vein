@@ -208,6 +208,12 @@ impl PipelineNode<DataChunk> for HashJoin {
         );
         self.next.flush()
     }
+
+    /// Whether the pipeline is done is decided below the join, so the source's
+    /// question has to pass through it.
+    fn finished(&self) -> bool {
+        self.next.finished()
+    }
 }
 
 impl crate::pipeline::Transform<DataChunk> for HashJoin {}

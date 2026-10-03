@@ -70,6 +70,14 @@ const SCENARIOS: &[Scenario] = &[
         vein: "FROM orders AS a\n|> JOIN orders AS b ON a.o_orderkey = b.o_orderkey\n|> SELECT a.o_orderkey, b.o_totalprice",
         duckdb: "SELECT a.o_orderkey, b.o_totalprice FROM './data/tpch/orders/*.parquet' a JOIN './data/tpch/orders/*.parquet' b ON a.o_orderkey = b.o_orderkey",
     },
+    // A limit is the one scenario answered by *not* reading. The window fills
+    // inside the first batch, so the scan stops there and the number to beat is
+    // DuckDB's, which stops the same way.
+    Scenario {
+        name: "limit/5",
+        vein: "FROM orders\n|> SELECT o_orderkey, o_totalprice\n|> LIMIT 5",
+        duckdb: "SELECT o_orderkey, o_totalprice FROM './data/tpch/orders/*.parquet' LIMIT 5",
+    },
 ];
 
 /// One scenario's samples.

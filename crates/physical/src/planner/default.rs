@@ -67,14 +67,14 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
             | LogicalPlan::Filter { .. }
             | LogicalPlan::Project { .. }
             | LogicalPlan::Join { .. }
+            | LogicalPlan::Limit { .. }
+            | LogicalPlan::SubqueryAlias { .. }
+            | LogicalPlan::Aggregate { .. }
+            | LogicalPlan::Distinct { .. }
             | LogicalPlan::Write { .. } => {
                 let stage = self.pipeline_builder.build(&logical_plan)?;
                 Ok(Job::new(request_id, query_id, stage, ExecutionMode::Batch))
             }
-            LogicalPlan::Aggregate { .. } => Err(VeinError::planning(
-                "aggregations are not supported by the single-node execution engine yet",
-                None,
-            )),
             other => Err(VeinError::planning(
                 format!("Logical plan node not yet supported by physical planner: {other:?}"),
                 None,

@@ -48,6 +48,17 @@ fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
     hash
 }
 
+/// The bucket a hash lands in.
+///
+/// `buckets.len()` is always a power of two — [`HashTable::rebucket`] rounds up
+/// and every growth doubles — so this is a mask. The `%` it replaces was a real
+/// 64-bit division on every probe row, because the compiler cannot see that
+/// invariant in a `Vec`'s length.
+#[inline]
+fn bucket_of(hash: u64, buckets: usize) -> usize {
+    (hash as usize) & (buckets - 1)
+}
+
 /// A key column resolved to its concrete Arrow type.
 ///
 /// The array is an `Arc` clone rather than a borrow, so the resolved keys can be
@@ -234,7 +245,9 @@ impl HashTable {
         self.chunks.push(chunk);
 
         for position in 0..self.chunks[chunk_index as usize].selection.size() {
-            let row = self.chunks[chunk_index as usize].selection.get_index(position) as u32;
+            let row = self.chunks[chunk_index as usize]
+                .selection
+                .get_index(position) as u32;
             if keys.any_null(row as usize) {
                 self.null_keyed.push((chunk_index, row));
                 continue;
@@ -244,7 +257,7 @@ impl HashTable {
             self.grow_if_needed(1);
             let hash = keys.hash(row as usize);
             let index = self.entries.len() as u32;
-            let bucket = (hash as usize) % self.buckets.len();
+            let bucket = bucket_of(hash, self.buckets.len());
             let next = self.buckets[bucket];
             self.buckets[bucket] = index;
             self.entries.push(Entry {
@@ -289,9 +302,13 @@ impl HashTable {
     /// hashes are already computed, so nothing is re-hashed. Null-keyed rows are
     /// not in `entries`, so they are correctly left out.
     fn rebucket(&mut self, size: usize) {
+        // `bucket_of` masks, so the count must be a power of two. A caller's
+        // "entries times two" is not one, and rounding up here keeps the
+        // invariant in a single place rather than at every call site.
+        let size = size.max(1).next_power_of_two();
         self.buckets = vec![NONE; size];
         for index in 0..self.entries.len() {
-            let bucket = (self.hashes[index] as usize) % size;
+            let bucket = bucket_of(self.hashes[index], size);
             self.entries[index].next = self.buckets[bucket];
             self.buckets[bucket] = index as u32;
         }
@@ -319,11 +336,12 @@ impl HashTable {
 
         self.chunks.extend(other.chunks);
         self.keys_by_chunk.extend(other.keys_by_chunk);
-        self.entries.extend(other.entries.into_iter().map(|entry| Entry {
-            chunk: entry.chunk + offset,
-            row: entry.row,
-            next: NONE,
-        }));
+        self.entries
+            .extend(other.entries.into_iter().map(|entry| Entry {
+                chunk: entry.chunk + offset,
+                row: entry.row,
+                next: NONE,
+            }));
         self.hashes.extend(other.hashes);
         self.null_keyed.extend(
             other
@@ -338,7 +356,12 @@ impl HashTable {
             self.keys.clear();
         }
 
-        self.rebucket(self.buckets.len().max(self.entries.len() * 2).max(INITIAL_BUCKETS));
+        self.rebucket(
+            self.buckets
+                .len()
+                .max(self.entries.len() * 2)
+                .max(INITIAL_BUCKETS),
+        );
         Ok(())
     }
 
@@ -361,7 +384,7 @@ impl HashTable {
             }
             let hash = probe_keys.hash(row as usize);
             let value = inline.then(|| probe_keys.single_i64(row as usize).unwrap_or_default());
-            let mut head = self.buckets[(hash as usize) % self.buckets.len()];
+            let mut head = self.buckets[bucket_of(hash, self.buckets.len())];
             while head != NONE {
                 let entry = self.entries[head as usize];
                 let same = self.hashes[head as usize] == hash
@@ -373,8 +396,7 @@ impl HashTable {
                             row as usize,
                         ),
                     };
-                if same
-                {
+                if same {
                     matches.push((row, (entry.chunk, entry.row)));
                 }
                 head = entry.next;
@@ -414,7 +436,6 @@ impl HashTable {
         let entry = self.entries[entry as usize];
         (entry.chunk, entry.row)
     }
-
 }
 
 #[cfg(test)]
@@ -548,6 +569,10 @@ mod tests {
             table.buckets.len() > INITIAL_BUCKETS,
             "buckets must grow past the initial size"
         );
+        assert!(
+            table.buckets.len().is_power_of_two(),
+            "the bucketing mask needs a power-of-two bucket count"
+        );
 
         let mut pairs = Vec::new();
         table
@@ -592,6 +617,10 @@ mod tests {
             .expect("insert");
 
         left.merge(right).expect("merge");
+        assert!(
+            left.buckets.len().is_power_of_two(),
+            "a merge must leave the bucket count a power of two"
+        );
 
         let mut pairs = Vec::new();
         left.probe(&chunk(ints(&[10, 30, 40, 99])), &mut pairs)

@@ -260,7 +260,7 @@ pub async fn execute_parquet_scan(
     bytes_read: &Arc<AtomicU64>,
     next: &mut dyn PipelineNode<DataChunk>,
 ) -> Result<()> {
-    for file in files {
+    'files: for file in files {
         let path = file.relative.as_str();
         let scan_started = Instant::now();
         tracing::info!(target: "vein.audit", event = "scan_started", path = %path, format = "parquet", "scan_started");
@@ -467,6 +467,13 @@ pub async fn execute_parquet_scan(
             next.push(chunk)?;
             downstream_time += downstream_started.elapsed();
 
+            // A limit below the pipeline already has every row it will emit, so
+            // the rest of this file — and every file after it — can only be
+            // discarded. Stop reading, but still report what this file cost.
+            if next.finished() {
+                break;
+            }
+
             if last_progress.elapsed() >= Duration::from_secs(10) {
                 tracing::info!(
                     target: "vein.audit",
@@ -535,6 +542,10 @@ pub async fn execute_parquet_scan(
                 as u64,
             "scan_completed"
         );
+
+        if next.finished() {
+            break 'files;
+        }
     }
 
     Ok(())

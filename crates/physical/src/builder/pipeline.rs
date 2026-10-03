@@ -6,7 +6,7 @@ use crate::task::Task;
 use common::Result;
 use common::identifiers::{PartitionId, StageId, TaskId};
 use common::protocol::{
-    DataSink, DataSource, JoinKind, JoinOutput, JoinPlan, MicroProgram,
+    DataSink, DataSource, JoinKind, JoinOutput, JoinPlan, LimitSpec, MicroProgram,
 };
 use error::VeinError;
 use parser::ast::expr::BinaryOp;
@@ -51,6 +51,7 @@ impl DefaultPipelineStageBuilder {
         plan: &LogicalPlan,
         schema: &VeinSchema,
         outputs: Option<&[LogicalExpr]>,
+        limit: Option<LimitSpec>,
     ) -> Result<Stage> {
         let LogicalPlan::Join {
             join_type,
@@ -100,17 +101,20 @@ impl DefaultPipelineStageBuilder {
         };
 
         let mut stage = Stage::new(StageId::new());
-        stage.tasks.push(Task::join(
-            TaskId::new(),
-            PartitionId::from_raw(0),
-            probe_source,
-            build_source,
-            join,
-            Arc::new(probe_program),
-            Arc::new(DataSink::Client {
-                schema: Arc::new(schema.clone()),
-            }),
-        ));
+        stage.tasks.push(
+            Task::join(
+                TaskId::new(),
+                PartitionId::from_raw(0),
+                probe_source,
+                build_source,
+                join,
+                Arc::new(probe_program),
+                Arc::new(DataSink::Client {
+                    schema: Arc::new(schema.clone()),
+                }),
+            )
+            .with_limit(limit),
+        );
         Ok(stage)
     }
 }
@@ -120,8 +124,8 @@ impl DefaultPipelineStageBuilder {
 ///
 /// A projection above the join is not a second operator: the join is where the
 /// pipeline breaks, so the projection is the join's output column list. Its
-/// **expressions** are what identify the source columns — its schema holds fresh
-/// output ids that match neither input, which is why they cannot be used.
+    /// **expressions** are what identify the source columns — its schema holds fresh
+    /// output ids that match neither input, which is why they cannot be used.
 fn join_root(plan: &LogicalPlan) -> Option<(&LogicalPlan, &VeinSchema, Option<&[LogicalExpr]>)> {
     match plan {
         LogicalPlan::Join { schema, .. } => Some((plan, schema.as_ref(), None)),
@@ -132,6 +136,9 @@ fn join_root(plan: &LogicalPlan) -> Option<(&LogicalPlan, &VeinSchema, Option<&[
         } if matches!(input.as_ref(), LogicalPlan::Join { .. }) => {
             Some((input.as_ref(), schema.as_ref(), Some(exprs)))
         }
+        // A limit sits above whatever it windows, so the join beneath it is still
+        // the pipeline breaker that has to be built.
+        LogicalPlan::Limit { input, .. } => join_root(input),
         _ => None,
     }
 }
@@ -307,8 +314,10 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         &self,
         plan: &LogicalPlan,
     ) -> Result<Stage> {
+        let limit = PipelineCompiler::window(plan)?;
+        let aggregate = PipelineCompiler::aggregate(plan)?;
         if let Some((join, schema, outputs)) = join_root(plan) {
-            return self.build_join(join, schema, outputs);
+            return self.build_join(join, schema, outputs, limit);
         }
         let (source, program, out_schema) = self.compile_pipeline(plan)?;
         let sink = match plan {
@@ -346,7 +355,11 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         };
         let stage_id = StageId::new();
         let mut stage = Stage::new(stage_id);
-        let sources = if matches!(sink, DataSink::Storage(_)) {
+        // A limit counts rows globally and an aggregate groups them globally, so
+        // a plan with either stays one task: the per-file split below would apply
+        // the window, or the grouping, once per file.
+        let sources = if limit.is_some() || aggregate.is_some() || matches!(sink, DataSink::Storage(_))
+        {
             vec![(PartitionId::from_raw(0), source)]
         } else {
             split_file_scan_source(source)?
@@ -354,13 +367,17 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         let program = Arc::new(program);
         let sink = Arc::new(sink);
         for (partition, source) in sources {
-            stage.tasks.push(Task::new(
-                TaskId::new(),
-                partition,
-                source,
-                Arc::clone(&program),
-                Arc::clone(&sink),
-            ));
+            stage.tasks.push(
+                Task::new(
+                    TaskId::new(),
+                    partition,
+                    source,
+                    Arc::clone(&program),
+                    Arc::clone(&sink),
+                )
+                .with_limit(limit)
+                .with_aggregate(aggregate.clone()),
+            );
         }
         Ok(stage)
     }

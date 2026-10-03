@@ -2,7 +2,8 @@
 
 use common::identifiers::{PartitionId, QueryId, RequestId, StageId, TaskId};
 use common::protocol::{
-    DataSink, DataSource, ExecuteTask, ExecutionMode, JoinPlan, MicroProgram,
+    AggregatePlan, DataSink, DataSource, ExecuteTask, ExecutionMode, JoinPlan, LimitSpec,
+    MicroProgram,
 };
 use std::sync::Arc;
 
@@ -27,6 +28,10 @@ pub struct Task {
     pub build: Option<DataSource>,
     /// How `source` and `build` are joined, when they are.
     pub join: Option<JoinPlan>,
+    /// The row window this task emits, when the query has a `LIMIT`.
+    pub limit: Option<LimitSpec>,
+    /// How this task aggregates, when the query has a `GROUP BY` or `DISTINCT`.
+    pub aggregate: Option<AggregatePlan>,
 }
 
 impl Task {
@@ -46,6 +51,8 @@ impl Task {
             sink,
             build: None,
             join: None,
+            limit: None,
+            aggregate: None,
         }
     }
 
@@ -71,7 +78,29 @@ impl Task {
             sink,
             build: Some(build),
             join: Some(join),
+            limit: None,
+            aggregate: None,
         }
+    }
+
+    /// The row window this task emits.
+    ///
+    /// Separate from [`Task::new`] because most tasks have no window, and a
+    /// limited plan is deliberately not split across files: a limit counts rows
+    /// globally, so a per-file task would emit the limit once per file.
+    pub fn with_limit(mut self, limit: Option<LimitSpec>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Groups this task's rows before they reach the sink.
+    ///
+    /// Like a limit, an aggregate is a property of the whole task, so a grouped
+    /// plan is never split across files: each split would group its own rows and
+    /// emit its own groups.
+    pub fn with_aggregate(mut self, aggregate: Option<AggregatePlan>) -> Self {
+        self.aggregate = aggregate;
+        self
     }
 
     /// Convert this task into a dispatchable [`ExecuteTask`], filling in the
@@ -104,6 +133,8 @@ impl Task {
             sink,
             build: self.build,
             join: self.join,
+            limit: self.limit,
+            aggregate: self.aggregate,
         }
     }
 }

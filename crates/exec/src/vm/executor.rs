@@ -302,6 +302,12 @@ impl PipelineNode<DataChunk> for VectorVmExecutor {
         }
         self.next.flush()
     }
+
+    /// The VM is a pass-through: whether the pipeline is done is decided below
+    /// it, so the source's question has to reach the node that knows.
+    fn finished(&self) -> bool {
+        self.next.finished()
+    }
 }
 
 impl Transform<DataChunk> for VectorVmExecutor {}

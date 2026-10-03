@@ -222,9 +222,17 @@ pub struct ExecuteTask {
     pub build: Option<DataSource>,
     /// How the two inputs are joined. Set exactly when `build` is.
     pub join: Option<JoinPlan>,
+    /// The row window to emit, when the query has a `LIMIT`.
+    ///
+    /// It travels with the task because a limit is cross-chunk state that also
+    /// has to *stop the source*: the VM sees one chunk at a time, and dropping
+    /// rows and knowing when to stop reading are one decision.
+    pub limit: Option<LimitSpec>,
+    /// How to aggregate, when the query has a `GROUP BY` or a `DISTINCT`.
+    pub aggregate: Option<AggregatePlan>,
 }
 
-use super::JoinKind;
+use super::{AggOpCode, JoinKind};
 
 /// Where one output column of a join comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,4 +263,36 @@ pub struct JoinPlan {
     pub probe_types: Vec<types::VeinDataType>,
     /// The data type of every build column the output may reference.
     pub build_types: Vec<types::VeinDataType>,
+}
+
+/// The row window a task emits: skip `offset` rows, then emit at most `count`.
+///
+/// One struct rather than two loose fields so "a task has a window" is a single
+/// thing to check, the way `JoinPlan` is one thing for "a task is a join".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitSpec {
+    /// Rows to skip before emitting any.
+    pub offset: u64,
+    /// Maximum rows to emit after the offset.
+    pub count: u64,
+}
+
+/// How a task aggregates its input, when the query groups or deduplicates.
+///
+/// The columns the executor sees are the program's output registers: the first
+/// `groups` of them are the group key, and every column after them is one
+/// aggregate's argument. The compiler puts them there, so an argument like
+/// `sum(price * quantity)` is just another register and this plan never has to
+/// describe an expression.
+///
+/// A `DISTINCT` is the same shape with every output column as a key and no
+/// aggregates, which is why it needs no operator of its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AggregatePlan {
+    /// Leading output columns that together form the group key.
+    pub groups: u32,
+    /// One op per column after the keys, in column order.
+    pub aggs: Vec<AggOpCode>,
+    /// The type of every output column: the keys first, then one per aggregate.
+    pub types: Vec<types::VeinDataType>,
 }

@@ -5,6 +5,8 @@
 //! - [`transform`]: Processes data chunks ([`LimitTransform`](transform::LimitTransform), [`VectorVmExecutor`](crate::vm::VectorVmExecutor)).
 //! - [`sink`]: Terminates data streams ([`CollectSink`](sink::CollectSink), [`DiscardSink`](sink::DiscardSink)).
 
+/// Aggregate operators that consume their whole input before emitting
+pub mod aggregate;
 /// Join operators that consume a second input before emitting
 pub mod join;
 /// Sink operators that consume data batches
