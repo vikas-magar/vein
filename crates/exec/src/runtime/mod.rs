@@ -336,11 +336,12 @@ impl DefaultTaskExecutor {
         cancel: &CancellationToken,
         span: &tracing::Span,
     ) -> Result<StageTiming> {
+        let post_aggregate_program = task.post_aggregate_program.as_ref();
         let (accumulator, handle) = aggregate::shared(plan)?;
 
         let vm_started = Instant::now();
         let mut vm = self.builder.build_vm(&task.program, handle)?;
-        let vm_build_us = vm_started.elapsed().as_micros() as u64;
+        let mut vm_build_us = vm_started.elapsed().as_micros() as u64;
 
         let source_started = Instant::now();
         let mut source = self
@@ -349,14 +350,13 @@ impl DefaultTaskExecutor {
         let source_build_us = source_started.elapsed().as_micros() as u64;
 
         // The window applies to the groups, not to the rows that produced them.
-        let mut head = with_window(
+        let mut head: Box<dyn PipelineNode<DataChunk>> = with_window(
             Box::new(CancelGuard::new(
                 Box::new(SinkHandle(sink.clone())),
                 cancel.clone(),
             )),
             task.limit,
         );
-
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(VeinError::cancelled()),
@@ -367,10 +367,20 @@ impl DefaultTaskExecutor {
             .lock()
             .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?
             .finish()?;
-        for chunk in groups {
-            head.push(chunk)?;
+        if let Some(program) = post_aggregate_program {
+            let vm_started = Instant::now();
+            let mut post_vm = self.builder.build_vm(program, head)?;
+            vm_build_us += vm_started.elapsed().as_micros() as u64;
+            for chunk in groups {
+                post_vm.push(chunk)?;
+            }
+            post_vm.flush()?;
+        } else {
+            for chunk in groups {
+                head.push(chunk)?;
+            }
+            head.flush()?;
         }
-        head.flush()?;
 
         Ok(StageTiming {
             bytes_read: source.bytes_read(),
@@ -664,7 +674,9 @@ mod tests {
     use super::*;
     use crate::operators::source::MemorySource;
     use common::identifiers::{QueryId, RequestId, StageId, TaskId};
-    use common::protocol::{ExecutionMode, JoinKind, JoinOutput, JoinPlan, MicroOp};
+    use common::protocol::{
+        AggOpCode, AggregatePlan, ExecutionMode, JoinKind, JoinOutput, JoinPlan, MicroOp,
+    };
 
     /// A builder whose only difference from the default is that it can
     /// materialize a `DataSource::Memory` task, which the default builder
@@ -768,7 +780,68 @@ mod tests {
             join: None,
             limit: None,
             aggregate: None,
+            post_aggregate_program: None,
         }
+    }
+
+    fn aggregate_task_with_post_filter(threshold: i64) -> ExecuteTask {
+        let mut task = task();
+        task.program = Arc::new(MicroProgram {
+            register_count: 1,
+            instructions: vec![MicroOp::ProjectRegisters { out_regs: vec![0] }],
+        });
+        task.aggregate = Some(AggregatePlan {
+            groups: 0,
+            grouping_sets: Some(vec![vec![]]),
+            aggs: vec![AggOpCode::Count],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Int64],
+        });
+        task.post_aggregate_program = Some(Arc::new(MicroProgram {
+            register_count: 3,
+            instructions: vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: types::LogicalLiteral::Int64(threshold),
+                },
+                MicroOp::CmpGt {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::FilterMask { bool_reg: 2 },
+            ],
+        }));
+        task
+    }
+
+    #[tokio::test]
+    async fn filters_aggregate_output_in_the_post_aggregate_vm() {
+        let task = aggregate_task_with_post_filter(4);
+        let result = runner()
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("post-aggregate filter should execute");
+
+        assert_eq!(result.row_count, 1);
+        let count = result.output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("aggregate count output");
+        assert_eq!(count.value(0), 5);
+    }
+
+    #[tokio::test]
+    async fn post_aggregate_filter_can_remove_every_group() {
+        let task = aggregate_task_with_post_filter(5);
+        let result = runner()
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("post-aggregate filter should execute");
+
+        assert_eq!(result.row_count, 0);
+        assert!(result.output.is_empty());
     }
 
     #[tokio::test]
@@ -793,6 +866,7 @@ mod tests {
         let mut task = task();
         task.aggregate = Some(AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![common::protocol::AggOpCode::Count],
             aggregate_input_types: vec![types::VeinDataType::Int64],
             types: vec![types::VeinDataType::Int64],

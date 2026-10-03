@@ -792,6 +792,8 @@ struct Group {
 /// Absorbs rows into groups, then emits one row per group.
 pub struct AggregateSink {
     plan: AggregatePlan,
+    /// Each grouping set's key positions in the projected key columns.
+    grouping_sets: Vec<Vec<u32>>,
     /// Encoded key to index in `groups`: encoding each key once makes a group
     /// lookup a hash of bytes rather than a comparison of typed columns.
     index: HashMap<Vec<u8>, usize>,
@@ -818,6 +820,30 @@ impl AggregateSink {
             )));
         }
         let groups = plan.groups as usize;
+        let grouping_sets = plan.grouping_sets.clone().unwrap_or_else(|| {
+            vec![(0..plan.groups).collect()]
+        });
+        if grouping_sets.is_empty() {
+            return Err(VeinError::internal(
+                "aggregate plan must contain at least one grouping set",
+            ));
+        }
+        for grouping_set in &grouping_sets {
+            let mut seen = Vec::with_capacity(grouping_set.len());
+            for &column in grouping_set {
+                if column as usize >= groups {
+                    return Err(VeinError::internal(format!(
+                        "aggregate grouping set references key column {column}, but only {groups} key columns exist"
+                    )));
+                }
+                if seen.contains(&column) {
+                    return Err(VeinError::internal(format!(
+                        "aggregate grouping set repeats key column {column}"
+                    )));
+                }
+                seen.push(column);
+            }
+        }
         let aggregate_states = plan
             .aggs
             .iter()
@@ -829,6 +855,7 @@ impl AggregateSink {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             plan,
+            grouping_sets,
             index: HashMap::new(),
             groups: Vec::new(),
             aggregate_states,
@@ -836,10 +863,14 @@ impl AggregateSink {
     }
 
     /// Adds a group slot and its corresponding state to every aggregate.
-    fn push_group(&mut self, key: Vec<KeyValue>) -> Result<usize> {
-        let slot = self.groups.len();
-        self.groups.push(Group { key });
-        for column in &mut self.aggregate_states {
+    fn push_group(
+        groups: &mut Vec<Group>,
+        aggregate_states: &mut [AggregateStateColumn],
+        key: Vec<KeyValue>,
+    ) -> Result<usize> {
+        let slot = groups.len();
+        groups.push(Group { key });
+        for column in aggregate_states {
             column.push_group();
         }
         Ok(slot)
@@ -856,29 +887,38 @@ impl AggregateSink {
             )));
         }
         let mut key = Vec::new();
-        let mut group_rows = Vec::with_capacity(chunk.selection.size());
+        let mut group_rows = Vec::with_capacity(
+            chunk.selection.size().saturating_mul(self.grouping_sets.len()),
+        );
         for logical_row in 0..chunk.selection.size() {
             let row = chunk.selection.get_index(logical_row);
-            key.clear();
-            let mut values = Vec::with_capacity(groups);
-            for column in 0..groups {
-                let value = key_value(chunk.column(column), row)?;
-                encode(&value, &mut key);
-                values.push(value);
-            }
-
-            // A new key takes a fresh slot; an existing one folds into its own.
-            let existing_slot = self.index.get(&key).copied();
-            let slot = match existing_slot {
-                Some(slot) => slot,
-                None => {
-                    let slot = self.push_group(values)?;
-                    self.index.insert(key.clone(), slot);
-                    slot
+            for (set_id, grouping_set) in self.grouping_sets.iter().enumerate() {
+                key.clear();
+                key.extend_from_slice(&(set_id as u64).to_le_bytes());
+                let mut values = vec![KeyValue::Null; groups];
+                for &column in grouping_set {
+                    let column = column as usize;
+                    let value = key_value(chunk.column(column), row)?;
+                    encode(&value, &mut key);
+                    values[column] = value;
                 }
-            };
 
-            group_rows.push((slot, row));
+                // Include the set identity: an omitted key and a real NULL key
+                // can have equal output values but remain distinct groups.
+                let slot = match self.index.get(&key).copied() {
+                    Some(slot) => slot,
+                    None => {
+                        let slot = Self::push_group(
+                            &mut self.groups,
+                            &mut self.aggregate_states,
+                            values,
+                        )?;
+                        self.index.insert(key.clone(), slot);
+                        slot
+                    }
+                };
+                group_rows.push((slot, row));
+            }
         }
 
         // Resolve each physical input layout once per aggregate column and
@@ -897,10 +937,27 @@ impl AggregateSink {
     /// The finished groups, as one chunk in the plan's output types.
     pub fn finish(&mut self) -> Result<Vec<DataChunk>> {
         if self.groups.is_empty() {
-            if self.plan.groups != 0 {
+            let empty_sets: Vec<usize> = self
+                .grouping_sets
+                .iter()
+                .enumerate()
+                .filter_map(|(set_id, grouping_set)| grouping_set.is_empty().then_some(set_id))
+                .collect();
+            for set_id in empty_sets {
+                let key = (set_id as u64).to_le_bytes().to_vec();
+                if !self.index.contains_key(&key) {
+                    Self::push_group(
+                        &mut self.groups,
+                        &mut self.aggregate_states,
+                        vec![KeyValue::Null; self.plan.groups as usize],
+                    )?;
+                    let slot = self.groups.len() - 1;
+                    self.index.insert(key, slot);
+                }
+            }
+            if self.groups.is_empty() {
                 return Ok(Vec::new());
             }
-            self.push_group(Vec::new())?;
         }
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.plan.types.len());
         for (column, data_type) in self.plan.types.iter().enumerate() {
@@ -1081,7 +1138,7 @@ mod tests {
 
     use arrow::array::{
         Decimal256Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array,
-        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow::datatypes::i256;
     use common::arrow::SelectionVector;
@@ -1096,6 +1153,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max],
             aggregate_input_types: vec![VeinDataType::Decimal256(76, 0); 3],
             types: vec![VeinDataType::Decimal256(76, 0); 3],
@@ -1135,6 +1193,7 @@ mod tests {
         let negative_large = i256::ZERO.checked_sub(large).unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Decimal256(76, 2)],
             types: vec![VeinDataType::Float64],
@@ -1168,6 +1227,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Decimal256(76, 0)],
             types: vec![VeinDataType::Decimal256(76, 0)],
@@ -1191,6 +1251,7 @@ mod tests {
 
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Float16; 4],
             types: vec![
@@ -1250,6 +1311,7 @@ mod tests {
             let input: ArrayRef = Arc::new(<$array>::from(vec![Some(2), None, Some(5)]));
             let plan = AggregatePlan {
                 groups: 0,
+                grouping_sets: None,
                 aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
                 aggregate_input_types: vec![$data_type.clone(); 4],
                 types: vec![
@@ -1319,6 +1381,7 @@ mod tests {
         ($array:ty, $data_type:expr) => {{
             let plan = AggregatePlan {
                 groups: 1,
+                grouping_sets: None,
                 aggs: vec![AggOpCode::Sum],
                 aggregate_input_types: vec![VeinDataType::Int64],
                 types: vec![$data_type, VeinDataType::Int64],
@@ -1368,6 +1431,7 @@ mod tests {
     fn uint64_sum_checks_overflow_and_average_uses_wide_exact_state() {
         let sum_plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::UInt64],
             types: vec![VeinDataType::UInt64],
@@ -1382,6 +1446,7 @@ mod tests {
 
         let avg_plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::UInt64],
             types: vec![VeinDataType::Float64],
@@ -1410,6 +1475,7 @@ mod tests {
     fn accumulation_reads_only_selected_physical_rows() {
         let plan = AggregatePlan {
             groups: 1,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64, VeinDataType::Int64],
@@ -1449,6 +1515,7 @@ mod tests {
     fn integer_sum_preserves_values_above_f64_precision() {
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max],
             aggregate_input_types: vec![VeinDataType::Int64; 3],
             types: vec![VeinDataType::Int64; 3],
@@ -1490,6 +1557,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Decimal128(38, 2)],
             types: vec![VeinDataType::Decimal128(38, 2)],
@@ -1517,6 +1585,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Decimal128(15, 2)],
             types: vec![VeinDataType::Float64],
@@ -1539,6 +1608,7 @@ mod tests {
     fn int64_average_accumulates_exactly_across_batches() {
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Float64],
@@ -1573,6 +1643,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Decimal128(19, 0)],
             types: vec![VeinDataType::Float64],
@@ -1596,6 +1667,7 @@ mod tests {
         let input = Float32Array::from(vec![100_000_000.0_f32, 1.0, -100_000_000.0]);
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Float32],
             types: vec![VeinDataType::Float64],
@@ -1618,6 +1690,7 @@ mod tests {
     fn float32_sum_reads_input_layout_and_emits_widened_result() {
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Float32],
             types: vec![VeinDataType::Float64],
@@ -1643,6 +1716,7 @@ mod tests {
         let values: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Int32; 4],
             types: vec![
@@ -1708,6 +1782,7 @@ mod tests {
             Arc::new(Int16Array::from(vec![Some(1_000), None, Some(-10)]));
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![
                 AggOpCode::Sum,
                 AggOpCode::Min,
@@ -1833,6 +1908,7 @@ mod tests {
         let values: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.5), None, Some(2.5)]));
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![
                 AggOpCode::Sum,
                 AggOpCode::Min,
@@ -1870,6 +1946,7 @@ mod tests {
     fn integer_sum_reports_overflow() {
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64],
@@ -1889,6 +1966,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Decimal128(38, 0)],
             types: vec![VeinDataType::Decimal128(38, 0)],
@@ -1906,6 +1984,7 @@ mod tests {
         let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(5)]));
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![
                 AggOpCode::Count,
                 AggOpCode::Sum,
@@ -1981,6 +2060,7 @@ mod tests {
     fn empty_global_aggregate_emits_count_zero_and_null_sum() {
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Count, AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64, VeinDataType::Float64],
             types: vec![VeinDataType::Int64, VeinDataType::Float64],
@@ -2014,6 +2094,7 @@ mod tests {
     fn empty_global_average_uses_its_declared_input_type() {
         let plan = AggregatePlan {
             groups: 0,
+            grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Float32],
             types: vec![VeinDataType::Float64],
@@ -2030,5 +2111,75 @@ mod tests {
             .unwrap();
 
         assert!(average.is_null(0));
+    }
+
+    #[test]
+    fn grouping_sets_keep_set_identity_and_null_omitted_keys() {
+        let plan = AggregatePlan {
+            groups: 2,
+            grouping_sets: Some(vec![vec![0, 1], vec![0], vec![]]),
+            aggs: vec![AggOpCode::Sum],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Int64, VeinDataType::Utf8, VeinDataType::Int64],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+        sink.accumulate(DataChunk::from_vectors(vec![
+            Arc::new(Int64Array::from(vec![Some(1), None])),
+            Arc::new(StringArray::from(vec![Some("x"), Some("z")])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+        ]))
+            .unwrap();
+
+        let output = sink.finish().unwrap();
+        let batch = &output[0];
+        let first_key = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let second_key = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let sums = batch.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(first_key.value(0), 1);
+        assert_eq!(second_key.value(0), "x");
+        assert_eq!(first_key.value(1), 1);
+        assert!(second_key.is_null(1));
+        assert!(first_key.is_null(2));
+        assert!(second_key.is_null(2));
+        assert_eq!(sums.value(2), 30);
+        assert!(first_key.is_null(3));
+        assert_eq!(second_key.value(3), "z");
+        assert!(first_key.is_null(4));
+        assert!(second_key.is_null(4));
+        assert_eq!(sums.value(4), 20);
+    }
+
+    #[test]
+    fn empty_input_emits_only_empty_grouping_sets() {
+        let plan = AggregatePlan {
+            groups: 1,
+            grouping_sets: Some(vec![vec![0], vec![]]),
+            aggs: vec![AggOpCode::Count],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Int64, VeinDataType::Int64],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+        sink.accumulate(DataChunk::from_vectors(vec![
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+        ]))
+            .unwrap();
+
+        let output = sink.finish().unwrap();
+        assert_eq!(output[0].num_rows(), 1);
+        assert!(output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .is_null(0));
+        assert_eq!(output[0]
+                       .column(1)
+                       .as_any()
+                       .downcast_ref::<Int64Array>()
+                       .unwrap()
+                       .value(0), 0);
     }
 }

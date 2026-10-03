@@ -55,11 +55,9 @@ impl PipelineCompiler {
     /// An aggregate is a pipeline breaker the executor drives, not a program the
     /// VM runs, so the executor needs the key and argument columns in one piece.
     ///
-    /// Only a limit may sit above it. Anything else above an aggregate would
-    /// have to run *after* the groups exist, and the program runs before: a
-    /// projection compiled against the group schema would read registers that
-    /// hold the aggregate's inputs, not its outputs, and quietly return the
-    /// wrong columns. That is refused rather than miscompiled.
+    /// Filters above it are compiled separately to run after the groups exist.
+    /// Projections remain unsupported until the physical plan carries their
+    /// output schema through the post-aggregate pipeline.
     pub fn aggregate(plan: &LogicalPlan) -> Result<Option<AggregatePlan>> {
         match plan {
             LogicalPlan::Limit { input, .. } => Self::aggregate(input),
@@ -69,12 +67,7 @@ impl PipelineCompiler {
                 schema,
                 ..
             } => {
-                let [keys] = grouping_sets.as_slice() else {
-                    return Err(VeinError::planning(
-                        "multiple grouping sets are not supported yet",
-                        None,
-                    ));
-                };
+                let (keys, grouping_sets) = grouping_layout(grouping_sets)?;
                 let (aggs, aggregate_input_types): (Vec<_>, Vec<_>) = aggs
                     .iter()
                     .map(|agg| {
@@ -86,6 +79,7 @@ impl PipelineCompiler {
                     .unzip();
                 Ok(Some(AggregatePlan {
                     groups: keys.len() as u32,
+                    grouping_sets: Some(grouping_sets),
                     aggs,
                     aggregate_input_types,
                     types: schema.fields.iter().map(|f| f.data_type.clone()).collect(),
@@ -95,11 +89,13 @@ impl PipelineCompiler {
             // and nothing to fold, which is why it needs no plan of its own.
             LogicalPlan::Distinct { schema, .. } => Ok(Some(AggregatePlan {
                 groups: schema.fields.len() as u32,
+                grouping_sets: Some(vec![(0..schema.fields.len() as u32).collect()]),
                 aggs: Vec::new(),
                 aggregate_input_types: Vec::new(),
                 types: schema.fields.iter().map(|f| f.data_type.clone()).collect(),
             })),
-            LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
+            LogicalPlan::Filter { input, .. } => Self::aggregate(input),
+            LogicalPlan::Project { input, .. } => {
                 if Self::aggregate(input)?.is_some() {
                     Err(VeinError::planning(
                         "an operator above an aggregate is not supported yet: the aggregate's groups \
@@ -124,6 +120,17 @@ impl PipelineCompiler {
         let mut compiler = BytecodeCompiler::new(register_count);
         let output_schema = Self::compile_node(plan, scan_schema, &mut compiler)?;
         Ok((source, compiler.finish(), output_schema))
+    }
+
+    /// Compiles row filters above an aggregate against the aggregate's output schema.
+    pub fn post_aggregate_program(plan: &LogicalPlan) -> Result<Option<MicroProgram>> {
+        let Some(schema) = aggregate_output_schema(plan) else {
+            return Ok(None);
+        };
+        let mut compiler = BytecodeCompiler::new(schema.fields.len() as RegId);
+        compile_post_aggregate_node(plan, &mut compiler)?;
+        let program = compiler.finish();
+        Ok((!program.instructions.is_empty()).then_some(program))
     }
 
     fn collect_leaf_source(plan: &LogicalPlan) -> Result<(DataSource, VeinSchema)> {
@@ -339,13 +346,8 @@ impl PipelineCompiler {
                 schema,
             } => {
                 let input_schema = Self::compile_node(input, input_schema, compiler)?;
-                let [keys] = grouping_sets.as_slice() else {
-                    return Err(VeinError::planning(
-                        "multiple grouping sets are not supported yet",
-                        None,
-                    ));
-                };
-                let mut projected = keys.clone();
+                let (keys, _) = grouping_layout(grouping_sets)?;
+                let mut projected = keys;
                 for agg in aggs {
                     let (name, argument) = aggregate_argument(agg)?;
                     agg_op(name)?;
@@ -368,7 +370,9 @@ impl PipelineCompiler {
             }
             LogicalPlan::Filter { input, predicate } => {
                 let schema = Self::compile_node(input, input_schema, compiler)?;
-                compiler.compile_filter(predicate, &schema)?;
+                if Self::aggregate(input)?.is_none() {
+                    compiler.compile_filter(predicate, &schema)?;
+                }
                 Ok(schema)
             }
             LogicalPlan::Project {
@@ -386,6 +390,85 @@ impl PipelineCompiler {
             )),
         }
     }
+}
+
+/// Returns the output schema at the aggregate boundary, walking row-wise nodes above it.
+fn aggregate_output_schema(plan: &LogicalPlan) -> Option<VeinSchema> {
+    match plan {
+        LogicalPlan::Aggregate { schema, .. } | LogicalPlan::Distinct { schema, .. } => {
+            Some((**schema).clone())
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::SubqueryAlias { input, .. }
+        | LogicalPlan::Write { input, .. } => aggregate_output_schema(input),
+        _ => None,
+    }
+}
+
+/// Compiles supported operators above the aggregate, in execution order.
+fn compile_post_aggregate_node(
+    plan: &LogicalPlan,
+    compiler: &mut BytecodeCompiler,
+) -> Result<VeinSchema> {
+    match plan {
+        LogicalPlan::Aggregate { schema, .. } | LogicalPlan::Distinct { schema, .. } => {
+            Ok((**schema).clone())
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            let schema = compile_post_aggregate_node(input, compiler)?;
+            compiler.compile_filter(predicate, &schema)?;
+            Ok(schema)
+        }
+        LogicalPlan::Limit { input, .. } | LogicalPlan::Write { input, .. } => {
+            compile_post_aggregate_node(input, compiler)
+        }
+        LogicalPlan::SubqueryAlias { input, schema, .. } => {
+            compile_post_aggregate_node(input, compiler)?;
+            Ok((**schema).clone())
+        }
+        LogicalPlan::Project { .. } => Err(VeinError::planning(
+            "projection above an aggregate is not supported yet",
+            None,
+        )),
+        other => Err(VeinError::planning(
+            format!("unsupported operator above an aggregate: {other:?}"),
+            None,
+        )),
+    }
+}
+
+/// Flattens the grouping columns into one VM projection and records each set as
+/// positions into that projection. The output schema uses this same first-seen
+/// union of keys.
+fn grouping_layout(grouping_sets: &[Vec<LogicalExpr>]) -> Result<(Vec<LogicalExpr>, Vec<Vec<u32>>)> {
+    if grouping_sets.is_empty() {
+        return Err(VeinError::planning("an aggregate must contain a grouping set", None));
+    }
+
+    let mut keys = Vec::new();
+    let mut positions = Vec::with_capacity(grouping_sets.len());
+    for grouping_set in grouping_sets {
+        let mut set_positions = Vec::with_capacity(grouping_set.len());
+        for expression in grouping_set {
+            let position = match keys.iter().position(|key| key == expression) {
+                Some(position) => position,
+                None => {
+                    keys.push(expression.clone());
+                    keys.len() - 1
+                }
+            };
+            let position = u32::try_from(position).map_err(|_| {
+                VeinError::planning("aggregate has too many grouping columns", None)
+            })?;
+            if !set_positions.contains(&position) {
+                set_positions.push(position);
+            }
+        }
+        positions.push(set_positions);
+    }
+    Ok((keys, positions))
 }
 
 /// The accumulator a registered aggregate function folds with.

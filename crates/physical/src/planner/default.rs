@@ -36,7 +36,6 @@ impl DefaultPhysicalPlanner {
     pub fn pipeline_builder(&self) -> &Arc<dyn PipelineStageBuilder> {
         &self.pipeline_builder
     }
-
 }
 
 impl Default for DefaultPhysicalPlanner {
@@ -168,6 +167,126 @@ mod tests {
         assert_eq!(aggregate.groups, 0);
         assert_eq!(aggregate.aggs, vec![common::protocol::AggOpCode::Count]);
         assert_eq!(aggregate.types, vec![VeinDataType::Int64]);
+    }
+
+    #[test]
+    fn plans_filter_against_aggregate_output_in_a_separate_program() {
+        let input = mock_scan_plan();
+        let argument = match &input {
+            LogicalPlan::Scan { schema, .. } => schema.fields[0].clone(),
+            _ => unreachable!(),
+        };
+        let aggregate_schema = Box::new(VeinSchema::new(vec![Arc::new(ResolvedColumn::new(
+            ColumnId(2),
+            "order_count",
+            None,
+            VeinDataType::Int64,
+        ))]));
+        let count_column = aggregate_schema.fields[0].clone();
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(input),
+            grouping_sets: vec![vec![]],
+            aggs: vec![LogicalExpr::FunctionCall {
+                name: "count".to_string(),
+                args: vec![LogicalExpr::Column(argument)],
+                is_aggregate: true,
+                distinct: false,
+                return_type: VeinDataType::Int64,
+            }],
+            schema: aggregate_schema,
+        };
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(aggregate),
+            predicate: LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(count_column)),
+                op: parser::ast::expr::BinaryOp::Gt,
+                right: Box::new(LogicalExpr::Literal(plan::LogicalLiteral::Int64(2))),
+                return_type: VeinDataType::Boolean,
+            },
+        };
+
+        let job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), filtered)
+            .expect("post-aggregate filter should compile");
+        let task = &job.stage().tasks()[0];
+        assert!(task
+            .program
+            .instructions
+            .iter()
+            .all(|op| !matches!(op, common::protocol::MicroOp::FilterMask { .. })));
+        let post = task
+            .post_aggregate_program
+            .as_ref()
+            .expect("post-aggregate filter program");
+        assert!(matches!(
+            post.instructions.last(),
+            Some(common::protocol::MicroOp::FilterMask { .. })
+        ));
+    }
+
+    #[test]
+    fn plans_multiple_grouping_sets_over_one_union_key_projection() {
+        let input = mock_scan_plan();
+        let (id, name) = match &input {
+            LogicalPlan::Scan { schema, .. } => {
+                (schema.fields[0].clone(), schema.fields[1].clone())
+            }
+            _ => unreachable!(),
+        };
+        let schema = Box::new(VeinSchema::new(vec![
+            Arc::new(ResolvedColumn::new(
+                ColumnId(2),
+                "id",
+                None,
+                VeinDataType::Int64,
+            )),
+            Arc::new(ResolvedColumn::new(
+                ColumnId(3),
+                "name",
+                None,
+                VeinDataType::Utf8,
+            )),
+            Arc::new(ResolvedColumn::new(
+                ColumnId(4),
+                "row_count",
+                None,
+                VeinDataType::Int64,
+            )),
+        ]));
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(input),
+            grouping_sets: vec![
+                vec![
+                    LogicalExpr::Column(id.clone()),
+                    LogicalExpr::Column(name),
+                ],
+                vec![LogicalExpr::Column(id.clone())],
+                vec![],
+            ],
+            aggs: vec![LogicalExpr::FunctionCall {
+                name: "count".to_string(),
+                args: vec![LogicalExpr::Column(id)],
+                is_aggregate: true,
+                distinct: false,
+                return_type: VeinDataType::Int64,
+            }],
+            schema,
+        };
+
+        let job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), aggregate)
+            .expect("multiple grouping sets should be carried into the task plan");
+        let plan = job.stage().tasks()[0]
+            .aggregate
+            .as_ref()
+            .expect("aggregate task metadata");
+
+        assert_eq!(plan.groups, 2);
+        assert_eq!(
+            plan.grouping_sets,
+            Some(vec![vec![0, 1], vec![0], vec![]])
+        );
+        assert_eq!(plan.aggs, vec![common::protocol::AggOpCode::Count]);
     }
 
     #[test]

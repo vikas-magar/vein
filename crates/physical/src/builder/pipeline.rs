@@ -316,6 +316,7 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
     ) -> Result<Stage> {
         let limit = PipelineCompiler::window(plan)?;
         let aggregate = PipelineCompiler::aggregate(plan)?;
+        let post_aggregate_program = PipelineCompiler::post_aggregate_program(plan)?.map(Arc::new);
         if let Some((join, schema, outputs)) = join_root(plan) {
             return self.build_join(join, schema, outputs, limit);
         }
@@ -375,8 +376,9 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                     Arc::clone(&program),
                     Arc::clone(&sink),
                 )
-                .with_limit(limit)
-                .with_aggregate(aggregate.clone()),
+                    .with_limit(limit)
+                    .with_aggregate(aggregate.clone())
+                    .with_post_aggregate_program(post_aggregate_program.clone()),
             );
         }
         Ok(stage)

@@ -32,6 +32,8 @@ pub struct Task {
     pub limit: Option<LimitSpec>,
     /// How this task aggregates, when the query has a `GROUP BY` or `DISTINCT`.
     pub aggregate: Option<AggregatePlan>,
+    /// VM program applied to aggregate output, when the plan has post-aggregate filters.
+    pub post_aggregate_program: Option<Arc<MicroProgram>>,
 }
 
 impl Task {
@@ -53,6 +55,7 @@ impl Task {
             join: None,
             limit: None,
             aggregate: None,
+            post_aggregate_program: None,
         }
     }
 
@@ -80,6 +83,7 @@ impl Task {
             join: Some(join),
             limit: None,
             aggregate: None,
+            post_aggregate_program: None,
         }
     }
 
@@ -100,6 +104,12 @@ impl Task {
     /// emit its own groups.
     pub fn with_aggregate(mut self, aggregate: Option<AggregatePlan>) -> Self {
         self.aggregate = aggregate;
+        self
+    }
+
+    /// Applies a separately compiled VM program after this task's aggregate.
+    pub fn with_post_aggregate_program(mut self, program: Option<Arc<MicroProgram>>) -> Self {
+        self.post_aggregate_program = program;
         self
     }
 
@@ -135,6 +145,7 @@ impl Task {
             join: self.join,
             limit: self.limit,
             aggregate: self.aggregate,
+            post_aggregate_program: self.post_aggregate_program,
         }
     }
 }

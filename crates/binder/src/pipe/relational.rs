@@ -114,32 +114,43 @@ pub async fn bind_select<'a>(
 /// Binds a PipeOperator::Aggregate into a LogicalPlan::Aggregate
 pub async fn bind_aggregate<'a>(
     input: LogicalPlan,
-    group_by: &[parser::ast::pipe_op::OrderByExpr<'_>],
+    grouping_sets: &[Vec<parser::ast::pipe_op::OrderByExpr<'_>>],
     aggregates: &[AggregateExpr<'_>],
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
-    let mut bound_group_by = Vec::new();
+    let mut bound_grouping_sets = Vec::with_capacity(grouping_sets.len());
     let mut new_fields: Vec<ResolvedColumnRef> = Vec::new();
 
-    for gb in group_by {
-        let bound_expr = ExprBinder::new(context, scopes).bind(&gb.expr).await?;
-        // Window functions are only allowed inside projection operators
-        // (Google: use EXTEND before AGGREGATE instead).
-        if expr_contains_window_call(&bound_expr) {
-            return Err(VeinError::semantic(
-                "window functions are not allowed inside AGGREGATE; use EXTEND before AGGREGATE",
-                Some(gb.expr.span),
-            ));
+    for grouping_set in grouping_sets {
+        let mut bound_grouping_set = Vec::with_capacity(grouping_set.len());
+        for grouping_expr in grouping_set {
+            let bound_expr = ExprBinder::new(context, scopes).bind(&grouping_expr.expr).await?;
+            // Window functions are only allowed inside projection operators
+            // (Google: use EXTEND before AGGREGATE instead).
+            if expr_contains_window_call(&bound_expr) {
+                return Err(VeinError::semantic(
+                    "window functions are not allowed inside AGGREGATE; use EXTEND before AGGREGATE",
+                    Some(grouping_expr.expr.span),
+                ));
+            }
+            if !bound_grouping_sets
+                .iter()
+                .flatten()
+                .chain(bound_grouping_set.iter())
+                .any(|expr| expr == &bound_expr)
+            {
+                let name = derive_column_name(&grouping_expr.expr.node);
+                new_fields.push(std::sync::Arc::new(ResolvedColumn::new(
+                    context.next_id(),
+                    name,
+                    None,
+                    bound_expr.data_type(),
+                )));
+            }
+            bound_grouping_set.push(bound_expr);
         }
-        let name = derive_column_name(&gb.expr.node);
-        new_fields.push(std::sync::Arc::new(ResolvedColumn::new(
-            context.next_id(),
-            name,
-            None,
-            bound_expr.data_type(),
-        )));
-        bound_group_by.push(bound_expr);
+        bound_grouping_sets.push(bound_grouping_set);
     }
 
     let mut bound_aggs = Vec::new();
@@ -170,7 +181,7 @@ pub async fn bind_aggregate<'a>(
 
     Ok(LogicalPlan::Aggregate {
         input: Box::new(input),
-        grouping_sets: vec![bound_group_by],
+        grouping_sets: bound_grouping_sets,
         aggs: bound_aggs,
         schema: Box::new(VeinSchema { fields: new_fields }),
     })

@@ -29,8 +29,7 @@ use crate::local::LocalQueryEngine;
 ///
 /// §4 requires a baseline on the same hardware and dataset with equivalent
 /// semantics, so both engines read the same Parquet files and compute the same
-/// rows. Aggregation and sort scenarios are Phase 2/5 work and are intentionally
-/// absent rather than reported as passing.
+/// rows. Each scenario is included only when both engines can run its shape.
 struct Scenario {
     name: &'static str,
     vein: &'static str,
@@ -77,6 +76,11 @@ const SCENARIOS: &[Scenario] = &[
         name: "limit/5",
         vein: "FROM orders\n|> SELECT o_orderkey, o_totalprice\n|> LIMIT 5",
         duckdb: "SELECT o_orderkey, o_totalprice FROM './data/tpch/orders/*.parquet' LIMIT 5",
+    },
+    Scenario {
+        name: "aggregate/post-filter",
+        vein: "FROM orders\n|> AGGREGATE count(o_orderkey) AS order_count GROUP BY o_orderstatus\n|> WHERE order_count > 50000",
+        duckdb: "SELECT o_orderstatus, count(o_orderkey) AS order_count FROM './data/tpch/orders/*.parquet' GROUP BY o_orderstatus HAVING count(o_orderkey) > 50000",
     },
 ];
 

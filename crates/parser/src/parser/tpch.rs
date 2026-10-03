@@ -30,7 +30,7 @@ mod tests {
             |> AGGREGATE sum(l_extendedprice * l_discount) AS revenue \
         ",
         )
-        .expect("test should succeed");
+            .expect("test should succeed");
         assert_eq!(
             q.source,
             TableSource::Table {
@@ -127,7 +127,7 @@ mod tests {
                AND l_receiptdate >= DATE '1994-01-01' \
         ",
         )
-        .expect("test should succeed");
+            .expect("test should succeed");
         assert_eq!(
             q.source,
             TableSource::Table {
@@ -186,7 +186,7 @@ mod tests {
             |> AGGREGATE sum(l_extendedprice * (1 - l_discount)) AS revenue \
         ",
         )
-        .expect("test should succeed");
+            .expect("test should succeed");
         assert_eq!(
             q.source,
             TableSource::Table {
@@ -280,7 +280,7 @@ mod tests {
             |> ORDER l_returnflag, l_linestatus \
         ",
         )
-        .expect("test should succeed");
+            .expect("test should succeed");
 
         assert_eq!(
             q.source,
@@ -296,14 +296,14 @@ mod tests {
         assert!(matches!(q.pipes[2], PipeOperator::OrderBy { .. }));
 
         if let PipeOperator::Aggregate {
-            group_by,
+            grouping_sets,
             aggregates,
         } = &q.pipes[1]
         {
             assert_eq!(
-                group_by.len(),
+                grouping_sets[0].len(),
                 2,
-                "l_returnflag and l_linestatus should be in group_by"
+                "l_returnflag and l_linestatus should be in the grouping set"
             );
             assert_eq!(
                 aggregates.len(),

@@ -81,12 +81,24 @@ FROM orders
 
 Expected result: one row with `order_count = 1` and `total_price = 172799.49`.
 
+Filter aggregate results:
+
+```bash
+VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "
+FROM orders
+|> AGGREGATE count(o_orderkey) AS order_count GROUP BY o_orderstatus
+|> WHERE order_count > 50000
+"
+```
+
+Expected result: two rows, for `O` (`56175`) and `F` (`55872`).
+
 Empty global aggregate over no matching rows:
 
 ```bash
 VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "
 FROM orders
-|> WHERE o_orderkey = 1
+|> WHERE o_orderkey = -1
 |> AGGREGATE count(o_orderkey) AS order_count, sum(o_totalprice) AS total_price
 "
 ```
@@ -101,10 +113,10 @@ VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "FROM lineitem
 
 ## Current Execution Scope
 
-These examples exercise TPC-H Parquet table discovery, filtering, projection, and a limited aggregate shape. They are
-not full official TPC-H benchmark queries: aggregate support currently requires one grouping set and no operators
-above the aggregate, while joins support only restricted equality-key forms. Queries such as TPC-H Q1 and Q3 still
-contain unsupported combinations. `LIMIT` is supported only in placements that preserve pipe semantics.
+These examples exercise TPC-H Parquet table discovery, filtering, projection, aggregation, and filtering aggregate
+results. Projection above aggregates and other aggregate post-operators remain unsupported. Joins support only
+restricted equality-key forms. Queries such as TPC-H Q1 and Q3 still contain unsupported combinations. `LIMIT` is
+supported only in placements that preserve pipe semantics.
 
 ## TPC-H Query Suite (Q1-Q22)
 

@@ -223,6 +223,10 @@ pub struct ExecuteTask {
     pub limit: Option<LimitSpec>,
     /// How to aggregate, when the query has a `GROUP BY` or a `DISTINCT`.
     pub aggregate: Option<AggregatePlan>,
+    /// Vector VM program applied to aggregate output, after the aggregate has
+    /// finished and before the output window and sink.
+    #[serde(default)]
+    pub post_aggregate_program: Option<Arc<MicroProgram>>,
 }
 
 use super::{AggOpCode, JoinKind};
@@ -284,6 +288,11 @@ pub struct LimitSpec {
 pub struct AggregatePlan {
     /// Leading output columns that together form the group key.
     pub groups: u32,
+    /// Positions in the leading key columns that belong to each grouping set.
+    /// `None` preserves the ordinary single-set layout where every key column
+    /// participates in the group. `Some` carries explicit grouping sets.
+    #[serde(default)]
+    pub grouping_sets: Option<Vec<Vec<u32>>>,
     /// One op per column after the keys, in column order.
     pub aggs: Vec<AggOpCode>,
     /// The physical input type for each aggregate argument, in aggregate order.

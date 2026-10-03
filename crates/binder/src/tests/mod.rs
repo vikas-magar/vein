@@ -737,6 +737,29 @@ mod aggregate_types {
     use plan::VeinDataType;
 
     #[tokio::test]
+    async fn grouping_sets_bind_all_keys_once_in_the_output_schema() {
+        let plan = bind(
+            "FROM users |> AGGREGATE COUNT(*) AS n GROUP BY GROUPING SETS ((name, age), (name), ())",
+        )
+            .await;
+        let LogicalPlan::Aggregate {
+            grouping_sets,
+            schema,
+            ..
+        } = plan
+        else {
+            panic!("expected Aggregate plan");
+        };
+
+        assert_eq!(grouping_sets.len(), 3);
+        assert_eq!(grouping_sets.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1, 0]);
+        assert_eq!(schema.fields.len(), 3);
+        assert_eq!(schema.fields[0].name, "name");
+        assert_eq!(schema.fields[1].name, "age");
+        assert_eq!(schema.fields[2].name, "n");
+    }
+
+    #[tokio::test]
     async fn aggregate_output_types_follow_numeric_input_types() {
         let plan = bind(
             "FROM users |> AGGREGATE SUM(id) AS total, MIN(age) AS youngest, AVG(age) AS mean_age",
@@ -771,7 +794,7 @@ mod aggregate_types {
         let plan = bind(
             "FROM numeric_values |> AGGREGATE SUM(i8_value), SUM(i16_value), SUM(i32_value), SUM(u8_value), SUM(u16_value), SUM(u32_value), SUM(u64_value), SUM(f16_value), SUM(f32_value), SUM(decimal256_value)",
         )
-        .await;
+            .await;
         let LogicalPlan::Aggregate { schema, .. } = plan else {
             panic!("expected Aggregate plan");
         };

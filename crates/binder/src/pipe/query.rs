@@ -223,16 +223,16 @@ pub async fn bind_source<'a>(
                     tbl.format.as_ref().map(|f| f.to_string()),
                 ),
                 Err(_error)
-                    if options
-                        .iter()
-                        .any(|(key, _)| key.eq_ignore_ascii_case("format")) =>
-                {
-                    (
-                        Arc::new(VeinSchema { fields: vec![] }),
-                        vec![url.to_string()],
-                        None,
-                    )
-                }
+                if options
+                    .iter()
+                    .any(|(key, _)| key.eq_ignore_ascii_case("format")) =>
+                    {
+                        (
+                            Arc::new(VeinSchema { fields: vec![] }),
+                            vec![url.to_string()],
+                            None,
+                        )
+                    }
                 Err(error) => return Err(error),
             };
 
@@ -306,9 +306,9 @@ pub async fn bind_pipeline<'a>(
                 bind_select(plan, items, &mut *context, &mut *scopes).await?
             }
             PipeOperator::Aggregate {
-                group_by,
+                grouping_sets,
                 aggregates,
-            } => bind_aggregate(plan, group_by, aggregates, &mut *context, &mut *scopes).await?,
+            } => bind_aggregate(plan, grouping_sets, aggregates, &mut *context, &mut *scopes).await?,
             PipeOperator::Join { join } => {
                 bind_join(plan, join, &mut *context, &mut *scopes).await?
             }
@@ -358,7 +358,7 @@ pub async fn bind_pipeline<'a>(
                     &mut *context,
                     &mut *scopes,
                 )
-                .await?
+                    .await?
             }
             PipeOperator::Unpivot {
                 value_name,
@@ -375,7 +375,7 @@ pub async fn bind_pipeline<'a>(
                     &mut *context,
                     &mut *scopes,
                 )
-                .await?
+                    .await?
             }
             PipeOperator::TableSample { method, percent } => {
                 bind_table_sample(plan, method, *percent)?

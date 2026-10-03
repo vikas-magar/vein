@@ -90,6 +90,13 @@ mod tests {
     }
 
     #[test]
+    fn test_grouping_sets_keywords_are_case_insensitive() {
+        let tokens = tokenize("GROUPING sets");
+        assert_eq!(tokens[0].0, TokenKind::Grouping);
+        assert_eq!(tokens[1].0, TokenKind::Sets);
+    }
+
+    #[test]
     fn test_identifier() {
         let tokens = tokenize("my_column");
         assert_eq!(tokens.len(), 1);

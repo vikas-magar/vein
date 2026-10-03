@@ -42,10 +42,11 @@ pub enum PipeOperator<'a> {
     },
     /// `|> AGGREGATE BY ... [SUM(...)]`
     Aggregate {
-        /// The `GROUP BY`-style grouping expressions.
+        /// Grouping sets. A normal `GROUP BY a, b` is represented as `[[a, b]]`;
+        /// an aggregate without `GROUP BY` is represented as `[[]]`.
 
         #[serde(borrow)]
-        group_by: Vec<OrderByExpr<'a>>,
+        grouping_sets: Vec<Vec<OrderByExpr<'a>>>,
         /// The aggregate expressions.
 
         #[serde(borrow)]
