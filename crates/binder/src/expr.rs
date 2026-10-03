@@ -301,6 +301,10 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
             }
         }
 
+        if signature.kind == FunctionKind::Scalar {
+            bound_args = bind_scalar_arguments(name, bound_args, &signature.arg_types, span)?;
+        }
+
         match signature.kind {
             FunctionKind::AiOperator => {
                 self.validate_ai_budget(name, &bound_args)?;
@@ -519,6 +523,64 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
 
         Ok(())
     }
+}
+
+fn bind_scalar_arguments(
+    name: &str,
+    args: Vec<LogicalExpr>,
+    expected_types: &[VeinDataType],
+    span: parser::token::Span,
+) -> Result<Vec<LogicalExpr>> {
+    if args.len() != expected_types.len() {
+        return Err(VeinError::semantic(
+            format!(
+                "scalar function '{name}' expects {} argument(s), got {}",
+                expected_types.len(),
+                args.len()
+            ),
+            Some(span),
+        ));
+    }
+
+    args.into_iter()
+        .zip(expected_types)
+        .enumerate()
+        .map(|(index, (arg, expected))| {
+            let actual = arg.data_type();
+            if actual == *expected {
+                return Ok(arg);
+            }
+            if *expected == VeinDataType::Vector(0)
+                && matches!(actual, VeinDataType::Vector(_))
+            {
+                return Ok(arg);
+            }
+
+            let common = unify_types(&actual, expected).map_err(|_| {
+                VeinError::semantic(
+                    format!(
+                        "scalar function '{name}' argument {} expects {expected:?}, got {actual:?}",
+                        index + 1
+                    ),
+                    Some(span),
+                )
+            })?;
+            if common != *expected {
+                return Err(VeinError::semantic(
+                    format!(
+                        "scalar function '{name}' argument {} expects {expected:?}, got {actual:?}",
+                        index + 1
+                    ),
+                    Some(span),
+                ));
+            }
+
+            Ok(LogicalExpr::Cast {
+                expr: Box::new(arg),
+                target_type: expected.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Unifies a branch type with the running common type (Null seeded start).

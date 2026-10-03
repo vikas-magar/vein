@@ -9,8 +9,9 @@ use common::cancellation::CancellationToken;
 use common::identifiers::RequestId;
 use common::protocol::{DataSink, ExecuteTask};
 use common::{Result, VeinError};
-use exec::runtime::TaskExecutor;
 use exec::operators::sink::WriteReceipt;
+use exec::runtime::TaskExecutor;
+use exec::udf::{FunctionRegistry, register_builtin_scalars};
 use futures::Stream;
 use optimizer::Optimizer;
 use physical::PhysicalPlanner;
@@ -38,11 +39,16 @@ impl LocalQueryEngine {
         let catalog: Arc<dyn CatalogProvider> = catalog;
         let functions = Arc::new(binder::BuiltinFunctionRegistry::new());
         let functions: Arc<dyn binder::FunctionRegistry> = functions;
+        let mut runtime_functions = FunctionRegistry::new();
+        register_builtin_scalars(&mut runtime_functions);
         let storage = Arc::new(ParquetStorage::new(data_root));
-        let executor = Arc::new(exec::factory::TaskExecutorBuilder::new()
-            .with_metadata_store(metadata_store)
-            .with_write_storage(storage)
-            .build());
+        let executor = Arc::new(
+            exec::factory::TaskExecutorBuilder::new()
+                .with_metadata_store(metadata_store)
+                .with_registry(Arc::new(runtime_functions))
+                .with_write_storage(storage)
+                .build(),
+        );
 
         Self {
             binder: binder::QueryBinder::new(catalog, functions),
@@ -83,14 +89,22 @@ impl LocalQueryEngine {
             .first()
             .is_some_and(|task| matches!(&*task.sink, DataSink::Storage(_)));
         if is_write && stage.tasks.len() != 1 {
-            return Err(VeinError::planning("a local WRITE must execute as one atomic task", None));
+            return Err(VeinError::planning(
+                "a local WRITE must execute as one atomic task",
+                None,
+            ));
         }
         let stage_id = stage.stage_id;
         let mut tasks = Vec::with_capacity(stage.tasks.len());
         for task in stage.tasks {
             match (&*task.sink, is_write) {
                 (DataSink::Client { .. }, false) | (DataSink::Storage(_), true) => {}
-                _ => return Err(VeinError::planning("physical stage contains inconsistent sink types", None)),
+                _ => {
+                    return Err(VeinError::planning(
+                        "physical stage contains inconsistent sink types",
+                        None,
+                    ));
+                }
             }
             tasks.push(task.into_execute_task(request_id, query_id, stage_id, mode));
         }
@@ -134,10 +148,18 @@ impl LocalQuery {
     /// Execute a storage write and return only after its commit is confirmed.
     pub async fn execute_write(self) -> Result<WriteReceipt> {
         if !self.is_write || self.tasks.len() != 1 {
-            return Err(VeinError::planning("prepared query is not a single-task WRITE", None));
+            return Err(VeinError::planning(
+                "prepared query is not a single-task WRITE",
+                None,
+            ));
         }
-        let result = self.executor.execute(&self.tasks[0], CancellationToken::new()).await?;
-        result.write_receipt.ok_or_else(|| VeinError::internal("WRITE task completed without a commit receipt"))
+        let result = self
+            .executor
+            .execute(&self.tasks[0], CancellationToken::new())
+            .await?;
+        result
+            .write_receipt
+            .ok_or_else(|| VeinError::internal("WRITE task completed without a commit receipt"))
     }
 
     /// Runs the query and yields Arrow batches through bounded per-task channels.
@@ -281,7 +303,7 @@ pub type LocalResultStream = Pin<Box<dyn Stream<Item=Result<RecordBatch>>>>;
 mod tests {
     use std::fs::File;
 
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Array, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use futures::StreamExt;
@@ -296,14 +318,16 @@ mod tests {
         std::fs::create_dir_all(&table_dir).expect("create table directory");
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        for (part, values) in [("part-1.parquet", vec![1, 4]), ("part-2.parquet", vec![5, 2, 3])] {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from(values))],
-            )
-                .expect("valid batch");
+        for (part, values) in [
+            ("part-1.parquet", vec![1, 4]),
+            ("part-2.parquet", vec![5, 2, 3]),
+        ] {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])
+                    .expect("valid batch");
             let file = File::create(table_dir.join(part)).expect("create Parquet file");
-            let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("create writer");
+            let mut writer =
+                ArrowWriter::try_new(file, schema.clone(), None).expect("create writer");
             writer.write(&batch).expect("write batch");
             writer.close().expect("close writer");
         }
@@ -313,7 +337,11 @@ mod tests {
             .prepare("FROM flights |> WHERE id > 1 |> SELECT id |> ORDER id DESC")
             .await
             .expect("prepare ordered local query");
-        assert_eq!(query.tasks.len(), 1, "a global sort must read all files in one task");
+        assert_eq!(
+            query.tasks.len(),
+            1,
+            "a global sort must read all files in one task"
+        );
         assert!(query.tasks[0].sort.is_some());
         let mut stream = query.into_stream();
         let mut rows = Vec::new();
@@ -348,7 +376,9 @@ mod tests {
         assert_eq!(computed_order_ids, vec![5, 4, 3, 2, 1]);
 
         let query = engine
-            .prepare("FROM flights |> AGGREGATE count(id) AS flight_count GROUP BY id |> ORDER id DESC")
+            .prepare(
+                "FROM flights |> AGGREGATE count(id) AS flight_count GROUP BY id |> ORDER id DESC",
+            )
             .await
             .expect("prepare ordered aggregate query");
         let mut stream = query.into_stream();
@@ -438,6 +468,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executes_lower_and_round_scalar_projections_preserving_nulls() {
+        let root = tempfile::tempdir().expect("temporary data root");
+        let table_dir = root.path().join("names");
+        std::fs::create_dir_all(&table_dir).expect("create table directory");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amount", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("MiXeD"),
+                    None,
+                    Some("VeIn"),
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.2),
+                    Some(1.5),
+                    Some(-1.5),
+                ])),
+            ],
+        )
+            .expect("valid batch");
+        let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let engine = LocalQueryEngine::new(root.path());
+        let query = engine
+            .prepare("FROM names |> SELECT LOWER(name) AS lowered")
+            .await
+            .expect("prepare LOWER projection");
+        let mut stream = query.into_stream();
+        let result = stream
+            .next()
+            .await
+            .expect("query batch")
+            .expect("successful LOWER projection");
+        let values = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("UTF-8 output");
+        assert_eq!(values.value(0), "mixed");
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), "vein");
+        assert!(stream.next().await.is_none());
+
+        let query = engine
+            .prepare("FROM names |> SELECT ROUND(amount) AS rounded")
+            .await
+            .expect("prepare ROUND projection");
+        let mut stream = query.into_stream();
+        let result = stream
+            .next()
+            .await
+            .expect("query batch")
+            .expect("successful ROUND projection");
+        let values = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Float64 output");
+        assert_eq!(values.value(0), 1.0);
+        assert_eq!(values.value(1), 2.0);
+        assert_eq!(values.value(2), -2.0);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn executes_pipe_write_and_exposes_only_committed_rows() {
         let root = tempfile::tempdir().expect("temporary data root");
         let table_dir = root.path().join("source");
@@ -448,7 +551,8 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![4, 5, 6]))],
         )
             .expect("valid source batch");
-        let file = File::create(table_dir.join("part.parquet")).expect("create source Parquet file");
+        let file =
+            File::create(table_dir.join("part.parquet")).expect("create source Parquet file");
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("create source writer");
         writer.write(&batch).expect("write source batch");
         writer.close().expect("close source writer");

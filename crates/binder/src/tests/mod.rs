@@ -640,6 +640,64 @@ mod extended_features {
         }
     }
 
+    #[tokio::test]
+    async fn scalar_function_arguments_follow_registered_signatures() {
+        let plan = bind("FROM users |> SELECT LOWER(name)").await;
+        let LogicalExpr::FunctionCall { args, .. } = expr_of(&plan) else {
+            panic!("expected scalar function call");
+        };
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].data_type(), plan::VeinDataType::Utf8);
+
+        for query in [
+            "FROM users |> SELECT LOWER(age)",
+            "FROM users |> SELECT LOWER(name, name)",
+        ] {
+            let error = bind_err(query).await;
+            assert!(matches!(error, error::VeinError::Semantic { .. }), "got {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn scalar_function_arguments_coerce_null_and_widening_to_signature_type() {
+        let null_plan = bind("FROM users |> SELECT LOWER(NULL)").await;
+        let LogicalExpr::FunctionCall { args, .. } = expr_of(&null_plan) else {
+            panic!("expected scalar function call");
+        };
+        assert!(matches!(
+            args.as_slice(),
+            [LogicalExpr::Cast {
+                target_type: plan::VeinDataType::Utf8,
+                ..
+            }]
+        ));
+
+        let numeric_plan = bind("FROM users |> SELECT ROUND(age)").await;
+        let LogicalExpr::FunctionCall { args, .. } = expr_of(&numeric_plan) else {
+            panic!("expected scalar function call");
+        };
+        assert!(matches!(
+            args.as_slice(),
+            [LogicalExpr::Cast {
+                target_type: plan::VeinDataType::Float64,
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn vector_dimension_wildcard_matches_registered_scalar_signature() {
+        let plan = bind(
+            "FROM vector_values |> SELECT VECTOR_DISTANCE(left_vector, right_vector)",
+        )
+            .await;
+        assert!(matches!(
+            expr_of(&plan),
+            LogicalExpr::FunctionCall { name, .. }
+                if name.eq_ignore_ascii_case("VECTOR_DISTANCE")
+        ));
+    }
+
     /// `COUNT(*)` is lowered to a non-null literal for ordinary aggregates.
     #[tokio::test]
     async fn aggregate_count_star_binds_as_one() {

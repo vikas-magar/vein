@@ -6,33 +6,33 @@ This document tracks the path from syntax accepted by the parser through binding
 
 ## Pipe operators
 
-| Parser operator | Status | Current implementation and remaining work |
-|---|---|---|
-| `SELECT` | Partial | Binds to `Project` and compiles supported expressions. Expression forms without bytecode lowering/runtime kernels remain unsupported. |
-| `WHERE` | Partial | Binds to `Filter`; VM filtering and scan predicate pushdown work for supported expressions and plan shapes. A post-aggregate `WHERE` also runs against aggregate output for supported predicates. |
-| `QUALIFY` | Not implemented | Binder creates window computation plus a filter. Physical planning does not support `Window`. |
-| `AGGREGATE` | Partial | Multiple grouping sets execute, including empty sets; omitted grouping columns are emitted as `NULL`, and empty input produces rows for empty grouping sets. Shared fold logic handles supported integer, floating-point, and decimal layouts; decimal sums preserve scaled integer values with checked overflow, and `AVG` uses floating-point output. Group-key and aggregate input/result type combinations remain limited. A post-aggregate `WHERE` is supported for supported predicates; post-aggregate projection/`SELECT` and other operator placements remain incomplete. |
-| `ORDER BY` | Not implemented | Binder creates `Sort`; no local physical sort implementation. |
-| `LIMIT` | Partial | Runtime limit exists, but some placements are rejected where current pipeline placement would change pipe semantics. |
-| `EXTEND` | Partial | Lowers to projection; inherits expression lowering/runtime limits. |
-| `SET` | Partial | Lowers to projection; inherits expression lowering/runtime limits. |
-| `DROP` | Partial | Lowers to projection; inherits expression lowering/runtime limits. |
-| `RENAME` | Partial | Lowers to projection; inherits expression lowering/runtime limits. |
-| `AS` | Partial | Lowers to an alias node; executable only when the wrapped plan is supported. |
-| `DISTINCT` | Partial | Reuses aggregate/grouping machinery; inherits its supported-key and execution limitations. |
-| `JOIN` | Partial | Local hash join supports restricted join types and key predicates. Cross joins and broader key expressions are unsupported; equality operand order can prevent planning. |
-| `CALL` | Not implemented | Binder creates `LogicalPlan::Call`; no physical implementation. |
-| `TABLESAMPLE` | Not implemented | Binder creates `Sample`; no physical implementation. |
-| `ASSERT` | Not implemented | Binder creates `Assert`; no physical implementation. |
-| `UNION` | Not implemented | Binds to `SetOp`; no physical implementation. |
-| `INTERSECT` | Not implemented | Binds to `SetOp`; no physical implementation. |
-| `EXCEPT` | Not implemented | Binds to `SetOp`; no physical implementation. |
-| `PIVOT` | Not implemented | Binder creates `Pivot`; no physical implementation. |
-| `UNPIVOT` | Not implemented | Binder creates `Unpivot`; no physical implementation. |
-| `WITH` | Partial | Binder expands CTE references into plans. Runtime support depends on whether all operators in each CTE plan are supported. |
-| `WRITE` | Partial | Transactional sink exists, but requires a configured backend and inherits pipeline/operator limits. |
-| `FORK` | Not implemented | Binder creates branch plans; no branch execution path. |
-| `TEE` | Not implemented | Binder creates branch plans; no fan-out execution path. |
+| Parser operator | Status | Current implementation | Missing behavior / reason for status |
+|---|---|---|---|
+| `SELECT` | Partial | Binds to `Project`; supported expressions compile to VM instructions. | Unsupported expression forms lack bytecode lowering or runtime kernels. Projection after an aggregate is not supported. |
+| `WHERE` | Partial | Binds to `Filter`; supported predicates run in the VM or are pushed into Parquet scans. Supported predicates can also filter aggregate output. | Predicate coverage is limited by expression support. General operators after ORDER and filters in placements the pipeline cannot preserve are rejected. |
+| `QUALIFY` | Not implemented | Binder represents the window computation and filter in the logical plan. | The physical planner and executor have no `Window` implementation. |
+| `AGGREGATE` | Partial | Executes supported aggregate functions, numeric layouts, and multiple grouping sets, including empty sets. Omitted grouping columns become `NULL`; decimal sums use checked scaled-integer state; `AVG` returns floating-point output. Supported post-aggregate `WHERE` predicates run against aggregate output. | Group key and aggregate input/result type combinations are still limited. Projection/`SELECT` and other general operators above the aggregate are not supported. |
+| `ORDER BY` | Partial | Supported local input pipelines execute one global ORDER at the end. Direct and computed expressions, multiple keys, direction/null ordering, and a following `LIMIT`/`OFFSET` are supported. Computed keys use temporary VM columns that are removed from output. | Operators after ORDER other than LIMIT are rejected; LIMIT before ORDER and multiple ORDER operators are rejected. The full task input stays in memory; there is no spill path. |
+| `LIMIT` | Partial | Runtime applies a row window, including above supported aggregate and sort plans. | Some placements are rejected when the current pipeline cannot preserve their position semantics, including LIMIT before WHERE or ORDER. |
+| `EXTEND` | Partial | Lowers to projection. | Inherits VM expression limits and the unsupported post-aggregate projection path. |
+| `SET` | Partial | Lowers to projection. | Inherits VM expression limits and the unsupported post-aggregate projection path. |
+| `DROP` | Partial | Lowers to projection. | Inherits VM expression limits and the unsupported post-aggregate projection path. |
+| `RENAME` | Partial | Lowers to projection. | Inherits VM expression limits and the unsupported post-aggregate projection path. |
+| `AS` | Partial | Lowers to a subquery alias. | Works only when the wrapped plan is supported; the alias does not add execution support for unsupported child operators. |
+| `DISTINCT` | Partial | Reuses aggregate/grouping machinery. | Inherits supported group-key and aggregate execution limits. |
+| `JOIN` | Partial | Local hash join supports selected join types, equality/`USING` keys, and plain-column output projections. | Cross joins, other join types, expression join keys, and expression projections are unsupported. Equality operand order can also prevent key planning. |
+| `CALL` | Not implemented | Binder creates `LogicalPlan::Call`. | No physical or runtime implementation exists. |
+| `TABLESAMPLE` | Not implemented | Binder creates a sample plan. | No physical or runtime sampling implementation exists. |
+| `ASSERT` | Not implemented | Binder creates an assert plan. | No physical or runtime assertion implementation exists. |
+| `UNION` | Not implemented | Binds to `SetOp`. | No physical or runtime set-operation implementation exists. |
+| `INTERSECT` | Not implemented | Binds to `SetOp`. | No physical or runtime set-operation implementation exists. |
+| `EXCEPT` | Not implemented | Binds to `SetOp`. | No physical or runtime set-operation implementation exists. |
+| `PIVOT` | Not implemented | Binder creates a pivot plan. | No physical or runtime pivot implementation exists. |
+| `UNPIVOT` | Not implemented | Binder creates an unpivot plan. | No physical or runtime unpivot implementation exists. |
+| `WITH` | Partial | Binder expands CTE references into logical plans. | There is no independent CTE execution path; each expanded plan must use operators the physical planner supports. |
+| `WRITE` | Partial | A transactional sink is available for configured storage backends. | Requires a configured backend and an input pipeline composed of supported operators. |
+| `FORK` | Not implemented | Binder creates branch plans. | No branch execution path exists. |
+| `TEE` | Not implemented | Binder creates branch plans. | No fan-out execution path exists. |
 
 ## Implemented end-to-end paths
 
@@ -42,6 +42,7 @@ No pipe operator is complete across its full syntax and semantics yet. These ope
 - `WHERE` before aggregation and supported `WHERE` predicates after aggregation.
 - `SELECT` and projection-backed `EXTEND`, `SET`, `DROP`, and `RENAME` with expressions the VM can compile and run.
 - `LIMIT` in placements the physical pipeline can preserve, including above aggregation.
+- `ORDER BY` at the end of a supported scan or join pipeline, optionally followed by `LIMIT`/`OFFSET`; direct and computed keys and multi-key ordering are supported. Sorting retains the input in memory, with no spill path.
 - `AGGREGATE` with supported aggregate functions and type combinations, including multiple grouping sets and empty grouping sets.
 - `DISTINCT` through the aggregate grouping machinery for supported key types.
 - Restricted local hash joins for supported join types and equality/`USING` key forms.
