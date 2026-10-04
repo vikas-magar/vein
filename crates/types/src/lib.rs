@@ -13,9 +13,12 @@ pub mod data_type;
 pub mod literal;
 /// Schemas and column layouts.
 pub mod schema;
+/// Temporal interval construction and unit conversion.
+pub mod temporal;
 
 pub use column::{ColumnId, ResolvedColumn, ResolvedColumnRef};
 pub use coercion::unify_types;
 pub use data_type::{VeinDataType, aggregate_return_type};
 pub use literal::{LogicalLiteral, literal_type};
 pub use schema::{VeinSchema, VeinSchemaRef};
+pub use temporal::{TemporalUnit, days_from_civil, interval_from_unit, truncate_epoch_value};

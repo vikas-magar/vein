@@ -7,9 +7,11 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    ListArray, NullArray, StringArray,
+    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int64Array,
+    IntervalMonthDayNanoArray, ListArray, NullArray, StringArray, Time64MicrosecondArray,
+    TimestampMicrosecondArray,
 };
+use arrow::array::types::IntervalMonthDayNano;
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field};
 use common::Result;
@@ -40,9 +42,14 @@ pub fn literal_to_array(literal: &LogicalLiteral, row_count: usize) -> Result<Ar
         }
         // `Date32` is a day count and `Time64`/`Timestamp` are microsecond
         // counts, so the logical value is already the Arrow payload.
-        LogicalLiteral::Date(v) => Arc::new(Int32Array::from(vec![*v; row_count])),
-        LogicalLiteral::Timestamp(v) | LogicalLiteral::Time(v) => {
-            Arc::new(Int64Array::from(vec![*v; row_count]))
+        LogicalLiteral::Date(v) => Arc::new(Date32Array::from(vec![*v; row_count])),
+        LogicalLiteral::Timestamp(v) => Arc::new(TimestampMicrosecondArray::from(vec![*v; row_count])),
+        LogicalLiteral::Time(v) => Arc::new(Time64MicrosecondArray::from(vec![*v; row_count])),
+        LogicalLiteral::Interval { months, days, nanos } => {
+            let value = IntervalMonthDayNano::new(*months, *days, *nanos);
+            Arc::new(IntervalMonthDayNanoArray::from_iter_values(
+                std::iter::repeat(value).take(row_count),
+            ))
         }
         LogicalLiteral::Decimal(v, precision, scale) => {
             let values = std::iter::repeat(*v).take(row_count);
@@ -105,5 +112,61 @@ mod tests {
         assert_eq!(array.value(0), 1234);
         assert_eq!(array.precision(), 15);
         assert_eq!(array.scale(), 2);
+    }
+
+    #[test]
+    fn interval_literal_keeps_month_day_nano_components() {
+        let array = literal_to_array(
+            &LogicalLiteral::Interval {
+                months: 2,
+                days: 90,
+                nanos: 1234,
+            },
+            2,
+        )
+            .unwrap();
+        let array = array
+            .as_any()
+            .downcast_ref::<IntervalMonthDayNanoArray>()
+            .unwrap();
+
+        assert_eq!(array.len(), 2);
+        assert_eq!(array.value(0), IntervalMonthDayNano::new(2, 90, 1234));
+        assert_eq!(array.value(1), IntervalMonthDayNano::new(2, 90, 1234));
+    }
+
+    #[test]
+    fn date_literal_uses_date32_arrow_type() {
+        let array = literal_to_array(&LogicalLiteral::Date(10), 1).unwrap();
+
+        assert_eq!(array.data_type(), &DataType::Date32);
+        assert_eq!(array.as_any().downcast_ref::<Date32Array>().unwrap().value(0), 10);
+    }
+
+    #[test]
+    fn timestamp_and_time_literals_keep_their_arrow_types() {
+        let timestamp = literal_to_array(&LogicalLiteral::Timestamp(1_000_000), 2).unwrap();
+        assert_eq!(
+            timestamp.data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+        let timestamp = timestamp
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(timestamp.values(), &[1_000_000, 1_000_000]);
+
+        let time = literal_to_array(&LogicalLiteral::Time(45_000_000_000), 1).unwrap();
+        assert_eq!(
+            time.data_type(),
+            &DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
+        );
+        assert_eq!(
+            time.as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .unwrap()
+                .value(0),
+            45_000_000_000
+        );
     }
 }

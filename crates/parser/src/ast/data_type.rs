@@ -84,8 +84,18 @@ pub enum IntervalField {
     Second,
     /// `INTERVAL YEAR TO MONTH`.
     YearToMonth,
+    /// `INTERVAL DAY TO HOUR`.
+    DayToHour,
+    /// `INTERVAL DAY TO MINUTE`.
+    DayToMinute,
     /// `INTERVAL DAY TO SECOND`.
     DayToSecond,
+    /// `INTERVAL HOUR TO MINUTE`.
+    HourToMinute,
+    /// `INTERVAL HOUR TO SECOND`.
+    HourToSecond,
+    /// `INTERVAL MINUTE TO SECOND`.
+    MinuteToSecond,
 }
 
 impl std::str::FromStr for DataType<'_> {

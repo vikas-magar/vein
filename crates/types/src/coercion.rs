@@ -70,6 +70,10 @@ fn common_string(left: &VeinDataType, right: &VeinDataType) -> VeinDataType {
 }
 
 fn common_numeric(left: &VeinDataType, right: &VeinDataType) -> Option<VeinDataType> {
+    if let Some(common) = common_decimal(left, right) {
+        return Some(common);
+    }
+
     let rank = |data_type: &VeinDataType| -> Option<u8> {
         Some(match data_type {
             VeinDataType::Int8 => 0,
@@ -90,6 +94,54 @@ fn common_numeric(left: &VeinDataType, right: &VeinDataType) -> Option<VeinDataT
     })
 }
 
+/// Finds a decimal supertype for decimal/integer operands without losing
+/// fractional scale or the integer range.
+fn common_decimal(left: &VeinDataType, right: &VeinDataType) -> Option<VeinDataType> {
+    if !matches!(left, VeinDataType::Decimal128(_, _) | VeinDataType::Decimal256(_, _))
+        && !matches!(right, VeinDataType::Decimal128(_, _) | VeinDataType::Decimal256(_, _))
+    {
+        return None;
+    }
+
+    let (left_precision, left_scale, left_is_decimal256) = decimal_shape(left)?;
+    let (right_precision, right_scale, right_is_decimal256) = decimal_shape(right)?;
+
+    let scale = left_scale.max(right_scale).max(0);
+    let integer_digits = (left_precision - left_scale)
+        .max(right_precision - right_scale)
+        .max(0);
+    let precision = integer_digits + scale;
+    let use_decimal256 = left_is_decimal256 || right_is_decimal256 || precision > 38;
+
+    let max_precision = if use_decimal256 { 76 } else { 38 };
+    if precision <= 0 || precision > max_precision {
+        return None;
+    }
+
+    if use_decimal256 {
+        Some(VeinDataType::Decimal256(precision as u8, scale as i8))
+    } else {
+        Some(VeinDataType::Decimal128(precision as u8, scale as i8))
+    }
+}
+
+/// Returns precision, scale, and decimal width for decimal types and integral
+/// layouts. Integral precision covers every value of that layout.
+fn decimal_shape(data_type: &VeinDataType) -> Option<(i16, i16, bool)> {
+    Some(match data_type {
+        VeinDataType::Decimal128(precision, scale) =>
+            (i16::from(*precision), i16::from(*scale), false),
+        VeinDataType::Decimal256(precision, scale) =>
+            (i16::from(*precision), i16::from(*scale), true),
+        VeinDataType::Int8 | VeinDataType::UInt8 => (3, 0, false),
+        VeinDataType::Int16 | VeinDataType::UInt16 => (5, 0, false),
+        VeinDataType::Int32 | VeinDataType::UInt32 => (10, 0, false),
+        VeinDataType::Int64 => (19, 0, false),
+        VeinDataType::UInt64 => (20, 0, false),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +155,41 @@ mod tests {
         assert_eq!(
             unify_types(&VeinDataType::Int64, &VeinDataType::Int32).unwrap(),
             VeinDataType::Int64
+        );
+    }
+
+    #[test]
+    fn unifies_integer_and_decimal_without_losing_range_or_scale() {
+        let decimal = VeinDataType::Decimal128(15, 2);
+        let expected = VeinDataType::Decimal128(21, 2);
+
+        assert_eq!(
+            unify_types(&VeinDataType::Int64, &decimal).unwrap(),
+            expected
+        );
+        assert_eq!(
+            unify_types(&decimal, &VeinDataType::Int64).unwrap(),
+            expected
+        );
+        assert_eq!(
+            unify_types(&VeinDataType::UInt64, &decimal).unwrap(),
+            VeinDataType::Decimal128(22, 2)
+        );
+    }
+
+    #[test]
+    fn decimal_unification_preserves_widest_scale_and_uses_decimal256_when_needed() {
+        assert_eq!(
+            unify_types(
+                &VeinDataType::Decimal128(12, 3),
+                &VeinDataType::Decimal128(15, 5)
+            )
+                .unwrap(),
+            VeinDataType::Decimal128(15, 5)
+        );
+        assert_eq!(
+            unify_types(&VeinDataType::Int64, &VeinDataType::Decimal128(38, 20)).unwrap(),
+            VeinDataType::Decimal256(39, 20)
         );
     }
 

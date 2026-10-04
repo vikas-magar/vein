@@ -289,6 +289,11 @@ impl From<&DataType> for VeinDataType {
             DataType::LargeList(inner) => {
                 VeinDataType::LargeList(Arc::new(Self::from(inner.data_type())))
             }
+            DataType::FixedSizeList(inner, size)
+            if inner.data_type() == &DataType::Float32 && *size >= 0 =>
+                {
+                    VeinDataType::Vector(*size as u32)
+                }
             DataType::FixedSizeList(inner, size) => {
                 VeinDataType::FixedSizeList(Arc::new(Self::from(inner.data_type())), *size)
             }
@@ -454,6 +459,13 @@ mod tests {
             let back: VeinDataType = (&arrow_dt).into();
             assert_eq!(t, back);
         }
+    }
+
+    #[test]
+    fn fixed_size_float32_list_maps_to_vector() {
+        let vector = VeinDataType::Vector(3);
+        let arrow_type = vector.to_arrow();
+        assert_eq!(VeinDataType::from(&arrow_type), vector);
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! the in-memory catalog and mock registry, so tests read like executable
 //! specs: `bind(sql).await` then shape/schema assertions.
 
-use plan::{LogicalExpr, LogicalPlan, PlanTraversal};
 use crate::testing;
+use plan::{LogicalExpr, LogicalPlan, PlanTraversal};
 
 /// Binds `sql` and unwraps the plan (tests assume the query is valid).
 pub async fn bind(sql: &str) -> LogicalPlan {
@@ -328,7 +328,10 @@ mod subquery {
             "FROM users |> WHERE EXISTS (FROM orders |> WHERE orders.user_id = users.id |> SELECT nope)",
         )
             .await;
-        assert!(matches!(err, error::VeinError::Semantic { .. }), "got {err}");
+        assert!(
+            matches!(err, error::VeinError::Semantic { .. }),
+            "got {err}"
+        );
     }
 
     /// Guard against accidental identifier capture: an unqualified column in a
@@ -339,13 +342,16 @@ mod subquery {
         // `users` has `age`, but `orders` does NOT have `age`.
         // In legacy SQL, `age > 18` inside the subquery would silently capture `users.age`.
         // In Vein, this is rejected with a helpful diagnostic hint.
-        let err = bind_err(
-            "FROM users |> WHERE EXISTS (FROM orders |> WHERE age > 18 |> SELECT id)",
-        )
-            .await;
-        assert!(matches!(err, error::VeinError::Semantic { .. }), "got {err}");
+        let err =
+            bind_err("FROM users |> WHERE EXISTS (FROM orders |> WHERE age > 18 |> SELECT id)")
+                .await;
         assert!(
-            err.to_string().contains("Hint: 'age' exists in outer scope 'users'"),
+            matches!(err, error::VeinError::Semantic { .. }),
+            "got {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("Hint: 'age' exists in outer scope 'users'"),
             "expected diagnostic hint, got: {err}"
         );
     }
@@ -354,10 +360,9 @@ mod subquery {
     /// cleanly to `OuterColumn`.
     #[tokio::test]
     async fn qualified_outer_column_resolves_successfully() {
-        let plan = bind(
-            "FROM users |> WHERE EXISTS (FROM orders |> WHERE users.age > 18 |> SELECT id)",
-        )
-            .await;
+        let plan =
+            bind("FROM users |> WHERE EXISTS (FROM orders |> WHERE users.age > 18 |> SELECT id)")
+                .await;
         assert_chain(&plan, &["Filter", "Scan"]);
     }
 }
@@ -371,7 +376,10 @@ mod projection_mutations {
     async fn drop_removes_columns() {
         let plan = bind("FROM users |> DROP name").await;
         assert_chain(&plan, &["Project", "Scan"]);
-        assert_schema(&plan, &[("id", Some("users"), false), ("age", Some("users"), false)]);
+        assert_schema(
+            &plan,
+            &[("id", Some("users"), false), ("age", Some("users"), false)],
+        );
     }
 
     /// DROP of an unknown column is a semantic error (mirrors SET), not a
@@ -383,10 +391,7 @@ mod projection_mutations {
             matches!(err, error::VeinError::Semantic { .. }),
             "got {err}"
         );
-        assert!(
-            err.to_string().contains("cannot find column"),
-            "got {err}"
-        );
+        assert!(err.to_string().contains("cannot find column"), "got {err}");
     }
 
     /// SET overwrites a column's value; the other columns pass through.
@@ -394,7 +399,14 @@ mod projection_mutations {
     async fn set_overwrites_column() {
         let plan = bind("FROM users |> SET age = age + 1").await;
         assert_chain(&plan, &["Project", "Scan"]);
-        assert_schema(&plan, &[("id", Some("users"), false), ("name", Some("users"), false), ("age", Some("users"), false)]);
+        assert_schema(
+            &plan,
+            &[
+                ("id", Some("users"), false),
+                ("name", Some("users"), false),
+                ("age", Some("users"), false),
+            ],
+        );
     }
 
     /// SET of an unknown column is a semantic error.
@@ -440,8 +452,7 @@ mod join_and_sources {
     async fn qualified_self_join_columns_resolve_to_each_side() {
         let plan = bind("FROM users AS a |> JOIN users AS b ON a.id = b.id").await;
         let LogicalPlan::Join {
-            on:
-            Some(LogicalExpr::BinaryOp { left, right, .. }),
+            on: Some(LogicalExpr::BinaryOp { left, right, .. }),
             ..
         } = plan
         else {
@@ -520,7 +531,11 @@ mod join_and_sources {
         let plan =
             bind("FROM users |> JOIN (FROM orders |> SELECT user_id AS uid) o ON users.id = o.uid")
                 .await;
-        assert!(matches!(&plan, LogicalPlan::Join { .. }), "got {:?}", node_kind(&plan));
+        assert!(
+            matches!(&plan, LogicalPlan::Join { .. }),
+            "got {:?}",
+            node_kind(&plan)
+        );
     }
 }
 
@@ -533,7 +548,10 @@ mod call_and_external {
     #[tokio::test]
     async fn call_binds_call_node() {
         let plan = bind("FROM users |> CALL my_udf(users.id, 1)").await;
-        if let LogicalPlan::Call { name, args, schema, .. } = &plan {
+        if let LogicalPlan::Call {
+            name, args, schema, ..
+        } = &plan
+        {
             assert_eq!(name, "my_udf");
             assert_eq!(args.len(), 2);
             assert_eq!(schema.fields.len(), 3, "Call mirrors the input schema");
@@ -558,10 +576,7 @@ mod pivot_unpivot {
     /// column per pivot value.
     #[tokio::test]
     async fn pivot_binds_pivot_node() {
-        let plan = bind(
-            "FROM orders |> PIVOT SUM(amount) AS total BY user_id IN (1, 2)",
-        )
-            .await;
+        let plan = bind("FROM orders |> PIVOT SUM(amount) AS total BY user_id IN (1, 2)").await;
         let LogicalPlan::Pivot {
             alias,
             value_column,
@@ -584,8 +599,7 @@ mod pivot_unpivot {
     /// columns and appends `name` and `value` columns.
     #[tokio::test]
     async fn unpivot_binds_unpivot_node() {
-        let plan = bind("FROM orders |> UNPIVOT ALL amount BY category IN (user_id, amount)")
-            .await;
+        let plan = bind("FROM orders |> UNPIVOT ALL amount BY category IN (user_id, amount)").await;
         let LogicalPlan::Unpivot {
             value_name,
             name_name,
@@ -615,14 +629,22 @@ mod cte_binding {
     #[tokio::test]
     async fn with_registers_cte_for_later_source() {
         let plan = bind("FROM users |> WITH cte AS (FROM orders |> SELECT user_id, amount) |> JOIN cte c ON users.id = c.user_id").await;
-        assert!(matches!(&plan, LogicalPlan::Join { .. }), "got {:?}", node_kind(&plan));
+        assert!(
+            matches!(&plan, LogicalPlan::Join { .. }),
+            "got {:?}",
+            node_kind(&plan)
+        );
     }
 
     /// A CTE used as the sole source substitutes for a catalog table.
     #[tokio::test]
     async fn cte_as_source() {
         let plan = bind("FROM users |> WITH big AS (FROM users |> WHERE age > 18) |> JOIN big b ON users.id = b.id").await;
-        assert!(matches!(&plan, LogicalPlan::Join { .. }), "got {:?}", node_kind(&plan));
+        assert!(
+            matches!(&plan, LogicalPlan::Join { .. }),
+            "got {:?}",
+            node_kind(&plan)
+        );
     }
 }
 
@@ -654,7 +676,41 @@ mod extended_features {
             "FROM users |> SELECT LOWER(name, name)",
         ] {
             let error = bind_err(query).await;
-            assert!(matches!(error, error::VeinError::Semantic { .. }), "got {error}");
+            assert!(
+                matches!(error, error::VeinError::Semantic { .. }),
+                "got {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_and_year_accept_temporal_inputs_and_return_int32() {
+        let plan = bind(
+            "FROM dates |> SELECT EXTRACT(YEAR FROM order_date), EXTRACT(MONTH FROM date64), EXTRACT(HOUR FROM time_of_day), EXTRACT(MINUTE FROM timestamp), YEAR(order_date)",
+        )
+            .await;
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project plan");
+        };
+        assert_eq!(exprs.len(), 5);
+        for expr in exprs {
+            let LogicalExpr::FunctionCall { return_type, .. } = expr else {
+                panic!("expected temporal function call");
+            };
+            assert_eq!(return_type, plan::VeinDataType::Int32);
+        }
+
+        for query in [
+            "FROM dates |> SELECT EXTRACT(FROM order_date)",
+            "FROM dates |> SELECT EXTRACT(YEAR order_date)",
+            "FROM dates |> SELECT EXTRACT(YEAR FROM 1)",
+            "FROM dates |> SELECT EXTRACT(YEAR FROM order_date, date64)",
+        ] {
+            let error = bind_err(query).await;
+            assert!(
+                matches!(error, error::VeinError::Semantic { .. }),
+                "got {error}"
+            );
         }
     }
 
@@ -687,10 +743,8 @@ mod extended_features {
 
     #[tokio::test]
     async fn vector_dimension_wildcard_matches_registered_scalar_signature() {
-        let plan = bind(
-            "FROM vector_values |> SELECT VECTOR_DISTANCE(left_vector, right_vector)",
-        )
-            .await;
+        let plan =
+            bind("FROM vector_values |> SELECT VECTOR_DISTANCE(left_vector, right_vector)").await;
         assert!(matches!(
             expr_of(&plan),
             LogicalExpr::FunctionCall { name, .. }
@@ -729,7 +783,9 @@ mod extended_features {
         ] {
             let error = bind_err(query).await;
             assert!(
-                error.to_string().contains("DISTINCT inside aggregate function"),
+                error
+                    .to_string()
+                    .contains("DISTINCT inside aggregate function"),
                 "got {error} for {query}"
             );
         }
@@ -763,11 +819,24 @@ mod extended_features {
     #[tokio::test]
     async fn typed_interval_literal_binds() {
         let plan = bind("FROM users |> SELECT INTERVAL '1 year 6 months' AS d").await;
-        let LogicalExpr::Literal(LogicalLiteral::Interval { months, .. }) = expr_of(&plan)
-        else {
+        let LogicalExpr::Literal(LogicalLiteral::Interval { months, .. }) = expr_of(&plan) else {
             panic!("expected Interval literal");
         };
         assert_eq!(*months, 18);
+    }
+
+    #[tokio::test]
+    async fn typed_interval_unit_qualifier_binds() {
+        let plan = bind("FROM users |> SELECT INTERVAL '90' DAY AS d").await;
+        let LogicalExpr::Literal(LogicalLiteral::Interval {
+                                     months,
+                                     days,
+                                     nanos,
+                                 }) = expr_of(&plan)
+        else {
+            panic!("expected Interval literal");
+        };
+        assert_eq!((*months, *days, *nanos), (0, 90, 0));
     }
 
     /// `QUALIFY` lowers to `Filter → Window → Scan`.
@@ -810,7 +879,10 @@ mod aggregate_types {
         };
 
         assert_eq!(grouping_sets.len(), 3);
-        assert_eq!(grouping_sets.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1, 0]);
+        assert_eq!(
+            grouping_sets.iter().map(Vec::len).collect::<Vec<_>>(),
+            [2, 1, 0]
+        );
         assert_eq!(schema.fields.len(), 3);
         assert_eq!(schema.fields[0].name, "name");
         assert_eq!(schema.fields[1].name, "age");
@@ -870,8 +942,145 @@ mod aggregate_types {
             VeinDataType::Decimal256(76, 3),
         ];
         assert_eq!(
-            schema.fields.iter().map(|field| field.data_type.clone()).collect::<Vec<_>>(),
+            schema
+                .fields
+                .iter()
+                .map(|field| field.data_type.clone())
+                .collect::<Vec<_>>(),
             expected
         );
+    }
+}
+
+#[cfg(test)]
+mod temporal_functions {
+    use super::*;
+    use parser::ast::expr::BinaryOp;
+    use plan::{LogicalExpr, LogicalLiteral, VeinDataType};
+
+    #[tokio::test]
+    async fn shift_lowers_to_temporal_interval_arithmetic() {
+        let plan =
+            bind("FROM users |> SELECT SHIFT(DATE '1998-12-01', -90, 'DAY') AS shifted").await;
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            &exprs[0],
+            LogicalExpr::BinaryOp {
+                op: BinaryOp::Plus,
+                return_type: VeinDataType::Date32,
+                right,
+                ..
+            } if matches!(right.as_ref(), LogicalExpr::Literal(LogicalLiteral::Interval {
+                months: 0, days: -90, nanos: 0
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn shift_supports_calendar_and_subday_units() {
+        for (unit, expected) in [
+            (
+                "MONTH",
+                LogicalLiteral::Interval {
+                    months: 1,
+                    days: 0,
+                    nanos: 0,
+                },
+            ),
+            (
+                "HOUR",
+                LogicalLiteral::Interval {
+                    months: 0,
+                    days: 0,
+                    nanos: 3_600_000_000_000,
+                },
+            ),
+            (
+                "MICROSECOND",
+                LogicalLiteral::Interval {
+                    months: 0,
+                    days: 0,
+                    nanos: 1_000,
+                },
+            ),
+        ] {
+            let sql = format!("FROM users |> SELECT SHIFT(DATE '2024-01-01', 1, '{unit}')");
+            let plan = bind(&sql).await;
+            let LogicalPlan::Project { exprs, .. } = plan else {
+                panic!("expected projection");
+            };
+            let LogicalExpr::BinaryOp { right, .. } = &exprs[0] else {
+                panic!("SHIFT should lower to binary arithmetic");
+            };
+            assert!(matches!(right.as_ref(), LogicalExpr::Literal(actual) if actual == &expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn shift_rejects_nonconstant_amount_invalid_units_and_non_temporal_values() {
+        for (query, message) in [
+            (
+                "FROM users |> SELECT SHIFT(DATE '2024-01-01', age, 'DAY')",
+                "constant integer",
+            ),
+            (
+                "FROM users |> SELECT SHIFT(DATE '2024-01-01', 1, age)",
+                "constant string",
+            ),
+            (
+                "FROM users |> SELECT SHIFT(DATE '2024-01-01', 1, 'FORTNIGHT')",
+                "unknown temporal unit",
+            ),
+            (
+                "FROM users |> SELECT SHIFT(age, 1, 'DAY')",
+                "no implicit coercion",
+            ),
+        ] {
+            let error = bind_err(query).await;
+            assert!(error.to_string().contains(message), "{error} for {query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn truncate_binds_to_the_unit_specific_vectorized_function() {
+        let plan = bind("FROM users |> SELECT TRUNCATE(DATE '2024-03-31', 'QUARTER') AS bucket").await;
+        let LogicalPlan::Project { exprs, schema, .. } = plan else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            &exprs[0],
+            LogicalExpr::FunctionCall { name, args, return_type, .. }
+                if name == "TRUNCATE_QUARTER"
+                    && args.len() == 1
+                    && *return_type == VeinDataType::Date32
+        ));
+        assert_eq!(schema.fields[0].data_type, VeinDataType::Date32);
+    }
+
+    #[tokio::test]
+    async fn truncate_validates_constant_unit_and_temporal_compatibility() {
+        for (query, message) in [
+            (
+                "FROM users |> SELECT TRUNCATE(DATE '2024-01-01', age)",
+                "constant string",
+            ),
+            (
+                "FROM users |> SELECT TRUNCATE(DATE '2024-01-01', 'FORTNIGHT')",
+                "unknown temporal unit",
+            ),
+            (
+                "FROM users |> SELECT TRUNCATE(TIME '12:30:00', 'MONTH')",
+                "does not support temporal type",
+            ),
+            (
+                "FROM users |> SELECT TRUNCATE(age, 'DAY')",
+                "does not support temporal type",
+            ),
+        ] {
+            let error = bind_err(query).await;
+            assert!(error.to_string().contains(message), "{error} for {query}");
+        }
     }
 }

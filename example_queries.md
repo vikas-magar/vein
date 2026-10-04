@@ -59,6 +59,35 @@ FROM customer
 "
 ```
 
+Truncate an order date to calendar boundaries:
+
+```bash
+VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "
+FROM orders
+|> WHERE o_orderkey = 1
+|> SELECT
+    o_orderdate,
+    TRUNCATE(o_orderdate, 'MONTH') AS order_month,
+    TRUNCATE(o_orderdate, 'QUARTER') AS order_quarter,
+    TRUNCATE(o_orderdate, 'YEAR') AS order_year
+"
+```
+
+Expected result: `o_orderdate = 1996-01-02`; all three truncated values are `1996-01-01`.
+
+Truncate shipment dates to the start of their ISO week (Monday):
+
+```bash
+VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "
+FROM lineitem
+|> WHERE l_orderkey = 1
+|> SELECT l_shipdate, TRUNCATE(l_shipdate, 'WEEK') AS ship_week
+|> LIMIT 5
+"
+```
+
+For example, `1996-03-13` truncates to `1996-03-11`.
+
 Combine predicates while keeping the result selective:
 
 ```bash
@@ -104,6 +133,24 @@ FROM orders
 ```
 
 Expected result: one row with `order_count = 0` and `total_price = NULL`.
+
+Vector similarity over TPC-H order comments (reference query):
+
+```bash
+VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "
+FROM orders
+|> EXTEND EMBED(o_comment) AS comment_vector
+|> EXTEND EMBED('urgent delivery for a priority customer') AS query_vector
+|> EXTEND VECTOR_DISTANCE(comment_vector, query_vector) AS distance
+|> SELECT o_orderkey, o_orderdate, distance
+|> ORDER distance
+|> LIMIT 10
+"
+```
+
+TPC-H has no stored vector columns, so this example embeds the order comments and a search phrase. `VECTOR_DISTANCE`
+uses cosine distance. This is a reference query; `EMBED` does not have a runtime implementation yet, so it cannot run
+end to end until that built-in is implemented.
 
 Equivalent CLI invocation:
 

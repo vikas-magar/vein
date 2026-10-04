@@ -1,19 +1,19 @@
 use std::sync::Arc;
 
-use crate::coerce::coerce_types;
+use crate::coerce::{coerce_arithmetic, coerce_types};
 use crate::context::BinderContext;
-use crate::date_time::{parse_date, parse_interval, parse_time, parse_timestamp};
+use crate::date_time::{parse_date, parse_qualified_interval, parse_time, parse_timestamp};
 use crate::pipe::query::bind_query_internal;
 use crate::scope::ScopeStack;
-use plan::{LogicalExpr, LogicalLiteral};
-use plan::SortKey;
-use plan::PlanTraversal;
-use plan::{ResolvedColumn, VeinDataType};
-use types::{aggregate_return_type, unify_types};
 use crate::traits::{FunctionKind, RuntimeKind};
 use error::{Result, VeinError};
 use parser::ast::data_type::DataType;
 use parser::ast::expr::{BinaryOp as AstBinaryOp, Expr, Literal as AstLiteral, SpannedExpr};
+use plan::PlanTraversal;
+use plan::SortKey;
+use plan::{LogicalExpr, LogicalLiteral};
+use plan::{ResolvedColumn, VeinDataType};
+use types::{aggregate_return_type, unify_types};
 
 /// Derives a human-readable output column name from an AST expression, used
 /// when a projection/aggregate item carries no explicit alias. Follows
@@ -112,7 +112,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                     });
                 }
 
-                let (l, r, common) = coerce_types(bound_left, bound_right)?;
+                let (l, r, common) = coerce_arithmetic(bound_left, bound_right, *op)?;
                 Ok(LogicalExpr::BinaryOp {
                     left: Box::new(l),
                     op: *op,
@@ -272,6 +272,12 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         span: parser::token::Span,
     ) -> Result<LogicalExpr> {
         let signature = self.context.functions.resolve(name)?;
+        if signature.kind == FunctionKind::TemporalShift {
+            return self.bind_temporal_shift(args, distinct, span).await;
+        }
+        if signature.kind == FunctionKind::TemporalTruncate {
+            return self.bind_temporal_truncate(args, distinct, span).await;
+        }
         let is_aggregate = signature.kind == FunctionKind::Aggregate;
 
         if is_aggregate && distinct {
@@ -306,6 +312,43 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         }
 
         match signature.kind {
+            FunctionKind::TemporalExtract => {
+                if distinct || bound_args.len() != 1 {
+                    return Err(VeinError::semantic(
+                        format!("EXTRACT field '{name}' expects one temporal argument"),
+                        Some(span),
+                    ));
+                }
+                if !matches!(
+                    bound_args[0].data_type(),
+                    VeinDataType::Date32
+                        | VeinDataType::Date64
+                        | VeinDataType::Time32
+                        | VeinDataType::Time64
+                        | VeinDataType::Timestamp(_)
+                        | VeinDataType::Duration(_)
+                        | VeinDataType::Interval
+                ) {
+                    return Err(VeinError::semantic(
+                        format!(
+                            "EXTRACT field '{name}' requires a temporal value, got {:?}",
+                            bound_args[0].data_type()
+                        ),
+                        Some(span),
+                    ));
+                }
+                Ok(LogicalExpr::FunctionCall {
+                    name: name.to_string(),
+                    args: bound_args,
+                    is_aggregate: false,
+                    distinct: false,
+                    return_type: signature.return_type,
+                })
+            }
+            FunctionKind::TemporalShift => unreachable!("handled before binding generic arguments"),
+            FunctionKind::TemporalTruncate => {
+                unreachable!("handled before binding generic arguments")
+            }
             FunctionKind::AiOperator => {
                 self.validate_ai_budget(name, &bound_args)?;
                 Ok(LogicalExpr::AiOperator {
@@ -347,6 +390,88 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 })
             }
         }
+    }
+
+    async fn bind_temporal_shift(
+        &mut self,
+        args: &[SpannedExpr<'_>],
+        distinct: bool,
+        span: parser::token::Span,
+    ) -> Result<LogicalExpr> {
+        if distinct || args.len() != 3 {
+            return Err(VeinError::semantic(
+                "SHIFT expects a temporal value, a constant integer amount, and a constant unit string",
+                Some(span),
+            ));
+        }
+
+        let Some(amount) = shift_amount(&args[1]) else {
+            return Err(VeinError::semantic(
+                "SHIFT amount must be a constant integer",
+                Some(args[1].span),
+            ));
+        };
+        let Expr::Literal(AstLiteral::String(unit)) = &args[2].node else {
+            return Err(VeinError::semantic(
+                "SHIFT unit must be a constant string",
+                Some(args[2].span),
+            ));
+        };
+        let interval = types::interval_from_unit(amount, unit)
+            .map_err(|error| VeinError::semantic(error.to_string(), Some(args[2].span)))?;
+        let temporal = Box::pin(self.bind(&args[0])).await?;
+        let (left, right, return_type) =
+            coerce_arithmetic(temporal, LogicalExpr::Literal(interval), AstBinaryOp::Plus)
+                .map_err(|error| VeinError::semantic(error.to_string(), Some(span)))?;
+
+        Ok(LogicalExpr::BinaryOp {
+            left: Box::new(left),
+            op: AstBinaryOp::Plus,
+            right: Box::new(right),
+            return_type,
+        })
+    }
+
+    async fn bind_temporal_truncate(
+        &mut self,
+        args: &[SpannedExpr<'_>],
+        distinct: bool,
+        span: parser::token::Span,
+    ) -> Result<LogicalExpr> {
+        if distinct || args.len() != 2 {
+            return Err(VeinError::semantic(
+                "TRUNCATE expects a temporal value and a constant unit string",
+                Some(span),
+            ));
+        }
+
+        let Expr::Literal(AstLiteral::String(unit_name)) = &args[1].node else {
+            return Err(VeinError::semantic(
+                "TRUNCATE unit must be a constant string",
+                Some(args[1].span),
+            ));
+        };
+        let unit = types::TemporalUnit::parse(unit_name)
+            .map_err(|error| VeinError::semantic(error.to_string(), Some(args[1].span)))?;
+        let temporal = Box::pin(self.bind(&args[0])).await?;
+        let return_type = temporal.data_type();
+        if !unit.supports(&return_type) {
+            return Err(VeinError::semantic(
+                format!(
+                    "TRUNCATE unit '{}' does not support temporal type {return_type:?}",
+                    unit.as_str()
+                ),
+                Some(span),
+            ));
+        }
+
+        Ok(LogicalExpr::FunctionCall {
+            name: unit.truncate_function_name().to_string(),
+            args: vec![temporal],
+            is_aggregate: false,
+            distinct: false,
+            return_type,
+        })
     }
 
     /// Binds a window function call (`fn(args) OVER (...)`). The call itself
@@ -475,14 +600,15 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
             DataType::Time => parse_time(value)
                 .map(LogicalLiteral::Time)
                 .map(LogicalExpr::Literal),
-            DataType::Interval { .. } => parse_interval(value)
-                .map(|(months, days, nanos)| {
+            DataType::Interval { fields } => {
+                parse_qualified_interval(value, fields).map(|(months, days, nanos)| {
                     LogicalExpr::Literal(LogicalLiteral::Interval {
                         months,
                         days,
                         nanos,
                     })
-                }),
+                })
+            }
             DataType::Timestamp { .. } => parse_timestamp(value)
                 .map(LogicalLiteral::Timestamp)
                 .map(LogicalExpr::Literal),
@@ -525,6 +651,27 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
     }
 }
 
+fn shift_amount(expr: &SpannedExpr<'_>) -> Option<i64> {
+    match &expr.node {
+        Expr::Literal(AstLiteral::Int(amount)) => Some(*amount),
+        Expr::UnaryOp {
+            op: parser::ast::expr::UnaryOp::Negate,
+            expr,
+        } => match &expr.node {
+            Expr::Literal(AstLiteral::Int(amount)) => amount.checked_neg(),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: parser::ast::expr::UnaryOp::Plus,
+            expr,
+        } => match &expr.node {
+            Expr::Literal(AstLiteral::Int(amount)) => Some(*amount),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn bind_scalar_arguments(
     name: &str,
     args: Vec<LogicalExpr>,
@@ -550,9 +697,7 @@ fn bind_scalar_arguments(
             if actual == *expected {
                 return Ok(arg);
             }
-            if *expected == VeinDataType::Vector(0)
-                && matches!(actual, VeinDataType::Vector(_))
-            {
+            if *expected == VeinDataType::Vector(0) && matches!(actual, VeinDataType::Vector(_)) {
                 return Ok(arg);
             }
 
