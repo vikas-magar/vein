@@ -214,8 +214,8 @@ impl VectorVmExecutor {
                     store_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::FilterMask { bool_reg } => {
-                    let mask = self.registers.to_array(*bool_reg)?;
-                    chunk.selection = ops::apply_filter_mask(&chunk.selection, &mask)?;
+                    let mask = self.registers.get(*bool_reg)?;
+                    chunk.selection = ops::apply_filter_mask(&chunk.selection, mask)?;
                     if chunk.selection.is_empty() {
                         return Ok(());
                     }

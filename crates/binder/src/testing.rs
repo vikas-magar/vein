@@ -21,6 +21,15 @@ impl TestCatalog {
         catalog.add_table("users", &[("id", VeinDataType::Int64), ("name", VeinDataType::Utf8), ("age", VeinDataType::Int64)]);
         catalog.add_table("orders", &[("id", VeinDataType::Int64), ("user_id", VeinDataType::Int64), ("amount", VeinDataType::Float64)]);
         catalog.add_table(
+            "dates",
+            &[
+                ("order_date", VeinDataType::Date32),
+                ("date64", VeinDataType::Date64),
+                ("time_of_day", VeinDataType::Time64(types::TimeUnit::Microsecond)),
+                ("timestamp", VeinDataType::Timestamp(types::TimeUnit::Microsecond, None)),
+            ],
+        );
+        catalog.add_table(
             "vector_values",
             &[
                 ("left_vector", VeinDataType::Vector(3)),
@@ -101,7 +110,7 @@ pub struct MockFunctionRegistry {
 
 impl MockFunctionRegistry {
     /// Creates a registry pre-populated with the test-corpus built-ins
-    /// (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, `LOWER`, `ROUND`, `EXTRACT`,
+    /// (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, `LOWER`, `ROUND`, temporal extractors,
     /// plus the AI/embedding mocks `EMBED` and `VECTOR_DISTANCE`).
     pub fn new() -> Self {
         let mut functions = HashMap::new();
@@ -143,10 +152,6 @@ impl MockFunctionRegistry {
                 ),
             ),
             (
-                "EXTRACT".to_string(),
-                builtin(VeinDataType::Int64, &[], FunctionKind::Scalar),
-            ),
-            (
                 "EMBED".to_string(),
                 builtin(
                     VeinDataType::Vector(1536),
@@ -165,6 +170,20 @@ impl MockFunctionRegistry {
         ] {
             functions.insert(name, sig);
         }
+        for name in crate::functions::TEMPORAL_EXTRACTORS {
+            functions.insert(
+                (*name).to_string(),
+                builtin(VeinDataType::Int32, &[], FunctionKind::TemporalExtract),
+            );
+        }
+        functions.insert(
+            "SHIFT".to_string(),
+            builtin(VeinDataType::Null, &[], FunctionKind::TemporalShift),
+        );
+        functions.insert(
+            "TRUNCATE".to_string(),
+            builtin(VeinDataType::Null, &[], FunctionKind::TemporalTruncate),
+        );
         Self { functions }
     }
 

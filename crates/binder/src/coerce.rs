@@ -9,6 +9,7 @@
 use plan::LogicalExpr;
 use types::{unify_types, VeinDataType};
 use error::Result;
+use parser::ast::expr::BinaryOp;
 
 /// Resolves the common supertype of two expressions, injecting `Cast` nodes
 /// where implicit coercion is required.
@@ -46,6 +47,41 @@ pub fn coerce_types(
     };
 
     Ok((left, right, common))
+}
+
+/// Applies operator-specific temporal arithmetic rules before falling back to
+/// ordinary common-type coercion.
+pub fn coerce_arithmetic(
+    left: LogicalExpr,
+    right: LogicalExpr,
+    op: BinaryOp,
+) -> Result<(LogicalExpr, LogicalExpr, VeinDataType)> {
+    let left_type = left.data_type();
+    let right_type = right.data_type();
+    let is_temporal = |data_type: &VeinDataType| {
+        matches!(
+            data_type,
+            VeinDataType::Date32 | VeinDataType::Date64 | VeinDataType::Timestamp(_, _)
+        )
+    };
+
+    if matches!(op, BinaryOp::Plus | BinaryOp::Minus)
+        && matches!(&right_type, VeinDataType::Interval(_))
+        && is_temporal(&left_type)
+    {
+        return Ok((left, right, left_type));
+    }
+
+    // Arrow's vectorized temporal kernels require the temporal array on the
+    // left, so normalize the commutative `INTERVAL + DATE` form here.
+    if op == BinaryOp::Plus
+        && matches!(&left_type, VeinDataType::Interval(_))
+        && is_temporal(&right_type)
+    {
+        return Ok((right, left, right_type));
+    }
+
+    coerce_types(left, right)
 }
 
 /// Wraps `expr` in a `Cast` if its type differs from `target` (no-op otherwise).
@@ -107,24 +143,56 @@ mod tests {
     fn date_promotes_to_timestamp() {
         let (_, _, t) = coerce_types(
             lit(VeinDataType::Date32),
-            lit(VeinDataType::Timestamp(None)),
+            lit(VeinDataType::Timestamp(types::TimeUnit::Microsecond, None)),
         )
             .unwrap();
-        assert_eq!(t, VeinDataType::Timestamp(None));
+        assert_eq!(t, VeinDataType::Timestamp(types::TimeUnit::Microsecond, None));
+    }
+
+    #[test]
+    fn date_interval_arithmetic_preserves_temporal_type_and_normalizes_addition() {
+        let date = lit(VeinDataType::Date32);
+        let interval = lit(VeinDataType::Interval(types::IntervalUnit::MonthDayNano));
+
+        let (left, right, result) =
+            coerce_arithmetic(date.clone(), interval.clone(), BinaryOp::Minus).unwrap();
+        assert_eq!((left.data_type(), right.data_type(), result), (
+            VeinDataType::Date32,
+            VeinDataType::Interval(types::IntervalUnit::MonthDayNano),
+            VeinDataType::Date32,
+        ));
+
+        let (left, right, result) =
+            coerce_arithmetic(interval, date, BinaryOp::Plus).unwrap();
+        assert_eq!((left.data_type(), right.data_type(), result), (
+            VeinDataType::Date32,
+            VeinDataType::Interval(types::IntervalUnit::MonthDayNano),
+            VeinDataType::Date32,
+        ));
+    }
+
+    #[test]
+    fn interval_minus_date_is_not_supported() {
+        assert!(coerce_arithmetic(
+            lit(VeinDataType::Interval(types::IntervalUnit::MonthDayNano)),
+            lit(VeinDataType::Date32),
+            BinaryOp::Minus,
+        )
+            .is_err());
     }
 
     #[test]
     fn date_promotes_preserving_timezone() {
         let (l, _, t) = coerce_types(
             lit(VeinDataType::Date32),
-            lit(VeinDataType::Timestamp(Some("UTC".to_string()))),
+            lit(VeinDataType::Timestamp(types::TimeUnit::Nanosecond, Some("UTC".to_string()))),
         )
             .unwrap();
-        assert_eq!(t, VeinDataType::Timestamp(Some("UTC".to_string())));
+        assert_eq!(t, VeinDataType::Timestamp(types::TimeUnit::Nanosecond, Some("UTC".to_string())));
         assert!(matches!(
             l,
             LogicalExpr::Cast {
-                target_type: VeinDataType::Timestamp(Some(ref tz)),
+                target_type: VeinDataType::Timestamp(types::TimeUnit::Nanosecond, Some(ref tz)),
                 ..
             } if tz == "UTC"
         ));
@@ -133,18 +201,27 @@ mod tests {
     #[test]
     fn timestamp_promotes_date_to_its_timezone() {
         let (_, r, t) = coerce_types(
-            lit(VeinDataType::Timestamp(Some("America/New_York".to_string()))),
+            lit(VeinDataType::Timestamp(
+                types::TimeUnit::Nanosecond,
+                Some("America/New_York".to_string()),
+            )),
             lit(VeinDataType::Date32),
         )
             .unwrap();
         assert_eq!(
             t,
-            VeinDataType::Timestamp(Some("America/New_York".to_string()))
+            VeinDataType::Timestamp(
+                types::TimeUnit::Nanosecond,
+                Some("America/New_York".to_string()),
+            )
         );
         assert!(matches!(
             r,
             LogicalExpr::Cast {
-                target_type: VeinDataType::Timestamp(Some(ref tz)),
+                target_type: VeinDataType::Timestamp(
+                    types::TimeUnit::Nanosecond,
+                    Some(ref tz),
+                ),
                 ..
             } if tz == "America/New_York"
         ));

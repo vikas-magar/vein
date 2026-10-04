@@ -37,6 +37,8 @@ pub struct ScanSource {
     files: Vec<ScanFile>,
     format: FileFormat,
     projected: VeinSchemaRef,
+    /// Projected columns whose Parquet dictionary encoding should be retained.
+    dictionary_columns: Vec<u32>,
     /// Predicate the reader evaluates before materializing rows.
     pushdown: Option<Arc<ScanPredicate>>,
     metadata_store: MetadataStore,
@@ -54,6 +56,7 @@ impl ScanSource {
         files: Vec<ScanFile>,
         format: FileFormat,
         projected: VeinSchemaRef,
+        dictionary_columns: Vec<u32>,
         pushdown: Option<Arc<ScanPredicate>>,
         metadata_store: MetadataStore,
         registry: Arc<FunctionRegistry>,
@@ -63,6 +66,7 @@ impl ScanSource {
             files,
             format,
             projected,
+            dictionary_columns,
             pushdown,
             metadata_store,
             registry,
@@ -80,6 +84,7 @@ impl Source<DataChunk> for ScanSource {
                     &self.operator,
                     &self.files,
                     &self.projected,
+                    &self.dictionary_columns,
                     self.pushdown.as_deref(),
                     &self.metadata_store,
                     &self.registry,
@@ -102,7 +107,7 @@ impl Source<DataChunk> for ScanSource {
 mod tests {
     use super::*;
     use crate::operators::sink::DiscardSink;
-    use arrow::array::Int64Array;
+    use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use ::parquet::arrow::ArrowWriter;
@@ -114,6 +119,21 @@ mod tests {
         let values = (0..rows).collect::<Vec<i64>>();
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])
             .expect("valid batch");
+        let file = std::fs::File::create(&path).expect("create Parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+        path
+    }
+
+    fn write_string_parquet(dir: &std::path::Path, relative: &str) -> PathBuf {
+        let path = dir.join(relative);
+        let schema = Arc::new(Schema::new(vec![Field::new("status", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![Some("O"), Some("F"), None]))],
+        )
+        .expect("valid string batch");
         let file = std::fs::File::create(&path).expect("create Parquet file");
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
         writer.write(&batch).expect("write batch");
@@ -137,10 +157,52 @@ mod tests {
             files,
             FileFormat::Parquet,
             Arc::new(types::VeinSchema::empty()),
+            Vec::new(),
             None,
             MetadataStore::new(),
             Arc::new(FunctionRegistry::new()),
         )
+    }
+
+    #[derive(Default)]
+    struct ArrayTypeSink(Option<DataType>);
+
+    impl PipelineNode<DataChunk> for ArrayTypeSink {
+        fn push(&mut self, batch: DataChunk) -> Result<()> {
+            self.0 = Some(batch.column(0).data_type().clone());
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_preserves_dictionary_encoding_when_requested() {
+        let dir = tempfile::tempdir().expect("temporary data root");
+        let path = write_string_parquet(dir.path(), "part-0.parquet");
+        let mut scan = scan_over(dir.path(), &[("part-0.parquet", path)]);
+        scan.projected = Arc::new(types::VeinSchema::new(vec![Arc::new(
+            types::ResolvedColumn::new(
+                types::ColumnId(0),
+                "status",
+                None,
+                types::VeinDataType::Utf8,
+            ),
+        )]));
+        scan.dictionary_columns = vec![0];
+        let mut sink = ArrayTypeSink::default();
+
+        scan.execute(&mut sink).await.expect("scan dictionary column");
+
+        assert_eq!(
+            sink.0,
+            Some(DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Utf8)
+            ))
+        );
     }
 
     /// [`Source::bytes_read`] feeds the runtime's task metrics, so a scan that read

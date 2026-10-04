@@ -50,6 +50,12 @@ pub struct FileScanTask {
     /// Refcounted so splitting one file scan into per-file tasks copies a
     /// handle rather than the schema.
     pub projected: VeinSchemaRef,
+    /// Projected column positions that may retain Parquet dictionary encoding.
+    ///
+    /// This is an execution hint for consumers that can use dictionary IDs
+    /// directly. An empty list keeps the default decoded Arrow representation.
+    #[serde(default)]
+    pub dictionary_columns: Vec<u32>,
     /// Push-down predicate the source evaluates before materializing rows.
     ///
     /// Refcounted for the same reason as `projected`: splitting a scan into
@@ -315,6 +321,12 @@ pub struct SortPlan {
 pub struct AggregatePlan {
     /// Leading output columns that together form the group key.
     pub groups: u32,
+    /// Optional planner estimate for the number of distinct groups.
+    ///
+    /// This is only a capacity hint; execution remains correct when it is absent
+    /// or inaccurate. Older serialized plans omit it.
+    #[serde(default)]
+    pub estimated_groups: Option<u64>,
     /// Positions in the leading key columns that belong to each grouping set.
     /// `None` preserves the ordinary single-set layout where every key column
     /// participates in the group. `Some` carries explicit grouping sets.
@@ -330,7 +342,7 @@ pub struct AggregatePlan {
 
 #[cfg(test)]
 mod tests {
-    use super::{SortKey, SortPlan};
+    use super::{AggOpCode, AggregatePlan, SortKey, SortPlan};
 
     #[test]
     fn sort_plan_preserves_key_priority_and_null_order_over_wire_format() {
@@ -353,5 +365,27 @@ mod tests {
         let decoded: SortPlan = serde_json::from_slice(&encoded).expect("deserialize sort plan");
 
         assert_eq!(decoded, plan);
+    }
+
+    #[test]
+    fn aggregate_estimate_round_trips_and_defaults_for_older_wire_plans() {
+        let plan = AggregatePlan {
+            groups: 1,
+            estimated_groups: Some(12),
+            grouping_sets: None,
+            aggs: vec![AggOpCode::Count],
+            aggregate_input_types: vec![types::VeinDataType::Int64],
+            types: vec![types::VeinDataType::Int64; 2],
+        };
+        let mut value = serde_json::to_value(&plan).expect("serialize aggregate plan");
+        value
+            .as_object_mut()
+            .expect("aggregate plan object")
+            .remove("estimated_groups");
+
+        let decoded: AggregatePlan =
+            serde_json::from_value(value).expect("deserialize legacy aggregate plan");
+
+        assert_eq!(decoded.estimated_groups, None);
     }
 }

@@ -8,7 +8,8 @@ use common::Result;
 use error::VeinError;
 use parser::ast::expr::BinaryOp;
 use plan::expr::logical::LogicalExpr;
-use plan::schema::VeinSchema;
+use plan::schema::{ColumnId, VeinSchema};
+use std::collections::HashMap;
 
 use super::allocator::RegisterAllocator;
 
@@ -16,6 +17,7 @@ use super::allocator::RegisterAllocator;
 pub struct BytecodeCompiler {
     allocator: RegisterAllocator,
     instructions: Vec<MicroOp>,
+    column_registers: HashMap<ColumnId, RegId>,
 }
 
 impl BytecodeCompiler {
@@ -24,7 +26,18 @@ impl BytecodeCompiler {
         Self {
             allocator: RegisterAllocator::new(input_columns),
             instructions: Vec::new(),
+            column_registers: HashMap::new(),
         }
+    }
+
+    /// Associates the scan's logical columns with their initial VM registers.
+    pub fn set_input_schema(&mut self, schema: &VeinSchema) {
+        self.column_registers = schema
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(register, field)| (field.id, register as RegId))
+            .collect();
     }
 
     /// Recursively compiles a [`LogicalExpr`] AST into register instructions,
@@ -32,34 +45,20 @@ impl BytecodeCompiler {
     pub fn compile_expr(&mut self, expr: &LogicalExpr, schema: &VeinSchema) -> Result<RegId> {
         match expr {
             LogicalExpr::Column(col) => {
-                let idx = schema
-                    .position_of_id(col.id)
-                    .or_else(|| schema.fields.iter().position(|f| f.name == col.name))
-                    .ok_or_else(|| {
-                        VeinError::planning(
-                            format!("Column not found in schema: {:?}", col.name),
-                            None,
-                        )
-                    })?;
-                if idx > u8::MAX as usize {
-                    return Err(VeinError::planning(
-                        "Column index exceeds maximum register capacity (255)",
+                self.column_register(col.id, &col.name, schema).ok_or_else(|| {
+                    VeinError::planning(
+                        format!("Column not found in schema: {:?}", col.name),
                         None,
-                    ));
-                }
-                Ok(idx as RegId)
+                    )
+                })
             }
             LogicalExpr::OuterColumn(col) => {
-                let idx = schema
-                    .position_of_id(col.id)
-                    .or_else(|| schema.fields.iter().position(|f| f.name == col.name))
-                    .ok_or_else(|| {
-                        VeinError::planning(
-                            format!("Outer column not found in schema: {:?}", col.name),
-                            None,
-                        )
-                    })?;
-                Ok(idx as RegId)
+                self.column_register(col.id, &col.name, schema).ok_or_else(|| {
+                    VeinError::planning(
+                        format!("Outer column not found in schema: {:?}", col.name),
+                        None,
+                    )
+                })
             }
             LogicalExpr::Literal(lit) => {
                 let dst = self.allocator.allocate()?;
@@ -154,6 +153,15 @@ impl BytecodeCompiler {
         }
     }
 
+    fn column_register(&self, id: ColumnId, name: &str, schema: &VeinSchema) -> Option<RegId> {
+        self.column_registers.get(&id).copied().or_else(|| {
+            schema
+                .position_of_id(id)
+                .or_else(|| schema.fields.iter().position(|field| field.name == name))
+                .and_then(|index| RegId::try_from(index).ok())
+        })
+    }
+
     /// Compiles a filter condition expression, emitting a [`MicroOp::FilterMask`] instruction.
     pub fn compile_filter(&mut self, predicate: &LogicalExpr, schema: &VeinSchema) -> Result<()> {
         let bool_reg = self.compile_expr(predicate, schema)?;
@@ -197,12 +205,45 @@ impl BytecodeCompiler {
         exprs: &[LogicalExpr],
         schema: &VeinSchema,
     ) -> Result<()> {
-        let mut out_regs = Vec::with_capacity(exprs.len());
-        for expr in exprs {
-            out_regs.push(self.compile_expr(expr, schema)?);
-        }
+        let out_regs = self.compile_projection_exprs(exprs, schema)?;
         self.compile_projection_registers(out_regs);
         Ok(())
+    }
+
+    /// Compiles a projection and records which registers represent its output
+    /// columns for subsequent filters and projections in the same VM program.
+    pub fn compile_projection_with_schema(
+        &mut self,
+        exprs: &[LogicalExpr],
+        input_schema: &VeinSchema,
+        output_schema: &VeinSchema,
+    ) -> Result<()> {
+        if exprs.len() != output_schema.fields.len() {
+            return Err(VeinError::planning(
+                "projection expression count does not match its output schema",
+                None,
+            ));
+        }
+        let out_regs = self.compile_projection_exprs(exprs, input_schema)?;
+        self.compile_projection_registers(out_regs.clone());
+        self.column_registers = output_schema
+            .fields
+            .iter()
+            .zip(out_regs)
+            .map(|(field, register)| (field.id, register))
+            .collect();
+        Ok(())
+    }
+
+    fn compile_projection_exprs(
+        &mut self,
+        exprs: &[LogicalExpr],
+        schema: &VeinSchema,
+    ) -> Result<Vec<RegId>> {
+        exprs
+            .iter()
+            .map(|expr| self.compile_expr(expr, schema))
+            .collect()
     }
 
     /// Projects registers already evaluated by this program.

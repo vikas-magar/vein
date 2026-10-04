@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use arrow::datatypes::{Field, Schema};
+use error::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::column::{ColumnId, ResolvedColumn, ResolvedColumnRef};
@@ -56,23 +57,25 @@ impl VeinSchema {
     }
 }
 
-impl From<&Schema> for VeinSchema {
-    fn from(arrow_schema: &Schema) -> Self {
+impl TryFrom<&Schema> for VeinSchema {
+    type Error = error::VeinError;
+
+    fn try_from(arrow_schema: &Schema) -> Result<Self> {
         let fields = arrow_schema
             .fields()
             .iter()
             .enumerate()
             .map(|(i, f)| {
-                Arc::new(ResolvedColumn::new(
+                Ok(Arc::new(ResolvedColumn::new(
                     ColumnId(i),
                     f.name().clone(),
                     None,
-                    f.data_type().into(),
+                    crate::data_type::VeinDataType::try_from(f.data_type())?,
                 )
-                .with_nullable(f.is_nullable()))
+                    .with_nullable(f.is_nullable())))
             })
-            .collect();
-        Self { fields }
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { fields })
     }
 }
 
@@ -110,19 +113,68 @@ mod tests {
                 ResolvedColumn::new(ColumnId(1), "name", None, VeinDataType::Utf8)
                     .with_nullable(true),
             ),
+            Arc::new(ResolvedColumn::new(
+                ColumnId(2),
+                "time",
+                None,
+                VeinDataType::Time32(crate::TimeUnit::Second),
+            )),
+            Arc::new(ResolvedColumn::new(
+                ColumnId(3),
+                "timestamp",
+                None,
+                VeinDataType::Timestamp(crate::TimeUnit::Nanosecond, Some("UTC".into())),
+            )),
+            Arc::new(ResolvedColumn::new(
+                ColumnId(4),
+                "year_month_interval",
+                None,
+                VeinDataType::Interval(crate::IntervalUnit::YearMonth),
+            )),
+            Arc::new(ResolvedColumn::new(
+                ColumnId(5),
+                "day_time_interval",
+                None,
+                VeinDataType::Interval(crate::IntervalUnit::DayTime),
+            )),
+            Arc::new(ResolvedColumn::new(
+                ColumnId(6),
+                "month_day_nano_interval",
+                None,
+                VeinDataType::Interval(crate::IntervalUnit::MonthDayNano),
+            )),
         ]);
 
         let arrow_schema: Schema = (&schema).into();
-        assert_eq!(arrow_schema.fields().len(), 2);
+        assert_eq!(arrow_schema.fields().len(), 7);
         assert_eq!(arrow_schema.field(0).name(), "id");
         assert_eq!(arrow_schema.field(1).name(), "name");
         assert!(arrow_schema.field(1).is_nullable());
 
-        let back: VeinSchema = (&arrow_schema).into();
+        let back = VeinSchema::try_from(&arrow_schema).expect("supported Arrow schema");
         assert_eq!(schema.fields.len(), back.fields.len());
         assert_eq!(schema.fields[0].name, back.fields[0].name);
         assert_eq!(schema.fields[0].data_type, back.fields[0].data_type);
         assert_eq!(schema.fields[1].name, back.fields[1].name);
         assert_eq!(schema.fields[1].nullable, back.fields[1].nullable);
+        assert_eq!(schema.fields[2].data_type, back.fields[2].data_type);
+        assert_eq!(schema.fields[3].data_type, back.fields[3].data_type);
+        assert_eq!(schema.fields[4].data_type, back.fields[4].data_type);
+        assert_eq!(schema.fields[5].data_type, back.fields[5].data_type);
+        assert_eq!(schema.fields[6].data_type, back.fields[6].data_type);
+    }
+
+    #[test]
+    fn unsupported_arrow_field_type_fails_schema_conversion() {
+        let arrow_schema = Schema::new(vec![Field::new(
+            "payload",
+            arrow::datatypes::DataType::Dictionary(
+                Box::new(arrow::datatypes::DataType::Int8),
+                Box::new(arrow::datatypes::DataType::Utf8),
+            ),
+            true,
+        )]);
+
+        assert!(VeinSchema::try_from(&arrow_schema).is_err());
     }
 }

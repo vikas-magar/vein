@@ -4,6 +4,12 @@ use crate::traits::{FunctionKind, FunctionRegistry, FunctionSignature};
 use error::{Result, VeinError};
 use plan::{VeinDataType, Volatility};
 
+pub(crate) const TEMPORAL_EXTRACTORS: &[&str] = &[
+    "YEAR", "ISOYEAR", "QUARTER", "MONTH", "WEEK", "ISOWEEK", "DAY", "DOW", "DOW1",
+    "ISODOW0", "ISODOW", "DOY", "HOUR", "MINUTE", "SECOND", "MILLISECOND", "MICROSECOND",
+    "NANOSECOND",
+];
+
 /// Registry of built-in function signatures understood by the binder.
 #[derive(Default)]
 pub struct BuiltinFunctionRegistry {
@@ -25,7 +31,6 @@ impl BuiltinFunctionRegistry {
                 "ROUND",
                 scalar(VeinDataType::Float64, vec![VeinDataType::Float64]),
             ),
-            ("EXTRACT", scalar(VeinDataType::Int64, Vec::new())),
             (
                 "EMBED",
                 FunctionSignature {
@@ -46,6 +51,11 @@ impl BuiltinFunctionRegistry {
         ] {
             registry.register(name, signature);
         }
+        for name in TEMPORAL_EXTRACTORS {
+            registry.register(name, temporal_extract());
+        }
+        registry.register("SHIFT", temporal_shift());
+        registry.register("TRUNCATE", temporal_truncate());
         registry
     }
 
@@ -81,6 +91,36 @@ fn scalar(return_type: VeinDataType, arg_types: Vec<VeinDataType>) -> FunctionSi
         volatility: Volatility::Immutable,
         arg_types,
         kind: FunctionKind::Scalar,
+        bytecode_ref: None,
+    }
+}
+
+fn temporal_extract() -> FunctionSignature {
+    FunctionSignature {
+        return_type: VeinDataType::Int32,
+        volatility: Volatility::Immutable,
+        arg_types: Vec::new(),
+        kind: FunctionKind::TemporalExtract,
+        bytecode_ref: None,
+    }
+}
+
+fn temporal_shift() -> FunctionSignature {
+    FunctionSignature {
+        return_type: VeinDataType::Null,
+        volatility: Volatility::Immutable,
+        arg_types: Vec::new(),
+        kind: FunctionKind::TemporalShift,
+        bytecode_ref: None,
+    }
+}
+
+fn temporal_truncate() -> FunctionSignature {
+    FunctionSignature {
+        return_type: VeinDataType::Null,
+        volatility: Volatility::Immutable,
+        arg_types: Vec::new(),
+        kind: FunctionKind::TemporalTruncate,
         bytecode_ref: None,
     }
 }

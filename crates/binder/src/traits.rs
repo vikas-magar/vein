@@ -19,6 +19,12 @@ pub enum RuntimeKind {
 pub enum FunctionKind {
     /// Standard SQL scalar function
     Scalar,
+    /// Temporal date/time part extractor with a polymorphic temporal argument.
+    TemporalExtract,
+    /// Temporal shift lowered to the existing interval arithmetic expression.
+    TemporalShift,
+    /// Temporal truncation with a compile-time-selected field.
+    TemporalTruncate,
     /// Standard SQL aggregate function
     Aggregate,
     /// First-Class AI Operator (requires cost estimation)

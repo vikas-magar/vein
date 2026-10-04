@@ -64,11 +64,13 @@ impl PipelineCompiler {
                 Self::aggregate(input)
             }
             LogicalPlan::Aggregate {
+                input,
                 grouping_sets,
                 aggs,
                 schema,
                 ..
             } => {
+                let estimated_groups = estimate_single_key_groups(input, grouping_sets);
                 let (keys, grouping_sets) = grouping_layout(grouping_sets)?;
                 let (aggs, aggregate_input_types): (Vec<_>, Vec<_>) = aggs
                     .iter()
@@ -81,6 +83,7 @@ impl PipelineCompiler {
                     .unzip();
                 Ok(Some(AggregatePlan {
                     groups: keys.len() as u32,
+                    estimated_groups,
                     grouping_sets: Some(grouping_sets),
                     aggs,
                     aggregate_input_types,
@@ -91,6 +94,7 @@ impl PipelineCompiler {
             // and nothing to fold, which is why it needs no plan of its own.
             LogicalPlan::Distinct { schema, .. } => Ok(Some(AggregatePlan {
                 groups: schema.fields.len() as u32,
+                estimated_groups: None,
                 grouping_sets: Some(vec![(0..schema.fields.len() as u32).collect()]),
                 aggs: Vec::new(),
                 aggregate_input_types: Vec::new(),
@@ -122,15 +126,24 @@ impl PipelineCompiler {
             return Ok(None);
         };
         let mut computed_index = 0usize;
-        let keys = sort_keys.iter()
+        let keys = sort_keys
+            .iter()
             .map(|key| {
                 let position = match &key.expr {
                     LogicalExpr::Column(column) => schema
                         .position_of_id(column.id)
-                        .or_else(|| schema.fields.iter().position(|field| field.name == column.name))
+                        .or_else(|| {
+                            schema
+                                .fields
+                                .iter()
+                                .position(|field| field.name == column.name)
+                        })
                         .ok_or_else(|| {
                             VeinError::planning(
-                                format!("ORDER BY column '{}' is absent from its output schema", column.name),
+                                format!(
+                                    "ORDER BY column '{}' is absent from its output schema",
+                                    column.name
+                                ),
                                 None,
                             )
                         })?,
@@ -151,7 +164,10 @@ impl PipelineCompiler {
             })
             .collect::<Result<Vec<_>>>()?;
         if keys.is_empty() {
-            return Err(VeinError::planning("ORDER requires at least one sort key", None));
+            return Err(VeinError::planning(
+                "ORDER requires at least one sort key",
+                None,
+            ));
         }
         Ok(Some(SortPlan { keys }))
     }
@@ -184,11 +200,27 @@ impl PipelineCompiler {
 
     /// Compiles a linear logical plan into its Parquet source and vector program.
     pub fn compile(plan: &LogicalPlan) -> Result<(DataSource, MicroProgram, VeinSchema)> {
-        let (source, scan_schema) = Self::collect_leaf_source(plan)?;
+        let mut dictionary_group_ids = Vec::new();
+        let (mut source, scan_schema) = Self::collect_leaf_source(plan, &mut dictionary_group_ids)?;
+        if let DataSource::File(scan) = &mut source {
+            if scan.pushdown.is_none() {
+                scan.dictionary_columns = scan_schema
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| {
+                        field.data_type == plan::schema::VeinDataType::Utf8
+                            && dictionary_group_ids.contains(&field.id)
+                    })
+                    .filter_map(|(index, _)| u32::try_from(index).ok())
+                    .collect();
+            }
+        }
         // `RegId` is wide enough for any schema, so the scan no longer has a
         // column-count ceiling (`02-execution-and-vir-lld.md` §2).
         let register_count = scan_schema.fields.len() as RegId;
         let mut compiler = BytecodeCompiler::new(register_count);
+        compiler.set_input_schema(&scan_schema);
         let output_schema = Self::compile_node(plan, scan_schema, &mut compiler)?;
         Ok((source, compiler.finish(), output_schema))
     }
@@ -204,7 +236,10 @@ impl PipelineCompiler {
         Ok((!program.instructions.is_empty()).then_some(program))
     }
 
-    fn collect_leaf_source(plan: &LogicalPlan) -> Result<(DataSource, VeinSchema)> {
+    fn collect_leaf_source(
+        plan: &LogicalPlan,
+        dictionary_group_ids: &mut Vec<plan::schema::ColumnId>,
+    ) -> Result<(DataSource, VeinSchema)> {
         match plan {
             LogicalPlan::Scan {
                 table,
@@ -255,14 +290,35 @@ impl PipelineCompiler {
                 };
                 Self::file_source(paths, (**schema).clone(), None)
             }
-            LogicalPlan::Filter { input, .. }
-            | LogicalPlan::Project { input, .. }
+            LogicalPlan::Aggregate {
+                input,
+                grouping_sets,
+                ..
+            } => {
+                let (keys, _) = grouping_layout(grouping_sets)?;
+                for key in keys {
+                    if let LogicalExpr::Column(column) = key {
+                        if !dictionary_group_ids.contains(&column.id) {
+                            dictionary_group_ids.push(column.id);
+                        }
+                    }
+                }
+                Self::collect_leaf_source(input, dictionary_group_ids)
+            }
+            LogicalPlan::Filter { input, .. } => {
+                // A filter below an aggregate may evaluate the key before the
+                // aggregate consumes it. Keep that scan on decoded Arrow arrays.
+                dictionary_group_ids.clear();
+                Self::collect_leaf_source(input, dictionary_group_ids)
+            }
+            LogicalPlan::Project { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::SubqueryAlias { input, .. }
             | LogicalPlan::Write { input, .. }
-            | LogicalPlan::Aggregate { input, .. }
-            | LogicalPlan::Distinct { input, .. } => Self::collect_leaf_source(input),
+            | LogicalPlan::Distinct { input, .. } => {
+                Self::collect_leaf_source(input, dictionary_group_ids)
+            }
             other => Err(VeinError::planning(
                 format!("unsupported source node in Parquet pipeline: {other:?}"),
                 None,
@@ -287,6 +343,7 @@ impl PipelineCompiler {
                 format: FileFormat::Parquet,
                 byte_range: None,
                 projected,
+                dictionary_columns: Vec::new(),
                 pushdown,
                 task_id: TaskId::new(),
                 catalog_snapshot: None,
@@ -429,7 +486,7 @@ impl PipelineCompiler {
                     agg_op(name)?;
                     projected.push(argument.clone());
                 }
-                compiler.compile_projection(&projected, &input_schema)?;
+                compiler.compile_projection_with_schema(&projected, &input_schema, schema)?;
                 Ok((**schema).clone())
             }
             // Distinct is a group by every column with nothing to fold.
@@ -441,7 +498,7 @@ impl PipelineCompiler {
                     .cloned()
                     .map(LogicalExpr::Column)
                     .collect();
-                compiler.compile_projection(&projected, &input_schema)?;
+                compiler.compile_projection_with_schema(&projected, &input_schema, schema)?;
                 Ok((**schema).clone())
             }
             LogicalPlan::Filter { input, predicate } => {
@@ -457,7 +514,7 @@ impl PipelineCompiler {
                 schema,
             } => {
                 let input_schema = Self::compile_node(input, input_schema, compiler)?;
-                compiler.compile_projection(exprs, &input_schema)?;
+                compiler.compile_projection_with_schema(exprs, &input_schema, schema)?;
                 Ok((**schema).clone())
             }
             other => Err(VeinError::planning(
@@ -577,9 +634,14 @@ fn contains_limit(plan: &LogicalPlan) -> bool {
 /// Flattens the grouping columns into one VM projection and records each set as
 /// positions into that projection. The output schema uses this same first-seen
 /// union of keys.
-fn grouping_layout(grouping_sets: &[Vec<LogicalExpr>]) -> Result<(Vec<LogicalExpr>, Vec<Vec<u32>>)> {
+fn grouping_layout(
+    grouping_sets: &[Vec<LogicalExpr>],
+) -> Result<(Vec<LogicalExpr>, Vec<Vec<u32>>)> {
     if grouping_sets.is_empty() {
-        return Err(VeinError::planning("an aggregate must contain a grouping set", None));
+        return Err(VeinError::planning(
+            "an aggregate must contain a grouping set",
+            None,
+        ));
     }
 
     let mut keys = Vec::new();
@@ -643,10 +705,40 @@ fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr)> {
     Ok((name, argument))
 }
 
+/// Uses a catalog NDV only when it describes the unfiltered single-key input
+/// directly. Estimates for computed, filtered, or multi-key groups are too
+/// uncertain to justify a hash-table allocation.
+fn estimate_single_key_groups(
+    input: &LogicalPlan,
+    grouping_sets: &[Vec<LogicalExpr>],
+) -> Option<u64> {
+    let [grouping_set] = grouping_sets else {
+        return None;
+    };
+    let [LogicalExpr::Column(column)] = grouping_set.as_slice() else {
+        return None;
+    };
+    let LogicalPlan::Scan { table, filters, .. } = input else {
+        return None;
+    };
+    if !filters.is_empty() {
+        return None;
+    }
+
+    let statistics = table.statistics.as_ref()?;
+    let row_count = statistics.num_rows?;
+    let distinct_count = statistics
+        .column_statistics
+        .get(&column.name)
+        .and_then(|column_statistics| column_statistics.distinct_count);
+    Some(distinct_count.map_or(row_count, |count| count.min(row_count)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use catalog::{ColumnStatistics, TableMetadata, TableStatistics};
     use common::protocol::{SortKey as PhysicalSortKey, SortPlan};
     use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
     use plan::{LogicalExpr, LogicalLiteral, LogicalPlan, SortKey as LogicalSortKey};
@@ -733,10 +825,12 @@ mod tests {
         let program = PipelineCompiler::sort_key_program(&plan)
             .expect("sort key program")
             .expect("computed key needs a program");
-        assert!(program
-            .instructions
-            .iter()
-            .any(|instruction| matches!(instruction, common::protocol::MicroOp::Add { .. })));
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, common::protocol::MicroOp::Add { .. }))
+        );
         assert!(matches!(
             program.instructions.last(),
             Some(common::protocol::MicroOp::ProjectRegisters { out_regs })
@@ -765,5 +859,175 @@ mod tests {
 
         let error = PipelineCompiler::sort(&plan).expect_err("pre-sort LIMIT is unsupported");
         assert!(error.to_string().contains("LIMIT before ORDER"));
+    }
+
+    #[test]
+    fn requests_dictionary_encoding_for_direct_utf8_aggregate_keys() {
+        let (input_schema, _) = schema();
+        let key = input_schema.fields[0].clone();
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(external_scan(&input_schema)),
+            grouping_sets: vec![vec![LogicalExpr::Column(key.clone())]],
+            aggs: Vec::new(),
+            schema: Box::new(VeinSchema::new(vec![key])),
+        };
+
+        let (source, _, _) = PipelineCompiler::compile(&aggregate).expect("compile aggregate");
+        let common::protocol::DataSource::File(scan) = source else {
+            panic!("aggregate scan should use Parquet");
+        };
+
+        assert_eq!(scan.dictionary_columns, vec![0]);
+    }
+
+    #[test]
+    fn does_not_request_dictionary_encoding_for_computed_group_keys() {
+        let (input_schema, price) = schema();
+        let computed_key = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(price)),
+            op: parser::ast::expr::BinaryOp::Plus,
+            right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(1))),
+            return_type: VeinDataType::Int64,
+        };
+        let output = Arc::new(ResolvedColumn::new(
+            ColumnId(3),
+            "adjusted_price",
+            None,
+            VeinDataType::Int64,
+        ));
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(external_scan(&input_schema)),
+            grouping_sets: vec![vec![computed_key]],
+            aggs: Vec::new(),
+            schema: Box::new(VeinSchema::new(vec![output])),
+        };
+
+        let (source, _, _) = PipelineCompiler::compile(&aggregate).expect("compile aggregate");
+        let common::protocol::DataSource::File(scan) = source else {
+            panic!("aggregate scan should use Parquet");
+        };
+
+        assert!(scan.dictionary_columns.is_empty());
+    }
+
+    #[test]
+    fn aggregate_uses_single_key_ndv_as_a_capped_capacity_hint() {
+        let (input_schema, key) = schema();
+        let mut column_statistics = std::collections::HashMap::new();
+        column_statistics.insert(
+            key.name.clone(),
+            ColumnStatistics {
+                distinct_count: Some(120),
+                ..ColumnStatistics::default()
+            },
+        );
+        let statistics = TableStatistics {
+            num_rows: Some(100),
+            column_statistics,
+            ..TableStatistics::default()
+        };
+        let table = Arc::new(
+            TableMetadata::new("orders", Arc::new(input_schema.clone()))
+                .with_statistics(statistics),
+        );
+        let input = LogicalPlan::Scan {
+            table,
+            projection: None,
+            filters: Vec::new(),
+            schema: Box::new(input_schema),
+        };
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(input),
+            grouping_sets: vec![vec![LogicalExpr::Column(key)]],
+            aggs: Vec::new(),
+            schema: Box::new(VeinSchema::empty()),
+        };
+
+        let plan = PipelineCompiler::aggregate(&aggregate)
+            .expect("plan aggregate")
+            .expect("aggregate plan");
+        assert_eq!(plan.estimated_groups, Some(100));
+    }
+
+    #[test]
+    fn aggregate_capacity_hint_requires_unfiltered_input_and_row_count() {
+        let (input_schema, key) = schema();
+        let mut column_statistics = std::collections::HashMap::new();
+        column_statistics.insert(
+            key.name.clone(),
+            ColumnStatistics {
+                distinct_count: Some(80),
+                ..ColumnStatistics::default()
+            },
+        );
+        let table = Arc::new(
+            TableMetadata::new("orders", Arc::new(input_schema.clone())).with_statistics(
+                TableStatistics {
+                    num_rows: Some(100),
+                    column_statistics,
+                    ..TableStatistics::default()
+                },
+            ),
+        );
+        let aggregate_for = |filters| LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Scan {
+                table: Arc::clone(&table),
+                projection: None,
+                filters,
+                schema: Box::new(input_schema.clone()),
+            }),
+            grouping_sets: vec![vec![LogicalExpr::Column(Arc::clone(&key))]],
+            aggs: Vec::new(),
+            schema: Box::new(VeinSchema::empty()),
+        };
+
+        let filtered = PipelineCompiler::aggregate(&aggregate_for(vec![LogicalExpr::Column(
+            Arc::clone(&key),
+        )]))
+            .expect("plan filtered aggregate")
+            .expect("aggregate plan");
+        assert_eq!(filtered.estimated_groups, None);
+
+        let mut no_ndv = (*table).clone();
+        no_ndv.statistics
+            .as_mut()
+            .unwrap()
+            .column_statistics
+            .clear();
+        let aggregate_without_ndv = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Scan {
+                table: Arc::new(no_ndv),
+                projection: None,
+                filters: Vec::new(),
+                schema: Box::new(input_schema.clone()),
+            }),
+            grouping_sets: vec![vec![LogicalExpr::Column(Arc::clone(&key))]],
+            aggs: Vec::new(),
+            schema: Box::new(VeinSchema::empty()),
+        };
+        let row_count_hint = PipelineCompiler::aggregate(&aggregate_without_ndv)
+            .expect("plan aggregate without NDV")
+            .expect("aggregate plan");
+        assert_eq!(row_count_hint.estimated_groups, Some(100));
+
+        let mut no_row_count = (*table).clone();
+        no_row_count.statistics.as_mut().unwrap().num_rows = None;
+        let no_row_count = Arc::new(no_row_count);
+        let input = LogicalPlan::Scan {
+            table: no_row_count,
+            projection: None,
+            filters: Vec::new(),
+            schema: Box::new(input_schema),
+        };
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(input),
+            grouping_sets: vec![vec![LogicalExpr::Column(key)]],
+            aggs: Vec::new(),
+            schema: Box::new(VeinSchema::empty()),
+        };
+        let unestimated = PipelineCompiler::aggregate(&aggregate)
+            .expect("plan unestimated aggregate")
+            .expect("aggregate plan");
+        assert_eq!(unestimated.estimated_groups, None);
     }
 }

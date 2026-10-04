@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::parquet_storage::{ParquetStorage, resolve_manifest_file};
 use async_trait::async_trait;
-use catalog::{MetadataKey, MetadataStore};
+use catalog::{MetadataKey, MetadataStore, TableStatistics};
 use error::{Result, VeinError};
 use exec::operators::source::scan::PARQUET_FOOTER;
 use parquet::arrow::arrow_reader::{
@@ -148,12 +148,12 @@ fn inspect_table_files(
 
     let footer_hits = schemas
         .iter()
-        .filter(|(_, served_from_store)| *served_from_store)
+        .filter(|(_, _, served_from_store)| *served_from_store)
         .count() as u64;
     let footer_misses = schemas.len() as u64 - footer_hits;
 
     let expected_schema = Arc::clone(&schemas[0].0);
-    for (file, (schema, _)) in files.iter().zip(schemas.iter()).skip(1) {
+    for (file, (schema, _, _)) in files.iter().zip(schemas.iter()).skip(1) {
         if schema.as_ref() != expected_schema.as_ref() {
             return Err(VeinError::internal(format!(
                 "Parquet schema mismatch in '{}'; all files in one table must have identical schemas",
@@ -161,17 +161,26 @@ fn inspect_table_files(
             )));
         }
     }
+    let num_rows = schemas.iter().try_fold(0u64, |total, (_, file_rows, _)| {
+        total.checked_add((*file_rows)?)
+    });
     let file_count = files.len();
 
-    let table_schema = Arc::new(VeinSchema::from(expected_schema.as_ref()));
+    let table_schema = Arc::new(VeinSchema::try_from(expected_schema.as_ref())?);
     let files = files
         .into_iter()
         .map(|file| file.to_string_lossy().into_owned())
         .collect();
-    let metadata = TableMetadata::new(name, table_schema)
+    let mut metadata = TableMetadata::new(name, table_schema)
         .with_location(path.to_string_lossy())
         .with_format(TableFormat::Parquet)
         .with_files(files);
+    if let Some(num_rows) = num_rows {
+        metadata = metadata.with_statistics(TableStatistics {
+            num_rows: Some(num_rows),
+            ..TableStatistics::default()
+        });
+    }
 
     tracing::info!(
         target: "vein.audit",
@@ -188,8 +197,8 @@ fn inspect_table_files(
     Ok(metadata)
 }
 
-/// Parses every file's footer concurrently, returning each file's schema and
-/// whether the catalog's store already held the parsed metadata.
+/// Parses every file's footer concurrently, returning each file's schema, row
+/// count, and whether the catalog's store already held the parsed metadata.
 ///
 /// Reading a footer opens and decodes one file, which costs hundreds of
 /// microseconds and depends on no other file. Reading them one after another
@@ -204,8 +213,8 @@ fn inspect_table_files(
 fn parquet_schemas(
     files: &[PathBuf],
     metadata_store: &MetadataStore,
-) -> Result<Vec<(Arc<arrow::datatypes::Schema>, bool)>> {
-    let slots: Mutex<Vec<Option<Result<(Arc<arrow::datatypes::Schema>, bool)>>>> =
+) -> Result<Vec<(Arc<arrow::datatypes::Schema>, Option<u64>, bool)>> {
+    let slots: Mutex<Vec<Option<Result<(Arc<arrow::datatypes::Schema>, Option<u64>, bool)>>>> =
         Mutex::new((0..files.len()).map(|_| None).collect());
     let next = AtomicUsize::new(0);
     let workers = std::thread::available_parallelism()
@@ -248,17 +257,19 @@ fn parquet_schemas(
         .collect()
 }
 
-/// Returns the Arrow schema of `path` and whether the catalog's store served it.
+/// Returns the Arrow schema and row count of `path`, plus whether the catalog's
+/// store served its footer metadata.
 ///
 /// The parsed footer is published under [`PARQUET_FOOTER`] so the scan reading
 /// the same file reuses it instead of parsing the footer a second time.
 fn parquet_schema(
     path: &Path,
     metadata_store: &MetadataStore,
-) -> Result<(Arc<arrow::datatypes::Schema>, bool)> {
+) -> Result<(Arc<arrow::datatypes::Schema>, Option<u64>, bool)> {
     let key = MetadataKey::for_file(PARQUET_FOOTER, path);
     if let Some(key) = &key {
         if let Some(metadata) = metadata_store.get::<ParquetMetaData>(key) {
+            let num_rows = parquet_num_rows(&metadata);
             let reader = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
                 .map_err(|error| {
                     VeinError::internal(format!(
@@ -266,7 +277,7 @@ fn parquet_schema(
                         path.display()
                     ))
                 })?;
-            return Ok((reader.schema().clone(), true));
+            return Ok((reader.schema().clone(), num_rows, true));
         }
     }
 
@@ -279,6 +290,7 @@ fn parquet_schema(
         ))
     })?;
     let schema = reader.schema().clone();
+    let num_rows = parquet_num_rows(reader.metadata());
     if let Some(key) = key {
         metadata_store.insert(key, Arc::clone(reader.metadata()));
         tracing::debug!(
@@ -288,7 +300,11 @@ fn parquet_schema(
             "parquet_footer_parsed"
         );
     }
-    Ok((schema, false))
+    Ok((schema, num_rows, false))
+}
+
+fn parquet_num_rows(metadata: &ParquetMetaData) -> Option<u64> {
+    u64::try_from(metadata.file_metadata().num_rows()).ok()
 }
 
 fn collect_parquet_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -369,6 +385,13 @@ mod tests {
         assert!(metadata.files[0].ends_with("a.parquet"));
         assert!(metadata.files[1].ends_with("b.parquet"));
         assert_eq!(metadata.schema.fields[0].name, "flight_id");
+        assert_eq!(
+            metadata
+                .statistics
+                .as_ref()
+                .and_then(|stats| stats.num_rows),
+            Some(4)
+        );
     }
 
     #[tokio::test]

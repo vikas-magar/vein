@@ -197,6 +197,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                     files,
                     scan.format.clone(),
                     scan.projected.clone(),
+                    scan.dictionary_columns.clone(),
                     scan.pushdown.clone(),
                     self.metadata_store.clone(),
                     self.registry.clone(),
