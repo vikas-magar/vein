@@ -30,7 +30,7 @@ impl ScalarUDFImpl for TruncateFunction {
                 None,
             ));
         };
-        let vein_type = types::VeinDataType::from(data_type);
+        let vein_type = types::VeinDataType::try_from(data_type)?;
         if !self.unit.supports(&vein_type) {
             return Err(VeinError::planning(
                 format!(

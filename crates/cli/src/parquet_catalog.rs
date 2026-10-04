@@ -163,7 +163,7 @@ fn inspect_table_files(
     }
     let file_count = files.len();
 
-    let table_schema = Arc::new(VeinSchema::from(expected_schema.as_ref()));
+    let table_schema = Arc::new(VeinSchema::try_from(expected_schema.as_ref())?);
     let files = files
         .into_iter()
         .map(|file| file.to_string_lossy().into_owned())

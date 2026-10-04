@@ -530,7 +530,8 @@ fn op_symbol(op: BinaryOp) -> &'static str {
 fn type_str(ty: &VeinDataType) -> String {
     match ty {
         VeinDataType::Decimal128(p, s) => format!("Decimal128({p}, {s})"),
-        VeinDataType::Timestamp(Some(tz)) => format!("Timestamp(\"{tz}\")"),
+        VeinDataType::Interval(unit) => format!("Interval({unit:?})"),
+        VeinDataType::Timestamp(unit, Some(tz)) => format!("Timestamp({unit:?}, \"{tz}\")"),
         _ => format!("{ty:?}"),
     }
 }
@@ -1095,7 +1096,7 @@ mod coverage {
         bind(LogicalExpr::Literal(LogicalLiteral::Boolean(true)), "true");
         bind(LogicalExpr::Literal(LogicalLiteral::Float64(1.5)), "1.5");
         bind(LogicalExpr::Literal(LogicalLiteral::String("a\\b".into())), "\"a\\\\b\"");
-                bind(LogicalExpr::Literal(LogicalLiteral::Date(19000)), "DATE 19000");
+        bind(LogicalExpr::Literal(LogicalLiteral::Date(19000)), "DATE 19000");
         bind(LogicalExpr::Literal(LogicalLiteral::Timestamp(123)), "TIMESTAMP 123");
         bind(LogicalExpr::Literal(LogicalLiteral::Time(9_000_000)), "TIME 9000000");
         bind(

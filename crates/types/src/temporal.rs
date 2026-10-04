@@ -107,8 +107,8 @@ impl TemporalUnit {
                 self,
                 Self::Year | Self::Quarter | Self::Month | Self::Week | Self::Day
             ),
-            VeinDataType::Timestamp(None) => true,
-            VeinDataType::Time32 | VeinDataType::Time64 => matches!(
+            VeinDataType::Timestamp(_, None) => true,
+            VeinDataType::Time32(_) | VeinDataType::Time64(_) => matches!(
                 self,
                 Self::Day
                     | Self::Hour

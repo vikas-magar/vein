@@ -2,13 +2,13 @@
 
 use error::{Result, VeinError};
 
-use crate::VeinDataType;
+use crate::{TimeUnit, VeinDataType};
 
 /// Resolves the common supertype of two data types, or errors if none exists.
 ///
 /// Identical types pass through, `Null` unifies with any type, numeric and
 /// string widening is symmetric, and `Date32` promotes to `Timestamp` while
-/// preserving the timestamp's timezone.
+/// preserving timestamp timezone and selecting the finest common time unit.
 pub fn unify_types(left: &VeinDataType, right: &VeinDataType) -> Result<VeinDataType> {
     if left == right {
         return Ok(left.clone());
@@ -29,21 +29,44 @@ pub fn unify_types(left: &VeinDataType, right: &VeinDataType) -> Result<VeinData
         return Ok(common_string(left, right));
     }
 
-    if let VeinDataType::Timestamp(tz) = right
+    if let (
+        VeinDataType::Timestamp(left_unit, left_tz),
+        VeinDataType::Timestamp(right_unit, right_tz),
+    ) = (left, right)
+        && left_tz == right_tz
+    {
+        return Ok(VeinDataType::Timestamp(
+            common_timestamp_unit(*left_unit, *right_unit),
+            left_tz.clone(),
+        ));
+    }
+
+    if let VeinDataType::Timestamp(unit, tz) = right
         && matches!(left, VeinDataType::Date32)
     {
-        return Ok(VeinDataType::Timestamp(tz.clone()));
+        return Ok(VeinDataType::Timestamp(*unit, tz.clone()));
     }
-    if let VeinDataType::Timestamp(tz) = left
+    if let VeinDataType::Timestamp(unit, tz) = left
         && matches!(right, VeinDataType::Date32)
     {
-        return Ok(VeinDataType::Timestamp(tz.clone()));
+        return Ok(VeinDataType::Timestamp(*unit, tz.clone()));
     }
 
     Err(VeinError::semantic(
         format!("no implicit coercion between types {left:?} and {right:?}"),
         None,
     ))
+}
+
+fn common_timestamp_unit(left: TimeUnit, right: TimeUnit) -> TimeUnit {
+    use TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
+    let precision = |unit| match unit {
+        Second => 0,
+        Millisecond => 1,
+        Microsecond => 2,
+        Nanosecond => 3,
+    };
+    if precision(left) >= precision(right) { left } else { right }
 }
 
 fn is_string_type(data_type: &VeinDataType) -> bool {
@@ -145,6 +168,7 @@ fn decimal_shape(data_type: &VeinDataType) -> Option<(i16, i16, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::TimeUnit;
 
     #[test]
     fn unifies_numeric_types_symmetrically() {
@@ -206,11 +230,26 @@ mod tests {
         assert_eq!(
             unify_types(
                 &VeinDataType::Date32,
-                &VeinDataType::Timestamp(Some("UTC".into()))
+                &VeinDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
             )
                 .unwrap(),
-            VeinDataType::Timestamp(Some("UTC".into()))
+            VeinDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         );
+    }
+
+    #[test]
+    fn timestamp_unification_selects_finest_unit_and_requires_matching_timezones() {
+        let seconds = VeinDataType::Timestamp(TimeUnit::Second, None);
+        let nanos = VeinDataType::Timestamp(TimeUnit::Nanosecond, None);
+        let expected = VeinDataType::Timestamp(TimeUnit::Nanosecond, None);
+
+        assert_eq!(unify_types(&seconds, &nanos).unwrap(), expected);
+        assert_eq!(unify_types(&nanos, &seconds).unwrap(), expected);
+        assert!(unify_types(
+            &seconds,
+            &VeinDataType::Timestamp(TimeUnit::Second, Some("UTC".into()))
+        )
+            .is_err());
     }
 
     #[test]

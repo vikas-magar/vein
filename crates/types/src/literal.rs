@@ -1,6 +1,7 @@
 //! Literal values of the engine's data types.
 
 use std::sync::Arc;
+use arrow::datatypes::TimeUnit;
 
 use crate::column::{ColumnId, ResolvedColumn};
 use crate::data_type::VeinDataType;
@@ -60,9 +61,11 @@ pub fn literal_type(literal: &LogicalLiteral) -> VeinDataType {
         LogicalLiteral::Float64(_) => VeinDataType::Float64,
         LogicalLiteral::String(_) => VeinDataType::Utf8,
         LogicalLiteral::Date(_) => VeinDataType::Date32,
-        LogicalLiteral::Timestamp(_) => VeinDataType::Timestamp(None),
-        LogicalLiteral::Time(_) => VeinDataType::Time64,
-        LogicalLiteral::Interval { .. } => VeinDataType::Interval,
+        LogicalLiteral::Timestamp(_) => VeinDataType::Timestamp(TimeUnit::Microsecond, None),
+        LogicalLiteral::Time(_) => VeinDataType::Time64(TimeUnit::Microsecond),
+        LogicalLiteral::Interval { .. } => {
+            VeinDataType::Interval(crate::IntervalUnit::MonthDayNano)
+        }
         LogicalLiteral::Decimal(_, precision, scale) => {
             VeinDataType::Decimal128(*precision, *scale)
         }
@@ -118,14 +121,17 @@ mod tests {
 
     #[test]
     fn time_interval_and_decimal_infer_their_types() {
-        assert_eq!(literal_type(&LogicalLiteral::Time(1_000)), VeinDataType::Time64);
+        assert_eq!(
+            literal_type(&LogicalLiteral::Time(1_000)),
+            VeinDataType::Time64(TimeUnit::Microsecond)
+        );
         assert_eq!(
             literal_type(&LogicalLiteral::Interval {
                 months: 1,
                 days: 2,
                 nanos: 3
             }),
-            VeinDataType::Interval
+            VeinDataType::Interval(crate::IntervalUnit::MonthDayNano)
         );
         assert_eq!(
             literal_type(&LogicalLiteral::Decimal(123, 76, 20)),

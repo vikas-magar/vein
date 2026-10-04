@@ -22,3 +22,4 @@ pub use data_type::{VeinDataType, aggregate_return_type};
 pub use literal::{LogicalLiteral, literal_type};
 pub use schema::{VeinSchema, VeinSchemaRef};
 pub use temporal::{TemporalUnit, days_from_civil, interval_from_unit, truncate_epoch_value};
+pub use arrow::datatypes::{IntervalUnit, TimeUnit};

@@ -7,12 +7,13 @@ use crate::pipe::query::bind_query_internal;
 use crate::scope::ScopeStack;
 use crate::traits::{FunctionKind, RuntimeKind};
 use error::{Result, VeinError};
-use parser::ast::data_type::DataType;
+use parser::ast::data_type::{DataType, IntervalField};
 use parser::ast::expr::{BinaryOp as AstBinaryOp, Expr, Literal as AstLiteral, SpannedExpr};
 use plan::PlanTraversal;
 use plan::SortKey;
 use plan::{LogicalExpr, LogicalLiteral};
 use plan::{ResolvedColumn, VeinDataType};
+use types::{IntervalUnit, TimeUnit};
 use types::{aggregate_return_type, unify_types};
 
 /// Derives a human-readable output column name from an AST expression, used
@@ -323,11 +324,11 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                     bound_args[0].data_type(),
                     VeinDataType::Date32
                         | VeinDataType::Date64
-                        | VeinDataType::Time32
-                        | VeinDataType::Time64
-                        | VeinDataType::Timestamp(_)
+                        | VeinDataType::Time32(_)
+                        | VeinDataType::Time64(_)
+                        | VeinDataType::Timestamp(_, _)
                         | VeinDataType::Duration(_)
-                        | VeinDataType::Interval
+                        | VeinDataType::Interval(_)
                 ) {
                     return Err(VeinError::semantic(
                         format!(
@@ -783,15 +784,20 @@ pub fn ast_type_to_vein(data_type: &DataType<'_>) -> Result<VeinDataType> {
         DataType::Char(_) | DataType::Varchar(_) => VeinDataType::Utf8,
         DataType::Binary | DataType::Varbinary(_) => VeinDataType::Binary,
         DataType::Date => VeinDataType::Date32,
-        DataType::Time => VeinDataType::Time64,
+        DataType::Time => VeinDataType::Time64(TimeUnit::Microsecond),
         DataType::Timestamp { with_tz } => {
             if *with_tz {
-                VeinDataType::Timestamp(Some("UTC".to_string()))
+                VeinDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".to_string()))
             } else {
-                VeinDataType::Timestamp(None)
+                VeinDataType::Timestamp(TimeUnit::Microsecond, None)
             }
         }
-        DataType::Interval { .. } => VeinDataType::Interval,
+        DataType::Interval { fields } => VeinDataType::Interval(match fields {
+            IntervalField::Year | IntervalField::Month | IntervalField::YearToMonth => {
+                IntervalUnit::YearMonth
+            }
+            _ => IntervalUnit::MonthDayNano,
+        }),
         DataType::Array(inner) => VeinDataType::List(Arc::new(ast_type_to_vein(inner)?)),
         DataType::Vector(dim) => VeinDataType::Vector(*dim),
         DataType::Struct(fields) => {
@@ -811,4 +817,27 @@ pub fn ast_type_to_vein(data_type: &DataType<'_>) -> Result<VeinDataType> {
             Arc::new(ast_type_to_vein(value)?),
         ),
     })
+}
+
+#[cfg(test)]
+mod interval_type_tests {
+    use super::*;
+
+    #[test]
+    fn sql_interval_qualifiers_select_the_matching_arrow_layout() {
+        let cases = [
+            (IntervalField::Year, IntervalUnit::YearMonth),
+            (IntervalField::Month, IntervalUnit::YearMonth),
+            (IntervalField::YearToMonth, IntervalUnit::YearMonth),
+            (IntervalField::Day, IntervalUnit::MonthDayNano),
+            (IntervalField::DayToSecond, IntervalUnit::MonthDayNano),
+        ];
+
+        for (fields, expected_unit) in cases {
+            assert_eq!(
+                ast_type_to_vein(&DataType::Interval { fields }).unwrap(),
+                VeinDataType::Interval(expected_unit)
+            );
+        }
+    }
 }

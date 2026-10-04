@@ -4,10 +4,12 @@
 //! conversions to and from Apache Arrow layouts.
 
 use std::sync::Arc;
-use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit, UnionFields, UnionMode};
+use arrow::datatypes::{DataType, Field, UnionFields, UnionMode};
+use error::{Result, VeinError};
 use serde::{Deserialize, Serialize};
 
 use crate::column::ResolvedColumn;
+use crate::{IntervalUnit, TimeUnit};
 
 /// Unified data types for the Vein database engine.
 ///
@@ -72,17 +74,18 @@ pub enum VeinDataType {
     Date32,
     /// Milliseconds since UNIX epoch.
     Date64,
-    /// Time of day (32-bit).
-    Time32,
-    /// Time of day (64-bit).
-    Time64,
-    /// Absolute timestamp with optional timezone.
-    Timestamp(Option<String>),
+    /// Time of day in the Arrow 32-bit time unit.
+    Time32(#[serde(with = "time_unit_serde")] TimeUnit),
+    /// Time of day in the Arrow 64-bit time unit.
+    Time64(#[serde(with = "time_unit_serde")] TimeUnit),
+    /// Absolute timestamp in the Arrow time unit with optional timezone.
+    Timestamp(#[serde(with = "time_unit_serde")] TimeUnit, Option<String>),
     /// A duration in the given time unit.
     #[serde(with = "time_unit_serde")]
     Duration(TimeUnit),
-    /// Time-series interval (Month, Day, Nanosecond).
-    Interval,
+    /// An interval using the corresponding Arrow physical layout.
+    #[serde(with = "interval_unit_serde")]
+    Interval(IntervalUnit),
 
     // ── Financial / High Precision ────────────────────────
     /// A 128-bit decimal type with precision and scale.
@@ -189,13 +192,13 @@ impl VeinDataType {
 
             VeinDataType::Date32 => DataType::Date32,
             VeinDataType::Date64 => DataType::Date64,
-            VeinDataType::Time32 => DataType::Time32(TimeUnit::Millisecond),
-            VeinDataType::Time64 => DataType::Time64(TimeUnit::Microsecond),
-            VeinDataType::Timestamp(tz) => {
-                DataType::Timestamp(TimeUnit::Microsecond, tz.as_deref().map(|s| s.into()))
+            VeinDataType::Time32(unit) => DataType::Time32(*unit),
+            VeinDataType::Time64(unit) => DataType::Time64(*unit),
+            VeinDataType::Timestamp(unit, tz) => {
+                DataType::Timestamp(*unit, tz.as_deref().map(|s| s.into()))
             }
             VeinDataType::Duration(unit) => DataType::Duration(*unit),
-            VeinDataType::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
+            VeinDataType::Interval(unit) => DataType::Interval(*unit),
 
             VeinDataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
             VeinDataType::Decimal256(p, s) => DataType::Decimal256(*p, *s),
@@ -251,9 +254,11 @@ impl VeinDataType {
     }
 }
 
-impl From<&DataType> for VeinDataType {
-    fn from(dt: &DataType) -> Self {
-        match dt {
+impl TryFrom<&DataType> for VeinDataType {
+    type Error = VeinError;
+
+    fn try_from(dt: &DataType) -> Result<Self> {
+        Ok(match dt {
             DataType::Null => VeinDataType::Null,
             DataType::Boolean => VeinDataType::Boolean,
             DataType::Int8 => VeinDataType::Int8,
@@ -276,18 +281,20 @@ impl From<&DataType> for VeinDataType {
             DataType::BinaryView => VeinDataType::BinaryView,
             DataType::Date32 => VeinDataType::Date32,
             DataType::Date64 => VeinDataType::Date64,
-            DataType::Time32(_) => VeinDataType::Time32,
-            DataType::Time64(_) => VeinDataType::Time64,
-            DataType::Timestamp(_, tz) => {
-                VeinDataType::Timestamp(tz.as_ref().map(|s| s.to_string()))
+            DataType::Time32(unit) => VeinDataType::Time32(*unit),
+            DataType::Time64(unit) => VeinDataType::Time64(*unit),
+            DataType::Timestamp(unit, tz) => {
+                VeinDataType::Timestamp(*unit, tz.as_ref().map(|s| s.to_string()))
             }
             DataType::Duration(unit) => VeinDataType::Duration(*unit),
-            DataType::Interval(_) => VeinDataType::Interval,
+            DataType::Interval(unit) => VeinDataType::Interval(*unit),
             DataType::Decimal128(p, s) => VeinDataType::Decimal128(*p, *s),
             DataType::Decimal256(p, s) => VeinDataType::Decimal256(*p, *s),
-            DataType::List(inner) => VeinDataType::List(Arc::new(Self::from(inner.data_type()))),
+            DataType::List(inner) => {
+                VeinDataType::List(Arc::new(Self::try_from(inner.data_type())?))
+            }
             DataType::LargeList(inner) => {
-                VeinDataType::LargeList(Arc::new(Self::from(inner.data_type())))
+                VeinDataType::LargeList(Arc::new(Self::try_from(inner.data_type())?))
             }
             DataType::FixedSizeList(inner, size)
             if inner.data_type() == &DataType::Float32 && *size >= 0 =>
@@ -295,25 +302,34 @@ impl From<&DataType> for VeinDataType {
                     VeinDataType::Vector(*size as u32)
                 }
             DataType::FixedSizeList(inner, size) => {
-                VeinDataType::FixedSizeList(Arc::new(Self::from(inner.data_type())), *size)
+                VeinDataType::FixedSizeList(
+                    Arc::new(Self::try_from(inner.data_type())?),
+                    *size,
+                )
             }
             DataType::Struct(fields) => {
                 let vein_fields = fields
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
-                        ResolvedColumn::new(
+                        Ok(ResolvedColumn::new(
                             crate::column::ColumnId(i),
                             f.name().clone(),
                             None,
-                            Self::from(f.data_type()),
+                            Self::try_from(f.data_type())?,
                         )
+                            .with_nullable(f.is_nullable()))
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
                 VeinDataType::Struct(vein_fields.into())
             }
-            _ => VeinDataType::Utf8,
-        }
+            _ => {
+                return Err(VeinError::planning(
+                    format!("Arrow data type {dt:?} is not supported by Vein"),
+                    None,
+                ));
+            }
+        })
     }
 }
 
@@ -373,11 +389,14 @@ impl std::str::FromStr for VeinDataType {
             "binaryview" => Ok(VeinDataType::BinaryView),
             "date32" | "date" => Ok(VeinDataType::Date32),
             "date64" => Ok(VeinDataType::Date64),
-            "time32" => Ok(VeinDataType::Time32),
-            "time64" | "time" => Ok(VeinDataType::Time64),
-            "timestamp" => Ok(VeinDataType::Timestamp(None)),
+            "time32" => Ok(VeinDataType::Time32(TimeUnit::Millisecond)),
+            "time64" | "time" => Ok(VeinDataType::Time64(TimeUnit::Microsecond)),
+            "timestamp" => Ok(VeinDataType::Timestamp(TimeUnit::Microsecond, None)),
             "variant" => Ok(VeinDataType::Variant),
-            _ => Ok(VeinDataType::Utf8),
+            _ => Err(VeinError::semantic(
+                format!("unknown data type '{s}'"),
+                None,
+            )),
         }
     }
 }
@@ -420,6 +439,36 @@ mod time_unit_serde {
     }
 }
 
+mod interval_unit_serde {
+    use arrow::datatypes::IntervalUnit;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(unit: &IntervalUnit, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let name = match unit {
+            IntervalUnit::YearMonth => "YearMonth",
+            IntervalUnit::DayTime => "DayTime",
+            IntervalUnit::MonthDayNano => "MonthDayNano",
+        };
+        serializer.serialize_str(name)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<IntervalUnit, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        match name.as_str() {
+            "YearMonth" => Ok(IntervalUnit::YearMonth),
+            "DayTime" => Ok(IntervalUnit::DayTime),
+            "MonthDayNano" => Ok(IntervalUnit::MonthDayNano),
+            other => Err(serde::de::Error::custom(format!("invalid IntervalUnit: {other}"))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,16 +505,78 @@ mod tests {
 
         for t in types {
             let arrow_dt: DataType = (&t).into();
-            let back: VeinDataType = (&arrow_dt).into();
+            let back = VeinDataType::try_from(&arrow_dt).expect("supported Arrow type");
             assert_eq!(t, back);
         }
+    }
+
+    #[test]
+    fn arrow_roundtrip_preserves_temporal_units_and_timezone() {
+        let types = [
+            VeinDataType::Time32(TimeUnit::Second),
+            VeinDataType::Time32(TimeUnit::Millisecond),
+            VeinDataType::Time64(TimeUnit::Microsecond),
+            VeinDataType::Time64(TimeUnit::Nanosecond),
+            VeinDataType::Timestamp(TimeUnit::Second, None),
+            VeinDataType::Timestamp(TimeUnit::Millisecond, None),
+            VeinDataType::Timestamp(TimeUnit::Microsecond, None),
+            VeinDataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            VeinDataType::Interval(IntervalUnit::YearMonth),
+            VeinDataType::Interval(IntervalUnit::DayTime),
+            VeinDataType::Interval(IntervalUnit::MonthDayNano),
+        ];
+
+        for vein_type in types {
+            let arrow_type = vein_type.to_arrow();
+            assert_eq!(VeinDataType::try_from(&arrow_type).unwrap(), vein_type);
+        }
+    }
+
+    #[test]
+    fn temporal_units_roundtrip_through_serde() {
+        let data_types = [
+            VeinDataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            VeinDataType::Interval(IntervalUnit::YearMonth),
+            VeinDataType::Interval(IntervalUnit::DayTime),
+            VeinDataType::Interval(IntervalUnit::MonthDayNano),
+        ];
+        for data_type in data_types {
+            let encoded = serde_json::to_string(&data_type).unwrap();
+            let decoded: VeinDataType = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, data_type);
+        }
+    }
+
+    #[test]
+    fn unsupported_arrow_types_return_an_error_instead_of_becoming_utf8() {
+        let dictionary = DataType::Dictionary(
+            Box::new(DataType::Int8),
+            Box::new(DataType::Utf8),
+        );
+
+        let error = VeinDataType::try_from(&dictionary).expect_err("dictionary is unsupported");
+        assert!(error.to_string().contains("not supported by Vein"));
+    }
+
+    #[test]
+    fn unsupported_nested_arrow_types_return_an_error() {
+        let nested = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        )));
+
+        assert!(VeinDataType::try_from(&nested).is_err());
     }
 
     #[test]
     fn fixed_size_float32_list_maps_to_vector() {
         let vector = VeinDataType::Vector(3);
         let arrow_type = vector.to_arrow();
-        assert_eq!(VeinDataType::from(&arrow_type), vector);
+        assert_eq!(
+            VeinDataType::try_from(&arrow_type).expect("supported vector Arrow type"),
+            vector
+        );
     }
 
     #[test]
@@ -526,5 +637,6 @@ mod tests {
         assert_eq!("INT64".parse::<VeinDataType>().unwrap(), VeinDataType::Int64);
         assert_eq!("utf8".parse::<VeinDataType>().unwrap(), VeinDataType::Utf8);
         assert_eq!("float64".parse::<VeinDataType>().unwrap(), VeinDataType::Float64);
+        assert!("not_a_type".parse::<VeinDataType>().is_err());
     }
 }

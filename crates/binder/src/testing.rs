@@ -25,8 +25,8 @@ impl TestCatalog {
             &[
                 ("order_date", VeinDataType::Date32),
                 ("date64", VeinDataType::Date64),
-                ("time_of_day", VeinDataType::Time64),
-                ("timestamp", VeinDataType::Timestamp(None)),
+                ("time_of_day", VeinDataType::Time64(types::TimeUnit::Microsecond)),
+                ("timestamp", VeinDataType::Timestamp(types::TimeUnit::Microsecond, None)),
             ],
         );
         catalog.add_table(
