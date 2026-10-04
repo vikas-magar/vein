@@ -14,7 +14,7 @@ This document tracks the path from syntax accepted by the parser through binding
 | `AGGREGATE` | Partial | Executes supported aggregate functions, numeric layouts, and multiple grouping sets, including empty sets. Omitted grouping columns become `NULL`; decimal sums use checked scaled-integer state; `AVG` returns floating-point output. Supported post-aggregate `WHERE` predicates run against aggregate output. | Group key and aggregate input/result type combinations are still limited. Projection/`SELECT` and other general operators above the aggregate are not supported. |
 | `ORDER BY` | Partial | Supported local input pipelines execute one global ORDER at the end. Direct and computed expressions, multiple keys, direction/null ordering, and a following `LIMIT`/`OFFSET` are supported. Computed keys use temporary VM columns that are removed from output. | Operators after ORDER other than LIMIT are rejected; LIMIT before ORDER and multiple ORDER operators are rejected. The full task input stays in memory; there is no spill path. |
 | `LIMIT` | Partial | Runtime applies a row window, including above supported aggregate and sort plans. | Some placements are rejected when the current pipeline cannot preserve their position semantics, including LIMIT before WHERE or ORDER. |
-| `EXTEND` | Partial | Lowers to projection. | Inherits VM expression limits and the unsupported post-aggregate projection path. |
+| `EXTEND` | Partial | Lowers to projection; output column IDs are mapped to their VM registers so later pipe stages can read computed columns. Temporal `TRUNCATE` is covered through `EXTEND` followed by `SELECT`. | Inherits VM expression limits and the unsupported post-aggregate projection path. |
 | `SET` | Partial | Lowers to projection. | Inherits VM expression limits and the unsupported post-aggregate projection path. |
 | `DROP` | Partial | Lowers to projection. | Inherits VM expression limits and the unsupported post-aggregate projection path. |
 | `RENAME` | Partial | Lowers to projection. | Inherits VM expression limits and the unsupported post-aggregate projection path. |
@@ -64,6 +64,7 @@ Operator support also depends on expression support. The parser and binder repre
 - Validate function argument count and types against registered signatures during binding.
 - Give built-in scalar functions runtime implementations, or clearly separate registered UDFs from built-ins. Physical compilation currently lowers function calls to UDF calls.
 - Track expression lowering and runtime-kernel coverage independently from pipe-operator coverage.
+- `TRUNCATE(value, unit)` runs as a vectorized scalar function for supported Arrow date, time, and timezone-naive timestamp layouts. Typed timestamp literals retain their Arrow type in VM registers. Timezone-aware timestamps remain unsupported. The local end-to-end test covers `TRUNCATE` through `EXTEND` and a timestamp literal; the CLI benchmark includes `temporal/truncate-month`.
 
 ## Correctness issues in currently implemented paths
 

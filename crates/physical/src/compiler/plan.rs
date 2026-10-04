@@ -189,6 +189,7 @@ impl PipelineCompiler {
         // column-count ceiling (`02-execution-and-vir-lld.md` §2).
         let register_count = scan_schema.fields.len() as RegId;
         let mut compiler = BytecodeCompiler::new(register_count);
+        compiler.set_input_schema(&scan_schema);
         let output_schema = Self::compile_node(plan, scan_schema, &mut compiler)?;
         Ok((source, compiler.finish(), output_schema))
     }
@@ -429,7 +430,7 @@ impl PipelineCompiler {
                     agg_op(name)?;
                     projected.push(argument.clone());
                 }
-                compiler.compile_projection(&projected, &input_schema)?;
+                compiler.compile_projection_with_schema(&projected, &input_schema, schema)?;
                 Ok((**schema).clone())
             }
             // Distinct is a group by every column with nothing to fold.
@@ -441,7 +442,7 @@ impl PipelineCompiler {
                     .cloned()
                     .map(LogicalExpr::Column)
                     .collect();
-                compiler.compile_projection(&projected, &input_schema)?;
+                compiler.compile_projection_with_schema(&projected, &input_schema, schema)?;
                 Ok((**schema).clone())
             }
             LogicalPlan::Filter { input, predicate } => {
@@ -457,7 +458,7 @@ impl PipelineCompiler {
                 schema,
             } => {
                 let input_schema = Self::compile_node(input, input_schema, compiler)?;
-                compiler.compile_projection(exprs, &input_schema)?;
+                compiler.compile_projection_with_schema(exprs, &input_schema, schema)?;
                 Ok((**schema).clone())
             }
             other => Err(VeinError::planning(

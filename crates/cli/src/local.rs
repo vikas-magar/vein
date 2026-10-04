@@ -605,6 +605,32 @@ mod tests {
         assert!(stream.next().await.is_none());
 
         let query = engine
+            .prepare(
+                "FROM names |> WHERE order_date = DATE '1970-01-01' |> EXTEND TRUNCATE(order_date, 'MONTH') AS month_start |> SELECT month_start, TRUNCATE(TIMESTAMP '2024-03-31 12:34:56', 'HOUR') AS hour_start",
+            )
+            .await
+            .expect("prepare temporal EXTEND and timestamp literal");
+        let mut stream = query.into_stream();
+        let result = stream
+            .next()
+            .await
+            .expect("query batch")
+            .expect("successful temporal EXTEND and timestamp literal");
+        let month_start = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .expect("Date32 TRUNCATE output");
+        assert_eq!(month_start.value(0), 0);
+        let hour_start = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("timestamp TRUNCATE output");
+        assert_eq!(hour_start.value(0), 1_711_886_400_000_000);
+        assert!(stream.next().await.is_none());
+
+        let query = engine
             .prepare("FROM names |> SELECT VECTOR_DISTANCE(left_vector, right_vector) AS distance")
             .await
             .expect("prepare VECTOR_DISTANCE projection");

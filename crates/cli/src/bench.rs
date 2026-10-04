@@ -62,6 +62,11 @@ const SCENARIOS: &[Scenario] = &[
         vein: "FROM orders\n|> WHERE o_orderkey = 99999999\n|> SELECT o_orderkey",
         duckdb: "SELECT o_orderkey FROM './data/tpch/orders/*.parquet' WHERE o_orderkey = 99999999",
     },
+    Scenario {
+        name: "temporal/truncate-month",
+        vein: "FROM orders\n|> EXTEND TRUNCATE(o_orderdate, 'MONTH') AS order_month\n|> SELECT o_orderkey, order_month",
+        duckdb: "SELECT o_orderkey, CAST(date_trunc('month', o_orderdate) AS DATE) AS order_month FROM './data/tpch/orders/*.parquet'",
+    },
     // A self-join, so both sides read the same files: one match per row, which
     // makes the row count checkable against DuckDB's.
     Scenario {
