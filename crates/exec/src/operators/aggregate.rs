@@ -875,10 +875,13 @@ pub struct AggregateSink {
 /// Low-overhead counters and phase timings for one aggregate sink.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct AggregateMetrics {
+    pub(crate) input_batches: u64,
     pub(crate) input_rows: u64,
     pub(crate) grouping_sets: u64,
     pub(crate) grouping_probes: u64,
     pub(crate) group_index_candidate_checks: u64,
+    pub(crate) group_index_reserve_ns: u64,
+    pub(crate) group_index_entries_ns: u64,
     pub(crate) full_hash_matches: u64,
     pub(crate) group_key_comparisons: u64,
     pub(crate) group_collision_retries: u64,
@@ -887,12 +890,17 @@ pub(crate) struct AggregateMetrics {
     pub(crate) new_groups: u64,
     pub(crate) retained_key_slots_initialized: u64,
     pub(crate) string_key_bytes_copied: u64,
+    pub(crate) hasher_setup_ns: u64,
+    pub(crate) key_hash_ns: u64,
+    pub(crate) hash_finalize_ns: u64,
     pub(crate) hash_generation_ns: u64,
     /// Resolving candidates to group slots, including collision checks and new groups.
-    pub(crate) group_resolution_us: u64,
+    pub(crate) group_resolution_ns: u64,
     /// Copying each batch's newly discovered key rows into owned group state.
-    pub(crate) group_materialize_us: u64,
-    pub(crate) state_update_us: u64,
+    pub(crate) group_materialize_ns: u64,
+    pub(crate) group_ids_distribution_ns: u64,
+    pub(crate) state_update_ns: u64,
+    pub(crate) output_materialize_ns: u64,
 }
 
 impl AggregateSink {
@@ -1023,6 +1031,7 @@ impl AggregateSink {
             .metrics
             .input_rows
             .saturating_add(chunk.selection.size() as u64);
+        self.metrics.input_batches = self.metrics.input_batches.saturating_add(1);
         let input_rows = chunk.selection.size();
         let grouping_set_count = self.grouping_sets.len();
         let candidate_count = input_rows
@@ -1041,12 +1050,17 @@ impl AggregateSink {
                 VeinError::internal(format!("cannot reserve aggregate group hashes: {error}"))
             })?;
         let hash_generation_started = Instant::now();
+        let hasher_setup_started = Instant::now();
         for candidate in 0..candidate_count {
             let set_id = candidate % grouping_set_count;
             let mut hasher = self.hash_builder.build_hasher();
             set_id.hash(&mut hasher);
             self.group_hashers.push(hasher);
         }
+        self.metrics.hasher_setup_ns = self.metrics.hasher_setup_ns.saturating_add(
+            hasher_setup_started.elapsed().as_nanos() as u64,
+        );
+        let key_hash_started = Instant::now();
         for (column, key_column) in key_columns.iter().enumerate() {
             if let Some(key_column) = key_column {
                 key_column.hash_batch(
@@ -1058,8 +1072,16 @@ impl AggregateSink {
                 );
             }
         }
+        self.metrics.key_hash_ns = self
+            .metrics
+            .key_hash_ns
+            .saturating_add(key_hash_started.elapsed().as_nanos() as u64);
+        let hash_finalize_started = Instant::now();
         self.group_hashes
             .extend(self.group_hashers.iter().map(Hasher::finish));
+        self.metrics.hash_finalize_ns = self.metrics.hash_finalize_ns.saturating_add(
+            hash_finalize_started.elapsed().as_nanos() as u64,
+        );
         let hash_generation_ns = hash_generation_started.elapsed().as_nanos() as u64;
         self.metrics.hash_generation_ns = self
             .metrics
@@ -1083,7 +1105,7 @@ impl AggregateSink {
             VeinError::internal(format!("cannot reserve aggregate batch groups: {error}"))
         })?;
         let resolution_started = Instant::now();
-        let candidate_checks = index.resolve_rows(hashes, batch_group_ids, |candidate, existing_slot| {
+        let index_metrics = index.resolve_rows(hashes, batch_group_ids, |candidate, existing_slot| {
             let set_id = candidate % grouping_set_count;
             let logical_row = candidate / grouping_set_count;
             let grouping_set = &self.grouping_sets[set_id];
@@ -1144,10 +1166,16 @@ impl AggregateSink {
         })?;
         metrics.group_index_candidate_checks = metrics
             .group_index_candidate_checks
-            .saturating_add(candidate_checks);
-        metrics.group_resolution_us = metrics
-            .group_resolution_us
-            .saturating_add(resolution_started.elapsed().as_micros() as u64);
+            .saturating_add(index_metrics.candidate_checks);
+        metrics.group_index_reserve_ns = metrics
+            .group_index_reserve_ns
+            .saturating_add(index_metrics.reserve_ns);
+        metrics.group_index_entries_ns = metrics
+            .group_index_entries_ns
+            .saturating_add(index_metrics.entries_ns);
+        metrics.group_resolution_ns = metrics
+            .group_resolution_ns
+            .saturating_add(resolution_started.elapsed().as_nanos() as u64);
 
         let materialize_started = Instant::now();
         groups_store.try_reserve(new_groups.len()).map_err(|error| {
@@ -1193,16 +1221,21 @@ impl AggregateSink {
         metrics.new_groups = metrics
             .new_groups
             .saturating_add(new_groups.len() as u64);
-        metrics.group_materialize_us = metrics
-            .group_materialize_us
-            .saturating_add(materialize_started.elapsed().as_micros() as u64);
+        metrics.group_materialize_ns = metrics
+            .group_materialize_ns
+            .saturating_add(materialize_started.elapsed().as_nanos() as u64);
 
+        let group_ids_distribution_started = Instant::now();
         for group_ids in &mut self.group_ids_by_set {
             group_ids.clear();
         }
         for (candidate, &slot) in self.batch_group_ids.iter().enumerate() {
             self.group_ids_by_set[candidate % grouping_set_count].push(slot);
         }
+        self.metrics.group_ids_distribution_ns = self
+            .metrics
+            .group_ids_distribution_ns
+            .saturating_add(group_ids_distribution_started.elapsed().as_nanos() as u64);
 
         // Resolve each physical input layout once per aggregate column and
         // batch, then fold the selected rows through the borrowed view.
@@ -1218,10 +1251,10 @@ impl AggregateSink {
                     .update_batch(input, GroupRows::new(group_ids, &chunk.selection))?;
             }
         }
-        self.metrics.state_update_us = self
+        self.metrics.state_update_ns = self
             .metrics
-            .state_update_us
-            .saturating_add(state_update_started.elapsed().as_micros() as u64);
+            .state_update_ns
+            .saturating_add(state_update_started.elapsed().as_nanos() as u64);
         Ok(())
     }
 
@@ -1266,11 +1299,17 @@ impl AggregateSink {
                 return Ok(Vec::new());
             }
         }
+        let output_materialize_started = Instant::now();
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.plan.types.len());
         for (column, data_type) in self.plan.types.iter().enumerate() {
             arrays.push(self.column(column, data_type)?);
         }
-        Ok(vec![DataChunk::from_vectors(arrays)])
+        let output = vec![DataChunk::from_vectors(arrays)];
+        self.metrics.output_materialize_ns = self
+            .metrics
+            .output_materialize_ns
+            .saturating_add(output_materialize_started.elapsed().as_nanos() as u64);
+        Ok(output)
     }
 
     /// One output column, built from every group in group order.
@@ -2581,6 +2620,7 @@ mod tests {
             .unwrap();
 
         let metrics = sink.metrics();
+        assert_eq!(metrics.input_batches, 1);
         assert_eq!(metrics.input_rows, 2);
         assert_eq!(metrics.grouping_sets, 3);
         assert_eq!(metrics.grouping_probes, 6);

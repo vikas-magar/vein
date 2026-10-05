@@ -414,14 +414,17 @@ impl DefaultTaskExecutor {
             let group_count = accumulator.group_count();
             (groups, accumulator.metrics(), group_count)
         };
-        let finish_us = finish_started.elapsed().as_micros() as u64;
+        let finish_ns = finish_started.elapsed().as_nanos() as u64;
         tracing::info!(
             target: "vein.audit",
             event = "aggregate_finished",
+            input_batches = aggregate_metrics.input_batches,
             input_rows = aggregate_metrics.input_rows,
             grouping_sets = aggregate_metrics.grouping_sets,
             grouping_probes = aggregate_metrics.grouping_probes,
             group_index_candidate_checks = aggregate_metrics.group_index_candidate_checks,
+            group_index_reserve_ns = aggregate_metrics.group_index_reserve_ns,
+            group_index_entries_ns = aggregate_metrics.group_index_entries_ns,
             full_hash_matches = aggregate_metrics.full_hash_matches,
             group_key_comparisons = aggregate_metrics.group_key_comparisons,
             group_collision_retries = aggregate_metrics.group_collision_retries,
@@ -431,11 +434,16 @@ impl DefaultTaskExecutor {
             groups = group_count,
             retained_key_slots_initialized = aggregate_metrics.retained_key_slots_initialized,
             string_key_bytes_copied = aggregate_metrics.string_key_bytes_copied,
+            hasher_setup_ns = aggregate_metrics.hasher_setup_ns,
+            key_hash_ns = aggregate_metrics.key_hash_ns,
+            hash_finalize_ns = aggregate_metrics.hash_finalize_ns,
             hash_generation_ns = aggregate_metrics.hash_generation_ns,
-            group_resolution_us = aggregate_metrics.group_resolution_us,
-            group_materialize_us = aggregate_metrics.group_materialize_us,
-            state_update_us = aggregate_metrics.state_update_us,
-            finish_us,
+            group_resolution_ns = aggregate_metrics.group_resolution_ns,
+            group_materialize_ns = aggregate_metrics.group_materialize_ns,
+            group_ids_distribution_ns = aggregate_metrics.group_ids_distribution_ns,
+            state_update_ns = aggregate_metrics.state_update_ns,
+            output_materialize_ns = aggregate_metrics.output_materialize_ns,
+            finish_ns,
             "aggregate_finished"
         );
         if let Some(program) = post_aggregate_program {

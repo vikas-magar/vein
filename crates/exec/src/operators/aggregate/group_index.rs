@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use common::Result;
 use error::VeinError;
 use hashbrown::HashTable;
@@ -13,6 +15,14 @@ pub(super) enum ProbeResolution {
     Match(usize),
     Retry,
     Insert(usize),
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct GroupIndexMetrics {
+    pub(super) candidate_checks: u64,
+    pub(super) reserve_ns: u64,
+    /// Time through hashbrown entry resolution, including the caller's key resolver.
+    pub(super) entries_ns: u64,
 }
 
 /// Safe SwissTable-backed scalar probe baseline.
@@ -54,12 +64,15 @@ impl GroupIndex {
         hashes: &[u64],
         group_slots: &mut Vec<usize>,
         mut resolve: impl FnMut(usize, Option<usize>) -> Result<ProbeResolution>,
-    ) -> Result<u64> {
+    ) -> Result<GroupIndexMetrics> {
         group_slots.clear();
         group_slots.reserve(hashes.len());
+        let reserve_started = Instant::now();
         self.reserve(hashes.len())?;
+        let reserve_ns = reserve_started.elapsed().as_nanos() as u64;
         let mut candidate_checks = 0u64;
 
+        let entries_started = Instant::now();
         for (row, &hash) in hashes.iter().enumerate() {
             let mut resolved_slot = None;
             let mut resolution_error = None;
@@ -116,7 +129,11 @@ impl GroupIndex {
             }
         }
 
-        Ok(candidate_checks)
+        Ok(GroupIndexMetrics {
+            candidate_checks,
+            reserve_ns,
+            entries_ns: entries_started.elapsed().as_nanos() as u64,
+        })
     }
 
     pub(super) fn insert_unique(&mut self, entry: GroupIndexEntry) -> Result<()> {
