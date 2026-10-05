@@ -291,7 +291,12 @@ impl DefaultTaskExecutor {
                 )),
                 task.limit,
             );
-            let head = ordered_head(task.sort.clone(), task.sort_output_columns, head);
+            let head = ordered_head(
+                task.sort.clone(),
+                task.sort_output_columns,
+                task.limit,
+                head,
+            );
             let head = sort_key_head(
                 self.builder.as_ref(),
                 task.sort_key_program.as_ref(),
@@ -383,7 +388,12 @@ impl DefaultTaskExecutor {
             )),
             task.limit,
         );
-        let mut head = ordered_head(task.sort.clone(), task.sort_output_columns, head);
+        let mut head = ordered_head(
+            task.sort.clone(),
+            task.sort_output_columns,
+            task.limit,
+            head,
+        );
         head = sort_key_head(
             self.builder.as_ref(),
             task.sort_key_program.as_ref(),
@@ -395,10 +405,39 @@ impl DefaultTaskExecutor {
             result = source.execute(&mut *vm).instrument(span.clone()) => result?,
         }
 
-        let groups = accumulator
-            .lock()
-            .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?
-            .finish()?;
+        let finish_started = Instant::now();
+        let (groups, aggregate_metrics, group_count) = {
+            let mut accumulator = accumulator
+                .lock()
+                .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
+            let groups = accumulator.finish()?;
+            let group_count = accumulator.group_count();
+            (groups, accumulator.metrics(), group_count)
+        };
+        let finish_us = finish_started.elapsed().as_micros() as u64;
+        tracing::info!(
+            target: "vein.audit",
+            event = "aggregate_finished",
+            input_rows = aggregate_metrics.input_rows,
+            grouping_sets = aggregate_metrics.grouping_sets,
+            grouping_probes = aggregate_metrics.grouping_probes,
+            group_index_candidate_checks = aggregate_metrics.group_index_candidate_checks,
+            full_hash_matches = aggregate_metrics.full_hash_matches,
+            group_key_comparisons = aggregate_metrics.group_key_comparisons,
+            group_collision_retries = aggregate_metrics.group_collision_retries,
+            group_index_hits = aggregate_metrics.group_index_hits,
+            group_index_misses = aggregate_metrics.group_index_misses,
+            new_groups = aggregate_metrics.new_groups,
+            groups = group_count,
+            retained_key_slots_initialized = aggregate_metrics.retained_key_slots_initialized,
+            string_key_bytes_copied = aggregate_metrics.string_key_bytes_copied,
+            hash_generation_ns = aggregate_metrics.hash_generation_ns,
+            group_resolution_us = aggregate_metrics.group_resolution_us,
+            group_materialize_us = aggregate_metrics.group_materialize_us,
+            state_update_us = aggregate_metrics.state_update_us,
+            finish_us,
+            "aggregate_finished"
+        );
         if let Some(program) = post_aggregate_program {
             let vm_started = Instant::now();
             let mut post_vm = self.builder.build_vm(program, head)?;
@@ -544,7 +583,12 @@ impl DefaultTaskExecutor {
                         )),
                         task.limit,
                     );
-                    let head = ordered_head(task.sort.clone(), task.sort_output_columns, head);
+                    let head = ordered_head(
+                        task.sort.clone(),
+                        task.sort_output_columns,
+                        task.limit,
+                        head,
+                    );
                     let head = sort_key_head(
                         self.builder.as_ref(),
                         task.sort_key_program.as_ref(),
@@ -652,12 +696,14 @@ fn with_window(
 fn ordered_head(
     sort: Option<SortPlan>,
     output_columns: Option<u32>,
+    limit: Option<LimitSpec>,
     next: Box<dyn PipelineNode<DataChunk>>,
 ) -> Box<dyn PipelineNode<DataChunk>> {
     match sort {
-        Some(plan) => Box::new(SortTransform::with_output_columns(
+        Some(plan) => Box::new(SortTransform::with_limit(
             plan,
             output_columns.map(|columns| columns as usize),
+            limit,
             next,
         )),
         None => next,

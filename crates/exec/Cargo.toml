@@ -7,6 +7,7 @@ edition = "2024"
 catalog = { path = "../catalog" }
 common = { path = "../common" }
 error = { path = "../error" }
+hashbrown = "0.17.1"
 tokio = { workspace = true }
 arrow = { workspace = true }
 arrow-row = { workspace = true }

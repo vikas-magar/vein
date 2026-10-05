@@ -10,8 +10,9 @@
 //! A `DISTINCT` arrives here as the same shape with every column a key and no
 //! aggregates, which is why it has no operator of its own.
 
-use std::collections::HashMap;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use arrow::array::{
     Array, ArrayRef, Decimal128Array, Float16Array, Float32Array, Float64Array, Int16Array,
@@ -19,12 +20,19 @@ use arrow::array::{
     UInt8Array, Decimal256Array,
 };
 use arrow::datatypes::i256;
+use arrow::buffer::NullBuffer;
+use hashbrown::DefaultHashBuilder;
 
+mod group_index;
+use group_index::{GroupIndex, GroupIndexEntry, ProbeResolution};
 use crate::pipeline::{DataChunk, PipelineNode};
+use common::arrow::SelectionVector;
 use common::Result;
 use common::protocol::{AggOpCode, AggregatePlan};
 use error::VeinError;
 use types::VeinDataType;
+
+type GroupHasher = <DefaultHashBuilder as BuildHasher>::Hasher;
 
 /// One group key value, kept in the shape its output column needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +41,26 @@ enum KeyValue {
     Int64(i64),
     UInt64(u64),
     Utf8(String),
+}
+
+/// A key value borrowed from the current Arrow batch.
+#[derive(Clone, Copy, Hash, PartialEq)]
+enum KeyValueRef<'a> {
+    Null,
+    Int64(i64),
+    UInt64(u64),
+    Utf8(&'a str),
+}
+
+impl KeyValueRef<'_> {
+    fn to_owned(self) -> KeyValue {
+        match self {
+            Self::Null => KeyValue::Null,
+            Self::Int64(value) => KeyValue::Int64(value),
+            Self::UInt64(value) => KeyValue::UInt64(value),
+            Self::Utf8(value) => KeyValue::Utf8(value.to_owned()),
+        }
+    }
 }
 
 /// Operations shared by every numeric accumulator type.
@@ -359,13 +387,43 @@ impl<'a> AggregateInput<'a> {
 /// Shared selected-row fold, monomorphized for a kernel's accumulator type.
 fn update_numeric_states<T: AggregateValue>(
     states: &mut [NumericAccumulator<T>],
-    group_rows: &[(usize, usize)],
+    group_rows: GroupRows<'_>,
     value_at: impl Fn(usize) -> Option<T>,
 ) -> Result<()> {
-    for &(slot, row) in group_rows {
+    for (slot, row) in group_rows {
         states[slot].update(value_at(row))?;
     }
     Ok(())
+}
+
+/// Zero-allocation view pairing per-row group IDs with the input selection.
+#[derive(Clone, Copy)]
+struct GroupRows<'a> {
+    group_ids: &'a [usize],
+    selection: &'a SelectionVector,
+    position: usize,
+}
+
+impl<'a> GroupRows<'a> {
+    fn new(group_ids: &'a [usize], selection: &'a SelectionVector) -> Self {
+        debug_assert_eq!(group_ids.len(), selection.size());
+        Self {
+            group_ids,
+            selection,
+            position: 0,
+        }
+    }
+}
+
+impl Iterator for GroupRows<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let position = self.position;
+        let group_id = *self.group_ids.get(position)?;
+        self.position += 1;
+        Some((group_id, self.selection.get_index(position)))
+    }
 }
 
 fn numeric_values<T: Copy>(states: &[NumericAccumulator<T>]) -> Vec<Option<T>> {
@@ -547,11 +605,11 @@ impl AggregateStateColumn {
     fn update_batch(
         &mut self,
         input: AggregateInput<'_>,
-        group_rows: &[(usize, usize)],
+        group_rows: GroupRows<'_>,
     ) -> Result<()> {
         match (self, input) {
             (Self::Count(states), AggregateInput::Count(array)) => {
-                for &(slot, row) in group_rows {
+                for (slot, row) in group_rows {
                     if !array.is_null(row) {
                         states[slot] += 1;
                     }
@@ -682,7 +740,7 @@ impl AggregateStateColumn {
     fn to_array(&self, op: AggOpCode, data_type: &VeinDataType) -> Result<ArrayRef> {
         Ok(match (self, op, data_type) {
             (Self::Count(states), AggOpCode::Count, VeinDataType::Int64) => {
-                Arc::new(Int64Array::from(states.clone()))
+                Arc::new(Int64Array::from_iter_values(states.iter().copied()))
             }
             (Self::Int64 { states, .. }, AggOpCode::Sum | AggOpCode::Min | AggOpCode::Max, VeinDataType::Int64) => {
                 Arc::new(Int64Array::from(numeric_values(states)))
@@ -784,9 +842,9 @@ impl AggregateStateColumn {
     }
 }
 
-/// One group: its key and slot in every aggregate state column.
+/// One group's non-key state.
 struct Group {
-    key: Vec<KeyValue>,
+    grouping_set_id: usize,
 }
 
 /// Absorbs rows into groups, then emits one row per group.
@@ -794,11 +852,47 @@ pub struct AggregateSink {
     plan: AggregatePlan,
     /// Each grouping set's key positions in the projected key columns.
     grouping_sets: Vec<Vec<u32>>,
-    /// Encoded key to index in `groups`: encoding each key once makes a group
-    /// lookup a hash of bytes rather than a comparison of typed columns.
-    index: HashMap<Vec<u8>, usize>,
+    /// Grouping-set membership by key column, prepared once per plan.
+    grouping_sets_by_column: Vec<Vec<usize>>,
+    /// Prehashed group slots; equality is checked against retained columnar keys.
+    index: GroupIndex,
+    hash_builder: DefaultHashBuilder,
+    /// Reused hash and probe storage for the current input batch.
+    group_hashers: Vec<GroupHasher>,
+    group_hashes: Vec<u64>,
+    batch_group_ids: Vec<usize>,
+    /// Candidate indexes that will become new groups after this batch resolves.
+    batch_new_groups: Vec<usize>,
+    /// Group key values stored by key column, indexed by group slot.
+    group_keys: Vec<Vec<KeyValue>>,
+    /// Reusable group IDs for each grouping set in the current input batch.
+    group_ids_by_set: Vec<Vec<usize>>,
     groups: Vec<Group>,
     aggregate_states: Vec<AggregateStateColumn>,
+    metrics: AggregateMetrics,
+}
+
+/// Low-overhead counters and phase timings for one aggregate sink.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AggregateMetrics {
+    pub(crate) input_rows: u64,
+    pub(crate) grouping_sets: u64,
+    pub(crate) grouping_probes: u64,
+    pub(crate) group_index_candidate_checks: u64,
+    pub(crate) full_hash_matches: u64,
+    pub(crate) group_key_comparisons: u64,
+    pub(crate) group_collision_retries: u64,
+    pub(crate) group_index_hits: u64,
+    pub(crate) group_index_misses: u64,
+    pub(crate) new_groups: u64,
+    pub(crate) retained_key_slots_initialized: u64,
+    pub(crate) string_key_bytes_copied: u64,
+    pub(crate) hash_generation_ns: u64,
+    /// Resolving candidates to group slots, including collision checks and new groups.
+    pub(crate) group_resolution_us: u64,
+    /// Copying each batch's newly discovered key rows into owned group state.
+    pub(crate) group_materialize_us: u64,
+    pub(crate) state_update_us: u64,
 }
 
 impl AggregateSink {
@@ -844,6 +938,12 @@ impl AggregateSink {
                 seen.push(column);
             }
         }
+        let mut grouping_sets_by_column = vec![Vec::new(); groups];
+        for (set_id, grouping_set) in grouping_sets.iter().enumerate() {
+            for &column in grouping_set {
+                grouping_sets_by_column[column as usize].push(set_id);
+            }
+        }
         let aggregate_states = plan
             .aggs
             .iter()
@@ -853,10 +953,23 @@ impl AggregateSink {
                 AggregateStateColumn::new(*op, input_type, result_type)
             })
             .collect::<Result<Vec<_>>>()?;
+        let group_ids_by_set = (0..grouping_sets.len()).map(|_| Vec::new()).collect();
         Ok(Self {
             plan,
+            metrics: AggregateMetrics {
+                grouping_sets: grouping_sets.len() as u64,
+                ..AggregateMetrics::default()
+            },
             grouping_sets,
-            index: HashMap::new(),
+            grouping_sets_by_column,
+            index: GroupIndex::default(),
+            hash_builder: DefaultHashBuilder::default(),
+            group_hashers: Vec::new(),
+            group_hashes: Vec::new(),
+            batch_group_ids: Vec::new(),
+            batch_new_groups: Vec::new(),
+            group_keys: (0..groups).map(|_| Vec::new()).collect(),
+            group_ids_by_set,
             groups: Vec::new(),
             aggregate_states,
         })
@@ -865,11 +978,16 @@ impl AggregateSink {
     /// Adds a group slot and its corresponding state to every aggregate.
     fn push_group(
         groups: &mut Vec<Group>,
+        group_keys: &mut [Vec<KeyValue>],
         aggregate_states: &mut [AggregateStateColumn],
-        key: Vec<KeyValue>,
+        key_values: &[KeyValueRef<'_>],
+        grouping_set_id: usize,
     ) -> Result<usize> {
         let slot = groups.len();
-        groups.push(Group { key });
+        for (key_column, value) in group_keys.iter_mut().zip(key_values.iter().copied()) {
+            key_column.push(value.to_owned());
+        }
+        groups.push(Group { grouping_set_id });
         for column in aggregate_states {
             column.push_group();
         }
@@ -886,57 +1004,235 @@ impl AggregateSink {
                 chunk.num_columns()
             )));
         }
-        let mut key = Vec::new();
-        let mut group_rows = Vec::with_capacity(
-            chunk.selection.size().saturating_mul(self.grouping_sets.len()),
-        );
-        for logical_row in 0..chunk.selection.size() {
-            let row = chunk.selection.get_index(logical_row);
-            for (set_id, grouping_set) in self.grouping_sets.iter().enumerate() {
-                key.clear();
-                key.extend_from_slice(&(set_id as u64).to_le_bytes());
-                let mut values = vec![KeyValue::Null; groups];
-                for &column in grouping_set {
-                    let column = column as usize;
-                    let value = key_value(chunk.column(column), row)?;
-                    encode(&value, &mut key);
-                    values[column] = value;
-                }
-
-                // Include the set identity: an omitted key and a real NULL key
-                // can have equal output values but remain distinct groups.
-                let slot = match self.index.get(&key).copied() {
-                    Some(slot) => slot,
-                    None => {
-                        let slot = Self::push_group(
-                            &mut self.groups,
-                            &mut self.aggregate_states,
-                            values,
-                        )?;
-                        self.index.insert(key.clone(), slot);
-                        slot
-                    }
-                };
-                group_rows.push((slot, row));
+        for group_ids in &mut self.group_ids_by_set {
+            group_ids.clear();
+            if group_ids.capacity() < chunk.selection.size() {
+                group_ids.reserve(chunk.selection.size());
             }
+        }
+        let mut key_columns = std::iter::repeat_with(|| None)
+            .take(groups)
+            .collect::<Vec<Option<GroupKeyColumn<'_>>>>();
+        for &column in self.grouping_sets.iter().flatten() {
+            let column = column as usize;
+            if key_columns[column].is_none() {
+                key_columns[column] = Some(GroupKeyColumn::new(chunk.column(column))?);
+            }
+        }
+        self.metrics.input_rows = self
+            .metrics
+            .input_rows
+            .saturating_add(chunk.selection.size() as u64);
+        let input_rows = chunk.selection.size();
+        let grouping_set_count = self.grouping_sets.len();
+        let candidate_count = input_rows
+            .checked_mul(grouping_set_count)
+            .ok_or_else(|| VeinError::internal("aggregate batch candidate count overflow"))?;
+        self.group_hashers.clear();
+        self.group_hashers
+            .try_reserve(candidate_count)
+            .map_err(|error| {
+                VeinError::internal(format!("cannot reserve aggregate hash states: {error}"))
+            })?;
+        self.group_hashes.clear();
+        self.group_hashes
+            .try_reserve(candidate_count)
+            .map_err(|error| {
+                VeinError::internal(format!("cannot reserve aggregate group hashes: {error}"))
+            })?;
+        let hash_generation_started = Instant::now();
+        for candidate in 0..candidate_count {
+            let set_id = candidate % grouping_set_count;
+            let mut hasher = self.hash_builder.build_hasher();
+            set_id.hash(&mut hasher);
+            self.group_hashers.push(hasher);
+        }
+        for (column, key_column) in key_columns.iter().enumerate() {
+            if let Some(key_column) = key_column {
+                key_column.hash_batch(
+                    column as u32,
+                    &chunk.selection,
+                    &self.grouping_sets_by_column[column],
+                    grouping_set_count,
+                    &mut self.group_hashers,
+                );
+            }
+        }
+        self.group_hashes
+            .extend(self.group_hashers.iter().map(Hasher::finish));
+        let hash_generation_ns = hash_generation_started.elapsed().as_nanos() as u64;
+        self.metrics.hash_generation_ns = self
+            .metrics
+            .hash_generation_ns
+            .saturating_add(hash_generation_ns);
+
+        self.metrics.grouping_probes = self
+            .metrics
+            .grouping_probes
+            .saturating_add(candidate_count as u64);
+        let hashes = &self.group_hashes;
+        let index = &mut self.index;
+        let batch_group_ids = &mut self.batch_group_ids;
+        let groups_store = &mut self.groups;
+        let group_keys_store = &mut self.group_keys;
+        let aggregate_states = &mut self.aggregate_states;
+        let metrics = &mut self.metrics;
+        let new_groups = &mut self.batch_new_groups;
+        new_groups.clear();
+        new_groups.try_reserve(candidate_count).map_err(|error| {
+            VeinError::internal(format!("cannot reserve aggregate batch groups: {error}"))
+        })?;
+        let resolution_started = Instant::now();
+        let candidate_checks = index.resolve_rows(hashes, batch_group_ids, |candidate, existing_slot| {
+            let set_id = candidate % grouping_set_count;
+            let logical_row = candidate / grouping_set_count;
+            let grouping_set = &self.grouping_sets[set_id];
+            let row = chunk.selection.get_index(logical_row);
+            match existing_slot {
+                Some(slot) => {
+                    metrics.full_hash_matches = metrics.full_hash_matches.saturating_add(1);
+                    let (existing_set_id, keys_match) = if slot < groups_store.len() {
+                        (
+                            groups_store[slot].grouping_set_id,
+                            grouping_set.iter().all(|&column| {
+                                metrics.group_key_comparisons =
+                                    metrics.group_key_comparisons.saturating_add(1);
+                                let column = column as usize;
+                                key_columns[column]
+                                    .as_ref()
+                                    .expect("grouping set columns have a batch view")
+                                    .matches_key(row, &group_keys_store[column][slot])
+                            }),
+                        )
+                    } else {
+                        let leader = new_groups[slot - groups_store.len()];
+                        let leader_set_id = leader % grouping_set_count;
+                        let leader_row = chunk
+                            .selection
+                            .get_index(leader / grouping_set_count);
+                        let keys_match = leader_set_id == set_id
+                            && grouping_set.iter().all(|&column| {
+                            metrics.group_key_comparisons =
+                                metrics.group_key_comparisons.saturating_add(1);
+                            let column = column as usize;
+                            key_columns[column]
+                                .as_ref()
+                                .expect("grouping set columns have a batch view")
+                                .rows_equal(row, leader_row)
+                        });
+                        (leader_set_id, keys_match)
+                    };
+                    if existing_set_id != set_id {
+                        return Ok(ProbeResolution::Retry);
+                    }
+                    if keys_match {
+                        metrics.group_index_hits = metrics.group_index_hits.saturating_add(1);
+                        Ok(ProbeResolution::Match(slot))
+                    } else {
+                        metrics.group_collision_retries =
+                            metrics.group_collision_retries.saturating_add(1);
+                        Ok(ProbeResolution::Retry)
+                    }
+                }
+                None => {
+                    metrics.group_index_misses = metrics.group_index_misses.saturating_add(1);
+                    let slot = groups_store.len() + new_groups.len();
+                    new_groups.push(candidate);
+                    Ok(ProbeResolution::Insert(slot))
+                }
+            }
+        })?;
+        metrics.group_index_candidate_checks = metrics
+            .group_index_candidate_checks
+            .saturating_add(candidate_checks);
+        metrics.group_resolution_us = metrics
+            .group_resolution_us
+            .saturating_add(resolution_started.elapsed().as_micros() as u64);
+
+        let materialize_started = Instant::now();
+        groups_store.try_reserve(new_groups.len()).map_err(|error| {
+            VeinError::internal(format!("cannot reserve aggregate groups: {error}"))
+        })?;
+        for key_column in group_keys_store.iter_mut() {
+            key_column.try_reserve(new_groups.len()).map_err(|error| {
+                VeinError::internal(format!("cannot reserve aggregate group keys: {error}"))
+            })?;
+        }
+        let mut key_values = vec![KeyValueRef::Null; groups];
+        let group_slot_base = groups_store.len();
+        for (new_group_index, &candidate) in new_groups.iter().enumerate() {
+            let set_id = candidate % grouping_set_count;
+            let logical_row = candidate / grouping_set_count;
+            let row = chunk.selection.get_index(logical_row);
+            let grouping_set = &self.grouping_sets[set_id];
+            key_values.fill(KeyValueRef::Null);
+            for &column in grouping_set {
+                let column = column as usize;
+                key_values[column] = key_columns[column]
+                    .as_ref()
+                    .expect("grouping set columns have a batch view")
+                    .value(row);
+                if let KeyValueRef::Utf8(value) = key_values[column] {
+                    metrics.string_key_bytes_copied = metrics
+                        .string_key_bytes_copied
+                        .saturating_add(value.len() as u64);
+                }
+            }
+            metrics.retained_key_slots_initialized = metrics
+                .retained_key_slots_initialized
+                .saturating_add(groups as u64);
+            let slot = Self::push_group(
+                groups_store,
+                group_keys_store,
+                aggregate_states,
+                &key_values,
+                set_id,
+            )?;
+            debug_assert_eq!(slot, group_slot_base + new_group_index);
+        }
+        metrics.new_groups = metrics
+            .new_groups
+            .saturating_add(new_groups.len() as u64);
+        metrics.group_materialize_us = metrics
+            .group_materialize_us
+            .saturating_add(materialize_started.elapsed().as_micros() as u64);
+
+        for group_ids in &mut self.group_ids_by_set {
+            group_ids.clear();
+        }
+        for (candidate, &slot) in self.batch_group_ids.iter().enumerate() {
+            self.group_ids_by_set[candidate % grouping_set_count].push(slot);
         }
 
         // Resolve each physical input layout once per aggregate column and
         // batch, then fold the selected rows through the borrowed view.
+        let state_update_started = Instant::now();
         for (offset, op) in self.plan.aggs.iter().enumerate() {
             let input = AggregateInput::new(
                 *op,
                 &self.plan.aggregate_input_types[offset],
                 chunk.column(groups + offset),
             )?;
-            self.aggregate_states[offset].update_batch(input, &group_rows)?;
+            for group_ids in &self.group_ids_by_set {
+                self.aggregate_states[offset]
+                    .update_batch(input, GroupRows::new(group_ids, &chunk.selection))?;
+            }
         }
+        self.metrics.state_update_us = self
+            .metrics
+            .state_update_us
+            .saturating_add(state_update_started.elapsed().as_micros() as u64);
         Ok(())
+    }
+
+    pub(crate) fn metrics(&self) -> AggregateMetrics {
+        self.metrics
     }
 
     /// The finished groups, as one chunk in the plan's output types.
     pub fn finish(&mut self) -> Result<Vec<DataChunk>> {
         if self.groups.is_empty() {
+            let empty_key_values = vec![KeyValueRef::Null; self.plan.groups as usize];
             let empty_sets: Vec<usize> = self
                 .grouping_sets
                 .iter()
@@ -944,15 +1240,26 @@ impl AggregateSink {
                 .filter_map(|(set_id, grouping_set)| grouping_set.is_empty().then_some(set_id))
                 .collect();
             for set_id in empty_sets {
-                let key = (set_id as u64).to_le_bytes().to_vec();
-                if !self.index.contains_key(&key) {
-                    Self::push_group(
+                let mut hasher = self.hash_builder.build_hasher();
+                set_id.hash(&mut hasher);
+                let hash = hasher.finish();
+                let exists = self.index.find(hash, |entry| {
+                    self.groups[entry.slot].grouping_set_id == set_id
+                });
+                if exists.is_none() {
+                    let slot = Self::push_group(
                         &mut self.groups,
+                        &mut self.group_keys,
                         &mut self.aggregate_states,
-                        vec![KeyValue::Null; self.plan.groups as usize],
+                        &empty_key_values,
+                        set_id,
                     )?;
-                    let slot = self.groups.len() - 1;
-                    self.index.insert(key, slot);
+                    self.index
+                        .insert_unique(GroupIndexEntry { hash, slot })?;
+                    self.metrics.retained_key_slots_initialized = self
+                        .metrics
+                        .retained_key_slots_initialized
+                        .saturating_add(self.plan.groups as u64);
                 }
             }
             if self.groups.is_empty() {
@@ -970,7 +1277,7 @@ impl AggregateSink {
     fn column(&self, column: usize, data_type: &VeinDataType) -> Result<ArrayRef> {
         let groups = self.plan.groups as usize;
         if column < groups {
-            return key_column(&self.groups, column, data_type);
+            return key_column(&self.group_keys[column], data_type);
         }
         let offset = column - groups;
         self.aggregate_states[offset].to_array(self.plan.aggs[offset], data_type)
@@ -1010,67 +1317,210 @@ pub fn shared(
     Ok((sink, handle))
 }
 
-/// One key column's value at `row`.
-fn key_value(array: &ArrayRef, row: usize) -> Result<KeyValue> {
-    if array.is_null(row) {
-        return Ok(KeyValue::Null);
-    }
-    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
-        return Ok(KeyValue::Int64(values.value(row)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<UInt8Array>() {
-        return Ok(KeyValue::UInt64(values.value(row) as u64));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<UInt16Array>() {
-        return Ok(KeyValue::UInt64(values.value(row) as u64));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<UInt32Array>() {
-        return Ok(KeyValue::UInt64(values.value(row) as u64));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
-        return Ok(KeyValue::UInt64(values.value(row)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(KeyValue::Utf8(values.value(row).to_string()));
-    }
-    Err(VeinError::internal(format!(
-        "grouping by {:?} is not supported yet",
-        array.data_type()
-    )))
+/// A borrowed, type-resolved view of a grouping column in one input batch.
+enum GroupKeyColumn<'a> {
+    Int64(&'a Int64Array),
+    UInt8(&'a UInt8Array),
+    UInt16(&'a UInt16Array),
+    UInt32(&'a UInt32Array),
+    UInt64(&'a UInt64Array),
+    Utf8(&'a StringArray),
 }
 
-/// Appends a key value to a group key's encoding.
-///
-/// Each value carries a tag, so a `NULL` and an empty string cannot encode the
-/// same way, and each string carries its length, so neither can two adjacent
-/// columns run together.
-fn encode(value: &KeyValue, out: &mut Vec<u8>) {
-    match value {
-        KeyValue::Null => out.push(0),
-        KeyValue::Int64(value) => {
-            out.push(1);
-            out.extend_from_slice(&value.to_le_bytes());
+impl<'a> GroupKeyColumn<'a> {
+    fn new(array: &'a ArrayRef) -> Result<Self> {
+        let invalid_type = || {
+            VeinError::internal(format!(
+                "grouping by {:?} is not supported yet",
+                array.data_type()
+            ))
+        };
+        if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+            return Ok(Self::Int64(values));
         }
-        KeyValue::UInt64(value) => {
-            out.push(3);
-            out.extend_from_slice(&value.to_le_bytes());
+        if let Some(values) = array.as_any().downcast_ref::<UInt8Array>() {
+            return Ok(Self::UInt8(values));
         }
-        KeyValue::Utf8(value) => {
-            out.push(2);
-            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            out.extend_from_slice(value.as_bytes());
+        if let Some(values) = array.as_any().downcast_ref::<UInt16Array>() {
+            return Ok(Self::UInt16(values));
+        }
+        if let Some(values) = array.as_any().downcast_ref::<UInt32Array>() {
+            return Ok(Self::UInt32(values));
+        }
+        if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
+            return Ok(Self::UInt64(values));
+        }
+        if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+            return Ok(Self::Utf8(values));
+        }
+        Err(invalid_type())
+    }
+
+    fn value(&self, row: usize) -> KeyValueRef<'a> {
+        match self {
+            Self::Int64(values) if values.is_null(row) => KeyValueRef::Null,
+            Self::Int64(values) => KeyValueRef::Int64(values.value(row)),
+            Self::UInt8(values) if values.is_null(row) => KeyValueRef::Null,
+            Self::UInt8(values) => KeyValueRef::UInt64(values.value(row) as u64),
+            Self::UInt16(values) if values.is_null(row) => KeyValueRef::Null,
+            Self::UInt16(values) => KeyValueRef::UInt64(values.value(row) as u64),
+            Self::UInt32(values) if values.is_null(row) => KeyValueRef::Null,
+            Self::UInt32(values) => KeyValueRef::UInt64(values.value(row) as u64),
+            Self::UInt64(values) if values.is_null(row) => KeyValueRef::Null,
+            Self::UInt64(values) => KeyValueRef::UInt64(values.value(row)),
+            Self::Utf8(values) if values.is_null(row) => KeyValueRef::Null,
+            Self::Utf8(values) => KeyValueRef::Utf8(values.value(row)),
+        }
+    }
+
+    fn matches_key(&self, row: usize, key: &KeyValue) -> bool {
+        match (self, key) {
+            (Self::Int64(values), KeyValue::Null) => values.is_null(row),
+            (Self::Int64(values), KeyValue::Int64(key)) => {
+                !values.is_null(row) && values.value(row) == *key
+            }
+            (Self::UInt8(values), KeyValue::Null) => values.is_null(row),
+            (Self::UInt8(values), KeyValue::UInt64(key)) => {
+                !values.is_null(row) && u64::from(values.value(row)) == *key
+            }
+            (Self::UInt16(values), KeyValue::Null) => values.is_null(row),
+            (Self::UInt16(values), KeyValue::UInt64(key)) => {
+                !values.is_null(row) && u64::from(values.value(row)) == *key
+            }
+            (Self::UInt32(values), KeyValue::Null) => values.is_null(row),
+            (Self::UInt32(values), KeyValue::UInt64(key)) => {
+                !values.is_null(row) && u64::from(values.value(row)) == *key
+            }
+            (Self::UInt64(values), KeyValue::Null) => values.is_null(row),
+            (Self::UInt64(values), KeyValue::UInt64(key)) => {
+                !values.is_null(row) && values.value(row) == *key
+            }
+            (Self::Utf8(values), KeyValue::Null) => values.is_null(row),
+            (Self::Utf8(values), KeyValue::Utf8(key)) => {
+                !values.is_null(row) && values.value(row) == key
+            }
+            _ => false,
+        }
+    }
+
+    fn rows_equal(&self, left: usize, right: usize) -> bool {
+        macro_rules! nullable_equal {
+                ($values:expr) => {{
+                    let left_null = $values.is_null(left);
+                    let right_null = $values.is_null(right);
+                    left_null == right_null
+                        && (left_null || $values.value(left) == $values.value(right))
+                }};
+            }
+
+        match self {
+            Self::Int64(values) => nullable_equal!(values),
+            Self::UInt8(values) => nullable_equal!(values),
+            Self::UInt16(values) => nullable_equal!(values),
+            Self::UInt32(values) => nullable_equal!(values),
+            Self::UInt64(values) => nullable_equal!(values),
+            Self::Utf8(values) => nullable_equal!(values),
+        }
+    }
+
+    fn hash_batch<H: Hasher>(
+        &self,
+        column: u32,
+        selection: &SelectionVector,
+        grouping_set_ids: &[usize],
+        grouping_set_count: usize,
+        hashers: &mut [H],
+    ) {
+        match self {
+            Self::Int64(values) => hash_nullable_column(
+                column,
+                selection,
+                grouping_set_ids,
+                grouping_set_count,
+                values.nulls(),
+                |row| values.value(row),
+                hashers,
+            ),
+            Self::UInt8(values) => hash_nullable_column(
+                column,
+                selection,
+                grouping_set_ids,
+                grouping_set_count,
+                values.nulls(),
+                |row| u64::from(values.value(row)),
+                hashers,
+            ),
+            Self::UInt16(values) => hash_nullable_column(
+                column,
+                selection,
+                grouping_set_ids,
+                grouping_set_count,
+                values.nulls(),
+                |row| u64::from(values.value(row)),
+                hashers,
+            ),
+            Self::UInt32(values) => hash_nullable_column(
+                column,
+                selection,
+                grouping_set_ids,
+                grouping_set_count,
+                values.nulls(),
+                |row| u64::from(values.value(row)),
+                hashers,
+            ),
+            Self::UInt64(values) => hash_nullable_column(
+                column,
+                selection,
+                grouping_set_ids,
+                grouping_set_count,
+                values.nulls(),
+                |row| values.value(row),
+                hashers,
+            ),
+            Self::Utf8(values) => hash_nullable_column(
+                column,
+                selection,
+                grouping_set_ids,
+                grouping_set_count,
+                values.nulls(),
+                |row| values.value(row),
+                hashers,
+            ),
+        }
+    }
+}
+
+fn hash_nullable_column<T: Hash, H: Hasher>(
+    column: u32,
+    selection: &SelectionVector,
+    grouping_set_ids: &[usize],
+    grouping_set_count: usize,
+    validity: Option<&NullBuffer>,
+    value_at: impl Fn(usize) -> T,
+    hashers: &mut [H],
+) {
+    for logical_row in 0..selection.size() {
+        let row = selection.get_index(logical_row);
+        for &set_id in grouping_set_ids {
+            let hasher = &mut hashers[logical_row * grouping_set_count + set_id];
+            column.hash(hasher);
+            if validity.is_some_and(|nulls| !nulls.is_valid(row)) {
+                Option::<T>::None.hash(hasher);
+            } else {
+                Some(value_at(row)).hash(hasher);
+            }
         }
     }
 }
 
 /// One key column, built from every group.
-fn key_column(groups: &[Group], column: usize, data_type: &VeinDataType) -> Result<ArrayRef> {
+fn key_column(keys: &[KeyValue], data_type: &VeinDataType) -> Result<ArrayRef> {
     Ok(match data_type {
         VeinDataType::Int64 => {
-            let values: Vec<Option<i64>> = groups
+            let values: Vec<Option<i64>> = keys
                 .iter()
-                .map(|group| match group.key[column] {
-                    KeyValue::Int64(value) => Some(value),
+                .map(|key| match key {
+                    KeyValue::Int64(value) => Some(*value),
                     KeyValue::Null => None,
                     KeyValue::UInt64(_) | KeyValue::Utf8(_) => {
                         unreachable!("an int64 key column holds int64 keys")
@@ -1080,28 +1530,28 @@ fn key_column(groups: &[Group], column: usize, data_type: &VeinDataType) -> Resu
             Arc::new(Int64Array::from(values))
         }
         VeinDataType::UInt8 => Arc::new(UInt8Array::from(
-            unsigned_key_values(groups, column)
+            unsigned_key_values(keys)
                 .into_iter()
                 .map(|value| value.map(|value| value as u8))
                 .collect::<Vec<_>>(),
         )),
         VeinDataType::UInt16 => Arc::new(UInt16Array::from(
-            unsigned_key_values(groups, column)
+            unsigned_key_values(keys)
                 .into_iter()
                 .map(|value| value.map(|value| value as u16))
                 .collect::<Vec<_>>(),
         )),
         VeinDataType::UInt32 => Arc::new(UInt32Array::from(
-            unsigned_key_values(groups, column)
+            unsigned_key_values(keys)
                 .into_iter()
                 .map(|value| value.map(|value| value as u32))
                 .collect::<Vec<_>>(),
         )),
-        VeinDataType::UInt64 => Arc::new(UInt64Array::from(unsigned_key_values(groups, column))),
+        VeinDataType::UInt64 => Arc::new(UInt64Array::from(unsigned_key_values(keys))),
         VeinDataType::Utf8 => {
-            let values: Vec<Option<&str>> = groups
+            let values: Vec<Option<&str>> = keys
                 .iter()
-                .map(|group| match &group.key[column] {
+                .map(|key| match key {
                     KeyValue::Utf8(value) => Some(value.as_str()),
                     KeyValue::Null => None,
                     KeyValue::Int64(_) | KeyValue::UInt64(_) => {
@@ -1119,11 +1569,11 @@ fn key_column(groups: &[Group], column: usize, data_type: &VeinDataType) -> Resu
     })
 }
 
-fn unsigned_key_values(groups: &[Group], column: usize) -> Vec<Option<u64>> {
-    groups
+fn unsigned_key_values(keys: &[KeyValue]) -> Vec<Option<u64>> {
+    keys
         .iter()
-        .map(|group| match group.key[column] {
-            KeyValue::UInt64(value) => Some(value),
+        .map(|key| match key {
+            KeyValue::UInt64(value) => Some(*value),
             KeyValue::Null => None,
             KeyValue::Int64(_) | KeyValue::Utf8(_) => {
                 unreachable!("an unsigned key column holds unsigned keys")
@@ -2130,6 +2580,14 @@ mod tests {
         ]))
             .unwrap();
 
+        let metrics = sink.metrics();
+        assert_eq!(metrics.input_rows, 2);
+        assert_eq!(metrics.grouping_sets, 3);
+        assert_eq!(metrics.grouping_probes, 6);
+        assert_eq!(metrics.new_groups, 5);
+        assert_eq!(metrics.retained_key_slots_initialized, 10);
+        assert_eq!(metrics.string_key_bytes_copied, 2);
+
         let output = sink.finish().unwrap();
         let batch = &output[0];
         let first_key = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -2137,18 +2595,25 @@ mod tests {
         let sums = batch.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
 
         assert_eq!(batch.num_rows(), 5);
-        assert_eq!(first_key.value(0), 1);
-        assert_eq!(second_key.value(0), "x");
-        assert_eq!(first_key.value(1), 1);
-        assert!(second_key.is_null(1));
-        assert!(first_key.is_null(2));
-        assert!(second_key.is_null(2));
-        assert_eq!(sums.value(2), 30);
-        assert!(first_key.is_null(3));
-        assert_eq!(second_key.value(3), "z");
-        assert!(first_key.is_null(4));
-        assert!(second_key.is_null(4));
-        assert_eq!(sums.value(4), 20);
+        let mut actual = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    (!first_key.is_null(row)).then(|| first_key.value(row)),
+                    (!second_key.is_null(row)).then(|| second_key.value(row)),
+                    sums.value(row),
+                )
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = vec![
+            (Some(1), Some("x"), 10),
+            (None, Some("z"), 20),
+            (Some(1), None, 10),
+            (None, None, 20),
+            (None, None, 30),
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2181,5 +2646,66 @@ mod tests {
                        .downcast_ref::<Int64Array>()
                        .unwrap()
                        .value(0), 0);
+    }
+
+    #[test]
+    fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
+        let plan = AggregatePlan {
+            groups: 1,
+            grouping_sets: None,
+            aggs: vec![AggOpCode::Sum],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Int64, VeinDataType::Int64],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+        sink.accumulate(DataChunk::from_vectors(vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![10])),
+        ]))
+            .unwrap();
+
+        let colliding_chunk = DataChunk::from_vectors(vec![
+            Arc::new(Int64Array::from(vec![2, 2])),
+            Arc::new(Int64Array::from(vec![20, 30])),
+        ]);
+        let colliding_key_column = GroupKeyColumn::new(colliding_chunk.column(0)).unwrap();
+        let mut colliding_hashers: Vec<_> = (0..colliding_chunk.selection.size())
+            .map(|_| sink.hash_builder.build_hasher())
+            .collect();
+        for hasher in &mut colliding_hashers {
+            0usize.hash(hasher);
+        }
+        colliding_key_column.hash_batch(
+            0,
+            &colliding_chunk.selection,
+            &[0],
+            1,
+            &mut colliding_hashers,
+        );
+        let colliding_hash = colliding_hashers[0].finish();
+        sink.index
+            .insert_unique(GroupIndexEntry {
+                hash: colliding_hash,
+                slot: 0,
+            })
+            .unwrap();
+        sink.accumulate(colliding_chunk).unwrap();
+        let metrics = sink.metrics();
+        assert_eq!(metrics.grouping_probes, 3);
+        assert_eq!(metrics.group_index_candidate_checks, 3);
+        assert_eq!(metrics.full_hash_matches, 3);
+        assert_eq!(metrics.group_key_comparisons, 3);
+        assert_eq!(metrics.group_collision_retries, 2);
+        assert_eq!(metrics.group_index_hits, 1);
+        assert_eq!(metrics.group_index_misses, 2);
+
+        let output = sink.finish().unwrap();
+        let batch = &output[0];
+        let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sums = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!((keys.value(0), sums.value(0)), (1, 10));
+        assert_eq!((keys.value(1), sums.value(1)), (2, 50));
     }
 }

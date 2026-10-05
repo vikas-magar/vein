@@ -88,6 +88,11 @@ const SCENARIOS: &[Scenario] = &[
         duckdb: "SELECT o_orderstatus, count(o_orderkey) AS order_count FROM './data/tpch/orders/*.parquet' GROUP BY o_orderstatus HAVING count(o_orderkey) > 50000",
     },
     Scenario {
+        name: "aggregate/high-cardinality",
+        vein: "FROM orders\n|> AGGREGATE count(o_orderkey) AS order_count GROUP BY o_orderkey",
+        duckdb: "SELECT o_orderkey, count(o_orderkey) AS order_count FROM './data/tpch/orders/*.parquet' GROUP BY o_orderkey",
+    },
+    Scenario {
         name: "order/multi-key-limit",
         vein: "FROM orders\n|> SELECT o_orderkey, o_totalprice\n|> ORDER o_totalprice DESC, o_orderkey ASC\n|> LIMIT 100",
         duckdb: "SELECT o_orderkey, o_totalprice FROM './data/tpch/orders/*.parquet' ORDER BY o_totalprice DESC, o_orderkey ASC LIMIT 100",
@@ -213,8 +218,9 @@ fn print_sample(name: &str, sample: &Measurement, duckdb: &str) {
 fn duckdb_millis(sql: &str, iterations: usize) -> Option<f64> {
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations.max(1) {
+        let query = format!("SET threads=1; EXPLAIN ANALYZE {sql}");
         let output = Command::new("duckdb")
-            .args([":memory:", "-c", &format!("EXPLAIN ANALYZE {sql}")])
+            .args([":memory:", "-c", &query])
             .output()
             .ok()?;
         if !output.status.success() {
@@ -290,6 +296,7 @@ fn report_environment(data_root: &Path) {
     println!("OS:            {}", os_version());
     println!("Compiler:      {}", command("rustc", &["--version"]));
     println!("Build flags:   debug_assertions={}", cfg!(debug_assertions));
+    println!("DuckDB threads: 1 (single-thread comparison)");
     println!("Dataset:       {}", data_root.display());
     println!("Cold/Warm:     warm");
 }
