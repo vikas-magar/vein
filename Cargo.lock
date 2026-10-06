@@ -1864,6 +1864,7 @@ name = "physical"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "catalog",
  "common",
  "error",
  "parser",

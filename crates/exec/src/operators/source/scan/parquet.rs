@@ -20,7 +20,8 @@ use parquet::file::metadata::ParquetMetaData;
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::Arc;
-use types::VeinSchema;
+use arrow::datatypes::{DataType as ArrowDataType, Schema, SchemaRef};
+use types::{VeinDataType, VeinSchema};
 use types::ResolvedColumnRef;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -29,6 +30,55 @@ use super::ScanFile;
 use catalog::{MetadataKey, MetadataKind, MetadataStore};
 
 const MAX_CONCURRENT_RANGE_READS: usize = 8;
+
+/// Builds the full Arrow schema hint required by Parquet while changing only
+/// the selected projected Utf8 columns to dictionary arrays.
+fn dictionary_schema_hint(
+    parquet_schema: &SchemaRef,
+    projected: &VeinSchema,
+    dictionary_columns: &[u32],
+) -> Result<SchemaRef> {
+    let mut dictionary_names = Vec::with_capacity(dictionary_columns.len());
+    for &index in dictionary_columns {
+        let column = projected.fields.get(index as usize).ok_or_else(|| {
+            VeinError::internal(format!("dictionary column index {index} is outside the projected schema"))
+        })?;
+        if column.data_type != VeinDataType::Utf8 {
+            return Err(VeinError::internal(format!(
+                "dictionary encoding is only supported for Utf8 grouping columns, got {:?}",
+                column.data_type
+            )));
+        }
+        dictionary_names.push(column.name.as_str());
+    }
+
+    let dictionary_type = ArrowDataType::Dictionary(
+        Box::new(ArrowDataType::Int32),
+        Box::new(ArrowDataType::Utf8),
+    );
+    let fields = parquet_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if dictionary_names.contains(&field.name().as_str()) {
+                Arc::new(field.as_ref().clone().with_data_type(dictionary_type.clone()))
+            } else {
+                Arc::clone(field)
+            }
+        })
+        .collect::<Vec<_>>();
+    for name in dictionary_names {
+        if !parquet_schema.fields().iter().any(|field| field.name() == name) {
+            return Err(VeinError::internal(format!(
+                "dictionary projected column '{name}' is missing from the Parquet schema"
+            )));
+        }
+    }
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        parquet_schema.metadata().clone(),
+    )))
+}
 
 /// Maps `fields` onto their Parquet root column indices, in source order.
 ///
@@ -254,6 +304,7 @@ pub async fn execute_parquet_scan(
     operator: &Operator,
     files: &[ScanFile],
     projected: &VeinSchema,
+    dictionary_columns: &[u32],
     pushdown: Option<&ScanPredicate>,
     metadata_store: &MetadataStore,
     registry: &Arc<FunctionRegistry>,
@@ -285,7 +336,7 @@ pub async fn execute_parquet_scan(
         };
         let stat_us = stat_started.elapsed().as_micros() as u64;
 
-        let reader = OpendalParquetReader::new(
+        let mut reader = OpendalParquetReader::new(
             operator,
             path,
             file_size_bytes,
@@ -298,24 +349,17 @@ pub async fn execute_parquet_scan(
             .as_ref()
             .and_then(|key| metadata_store.get::<ParquetMetaData>(key));
         let footer_hit = cached_footer.is_some();
-        let mut builder = match cached_footer {
-            Some(metadata) => {
-                let metadata = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
-                    .map_err(|error| {
-                        VeinError::internal(format!(
-                            "Failed to reuse Parquet metadata for '{path}': {error}"
-                        ))
-                    })?;
-                ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
-            }
+        let parquet_metadata = match cached_footer {
+            Some(metadata) => metadata,
             None => {
-                let builder = ParquetRecordBatchStreamBuilder::new(reader)
+                let metadata = reader
+                    .get_metadata(None)
                     .await
-                    .map_err(|e| {
-                        VeinError::internal(format!("Failed to build parquet stream: {}", e))
+                    .map_err(|error| {
+                        VeinError::internal(format!("Failed to read Parquet metadata: {error}"))
                     })?;
                 if let Some(key) = footer_key {
-                    metadata_store.insert(key, Arc::clone(builder.metadata()));
+                    metadata_store.insert(key, Arc::clone(&metadata));
                 }
                 tracing::debug!(
                     target: "vein.audit",
@@ -323,9 +367,26 @@ pub async fn execute_parquet_scan(
                     path = %path,
                     "parquet_footer_miss"
                 );
-                builder
+                metadata
             }
         };
+        let options = if dictionary_columns.is_empty() {
+            ArrowReaderOptions::new()
+        } else {
+            let default_metadata = ArrowReaderMetadata::try_new(
+                Arc::clone(&parquet_metadata),
+                ArrowReaderOptions::new(),
+            )
+            .map_err(|error| {
+                VeinError::internal(format!("Failed to infer Parquet schema for '{path}': {error}"))
+            })?;
+            let schema = dictionary_schema_hint(default_metadata.schema(), projected, dictionary_columns)?;
+            ArrowReaderOptions::new().with_schema(schema)
+        };
+        let arrow_metadata = ArrowReaderMetadata::try_new(parquet_metadata, options).map_err(|error| {
+            VeinError::internal(format!("Failed to configure Parquet reader for '{path}': {error}"))
+        })?;
+        let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_metadata);
 
         // Rows per scanned batch, overridable with `VEIN_SCAN_BATCH_ROWS` so the
         // value can be measured rather than argued about.
@@ -549,4 +610,62 @@ pub async fn execute_parquet_scan(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+    use std::sync::Arc;
+    use types::{ColumnId, ResolvedColumn};
+
+    #[test]
+    fn dictionary_schema_hint_changes_only_requested_utf8_fields() {
+        let metadata = std::collections::HashMap::from([("source".to_string(), "test".to_string())]);
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("status", DataType::Utf8, true),
+                Field::new("orderkey", DataType::Int64, false),
+            ],
+            metadata,
+        ));
+        let projected = VeinSchema::new(vec![
+            Arc::new(ResolvedColumn::new(
+                ColumnId(0),
+                "status",
+                None,
+                VeinDataType::Utf8,
+            )),
+            Arc::new(ResolvedColumn::new(
+                ColumnId(1),
+                "orderkey",
+                None,
+                VeinDataType::Int64,
+            )),
+        ]);
+
+        let hinted = dictionary_schema_hint(&schema, &projected, &[0]).expect("valid hint");
+
+        assert_eq!(
+            hinted.field(0).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
+        assert!(hinted.field(0).is_nullable());
+        assert_eq!(hinted.field(1).data_type(), &DataType::Int64);
+        assert_eq!(hinted.metadata()["source"], "test");
+    }
+
+    #[test]
+    fn dictionary_schema_hint_rejects_non_utf8_and_out_of_range_fields() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let projected = VeinSchema::new(vec![Arc::new(ResolvedColumn::new(
+            ColumnId(0),
+            "id",
+            None,
+            VeinDataType::Int64,
+        ))]);
+
+        assert!(dictionary_schema_hint(&schema, &projected, &[0]).is_err());
+        assert!(dictionary_schema_hint(&schema, &projected, &[1]).is_err());
+    }
 }

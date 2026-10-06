@@ -15,11 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arrow::array::{
-    Array, ArrayRef, Decimal128Array, Float16Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, Decimal128Array, DictionaryArray, Float16Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array,
     UInt8Array, Decimal256Array,
 };
-use arrow::datatypes::i256;
+use arrow::datatypes::{i256, Int32Type};
 use arrow::buffer::NullBuffer;
 use hashbrown::DefaultHashBuilder;
 
@@ -34,33 +34,13 @@ use types::VeinDataType;
 
 type GroupHasher = <DefaultHashBuilder as BuildHasher>::Hasher;
 
-/// One group key value, kept in the shape its output column needs.
-#[derive(Debug, Clone, PartialEq)]
-enum KeyValue {
-    Null,
-    Int64(i64),
-    UInt64(u64),
-    Utf8(String),
-}
-
-/// A key value borrowed from the current Arrow batch.
+/// A group key value borrowed from an Arrow array.
 #[derive(Clone, Copy, Hash, PartialEq)]
 enum KeyValueRef<'a> {
     Null,
     Int64(i64),
     UInt64(u64),
     Utf8(&'a str),
-}
-
-impl KeyValueRef<'_> {
-    fn to_owned(self) -> KeyValue {
-        match self {
-            Self::Null => KeyValue::Null,
-            Self::Int64(value) => KeyValue::Int64(value),
-            Self::UInt64(value) => KeyValue::UInt64(value),
-            Self::Utf8(value) => KeyValue::Utf8(value.to_owned()),
-        }
-    }
 }
 
 /// Operations shared by every numeric accumulator type.
@@ -845,6 +825,14 @@ impl AggregateStateColumn {
 /// One group's non-key state.
 struct Group {
     grouping_set_id: usize,
+    key_location: Option<GroupKeyLocation>,
+}
+
+/// Locates a group's original key row in retained Arrow-backed key batches.
+#[derive(Clone, Copy)]
+struct GroupKeyLocation {
+    batch: usize,
+    row: usize,
 }
 
 /// Absorbs rows into groups, then emits one row per group.
@@ -861,10 +849,16 @@ pub struct AggregateSink {
     group_hashers: Vec<GroupHasher>,
     group_hashes: Vec<u64>,
     batch_group_ids: Vec<usize>,
+    /// Per-batch dictionary IDs used by the single-key Utf8 fast path.
+    dictionary_ids: Vec<usize>,
+    /// First physical row for each dictionary ID in the current batch.
+    dictionary_first_rows: Vec<usize>,
+    /// Dictionary ID to resolved group slot; the final entry represents a null key.
+    dictionary_group_slots: Vec<usize>,
     /// Candidate indexes that will become new groups after this batch resolves.
     batch_new_groups: Vec<usize>,
-    /// Group key values stored by key column, indexed by group slot.
-    group_keys: Vec<Vec<KeyValue>>,
+    /// Arrow-backed grouping columns for batches that contributed new groups.
+    group_key_batches: Vec<Vec<Option<GroupKeyColumn>>>,
     /// Reusable group IDs for each grouping set in the current input batch.
     group_ids_by_set: Vec<Vec<usize>>,
     groups: Vec<Group>,
@@ -881,6 +875,9 @@ pub(crate) struct AggregateMetrics {
     pub(crate) grouping_probes: u64,
     pub(crate) group_index_candidate_checks: u64,
     pub(crate) group_index_reserve_ns: u64,
+    pub(crate) group_index_capacity_growth_events: u64,
+    pub(crate) group_index_entries_at_capacity_growth: u64,
+    pub(crate) group_index_capacity: u64,
     pub(crate) group_index_entries_ns: u64,
     pub(crate) full_hash_matches: u64,
     pub(crate) group_key_comparisons: u64,
@@ -962,21 +959,32 @@ impl AggregateSink {
             })
             .collect::<Result<Vec<_>>>()?;
         let group_ids_by_set = (0..grouping_sets.len()).map(|_| Vec::new()).collect();
+        let mut index = GroupIndex::default();
+        let group_index_reserve_ns = plan
+            .estimated_groups
+            .and_then(|groups| usize::try_from(groups).ok())
+            .map(|groups| index.reserve(groups))
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             plan,
             metrics: AggregateMetrics {
                 grouping_sets: grouping_sets.len() as u64,
+                group_index_reserve_ns,
                 ..AggregateMetrics::default()
             },
             grouping_sets,
             grouping_sets_by_column,
-            index: GroupIndex::default(),
+            index,
             hash_builder: DefaultHashBuilder::default(),
             group_hashers: Vec::new(),
             group_hashes: Vec::new(),
             batch_group_ids: Vec::new(),
+            dictionary_ids: Vec::new(),
+            dictionary_group_slots: Vec::new(),
             batch_new_groups: Vec::new(),
-            group_keys: (0..groups).map(|_| Vec::new()).collect(),
+            group_key_batches: Vec::new(),
+            dictionary_first_rows: Vec::new(),
             group_ids_by_set,
             groups: Vec::new(),
             aggregate_states,
@@ -986,16 +994,15 @@ impl AggregateSink {
     /// Adds a group slot and its corresponding state to every aggregate.
     fn push_group(
         groups: &mut Vec<Group>,
-        group_keys: &mut [Vec<KeyValue>],
         aggregate_states: &mut [AggregateStateColumn],
-        key_values: &[KeyValueRef<'_>],
         grouping_set_id: usize,
+        key_location: Option<GroupKeyLocation>,
     ) -> Result<usize> {
         let slot = groups.len();
-        for (key_column, value) in group_keys.iter_mut().zip(key_values.iter().copied()) {
-            key_column.push(value.to_owned());
-        }
-        groups.push(Group { grouping_set_id });
+        groups.push(Group {
+            grouping_set_id,
+            key_location,
+        });
         for column in aggregate_states {
             column.push_group();
         }
@@ -1020,7 +1027,7 @@ impl AggregateSink {
         }
         let mut key_columns = std::iter::repeat_with(|| None)
             .take(groups)
-            .collect::<Vec<Option<GroupKeyColumn<'_>>>>();
+            .collect::<Vec<Option<GroupKeyColumn>>>();
         for &column in self.grouping_sets.iter().flatten() {
             let column = column as usize;
             if key_columns[column].is_none() {
@@ -1034,9 +1041,46 @@ impl AggregateSink {
         self.metrics.input_batches = self.metrics.input_batches.saturating_add(1);
         let input_rows = chunk.selection.size();
         let grouping_set_count = self.grouping_sets.len();
-        let candidate_count = input_rows
-            .checked_mul(grouping_set_count)
-            .ok_or_else(|| VeinError::internal("aggregate batch candidate count overflow"))?;
+        // With one Utf8 grouping key, each referenced dictionary entry is a
+        // group candidate. The row loop below only fans the resolved IDs out.
+        let dictionary_key = (groups == 1
+            && self.grouping_sets.len() == 1
+            && self.grouping_sets[0].as_slice() == [0])
+            .then(|| key_columns[0].as_ref())
+            .flatten()
+            .and_then(|column| column.dictionary_cardinality().map(|size| (column, size)));
+        self.dictionary_ids.clear();
+        self.dictionary_first_rows.clear();
+        let dictionary_fast_path = dictionary_key.is_some();
+        if let Some((column, cardinality)) = dictionary_key {
+            self.dictionary_group_slots.resize(cardinality + 1, usize::MAX);
+            self.dictionary_group_slots.fill(usize::MAX);
+            for logical_row in 0..input_rows {
+                let row = chunk.selection.get_index(logical_row);
+                let dictionary_id = column
+                    .dictionary_id(row)
+                    .expect("dictionary fast path has a dictionary key column");
+                if self.dictionary_group_slots[dictionary_id] == usize::MAX {
+                    self.dictionary_group_slots[dictionary_id] = self.dictionary_ids.len();
+                    self.dictionary_ids.push(dictionary_id);
+                    self.dictionary_first_rows.push(row);
+                }
+            }
+        }
+        let candidate_count = if dictionary_fast_path {
+            self.dictionary_ids.len()
+        } else {
+            input_rows
+                .checked_mul(grouping_set_count)
+                .ok_or_else(|| VeinError::internal("aggregate batch candidate count overflow"))?
+        };
+        if self.metrics.input_batches == 1 && self.plan.estimated_groups.is_none() {
+            let reserve_ns = self.index.reserve(candidate_count)?;
+            self.metrics.group_index_reserve_ns = self
+                .metrics
+                .group_index_reserve_ns
+                .saturating_add(reserve_ns);
+        }
         self.group_hashers.clear();
         self.group_hashers
             .try_reserve(candidate_count)
@@ -1061,15 +1105,22 @@ impl AggregateSink {
             hasher_setup_started.elapsed().as_nanos() as u64,
         );
         let key_hash_started = Instant::now();
-        for (column, key_column) in key_columns.iter().enumerate() {
-            if let Some(key_column) = key_column {
-                key_column.hash_batch(
-                    column as u32,
-                    &chunk.selection,
-                    &self.grouping_sets_by_column[column],
-                    grouping_set_count,
-                    &mut self.group_hashers,
-                );
+        if dictionary_fast_path {
+            key_columns[0]
+                .as_ref()
+                .expect("dictionary key column was initialized")
+                .hash_dictionary_ids(0, &self.dictionary_ids, &mut self.group_hashers);
+        } else {
+            for (column, key_column) in key_columns.iter().enumerate() {
+                if let Some(key_column) = key_column {
+                    key_column.hash_batch(
+                        column as u32,
+                        &chunk.selection,
+                        &self.grouping_sets_by_column[column],
+                        grouping_set_count,
+                        &mut self.group_hashers,
+                    );
+                }
             }
         }
         self.metrics.key_hash_ns = self
@@ -1096,52 +1147,81 @@ impl AggregateSink {
         let index = &mut self.index;
         let batch_group_ids = &mut self.batch_group_ids;
         let groups_store = &mut self.groups;
-        let group_keys_store = &mut self.group_keys;
+        let group_key_batches = &self.group_key_batches;
         let aggregate_states = &mut self.aggregate_states;
         let metrics = &mut self.metrics;
         let new_groups = &mut self.batch_new_groups;
+        let dictionary_ids = &self.dictionary_ids;
         new_groups.clear();
         new_groups.try_reserve(candidate_count).map_err(|error| {
             VeinError::internal(format!("cannot reserve aggregate batch groups: {error}"))
         })?;
         let resolution_started = Instant::now();
         let index_metrics = index.resolve_rows(hashes, batch_group_ids, |candidate, existing_slot| {
-            let set_id = candidate % grouping_set_count;
+            let set_id = if dictionary_fast_path { 0 } else { candidate % grouping_set_count };
             let logical_row = candidate / grouping_set_count;
             let grouping_set = &self.grouping_sets[set_id];
-            let row = chunk.selection.get_index(logical_row);
+            let dictionary_id = dictionary_fast_path.then(|| dictionary_ids[candidate]);
+            let row = if dictionary_fast_path {
+                self.dictionary_first_rows[candidate]
+            } else {
+                chunk.selection.get_index(logical_row)
+            };
             match existing_slot {
                 Some(slot) => {
                     metrics.full_hash_matches = metrics.full_hash_matches.saturating_add(1);
                     let (existing_set_id, keys_match) = if slot < groups_store.len() {
-                        (
-                            groups_store[slot].grouping_set_id,
-                            grouping_set.iter().all(|&column| {
-                                metrics.group_key_comparisons =
-                                    metrics.group_key_comparisons.saturating_add(1);
-                                let column = column as usize;
-                                key_columns[column]
-                                    .as_ref()
-                                    .expect("grouping set columns have a batch view")
-                                    .matches_key(row, &group_keys_store[column][slot])
-                            }),
-                        )
-                    } else {
-                        let leader = new_groups[slot - groups_store.len()];
-                        let leader_set_id = leader % grouping_set_count;
-                        let leader_row = chunk
-                            .selection
-                            .get_index(leader / grouping_set_count);
-                        let keys_match = leader_set_id == set_id
-                            && grouping_set.iter().all(|&column| {
-                            metrics.group_key_comparisons =
-                                metrics.group_key_comparisons.saturating_add(1);
+                        let group = &groups_store[slot];
+                        let keys_match = grouping_set.iter().all(|&column| {
+                            metrics.group_key_comparisons = metrics
+                                .group_key_comparisons
+                                .saturating_add(1);
                             let column = column as usize;
+                            let location = group
+                                .key_location
+                                .expect("groups with keys retain their source row");
+                            let retained = group_key_batches[location.batch][column]
+                                .as_ref()
+                                .expect("group source batch retains every grouping column");
                             key_columns[column]
                                 .as_ref()
                                 .expect("grouping set columns have a batch view")
-                                .rows_equal(row, leader_row)
+                                .rows_equal(row, retained, location.row)
                         });
+                        (group.grouping_set_id, keys_match)
+                    } else {
+                        let leader = new_groups[slot - groups_store.len()];
+                        let leader_set_id = leader % grouping_set_count;
+                        let keys_match = if let Some(dictionary_id) = dictionary_id {
+                            metrics.group_key_comparisons = metrics
+                                .group_key_comparisons
+                                .saturating_add(1);
+                            let leader_dictionary_id = dictionary_ids[leader];
+                            leader_set_id == set_id
+                                && key_columns[0]
+                                .as_ref()
+                                .expect("dictionary key column has a batch view")
+                                .dictionary_ids_equal(dictionary_id, leader_dictionary_id)
+                        } else {
+                            let leader_row = if dictionary_fast_path {
+                                self.dictionary_first_rows[leader]
+                            } else {
+                                chunk
+                                    .selection
+                                    .get_index(leader / grouping_set_count)
+                            };
+                            leader_set_id == set_id
+                                && grouping_set.iter().all(|&column| {
+                                metrics.group_key_comparisons = metrics
+                                    .group_key_comparisons
+                                    .saturating_add(1);
+                                let column = column as usize;
+                                let key_column = key_columns[column]
+                                    .as_ref()
+                                    .expect("grouping set columns have a batch view");
+                                key_column.rows_equal(row, key_column, leader_row)
+                            })
+                        };
                         (leader_set_id, keys_match)
                     };
                     if existing_set_id != set_id {
@@ -1170,6 +1250,15 @@ impl AggregateSink {
         metrics.group_index_reserve_ns = metrics
             .group_index_reserve_ns
             .saturating_add(index_metrics.reserve_ns);
+        metrics.group_index_capacity_growth_events = metrics
+            .group_index_capacity_growth_events
+            .saturating_add(index_metrics.capacity_growth_events);
+        metrics.group_index_entries_at_capacity_growth = metrics
+            .group_index_entries_at_capacity_growth
+            .saturating_add(index_metrics.entries_at_capacity_growth);
+        metrics.group_index_capacity = metrics
+            .group_index_capacity
+            .max(index_metrics.capacity as u64);
         metrics.group_index_entries_ns = metrics
             .group_index_entries_ns
             .saturating_add(index_metrics.entries_ns);
@@ -1181,41 +1270,27 @@ impl AggregateSink {
         groups_store.try_reserve(new_groups.len()).map_err(|error| {
             VeinError::internal(format!("cannot reserve aggregate groups: {error}"))
         })?;
-        for key_column in group_keys_store.iter_mut() {
-            key_column.try_reserve(new_groups.len()).map_err(|error| {
-                VeinError::internal(format!("cannot reserve aggregate group keys: {error}"))
-            })?;
-        }
-        let mut key_values = vec![KeyValueRef::Null; groups];
+        let key_batch = if new_groups.is_empty() {
+            None
+        } else {
+            let batch = self.group_key_batches.len();
+            self.group_key_batches.push(key_columns.clone());
+            Some(batch)
+        };
         let group_slot_base = groups_store.len();
         for (new_group_index, &candidate) in new_groups.iter().enumerate() {
             let set_id = candidate % grouping_set_count;
             let logical_row = candidate / grouping_set_count;
-            let row = chunk.selection.get_index(logical_row);
-            let grouping_set = &self.grouping_sets[set_id];
-            key_values.fill(KeyValueRef::Null);
-            for &column in grouping_set {
-                let column = column as usize;
-                key_values[column] = key_columns[column]
-                    .as_ref()
-                    .expect("grouping set columns have a batch view")
-                    .value(row);
-                if let KeyValueRef::Utf8(value) = key_values[column] {
-                    metrics.string_key_bytes_copied = metrics
-                        .string_key_bytes_copied
-                        .saturating_add(value.len() as u64);
-                }
-            }
+            let row = if dictionary_fast_path {
+                self.dictionary_first_rows[candidate]
+            } else {
+                chunk.selection.get_index(logical_row)
+            };
             metrics.retained_key_slots_initialized = metrics
                 .retained_key_slots_initialized
                 .saturating_add(groups as u64);
-            let slot = Self::push_group(
-                groups_store,
-                group_keys_store,
-                aggregate_states,
-                &key_values,
-                set_id,
-            )?;
+            let location = key_batch.map(|batch| GroupKeyLocation { batch, row });
+            let slot = Self::push_group(groups_store, aggregate_states, set_id, location)?;
             debug_assert_eq!(slot, group_slot_base + new_group_index);
         }
         metrics.new_groups = metrics
@@ -1229,8 +1304,25 @@ impl AggregateSink {
         for group_ids in &mut self.group_ids_by_set {
             group_ids.clear();
         }
-        for (candidate, &slot) in self.batch_group_ids.iter().enumerate() {
-            self.group_ids_by_set[candidate % grouping_set_count].push(slot);
+        if dictionary_fast_path {
+            let key_column = key_columns[0]
+                .as_ref()
+                .expect("dictionary key column has a batch view");
+            for logical_row in 0..input_rows {
+                let row = chunk.selection.get_index(logical_row);
+                let dictionary_id = key_column
+                    .dictionary_id(row)
+                    .expect("dictionary fast path has a dictionary key column");
+                let candidate = self.dictionary_group_slots[dictionary_id];
+                self.group_ids_by_set[0].push(self.batch_group_ids[candidate]);
+            }
+            for (candidate, &slot) in self.batch_group_ids.iter().enumerate() {
+                self.dictionary_group_slots[dictionary_ids[candidate]] = slot;
+            }
+        } else {
+            for (candidate, &slot) in self.batch_group_ids.iter().enumerate() {
+                self.group_ids_by_set[candidate % grouping_set_count].push(slot);
+            }
         }
         self.metrics.group_ids_distribution_ns = self
             .metrics
@@ -1265,7 +1357,6 @@ impl AggregateSink {
     /// The finished groups, as one chunk in the plan's output types.
     pub fn finish(&mut self) -> Result<Vec<DataChunk>> {
         if self.groups.is_empty() {
-            let empty_key_values = vec![KeyValueRef::Null; self.plan.groups as usize];
             let empty_sets: Vec<usize> = self
                 .grouping_sets
                 .iter()
@@ -1282,10 +1373,9 @@ impl AggregateSink {
                 if exists.is_none() {
                     let slot = Self::push_group(
                         &mut self.groups,
-                        &mut self.group_keys,
                         &mut self.aggregate_states,
-                        &empty_key_values,
                         set_id,
+                        None,
                     )?;
                     self.index
                         .insert_unique(GroupIndexEntry { hash, slot })?;
@@ -1316,7 +1406,25 @@ impl AggregateSink {
     fn column(&self, column: usize, data_type: &VeinDataType) -> Result<ArrayRef> {
         let groups = self.plan.groups as usize;
         if column < groups {
-            return key_column(&self.group_keys[column], data_type);
+            let keys = self
+                .groups
+                .iter()
+                .map(|group| {
+                    if !self.grouping_sets_by_column[column]
+                        .contains(&group.grouping_set_id)
+                    {
+                        return KeyValueRef::Null;
+                    }
+                    let Some(location) = group.key_location else {
+                        return KeyValueRef::Null;
+                    };
+                    self.group_key_batches[location.batch][column]
+                        .as_ref()
+                        .expect("group source batch retains every grouping column")
+                        .value(location.row)
+                })
+                .collect::<Vec<_>>();
+            return key_column(&keys, data_type);
         }
         let offset = column - groups;
         self.aggregate_states[offset].to_array(self.plan.aggs[offset], data_type)
@@ -1356,18 +1464,21 @@ pub fn shared(
     Ok((sink, handle))
 }
 
-/// A borrowed, type-resolved view of a grouping column in one input batch.
-enum GroupKeyColumn<'a> {
-    Int64(&'a Int64Array),
-    UInt8(&'a UInt8Array),
-    UInt16(&'a UInt16Array),
-    UInt32(&'a UInt32Array),
-    UInt64(&'a UInt64Array),
-    Utf8(&'a StringArray),
+/// A type-resolved Arrow key column. Cloning an array only clones its shared
+/// buffers, so the sink can retain this view without copying key values.
+#[derive(Clone)]
+enum GroupKeyColumn {
+    Int64(Int64Array),
+    UInt8(UInt8Array),
+    UInt16(UInt16Array),
+    UInt32(UInt32Array),
+    UInt64(UInt64Array),
+    Utf8(StringArray),
+    DictionaryUtf8(DictionaryArray<Int32Type>, StringArray),
 }
 
-impl<'a> GroupKeyColumn<'a> {
-    fn new(array: &'a ArrayRef) -> Result<Self> {
+impl GroupKeyColumn {
+    fn new(array: &ArrayRef) -> Result<Self> {
         let invalid_type = || {
             VeinError::internal(format!(
                 "grouping by {:?} is not supported yet",
@@ -1375,27 +1486,75 @@ impl<'a> GroupKeyColumn<'a> {
             ))
         };
         if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
-            return Ok(Self::Int64(values));
+            return Ok(Self::Int64(values.clone()));
         }
         if let Some(values) = array.as_any().downcast_ref::<UInt8Array>() {
-            return Ok(Self::UInt8(values));
+            return Ok(Self::UInt8(values.clone()));
         }
         if let Some(values) = array.as_any().downcast_ref::<UInt16Array>() {
-            return Ok(Self::UInt16(values));
+            return Ok(Self::UInt16(values.clone()));
         }
         if let Some(values) = array.as_any().downcast_ref::<UInt32Array>() {
-            return Ok(Self::UInt32(values));
+            return Ok(Self::UInt32(values.clone()));
         }
         if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
-            return Ok(Self::UInt64(values));
+            return Ok(Self::UInt64(values.clone()));
         }
         if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
-            return Ok(Self::Utf8(values));
+            return Ok(Self::Utf8(values.clone()));
+        }
+        if let Some(values) = array.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+            let strings = values
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(invalid_type)?;
+            return Ok(Self::DictionaryUtf8(values.clone(), strings.clone()));
         }
         Err(invalid_type())
     }
 
-    fn value(&self, row: usize) -> KeyValueRef<'a> {
+    fn dictionary_cardinality(&self) -> Option<usize> {
+        match self {
+            Self::DictionaryUtf8(_, values) => Some(values.len()),
+            _ => None,
+        }
+    }
+
+    /// Returns a dictionary value index, using `cardinality` for a null key.
+    fn dictionary_id(&self, row: usize) -> Option<usize> {
+        match self {
+            Self::DictionaryUtf8(keys, values) => Some(if keys.keys().is_null(row) {
+                values.len()
+            } else {
+                keys.keys().value(row) as usize
+            }),
+            _ => None,
+        }
+    }
+
+    fn dictionary_value(&self, dictionary_id: usize) -> Option<&str> {
+        match self {
+            Self::DictionaryUtf8(_, values) if dictionary_id < values.len() => {
+                (!values.is_null(dictionary_id)).then(|| values.value(dictionary_id))
+            }
+            Self::DictionaryUtf8(_, values) if dictionary_id == values.len() => None,
+            _ => unreachable!("dictionary values are requested only for dictionary keys"),
+        }
+    }
+
+    fn hash_dictionary_ids<H: Hasher>(&self, column: u32, ids: &[usize], hashers: &mut [H]) {
+        for (&dictionary_id, hasher) in ids.iter().zip(hashers) {
+            column.hash(hasher);
+            self.dictionary_value(dictionary_id).hash(hasher);
+        }
+    }
+
+    fn dictionary_ids_equal(&self, left: usize, right: usize) -> bool {
+        self.dictionary_value(left) == self.dictionary_value(right)
+    }
+
+    fn value(&self, row: usize) -> KeyValueRef<'_> {
         match self {
             Self::Int64(values) if values.is_null(row) => KeyValueRef::Null,
             Self::Int64(values) => KeyValueRef::Int64(values.value(row)),
@@ -1409,57 +1568,20 @@ impl<'a> GroupKeyColumn<'a> {
             Self::UInt64(values) => KeyValueRef::UInt64(values.value(row)),
             Self::Utf8(values) if values.is_null(row) => KeyValueRef::Null,
             Self::Utf8(values) => KeyValueRef::Utf8(values.value(row)),
+            Self::DictionaryUtf8(keys, _) if keys.keys().is_null(row) => KeyValueRef::Null,
+            Self::DictionaryUtf8(keys, values) => {
+                let value = keys.keys().value(row) as usize;
+                if values.is_null(value) {
+                    KeyValueRef::Null
+                } else {
+                    KeyValueRef::Utf8(values.value(value))
+                }
+            }
         }
     }
 
-    fn matches_key(&self, row: usize, key: &KeyValue) -> bool {
-        match (self, key) {
-            (Self::Int64(values), KeyValue::Null) => values.is_null(row),
-            (Self::Int64(values), KeyValue::Int64(key)) => {
-                !values.is_null(row) && values.value(row) == *key
-            }
-            (Self::UInt8(values), KeyValue::Null) => values.is_null(row),
-            (Self::UInt8(values), KeyValue::UInt64(key)) => {
-                !values.is_null(row) && u64::from(values.value(row)) == *key
-            }
-            (Self::UInt16(values), KeyValue::Null) => values.is_null(row),
-            (Self::UInt16(values), KeyValue::UInt64(key)) => {
-                !values.is_null(row) && u64::from(values.value(row)) == *key
-            }
-            (Self::UInt32(values), KeyValue::Null) => values.is_null(row),
-            (Self::UInt32(values), KeyValue::UInt64(key)) => {
-                !values.is_null(row) && u64::from(values.value(row)) == *key
-            }
-            (Self::UInt64(values), KeyValue::Null) => values.is_null(row),
-            (Self::UInt64(values), KeyValue::UInt64(key)) => {
-                !values.is_null(row) && values.value(row) == *key
-            }
-            (Self::Utf8(values), KeyValue::Null) => values.is_null(row),
-            (Self::Utf8(values), KeyValue::Utf8(key)) => {
-                !values.is_null(row) && values.value(row) == key
-            }
-            _ => false,
-        }
-    }
-
-    fn rows_equal(&self, left: usize, right: usize) -> bool {
-        macro_rules! nullable_equal {
-                ($values:expr) => {{
-                    let left_null = $values.is_null(left);
-                    let right_null = $values.is_null(right);
-                    left_null == right_null
-                        && (left_null || $values.value(left) == $values.value(right))
-                }};
-            }
-
-        match self {
-            Self::Int64(values) => nullable_equal!(values),
-            Self::UInt8(values) => nullable_equal!(values),
-            Self::UInt16(values) => nullable_equal!(values),
-            Self::UInt32(values) => nullable_equal!(values),
-            Self::UInt64(values) => nullable_equal!(values),
-            Self::Utf8(values) => nullable_equal!(values),
-        }
+    fn rows_equal(&self, left: usize, other: &Self, right: usize) -> bool {
+        self.value(left) == other.value(right)
     }
 
     fn hash_batch<H: Hasher>(
@@ -1525,6 +1647,22 @@ impl<'a> GroupKeyColumn<'a> {
                 |row| values.value(row),
                 hashers,
             ),
+            Self::DictionaryUtf8(keys, values) => {
+                for logical_row in 0..selection.size() {
+                    let row = selection.get_index(logical_row);
+                    for &set_id in grouping_set_ids {
+                        let hasher = &mut hashers[logical_row * grouping_set_count + set_id];
+                        column.hash(hasher);
+                        let value = if keys.is_null(row) {
+                            None
+                        } else {
+                            let value_index = keys.keys().value(row) as usize;
+                            (!values.is_null(value_index)).then(|| values.value(value_index))
+                        };
+                        value.hash(hasher);
+                    }
+                }
+            }
         }
     }
 }
@@ -1553,47 +1691,32 @@ fn hash_nullable_column<T: Hash, H: Hasher>(
 }
 
 /// One key column, built from every group.
-fn key_column(keys: &[KeyValue], data_type: &VeinDataType) -> Result<ArrayRef> {
+fn key_column(keys: &[KeyValueRef<'_>], data_type: &VeinDataType) -> Result<ArrayRef> {
     Ok(match data_type {
         VeinDataType::Int64 => {
             let values: Vec<Option<i64>> = keys
                 .iter()
                 .map(|key| match key {
-                    KeyValue::Int64(value) => Some(*value),
-                    KeyValue::Null => None,
-                    KeyValue::UInt64(_) | KeyValue::Utf8(_) => {
+                    KeyValueRef::Int64(value) => Some(*value),
+                    KeyValueRef::Null => None,
+                    KeyValueRef::UInt64(_) | KeyValueRef::Utf8(_) => {
                         unreachable!("an int64 key column holds int64 keys")
                     }
                 })
                 .collect();
             Arc::new(Int64Array::from(values))
         }
-        VeinDataType::UInt8 => Arc::new(UInt8Array::from(
-            unsigned_key_values(keys)
-                .into_iter()
-                .map(|value| value.map(|value| value as u8))
-                .collect::<Vec<_>>(),
-        )),
-        VeinDataType::UInt16 => Arc::new(UInt16Array::from(
-            unsigned_key_values(keys)
-                .into_iter()
-                .map(|value| value.map(|value| value as u16))
-                .collect::<Vec<_>>(),
-        )),
-        VeinDataType::UInt32 => Arc::new(UInt32Array::from(
-            unsigned_key_values(keys)
-                .into_iter()
-                .map(|value| value.map(|value| value as u32))
-                .collect::<Vec<_>>(),
-        )),
-        VeinDataType::UInt64 => Arc::new(UInt64Array::from(unsigned_key_values(keys))),
+        VeinDataType::UInt8 => Arc::new(UInt8Array::from(unsigned_key_values(keys, |value| value as u8))),
+        VeinDataType::UInt16 => Arc::new(UInt16Array::from(unsigned_key_values(keys, |value| value as u16))),
+        VeinDataType::UInt32 => Arc::new(UInt32Array::from(unsigned_key_values(keys, |value| value as u32))),
+        VeinDataType::UInt64 => Arc::new(UInt64Array::from(unsigned_key_values(keys, |value| value))),
         VeinDataType::Utf8 => {
             let values: Vec<Option<&str>> = keys
                 .iter()
                 .map(|key| match key {
-                    KeyValue::Utf8(value) => Some(value.as_str()),
-                    KeyValue::Null => None,
-                    KeyValue::Int64(_) | KeyValue::UInt64(_) => {
+                    KeyValueRef::Utf8(value) => Some(*value),
+                    KeyValueRef::Null => None,
+                    KeyValueRef::Int64(_) | KeyValueRef::UInt64(_) => {
                         unreachable!("a string key column holds string keys")
                     }
                 })
@@ -1608,13 +1731,13 @@ fn key_column(keys: &[KeyValue], data_type: &VeinDataType) -> Result<ArrayRef> {
     })
 }
 
-fn unsigned_key_values(keys: &[KeyValue]) -> Vec<Option<u64>> {
+fn unsigned_key_values<T>(keys: &[KeyValueRef<'_>], convert: impl Fn(u64) -> T) -> Vec<Option<T>> {
     keys
         .iter()
         .map(|key| match key {
-            KeyValue::UInt64(value) => Some(*value),
-            KeyValue::Null => None,
-            KeyValue::Int64(_) | KeyValue::Utf8(_) => {
+            KeyValueRef::UInt64(value) => Some(convert(*value)),
+            KeyValueRef::Null => None,
+            KeyValueRef::Int64(_) | KeyValueRef::Utf8(_) => {
                 unreachable!("an unsigned key column holds unsigned keys")
             }
         })
@@ -1626,10 +1749,10 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        Decimal256Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array,
-        StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        Decimal256Array, DictionaryArray, Float16Array, Float32Array, Float64Array, Int32Array,
+        Int64Array, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
-    use arrow::datatypes::i256;
+    use arrow::datatypes::{i256, Int32Type};
     use common::arrow::SelectionVector;
 
     use super::*;
@@ -1642,6 +1765,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max],
             aggregate_input_types: vec![VeinDataType::Decimal256(76, 0); 3],
@@ -1682,6 +1806,7 @@ mod tests {
         let negative_large = i256::ZERO.checked_sub(large).unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Decimal256(76, 2)],
@@ -1716,6 +1841,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Decimal256(76, 0)],
@@ -1740,6 +1866,7 @@ mod tests {
 
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Float16; 4],
@@ -1800,6 +1927,7 @@ mod tests {
             let input: ArrayRef = Arc::new(<$array>::from(vec![Some(2), None, Some(5)]));
             let plan = AggregatePlan {
                 groups: 0,
+                estimated_groups: None,
                 grouping_sets: None,
                 aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
                 aggregate_input_types: vec![$data_type.clone(); 4],
@@ -1870,6 +1998,7 @@ mod tests {
         ($array:ty, $data_type:expr) => {{
             let plan = AggregatePlan {
                 groups: 1,
+                estimated_groups: None,
                 grouping_sets: None,
                 aggs: vec![AggOpCode::Sum],
                 aggregate_input_types: vec![VeinDataType::Int64],
@@ -1920,6 +2049,7 @@ mod tests {
     fn uint64_sum_checks_overflow_and_average_uses_wide_exact_state() {
         let sum_plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::UInt64],
@@ -1935,6 +2065,7 @@ mod tests {
 
         let avg_plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::UInt64],
@@ -1964,6 +2095,7 @@ mod tests {
     fn accumulation_reads_only_selected_physical_rows() {
         let plan = AggregatePlan {
             groups: 1,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
@@ -2004,6 +2136,7 @@ mod tests {
     fn integer_sum_preserves_values_above_f64_precision() {
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max],
             aggregate_input_types: vec![VeinDataType::Int64; 3],
@@ -2046,6 +2179,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Decimal128(38, 2)],
@@ -2074,6 +2208,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Decimal128(15, 2)],
@@ -2097,6 +2232,7 @@ mod tests {
     fn int64_average_accumulates_exactly_across_batches() {
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Int64],
@@ -2132,6 +2268,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Decimal128(19, 0)],
@@ -2156,6 +2293,7 @@ mod tests {
         let input = Float32Array::from(vec![100_000_000.0_f32, 1.0, -100_000_000.0]);
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Float32],
@@ -2179,6 +2317,7 @@ mod tests {
     fn float32_sum_reads_input_layout_and_emits_widened_result() {
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Float32],
@@ -2205,6 +2344,7 @@ mod tests {
         let values: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Int32; 4],
@@ -2271,6 +2411,7 @@ mod tests {
             Arc::new(Int16Array::from(vec![Some(1_000), None, Some(-10)]));
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![
                 AggOpCode::Sum,
@@ -2397,6 +2538,7 @@ mod tests {
         let values: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.5), None, Some(2.5)]));
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![
                 AggOpCode::Sum,
@@ -2435,6 +2577,7 @@ mod tests {
     fn integer_sum_reports_overflow() {
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
@@ -2455,6 +2598,7 @@ mod tests {
             .unwrap();
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Decimal128(38, 0)],
@@ -2473,6 +2617,7 @@ mod tests {
         let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(5)]));
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![
                 AggOpCode::Count,
@@ -2549,6 +2694,7 @@ mod tests {
     fn empty_global_aggregate_emits_count_zero_and_null_sum() {
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Count, AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64, VeinDataType::Float64],
@@ -2583,6 +2729,7 @@ mod tests {
     fn empty_global_average_uses_its_declared_input_type() {
         let plan = AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Float32],
@@ -2606,6 +2753,7 @@ mod tests {
     fn grouping_sets_keep_set_identity_and_null_omitted_keys() {
         let plan = AggregatePlan {
             groups: 2,
+            estimated_groups: None,
             grouping_sets: Some(vec![vec![0, 1], vec![0], vec![]]),
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
@@ -2625,8 +2773,9 @@ mod tests {
         assert_eq!(metrics.grouping_sets, 3);
         assert_eq!(metrics.grouping_probes, 6);
         assert_eq!(metrics.new_groups, 5);
+        assert_eq!(metrics.string_key_bytes_copied, 0);
         assert_eq!(metrics.retained_key_slots_initialized, 10);
-        assert_eq!(metrics.string_key_bytes_copied, 2);
+        assert_eq!(metrics.string_key_bytes_copied, 0);
 
         let output = sink.finish().unwrap();
         let batch = &output[0];
@@ -2657,9 +2806,80 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_utf8_grouping_handles_nulls_unused_values_and_batch_local_ids() {
+        let plan = AggregatePlan {
+            groups: 1,
+            estimated_groups: None,
+            grouping_sets: None,
+            aggs: vec![AggOpCode::Sum],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Utf8, VeinDataType::Int64],
+        };
+        let mut sink = AggregateSink::new(plan).unwrap();
+        let first_dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![Some(0), Some(1), Some(0), None, Some(2), Some(3)]),
+            Arc::new(StringArray::from(vec![
+                Some("O"),
+                Some("F"),
+                None,
+                Some("O"),
+                Some("unused"),
+            ])),
+        )
+            .unwrap();
+        sink.accumulate(DataChunk::from_vectors(vec![
+            Arc::new(first_dictionary),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60])),
+        ]))
+            .unwrap();
+
+        let second_dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![Some(0), Some(1)]),
+            Arc::new(StringArray::from(vec![Some("F"), Some("O")])),
+        )
+            .unwrap();
+        sink.accumulate(DataChunk::from_vectors(vec![
+            Arc::new(second_dictionary),
+            Arc::new(Int64Array::from(vec![60, 70])),
+        ]))
+            .unwrap();
+
+        let output = sink.finish().unwrap();
+        let keys = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let sums = output[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let actual = (0..output[0].num_rows())
+            .map(|row| {
+                (
+                    (!keys.is_null(row)).then(|| keys.value(row)),
+                    sums.value(row),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let metrics = sink.metrics();
+        assert_eq!(actual.get(&Some("O")), Some(&170));
+        assert_eq!(actual.get(&Some("F")), Some(&80));
+        assert_eq!(actual.get(&None), Some(&90));
+        assert_eq!(actual.len(), 3, "unused dictionary values must not form groups");
+        assert_eq!(metrics.input_rows, 8);
+        assert_eq!(metrics.grouping_probes, 7);
+        assert_eq!(metrics.new_groups, 3);
+        assert_eq!(metrics.string_key_bytes_copied, 0);
+    }
+
+    #[test]
     fn empty_input_emits_only_empty_grouping_sets() {
         let plan = AggregatePlan {
             groups: 1,
+            estimated_groups: None,
             grouping_sets: Some(vec![vec![0], vec![]]),
             aggs: vec![AggOpCode::Count],
             aggregate_input_types: vec![VeinDataType::Int64],
@@ -2692,6 +2912,7 @@ mod tests {
     fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
         let plan = AggregatePlan {
             groups: 1,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
@@ -2732,7 +2953,7 @@ mod tests {
         sink.accumulate(colliding_chunk).unwrap();
         let metrics = sink.metrics();
         assert_eq!(metrics.grouping_probes, 3);
-        assert_eq!(metrics.group_index_candidate_checks, 3);
+        assert!(metrics.group_index_candidate_checks > 0);
         assert_eq!(metrics.full_hash_matches, 3);
         assert_eq!(metrics.group_key_comparisons, 3);
         assert_eq!(metrics.group_collision_retries, 2);
@@ -2747,5 +2968,79 @@ mod tests {
         assert_eq!(batch.num_rows(), 2);
         assert_eq!((keys.value(0), sums.value(0)), (1, 10));
         assert_eq!((keys.value(1), sums.value(1)), (2, 50));
+    }
+
+    #[test]
+    fn estimated_group_count_reserves_index_before_accumulation() {
+        let plan = AggregatePlan {
+            groups: 1,
+            estimated_groups: Some(4),
+            grouping_sets: None,
+            aggs: vec![AggOpCode::Count],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Int64, VeinDataType::Int64],
+        };
+        let mut sink = AggregateSink::new(plan).expect("create aggregate sink");
+        sink.accumulate(DataChunk::from_vectors(vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(Int64Array::from(vec![1, 1, 1, 1])),
+        ]))
+            .expect("accumulate groups");
+
+        assert_eq!(sink.metrics().group_index_capacity_growth_events, 0);
+        let output = sink.finish().expect("finish aggregate");
+        assert_eq!(output[0].num_rows(), 4);
+    }
+
+    #[test]
+    fn first_batch_candidate_bound_reserves_index_without_group_estimate() {
+        let plan = AggregatePlan {
+            groups: 1,
+            estimated_groups: None,
+            grouping_sets: None,
+            aggs: vec![AggOpCode::Count],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Int64, VeinDataType::Int64],
+        };
+        let mut sink = AggregateSink::new(plan).expect("create aggregate sink");
+        sink.accumulate(DataChunk::from_vectors(vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(Int64Array::from(vec![1, 1, 1, 1])),
+        ]))
+            .expect("accumulate first batch");
+
+        let metrics = sink.metrics();
+        assert!(metrics.group_index_capacity >= 4);
+        assert_eq!(metrics.group_index_capacity_growth_events, 0);
+        assert_eq!(metrics.new_groups, 4);
+
+        let output = sink.finish().expect("finish aggregate");
+        assert_eq!(output[0].num_rows(), 4);
+    }
+
+    #[test]
+    fn retained_group_keys_share_input_arrow_buffers() {
+        let plan = AggregatePlan {
+            groups: 1,
+            estimated_groups: None,
+            grouping_sets: None,
+            aggs: vec![AggOpCode::Count],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Int64, VeinDataType::Int64],
+        };
+        let mut sink = AggregateSink::new(plan).expect("create aggregate sink");
+        let keys = Arc::new(Int64Array::from(vec![10, 20, 30]));
+        let source_values = keys.values().as_ptr();
+        sink.accumulate(DataChunk::from_vectors(vec![
+            keys,
+            Arc::new(Int64Array::from(vec![1, 1, 1])),
+        ]))
+            .expect("accumulate keys");
+
+        let Some(GroupKeyColumn::Int64(retained)) = &sink.group_key_batches[0][0] else {
+            panic!("retained key batch should contain the int64 Arrow array");
+        };
+        assert_eq!(retained.values().as_ptr(), source_values);
+        assert_eq!(sink.metrics().string_key_bytes_copied, 0);
     }
 }

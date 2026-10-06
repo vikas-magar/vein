@@ -425,6 +425,7 @@ mod tests {
             format: FileFormat::Parquet,
             byte_range: None,
             projected: Arc::new(VeinSchema::empty()),
+            dictionary_columns: Vec::new(),
             pushdown: None,
             task_id: TaskId::new(),
             catalog_snapshot: None,

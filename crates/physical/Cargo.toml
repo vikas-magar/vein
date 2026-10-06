@@ -13,3 +13,6 @@ error = { path = "../error" }
 parser = { path = "../parser" }
 plan = { path = "../plan" }
 tracing = { workspace = true }
+
+[dev-dependencies]
+catalog = { path = "../catalog" }

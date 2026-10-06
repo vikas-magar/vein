@@ -11,9 +11,10 @@
 //! `vein.audit` tracing events rather than returned here; folding them into this
 //! report needs the storage counters work tracked separately.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -108,6 +109,7 @@ const SCENARIOS: &[Scenario] = &[
 struct Measurement {
     rows: u64,
     bytes_read: u64,
+    operator_metrics: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
     prepare: Vec<Duration>,
     execute: Vec<Duration>,
 }
@@ -121,11 +123,24 @@ struct Measurement {
 #[derive(Clone, Default)]
 struct IoCounters {
     bytes_read: Arc<AtomicU64>,
+    operator_metrics: Arc<Mutex<BTreeMap<&'static str, BTreeMap<&'static str, u64>>>>,
 }
 
 impl IoCounters {
     fn taken(&self, before: u64) -> u64 {
         self.bytes_read.load(Ordering::Relaxed).saturating_sub(before)
+    }
+
+    fn reset_operator_metrics(&self) {
+        if let Ok(mut metrics) = self.operator_metrics.lock() {
+            metrics.clear();
+        }
+    }
+
+    fn operator_metrics(&self) -> BTreeMap<&'static str, BTreeMap<&'static str, u64>> {
+        self.operator_metrics
+            .lock()
+            .map_or_else(|_| BTreeMap::new(), |metrics| metrics.clone())
     }
 }
 
@@ -133,6 +148,7 @@ impl IoCounters {
 struct FieldVisitor {
     kind: Option<String>,
     bytes_read: u64,
+    metrics: BTreeMap<&'static str, u64>,
 }
 
 impl Visit for FieldVisitor {
@@ -151,6 +167,14 @@ impl Visit for FieldVisitor {
     fn record_u64(&mut self, field: &Field, value: u64) {
         if field.name() == "bytes_read" {
             self.bytes_read = value;
+        } else {
+            self.metrics.insert(field.name(), value);
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        if let Ok(value) = u64::try_from(value) {
+            self.metrics.insert(field.name(), value);
         }
     }
 }
@@ -162,6 +186,15 @@ impl<S: Subscriber> Layer<S> for IoCounters {
         if visitor.kind.as_deref() == Some("scan_completed") {
             self.bytes_read
                 .fetch_add(visitor.bytes_read, Ordering::Relaxed);
+        } else {
+            let metric_event = match visitor.kind.as_deref() {
+                Some("aggregate_finished") => Some("aggregate_finished"),
+                Some("sort_finished") => Some("sort_finished"),
+                _ => None,
+            };
+            if let (Some(kind), Ok(mut metrics)) = (metric_event, self.operator_metrics.lock()) {
+                metrics.insert(kind, visitor.metrics);
+            }
         }
     }
 }
@@ -183,6 +216,7 @@ pub async fn run(iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
         "\n{:<16} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12}",
         "scenario", "prep p50", "exec p50", "exec p95", "rows", "bytes", "duckdb p50", "rows/sec"
     );
+    println!("Aggregate phase metrics are reported below aggregate scenarios (last iteration).");
     for scenario in SCENARIOS {
         let duckdb = duckdb_millis(scenario.duckdb, iterations)
             .map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.2}ms"));
@@ -208,6 +242,67 @@ fn print_sample(name: &str, sample: &Measurement, duckdb: &str) {
         duckdb,
         sample.rows as f64 / p50.as_secs_f64().max(f64::MIN_POSITIVE),
     );
+    if let Some(metrics) = sample.operator_metrics.get("aggregate_finished") {
+        println!(
+            "  aggregate: input_rows={} batches={} sets={} groups={} probes={} candidates={} hits={} misses={} hash_matches={} key_comparisons={} retries={} new_groups={} key_bytes_copied={} retained_key_slots={} index_capacity={} growth_events={} entries_at_growth={}",
+            metric(metrics, "input_rows"),
+            metric(metrics, "input_batches"),
+            metric(metrics, "grouping_sets"),
+            metric(metrics, "groups"),
+            metric(metrics, "grouping_probes"),
+            metric(metrics, "group_index_candidate_checks"),
+            metric(metrics, "group_index_hits"),
+            metric(metrics, "group_index_misses"),
+            metric(metrics, "full_hash_matches"),
+            metric(metrics, "group_key_comparisons"),
+            metric(metrics, "group_collision_retries"),
+            metric(metrics, "new_groups"),
+            metric(metrics, "string_key_bytes_copied"),
+            metric(metrics, "retained_key_slots_initialized"),
+            metric(metrics, "group_index_capacity"),
+            metric(metrics, "group_index_capacity_growth_events"),
+            metric(metrics, "group_index_entries_at_capacity_growth"),
+        );
+        println!(
+            "  aggregate phase ns: hash={} (setup={}, key={}, finalize={}); resolve={} (index_entries={} nested); reserve={}; key_materialize={}; group_id_distribution={}; state_update={}; output_materialize={}; finish={}",
+            metric(metrics, "hash_generation_ns"),
+            metric(metrics, "hasher_setup_ns"),
+            metric(metrics, "key_hash_ns"),
+            metric(metrics, "hash_finalize_ns"),
+            metric(metrics, "group_resolution_ns"),
+            metric(metrics, "group_index_entries_ns"),
+            metric(metrics, "group_index_reserve_ns"),
+            metric(metrics, "group_materialize_ns"),
+            metric(metrics, "group_ids_distribution_ns"),
+            metric(metrics, "state_update_ns"),
+            metric(metrics, "output_materialize_ns"),
+            metric(metrics, "finish_ns"),
+        );
+    }
+    if let Some(metrics) = sample.operator_metrics.get("sort_finished") {
+        println!(
+            "  sort: input_rows={} batches={} keys={} candidates={} insertions={} replacements={} key_bytes_copied={} output_rows={}",
+            metric(metrics, "input_rows"),
+            metric(metrics, "input_batches"),
+            metric(metrics, "keys"),
+            metric(metrics, "candidate_rows_examined"),
+            metric(metrics, "candidate_insertions"),
+            metric(metrics, "candidate_replacements"),
+            metric(metrics, "candidate_key_bytes_copied"),
+            metric(metrics, "output_rows"),
+        );
+        println!(
+            "  sort phase us: key_encode={} selection={} sort={} emit={}",
+            metric(metrics, "key_encode_us"),
+            metric(metrics, "selection_us"),
+            metric(metrics, "sort_us"),
+            metric(metrics, "emit_us"),
+        );
+    }
+}
+
+fn metric(metrics: &BTreeMap<&'static str, u64>, name: &'static str) -> u64 {
+    metrics.get(name).copied().unwrap_or_default()
 }
 
 /// DuckDB's own measured execution time for the equivalent query.
@@ -251,6 +346,7 @@ async fn measure(
     let mut execute = Vec::with_capacity(iterations);
     let mut rows = 0u64;
     let mut bytes_read = 0u64;
+    let mut operator_metrics = BTreeMap::new();
 
     for _ in 0..iterations.max(1) {
         let before = counters.bytes_read.load(Ordering::Relaxed);
@@ -258,6 +354,7 @@ async fn measure(
         let prepared = engine.prepare(query).await?;
         prepare.push(started.elapsed());
 
+        counters.reset_operator_metrics();
         let started = Instant::now();
         let mut stream = prepared.into_stream();
         rows = 0;
@@ -266,10 +363,12 @@ async fn measure(
         }
         execute.push(started.elapsed());
         bytes_read = counters.taken(before);
+        operator_metrics = counters.operator_metrics();
     }
     Ok(Measurement {
         rows,
         bytes_read,
+        operator_metrics,
         prepare,
         execute,
     })

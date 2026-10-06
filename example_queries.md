@@ -59,6 +59,12 @@ FROM customer
 "
 ```
 
+The Bench
+
+```bash
+VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run --color=always --bin cli --profile test -- --bench 10
+```
+
 Truncate an order date to calendar boundaries:
 
 ```bash

@@ -424,6 +424,9 @@ impl DefaultTaskExecutor {
             grouping_probes = aggregate_metrics.grouping_probes,
             group_index_candidate_checks = aggregate_metrics.group_index_candidate_checks,
             group_index_reserve_ns = aggregate_metrics.group_index_reserve_ns,
+            group_index_capacity_growth_events = aggregate_metrics.group_index_capacity_growth_events,
+            group_index_entries_at_capacity_growth = aggregate_metrics.group_index_entries_at_capacity_growth,
+            group_index_capacity = aggregate_metrics.group_index_capacity,
             group_index_entries_ns = aggregate_metrics.group_index_entries_ns,
             full_hash_matches = aggregate_metrics.full_hash_matches,
             group_key_comparisons = aggregate_metrics.group_key_comparisons,
@@ -916,6 +919,7 @@ mod tests {
         });
         task.aggregate = Some(AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: Some(vec![vec![]]),
             aggs: vec![AggOpCode::Count],
             aggregate_input_types: vec![VeinDataType::Int64],
@@ -1020,6 +1024,7 @@ mod tests {
         let mut task = task();
         task.aggregate = Some(AggregatePlan {
             groups: 0,
+            estimated_groups: None,
             grouping_sets: None,
             aggs: vec![common::protocol::AggOpCode::Count],
             aggregate_input_types: vec![types::VeinDataType::Int64],
