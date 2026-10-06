@@ -355,13 +355,14 @@ fn print_sample(name: &str, sample: &Measurement, duckdb: &str) {
     }
     if let Some(metrics) = sample.operator_metrics.get("sort_finished") {
         println!(
-            "  sort: input_rows={} batches={} keys={} candidates={} insertions={} replacements={} key_bytes_copied={} output_rows={}",
+            "  sort: input_rows={} batches={} keys={} candidates={} insertions={} replacements={} key_buffer_allocations={} key_bytes_copied={} output_rows={}",
             metric(metrics, "input_rows"),
             metric(metrics, "input_batches"),
             metric(metrics, "keys"),
             metric(metrics, "candidate_rows_examined"),
             metric(metrics, "candidate_insertions"),
             metric(metrics, "candidate_replacements"),
+            metric(metrics, "candidate_key_buffer_allocations"),
             metric(metrics, "candidate_key_bytes_copied"),
             metric(metrics, "output_rows"),
         );

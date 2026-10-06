@@ -10,7 +10,6 @@ use common::protocol::{LimitSpec, SortPlan};
 use error::VeinError;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::Arc;
 use std::time::Instant;
 
 use crate::operators::join::gather::gather;
@@ -25,19 +24,16 @@ struct RowRef {
     row: usize,
 }
 
-/// A candidate shares the encoded keys for its input batch; its payload stays in
-/// the input Arrow chunk referenced by `row`.
+/// A candidate owns only its encoded sort key; its payload stays in the input
+/// Arrow chunk referenced by `row`.
 struct TopNEntry {
-    keys: Arc<Rows>,
-    key_row: usize,
+    key: Vec<u8>,
     row: RowRef,
 }
 
 impl PartialEq for TopNEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.keys.row(self.key_row) == other.keys.row(other.key_row)
-            && self.row.chunk == other.row.chunk
-            && self.row.row == other.row.row
+        self.key == other.key && self.row.chunk == other.row.chunk && self.row.row == other.row.row
     }
 }
 
@@ -51,9 +47,8 @@ impl PartialOrd for TopNEntry {
 
 impl Ord for TopNEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.keys
-            .row(self.key_row)
-            .cmp(&other.keys.row(other.key_row))
+        self.key
+            .cmp(&other.key)
             .then_with(|| self.row.chunk.cmp(&other.row.chunk))
             .then_with(|| self.row.row.cmp(&other.row.row))
     }
@@ -95,6 +90,11 @@ impl<T: Ord> BoundedTopN<T> {
         }
     }
 
+    fn replace_worst_with<R>(&mut self, replace: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let mut worst = self.entries.peek_mut()?;
+        Some(replace(&mut worst))
+    }
+
     fn drain_sorted(&mut self) -> Vec<T> {
         std::mem::take(&mut self.entries).into_sorted_vec()
     }
@@ -122,6 +122,7 @@ struct SortMetrics {
     candidate_rows_examined: u64,
     candidate_insertions: u64,
     candidate_replacements: u64,
+    candidate_key_buffer_allocations: u64,
     candidate_key_bytes_copied: u64,
     output_rows: u64,
     key_encode_us: u64,
@@ -376,14 +377,12 @@ impl SortTransform {
         }
         let key_columns = self.sort_key_columns(&chunk)?;
         let encode_started = Instant::now();
-        let keys = Arc::new(
-            self
+        let keys = self
             .row_converter
             .as_ref()
             .expect("row converter initialized above")
             .convert_columns(&key_columns)
-            .map_err(row_sort_error)?,
-        );
+            .map_err(row_sort_error)?;
         self.metrics.key_encode_us = self
             .metrics
             .key_encode_us
@@ -406,40 +405,64 @@ impl SortTransform {
                 .saturating_add(1);
             let row = selection.get_index(active_row);
             let key = keys.row(row).data();
-            let replaced_chunk = if top_n.is_full() {
+            let candidate_row = RowRef {
+                chunk: chunk_index,
+                row,
+            };
+            let replaced_row = if top_n.is_full() {
                 let Some(worst) = top_n.peek() else {
                     continue;
                 };
-                if key >= worst.keys.row(worst.key_row) {
+                if key >= worst.key.as_slice() {
                     continue;
                 }
-                Some(worst.row.chunk)
+                let (replaced_row, buffer_grew) = top_n
+                    .replace_worst_with(|worst| {
+                        let replaced_row = worst.row;
+                        let capacity = worst.key.capacity();
+                        worst.key.clear();
+                        worst.key.extend_from_slice(key);
+                        worst.row = candidate_row;
+                        (replaced_row, worst.key.capacity() > capacity)
+                    })
+                    .ok_or_else(|| VeinError::internal("Top-N heap unexpectedly empty"))?;
+                if buffer_grew {
+                    self.metrics.candidate_key_buffer_allocations = self
+                        .metrics
+                        .candidate_key_buffer_allocations
+                        .saturating_add(1);
+                }
+                Some(replaced_row)
             } else {
+                self.metrics.candidate_key_buffer_allocations = self
+                    .metrics
+                    .candidate_key_buffer_allocations
+                    .saturating_add(1);
+                top_n.push(TopNEntry {
+                    key: key.to_vec(),
+                    row: candidate_row,
+                });
                 None
             };
-            top_n.push(TopNEntry {
-                keys: Arc::clone(&keys),
-                key_row: row,
-                row: RowRef {
-                    chunk: chunk_index,
-                    row,
-                },
-            });
+            self.metrics.candidate_key_bytes_copied = self
+                .metrics
+                .candidate_key_bytes_copied
+                .saturating_add(key.len() as u64);
             self.metrics.candidate_insertions =
                 self.metrics.candidate_insertions.saturating_add(1);
             self.top_n_references[chunk_index] = self.top_n_references[chunk_index]
                 .checked_add(1)
                 .ok_or_else(|| VeinError::internal("Top-N candidate count overflow"))?;
-            if let Some(replaced_chunk) = replaced_chunk {
+            if let Some(replaced_row) = replaced_row {
                 self.metrics.candidate_replacements = self
                     .metrics
                     .candidate_replacements
                     .saturating_add(1);
-                self.top_n_references[replaced_chunk] = self.top_n_references[replaced_chunk]
+                self.top_n_references[replaced_row.chunk] = self.top_n_references[replaced_row.chunk]
                     .checked_sub(1)
                     .ok_or_else(|| VeinError::internal("Top-N candidate count underflow"))?;
-                if self.top_n_references[replaced_chunk] == 0 {
-                    self.chunks[replaced_chunk] = None;
+                if self.top_n_references[replaced_row.chunk] == 0 {
+                    self.chunks[replaced_row.chunk] = None;
                 }
             }
         }
@@ -487,6 +510,7 @@ impl PipelineNode<DataChunk> for SortTransform {
             candidate_rows_examined = self.metrics.candidate_rows_examined,
             candidate_insertions = self.metrics.candidate_insertions,
             candidate_replacements = self.metrics.candidate_replacements,
+            candidate_key_buffer_allocations = self.metrics.candidate_key_buffer_allocations,
             candidate_key_bytes_copied = self.metrics.candidate_key_bytes_copied,
             output_rows = self.metrics.output_rows,
             key_encode_us = self.metrics.key_encode_us,
@@ -612,18 +636,6 @@ mod tests {
         sort.push(DataChunk::from_vectors(vec![values.clone()]))
             .unwrap();
 
-        let candidates: Vec<_> = sort
-            .top_n
-            .as_ref()
-            .unwrap()
-            .entries
-            .iter()
-            .collect();
-        assert_eq!(candidates.len(), 3);
-        assert!(candidates
-            .iter()
-            .all(|candidate| Arc::ptr_eq(&candidate.keys, &candidates[0].keys)));
-
         sort.flush().unwrap();
 
         let chunks = output.lock().unwrap();
@@ -722,8 +734,26 @@ mod tests {
         );
         sort.push(DataChunk::from_vectors(vec![integers(&[4, 1])]))
             .unwrap();
+        let evicted_key_buffer = sort
+            .top_n
+            .as_ref()
+            .unwrap()
+            .peek()
+            .unwrap()
+            .key
+            .as_ptr();
         sort.push(DataChunk::from_vectors(vec![integers(&[3, 2])]))
             .unwrap();
+
+        let replacement = sort
+            .top_n
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|entry| entry.row.chunk == 1 && entry.row.row == 1)
+            .expect("second chunk's better candidate remains in the heap");
+        assert_eq!(replacement.key.as_ptr(), evicted_key_buffer);
 
         sort.flush().unwrap();
 
@@ -732,7 +762,8 @@ mod tests {
         assert_eq!(sort.metrics.candidate_rows_examined, 4);
         assert_eq!(sort.metrics.candidate_insertions, 4);
         assert_eq!(sort.metrics.candidate_replacements, 1);
-        assert_eq!(sort.metrics.candidate_key_bytes_copied, 0);
+        assert_eq!(sort.metrics.candidate_key_buffer_allocations, 3);
+        assert!(sort.metrics.candidate_key_bytes_copied > 0);
         assert_eq!(sort.metrics.output_rows, 3);
 
         let chunks = output.lock().unwrap();
