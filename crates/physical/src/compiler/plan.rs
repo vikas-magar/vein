@@ -729,9 +729,9 @@ fn estimate_single_key_groups(
     let row_count = statistics.num_rows?;
     let distinct_count = statistics
         .column_statistics
-        .get(&column.name)?
-        .distinct_count?;
-    Some(distinct_count.min(row_count))
+        .get(&column.name)
+        .and_then(|column_statistics| column_statistics.distinct_count);
+    Some(distinct_count.map_or(row_count, |count| count.min(row_count)))
 }
 
 #[cfg(test)]
@@ -950,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_ignores_ndv_for_filtered_or_unestimated_inputs() {
+    fn aggregate_capacity_hint_requires_unfiltered_input_and_row_count() {
         let (input_schema, key) = schema();
         let mut column_statistics = std::collections::HashMap::new();
         column_statistics.insert(
@@ -984,9 +984,31 @@ mod tests {
         let filtered = PipelineCompiler::aggregate(&aggregate_for(vec![LogicalExpr::Column(
             Arc::clone(&key),
         )]))
-        .expect("plan filtered aggregate")
-        .expect("aggregate plan");
+            .expect("plan filtered aggregate")
+            .expect("aggregate plan");
         assert_eq!(filtered.estimated_groups, None);
+
+        let mut no_ndv = (*table).clone();
+        no_ndv.statistics
+            .as_mut()
+            .unwrap()
+            .column_statistics
+            .clear();
+        let aggregate_without_ndv = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Scan {
+                table: Arc::new(no_ndv),
+                projection: None,
+                filters: Vec::new(),
+                schema: Box::new(input_schema.clone()),
+            }),
+            grouping_sets: vec![vec![LogicalExpr::Column(Arc::clone(&key))]],
+            aggs: Vec::new(),
+            schema: Box::new(VeinSchema::empty()),
+        };
+        let row_count_hint = PipelineCompiler::aggregate(&aggregate_without_ndv)
+            .expect("plan aggregate without NDV")
+            .expect("aggregate plan");
+        assert_eq!(row_count_hint.estimated_groups, Some(100));
 
         let mut no_row_count = (*table).clone();
         no_row_count.statistics.as_mut().unwrap().num_rows = None;

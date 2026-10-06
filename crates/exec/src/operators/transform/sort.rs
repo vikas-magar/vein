@@ -10,6 +10,7 @@ use common::protocol::{LimitSpec, SortPlan};
 use error::VeinError;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::operators::join::gather::gather;
@@ -24,16 +25,19 @@ struct RowRef {
     row: usize,
 }
 
-/// A candidate owns only its encoded sort key; its payload stays in the input
-/// Arrow chunk referenced by `row`.
+/// A candidate shares the encoded keys for its input batch; its payload stays in
+/// the input Arrow chunk referenced by `row`.
 struct TopNEntry {
-    key: Vec<u8>,
+    keys: Arc<Rows>,
+    key_row: usize,
     row: RowRef,
 }
 
 impl PartialEq for TopNEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.row.chunk == other.row.chunk && self.row.row == other.row.row
+        self.keys.row(self.key_row) == other.keys.row(other.key_row)
+            && self.row.chunk == other.row.chunk
+            && self.row.row == other.row.row
     }
 }
 
@@ -47,8 +51,9 @@ impl PartialOrd for TopNEntry {
 
 impl Ord for TopNEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.key
-            .cmp(&other.key)
+        self.keys
+            .row(self.key_row)
+            .cmp(&other.keys.row(other.key_row))
             .then_with(|| self.row.chunk.cmp(&other.row.chunk))
             .then_with(|| self.row.row.cmp(&other.row.row))
     }
@@ -371,12 +376,14 @@ impl SortTransform {
         }
         let key_columns = self.sort_key_columns(&chunk)?;
         let encode_started = Instant::now();
-        let keys = self
+        let keys = Arc::new(
+            self
             .row_converter
             .as_ref()
             .expect("row converter initialized above")
             .convert_columns(&key_columns)
-            .map_err(row_sort_error)?;
+            .map_err(row_sort_error)?,
+        );
         self.metrics.key_encode_us = self
             .metrics
             .key_encode_us
@@ -403,7 +410,7 @@ impl SortTransform {
                 let Some(worst) = top_n.peek() else {
                     continue;
                 };
-                if key >= worst.key.as_slice() {
+                if key >= worst.keys.row(worst.key_row) {
                     continue;
                 }
                 Some(worst.row.chunk)
@@ -411,13 +418,8 @@ impl SortTransform {
                 None
             };
             top_n.push(TopNEntry {
-                key: {
-                    self.metrics.candidate_key_bytes_copied = self
-                        .metrics
-                        .candidate_key_bytes_copied
-                        .saturating_add(key.len() as u64);
-                    key.to_vec()
-                },
+                keys: Arc::clone(&keys),
+                key_row: row,
                 row: RowRef {
                     chunk: chunk_index,
                     row,
@@ -610,6 +612,18 @@ mod tests {
         sort.push(DataChunk::from_vectors(vec![values.clone()]))
             .unwrap();
 
+        let candidates: Vec<_> = sort
+            .top_n
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .collect();
+        assert_eq!(candidates.len(), 3);
+        assert!(candidates
+            .iter()
+            .all(|candidate| Arc::ptr_eq(&candidate.keys, &candidates[0].keys)));
+
         sort.flush().unwrap();
 
         let chunks = output.lock().unwrap();
@@ -718,7 +732,7 @@ mod tests {
         assert_eq!(sort.metrics.candidate_rows_examined, 4);
         assert_eq!(sort.metrics.candidate_insertions, 4);
         assert_eq!(sort.metrics.candidate_replacements, 1);
-        assert!(sort.metrics.candidate_key_bytes_copied > 0);
+        assert_eq!(sort.metrics.candidate_key_bytes_copied, 0);
         assert_eq!(sort.metrics.output_rows, 3);
 
         let chunks = output.lock().unwrap();
