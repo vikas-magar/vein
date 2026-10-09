@@ -225,6 +225,93 @@ impl PipelineCompiler {
         Ok((source, compiler.finish(), output_schema))
     }
 
+    /// Compiles row-wise operators above a join boundary against that join's
+    /// output schema. Unlike `compile`, this does not search for a Parquet leaf:
+    /// the recursive input plan supplies the batches at runtime.
+    pub fn compile_join_transform(
+        plan: &LogicalPlan,
+        input_schema: &VeinSchema,
+    ) -> Result<(MicroProgram, VeinSchema)> {
+        let mut compiler = BytecodeCompiler::new(input_schema.fields.len() as RegId);
+        compiler.set_input_schema(input_schema);
+        // The recursive join builder has already compiled the child into a
+        // PhysicalInputPlan. Compile only this node against that child's output;
+        // recursively compiling `plan` here would walk the logical child again
+        // against the narrower physical schema and can lose filter-only columns.
+        let output_schema = Self::compile_join_transform_node(plan, input_schema, &mut compiler).map_err(|error| {
+            let columns = input_schema
+                .fields
+                .iter()
+                .map(|field| format!("{}#{}", field.name, field.id.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            VeinError::planning(
+                format!("failed to compile recursive join transform against input columns [{columns}]: {error}"),
+                None,
+            )
+        })?;
+        Ok((compiler.finish(), output_schema))
+    }
+
+    fn compile_join_transform_node(
+        plan: &LogicalPlan,
+        input_schema: &VeinSchema,
+        compiler: &mut BytecodeCompiler,
+    ) -> Result<VeinSchema> {
+        match plan {
+            LogicalPlan::Filter { input, predicate } => {
+                if Self::aggregate(input)?.is_none() {
+                    compiler.compile_filter(predicate, input_schema)?;
+                }
+                Ok(input_schema.clone())
+            }
+            LogicalPlan::Project { exprs, schema, .. } => {
+                compiler.compile_projection_with_schema(exprs, input_schema, schema)?;
+                Ok((**schema).clone())
+            }
+            LogicalPlan::Aggregate {
+                grouping_sets,
+                aggs,
+                schema,
+                ..
+            } => {
+                let (keys, _) = grouping_layout(grouping_sets)?;
+                let mut projected = keys;
+                for agg in aggs {
+                    let (name, argument) = aggregate_argument(agg)?;
+                    agg_op(name)?;
+                    projected.push(argument.clone());
+                }
+                compiler.compile_projection_with_schema(&projected, input_schema, schema)?;
+                Ok((**schema).clone())
+            }
+            LogicalPlan::Join { schema, .. }
+            | LogicalPlan::Scan { schema, .. }
+            | LogicalPlan::ExternalScan { schema, .. } => Ok((**schema).clone()),
+            LogicalPlan::Limit { .. } | LogicalPlan::Sort { .. } => Ok(input_schema.clone()),
+            LogicalPlan::SubqueryAlias { schema, .. } => {
+                if schema.fields.len() != input_schema.fields.len() {
+                    return Err(VeinError::planning(
+                        "subquery alias changes the number of columns in a recursive join input",
+                        None,
+                    ));
+                }
+                let projection = input_schema
+                    .fields
+                    .iter()
+                    .cloned()
+                    .map(LogicalExpr::Column)
+                    .collect::<Vec<_>>();
+                compiler.compile_projection_with_schema(&projection, input_schema, schema)?;
+                Ok((**schema).clone())
+            }
+            other => Err(VeinError::planning(
+                format!("unsupported recursive join transform: {other:?}"),
+                None,
+            )),
+        }
+    }
+
     /// Compiles row filters above an aggregate against the aggregate's output schema.
     pub fn post_aggregate_program(plan: &LogicalPlan) -> Result<Option<MicroProgram>> {
         let Some(schema) = aggregate_output_schema(plan) else {
@@ -446,6 +533,10 @@ impl PipelineCompiler {
         compiler: &mut BytecodeCompiler,
     ) -> Result<VeinSchema> {
         match plan {
+            // The recursive physical input builder executes the join and
+            // supplies its output batch; this method compiles only operators
+            // above that boundary.
+            LogicalPlan::Join { schema, .. } => Ok((**schema).clone()),
             LogicalPlan::Scan { filters, .. } => {
                 for filter in filters {
                     compiler.compile_filter(filter, &input_schema)?;
@@ -768,6 +859,62 @@ mod tests {
             files: Vec::new(),
             schema: Box::new(schema.clone()),
         }
+    }
+
+    #[test]
+    fn compiles_only_the_project_above_an_already_built_join_filter() {
+        let visible = Arc::new(ResolvedColumn::new(
+            ColumnId(10),
+            "s_name",
+            None,
+            VeinDataType::Utf8,
+        ));
+        let hidden_filter_column = Arc::new(ResolvedColumn::new(
+            ColumnId(11),
+            "ps_supplycost",
+            None,
+            VeinDataType::Int64,
+        ));
+        let join_schema = Box::new(VeinSchema::new(vec![
+            Arc::clone(&visible),
+            Arc::clone(&hidden_filter_column),
+        ]));
+        let leaf = external_scan(&join_schema);
+        let join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(leaf.clone()),
+            right: Box::new(leaf),
+            on: None,
+            using: Vec::new(),
+            schema: join_schema,
+        };
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(join),
+            predicate: LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(hidden_filter_column.clone())),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(7))),
+                return_type: VeinDataType::Boolean,
+            },
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(filtered),
+            exprs: vec![LogicalExpr::Column(Arc::clone(&visible))],
+            schema: Box::new(VeinSchema::new(vec![Arc::clone(&visible)])),
+        };
+        let built_child_schema = VeinSchema::new(vec![visible, hidden_filter_column]);
+
+        let (program, output_schema) = PipelineCompiler::compile_join_transform(
+            &plan,
+            &built_child_schema,
+        )
+        .expect("the project must bind against the already-built filtered join schema");
+
+        assert_eq!(output_schema.fields.len(), 1);
+        assert!(!program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            common::protocol::MicroOp::FilterMask { .. }
+        )), "the child filter must not be compiled a second time");
     }
 
     #[test]

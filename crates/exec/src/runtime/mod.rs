@@ -10,6 +10,9 @@
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
@@ -24,7 +27,7 @@ use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
 use common::protocol::{
     AggregatePlan, DataSink, DataSource, ExecuteTask, JoinKind, JoinOutput, JoinPlan, LimitSpec,
-    MicroProgram, SortPlan,
+    MicroProgram, PhysicalInputPlan, SortPlan,
 };
 use error::VeinError;
 use types::VeinDataType;
@@ -192,6 +195,54 @@ impl PipelineNode<DataChunk> for TransformHandle {
     }
 }
 
+/// Shares a build sink with the join executor while a source owns its pipeline.
+struct SharedBuildSink(Arc<Mutex<Option<BuildSink>>>);
+
+impl PipelineNode<DataChunk> for SharedBuildSink {
+    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+        self.0.lock().map_err(|_| VeinError::internal("join build mutex poisoned"))?
+            .as_mut().ok_or_else(|| VeinError::internal("join build sink already finished"))?
+            .push(chunk)
+    }
+    fn flush(&mut self) -> Result<()> {
+        self.0.lock().map_err(|_| VeinError::internal("join build mutex poisoned"))?
+            .as_mut().ok_or_else(|| VeinError::internal("join build sink already finished"))?
+            .flush()
+    }
+}
+
+/// Serializes pushes from concurrent file readers into one downstream node.
+struct SharedPipelineNode(Arc<Mutex<Box<dyn PipelineNode<DataChunk>>>>);
+
+impl PipelineNode<DataChunk> for SharedPipelineNode {
+    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+        self.0.lock().map_err(|_| VeinError::internal("pipeline node mutex poisoned"))?.push(chunk)
+    }
+    fn flush(&mut self) -> Result<()> {
+        self.0.lock().map_err(|_| VeinError::internal("pipeline node mutex poisoned"))?.flush()
+    }
+    fn finished(&self) -> bool {
+        self.0.lock().map(|node| node.finished()).unwrap_or(false)
+    }
+}
+
+/// Counts active rows and chunks entering a join without inspecting or cloning columns.
+struct JoinProbeCounter {
+    inner: Box<dyn PipelineNode<DataChunk>>,
+    rows: Arc<AtomicU64>,
+    batches: Arc<AtomicU64>,
+}
+
+impl PipelineNode<DataChunk> for JoinProbeCounter {
+    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+        self.rows.fetch_add(chunk.num_rows() as u64, Ordering::Relaxed);
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.inner.push(chunk)
+    }
+    fn flush(&mut self) -> Result<()> { self.inner.flush() }
+    fn finished(&self) -> bool { self.inner.finished() }
+}
+
 /// A [`PipelineNode`] adapter that forwards pushes and swallows the flush.
 ///
 /// A join's probe side is split into one chain per file, all feeding the one
@@ -241,6 +292,201 @@ impl DefaultTaskExecutor {
     /// Create a task executor that builds pipelines with `builder`.
     pub fn new(builder: Arc<dyn ExecutorBuilder>) -> Self {
         Self { builder }
+    }
+
+    /// Execute a recursive input tree with bounded batches between operators.
+    fn execute_input<'a>(
+        &'a self,
+        input: &'a PhysicalInputPlan,
+        mut next: Box<dyn PipelineNode<DataChunk>>,
+        task: &'a ExecuteTask,
+        cancel: &'a CancellationToken,
+        span: &'a tracing::Span,
+        depth: usize,
+    ) -> Pin<Box<dyn Future<Output=Result<u64>> + Send + 'a>> {
+        Box::pin(async move {
+            if cancel.is_cancelled() { return Err(VeinError::cancelled()); }
+            match input {
+                PhysicalInputPlan::Pipeline { source: data_source, program } => {
+                    let sources = split_scan(data_source);
+                    if sources.len() > 1 {
+                        let shared = Arc::new(Mutex::new(next));
+                        let mut workers = Vec::with_capacity(sources.len());
+                        for source_spec in sources {
+                            let builder = Arc::clone(&self.builder);
+                            let shared = Arc::clone(&shared);
+                            let program = Arc::clone(program);
+                            let task_id = task.task_id;
+                            let attempt = task.attempt;
+                            let cancel = cancel.clone();
+                            let span = span.clone();
+                            workers.push(tokio::spawn(async move {
+                                let mut source = builder.build_source(&source_spec, task_id, attempt)?;
+                                let next: Box<dyn PipelineNode<DataChunk>> = Box::new(
+                                    SuppressFlush::new(Box::new(SharedPipelineNode(shared))),
+                                );
+                                if program.instructions.is_empty() {
+                                    let mut next = next;
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancel.cancelled() => Err(VeinError::cancelled()),
+                                        result = source.execute(&mut *next).instrument(span) => {
+                                            result?;
+                                            Ok(source.bytes_read())
+                                        }
+                                    }
+                                } else {
+                                    let mut vm = builder.build_vm(&program, next)?;
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancel.cancelled() => Err(VeinError::cancelled()),
+                                        result = source.execute(&mut *vm).instrument(span) => {
+                                            result?;
+                                            Ok(source.bytes_read())
+                                        }
+                                    }
+                                }
+                            }));
+                        }
+                        let mut bytes = 0u64;
+                        let mut worker_error = None;
+                        for worker in workers {
+                            match worker.await {
+                                Ok(Ok(worker_bytes)) => bytes = bytes.saturating_add(worker_bytes),
+                                Ok(Err(error)) => { worker_error.get_or_insert(error); }
+                                Err(error) => {
+                                    worker_error.get_or_insert_with(|| {
+                                        VeinError::internal(format!("input scan task failed: {error}"))
+                                    });
+                                }
+                            };
+                        }
+                        if let Some(error) = worker_error {
+                            return Err(error);
+                        }
+                        shared.lock().map_err(|_| VeinError::internal("pipeline node mutex poisoned"))?.flush()?;
+                        return Ok(bytes);
+                    }
+                    let mut source = self.builder.build_source(data_source, task.task_id, task.attempt)?;
+                    if program.instructions.is_empty() {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => Err(VeinError::cancelled()),
+                            result = source.execute(&mut *next).instrument(span.clone()) => {
+                                result?;
+                                Ok(source.bytes_read())
+                            }
+                        }
+                    } else {
+                        let mut vm = self.builder.build_vm(program, next)?;
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => Err(VeinError::cancelled()),
+                            result = source.execute(&mut *vm).instrument(span.clone()) => {
+                                result?;
+                                Ok(source.bytes_read())
+                            }
+                        }
+                    }
+                }
+                PhysicalInputPlan::Transform { input, program } => {
+                    let transform = self.builder.build_vm(program, next)?;
+                    let bytes = self.execute_input(
+                        input,
+                        Box::new(TransformHandle(transform)),
+                        task,
+                        cancel,
+                        span,
+                        depth + 1,
+                    ).await?;
+                    Ok(bytes)
+                }
+                PhysicalInputPlan::Aggregate { input, plan } => {
+                    let (accumulator, handle) = aggregate::shared(plan.clone())?;
+                    let bytes = self
+                        .execute_input(input, handle, task, cancel, span, depth + 1)
+                        .await?;
+                    let groups = accumulator
+                        .lock()
+                        .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?
+                        .finish()?;
+                    for batch in groups {
+                        next.push(batch)?;
+                    }
+                    next.flush()?;
+                    tracing::debug!(
+                        target: "vein.audit",
+                        event = "recursive_aggregate_finished",
+                        depth,
+                        input_bytes = bytes,
+                        "recursive_aggregate_finished"
+                    );
+                    Ok(bytes)
+                }
+                PhysicalInputPlan::Join { probe, build, plan } => {
+                    let started = Instant::now();
+                    let build_sink = Arc::new(Mutex::new(Some(BuildSink::new(
+                        join_keys(&plan.probe_keys),
+                        join_keys(&plan.build_keys),
+                    ))));
+                    let build_bytes = self.execute_input(
+                        build,
+                        Box::new(SharedBuildSink(Arc::clone(&build_sink))),
+                        task,
+                        cancel,
+                        span,
+                        depth + 1,
+                    ).await?;
+                    let build_sink = build_sink.lock()
+                        .map_err(|_| VeinError::internal("join build mutex poisoned"))?
+                        .take().ok_or_else(|| VeinError::internal("join build sink missing after execution"))?;
+                    let table = build_sink.finish();
+                    let build_rows = table.len() as u64;
+                    let build_us = started.elapsed().as_micros() as u64;
+
+                    let kind = join_type(plan.join_type)?;
+                    let join = HashJoin::new(
+                        Arc::new(table),
+                        kind,
+                        join_outputs(&plan.outputs),
+                        join_types(&plan.probe_types),
+                        join_types(&plan.build_types),
+                        next,
+                    );
+                    let probe_rows = Arc::new(AtomicU64::new(0));
+                    let probe_batches = Arc::new(AtomicU64::new(0));
+                    let probe_started = Instant::now();
+                    let probe_bytes = self.execute_input(
+                        probe,
+                        Box::new(JoinProbeCounter {
+                            inner: Box::new(join),
+                            rows: Arc::clone(&probe_rows),
+                            batches: Arc::clone(&probe_batches),
+                        }),
+                        task,
+                        cancel,
+                        span,
+                        depth + 1,
+                    ).await?;
+                    let probe_us = probe_started.elapsed().as_micros() as u64;
+                    tracing::info!(
+                        target: "vein.audit",
+                        event = "join_node_finished",
+                        depth,
+                        join_type = ?plan.join_type,
+                        build_rows,
+                        build_bytes,
+                        build_us,
+                        probe_rows = probe_rows.load(Ordering::Relaxed),
+                        probe_batches = probe_batches.load(Ordering::Relaxed),
+                        probe_bytes,
+                        probe_us,
+                        "join_node_finished"
+                    );
+                    Ok(build_bytes.saturating_add(probe_bytes))
+                }
+            }
+        })
     }
 
     /// The probe half of a join: one chain per file of the probe source, sharing
@@ -485,50 +731,51 @@ impl DefaultTaskExecutor {
         // A join reads its build side to completion before the probe starts.
         // That ordering is what makes it a pipeline breaker, and it is the
         // runtime's job because only the runtime knows when a source is done.
-        let join = match (&task.build, &task.join) {
-            (Some(build_source), Some(plan)) => {
-                let build_started = Instant::now();
-                let probe_keys = join_keys(&plan.probe_keys);
-                let build_keys = join_keys(&plan.build_keys);
+        let join = if task.input_plan.is_some() { None } else {
+            match (&task.build, &task.join) {
+                (Some(build_source), Some(plan)) => {
+                    let build_started = Instant::now();
+                    let probe_keys = join_keys(&plan.probe_keys);
+                    let build_keys = join_keys(&plan.build_keys);
 
-                // One build per file, run concurrently, then merged. Reading the
-                // build side as a single source walked its files one after
-                // another, which is the largest serial cost in a join — an
-                // ordinary scan already spreads a table's files across workers.
-                let sources = split_scan(build_source);
-                let builds_used = sources.len();
-                let mut builds = Vec::with_capacity(sources.len());
-                for source in sources {
-                    let builder = self.builder.clone();
-                    let sink = BuildSink::new(probe_keys.clone(), build_keys.clone());
-                    let task_id = task.task_id;
-                    let attempt = task.attempt;
-                    builds.push(tokio::spawn(async move {
-                        let mut sink = sink;
-                        let mut source = builder.build_source(&source, task_id, attempt)?;
-                        source.execute(&mut sink).await?;
-                        Ok::<_, VeinError>(sink.finish())
-                    }));
-                }
-
-                let mut table: Option<HashTable> = None;
-                for build in builds {
-                    let partial = build.await.map_err(|error| {
-                        VeinError::internal(format!("join build task failed: {error}"))
-                    })??;
-                    match &mut table {
-                        Some(table) => table.merge(partial)?,
-                        None => table = Some(partial),
+                    // One build per file, run concurrently, then merged. Reading the
+                    // build side as a single source walked its files one after
+                    // another, which is the largest serial cost in a join — an
+                    // ordinary scan already spreads a table's files across workers.
+                    let sources = split_scan(build_source);
+                    let builds_used = sources.len();
+                    let mut builds = Vec::with_capacity(sources.len());
+                    for source in sources {
+                        let builder = self.builder.clone();
+                        let sink = BuildSink::new(probe_keys.clone(), build_keys.clone());
+                        let task_id = task.task_id;
+                        let attempt = task.attempt;
+                        builds.push(tokio::spawn(async move {
+                            let mut sink = sink;
+                            let mut source = builder.build_source(&source, task_id, attempt)?;
+                            source.execute(&mut sink).await?;
+                            Ok::<_, VeinError>(sink.finish())
+                        }));
                     }
-                }
-                let table =
-                    table.ok_or_else(|| VeinError::internal("a join build produced no chunks"))?;
 
-                // The whole build phase — reading it *and* hashing it — so the
-                // join's two halves can be compared without summing scan events.
-                let build_rows = table.len() as u64;
-                let build_us = build_started.elapsed().as_micros() as u64;
-                tracing::info!(
+                    let mut table: Option<HashTable> = None;
+                    for build in builds {
+                        let partial = build.await.map_err(|error| {
+                            VeinError::internal(format!("join build task failed: {error}"))
+                        })??;
+                        match &mut table {
+                            Some(table) => table.merge(partial)?,
+                            None => table = Some(partial),
+                        }
+                    }
+                    let table =
+                        table.ok_or_else(|| VeinError::internal("a join build produced no chunks"))?;
+
+                    // The whole build phase — reading it *and* hashing it — so the
+                    // join's two halves can be compared without summing scan events.
+                    let build_rows = table.len() as u64;
+                    let build_us = build_started.elapsed().as_micros() as u64;
+                    tracing::info!(
                     target: "vein.audit",
                     event = "join_build_phase",
                     rows = build_rows,
@@ -536,9 +783,10 @@ impl DefaultTaskExecutor {
                     build_us,
                     "join_build_phase"
                 );
-                Some((table, plan))
+                    Some((table, plan))
+                }
+                _ => None,
             }
-            _ => None,
         };
 
         let sink_started = Instant::now();
@@ -585,6 +833,32 @@ impl DefaultTaskExecutor {
                         .probe_join(task, table, plan, sink.clone(), cancel.clone(), &task_span)
                         .await?;
                     (probe.bytes_read, probe.vm_build_us, probe.source_build_us)
+                }
+                None if task.input_plan.is_some() => {
+                    let head = with_window(
+                        Box::new(CancelGuard::new(
+                            Box::new(SinkHandle(sink.clone())),
+                            cancel.clone(),
+                        )),
+                        task.limit,
+                    );
+                    let head = ordered_head(task.sort.clone(), task.sort_output_columns, task.limit, head);
+                    let head = sort_key_head(
+                        self.builder.as_ref(),
+                        task.sort_key_program.as_ref(),
+                        head,
+                    )?;
+                    let source_build_started = Instant::now();
+                    let input_plan = task.input_plan.as_ref().expect("guarded above");
+                    let bytes = self.execute_input(
+                        input_plan,
+                        head,
+                        task,
+                        &cancel,
+                        &task_span,
+                        0,
+                    ).await?;
+                    (bytes, 0, source_build_started.elapsed().as_micros() as u64)
                 }
                 None => {
                     let head = with_window(
@@ -800,6 +1074,7 @@ mod tests {
     use common::identifiers::{QueryId, RequestId, StageId, TaskId};
     use common::protocol::{
         AggOpCode, AggregatePlan, ExecutionMode, JoinKind, JoinOutput, JoinPlan, MicroOp,
+        PhysicalInputPlan,
     };
 
     /// A builder whose only difference from the default is that it can
@@ -880,6 +1155,7 @@ mod tests {
             attempt: 0,
             query_id: QueryId::new(),
             stage_id: StageId::new(),
+            input_plan: None,
             source: DataSource::Memory, // supplied by MemoryFeedBuilder: Int64 [1,2,3,4,5]
             program: Arc::new(MicroProgram {
                 register_count: 3,
@@ -1118,5 +1394,82 @@ mod tests {
             })
             .collect();
         assert_eq!(rows, vec![5, 4, 3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn streams_chained_joins_between_hash_join_nodes() {
+        let leaf = || PhysicalInputPlan::Pipeline {
+            source: DataSource::Memory,
+            program: Arc::new(MicroProgram::empty()),
+        };
+        let join_plan = || JoinPlan {
+            join_type: JoinKind::Inner,
+            probe_keys: vec![0],
+            build_keys: vec![0],
+            outputs: vec![JoinOutput::Probe(0)],
+            probe_types: vec![types::VeinDataType::Int64],
+            build_types: vec![types::VeinDataType::Int64],
+        };
+        let projected_inner = PhysicalInputPlan::Transform {
+            input: Box::new(PhysicalInputPlan::Join {
+                probe: Box::new(leaf()),
+                build: Box::new(leaf()),
+                plan: join_plan(),
+            }),
+            program: Arc::new(MicroProgram {
+                register_count: 1,
+                instructions: vec![common::protocol::MicroOp::ProjectRegisters {
+                    out_regs: vec![0],
+                }],
+            }),
+        };
+        let input = PhysicalInputPlan::Join {
+            probe: Box::new(projected_inner),
+            build: Box::new(leaf()),
+            plan: join_plan(),
+        };
+        let mut task = task();
+        task.program = Arc::new(MicroProgram::empty());
+        task.input_plan = Some(Arc::new(input));
+
+        let result = runner()
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("chained hash joins should execute");
+
+        assert_eq!(result.row_count, 5);
+    }
+
+    #[tokio::test]
+    async fn aggregates_recursive_input_before_forwarding_batches() {
+        let mut task = task();
+        task.program = Arc::new(MicroProgram::empty());
+        task.input_plan = Some(Arc::new(PhysicalInputPlan::Aggregate {
+            input: Box::new(PhysicalInputPlan::Pipeline {
+                source: DataSource::Memory,
+                program: Arc::new(MicroProgram::empty()),
+            }),
+            plan: AggregatePlan {
+                groups: 0,
+                estimated_groups: None,
+                grouping_sets: Some(vec![vec![]]),
+                aggs: vec![AggOpCode::Count],
+                aggregate_input_types: vec![types::VeinDataType::Int64],
+                types: vec![types::VeinDataType::Int64],
+            },
+        }));
+
+        let result = runner()
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("recursive aggregate should execute");
+
+        assert_eq!(result.row_count, 1);
+        let count = result.output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("count result should be int64");
+        assert_eq!(count.value(0), 5);
     }
 }

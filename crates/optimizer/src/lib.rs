@@ -29,4 +29,5 @@ pub use rules::{
     join_transitivity::JoinPredicateTransitivityRule, predicate_pushdown::PredicatePushdownRule,
     scan_filter_pushdown::ScanFilterPushdownRule,
     scan_statistics_pruning::ScanStatisticsPruningRule,
+    scalar_aggregate_decorrelation::ScalarAggregateDecorrelationRule,
 };

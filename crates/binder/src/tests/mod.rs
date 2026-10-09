@@ -663,6 +663,18 @@ mod extended_features {
     }
 
     #[tokio::test]
+    async fn decimal_literal_binds_exactly_and_compares_with_decimal_column() {
+        let projection = bind("FROM decimal_values |> SELECT 0.05 AS threshold").await;
+        assert!(matches!(
+            expr_of(&projection),
+            LogicalExpr::Literal(LogicalLiteral::Decimal(5, 2, 2))
+        ));
+
+        let filter = bind("FROM decimal_values |> WHERE amount >= 0.05").await;
+        assert_eq!(expr_of(&filter).data_type(), plan::VeinDataType::Boolean);
+    }
+
+    #[tokio::test]
     async fn scalar_function_arguments_follow_registered_signatures() {
         let plan = bind("FROM users |> SELECT LOWER(name)").await;
         let LogicalExpr::FunctionCall { args, .. } = expr_of(&plan) else {

@@ -1,13 +1,8 @@
-mod bench;
-mod local;
-mod parquet_catalog;
-mod parquet_storage;
-
 use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use local::LocalQueryEngine;
+use cli::local::LocalQueryEngine;
 
 /// Rows the CLI renders before summarising the rest.
 ///
@@ -19,18 +14,7 @@ const DISPLAY_ROWS: usize = 1_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1).peekable();
-
-    // Benchmark mode runs without the audit subscriber: the report must not be
-    // interleaved with per-task trace events.
-    if args.peek().map(String::as_str) == Some("--bench") {
-        args.next();
-        let iterations = args
-            .next()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(10);
-        return bench::run(iterations).await;
-    }
+    let args = std::env::args().skip(1);
 
     common::logging::init("cli")?;
 

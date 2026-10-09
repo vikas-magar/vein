@@ -514,6 +514,7 @@ fn collect_columns(expr: &LogicalExpr, output: &mut RequiredColumns) {
 mod tests {
     use super::*;
     use plan::{ColumnId, ResolvedColumn, ResolvedColumnRef, TableMetadata, VeinDataType};
+    type Arc<T> = std::sync::Arc<T>;
 
     fn field(id: usize, name: &str) -> ResolvedColumnRef {
         std::sync::Arc::new(ResolvedColumn::new(
@@ -564,5 +565,162 @@ mod tests {
             panic!("expected scan");
         };
         assert_eq!(projection, Some(vec![ColumnId(1)]));
+    }
+
+    #[test]
+    fn filter_dependencies_survive_projection_pruning_across_join_inputs() {
+        let column = |id, name: &str, qualifier: &str| {
+            std::sync::Arc::new(ResolvedColumn::new(
+                ColumnId(id),
+                name,
+                Some(qualifier.to_string()),
+                VeinDataType::Int64,
+            ))
+        };
+        let scan = |table: &str, fields: Vec<ResolvedColumnRef>| {
+            let schema = Box::new(VeinSchema { fields });
+            LogicalPlan::Scan {
+                table: std::sync::Arc::new(TableMetadata::new(
+                    table,
+                    std::sync::Arc::new(*schema.clone()),
+                )),
+                projection: None,
+                filters: vec![],
+                schema,
+            }
+        };
+
+        let part_key = column(10, "p_partkey", "part");
+        let supply_part_key = column(11, "ps_partkey", "partsupp");
+        let supply_cost = column(12, "ps_supplycost", "partsupp");
+        let supplier_key = column(13, "ps_suppkey", "partsupp");
+        let supplier_supp_key = column(14, "s_suppkey", "supplier");
+        let supplier_name = column(15, "s_name", "supplier");
+        let min_part_key = column(16, "group_partkey", "partsupp_min");
+        let min_cost = column(17, "min_supplycost", "partsupp_min");
+
+        let part_scan = scan("part", vec![Arc::clone(&part_key)]);
+        let partsupp_scan = scan(
+            "partsupp",
+            vec![
+                Arc::clone(&supply_part_key),
+                Arc::clone(&supply_cost),
+                Arc::clone(&supplier_key),
+            ],
+        );
+        let first_join_schema = Box::new(VeinSchema::new(vec![
+            Arc::clone(&part_key),
+            Arc::clone(&supply_part_key),
+            Arc::clone(&supply_cost),
+            Arc::clone(&supplier_key),
+        ]));
+        let first_join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(part_scan),
+            right: Box::new(partsupp_scan),
+            on: Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&part_key))),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(Arc::clone(&supply_part_key))),
+                return_type: VeinDataType::Boolean,
+            }),
+            using: vec![],
+            schema: first_join_schema,
+        };
+
+        let supplier_scan = scan(
+            "supplier",
+            vec![Arc::clone(&supplier_supp_key), Arc::clone(&supplier_name)],
+        );
+        let chained_schema = Box::new(VeinSchema::new(vec![
+            Arc::clone(&part_key),
+            Arc::clone(&supply_part_key),
+            Arc::clone(&supply_cost),
+            Arc::clone(&supplier_key),
+            Arc::clone(&supplier_supp_key),
+            Arc::clone(&supplier_name),
+        ]));
+        let chained_join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(first_join),
+            right: Box::new(supplier_scan),
+            on: Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&supplier_key))),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(Arc::clone(&supplier_supp_key))),
+                return_type: VeinDataType::Boolean,
+            }),
+            using: vec![],
+            schema: chained_schema,
+        };
+
+        let min_scan = scan(
+            "partsupp_min",
+            vec![Arc::clone(&min_part_key), Arc::clone(&min_cost)],
+        );
+        let correlated_join_schema = Box::new(VeinSchema::new(vec![
+            Arc::clone(&part_key),
+            Arc::clone(&supply_part_key),
+            Arc::clone(&supply_cost),
+            Arc::clone(&supplier_key),
+            Arc::clone(&supplier_supp_key),
+            Arc::clone(&supplier_name),
+            Arc::clone(&min_part_key),
+            Arc::clone(&min_cost),
+        ]));
+        let correlated_join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Left,
+            left: Box::new(chained_join),
+            right: Box::new(min_scan),
+            on: Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&part_key))),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(Arc::clone(&min_part_key))),
+                return_type: VeinDataType::Boolean,
+            }),
+            using: vec![],
+            schema: correlated_join_schema,
+        };
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(correlated_join),
+            predicate: LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&supply_cost))),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(Arc::clone(&min_cost))),
+                return_type: VeinDataType::Boolean,
+            },
+        };
+        let output = column(18, "s_name", "result");
+        let plan = LogicalPlan::Project {
+            input: Box::new(filtered),
+            exprs: vec![LogicalExpr::Column(Arc::clone(&supplier_name))],
+            schema: Box::new(VeinSchema::new(vec![output])),
+        };
+
+        let pruned = prune_plan(plan, &[ColumnId(18)].into_iter().collect());
+        let LogicalPlan::Project { input, .. } = pruned else {
+            panic!("expected output projection");
+        };
+        let LogicalPlan::Filter { input, .. } = *input else {
+            panic!("filter must stay below the output projection");
+        };
+        let LogicalPlan::Join { left, .. } = *input else {
+            panic!("expected decorrelated aggregate join");
+        };
+        let LogicalPlan::Join { left, .. } = *left else {
+            panic!("expected chained supplier join");
+        };
+        let LogicalPlan::Join { right, .. } = *left else {
+            panic!("expected part-to-partsupp join");
+        };
+        let LogicalPlan::Scan { projection, .. } = *right else {
+            panic!("expected partsupp scan");
+        };
+        assert!(
+            projection
+                .as_ref()
+                .is_none_or(|columns| columns.contains(&ColumnId(12))),
+            "filter-only ps_supplycost must survive scan pruning: {projection:?}"
+        );
     }
 }

@@ -26,4 +26,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["async_tokio", "html_reports"] }
 tempfile = "3"
+
+[[bench]]
+name = "queries"
+harness = false

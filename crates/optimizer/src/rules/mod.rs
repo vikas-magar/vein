@@ -24,6 +24,9 @@ pub mod scan_filter_pushdown;
 /// Conservative statistics-based scan elimination.
 pub mod scan_statistics_pruning;
 
+/// Decorrelation of supported correlated scalar aggregates into grouped joins.
+pub mod scalar_aggregate_decorrelation;
+
 /// Equality-based predicate propagation across inner joins.
 pub mod join_transitivity;
 
@@ -35,3 +38,4 @@ pub use join_transitivity::JoinPredicateTransitivityRule;
 pub use predicate_pushdown::PredicatePushdownRule;
 pub use scan_filter_pushdown::ScanFilterPushdownRule;
 pub use scan_statistics_pruning::ScanStatisticsPruningRule;
+pub use scalar_aggregate_decorrelation::ScalarAggregateDecorrelationRule;

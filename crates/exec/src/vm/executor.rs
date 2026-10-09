@@ -166,6 +166,19 @@ impl VectorVmExecutor {
                         ops::eval_cmp_neq(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
                     store_result(&mut self.registers, *dst, res)?;
                 }
+                MicroOp::Like {
+                    dst,
+                    src,
+                    pattern,
+                    negated,
+                } => {
+                    let res = ops::eval_like(
+                        self.registers.get(*src)?,
+                        self.registers.get(*pattern)?,
+                        *negated,
+                    )?;
+                    store_result(&mut self.registers, *dst, res)?;
+                }
                 MicroOp::CmpGt { dst, src1, src2 } => {
                     let res =
                         ops::eval_cmp_gt(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
@@ -315,7 +328,7 @@ impl Transform<DataChunk> for VectorVmExecutor {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Float64Array, Int64Array};
+    use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
     use types::LogicalLiteral;
     use std::sync::Mutex;
     use types::VeinDataType;
@@ -471,5 +484,54 @@ mod tests {
             .expect("Cast must project a Float64 column");
         assert_eq!(out_col.value(0), 1.0);
         assert_eq!(out_col.value(2), 3.0);
+    }
+
+    #[test]
+    fn vector_vm_executes_like_and_projects_boolean_result() {
+        let values: ArrayRef =
+            Arc::new(StringArray::from(vec!["POLISHED BRASS", "STEEL", "BRASS"]));
+        let chunk = DataChunk::from_vectors(vec![values]);
+        let program = MicroProgram {
+            register_count: 3,
+            instructions: vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::String("%BRASS".to_string()),
+                },
+                MicroOp::Like {
+                    dst: 2,
+                    src: 0,
+                    pattern: 1,
+                    negated: false,
+                },
+                MicroOp::ProjectRegisters { out_regs: vec![2] },
+            ],
+        };
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let sink = Box::new(CollectNode {
+            chunks: Arc::clone(&collected),
+        });
+        let mut vm = VectorVmExecutor::new(
+            Arc::new(program),
+            Arc::new(FunctionRegistry::new()),
+            sink,
+        );
+
+        vm.push(chunk).expect("LIKE instruction should execute");
+        vm.flush().expect("LIKE result should flush");
+
+        let chunks = collected.lock().unwrap();
+        assert_eq!(chunks.len(), 1);
+        let result = chunks[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("LIKE result is boolean");
+        assert_eq!(
+            (0..result.len())
+                .map(|index| result.value(index))
+                .collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
     }
 }

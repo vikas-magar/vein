@@ -4,6 +4,41 @@ use crate::ast::pipe_op::OrderByExpr;
 use crate::parser::{ParseError, Parser, TokenKind};
 use crate::token::Span;
 
+/// Parses a decimal-form numeric token without passing through binary floating
+/// point. The returned tuple is the unscaled value, precision, and scale.
+fn parse_exact_decimal(text: &str) -> Result<(i128, u8, i8), String> {
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(index) => {
+            let exponent = text[index + 1..]
+                .parse::<i32>()
+                .map_err(|_| format!("invalid decimal exponent: {text}"))?;
+            (&text[..index], exponent)
+        }
+        None => (text, 0),
+    };
+    let fractional_digits = mantissa
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
+    let significant = digits.trim_start_matches('0');
+    let significant = if significant.is_empty() { "0" } else { significant };
+    let scale = i32::try_from(fractional_digits)
+        .map_err(|_| format!("decimal scale is out of range: {text}"))?
+        - exponent;
+    let precision = significant
+        .len()
+        .saturating_add(usize::try_from((-scale).max(0)).unwrap_or(0))
+        .max(usize::try_from(scale.max(0)).unwrap_or(0))
+        .max(1);
+    if precision > 38 || scale < -38 || scale > 38 {
+        return Err(format!("decimal literal exceeds Decimal128 precision: {text}"));
+    }
+    let unscaled = significant
+        .parse::<i128>()
+        .map_err(|_| format!("decimal literal exceeds Decimal128 range: {text}"))?;
+    Ok((unscaled, precision as u8, scale as i8))
+}
+
 /// Resolves the escapes inside a string literal body (the text between the
 /// surrounding quotes): a doubled quote `''` becomes `'`, and a backslash
 /// escape `\X` becomes `X`. Mirrors how the lexer scans these forms.
@@ -192,7 +227,14 @@ impl<'a> Parser<'a> {
                 })
             }
             TokenKind::Like => {
-                let pattern = self.parse_expr()?;
+                // Parse only the pattern's tighter-binding expression. Parsing
+                // a full expression here would absorb a following AND/OR into
+                // the pattern (for example, `name LIKE 'A%' AND active`).
+                let pattern_min_prec = infix_prec(&TokenKind::Like)
+                    .expect("LIKE always has a precedence")
+                    .0
+                    + 1;
+                let pattern = self.parse_binary(pattern_min_prec)?;
                 Ok(SpannedExpr {
                     span,
                     node: Expr::Like {
@@ -426,19 +468,13 @@ impl<'a> Parser<'a> {
                         node: Expr::Literal(Literal::Int(val)),
                     })
                 } else if text.contains('.') || text.contains('e') || text.contains('E') {
-                    let val: f64 = text.parse().map_err(|_| ParseError::NumberParse {
-                        message: format!("invalid float literal: {text}"),
+                    let (unscaled, precision, scale) = parse_exact_decimal(text).map_err(|message| ParseError::NumberParse {
+                        message,
                         span,
                     })?;
-                    if !val.is_finite() {
-                        return Err(ParseError::NumberParse {
-                            message: format!("float literal overflows f64: {text}"),
-                            span,
-                        });
-                    }
                     Ok(SpannedExpr {
                         span,
-                        node: Expr::Literal(Literal::Float(val.into())),
+                        node: Expr::Literal(Literal::Decimal(unscaled, precision, scale)),
                     })
                 } else {
                     let val: i64 = text.parse().map_err(|_| ParseError::NumberParse {
@@ -1141,6 +1177,30 @@ mod tests {
     fn test_overflowing_float_literal_is_error() {
         let err = parse_expr("1e999").expect_err("test should fail");
         assert!(matches!(err, ParseError::NumberParse { .. }));
+    }
+
+    #[test]
+    fn decimal_literals_preserve_unscaled_value_precision_and_scale() {
+        for (sql, expected) in [
+            ("0.05", (5, 2, 2)),
+            ("1.2300", (12300, 5, 4)),
+            ("1.25e-2", (125, 4, 4)),
+            ("1e2", (1, 3, -2)),
+        ] {
+            let expr = parse_expr(sql).expect("valid Decimal128 literal");
+            assert!(matches!(
+                expr.node,
+                Expr::Literal(Literal::Decimal(value, precision, scale))
+                    if (value, precision, scale) == expected
+            ), "wrong decimal representation for {sql}");
+        }
+    }
+
+    #[test]
+    fn decimal_literals_outside_decimal128_range_are_rejected() {
+        for sql in ["1e39", "1e-39"] {
+            assert!(parse_expr(sql).is_err(), "accepted out-of-range {sql}");
+        }
     }
 
     #[test]

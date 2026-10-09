@@ -315,4 +315,32 @@ mod tests {
             assert_eq!(aggregates[7].alias, Some("count_order"));
         }
     }
+
+    /// Regression fixture for the TPC-H Q2 query that combines chained joins,
+    /// LIKE, a correlated scalar MIN, a narrow SELECT, and ORDER BY.
+    #[test]
+    fn parses_tpch_q2_correlated_min_query() {
+        let query = parse_query(
+            "\
+            FROM part \
+            |> JOIN partsupp ON p_partkey = ps_partkey \
+            |> JOIN supplier ON ps_suppkey = s_suppkey \
+            |> JOIN nation ON s_nationkey = n_nationkey \
+            |> JOIN region ON n_regionkey = r_regionkey \
+            |> WHERE p_size = 15 AND p_type LIKE '%BRASS' AND r_name = 'EUROPE' \
+            |> WHERE ps_supplycost = (FROM partsupp |> WHERE ps_partkey = part.p_partkey |> AGGREGATE min(ps_supplycost)) \
+            |> SELECT s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment \
+            |> ORDER s_acctbal DESC, n_name, s_name, p_partkey \
+            ",
+        )
+            .expect("TPC-H Q2 regression query should parse");
+
+        assert_eq!(query.pipes.len(), 8);
+        assert!(matches!(query.pipes[0], PipeOperator::Join { .. }));
+        assert!(matches!(query.pipes[3], PipeOperator::Join { .. }));
+        assert!(matches!(query.pipes[4], PipeOperator::Where { .. }));
+        assert!(matches!(query.pipes[5], PipeOperator::Where { .. }));
+        assert!(matches!(query.pipes[6], PipeOperator::Select { .. }));
+        assert!(matches!(query.pipes[7], PipeOperator::OrderBy { .. }));
+    }
 }

@@ -54,10 +54,21 @@ pub fn eval_cmp_lte(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<ArrayRef> {
     Ok(Arc::new(res))
 }
 
+/// Performs SQL LIKE or NOT LIKE with Arrow's vectorized string kernel.
+pub fn eval_like(value: &dyn Datum, pattern: &dyn Datum, negated: bool) -> Result<ArrayRef> {
+    let result = if negated {
+        arrow::compute::kernels::comparison::nlike(value, pattern)
+    } else {
+        arrow::compute::kernels::comparison::like(value, pattern)
+    }
+        .map_err(|error| VeinError::internal(format!("Vector VM Like error: {error}")))?;
+    Ok(Arc::new(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{BooleanArray, Int32Array};
+    use arrow::array::{Array, BooleanArray, Int32Array};
 
     #[test]
     fn test_comparison_kernels() {
@@ -81,5 +92,32 @@ mod tests {
         assert_eq!(lte_bool.value(0), true);
         assert_eq!(lte_bool.value(1), true);
         assert_eq!(lte_bool.value(2), false);
+    }
+
+    #[test]
+    fn sql_like_kernel_supports_wildcards_negation_and_nulls() {
+        use arrow::array::StringArray;
+
+        let values = StringArray::from(vec![Some("POLISHED BRASS"), Some("BRASS"), None]);
+        let pattern = StringArray::from(vec![Some("%BRASS"), Some("B_ASS"), Some("%")]);
+        let matched = eval_like(&values, &pattern, false).expect("LIKE kernel should run");
+        let matched = matched
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("LIKE returns booleans");
+        assert_eq!(matched.value(0), true);
+        assert_eq!(matched.value(1), true);
+        assert!(matched.is_null(2));
+
+        let values = StringArray::from(vec![Some("POLISHED BRASS"), Some("BRASS"), None]);
+        let pattern = StringArray::from(vec![Some("%BRASS"), Some("B_ASS"), Some("%")]);
+        let unmatched = eval_like(&values, &pattern, true).expect("NOT LIKE kernel should run");
+        let unmatched = unmatched
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("NOT LIKE returns booleans");
+        assert_eq!(unmatched.value(0), false);
+        assert_eq!(unmatched.value(1), false);
+        assert!(unmatched.is_null(2));
     }
 }

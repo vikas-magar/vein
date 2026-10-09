@@ -207,7 +207,7 @@ FROM part
 |> JOIN nation ON s_nationkey = n_nationkey
 |> JOIN region ON n_regionkey = r_regionkey
 |> WHERE p_size = 15 AND p_type LIKE '%BRASS' AND r_name = 'EUROPE'
-|> WHERE ps_supplycost = (FROM partsupp |> WHERE ps_partkey = p_partkey |> AGGREGATE min(ps_supplycost))
+|> WHERE ps_supplycost = (FROM partsupp |> WHERE ps_partkey = part.p_partkey |> AGGREGATE min(ps_supplycost))
 |> SELECT s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment
 |> ORDER s_acctbal DESC, n_name, s_name, p_partkey
 "
@@ -233,7 +233,7 @@ FROM customer
 VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "
 FROM orders
 |> WHERE o_orderdate >= DATE '1993-07-01' AND o_orderdate < DATE '1993-10-01'
-   AND EXISTS (FROM lineitem |> WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate)
+   AND EXISTS (FROM lineitem |> WHERE l_orderkey = orders.o_orderkey AND l_commitdate < l_receiptdate)
 |> AGGREGATE count(*) AS order_count GROUP BY o_orderpriority
 |> ORDER o_orderpriority
 "
@@ -441,8 +441,8 @@ FROM partsupp
 VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "
 FROM lineitem
 |> JOIN part ON l_partkey = p_partkey
-|> WHERE p_brand = 'Brand#23' AND p_container = 'MED BOX'
-   AND l_quantity < (FROM lineitem |> WHERE l_partkey = p_partkey
+   |> WHERE p_brand = 'Brand#23' AND p_container = 'MED BOX'
+   AND l_quantity < (FROM lineitem |> WHERE l_partkey = part.p_partkey
       |> AGGREGATE avg(l_quantity) * 0.2)
 |> AGGREGATE sum(l_extendedprice) / 7.0 AS avg_yearly
 "
@@ -490,7 +490,7 @@ FROM supplier
    AND s_suppkey IN (FROM partsupp |> JOIN part ON ps_partkey = p_partkey
       |> WHERE p_name LIKE 'forest%'
       |> WHERE ps_availqty > (FROM lineitem
-         |> WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey
+          |> WHERE l_partkey = partsupp.ps_partkey AND l_suppkey = partsupp.ps_suppkey
             AND l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'
          |> AGGREGATE sum(l_quantity) * 0.5))
 |> SELECT s_name, s_address
@@ -527,7 +527,7 @@ FROM customer
    AND c_acctbal > (FROM customer
       |> WHERE c_acctbal > 0 AND substring(c_phone, 1, 2) IN ('13', '31', '23', '29', '30', '18', '17')
       |> AGGREGATE avg(c_acctbal))
-   AND NOT EXISTS (FROM orders |> WHERE o_custkey = c_custkey)
+    AND NOT EXISTS (FROM orders |> WHERE o_custkey = customer.c_custkey)
 |> AGGREGATE count(*) AS numcust, sum(c_acctbal) AS totacctbal GROUP BY country_code
 |> ORDER country_code
 "

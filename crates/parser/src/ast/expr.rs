@@ -232,6 +232,8 @@ pub enum Literal {
     Boolean(bool),
     /// An integer literal.
     Int(i64),
+    /// An exact decimal literal: unscaled value, precision, and scale.
+    Decimal(i128, u8, i8),
     /// A floating-point literal.
     Float(OrderedFloat<f64>),
     /// A string literal, with escapes already resolved.
@@ -244,6 +246,9 @@ impl PartialEq for Literal {
             (Literal::Null, Literal::Null) => true,
             (Literal::Boolean(a), Literal::Boolean(b)) => a == b,
             (Literal::Int(a), Literal::Int(b)) => a == b,
+            (Literal::Decimal(a, ap, as_), Literal::Decimal(b, bp, bs)) => {
+                a == b && ap == bp && as_ == bs
+            }
             (Literal::Float(a), Literal::Float(b)) => a.0 == b.0,
             (Literal::String(a), Literal::String(b)) => a == b,
             _ => false,

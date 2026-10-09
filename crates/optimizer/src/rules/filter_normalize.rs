@@ -43,7 +43,11 @@ impl OptimizerRule for FilterNormalizationRule {
             _ => plan.clone(),
         };
 
-        Ok((rewritten != *plan).then_some(rewritten))
+        if rewritten == *plan {
+            Ok(None)
+        } else {
+            Ok(Some(rewritten))
+        }
     }
 }
 
@@ -145,7 +149,7 @@ fn deduplicate_deterministic(conjuncts: &mut Vec<LogicalExpr>) {
 
 /// Builds a filter chain whose first conjunct is evaluated closest to input.
 fn build_filter_chain(mut input: LogicalPlan, conjuncts: Vec<LogicalExpr>) -> LogicalPlan {
-    for conjunct in conjuncts.into_iter().rev() {
+    for conjunct in conjuncts {
         input = LogicalPlan::Filter {
             input: Box::new(input),
             predicate: conjunct,
@@ -246,7 +250,8 @@ mod tests {
                 _ => unreachable!(),
             },
         );
-        assert_eq!(predicates(&normalized), vec![&a, &b]);
+        // The helper walks from the root toward the input.
+        assert_eq!(predicates(&normalized), vec![&b, &a]);
     }
 
     #[test]
@@ -274,6 +279,26 @@ mod tests {
         let a = bool_column(1, "a");
         let normalized = normalize_filter(&scan(), &and(a.clone(), a.clone()));
         assert_eq!(predicates(&normalized), vec![&a]);
+    }
+
+    #[test]
+    fn repeated_normalization_preserves_filter_order_and_converges() {
+        let a = bool_column(1, "a");
+        let b = bool_column(2, "b");
+        let c = bool_column(3, "c");
+        let plan = filter(filter(filter(scan(), a.clone()), b.clone()), c.clone());
+
+        let normalize = |plan: &LogicalPlan| match plan {
+            LogicalPlan::Filter { input, predicate } => normalize_filter(input, predicate),
+            _ => unreachable!("fixture has a filter at the root"),
+        };
+        let once = normalize(&plan);
+        let twice = normalize(&once);
+
+        // `predicates` walks from the root toward the input, so its order is
+        // the reverse of the evaluation order in the filter chain.
+        assert_eq!(predicates(&once), vec![&c, &b, &a]);
+        assert_eq!(twice, once);
     }
 
     #[test]

@@ -171,6 +171,87 @@ mod tests {
     }
 
     #[test]
+    fn plans_aggregate_join_input_as_recursive_pipeline_breaker() {
+        let left = mock_scan_plan();
+        let aggregate_input = mock_scan_plan();
+        let (input_key, input_value) = match &aggregate_input {
+            LogicalPlan::Scan { schema, .. } => {
+                (Arc::clone(&schema.fields[0]), Arc::clone(&schema.fields[1]))
+            }
+            _ => unreachable!(),
+        };
+        let aggregate_key = Arc::new(ResolvedColumn::new(
+            ColumnId(2),
+            "group_id",
+            None,
+            VeinDataType::Int64,
+        ));
+        let aggregate_count = Arc::new(ResolvedColumn::new(
+            ColumnId(3),
+            "row_count",
+            None,
+            VeinDataType::Int64,
+        ));
+        let aggregate_schema = Box::new(VeinSchema::new(vec![
+            Arc::clone(&aggregate_key),
+            Arc::clone(&aggregate_count),
+        ]));
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(aggregate_input),
+            grouping_sets: vec![vec![LogicalExpr::Column(input_key)]],
+            aggs: vec![LogicalExpr::FunctionCall {
+                name: "count".to_owned(),
+                args: vec![LogicalExpr::Column(input_value)],
+                is_aggregate: true,
+                distinct: false,
+                return_type: VeinDataType::Int64,
+            }],
+            schema: aggregate_schema,
+        };
+        let left_key = match &left {
+            LogicalPlan::Scan { schema, .. } => Arc::clone(&schema.fields[0]),
+            _ => unreachable!(),
+        };
+        let join_schema = match &left {
+            LogicalPlan::Scan { schema, .. } => {
+                let mut fields = schema.fields.clone();
+                fields.push(Arc::clone(&aggregate_key));
+                fields.push(Arc::clone(&aggregate_count));
+                Box::new(VeinSchema::new(fields))
+            }
+            _ => unreachable!(),
+        };
+        let join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(left),
+            right: Box::new(aggregate),
+            on: Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(left_key)),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(aggregate_key)),
+                return_type: VeinDataType::Boolean,
+            }),
+            using: vec![],
+            schema: join_schema,
+        };
+
+        let job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), join)
+            .expect("join with aggregate input should plan");
+        let input = job.stage().tasks()[0]
+            .input_plan
+            .as_ref()
+            .expect("recursive join input");
+        let common::protocol::PhysicalInputPlan::Join { build, .. } = input.as_ref() else {
+            panic!("root should be a join input");
+        };
+        assert!(
+            matches!(build.as_ref(), common::protocol::PhysicalInputPlan::Aggregate { .. }),
+            "aggregate build side should be represented as a pipeline breaker"
+        );
+    }
+
+    #[test]
     fn plans_filter_against_aggregate_output_in_a_separate_program() {
         let input = mock_scan_plan();
         let argument = match &input {
@@ -312,6 +393,84 @@ mod tests {
         let aggregate = task.aggregate.as_ref().expect("distinct aggregate metadata");
         assert_eq!(aggregate.groups, 2);
         assert!(aggregate.aggs.is_empty());
+    }
+
+    #[test]
+    fn plans_projection_above_an_intermediate_join_as_a_streaming_transform() {
+        let left = mock_scan_plan();
+        let right = mock_scan_plan();
+        let base_schema = match &left {
+            LogicalPlan::Scan { schema, .. } => schema.clone(),
+            _ => unreachable!(),
+        };
+        let left_key = base_schema.fields[0].clone();
+        let right_key = match &right {
+            LogicalPlan::Scan { schema, .. } => schema.fields[0].clone(),
+            _ => unreachable!(),
+        };
+        let inner = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(left),
+            right: Box::new(right),
+            on: Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(left_key.clone())),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(right_key)),
+                return_type: VeinDataType::Boolean,
+            }),
+            using: vec![],
+            schema: base_schema.clone(),
+        };
+        let projected_key = Arc::new(ResolvedColumn::new(
+            ColumnId(2),
+            "projected_id",
+            None,
+            VeinDataType::Int64,
+        ));
+        let projected_schema = Box::new(VeinSchema::new(vec![Arc::clone(&projected_key)]));
+        let projected = LogicalPlan::Project {
+            input: Box::new(inner),
+            exprs: vec![LogicalExpr::Column(left_key)],
+            schema: projected_schema.clone(),
+        };
+        let outer_right = mock_scan_plan();
+        let outer_right_key = match &outer_right {
+            LogicalPlan::Scan { schema, .. } => schema.fields[0].clone(),
+            _ => unreachable!(),
+        };
+        let outer_schema = Box::new(VeinSchema::new(vec![
+            Arc::clone(&projected_key),
+            Arc::clone(&outer_right_key),
+        ]));
+        let chained = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(projected),
+            right: Box::new(outer_right),
+            on: Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(projected_key)),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(outer_right_key)),
+                return_type: VeinDataType::Boolean,
+            }),
+            using: vec![],
+            schema: outer_schema,
+        };
+
+        let job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), chained)
+            .expect("projected intermediate join should plan");
+        let input = job.stage().tasks()[0]
+            .input_plan
+            .as_ref()
+            .expect("recursive join input");
+        let common::protocol::PhysicalInputPlan::Join { probe, .. } = input.as_ref() else {
+            panic!("root should be a join input");
+        };
+        assert!(matches!(
+            probe.as_ref(),
+            common::protocol::PhysicalInputPlan::Transform { input, .. }
+                if matches!(input.as_ref(), common::protocol::PhysicalInputPlan::Join { .. })
+        ));
     }
 
     #[test]

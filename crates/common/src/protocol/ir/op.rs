@@ -114,6 +114,17 @@ pub enum MicroOp {
         /// Right operand register.
         src2: RegId,
     },
+    /// SQL string pattern comparison: dst = src LIKE pattern.
+    Like {
+        /// Destination register.
+        dst: RegId,
+        /// String value register.
+        src: RegId,
+        /// SQL pattern register.
+        pattern: RegId,
+        /// Whether to negate the match (NOT LIKE).
+        negated: bool,
+    },
     /// Vector comparison: `dst = src1 < src2`
     CmpLt {
         /// Destination register.

@@ -24,7 +24,7 @@ use crate::rule::{OptimizerRule, RuleType};
 use crate::rules::{
     ColumnPruningRule, ConstantFoldingRule, ExpressionSimplificationRule, FilterNormalizationRule,
     JoinPredicateTransitivityRule, PredicatePushdownRule, ScanFilterPushdownRule,
-    ScanStatisticsPruningRule,
+    ScanStatisticsPruningRule, ScalarAggregateDecorrelationRule,
 };
 
 /// The engine-facing optimizer seam.
@@ -78,6 +78,7 @@ impl OptimizerPipeline {
             Arc::new(FilterNormalizationRule),
             Arc::new(ScanStatisticsPruningRule),
             Arc::new(JoinPredicateTransitivityRule),
+            Arc::new(ScalarAggregateDecorrelationRule),
             Arc::new(PredicatePushdownRule),
             Arc::new(ScanFilterPushdownRule),
             Arc::new(ColumnPruningRule),
@@ -126,7 +127,7 @@ impl OptimizerPipeline {
                 changed |= any_changed;
                 let elapsed = started.elapsed();
                 tracing::debug!(
-                    target: "vein.audit",
+                    target: "vein.optimizer",
                     event = "optimizer_rule_applied",
                     rule = rule.name(),
                     phase = ?rule.phase(),
@@ -142,6 +143,17 @@ impl OptimizerPipeline {
                     changed: any_changed,
                     elapsed,
                 });
+                if any_changed {
+                    tracing::trace!(
+                        target: "vein.optimizer",
+                        event = "optimizer_plan_after_rule",
+                        rule = rule.name(),
+                        phase = ?rule.phase(),
+                        sweep,
+                        plan = %plan::display::format_plan(&next),
+                        "optimizer_plan_after_rule"
+                    );
+                }
             }
 
             diagnostics.sweeps = sweep;

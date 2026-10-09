@@ -8,7 +8,7 @@ use common::Result;
 use error::VeinError;
 use parser::ast::expr::BinaryOp;
 use plan::expr::logical::LogicalExpr;
-use plan::schema::{ColumnId, VeinSchema};
+use plan::schema::{ColumnId, ResolvedColumnRef, VeinSchema};
 use std::collections::HashMap;
 
 use super::allocator::RegisterAllocator;
@@ -18,6 +18,8 @@ pub struct BytecodeCompiler {
     allocator: RegisterAllocator,
     instructions: Vec<MicroOp>,
     column_registers: HashMap<ColumnId, RegId>,
+    register_columns: Vec<(ResolvedColumnRef, RegId)>,
+    input_schema_registered: bool,
 }
 
 impl BytecodeCompiler {
@@ -27,16 +29,24 @@ impl BytecodeCompiler {
             allocator: RegisterAllocator::new(input_columns),
             instructions: Vec::new(),
             column_registers: HashMap::new(),
+            register_columns: Vec::new(),
+            input_schema_registered: false,
         }
     }
 
     /// Associates the scan's logical columns with their initial VM registers.
     pub fn set_input_schema(&mut self, schema: &VeinSchema) {
-        self.column_registers = schema
+        self.input_schema_registered = true;
+        self.register_columns = schema
             .fields
             .iter()
             .enumerate()
-            .map(|(register, field)| (field.id, register as RegId))
+            .map(|(register, field)| (std::sync::Arc::clone(field), register as RegId))
+            .collect();
+        self.column_registers = self
+            .register_columns
+            .iter()
+            .map(|(field, register)| (field.id, *register))
             .collect();
     }
 
@@ -45,7 +55,7 @@ impl BytecodeCompiler {
     pub fn compile_expr(&mut self, expr: &LogicalExpr, schema: &VeinSchema) -> Result<RegId> {
         match expr {
             LogicalExpr::Column(col) => {
-                self.column_register(col.id, &col.name, schema).ok_or_else(|| {
+                self.column_register(col.id, &col.name, col.qualifier.as_deref(), schema).ok_or_else(|| {
                     VeinError::planning(
                         format!("Column not found in schema: {:?}", col.name),
                         None,
@@ -53,7 +63,7 @@ impl BytecodeCompiler {
                 })
             }
             LogicalExpr::OuterColumn(col) => {
-                self.column_register(col.id, &col.name, schema).ok_or_else(|| {
+                self.column_register(col.id, &col.name, col.qualifier.as_deref(), schema).ok_or_else(|| {
                     VeinError::planning(
                         format!("Outer column not found in schema: {:?}", col.name),
                         None,
@@ -122,6 +132,22 @@ impl BytecodeCompiler {
                 self.instructions.push(MicroOp::IsNotNull { dst, src });
                 Ok(dst)
             }
+            LogicalExpr::Like {
+                expr,
+                pattern,
+                negated,
+            } => {
+                let src = self.compile_expr(expr, schema)?;
+                let pattern = self.compile_expr(pattern, schema)?;
+                let dst = self.allocator.allocate()?;
+                self.instructions.push(MicroOp::Like {
+                    dst,
+                    src,
+                    pattern,
+                    negated: *negated,
+                });
+                Ok(dst)
+            }
             LogicalExpr::FunctionCall { name, args, .. }
             | LogicalExpr::AiOperator { name, args, .. } => {
                 let mut arg_regs = Vec::with_capacity(args.len());
@@ -153,8 +179,31 @@ impl BytecodeCompiler {
         }
     }
 
-    fn column_register(&self, id: ColumnId, name: &str, schema: &VeinSchema) -> Option<RegId> {
+    fn column_register(
+        &self,
+        id: ColumnId,
+        name: &str,
+        qualifier: Option<&str>,
+        schema: &VeinSchema,
+    ) -> Option<RegId> {
         self.column_registers.get(&id).copied().or_else(|| {
+            if self.input_schema_registered {
+                // Optimizer rewrites can preserve a column's name and qualifier
+                // while changing its ID. Resolve such columns against the actual
+                // physical input layout; never use an ordinal from a wider logical
+                // schema, which can point past an optimizer-pruned batch.
+                let mut matches = self.register_columns.iter().filter(|(field, _)| {
+                    field.name == name
+                        && qualifier.is_none_or(|qualifier| {
+                        field.qualifier.as_deref() == Some(qualifier)
+                    })
+                });
+                let (_, register) = matches.next()?;
+                if matches.next().is_some() {
+                    return None;
+                }
+                return Some(*register);
+            }
             schema
                 .position_of_id(id)
                 .or_else(|| schema.fields.iter().position(|field| field.name == name))
@@ -226,11 +275,16 @@ impl BytecodeCompiler {
         }
         let out_regs = self.compile_projection_exprs(exprs, input_schema)?;
         self.compile_projection_registers(out_regs.clone());
-        self.column_registers = output_schema
+        self.register_columns = output_schema
             .fields
             .iter()
             .zip(out_regs)
-            .map(|(field, register)| (field.id, register))
+            .map(|(field, register)| (std::sync::Arc::clone(field), register))
+            .collect();
+        self.column_registers = self
+            .register_columns
+            .iter()
+            .map(|(field, register)| (field.id, *register))
             .collect();
         Ok(())
     }
@@ -354,5 +408,112 @@ mod tests {
             }]
         );
         assert_eq!(program.register_count, 3);
+    }
+
+    #[test]
+    fn compile_like_emits_vectorized_like_instruction() {
+        let schema = VeinSchema::new(vec![std::sync::Arc::new(ResolvedColumn::new(
+            ColumnId(1),
+            "name",
+            None,
+            VeinDataType::Utf8,
+        ))]);
+        let expr = LogicalExpr::Like {
+            expr: Box::new(LogicalExpr::Column(schema.fields[0].clone())),
+            pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String(
+                "%BRASS".to_string(),
+            ))),
+            negated: true,
+        };
+        let mut compiler = BytecodeCompiler::new(1);
+        compiler.set_input_schema(&schema);
+
+        assert_eq!(compiler.compile_expr(&expr, &schema).unwrap(), 2);
+        assert!(matches!(
+            compiler.finish().instructions.as_slice(),
+            [
+                MicroOp::LoadConstant { dst: 1, .. },
+                MicroOp::Like {
+                    dst: 2,
+                    src: 0,
+                    pattern: 1,
+                    negated: true
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn registered_input_schema_prevents_logical_ordinal_fallback() {
+        let logical_schema = test_schema();
+        let physical_schema = VeinSchema::new(vec![
+            std::sync::Arc::new(ResolvedColumn::new(
+                ColumnId(2),
+                "salary",
+                None,
+                VeinDataType::Int64,
+            )),
+            std::sync::Arc::new(ResolvedColumn::new(
+                ColumnId(99),
+                "age",
+                None,
+                VeinDataType::Int64,
+            )),
+        ]);
+        let mut compiler = BytecodeCompiler::new(2);
+        compiler.set_input_schema(&physical_schema);
+
+        assert_eq!(
+            compiler.column_register(ColumnId(2), "salary", None, &logical_schema),
+            Some(0)
+        );
+        assert_eq!(
+            compiler.column_register(ColumnId(1), "age", None, &logical_schema),
+            Some(1)
+        );
+        assert_eq!(
+            compiler.column_register(ColumnId(3), "missing", None, &logical_schema),
+            None
+        );
+    }
+
+    #[test]
+    fn name_resolution_tracks_projected_register_layout() {
+        let input_schema = test_schema();
+        let projected_schema = VeinSchema::new(vec![
+            std::sync::Arc::new(ResolvedColumn::new(
+                ColumnId(90),
+                "salary_alias",
+                None,
+                VeinDataType::Int64,
+            )),
+            std::sync::Arc::new(ResolvedColumn::new(
+                ColumnId(91),
+                "age_alias",
+                None,
+                VeinDataType::Int64,
+            )),
+        ]);
+        let mut compiler = BytecodeCompiler::new(2);
+        compiler.set_input_schema(&input_schema);
+        compiler
+            .compile_projection_with_schema(
+                &[
+                    LogicalExpr::Column(input_schema.fields[1].clone()),
+                    LogicalExpr::Column(input_schema.fields[0].clone()),
+                ],
+                &input_schema,
+                &projected_schema,
+            )
+            .expect("projection should compile");
+
+        assert_eq!(
+            compiler.column_register(ColumnId(900), "age_alias", None, &projected_schema),
+            Some(0)
+        );
+        assert_eq!(
+            compiler.column_register(ColumnId(901), "missing", None, &projected_schema),
+            None
+        );
     }
 }

@@ -3,7 +3,7 @@
 use common::identifiers::{PartitionId, QueryId, RequestId, StageId, TaskId};
 use common::protocol::{
     AggregatePlan, DataSink, DataSource, ExecuteTask, ExecutionMode, JoinPlan, LimitSpec,
-    MicroProgram, SortPlan,
+    MicroProgram, PhysicalInputPlan, SortPlan,
 };
 use std::sync::Arc;
 
@@ -40,6 +40,8 @@ pub struct Task {
     pub aggregate: Option<AggregatePlan>,
     /// VM program applied to aggregate output, when the plan has post-aggregate filters.
     pub post_aggregate_program: Option<Arc<MicroProgram>>,
+    /// Recursive source/operator tree for chained joins.
+    pub input_plan: Option<Arc<PhysicalInputPlan>>,
 }
 
 impl Task {
@@ -65,6 +67,7 @@ impl Task {
             sort_output_columns: None,
             aggregate: None,
             post_aggregate_program: None,
+            input_plan: None,
         }
     }
 
@@ -96,6 +99,7 @@ impl Task {
             sort_output_columns: None,
             aggregate: None,
             post_aggregate_program: None,
+            input_plan: None,
         }
     }
 
@@ -142,6 +146,12 @@ impl Task {
         self
     }
 
+    /// Uses a recursive physical input tree for chained joins.
+    pub fn with_input_plan(mut self, input_plan: Arc<PhysicalInputPlan>) -> Self {
+        self.input_plan = Some(input_plan);
+        self
+    }
+
     /// Convert this task into a dispatchable [`ExecuteTask`], filling in the
     /// owning query and stage from the caller.
     pub fn into_execute_task(
@@ -167,6 +177,7 @@ impl Task {
             attempt: 0,
             query_id,
             stage_id,
+            input_plan: self.input_plan,
             source: self.source,
             program: self.program,
             sink,

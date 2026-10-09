@@ -87,6 +87,50 @@ pub enum DataSource {
     Memory,
 }
 
+/// A streaming input tree used when a logical input contains chained joins.
+///
+/// Each pipeline leaf retains its own VM program so scan filters and projections
+/// remain attached to the scan that produces them. Join nodes build their right
+/// input and stream their left input through a hash join.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PhysicalInputPlan {
+    /// A source and its per-batch vector program.
+    Pipeline {
+        /// Source that produces this input's batches.
+        source: DataSource,
+        /// Batch program applied before forwarding the input.
+        program: Arc<MicroProgram>,
+    },
+    /// A row-wise VM program applied to batches from a recursive input.
+    ///
+    /// This carries filters and projections that sit above a join. The VM's
+    /// Arrow projection retains array buffers by reference, so this boundary
+    /// does not materialize intermediate columns.
+    Transform {
+        /// The input whose batches this program consumes.
+        input: Box<PhysicalInputPlan>,
+        /// The program applied to each input batch.
+        program: Arc<MicroProgram>,
+    },
+    /// A pipeline breaker that groups a recursive input before forwarding its
+    /// output batches. This is used when an aggregate feeds a join input.
+    Aggregate {
+        /// Input batches containing group keys followed by aggregate arguments.
+        input: Box<PhysicalInputPlan>,
+        /// Grouping and reduction instructions for the input batches.
+        plan: AggregatePlan,
+    },
+    /// A hash join over two recursively executable inputs.
+    Join {
+        /// Input streamed through the probe side of this join.
+        probe: Box<PhysicalInputPlan>,
+        /// Input fully consumed to build this join's hash table.
+        build: Box<PhysicalInputPlan>,
+        /// Join keys, output layout, and join flavour.
+        plan: JoinPlan,
+    },
+}
+
 /// Key-value option pair for storage and scan configurations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyValue {
@@ -202,6 +246,11 @@ pub struct ExecuteTask {
     pub query_id: QueryId,
     /// Stage this task is part of.
     pub stage_id: StageId,
+    /// Recursive physical input for a plan with chained pipeline breakers.
+    ///
+    /// `None` preserves the original single-source task wire format.
+    #[serde(default)]
+    pub input_plan: Option<Arc<PhysicalInputPlan>>,
     /// Data source for this task.
     pub source: DataSource,
     /// The Micro-IR program to apply to the data stream.

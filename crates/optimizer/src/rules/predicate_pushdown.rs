@@ -108,6 +108,17 @@ fn push_through_project(
 
     let referenced = referenced_columns(predicate)?;
     if !referenced.iter().all(|column| mapping.contains_key(column)) {
+        // A filter can refer to an input column that the projection intentionally
+        // omits. Such a predicate cannot be evaluated above the projection, but
+        // it can be moved below it unchanged when every reference is available
+        // from the projection input.
+        let input_ids = schema_ids(input.schema());
+        if referenced.iter().all(|column| input_ids.contains(column)) {
+            return Some(LogicalPlan::Filter {
+                input: Box::new(input.clone()),
+                predicate: predicate.clone(),
+            });
+        }
         return None;
     }
 
@@ -330,9 +341,40 @@ mod tests {
             },
             &predicate,
         )
-        .expect("predicate should push");
+            .expect("predicate should push");
 
         assert!(matches!(pushed, LogicalPlan::Filter { .. }));
+    }
+
+    #[test]
+    fn pushes_filter_below_project_when_predicate_column_is_not_projected() {
+        let output = field(20, "output", plan::VeinDataType::Int64);
+        let hidden_input = field(21, "hidden_input", plan::VeinDataType::Int64);
+        let input = scan(vec![output.clone(), hidden_input.clone()]);
+        let project = LogicalPlan::Project {
+            input: Box::new(input),
+            exprs: vec![column(&output)],
+            schema: Box::new(VeinSchema {
+                fields: vec![field(22, "renamed_output", plan::VeinDataType::Int64)],
+            }),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(project),
+            predicate: bool_predicate(&hidden_input),
+        };
+
+        let rewritten = PredicatePushdownRule
+            .apply(&plan, &OptimizerContext::default())
+            .expect("predicate pushdown should succeed")
+            .expect("input-column predicate should move below the project");
+        let LogicalPlan::Project { input, .. } = rewritten else {
+            panic!("the projection should remain the visible output");
+        };
+        let LogicalPlan::Filter { predicate, input } = input.as_ref() else {
+            panic!("the filter should execute against the projection input");
+        };
+        assert_eq!(predicate, &bool_predicate(&hidden_input));
+        assert_eq!(input.schema().fields.len(), 2);
     }
 
     #[test]

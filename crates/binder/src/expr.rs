@@ -90,6 +90,25 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 let bound_left = Box::pin(self.bind(left)).await?;
                 let bound_right = Box::pin(self.bind(right)).await?;
 
+                if matches!(op, AstBinaryOp::And | AstBinaryOp::Or) {
+                    let left_type = bound_left.data_type();
+                    let right_type = bound_right.data_type();
+                    if left_type != VeinDataType::Boolean || right_type != VeinDataType::Boolean {
+                        return Err(VeinError::semantic(
+                            format!(
+                                "logical operator {op:?} requires Boolean operands, got {left_type:?} and {right_type:?}"
+                            ),
+                            Some(ast.span),
+                        ));
+                    }
+                    return Ok(LogicalExpr::BinaryOp {
+                        left: Box::new(bound_left),
+                        op: *op,
+                        right: Box::new(bound_right),
+                        return_type: VeinDataType::Boolean,
+                    });
+                }
+
                 // Comparison/logical operators always return Boolean while
                 // widening their operands; arithmetic unifies both operands
                 // to the common supertype and returns that type.
@@ -101,8 +120,6 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                         | AstBinaryOp::Gt
                         | AstBinaryOp::Leq
                         | AstBinaryOp::Geq
-                        | AstBinaryOp::And
-                        | AstBinaryOp::Or
                 ) {
                     let (l, r, _) = coerce_types(bound_left, bound_right)?;
                     return Ok(LogicalExpr::BinaryOp {
@@ -125,9 +142,18 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 let bound = Box::pin(self.bind(expr)).await?;
                 use parser::ast::expr::UnaryOp as AstUnaryOp;
                 match op {
-                    AstUnaryOp::Not => Ok(LogicalExpr::Not {
-                        expr: Box::new(bound),
-                    }),
+                    AstUnaryOp::Not => {
+                        let data_type = bound.data_type();
+                        if data_type != VeinDataType::Boolean {
+                            return Err(VeinError::semantic(
+                                format!("NOT requires a Boolean operand, got {data_type:?}"),
+                                Some(ast.span),
+                            ));
+                        }
+                        Ok(LogicalExpr::Not {
+                            expr: Box::new(bound),
+                        })
+                    }
                     AstUnaryOp::Negate => Ok(LogicalExpr::Negate {
                         expr: Box::new(bound),
                     }),
@@ -256,6 +282,9 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         let logical_lit = match lit {
             AstLiteral::Boolean(b) => LogicalLiteral::Boolean(*b),
             AstLiteral::Int(i) => LogicalLiteral::Int64(*i),
+            AstLiteral::Decimal(value, precision, scale) => {
+                LogicalLiteral::Decimal(*value, *precision, *scale)
+            }
             AstLiteral::Float(f) => LogicalLiteral::Float64(f.0),
             AstLiteral::String(s) => LogicalLiteral::String(s.clone()),
             AstLiteral::Null => LogicalLiteral::Null(VeinDataType::Null),
