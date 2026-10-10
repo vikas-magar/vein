@@ -8,6 +8,11 @@ pub mod builder;
 /// The physical bytecode compiler and lowering engine.
 pub mod compiler;
 
+/// Pipeline boundaries and dependencies derived from the canonical plan tree.
+pub mod pipeline_graph {
+    pub use common::protocol::pipeline_graph::*;
+}
+
 /// A single-stage physical plan.
 pub mod job;
 
@@ -22,5 +27,9 @@ pub mod task;
 
 pub use job::Job;
 pub use planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+pub use pipeline_graph::{
+    DerivedPipeline, DerivedPipelineGraph, PipelineBoundary, PipelineBoundaryKind,
+    PipelineDependency, PipelineDependencyKind, PipelineId,
+};
 pub use stage::Stage;
 pub use task::Task;

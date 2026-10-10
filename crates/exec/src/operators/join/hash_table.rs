@@ -15,6 +15,7 @@ use arrow::array::{Array, Int64Array, StringArray};
 use crate::pipeline::DataChunk;
 use common::Result;
 use error::VeinError;
+use types::{HashJoinKeyType, VeinDataType};
 
 /// Which columns of a chunk form the join key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,15 +113,35 @@ impl ChunkKeys {
         let mut columns = Vec::with_capacity(keys.columns.len());
         for index in &keys.columns {
             let array = chunk.column(*index);
-            let resolved = if let Some(ints) = array.as_any().downcast_ref::<Int64Array>() {
-                KeyArray::Int64(ints.clone())
-            } else if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
-                KeyArray::Utf8(strings.clone())
-            } else {
-                return Err(VeinError::internal(format!(
-                    "join key column {index} is {:?}, which hashing does not cover yet",
+            let data_type = VeinDataType::try_from(array.data_type()).map_err(|error| {
+                VeinError::internal(format!(
+                    "join key column {index} has an unsupported Arrow type {:?}: {error}",
                     array.data_type()
-                )));
+                ))
+            })?;
+            let resolved = match data_type.hash_join_key_type() {
+                Some(HashJoinKeyType::Int64) => {
+                    let ints = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                        VeinError::internal(format!(
+                            "join key column {index} does not match its declared Int64 type"
+                        ))
+                    })?;
+                    KeyArray::Int64(ints.clone())
+                }
+                Some(HashJoinKeyType::Utf8) => {
+                    let strings = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                        VeinError::internal(format!(
+                            "join key column {index} does not match its declared Utf8 type"
+                        ))
+                    })?;
+                    KeyArray::Utf8(strings.clone())
+                }
+                None => {
+                    return Err(VeinError::internal(format!(
+                        "join key column {index} has type {:?}, which is not supported by hash join",
+                        array.data_type()
+                    )));
+                }
             };
             columns.push(resolved);
         }
@@ -442,7 +463,7 @@ impl HashTable {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
 
     use super::*;
 
@@ -474,6 +495,19 @@ mod tests {
         // Probe row 0 (key 20) matches chunk 0 row 1 and chunk 1 row 0; probe
         // row 1 (key 30) matches chunk 0 row 2; probe row 2 (50) matches nothing.
         assert_eq!(matches, vec![(0, 0, 1), (0, 1, 0), (1, 0, 2)]);
+    }
+
+    #[test]
+    fn insert_rejects_key_types_without_a_hash_join_representation() {
+        let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        let unsupported: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+
+        let error = table
+            .insert(chunk(unsupported))
+            .expect_err("unsupported key representations must fail before probing");
+
+        assert!(error.to_string().contains("not supported by hash join"));
+        assert!(error.to_string().contains("Int32"));
     }
 
     /// A null key never matches, on either side of the join.

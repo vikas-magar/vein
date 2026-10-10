@@ -12,9 +12,9 @@ use std::time::Instant;
 /// [`Sink::collect`].
 ///
 /// Filters narrow a chunk's [`SelectionVector`](common::arrow::SelectionVector)
-/// rather than compacting the underlying arrays, so this sink materializes the
-/// selected rows via `arrow::compute::take` so the captured batches contain
-/// exactly the surviving rows.
+/// rather than compacting the underlying arrays. This sink returns ordinary
+/// `RecordBatch` values: contiguous selections are represented by zero-copy
+/// Arrow slices, while sparse selections are gathered with `arrow::compute::take`.
 pub struct CollectSink {
     output: Vec<RecordBatch>,
     field_names: Vec<String>,

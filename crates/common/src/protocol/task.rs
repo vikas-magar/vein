@@ -87,66 +87,95 @@ pub enum DataSource {
     Memory,
 }
 
-/// A streaming input tree used when a logical input contains chained joins.
+/// Immutable, schema-aware physical plan tree shared by planning and execution.
 ///
-/// Each pipeline leaf retains its own VM program so scan filters and projections
-/// remain attached to the scan that produces them. Join nodes build their right
-/// input and stream their left input through a hash join.
+/// The root is normally a [`PhysicalPlanOperator::Sink`]. Each operator node
+/// owns its output schema and references its input nodes through `Arc`, so a
+/// plan can be inspected or shared without copying operator subtrees. Mutable
+/// execution state such as hash tables and aggregate accumulators belongs to an
+/// execution, not to these nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PhysicalInputPlan {
-    /// A source and its per-batch vector program.
+pub struct PhysicalPlan {
+    /// The root operator of the query plan.
+    pub root: Arc<PhysicalPlanNode>,
+}
+
+/// One immutable operator node in a [`PhysicalPlan`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhysicalPlanNode {
+    /// Output columns produced by this operator. For a sink, this is the schema
+    /// consumed by the sink.
+    pub output_schema: VeinSchemaRef,
+    /// Operator semantics and references to this node's inputs.
+    pub operator: PhysicalPlanOperator,
+}
+
+/// Physical operator semantics stored in the canonical plan tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PhysicalPlanOperator {
+    /// A data source and its source-local vector program.
     Pipeline {
-        /// Source that produces this input's batches.
-        source: DataSource,
-        /// Batch program applied before forwarding the input.
+        /// Source descriptor.
+        source: Arc<DataSource>,
+        /// Ordered columns emitted by the source before the program runs.
+        input_schema: VeinSchemaRef,
+        /// Program applied to each source batch.
         program: Arc<MicroProgram>,
     },
-    /// A row-wise VM program applied to batches from a recursive input.
-    ///
-    /// This carries filters and projections that sit above a join. The VM's
-    /// Arrow projection retains array buffers by reference, so this boundary
-    /// does not materialize intermediate columns.
+    /// A vector program applied to a recursively produced input.
     Transform {
-        /// The input whose batches this program consumes.
-        input: Box<PhysicalInputPlan>,
-        /// The program applied to each input batch.
+        /// Child input.
+        input: Arc<PhysicalPlanNode>,
+        /// Program applied to the child batches.
         program: Arc<MicroProgram>,
     },
-    /// A pipeline breaker that groups a recursive input before forwarding its
-    /// output batches. This is used when an aggregate feeds a join input.
+    /// A hash join over probe and build inputs.
+    Join {
+        /// Input streamed through the probe side.
+        probe: Arc<PhysicalPlanNode>,
+        /// Input fully consumed to build the hash table.
+        build: Arc<PhysicalPlanNode>,
+        /// Join keys, output layout, and join flavor.
+        plan: JoinPlan,
+    },
+    /// A grouped or scalar aggregate over one input.
     Aggregate {
-        /// Input batches containing group keys followed by aggregate arguments.
-        input: Box<PhysicalInputPlan>,
-        /// Grouping and reduction instructions for the input batches.
+        /// Child input.
+        input: Arc<PhysicalPlanNode>,
+        /// Grouping and reduction instructions.
         plan: AggregatePlan,
     },
-    /// A global ordering boundary over a recursively produced input.
+    /// Duplicate elimination by grouping every child output column.
+    Distinct {
+        /// Child input.
+        input: Arc<PhysicalPlanNode>,
+        /// Grouping layout and output types used by the shared aggregate engine.
+        plan: AggregatePlan,
+    },
+    /// A global ordering boundary over one input.
     Sort {
-        /// Input batches collected and ordered by this node.
-        input: Box<PhysicalInputPlan>,
-        /// Sort keys over the input, including appended computed-key columns.
+        /// Child input.
+        input: Arc<PhysicalPlanNode>,
+        /// Sort keys and their ordering semantics.
         plan: SortPlan,
-        /// Optional VM program that appends computed sort keys.
-        #[serde(default)]
+        /// Optional program that appends computed sort keys.
         key_program: Option<Arc<MicroProgram>>,
-        /// Number of input columns to retain after removing computed keys.
+        /// Number of child columns to retain after removing helper keys.
         output_columns: u32,
     },
-    /// A row window applied to a recursively produced input.
+    /// A row window over one input.
     Limit {
-        /// Input batches to window.
-        input: Box<PhysicalInputPlan>,
-        /// Offset and maximum number of rows to emit.
+        /// Child input.
+        input: Arc<PhysicalPlanNode>,
+        /// Offset and maximum output row count.
         spec: LimitSpec,
     },
-    /// A hash join over two recursively executable inputs.
-    Join {
-        /// Input streamed through the probe side of this join.
-        probe: Box<PhysicalInputPlan>,
-        /// Input fully consumed to build this join's hash table.
-        build: Box<PhysicalInputPlan>,
-        /// Join keys, output layout, and join flavour.
-        plan: JoinPlan,
+    /// The output boundary for client results or storage writes.
+    Sink {
+        /// Child input consumed by the sink.
+        input: Arc<PhysicalPlanNode>,
+        /// Client, storage, or discard destination.
+        sink: Arc<DataSink>,
     },
 }
 
@@ -265,51 +294,8 @@ pub struct ExecuteTask {
     pub query_id: QueryId,
     /// Stage this task is part of.
     pub stage_id: StageId,
-    /// Recursive physical input for a plan with chained pipeline breakers.
-    ///
-    /// `None` preserves the original single-source task wire format.
-    #[serde(default)]
-    pub input_plan: Option<Arc<PhysicalInputPlan>>,
-    /// Data source for this task.
-    pub source: DataSource,
-    /// The Micro-IR program to apply to the data stream.
-    ///
-    /// Shared so every task split from one stage refers to a single compiled
-    /// program instead of deep-cloning the instruction vector per partition.
-    pub program: Arc<MicroProgram>,
-    /// Where to send the output.
-    pub sink: Arc<DataSink>,
-    /// Second input, read to completion before `source` is probed.
-    ///
-    /// `Some` makes this task a join: the build side is absorbed into a hash
-    /// table, and only then does the probe side stream against it. `None` is a
-    /// plain single-input task. The two-input shape is on the task rather than
-    /// in the program because a join is a pipeline breaker — the VM sees one
-    /// chunk at a time and has no second stream.
-    pub build: Option<DataSource>,
-    /// How the two inputs are joined. Set exactly when `build` is.
-    pub join: Option<JoinPlan>,
-    /// The row window to emit, when the query has a `LIMIT`.
-    ///
-    /// It travels with the task because a limit is cross-chunk state that also
-    /// has to *stop the source*: the VM sees one chunk at a time, and dropping
-    /// rows and knowing when to stop reading are one decision.
-    pub limit: Option<LimitSpec>,
-    /// Global row ordering, applied before the output window.
-    #[serde(default)]
-    pub sort: Option<SortPlan>,
-    /// VM program that appends computed sort keys after the main row program.
-    #[serde(default)]
-    pub sort_key_program: Option<Arc<MicroProgram>>,
-    /// Number of user-visible columns before helper sort keys are appended.
-    #[serde(default)]
-    pub sort_output_columns: Option<u32>,
-    /// How to aggregate, when the query has a `GROUP BY` or a `DISTINCT`.
-    pub aggregate: Option<AggregatePlan>,
-    /// Vector VM program applied to aggregate output, after the aggregate has
-    /// finished and before the output window and sink.
-    #[serde(default)]
-    pub post_aggregate_program: Option<Arc<MicroProgram>>,
+    /// The authoritative physical operator tree for this task.
+    pub plan: PhysicalPlan,
 }
 
 use super::{AggOpCode, JoinKind};
@@ -433,7 +419,12 @@ fn default_emit_empty_group() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AggOpCode, AggregatePlan, SortKey, SortPlan};
+    use super::{
+        AggOpCode, AggregatePlan, DataSink, DataSource, JoinKind, JoinOutput, JoinPlan, LimitSpec,
+        MicroProgram, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator, SortKey, SortPlan,
+    };
+    use std::sync::Arc;
+    use types::VeinSchema;
 
     #[test]
     fn sort_plan_preserves_key_priority_and_null_order_over_wire_format() {
@@ -484,5 +475,172 @@ mod tests {
 
         assert_eq!(decoded.estimated_groups, None);
         assert!(decoded.emit_empty_group_on_empty_input);
+    }
+
+    fn node(operator: PhysicalPlanOperator) -> Arc<PhysicalPlanNode> {
+        Arc::new(PhysicalPlanNode {
+            output_schema: Arc::new(VeinSchema::empty()),
+            operator,
+        })
+    }
+
+    fn operator_names(node: &PhysicalPlanNode, names: &mut Vec<&'static str>) {
+        match &node.operator {
+            PhysicalPlanOperator::Pipeline { .. } => names.push("pipeline"),
+            PhysicalPlanOperator::Transform { input, .. } => {
+                operator_names(input, names);
+                names.push("transform");
+            }
+            PhysicalPlanOperator::Join { probe, build, .. } => {
+                operator_names(probe, names);
+                operator_names(build, names);
+                names.push("join");
+            }
+            PhysicalPlanOperator::Aggregate { input, .. } => {
+                operator_names(input, names);
+                names.push("aggregate");
+            }
+            PhysicalPlanOperator::Distinct { input, .. } => {
+                operator_names(input, names);
+                names.push("distinct");
+            }
+            PhysicalPlanOperator::Sort { input, .. } => {
+                operator_names(input, names);
+                names.push("sort");
+            }
+            PhysicalPlanOperator::Limit { input, .. } => {
+                operator_names(input, names);
+                names.push("limit");
+            }
+            PhysicalPlanOperator::Sink { input, .. } => {
+                operator_names(input, names);
+                names.push("sink");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_physical_plan_round_trips_every_operator_node() {
+        let leaf = || {
+            node(PhysicalPlanOperator::Pipeline {
+                source: Arc::new(DataSource::Memory),
+                input_schema: Arc::new(VeinSchema::empty()),
+                program: Arc::new(MicroProgram::empty()),
+            })
+        };
+        let join = node(PhysicalPlanOperator::Join {
+            probe: leaf(),
+            build: leaf(),
+            plan: JoinPlan {
+                join_type: JoinKind::Inner,
+                probe_keys: vec![0],
+                build_keys: vec![0],
+                residual: None,
+                outputs: vec![JoinOutput::Probe(0)],
+                probe_types: vec![types::VeinDataType::Int64],
+                build_types: vec![types::VeinDataType::Int64],
+            },
+        });
+        let transformed = node(PhysicalPlanOperator::Transform {
+            input: join,
+            program: Arc::new(MicroProgram::empty()),
+        });
+        let aggregated = node(PhysicalPlanOperator::Aggregate {
+            input: transformed,
+            plan: AggregatePlan {
+                groups: 0,
+                estimated_groups: None,
+                grouping_sets: None,
+                emit_empty_group_on_empty_input: true,
+                aggs: vec![AggOpCode::Count],
+                aggregate_input_types: vec![types::VeinDataType::Int64],
+                types: vec![types::VeinDataType::Int64],
+            },
+        });
+        let distinct = node(PhysicalPlanOperator::Distinct {
+            input: aggregated,
+            plan: AggregatePlan {
+                groups: 0,
+                estimated_groups: None,
+                grouping_sets: Some(vec![vec![]]),
+                emit_empty_group_on_empty_input: false,
+                aggs: Vec::new(),
+                aggregate_input_types: Vec::new(),
+                types: Vec::new(),
+            },
+        });
+        let sorted = node(PhysicalPlanOperator::Sort {
+            input: distinct,
+            plan: SortPlan {
+                keys: vec![SortKey {
+                    column: 0,
+                    ascending: true,
+                    nulls_first: false,
+                }],
+            },
+            key_program: None,
+            output_columns: 1,
+        });
+        let limited = node(PhysicalPlanOperator::Limit {
+            input: sorted,
+            spec: LimitSpec {
+                offset: 1,
+                count: 10,
+            },
+        });
+        let plan = PhysicalPlan {
+            root: node(PhysicalPlanOperator::Sink {
+                input: limited,
+                sink: Arc::new(DataSink::Discard),
+            }),
+        };
+
+        let encoded = serde_json::to_vec(&plan).expect("serialize canonical physical plan");
+        let decoded: PhysicalPlan =
+            serde_json::from_slice(&encoded).expect("deserialize canonical physical plan");
+        let mut names = Vec::new();
+        operator_names(&decoded.root, &mut names);
+
+        assert_eq!(
+            names,
+            vec![
+                "pipeline",
+                "pipeline",
+                "join",
+                "transform",
+                "aggregate",
+                "distinct",
+                "sort",
+                "limit",
+                "sink",
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_plan_clones_share_immutable_operator_nodes() {
+        let child = node(PhysicalPlanOperator::Pipeline {
+            source: Arc::new(DataSource::Memory),
+            input_schema: Arc::new(VeinSchema::empty()),
+            program: Arc::new(MicroProgram::empty()),
+        });
+        let plan = PhysicalPlan {
+            root: node(PhysicalPlanOperator::Limit {
+                input: Arc::clone(&child),
+                spec: LimitSpec {
+                    offset: 0,
+                    count: 5,
+                },
+            }),
+        };
+        let cloned = plan.clone();
+
+        assert!(Arc::ptr_eq(&plan.root, &cloned.root));
+        let (PhysicalPlanOperator::Limit { input, .. }, PhysicalPlanOperator::Limit { input: cloned_input, .. }) =
+            (&plan.root.operator, &cloned.root.operator)
+        else {
+            panic!("cloned plan should retain its root node");
+        };
+        assert!(Arc::ptr_eq(input, cloned_input));
     }
 }

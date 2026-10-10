@@ -158,8 +158,9 @@ impl OptimizerPipeline {
             }
 
             diagnostics.sweeps = sweep;
-            if !changed {
-                tracing::info!(
+                if !changed {
+                    validate_lowered_subqueries(&next)?;
+                    tracing::info!(
                     target: "vein.audit",
                     event = "optimizer_converged",
                     sweeps = sweep,
@@ -179,6 +180,31 @@ impl OptimizerPipeline {
             None,
         ))
     }
+}
+
+/// Prevents unsupported subqueries from reaching physical expression
+/// compilation, where the resulting error lacks the owning operator context.
+/// Supported scalar and EXISTS rewrites remove their subquery expressions
+/// before this final invariant check.
+fn validate_lowered_subqueries(plan: &LogicalPlan) -> Result<()> {
+    let mut unsupported_owner = None;
+    plan.for_each_expression(&mut |owner, expression| {
+        if unsupported_owner.is_none() && !expression.subquery_plans().is_empty() {
+            unsupported_owner = Some(owner);
+        }
+    });
+
+    if let Some(owner) = unsupported_owner {
+        return Err(VeinError::planning(
+            format!("subquery expression in {owner} was not lowered by the optimizer"),
+            None,
+        ));
+    }
+
+    for child in plan.children() {
+        validate_lowered_subqueries(child)?;
+    }
+    Ok(())
 }
 
 impl Optimizer for OptimizerPipeline {
@@ -295,5 +321,36 @@ mod tests {
             panic!("expected a Project node");
         };
         assert_eq!(exprs, vec![lit(6)]);
+    }
+
+    #[test]
+    fn optimizer_reports_owner_for_unlowered_scan_filter_subquery() {
+        let base = project(vec![lit(1)]);
+        let LogicalPlan::Project { input, .. } = base else {
+            unreachable!();
+        };
+        let LogicalPlan::Scan { table, schema, .. } = *input else {
+            unreachable!();
+        };
+        let plan = LogicalPlan::Scan {
+            table,
+            projection: None,
+            filters: vec![LogicalExpr::ScalarSubquery(Box::new(LogicalPlan::Scan {
+                table: std::sync::Arc::new(plan::TableMetadata::new(
+                    "inner",
+                    std::sync::Arc::new(*schema.clone()),
+                )),
+                projection: None,
+                filters: vec![],
+                schema: schema.clone(),
+            }))],
+            schema,
+        };
+
+        let error = OptimizerPipeline::default()
+            .optimize(plan)
+            .expect_err("unsupported scan-filter subquery should fail in planning");
+        assert!(error.to_string().contains("Scan.filters"), "{error}");
+        assert!(error.to_string().contains("not lowered by the optimizer"), "{error}");
     }
 }

@@ -29,6 +29,11 @@ pub trait WriteTransaction: Send {
 
 /// Storage backend used by `WRITE` sinks.
 pub trait WriteStorage: Send + Sync {
+    /// Validate a logical target and its user-supplied options without opening a transaction.
+    ///
+    /// Query preparation calls this before physical planning so backend-specific
+    /// configuration errors are reported before a task can be created.
+    fn validate_target(&self, destination_uri: &str, options: &[(String, String)]) -> Result<()>;
     /// Start a staged write for a logical target.
     fn begin_write(&self, target: &StorageTarget) -> Result<Box<dyn WriteTransaction>>;
 }

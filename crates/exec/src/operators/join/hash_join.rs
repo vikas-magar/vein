@@ -344,9 +344,9 @@ impl HashJoin {
                             UInt32Array::from(indices),
                             Arc::clone(values),
                         )
-                        .map_err(|error| VeinError::internal(format!(
-                            "single join dictionary construction failed: {error}"
-                        )))?;
+                            .map_err(|error| VeinError::internal(format!(
+                                "single join dictionary construction failed: {error}"
+                            )))?;
                         columns.push(Arc::new(dictionary) as ArrayRef);
                     }
                 }
@@ -448,8 +448,11 @@ mod tests {
 
     use arrow::array::{Array, ArrayRef, DictionaryArray, Int64Array};
     use arrow::datatypes::UInt32Type;
+    use common::protocol::{MicroOp, MicroProgram};
 
     use super::*;
+    use crate::udf::FunctionRegistry;
+    use crate::vm::VectorVmExecutor;
 
     #[derive(Clone, Default)]
     struct Collect(Arc<Mutex<Vec<DataChunk>>>);
@@ -469,6 +472,19 @@ mod tests {
         Arc::new(Int64Array::from(values.to_vec()))
     }
 
+    fn nullable_ints(values: &[Option<i64>]) -> ArrayRef {
+        Arc::new(Int64Array::from(values.to_vec()))
+    }
+
+    fn selected_value(chunk: &DataChunk, column: usize, physical_row: usize) -> Option<i64> {
+        let values = chunk
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 join output");
+        values.is_valid(physical_row).then(|| values.value(physical_row))
+    }
+
     fn cells(chunk: &DataChunk, column: usize) -> Vec<Option<i64>> {
         let array = chunk.column(column);
         let ints = array
@@ -481,17 +497,82 @@ mod tests {
     }
 
     fn selected_cells(chunk: &DataChunk, column: usize) -> Vec<Option<i64>> {
-        let array = chunk
-            .column(column)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 output");
         (0..chunk.selection.size())
-            .map(|logical_row| {
-                let physical_row = chunk.selection.get_index(logical_row);
-                array.is_valid(physical_row).then(|| array.value(physical_row))
+            .map(|logical_row| selected_value(chunk, column, chunk.selection.get_index(logical_row)))
+            .collect()
+    }
+
+    fn selected_rows(chunk: &DataChunk) -> Vec<[Option<i64>; 4]> {
+        (0..chunk.selection.size())
+            .map(|position| {
+                let physical = chunk.selection.get_index(position);
+                std::array::from_fn(|column| selected_value(chunk, column, physical))
             })
             .collect()
+    }
+
+    fn residual_greater_than_filter() -> (VectorVmExecutor, JoinFilterCollector) {
+        let collector = JoinFilterCollector::default();
+        let program = Arc::new(MicroProgram::new(
+            3,
+            vec![
+                MicroOp::CmpGt {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::FilterMask { bool_reg: 2 },
+            ],
+        ));
+        let vm = VectorVmExecutor::new(
+            program,
+            Arc::new(FunctionRegistry::new()),
+            Box::new(collector.clone()),
+        );
+        (vm, collector)
+    }
+
+    fn run_outer_join_with_residual(join_type: JoinType) -> Vec<[Option<i64>; 4]> {
+        let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        table
+            .insert(DataChunk::from_vectors(vec![
+                ints(&[1, 1, 3]),
+                nullable_ints(&[Some(5), Some(15), Some(7)]),
+            ]))
+            .expect("build rows");
+
+        let sink = Collect::default();
+        let (vm, collector) = residual_greater_than_filter();
+        let mut join = HashJoin::new(
+            Arc::new(table),
+            join_type,
+            vec![
+                OutputColumn::Probe(0),
+                OutputColumn::Probe(1),
+                OutputColumn::Build(0),
+                OutputColumn::Build(1),
+            ],
+            vec![DataType::Int64, DataType::Int64],
+            vec![DataType::Int64, DataType::Int64],
+            Box::new(sink.clone()),
+        )
+            .with_residual_filter(
+                vec![OutputColumn::Probe(1), OutputColumn::Build(1)],
+                Box::new(vm),
+                collector,
+            );
+
+        join.push(DataChunk::from_vectors(vec![
+            ints(&[1, 1, 1, 2]),
+            nullable_ints(&[Some(1), Some(10), None, Some(9)]),
+        ]))
+            .expect("probe rows");
+        join.flush().expect("flush outer join");
+
+        let chunks = sink.0.lock().expect("collect lock");
+        let mut rows = chunks.iter().flat_map(selected_rows).collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
     }
 
     /// A built table over one chunk of `values`.
@@ -522,6 +603,92 @@ mod tests {
         let chunks = sink.0.lock().expect("collect lock");
         let all: Vec<Option<i64>> = chunks.iter().flat_map(|chunk| cells(chunk, 0)).collect();
         assert_eq!(all, vec![Some(20)], "only the matching probe row survives");
+    }
+
+    #[test]
+    fn cross_join_emits_cartesian_product_with_empty_key_vectors() {
+        let mut table = HashTable::new(JoinKeys::new(Vec::new()), JoinKeys::new(Vec::new()));
+        let build_values = ints(&[10, 20, 30]);
+        table
+            .insert(DataChunk::from_vectors(vec![Arc::clone(&build_values)]))
+            .expect("insert build rows without join keys");
+
+        let probe_values = ints(&[1, 2]);
+        let sink = Collect::default();
+        let mut join = HashJoin::new(
+            Arc::new(table),
+            JoinType::Cross,
+            vec![OutputColumn::Probe(0), OutputColumn::Build(0)],
+            vec![DataType::Int64],
+            vec![DataType::Int64],
+            Box::new(sink.clone()),
+        );
+
+        join.push(DataChunk::from_vectors(vec![Arc::clone(&probe_values)]))
+            .expect("probe cross join rows");
+        join.flush().expect("flush cross join");
+
+        let chunks = sink.0.lock().expect("collect lock");
+        let mut pairs = chunks
+            .iter()
+            .flat_map(|chunk| {
+                selected_cells(chunk, 0)
+                    .into_iter()
+                    .zip(selected_cells(chunk, 1))
+            })
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(1), Some(10)),
+                (Some(1), Some(20)),
+                (Some(1), Some(30)),
+                (Some(2), Some(10)),
+                (Some(2), Some(20)),
+                (Some(2), Some(30)),
+            ]
+        );
+    }
+
+    #[test]
+    fn left_join_residual_false_and_null_leave_probe_rows_unmatched() {
+        assert_eq!(
+            run_outer_join_with_residual(JoinType::Left),
+            vec![
+                [Some(1), None, None, None],
+                [Some(1), Some(1), None, None],
+                [Some(1), Some(10), Some(1), Some(5)],
+                [Some(2), Some(9), None, None],
+            ]
+        );
+    }
+
+    #[test]
+    fn right_join_residual_false_and_null_leave_build_rows_unmatched() {
+        assert_eq!(
+            run_outer_join_with_residual(JoinType::Right),
+            vec![
+                [None, None, Some(1), Some(15)],
+                [None, None, Some(3), Some(7)],
+                [Some(1), Some(10), Some(1), Some(5)],
+            ]
+        );
+    }
+
+    #[test]
+    fn full_join_tracks_matches_only_after_residual_filtering() {
+        assert_eq!(
+            run_outer_join_with_residual(JoinType::Full),
+            vec![
+                [None, None, Some(1), Some(15)],
+                [None, None, Some(3), Some(7)],
+                [Some(1), None, None, None],
+                [Some(1), Some(1), None, None],
+                [Some(1), Some(10), Some(1), Some(5)],
+                [Some(2), Some(9), None, None],
+            ]
+        );
     }
 
     #[test]

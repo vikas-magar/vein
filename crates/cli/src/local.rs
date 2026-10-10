@@ -7,15 +7,15 @@ use arrow::record_batch::RecordBatch;
 use binder::LogicalBinder;
 use common::cancellation::CancellationToken;
 use common::identifiers::RequestId;
-use common::protocol::{DataSink, ExecuteTask};
+use common::protocol::{DataSink, ExecuteTask, PhysicalPlanOperator};
 use common::{Result, VeinError};
-use exec::operators::sink::WriteReceipt;
+use exec::operators::sink::{WriteReceipt, WriteStorage};
 use exec::runtime::TaskExecutor;
 use exec::udf::{FunctionRegistry, register_builtin_scalars};
 use futures::Stream;
 use optimizer::Optimizer;
 use physical::PhysicalPlanner;
-use plan::CatalogProvider;
+use plan::{CatalogProvider, LogicalPlan};
 
 use super::parquet_catalog::ParquetCatalog;
 use super::parquet_storage::ParquetStorage;
@@ -28,6 +28,7 @@ pub struct LocalQueryEngine {
     optimizer: optimizer::OptimizerPipeline,
     planner: physical::DefaultPhysicalPlanner,
     executor: Arc<dyn TaskExecutor>,
+    write_storage: Arc<dyn WriteStorage>,
 }
 
 impl LocalQueryEngine {
@@ -41,12 +42,12 @@ impl LocalQueryEngine {
         let functions: Arc<dyn binder::FunctionRegistry> = functions;
         let mut runtime_functions = FunctionRegistry::new();
         register_builtin_scalars(&mut runtime_functions);
-        let storage = Arc::new(ParquetStorage::new(data_root));
+        let storage: Arc<dyn WriteStorage> = Arc::new(ParquetStorage::new(data_root));
         let executor = Arc::new(
             exec::factory::TaskExecutorBuilder::new()
                 .with_metadata_store(metadata_store)
                 .with_registry(Arc::new(runtime_functions))
-                .with_write_storage(storage)
+                .with_write_storage(Arc::clone(&storage))
                 .build(),
         );
 
@@ -55,6 +56,7 @@ impl LocalQueryEngine {
             optimizer: optimizer::OptimizerPipeline::default(),
             planner: physical::DefaultPhysicalPlanner::new(),
             executor,
+            write_storage: storage,
         }
     }
 
@@ -77,6 +79,10 @@ impl LocalQueryEngine {
         let optimized = self.optimizer.optimize(bound.plan)?;
         let optimize_us = optimize_started.elapsed().as_micros() as u64;
 
+        if let LogicalPlan::Write { target, options, .. } = &optimized {
+            self.write_storage.validate_target(target, options)?;
+        }
+
         let plan_started = Instant::now();
         let request_id = RequestId::new();
         let job = self.planner.create_physical_plan(request_id, optimized)?;
@@ -84,10 +90,11 @@ impl LocalQueryEngine {
 
         let task_started = Instant::now();
         let (request_id, query_id, mode, stage) = job.into_parts();
-        let is_write = stage
-            .tasks
-            .first()
-            .is_some_and(|task| matches!(&*task.sink, DataSink::Storage(_)));
+        let first_sink = stage.tasks.first().and_then(|task| match &task.plan.root.operator {
+            PhysicalPlanOperator::Sink { sink, .. } => Some(sink.as_ref()),
+            _ => None,
+        });
+        let is_write = first_sink.is_some_and(|sink| matches!(sink, DataSink::Storage(_)));
         if is_write && stage.tasks.len() != 1 {
             return Err(VeinError::planning(
                 "a local WRITE must execute as one atomic task",
@@ -97,7 +104,13 @@ impl LocalQueryEngine {
         let stage_id = stage.stage_id;
         let mut tasks = Vec::with_capacity(stage.tasks.len());
         for task in stage.tasks {
-            match (&*task.sink, is_write) {
+            let PhysicalPlanOperator::Sink { sink, .. } = &task.plan.root.operator else {
+                return Err(VeinError::planning(
+                    "physical task plan must have a sink root",
+                    None,
+                ));
+            };
+            match (sink.as_ref(), is_write) {
                 (DataSink::Client { .. }, false) | (DataSink::Storage(_), true) => {}
                 _ => {
                     return Err(VeinError::planning(
@@ -311,6 +324,43 @@ mod tests {
 
     use super::*;
 
+    fn contains_sort(node: &common::protocol::PhysicalPlanNode) -> bool {
+        use common::protocol::PhysicalPlanOperator;
+        match &node.operator {
+            PhysicalPlanOperator::Sort { .. } => true,
+            PhysicalPlanOperator::Transform { input, .. }
+            | PhysicalPlanOperator::Aggregate { input, .. }
+            | PhysicalPlanOperator::Distinct { input, .. }
+            | PhysicalPlanOperator::Limit { input, .. }
+            | PhysicalPlanOperator::Sink { input, .. } => contains_sort(input),
+            PhysicalPlanOperator::Join { probe, build, .. } => {
+                contains_sort(probe) || contains_sort(build)
+            }
+            PhysicalPlanOperator::Pipeline { .. } => false,
+        }
+    }
+
+    fn find_file_scan(
+        node: &common::protocol::PhysicalPlanNode,
+    ) -> Option<&common::protocol::FileScanTask> {
+        use common::protocol::{DataSource, PhysicalPlanOperator};
+        match &node.operator {
+            PhysicalPlanOperator::Pipeline { source, .. } => match source.as_ref() {
+                DataSource::File(scan) => Some(scan),
+                DataSource::Memory | DataSource::Stream(_) => None,
+            },
+            PhysicalPlanOperator::Transform { input, .. }
+            | PhysicalPlanOperator::Aggregate { input, .. }
+            | PhysicalPlanOperator::Distinct { input, .. }
+            | PhysicalPlanOperator::Sort { input, .. }
+            | PhysicalPlanOperator::Limit { input, .. }
+            | PhysicalPlanOperator::Sink { input, .. } => find_file_scan(input),
+            PhysicalPlanOperator::Join { probe, build, .. } => {
+                find_file_scan(probe).or_else(|| find_file_scan(build))
+            }
+        }
+    }
+
     #[tokio::test]
     async fn executes_ordered_local_parquet_query_across_files() {
         let root = tempfile::tempdir().expect("temporary data root");
@@ -342,7 +392,7 @@ mod tests {
             1,
             "a global sort must read all files in one task"
         );
-        assert!(query.tasks[0].sort.is_some());
+        assert!(contains_sort(&query.tasks[0].plan.root));
         let mut stream = query.into_stream();
         let mut rows = Vec::new();
         while let Some(batch) = stream.next().await {
@@ -426,9 +476,8 @@ mod tests {
             .prepare("FROM wide |> WHERE id = 2 |> SELECT value")
             .await
             .expect("prepare projected scan");
-        let common::protocol::DataSource::File(scan) = &query.tasks[0].source else {
-            panic!("expected a Parquet file scan");
-        };
+        let scan = find_file_scan(&query.tasks[0].plan.root)
+            .expect("expected a Parquet file scan in the physical plan");
         assert_eq!(
             scan.projected
                 .fields
@@ -669,6 +718,15 @@ mod tests {
         writer.close().expect("close source writer");
 
         let engine = LocalQueryEngine::new(root.path());
+        let error = match engine
+            .prepare("FROM source |> SELECT id |> WRITE archived (compression='zstd')")
+            .await
+        {
+            Ok(_) => panic!("unsupported writer options should fail preparation"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not support option 'compression'"));
+
         let query = engine
             .prepare("FROM source |> WHERE id > 4 |> SELECT id |> WRITE archived")
             .await

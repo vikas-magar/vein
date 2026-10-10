@@ -155,17 +155,22 @@ impl PipelineCompiler {
                     types: schema.fields.iter().map(|f| f.data_type.clone()).collect(),
                 }))
             }
-            // A `DISTINCT` is the same operator with every output column as a key
-            // and nothing to fold, which is why it needs no plan of its own.
-            LogicalPlan::Distinct { schema, .. } => Ok(Some(AggregatePlan {
-                groups: schema.fields.len() as u32,
-                estimated_groups: None,
-                grouping_sets: Some(vec![(0..schema.fields.len() as u32).collect()]),
-                emit_empty_group_on_empty_input: false,
-                aggs: Vec::new(),
-                aggregate_input_types: Vec::new(),
-                types: schema.fields.iter().map(|f| f.data_type.clone()).collect(),
-            })),
+            // The runtime keeps DISTINCT explicit in the physical tree while
+            // reusing the aggregate engine's all-keys, no-fold execution plan.
+            LogicalPlan::Distinct { schema, .. } => {
+                let groups = u32::try_from(schema.fields.len()).map_err(|_| {
+                    VeinError::planning("DISTINCT input has too many columns", None)
+                })?;
+                Ok(Some(AggregatePlan {
+                    groups,
+                    estimated_groups: None,
+                    grouping_sets: Some(vec![(0..groups).collect()]),
+                    emit_empty_group_on_empty_input: false,
+                    aggs: Vec::new(),
+                    aggregate_input_types: Vec::new(),
+                    types: schema.fields.iter().map(|f| f.data_type.clone()).collect(),
+                }))
+            }
             LogicalPlan::Filter { input, .. } => Self::aggregate(input),
             LogicalPlan::Project { input, .. } => Self::aggregate(input),
             _ => Ok(None),
@@ -186,9 +191,7 @@ impl PipelineCompiler {
     /// Compiles the sort operator at this node without imposing root-pipeline
     /// restrictions on operators below it. Recursive inputs retain the exact
     /// logical order, including a limit that precedes a sort.
-    pub fn recursive_sort(
-        plan: &LogicalPlan,
-    ) -> Result<Option<(SortPlan, Option<MicroProgram>)>> {
+    pub fn recursive_sort(plan: &LogicalPlan) -> Result<Option<(SortPlan, Option<MicroProgram>)>> {
         let LogicalPlan::Sort {
             sort_keys, schema, ..
         } = plan
@@ -210,9 +213,10 @@ impl PipelineCompiler {
         compile_sort_key_program(sort_keys, schema)
     }
 
-
     /// Compiles a linear logical plan into its Parquet source and vector program.
-    pub fn compile(plan: &LogicalPlan) -> Result<(DataSource, MicroProgram, VeinSchema)> {
+    pub fn compile(
+        plan: &LogicalPlan,
+    ) -> Result<(DataSource, MicroProgram, VeinSchema, VeinSchema)> {
         let mut dictionary_group_ids = Vec::new();
         let (mut source, scan_schema) = Self::collect_leaf_source(plan, &mut dictionary_group_ids)?;
         if let DataSource::File(scan) = &mut source {
@@ -234,45 +238,70 @@ impl PipelineCompiler {
         let register_count = scan_schema.fields.len() as RegId;
         let mut compiler = BytecodeCompiler::new(register_count);
         compiler.set_input_schema(&scan_schema);
-        let output_schema = Self::compile_node(plan, scan_schema, &mut compiler)?;
-        Ok((source, compiler.finish(), output_schema))
+        let output_schema = Self::compile_node(plan, scan_schema.clone(), &mut compiler)?;
+        Ok((source, compiler.finish(), scan_schema, output_schema))
     }
 
-    /// Compiles row-wise operators above a join boundary against that join's
-    /// output schema. Unlike `compile`, this does not search for a Parquet leaf:
-    /// the recursive input plan supplies the batches at runtime.
-    pub fn compile_join_transform(
+    /// Compiles the VM portion of one operator against its recursively produced
+    /// input. Unlike `compile`, this does not search for a Parquet leaf: the
+    /// physical child supplies the batches at runtime.
+    pub fn compile_recursive_transform(
         plan: &LogicalPlan,
+        input_schema: &VeinSchema,
+    ) -> Result<(MicroProgram, VeinSchema)> {
+        Self::compile_recursive_transforms(&[plan], input_schema)
+    }
+
+    /// Compiles adjacent VM-expressible operators into one program over a
+    /// recursively produced input. The nodes must be ordered from the child
+    /// toward the root so each operator sees the preceding node's output schema.
+    pub fn compile_recursive_transforms(
+        plans: &[&LogicalPlan],
         input_schema: &VeinSchema,
     ) -> Result<(MicroProgram, VeinSchema)> {
         let mut compiler = BytecodeCompiler::new(input_schema.fields.len() as RegId);
         compiler.set_input_schema(input_schema);
-        // The recursive join builder has already compiled the child into a
-        // PhysicalInputPlan. Compile only this node against that child's output;
-        // recursively compiling `plan` here would walk the logical child again
-        // against the narrower physical schema and can lose filter-only columns.
-        let output_schema = Self::compile_join_transform_node(plan, input_schema, &mut compiler).map_err(|error| {
-            let columns = input_schema
-                .fields
-                .iter()
-                .map(|field| format!("{}#{}", field.name, field.id.0))
-                .collect::<Vec<_>>()
-                .join(", ");
-            VeinError::planning(
-                format!("failed to compile recursive join transform against input columns [{columns}]: {error}"),
-                None,
-            )
-        })?;
+        let mut output_schema = input_schema.clone();
+        for plan in plans {
+            // Recursive lowering already compiled the child into a canonical
+            // physical node. Compile only each operator against its immediate
+            // input schema; walking its logical child again can lose columns
+            // that a preceding operator has intentionally narrowed.
+            output_schema = Self::compile_recursive_transform_node(plan, &output_schema, &mut compiler)
+                .map_err(|error| {
+                    let operator = match *plan {
+                        LogicalPlan::Filter { .. } => "filter",
+                        LogicalPlan::Project { .. } => "projection",
+                        LogicalPlan::Aggregate { .. } => "aggregate",
+                        LogicalPlan::Distinct { .. } => "distinct",
+                        LogicalPlan::SubqueryAlias { .. } => "subquery alias",
+                        _ => "transform",
+                    };
+                    let columns = output_schema
+                        .fields
+                        .iter()
+                        .map(|field| format!("{}#{}", field.name, field.id.0))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    VeinError::planning(
+                        format!("failed to compile recursive {operator} against input schema [{columns}]: {error}"),
+                        None,
+                    )
+                })?;
+        }
         Ok((compiler.finish(), output_schema))
     }
 
-    fn compile_join_transform_node(
+    fn compile_recursive_transform_node(
         plan: &LogicalPlan,
         input_schema: &VeinSchema,
         compiler: &mut BytecodeCompiler,
     ) -> Result<VeinSchema> {
         match plan {
-            LogicalPlan::Filter { input: _, predicate } => {
+            LogicalPlan::Filter {
+                input: _,
+                predicate,
+            } => {
                 // Recursive input plans execute this transform immediately
                 // after its child. For a filter above an aggregate, the child
                 // schema is the aggregate output, so compile the predicate here
@@ -743,7 +772,10 @@ fn compile_sort_plan(sort_keys: &[LogicalSortKey], schema: &VeinSchema) -> Resul
         })
         .collect::<Result<Vec<_>>>()?;
     if keys.is_empty() {
-        return Err(VeinError::planning("ORDER requires at least one sort key", None));
+        return Err(VeinError::planning(
+            "ORDER requires at least one sort key",
+            None,
+        ));
     }
     Ok(SortPlan { keys })
 }
@@ -1013,17 +1045,18 @@ mod tests {
         };
         let built_child_schema = VeinSchema::new(vec![visible, hidden_filter_column]);
 
-        let (program, output_schema) = PipelineCompiler::compile_join_transform(
-            &plan,
-            &built_child_schema,
-        )
-            .expect("the project must bind against the already-built filtered join schema");
+        let (program, output_schema) =
+            PipelineCompiler::compile_recursive_transform(&plan, &built_child_schema)
+                .expect("the project must bind against the already-built filtered join schema");
 
         assert_eq!(output_schema.fields.len(), 1);
-        assert!(!program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            common::protocol::MicroOp::FilterMask { .. }
-        )), "the child filter must not be compiled a second time");
+        assert!(
+            !program.instructions.iter().any(|instruction| matches!(
+                instruction,
+                common::protocol::MicroOp::FilterMask { .. }
+            )),
+            "the child filter must not be compiled a second time"
+        );
     }
 
     #[test]
@@ -1077,8 +1110,10 @@ mod tests {
         assert_eq!(plan.keys[0].column, 1);
         assert!(plan.keys[0].ascending);
         assert!(key_program.is_none());
-        assert!(PipelineCompiler::sort(&sort).is_err(),
-                "root ORDER keeps its existing sort-after-limit validation");
+        assert!(
+            PipelineCompiler::sort(&sort).is_err(),
+            "root ORDER keeps its existing sort-after-limit validation"
+        );
     }
 
     #[test]
@@ -1158,7 +1193,7 @@ mod tests {
             schema: Box::new(VeinSchema::new(vec![key])),
         };
 
-        let (source, _, _) = PipelineCompiler::compile(&aggregate).expect("compile aggregate");
+        let (source, _, _, _) = PipelineCompiler::compile(&aggregate).expect("compile aggregate");
         let common::protocol::DataSource::File(scan) = source else {
             panic!("aggregate scan should use Parquet");
         };
@@ -1188,7 +1223,7 @@ mod tests {
             schema: Box::new(VeinSchema::new(vec![output])),
         };
 
-        let (source, _, _) = PipelineCompiler::compile(&aggregate).expect("compile aggregate");
+        let (source, _, _, _) = PipelineCompiler::compile(&aggregate).expect("compile aggregate");
         let common::protocol::DataSource::File(scan) = source else {
             panic!("aggregate scan should use Parquet");
         };
@@ -1275,7 +1310,8 @@ mod tests {
         assert_eq!(filtered.estimated_groups, None);
 
         let mut no_ndv = (*table).clone();
-        no_ndv.statistics
+        no_ndv
+            .statistics
             .as_mut()
             .unwrap()
             .column_statistics
@@ -1422,34 +1458,67 @@ mod tests {
         let aggregate_plan = PipelineCompiler::aggregate(&limited)
             .expect("aggregate under post-aggregate operators should plan")
             .expect("aggregate plan");
-        assert_eq!(aggregate_plan.types, vec![VeinDataType::Utf8, VeinDataType::Int64]);
+        assert_eq!(
+            aggregate_plan.types,
+            vec![VeinDataType::Utf8, VeinDataType::Int64]
+        );
 
-        let (_, input_program, output_schema) = PipelineCompiler::compile(&limited)
-            .expect("compile aggregate input program");
+        let (_, input_program, _, output_schema) =
+            PipelineCompiler::compile(&limited).expect("compile aggregate input program");
         assert_eq!(output_schema.fields[1].name, "adjusted_count");
         assert!(
-            !input_program.instructions.iter().any(|instruction| matches!(instruction, MicroOp::Add { .. })),
+            !input_program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, MicroOp::Add { .. })),
             "computed projection must not execute before aggregate groups are built"
         );
 
         let post_aggregate = PipelineCompiler::post_aggregate_program(&limited)
             .expect("compile post-aggregate operators")
             .expect("project and HAVING require a post-aggregate program");
-        assert!(post_aggregate.instructions.iter().any(|instruction| matches!(instruction, MicroOp::Add { .. })));
-        assert!(post_aggregate.instructions.iter().any(|instruction| matches!(instruction, MicroOp::FilterMask { .. })));
+        assert!(
+            post_aggregate
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, MicroOp::Add { .. }))
+        );
+        assert!(
+            post_aggregate
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, MicroOp::FilterMask { .. }))
+        );
         assert!(post_aggregate.instructions.iter().any(|instruction| matches!(instruction, MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 2)));
     }
 
     #[test]
     fn compiles_join_residual_against_only_referenced_build_columns() {
-        let probe_key = Arc::new(ResolvedColumn::new(ColumnId(1), "probe_key", None, VeinDataType::Int64));
-        let build_key = Arc::new(ResolvedColumn::new(ColumnId(2), "build_key", None, VeinDataType::Int64));
-        let build_comment = Arc::new(ResolvedColumn::new(ColumnId(3), "comment", None, VeinDataType::Utf8));
+        let probe_key = Arc::new(ResolvedColumn::new(
+            ColumnId(1),
+            "probe_key",
+            None,
+            VeinDataType::Int64,
+        ));
+        let build_key = Arc::new(ResolvedColumn::new(
+            ColumnId(2),
+            "build_key",
+            None,
+            VeinDataType::Int64,
+        ));
+        let build_comment = Arc::new(ResolvedColumn::new(
+            ColumnId(3),
+            "comment",
+            None,
+            VeinDataType::Utf8,
+        ));
         let probe = VeinSchema::new(vec![Arc::clone(&probe_key)]);
         let build = VeinSchema::new(vec![Arc::clone(&build_key), Arc::clone(&build_comment)]);
         let predicate = LogicalExpr::Like {
             expr: Box::new(LogicalExpr::Column(build_comment)),
-            pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String("%special%requests%".into()))),
+            pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String(
+                "%special%requests%".into(),
+            ))),
             negated: true,
         };
 
@@ -1458,7 +1527,125 @@ mod tests {
             .expect("predicate should produce a residual plan");
 
         assert_eq!(residual.input_columns, vec![JoinOutput::Build(1)]);
-        assert!(residual.program.instructions.iter().any(|op| matches!(op, MicroOp::Like { negated: true, .. })));
-        assert!(residual.program.instructions.iter().any(|op| matches!(op, MicroOp::FilterMask { .. })));
+        assert!(
+            residual
+                .program
+                .instructions
+                .iter()
+                .any(|op| matches!(op, MicroOp::Like { negated: true, .. }))
+        );
+        assert!(
+            residual
+                .program
+                .instructions
+                .iter()
+                .any(|op| matches!(op, MicroOp::FilterMask { .. }))
+        );
+    }
+
+    #[test]
+    fn compiles_expression_equality_as_a_join_residual_without_copying_unreferenced_columns() {
+        let probe_key = Arc::new(ResolvedColumn::new(
+            ColumnId(1),
+            "probe_key",
+            None,
+            VeinDataType::Int64,
+        ));
+        let probe_value = Arc::new(ResolvedColumn::new(
+            ColumnId(2),
+            "probe_value",
+            None,
+            VeinDataType::Int64,
+        ));
+        let build_key = Arc::new(ResolvedColumn::new(
+            ColumnId(3),
+            "build_key",
+            None,
+            VeinDataType::Int64,
+        ));
+        let build_value = Arc::new(ResolvedColumn::new(
+            ColumnId(4),
+            "build_value",
+            None,
+            VeinDataType::Int64,
+        ));
+        let probe = VeinSchema::new(vec![Arc::clone(&probe_key), Arc::clone(&probe_value)]);
+        let build = VeinSchema::new(vec![Arc::clone(&build_key), Arc::clone(&build_value)]);
+        let add_one = |column| LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(column)),
+            op: parser::ast::expr::BinaryOp::Plus,
+            right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(1))),
+            return_type: VeinDataType::Int64,
+        };
+        let predicate = LogicalExpr::BinaryOp {
+            left: Box::new(add_one(probe_value)),
+            op: parser::ast::expr::BinaryOp::Eq,
+            right: Box::new(add_one(build_value)),
+            return_type: VeinDataType::Boolean,
+        };
+
+        let residual = PipelineCompiler::compile_join_residual(&[predicate], &probe, &build, 0)
+            .expect("expression-valued residual should compile")
+            .expect("predicate should produce a residual plan");
+
+        assert_eq!(
+            residual.input_columns,
+            vec![JoinOutput::Probe(1), JoinOutput::Build(1)]
+        );
+        assert_eq!(
+            residual
+                .program
+                .instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, MicroOp::Add { .. }))
+                .count(),
+            2
+        );
+        assert!(residual
+            .program
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, MicroOp::CmpEq { .. })));
+        assert!(residual
+            .program
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, MicroOp::FilterMask { .. })));
+    }
+
+    #[test]
+    fn missing_recursive_filter_column_reports_operator_identity_and_input_schema() {
+        let input_column = Arc::new(ResolvedColumn::new(
+            ColumnId(1),
+            "p_partkey",
+            None,
+            VeinDataType::Int64,
+        ));
+        let input_schema = VeinSchema::new(vec![input_column]);
+        let missing_column = Arc::new(ResolvedColumn::new(
+            ColumnId(39),
+            "ps_supplycost",
+            None,
+            VeinDataType::Int64,
+        ));
+        let filter = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                table: Arc::new(
+                    TableMetadata::new("partsupp", Arc::new(VeinSchema::empty()))
+                        .with_format(plan::TableFormat::Parquet),
+                ),
+                projection: None,
+                filters: Vec::new(),
+                schema: Box::new(VeinSchema::empty()),
+            }),
+            predicate: LogicalExpr::Column(missing_column),
+        };
+
+        let error = PipelineCompiler::compile_recursive_transform(&filter, &input_schema)
+            .expect_err("filter column omitted from recursive input should fail during lowering");
+        let message = error.to_string();
+        assert!(message.contains("recursive filter"), "{message}");
+        assert!(message.contains("ps_supplycost#39"), "{message}");
+        assert!(message.contains("input schema [p_partkey#1]"), "{message}");
     }
 }

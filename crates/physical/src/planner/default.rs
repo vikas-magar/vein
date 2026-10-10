@@ -73,6 +73,22 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
             | LogicalPlan::Distinct { .. }
             | LogicalPlan::Write { .. } => {
                 let stage = self.pipeline_builder.build(&logical_plan)?;
+                let graph = stage.pipeline_graph();
+                tracing::info!(
+                    target: "vein.audit",
+                    event = "pipeline_graph_derived",
+                    pipeline_count = graph.pipelines().len(),
+                    dependency_count = graph.dependencies().len(),
+                    streaming_operator_count = graph
+                        .pipelines()
+                        .iter()
+                        .map(|pipeline| pipeline.operators.len())
+                        .sum::<usize>(),
+                    "pipeline_graph_derived"
+                );
+                for task in stage.tasks() {
+                    task.plan.validate()?;
+                }
                 Ok(Job::new(request_id, query_id, stage, ExecutionMode::Batch))
             }
             other => Err(VeinError::planning(
@@ -89,21 +105,36 @@ mod tests {
     use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
     use plan::LogicalExpr;
 
+    fn task_input(task: &crate::task::Task) -> &common::protocol::PhysicalPlanNode {
+        let common::protocol::PhysicalPlanOperator::Sink { input, .. } = &task.plan.root.operator else {
+            panic!("physical task plan must have a sink root");
+        };
+        input
+    }
+
     fn mock_scan_plan() -> LogicalPlan {
         mock_scan_plan_with_column_id_offset(0)
     }
 
     fn mock_scan_plan_with_column_id_offset(column_id_offset: usize) -> LogicalPlan {
+        mock_scan_plan_with_columns(column_id_offset, "id", "name")
+    }
+
+    fn mock_scan_plan_with_columns(
+        column_id_offset: usize,
+        key_name: &str,
+        value_name: &str,
+    ) -> LogicalPlan {
         let schema = Box::new(VeinSchema::new(vec![
             std::sync::Arc::new(ResolvedColumn::new(
                 ColumnId(column_id_offset),
-                "id",
+                key_name,
                 None,
                 VeinDataType::Int64,
             )),
             std::sync::Arc::new(ResolvedColumn::new(
                 ColumnId(column_id_offset + 1),
-                "name",
+                value_name,
                 None,
                 VeinDataType::Utf8,
             )),
@@ -131,8 +162,11 @@ mod tests {
         let stage = job.stage();
         assert_eq!(stage.tasks().len(), 1);
 
-        let task = &stage.tasks()[0];
-        assert_eq!(task.program.register_count, 2);
+        let input = task_input(&stage.tasks()[0]);
+        let common::protocol::PhysicalPlanOperator::Pipeline { program, .. } = &input.operator else {
+            panic!("scan-only plan should lower to a pipeline");
+        };
+        assert_eq!(program.register_count, 2);
     }
 
     #[test]
@@ -166,9 +200,17 @@ mod tests {
             .expect("aggregate should compile back to its scan source");
 
         assert_eq!(job.stage().tasks().len(), 1);
-        let task = &job.stage().tasks()[0];
-        assert!(matches!(&task.source, common::protocol::DataSource::File(_)));
-        let aggregate = task.aggregate.as_ref().expect("aggregate task metadata");
+        let root = task_input(&job.stage().tasks()[0]);
+        let common::protocol::PhysicalPlanOperator::Aggregate { input, plan: aggregate } = &root.operator else {
+            panic!("global aggregate should be an aggregate operator");
+        };
+        let common::protocol::PhysicalPlanOperator::Transform { input, .. } = &input.operator else {
+            panic!("aggregate arguments should be projected before aggregation");
+        };
+        let common::protocol::PhysicalPlanOperator::Pipeline { source, .. } = &input.operator else {
+            panic!("aggregate input transform should consume a source pipeline");
+        };
+        assert!(matches!(source.as_ref(), common::protocol::DataSource::File(_)));
         assert_eq!(aggregate.groups, 0);
         assert_eq!(aggregate.aggs, vec![common::protocol::AggOpCode::Count]);
         assert_eq!(aggregate.types, vec![VeinDataType::Int64]);
@@ -242,15 +284,12 @@ mod tests {
         let job = DefaultPhysicalPlanner::new()
             .create_physical_plan(RequestId::new(), join)
             .expect("join with aggregate input should plan");
-        let input = job.stage().tasks()[0]
-            .input_plan
-            .as_ref()
-            .expect("recursive join input");
-        let common::protocol::PhysicalInputPlan::Join { build, .. } = input.as_ref() else {
+        let input = task_input(&job.stage().tasks()[0]);
+        let common::protocol::PhysicalPlanOperator::Join { build, .. } = &input.operator else {
             panic!("root should be a join input");
         };
         assert!(
-            matches!(build.as_ref(), common::protocol::PhysicalInputPlan::Aggregate { .. }),
+            matches!(build.operator, common::protocol::PhysicalPlanOperator::Aggregate { .. }),
             "aggregate build side should be represented as a pipeline breaker"
         );
     }
@@ -349,18 +388,15 @@ mod tests {
         let job = DefaultPhysicalPlanner::new()
             .create_physical_plan(RequestId::new(), aggregate.clone())
             .expect("aggregate over a join should use recursive join planning");
-        let input = job.stage().tasks()[0]
-            .input_plan
-            .as_ref()
-            .expect("recursive aggregate input plan");
-        let common::protocol::PhysicalInputPlan::Aggregate { input, .. } = input.as_ref() else {
+        let input = task_input(&job.stage().tasks()[0]);
+        let common::protocol::PhysicalPlanOperator::Aggregate { input, .. } = &input.operator else {
             panic!("the recursive input root should be an aggregate");
         };
-        let common::protocol::PhysicalInputPlan::Transform { input, .. } = input.as_ref() else {
+        let common::protocol::PhysicalPlanOperator::Transform { input, .. } = &input.operator else {
             panic!("aggregate arguments should be projected by a transform");
         };
         assert!(
-            matches!(input.as_ref(), common::protocol::PhysicalInputPlan::Join { .. }),
+            matches!(input.operator, common::protocol::PhysicalPlanOperator::Join { .. }),
             "the aggregate transform must consume the planned join"
         );
 
@@ -395,20 +431,17 @@ mod tests {
         let projected_job = DefaultPhysicalPlanner::new()
             .create_physical_plan(RequestId::new(), projected)
             .expect("computed projection above aggregate over join should plan");
-        let projected_input = projected_job.stage().tasks()[0]
-            .input_plan
-            .as_ref()
-            .expect("recursive projected input");
-        let common::protocol::PhysicalInputPlan::Transform {
+        let projected_input = task_input(&projected_job.stage().tasks()[0]);
+        let common::protocol::PhysicalPlanOperator::Transform {
             input,
             program,
-        } = projected_input.as_ref()
+        } = &projected_input.operator
         else {
             panic!("projection should be represented as a transform above the aggregate");
         };
         assert!(matches!(
-            input.as_ref(),
-            common::protocol::PhysicalInputPlan::Aggregate { .. }
+            input.operator,
+            common::protocol::PhysicalPlanOperator::Aggregate { .. }
         ));
         assert!(
             program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::Add { .. })),
@@ -436,16 +469,13 @@ mod tests {
         let filtered_job = DefaultPhysicalPlanner::new()
             .create_physical_plan(RequestId::new(), filtered)
             .expect("HAVING over an aggregate join should plan");
-        let filtered_input = filtered_job.stage().tasks()[0]
-            .input_plan
-            .as_ref()
-            .expect("recursive filtered input");
-        let common::protocol::PhysicalInputPlan::Transform { input, program } = filtered_input.as_ref() else {
+        let filtered_input = task_input(&filtered_job.stage().tasks()[0]);
+        let common::protocol::PhysicalPlanOperator::Transform { input, program } = &filtered_input.operator else {
             panic!("HAVING should be represented as a transform above the aggregate");
         };
         assert!(matches!(
-            input.as_ref(),
-            common::protocol::PhysicalInputPlan::Aggregate { .. }
+            input.operator,
+            common::protocol::PhysicalPlanOperator::Aggregate { .. }
         ));
         assert!(
             program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::FilterMask { .. })),
@@ -493,19 +523,27 @@ mod tests {
             .create_physical_plan(RequestId::new(), filtered)
             .expect("post-aggregate filter should compile");
         let task = &job.stage().tasks()[0];
-        assert!(task
-            .program
-            .instructions
-            .iter()
-            .all(|op| !matches!(op, common::protocol::MicroOp::FilterMask { .. })));
-        let post = task
-            .post_aggregate_program
-            .as_ref()
-            .expect("post-aggregate filter program");
-        assert!(matches!(
-            post.instructions.last(),
-            Some(common::protocol::MicroOp::FilterMask { .. })
-        ));
+        let input = task_input(task);
+        let common::protocol::PhysicalPlanOperator::Transform { input, program } = &input.operator else {
+            panic!("post-aggregate filter should be a transform node");
+        };
+        assert!(program.instructions.iter().any(|op| matches!(
+            op,
+            common::protocol::MicroOp::FilterMask { .. }
+        )));
+        let common::protocol::PhysicalPlanOperator::Aggregate { input, .. } = &input.operator else {
+            panic!("post-aggregate filter should follow an aggregate node");
+        };
+        let common::protocol::PhysicalPlanOperator::Transform { input, .. } = &input.operator else {
+            panic!("aggregate arguments should be projected at the aggregate boundary");
+        };
+        let common::protocol::PhysicalPlanOperator::Pipeline { program, .. } = &input.operator else {
+            panic!("the aggregate input transform should consume the scan pipeline");
+        };
+        assert!(program.instructions.iter().all(|op| !matches!(
+            op,
+            common::protocol::MicroOp::FilterMask { .. }
+        )));
     }
 
     #[test]
@@ -560,10 +598,10 @@ mod tests {
         let job = DefaultPhysicalPlanner::new()
             .create_physical_plan(RequestId::new(), aggregate)
             .expect("multiple grouping sets should be carried into the task plan");
-        let plan = job.stage().tasks()[0]
-            .aggregate
-            .as_ref()
-            .expect("aggregate task metadata");
+        let input = task_input(&job.stage().tasks()[0]);
+        let common::protocol::PhysicalPlanOperator::Aggregate { plan, .. } = &input.operator else {
+            panic!("grouping sets should lower to an aggregate node");
+        };
 
         assert_eq!(plan.groups, 2);
         assert_eq!(
@@ -591,14 +629,25 @@ mod tests {
 
         assert_eq!(job.stage().tasks().len(), 1);
         let task = &job.stage().tasks()[0];
-        assert!(matches!(&task.source, common::protocol::DataSource::File(_)));
-        let aggregate = task.aggregate.as_ref().expect("distinct aggregate metadata");
-        assert_eq!(aggregate.groups, 2);
-        assert!(aggregate.aggs.is_empty());
+        let input = task_input(task);
+        let common::protocol::PhysicalPlanOperator::Distinct { input, plan } = &input.operator else {
+            panic!("distinct should lower to a distinct node");
+        };
+        assert_eq!(plan.groups, 2);
+        assert_eq!(plan.grouping_sets, Some(vec![vec![0, 1]]));
+        assert!(plan.aggs.is_empty());
+        assert!(!plan.emit_empty_group_on_empty_input);
+        let common::protocol::PhysicalPlanOperator::Transform { input, .. } = &input.operator else {
+            panic!("distinct should consume a schema-aligned input transform");
+        };
+        let common::protocol::PhysicalPlanOperator::Pipeline { source, .. } = &input.operator else {
+            panic!("distinct transform should consume a scan pipeline");
+        };
+        assert!(matches!(source.as_ref(), common::protocol::DataSource::File(_)));
     }
 
     #[test]
-    fn plans_distinct_over_join_as_recursive_aggregate() {
+    fn plans_distinct_over_join_as_recursive_distinct() {
         let left_key = Arc::new(ResolvedColumn::new(
             ColumnId(10),
             "left_key",
@@ -665,20 +714,18 @@ mod tests {
         let job = DefaultPhysicalPlanner::new()
             .create_physical_plan(RequestId::new(), distinct)
             .expect("distinct over a join should use recursive planning");
-        let input = job.stage().tasks()[0]
-            .input_plan
-            .as_ref()
-            .expect("recursive distinct input");
-        let common::protocol::PhysicalInputPlan::Aggregate { input, plan } = input.as_ref() else {
-            panic!("distinct should be represented as an aggregate pipeline breaker");
+        let input = task_input(&job.stage().tasks()[0]);
+        let common::protocol::PhysicalPlanOperator::Distinct { input, plan } = &input.operator else {
+            panic!("distinct should be represented by its canonical distinct operator");
         };
         assert_eq!(plan.groups, 4);
         assert_eq!(plan.grouping_sets, Some(vec![vec![0, 1, 2, 3]]));
         assert!(plan.aggs.is_empty());
+        assert!(!plan.emit_empty_group_on_empty_input);
         assert!(matches!(
-            input.as_ref(),
-            common::protocol::PhysicalInputPlan::Transform { input, .. }
-                if matches!(input.as_ref(), common::protocol::PhysicalInputPlan::Join { .. })
+            &input.operator,
+            common::protocol::PhysicalPlanOperator::Transform { input, .. }
+                if matches!(&input.operator, common::protocol::PhysicalPlanOperator::Join { .. })
         ));
     }
 
@@ -746,24 +793,21 @@ mod tests {
         let job = DefaultPhysicalPlanner::new()
             .create_physical_plan(RequestId::new(), chained)
             .expect("projected intermediate join should plan");
-        let input = job.stage().tasks()[0]
-            .input_plan
-            .as_ref()
-            .expect("recursive join input");
-        let common::protocol::PhysicalInputPlan::Join { probe, .. } = input.as_ref() else {
+        let input = task_input(&job.stage().tasks()[0]);
+        let common::protocol::PhysicalPlanOperator::Join { probe, .. } = &input.operator else {
             panic!("root should be a join input");
         };
         assert!(matches!(
-            probe.as_ref(),
-            common::protocol::PhysicalInputPlan::Transform { input, .. }
-                if matches!(input.as_ref(), common::protocol::PhysicalInputPlan::Join { .. })
+            &probe.operator,
+            common::protocol::PhysicalPlanOperator::Transform { input, .. }
+                if matches!(&input.operator, common::protocol::PhysicalPlanOperator::Join { .. })
         ));
     }
 
     #[test]
     fn plans_projection_over_single_match_join_as_a_transform() {
-        let left = mock_scan_plan_with_column_id_offset(0);
-        let right = mock_scan_plan_with_column_id_offset(2);
+        let left = mock_scan_plan_with_columns(0, "left_id", "left_value");
+        let right = mock_scan_plan_with_columns(2, "right_id", "right_value");
         let (left_key, left_value) = match &left {
             LogicalPlan::Scan { schema, .. } => (
                 Arc::clone(&schema.fields[0]),
@@ -818,16 +862,13 @@ mod tests {
         let job = DefaultPhysicalPlanner::new()
             .create_physical_plan(RequestId::new(), projected)
             .expect("projection above a scalar single-match join should plan");
-        let input = job.stage().tasks()[0]
-            .input_plan
-            .as_ref()
-            .expect("recursive projected input");
-        let common::protocol::PhysicalInputPlan::Transform { input, program } = input.as_ref() else {
+        let input = task_input(&job.stage().tasks()[0]);
+        let common::protocol::PhysicalPlanOperator::Transform { input, program } = &input.operator else {
             panic!("the projection should compile as a transform above the join");
         };
         assert!(matches!(
-            input.as_ref(),
-            common::protocol::PhysicalInputPlan::Join { .. }
+            &input.operator,
+            common::protocol::PhysicalPlanOperator::Join { .. }
         ));
         assert!(program.instructions.iter().any(|op| matches!(
             op,

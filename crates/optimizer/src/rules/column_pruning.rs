@@ -514,11 +514,112 @@ fn collect_columns(expr: &LogicalExpr, output: &mut RequiredColumns) {
         LogicalExpr::Column(column) | LogicalExpr::OuterColumn(column) => {
             output.insert(column.id);
         }
+        // Subquery bodies are plan trees and intentionally aren't exposed as
+        // expression children. Inspect each body once to retain correlated IDs.
+        LogicalExpr::ScalarSubquery(subquery) => collect_plan_columns(subquery, output),
+        LogicalExpr::Exists { subquery, .. } => collect_plan_columns(subquery, output),
+        LogicalExpr::Lambda { body, captures, .. } => {
+            output.extend(captures.iter().map(|column| column.id));
+            collect_columns(body, output);
+        }
         _ => {
             for child in expr.children() {
                 collect_columns(child, output);
             }
         }
+    }
+}
+
+/// Collects column dependencies from a plan embedded in an expression.
+///
+/// Column IDs are query-local and stable across rewrites. Collecting all IDs
+/// here is safe: callers intersect this set with the schema of the input they
+/// are pruning, so inner-local columns cannot become outer input requirements.
+fn collect_plan_columns(plan: &LogicalPlan, output: &mut RequiredColumns) {
+    match plan {
+        LogicalPlan::Scan { filters, .. } => collect_exprs(filters, output),
+        LogicalPlan::Filter { predicate, .. } => collect_columns(predicate, output),
+        LogicalPlan::Project { exprs, .. } => collect_exprs(exprs, output),
+        LogicalPlan::Aggregate {
+            grouping_sets, aggs, ..
+        } => {
+            for grouping_set in grouping_sets {
+                collect_exprs(grouping_set, output);
+            }
+            collect_exprs(aggs, output);
+        }
+        LogicalPlan::Window {
+            partition_by,
+            order_by,
+            exprs,
+            ..
+        } => {
+            collect_exprs(partition_by, output);
+            collect_sort_keys(order_by, output);
+            for expr in exprs {
+                collect_columns(&expr.call, output);
+            }
+        }
+        LogicalPlan::Join { on, .. } => {
+            if let Some(on) = on {
+                collect_columns(on, output);
+            }
+        }
+        LogicalPlan::Sort { sort_keys, .. } => collect_sort_keys(sort_keys, output),
+        LogicalPlan::Assert { condition, .. } => collect_columns(condition, output),
+        LogicalPlan::Pivot {
+            aggregate, values, ..
+        } => {
+            collect_columns(aggregate, output);
+            collect_exprs(values, output);
+        }
+        LogicalPlan::Unpivot { columns, .. } => {
+            output.extend(columns.iter().map(|column| column.id));
+        }
+        LogicalPlan::SemanticFilter { targets, .. } => {
+            output.extend(targets.iter().map(|column| column.id));
+        }
+        LogicalPlan::SemanticJoin {
+            bounding_equi,
+            depends_on,
+            ..
+        } => {
+            output.extend(
+                bounding_equi
+                    .iter()
+                    .flat_map(|(left, right)| [left.id, right.id]),
+            );
+            output.extend(
+                depends_on
+                    .0
+                    .iter()
+                    .chain(&depends_on.1)
+                    .map(|column| column.id),
+            );
+        }
+        LogicalPlan::SemanticCalibrate {
+            target_features,
+            ground_truth_label,
+            ..
+        } => {
+            output.extend(target_features.iter().map(|column| column.id));
+            output.insert(ground_truth_label.id);
+        }
+        LogicalPlan::Call { args, .. } => collect_exprs(args, output),
+        LogicalPlan::ExternalScan { .. }
+        | LogicalPlan::Limit { .. }
+        | LogicalPlan::Distinct { .. }
+        | LogicalPlan::SubqueryAlias { .. }
+        | LogicalPlan::Explain { .. }
+        | LogicalPlan::SetOp { .. }
+        | LogicalPlan::Sample { .. }
+        | LogicalPlan::Fork { .. }
+        | LogicalPlan::Tee { .. }
+        | LogicalPlan::Write { .. } => {}
+    }
+
+    for child in plan.children() {
+        collect_plan_columns(child, output);
     }
 }
 
@@ -538,12 +639,15 @@ mod tests {
     }
 
     fn scan() -> LogicalPlan {
-        let fields = vec![field(1, "id"), field(2, "unused")];
+        scan_with_fields("t", vec![field(1, "id"), field(2, "unused")])
+    }
+
+    fn scan_with_fields(name: &str, fields: Vec<ResolvedColumnRef>) -> LogicalPlan {
         let schema = std::sync::Arc::new(VeinSchema {
             fields: fields.clone(),
         });
         LogicalPlan::Scan {
-            table: std::sync::Arc::new(TableMetadata::new("t", schema)),
+            table: std::sync::Arc::new(TableMetadata::new(name, schema)),
             projection: None,
             filters: vec![],
             schema: Box::new(VeinSchema { fields }),
@@ -552,6 +656,92 @@ mod tests {
 
     fn column(id: usize, name: &str) -> LogicalExpr {
         LogicalExpr::Column(field(id, name))
+    }
+
+    fn correlated_inner_plan(outer_key: &ResolvedColumnRef) -> LogicalPlan {
+        let inner_key = field(4, "inner_key");
+        let schema = Box::new(VeinSchema::new(vec![Arc::clone(&inner_key)]));
+        let input = LogicalPlan::Scan {
+            table: Arc::new(TableMetadata::new(
+                "inner",
+                Arc::new(*schema.clone()),
+            )),
+            projection: None,
+            filters: Vec::new(),
+            schema: schema.clone(),
+        };
+        LogicalPlan::Filter {
+            input: Box::new(input),
+            predicate: LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(inner_key)),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::OuterColumn(Arc::clone(outer_key))),
+                return_type: VeinDataType::Boolean,
+            },
+        }
+    }
+
+    fn outer_scan_projection_for_subquery(predicate: LogicalExpr) -> Option<Vec<ColumnId>> {
+        let outer_key = Arc::new(ResolvedColumn::new(
+            ColumnId(1),
+            "outer_key",
+            Some("outer".to_string()),
+            VeinDataType::Int64,
+        ));
+        let output = Arc::new(ResolvedColumn::new(
+            ColumnId(2),
+            "output",
+            Some("outer".to_string()),
+            VeinDataType::Int64,
+        ));
+        let unused = Arc::new(ResolvedColumn::new(
+            ColumnId(3),
+            "unused",
+            Some("outer".to_string()),
+            VeinDataType::Int64,
+        ));
+        let fields = vec![
+            Arc::clone(&outer_key),
+            Arc::clone(&output),
+            Arc::clone(&unused),
+        ];
+        let schema = Box::new(VeinSchema::new(fields.clone()));
+        let scan = LogicalPlan::Scan {
+            table: Arc::new(TableMetadata::new(
+                "outer",
+                Arc::new(*schema.clone()),
+            )),
+            projection: None,
+            filters: Vec::new(),
+            schema,
+        };
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(scan),
+            predicate,
+        };
+        let output_alias = Arc::new(ResolvedColumn::new(
+            ColumnId(5),
+            "selected_output",
+            None,
+            VeinDataType::Int64,
+        ));
+        let plan = LogicalPlan::Project {
+            input: Box::new(filtered),
+            exprs: vec![LogicalExpr::Column(output)],
+            schema: Box::new(VeinSchema::new(vec![output_alias])),
+        };
+
+        let pruned = prune_plan(plan, &[ColumnId(5)].into_iter().collect());
+        let LogicalPlan::Project { input, .. } = pruned else {
+            panic!("expected output projection");
+        };
+        let LogicalPlan::Filter { input, .. } = *input else {
+            panic!("expected subquery filter");
+        };
+        let LogicalPlan::Scan { projection, .. } = *input else {
+            panic!("expected outer scan");
+        };
+        projection
     }
 
     #[test]
@@ -577,6 +767,227 @@ mod tests {
             panic!("expected scan");
         };
         assert_eq!(projection, Some(vec![ColumnId(1)]));
+    }
+
+    #[test]
+    fn correlated_scalar_subquery_keeps_outer_reference_in_scan_projection() {
+        let outer_key = field(1, "outer_key");
+        let inner = correlated_inner_plan(&outer_key);
+        let predicate = LogicalExpr::BinaryOp {
+            left: Box::new(column(2, "output")),
+            op: parser::ast::expr::BinaryOp::Eq,
+            right: Box::new(LogicalExpr::ScalarSubquery(Box::new(inner))),
+            return_type: VeinDataType::Boolean,
+        };
+
+        let projection = outer_scan_projection_for_subquery(predicate);
+
+        assert_eq!(projection, Some(vec![ColumnId(1), ColumnId(2)]));
+    }
+
+    #[test]
+    fn correlated_exists_subquery_keeps_outer_reference_in_scan_projection() {
+        let outer_key = field(1, "outer_key");
+        let predicate = LogicalExpr::Exists {
+            subquery: Box::new(correlated_inner_plan(&outer_key)),
+            negated: false,
+        };
+
+        let projection = outer_scan_projection_for_subquery(predicate);
+
+        assert_eq!(projection, Some(vec![ColumnId(1), ColumnId(2)]));
+    }
+
+    #[test]
+    fn lambda_captures_are_kept_as_expression_dependencies() {
+        let capture = field(6, "captured");
+        let lambda = LogicalExpr::Lambda {
+            params: Vec::new(),
+            body: Box::new(LogicalExpr::Literal(plan::LogicalLiteral::Int64(1))),
+            captures: vec![capture],
+        };
+        let mut required = RequiredColumns::new();
+
+        collect_columns(&lambda, &mut required);
+
+        assert_eq!(required, [ColumnId(6)].into_iter().collect());
+    }
+
+    #[test]
+    fn computed_sort_key_columns_survive_projection_pruning() {
+        let visible = field(1, "visible");
+        let sort_input = field(2, "sort_input");
+        let unused = field(3, "unused");
+        let input_fields = vec![
+            Arc::clone(&visible),
+            Arc::clone(&sort_input),
+            Arc::clone(&unused),
+        ];
+        let sort_key = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(Arc::clone(&sort_input))),
+            op: parser::ast::expr::BinaryOp::Plus,
+            right: Box::new(LogicalExpr::Literal(plan::LogicalLiteral::Int64(1))),
+            return_type: VeinDataType::Int64,
+        };
+        let sorted = LogicalPlan::Sort {
+            input: Box::new(scan_with_fields("sort_input", input_fields.clone())),
+            sort_keys: vec![SortKey {
+                expr: sort_key,
+                asc: true,
+                nulls_first: false,
+            }],
+            schema: Box::new(VeinSchema::new(input_fields)),
+        };
+        let output = field(4, "output");
+        let plan = LogicalPlan::Project {
+            input: Box::new(sorted),
+            exprs: vec![LogicalExpr::Column(visible)],
+            schema: Box::new(VeinSchema::new(vec![output])),
+        };
+
+        let pruned = prune_plan(plan, &[ColumnId(4)].into_iter().collect());
+        let LogicalPlan::Project { input, .. } = pruned else {
+            panic!("expected output projection");
+        };
+        let LogicalPlan::Sort { input, .. } = *input else {
+            panic!("expected sort");
+        };
+        let LogicalPlan::Scan { projection, .. } = *input else {
+            panic!("expected scan");
+        };
+
+        assert_eq!(projection, Some(vec![ColumnId(1), ColumnId(2)]));
+    }
+
+    #[test]
+    fn aggregate_arguments_survive_pruning_when_only_aggregate_output_is_selected() {
+        let group_key = field(1, "group_key");
+        let aggregate_input = field(2, "aggregate_input");
+        let unused = field(3, "unused");
+        let aggregate_output = field(4, "total");
+        let input_fields = vec![
+            Arc::clone(&group_key),
+            Arc::clone(&aggregate_input),
+            Arc::clone(&unused),
+        ];
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(scan_with_fields("aggregate_input", input_fields)),
+            grouping_sets: vec![vec![LogicalExpr::Column(group_key)]],
+            aggs: vec![LogicalExpr::FunctionCall {
+                name: "sum".to_string(),
+                args: vec![LogicalExpr::Column(aggregate_input)],
+                is_aggregate: true,
+                distinct: false,
+                return_type: VeinDataType::Int64,
+            }],
+            schema: Box::new(VeinSchema::new(vec![
+                field(1, "group_key"),
+                Arc::clone(&aggregate_output),
+            ])),
+        };
+        let output = field(5, "output");
+        let plan = LogicalPlan::Project {
+            input: Box::new(aggregate),
+            exprs: vec![LogicalExpr::Column(aggregate_output)],
+            schema: Box::new(VeinSchema::new(vec![output])),
+        };
+
+        let pruned = prune_plan(plan, &[ColumnId(5)].into_iter().collect());
+        let LogicalPlan::Project { input, .. } = pruned else {
+            panic!("expected output projection");
+        };
+        let LogicalPlan::Aggregate { input, .. } = *input else {
+            panic!("expected aggregate");
+        };
+        let LogicalPlan::Scan { projection, .. } = *input else {
+            panic!("expected scan");
+        };
+
+        assert_eq!(projection, Some(vec![ColumnId(1), ColumnId(2)]));
+    }
+
+    #[test]
+    fn join_residual_columns_survive_when_not_in_join_output() {
+        let left_key = field(1, "left_key");
+        let visible = field(2, "visible");
+        let left_unused = field(3, "left_unused");
+        let right_key = field(4, "right_key");
+        let right_visible = field(5, "right_visible");
+        let residual = field(6, "residual");
+        let left_fields = vec![
+            Arc::clone(&left_key),
+            Arc::clone(&visible),
+            Arc::clone(&left_unused),
+        ];
+        let right_fields = vec![
+            Arc::clone(&right_key),
+            Arc::clone(&right_visible),
+            Arc::clone(&residual),
+        ];
+        let on = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&left_key))),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(Arc::clone(&right_key))),
+                return_type: VeinDataType::Boolean,
+            }),
+            op: parser::ast::expr::BinaryOp::And,
+            right: Box::new(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&residual))),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Literal(plan::LogicalLiteral::Int64(7))),
+                return_type: VeinDataType::Boolean,
+            }),
+            return_type: VeinDataType::Boolean,
+        };
+        let join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(scan_with_fields("left", left_fields.clone())),
+            right: Box::new(scan_with_fields("right", right_fields.clone())),
+            on: Some(on),
+            using: Vec::new(),
+            schema: Box::new(VeinSchema::new(
+                left_fields.into_iter().chain(right_fields).collect(),
+            )),
+        };
+        let output = field(7, "output");
+        let plan = LogicalPlan::Project {
+            input: Box::new(join),
+            exprs: vec![LogicalExpr::Column(visible)],
+            schema: Box::new(VeinSchema::new(vec![output])),
+        };
+
+        let pruned = prune_plan(plan, &[ColumnId(7)].into_iter().collect());
+        let LogicalPlan::Project { input, .. } = pruned else {
+            panic!("expected output projection");
+        };
+        let LogicalPlan::Join {
+            left,
+            right,
+            schema,
+            ..
+        } = *input
+        else {
+            panic!("expected join");
+        };
+        let LogicalPlan::Scan {
+            projection: left_projection,
+            ..
+        } = *left
+        else {
+            panic!("expected left scan");
+        };
+        let LogicalPlan::Scan {
+            projection: right_projection,
+            ..
+        } = *right
+        else {
+            panic!("expected right scan");
+        };
+
+        assert_eq!(schema.fields.iter().map(|field| field.id).collect::<Vec<_>>(), [ColumnId(2)]);
+        assert_eq!(left_projection, Some(vec![ColumnId(1), ColumnId(2)]));
+        assert_eq!(right_projection, Some(vec![ColumnId(4), ColumnId(6)]));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! Turning a join's output rows into columns.
 //!
-//! This is the only place a join materialises anything: an output row has to
-//! exist somewhere. Everything else is references — the probe chunk's columns
-//! and the table's retained build chunks are read, never copied, and a side that
-//! is absent for a row becomes one typed null array rather than a placeholder.
+//! Join output columns are currently gathered into new Arrow arrays with
+//! `interleave`. The probe and retained build chunks remain referenced while
+//! gathering, but their payload values are copied into the result arrays. A side
+//! absent for a row is represented by a typed null array during that gather.
 //!
 //! One **output chunk per call**, not one per (probe chunk × build chunk) group.
 //! `interleave` reads several source arrays in a single pass, so a probe chunk
@@ -255,6 +255,52 @@ mod tests {
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(cells(&chunks[0], 1), vec![Some(20), Some(20)]);
+    }
+
+    #[test]
+    fn interleaved_join_columns_have_output_buffers_distinct_from_inputs() {
+        let (table, probe) = fixture(&[10, 20], &[20, 10]);
+        let probe_values = probe
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("probe values")
+            .values()
+            .as_ptr();
+        let build_values = table
+            .build_chunk(0)
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("build values")
+            .values()
+            .as_ptr();
+        let rows = output_rows(JoinType::Inner, &[0], &[(0, (0, 1)), (1, (0, 0))], &[]);
+
+        let chunks = assemble(
+            Some(&probe),
+            &table,
+            &rows,
+            &[OutputColumn::Probe(0), OutputColumn::Build(0)],
+            &[DataType::Int64],
+            &[DataType::Int64],
+        )
+        .expect("assemble joined rows");
+
+        let output_probe = chunks[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("probe output");
+        let output_build = chunks[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("build output");
+        assert_ne!(output_probe.values().as_ptr(), probe_values);
+        assert_ne!(output_build.values().as_ptr(), build_values);
+        assert_eq!(output_probe.values().as_ref(), &[20, 10]);
+        assert_eq!(output_build.values().as_ref(), &[20, 10]);
     }
 
     /// Left: the unmatched probe row is emitted with a null build column.

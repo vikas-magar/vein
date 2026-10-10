@@ -459,6 +459,47 @@ mod tests {
         assert_eq!(out_col.value(3), 41);
     }
 
+    #[test]
+    fn vector_vm_filter_and_direct_projection_keep_source_array_shared() {
+        let source: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30, 40]));
+        let chunk = DataChunk::from_vectors(vec![Arc::clone(&source)]);
+        let program = MicroProgram {
+            register_count: 3,
+            instructions: vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(25),
+                },
+                MicroOp::CmpGt {
+                    dst: 2,
+                    src1: 0,
+                    src2: 1,
+                },
+                MicroOp::FilterMask { bool_reg: 2 },
+                MicroOp::ProjectRegisters { out_regs: vec![0] },
+            ],
+        };
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let sink = Box::new(CollectNode {
+            chunks: Arc::clone(&collected),
+        });
+        let mut vm = VectorVmExecutor::new(
+            Arc::new(program),
+            Arc::new(FunctionRegistry::new()),
+            sink,
+        );
+
+        vm.push(chunk).expect("filter and projection should execute");
+        vm.flush().expect("projected chunk should flush");
+
+        let chunks = collected.lock().expect("collected chunks");
+        assert_eq!(chunks.len(), 1);
+        assert!(Arc::ptr_eq(&source, chunks[0].column(0)));
+        assert_eq!(chunks[0].selection.size(), 2);
+        assert_eq!(chunks[0].selection.get_index(0), 2);
+        assert_eq!(chunks[0].selection.get_index(1), 3);
+    }
+
     /// A constant literal must stay a length-1 broadcast scalar; only a consumer
     /// that genuinely needs a column (here `ProjectRegisters`) may expand it.
     #[test]

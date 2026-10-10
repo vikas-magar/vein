@@ -2,6 +2,7 @@
 
 use crate::task::Task;
 use common::identifiers::StageId;
+use crate::pipeline_graph::DerivedPipelineGraph;
 
 /// A set of independent tasks that together produce one query result.
 #[derive(Debug, Clone)]
@@ -10,6 +11,8 @@ pub struct Stage {
     pub stage_id: StageId,
     /// The parallel tasks belonging to this stage.
     pub tasks: Vec<Task>,
+    /// Scheduling graph derived from the canonical input plan before task splitting.
+    pipeline_graph: DerivedPipelineGraph,
 }
 
 impl Stage {
@@ -18,7 +21,19 @@ impl Stage {
         Self {
             stage_id,
             tasks: Vec::new(),
+            pipeline_graph: DerivedPipelineGraph::default(),
         }
+    }
+
+    /// Attach the graph derived from this stage's canonical physical plan.
+    pub fn with_pipeline_graph(mut self, pipeline_graph: DerivedPipelineGraph) -> Self {
+        self.pipeline_graph = pipeline_graph;
+        self
+    }
+
+    /// Return pipeline boundaries and dependencies for inspection and scheduling.
+    pub fn pipeline_graph(&self) -> &DerivedPipelineGraph {
+        &self.pipeline_graph
     }
 
     /// Add a task to this stage.

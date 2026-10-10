@@ -3,8 +3,8 @@
 //! Lowers arbitrary [`LogicalExpr`] AST trees into a linear sequence of [`MicroOp`]
 //! virtual machine instructions using a [`RegisterAllocator`].
 
-use common::protocol::{MicroOp, MicroProgram, RegId};
 use common::Result;
+use common::protocol::{MicroOp, MicroProgram, RegId};
 use error::VeinError;
 use parser::ast::expr::BinaryOp;
 use plan::expr::logical::LogicalExpr;
@@ -54,22 +54,22 @@ impl BytecodeCompiler {
     /// returning the [`RegId`] holding the evaluated result.
     pub fn compile_expr(&mut self, expr: &LogicalExpr, schema: &VeinSchema) -> Result<RegId> {
         match expr {
-            LogicalExpr::Column(col) => {
-                self.column_register(col.id, &col.name, col.qualifier.as_deref(), schema).ok_or_else(|| {
+            LogicalExpr::Column(col) => self
+                .column_register(col.id, &col.name, col.qualifier.as_deref(), schema)
+                .ok_or_else(|| {
                     VeinError::planning(
-                        format!("Column not found in schema: {:?}", col.name),
+                        missing_column_message("column", col.id, &col.name, schema),
                         None,
                     )
-                })
-            }
-            LogicalExpr::OuterColumn(col) => {
-                self.column_register(col.id, &col.name, col.qualifier.as_deref(), schema).ok_or_else(|| {
+                }),
+            LogicalExpr::OuterColumn(col) => self
+                .column_register(col.id, &col.name, col.qualifier.as_deref(), schema)
+                .ok_or_else(|| {
                     VeinError::planning(
-                        format!("Outer column not found in schema: {:?}", col.name),
+                        missing_column_message("outer column", col.id, &col.name, schema),
                         None,
                     )
-                })
-            }
+                }),
             LogicalExpr::Literal(lit) => {
                 let dst = self.allocator.allocate()?;
                 self.instructions.push(MicroOp::LoadConstant {
@@ -148,7 +148,11 @@ impl BytecodeCompiler {
                 });
                 Ok(dst)
             }
-            LogicalExpr::InList { expr, list, negated } => {
+            LogicalExpr::InList {
+                expr,
+                list,
+                negated,
+            } => {
                 let value = self.compile_expr(expr, schema)?;
                 let mut candidates = Vec::with_capacity(list.len());
                 for candidate in list {
@@ -163,7 +167,12 @@ impl BytecodeCompiler {
                 });
                 Ok(dst)
             }
-            LogicalExpr::Case { when, then, else_, return_type } => {
+            LogicalExpr::Case {
+                when,
+                then,
+                else_,
+                return_type,
+            } => {
                 let mut when_regs = Vec::with_capacity(when.len());
                 let mut then_regs = Vec::with_capacity(then.len());
                 for condition in when {
@@ -172,7 +181,8 @@ impl BytecodeCompiler {
                 for result in then {
                     then_regs.push(self.compile_expr(result, schema)?);
                 }
-                let else_reg = else_.as_ref()
+                let else_reg = else_
+                    .as_ref()
                     .map(|result| self.compile_expr(result, schema))
                     .transpose()?;
                 let dst = self.allocator.allocate()?;
@@ -231,9 +241,8 @@ impl BytecodeCompiler {
                 // schema, which can point past an optimizer-pruned batch.
                 let mut matches = self.register_columns.iter().filter(|(field, _)| {
                     field.name == name
-                        && qualifier.is_none_or(|qualifier| {
-                        field.qualifier.as_deref() == Some(qualifier)
-                    })
+                        && qualifier
+                            .is_none_or(|qualifier| field.qualifier.as_deref() == Some(qualifier))
                 });
                 let (_, register) = matches.next()?;
                 if matches.next().is_some() {
@@ -286,11 +295,7 @@ impl BytecodeCompiler {
     }
 
     /// Compiles a projection list, emitting a [`MicroOp::ProjectRegisters`] instruction.
-    pub fn compile_projection(
-        &mut self,
-        exprs: &[LogicalExpr],
-        schema: &VeinSchema,
-    ) -> Result<()> {
+    pub fn compile_projection(&mut self, exprs: &[LogicalExpr], schema: &VeinSchema) -> Result<()> {
         let out_regs = self.compile_projection_exprs(exprs, schema)?;
         self.compile_projection_registers(out_regs);
         Ok(())
@@ -342,7 +347,8 @@ impl BytecodeCompiler {
     /// This lets a caller retain source columns alongside computed helper
     /// columns without recompiling those expressions during projection.
     pub fn compile_projection_registers(&mut self, out_regs: Vec<RegId>) {
-        self.instructions.push(MicroOp::ProjectRegisters { out_regs });
+        self.instructions
+            .push(MicroOp::ProjectRegisters { out_regs });
     }
 
     /// Finalizes compilation into a self-contained [`MicroProgram`].
@@ -352,6 +358,19 @@ impl BytecodeCompiler {
             instructions: self.instructions,
         }
     }
+}
+
+fn missing_column_message(kind: &str, id: ColumnId, name: &str, schema: &VeinSchema) -> String {
+    let available = schema
+        .fields
+        .iter()
+        .map(|field| format!("{}#{}", field.name, field.id.0))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{kind} {name}#{} is not present in input schema [{available}]",
+        id.0
+    )
 }
 
 #[cfg(test)]
@@ -407,7 +426,11 @@ mod tests {
         ));
         assert!(matches!(
             program.instructions[1],
-            MicroOp::CmpGt { dst: 3, src1: 0, src2: 2 }
+            MicroOp::CmpGt {
+                dst: 3,
+                src1: 0,
+                src2: 2
+            }
         ));
         assert!(matches!(
             program.instructions[2],
@@ -424,12 +447,9 @@ mod tests {
         let mut compiler = BytecodeCompiler::new(2);
 
         let cast = LogicalExpr::Cast {
-            expr: Box::new(LogicalExpr::Column(std::sync::Arc::new(ResolvedColumn::new(
-                ColumnId(1),
-                "age",
-                None,
-                VeinDataType::Int64,
-            )))),
+            expr: Box::new(LogicalExpr::Column(std::sync::Arc::new(
+                ResolvedColumn::new(ColumnId(1), "age", None, VeinDataType::Int64),
+            ))),
             target_type: VeinDataType::Float64,
         };
 
@@ -496,12 +516,15 @@ mod tests {
 
         let output = compiler.compile_expr(&expr, &schema).unwrap();
         let program = compiler.finish();
-        assert_eq!(program.instructions.last(), Some(&MicroOp::InList {
-            dst: output,
-            value: 0,
-            candidates: vec![2, 3],
-            negated: true,
-        }));
+        assert_eq!(
+            program.instructions.last(),
+            Some(&MicroOp::InList {
+                dst: output,
+                value: 0,
+                candidates: vec![2, 3],
+                negated: true,
+            })
+        );
     }
 
     #[test]
@@ -518,13 +541,16 @@ mod tests {
 
         let output = compiler.compile_expr(&expr, &schema).unwrap();
         let program = compiler.finish();
-        assert_eq!(program.instructions.last(), Some(&MicroOp::Case {
-            dst: output,
-            when_regs: vec![2],
-            then_regs: vec![3],
-            else_reg: Some(4),
-            return_type: VeinDataType::Int64,
-        }));
+        assert_eq!(
+            program.instructions.last(),
+            Some(&MicroOp::Case {
+                dst: output,
+                when_regs: vec![2],
+                then_regs: vec![3],
+                else_reg: Some(4),
+                return_type: VeinDataType::Int64,
+            })
+        );
     }
 
     #[test]

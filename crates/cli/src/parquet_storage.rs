@@ -48,15 +48,19 @@ impl ParquetStorage {
 }
 
 impl WriteStorage for ParquetStorage {
+    fn validate_target(&self, destination_uri: &str, options: &[(String, String)]) -> Result<()> {
+        validate_target_parts(destination_uri, options.iter().map(|(key, value)| (key.as_str(), value.as_str())), false)
+            .map(|_| ())
+    }
+
     fn begin_write(&self, target: &StorageTarget) -> Result<Box<dyn WriteTransaction>> {
-        let table = safe_table_name(&target.destination_uri)?.to_owned();
-        let mode = target.get_option("mode").unwrap_or("create").to_ascii_lowercase();
-        if !matches!(mode.as_str(), "create" | "append" | "overwrite") {
-            return Err(VeinError::planning("WRITE mode must be create, append, or overwrite", None));
-        }
-        if target.get_option("format").is_some_and(|format| !format.eq_ignore_ascii_case("parquet")) {
-            return Err(VeinError::planning("local WRITE supports only format='parquet'", None));
-        }
+        // `partition_id` is added by task dispatch after query preparation; it is
+        // runtime metadata and is not a user-configurable Parquet writer option.
+        let (table, mode) = validate_target_parts(
+            &target.destination_uri,
+            target.options.iter().map(|option| (option.key.as_str(), option.value.as_str())),
+            true,
+        )?;
 
         let base_manifest = self.read_manifest(&table)?;
         match (mode.as_str(), base_manifest.as_ref()) {
@@ -300,6 +304,50 @@ fn safe_table_name(name: &str) -> Result<&str> {
     }
 }
 
+fn validate_target_parts<'a>(
+    destination_uri: &str,
+    options: impl IntoIterator<Item=(&'a str, &'a str)>,
+    allow_partition_id: bool,
+) -> Result<(String, String)> {
+    let table = safe_table_name(destination_uri)?.to_owned();
+    let mut seen = Vec::new();
+    let mut mode = "create";
+
+    for (key, value) in options {
+        if seen.iter().any(|seen_key: &&str| seen_key.eq_ignore_ascii_case(key)) {
+            return Err(VeinError::planning(format!("duplicate WRITE option '{key}'"), None));
+        }
+        seen.push(key);
+
+        if key.eq_ignore_ascii_case("mode") {
+            if !["create", "append", "overwrite"].iter().any(|supported| value.eq_ignore_ascii_case(supported)) {
+                return Err(VeinError::planning("WRITE mode must be create, append, or overwrite", None));
+            }
+            mode = if value.eq_ignore_ascii_case("create") {
+                "create"
+            } else if value.eq_ignore_ascii_case("append") {
+                "append"
+            } else {
+                "overwrite"
+            };
+        } else if key.eq_ignore_ascii_case("format") {
+            if !value.eq_ignore_ascii_case("parquet") {
+                return Err(VeinError::planning("local WRITE supports only format='parquet'", None));
+            }
+        } else if key.eq_ignore_ascii_case("partition_id") && allow_partition_id {
+            value.parse::<u16>().map_err(|_| {
+                VeinError::planning("invalid internal WRITE partition identifier", None)
+            })?;
+        } else if key.eq_ignore_ascii_case("partition_id") {
+            return Err(VeinError::planning("WRITE option 'partition_id' is reserved for the execution engine", None));
+        } else {
+            return Err(VeinError::planning(format!("local Parquet WRITE does not support option '{key}'"), None));
+        }
+    }
+
+    Ok((table, mode.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,7 +378,42 @@ mod tests {
                 ),
             )])),
         )
-        .with_schema_ipc(schema_ipc)
+            .with_schema_ipc(schema_ipc)
+    }
+
+    #[test]
+    fn validates_parquet_targets_and_rejects_unsupported_or_ambiguous_options() {
+        let storage = ParquetStorage::new(std::env::temp_dir());
+        assert!(storage.validate_target("events", &[]).is_ok());
+        assert!(storage
+            .validate_target("events", &[("MODE".into(), "OVERWRITE".into()), ("format".into(), "PARQUET".into())])
+            .is_ok());
+
+        for (destination, options, expected) in [
+            ("../events", vec![], "single logical table name"),
+            ("events", vec![("mode".into(), "merge".into())], "mode must be create, append, or overwrite"),
+            ("events", vec![("format".into(), "csv".into())], "supports only format='parquet'"),
+            ("events", vec![("compression".into(), "zstd".into())], "does not support option 'compression'"),
+            ("events", vec![("mode".into(), "append".into()), ("MODE".into(), "create".into())], "duplicate WRITE option"),
+            ("events", vec![("partition_id".into(), "0".into())], "reserved for the execution engine"),
+        ] {
+            let error = storage.validate_target(destination, &options).err().expect("invalid target should fail preflight");
+            assert!(error.to_string().contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn begin_write_revalidates_options_and_accepts_dispatch_partition_metadata() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let storage = ParquetStorage::new(root.path());
+        let mut supported = target(None);
+        supported.options.push(KeyValue::new("partition_id", "0"));
+        assert!(storage.begin_write(&supported).is_ok());
+
+        let mut unsupported = target(None);
+        unsupported.options.push(KeyValue::new("compression", "zstd"));
+        let error = storage.begin_write(&unsupported).err().expect("unsupported option should fail");
+        assert!(error.to_string().contains("does not support option 'compression'"));
     }
 
     fn batch(values: Vec<i64>) -> RecordBatch {
