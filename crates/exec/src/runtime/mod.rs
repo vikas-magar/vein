@@ -24,7 +24,7 @@ use crate::operators::join::{
 };
 use crate::operators::sink::WriteReceipt;
 use crate::operators::{LimitTransform, SortTransform};
-use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
+use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Sink, Source, Transform};
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
@@ -86,6 +86,13 @@ pub trait ExecutorBuilder: Send + Sync {
         program: &Arc<MicroProgram>,
         next: Box<dyn PipelineNode<DataChunk>>,
     ) -> Result<Box<dyn Transform<DataChunk>>>;
+
+    /// Build a VM transform over reference-backed pipeline batches.
+    fn build_view_vm(
+        &self,
+        program: &Arc<MicroProgram>,
+        next: Box<dyn PipelineNode<DataChunkView>>,
+    ) -> Result<Box<dyn Transform<DataChunkView>>>;
 
     /// Build a sink from the task's [`DataSink`]. The sink is the terminal
     /// stage; a sink that returns data (e.g. `DataSink::Client`) exposes it via
@@ -191,11 +198,62 @@ impl<B> PipelineNode<B> for SinkHandle<B> {
 }
 
 /// Adapts an already-built transform so another pipeline stage can own it as a node.
-struct TransformHandle(Box<dyn Transform<DataChunk>>);
+struct TransformHandle(Box<dyn Transform<DataChunkView>>);
 
-impl PipelineNode<DataChunk> for TransformHandle {
+impl PipelineNode<DataChunkView> for TransformHandle {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.0.push(view)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.0.flush()
+    }
+
+    fn finished(&self) -> bool {
+        self.0.finished()
+    }
+}
+
+/// Converts a source batch once at the boundary into the canonical view path.
+struct ChunkToViewNode(Box<dyn PipelineNode<DataChunkView>>);
+
+impl PipelineNode<DataChunk> for ChunkToViewNode {
     fn push(&mut self, chunk: DataChunk) -> Result<()> {
-        self.0.push(chunk)
+        self.0.push(DataChunkView::from_chunk(chunk)?)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.0.flush()
+    }
+
+    fn finished(&self) -> bool {
+        self.0.finished()
+    }
+}
+
+/// Materializes a view only where an existing blocking operator requires arrays.
+struct ViewToChunkNode(Box<dyn PipelineNode<DataChunk>>);
+
+impl PipelineNode<DataChunkView> for ViewToChunkNode {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.0.push(view.to_data_chunk()?)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.0.flush()
+    }
+
+    fn finished(&self) -> bool {
+        self.0.finished()
+    }
+}
+
+/// The final result sink is an explicit materialization boundary.
+struct MaterializeViewNode(Box<dyn PipelineNode<DataChunk>>);
+
+impl PipelineNode<DataChunkView> for MaterializeViewNode {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.0.push(view.to_data_chunk()?)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -210,14 +268,14 @@ impl PipelineNode<DataChunk> for TransformHandle {
 /// Shares a build sink with the join executor while a source owns its pipeline.
 struct SharedBuildSink(Arc<Mutex<Option<BuildSink>>>);
 
-impl PipelineNode<DataChunk> for SharedBuildSink {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+impl PipelineNode<DataChunkView> for SharedBuildSink {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0
             .lock()
             .map_err(|_| VeinError::internal("join build mutex poisoned"))?
             .as_mut()
             .ok_or_else(|| VeinError::internal("join build sink already finished"))?
-            .push(chunk)
+            .push(view)
     }
     fn flush(&mut self) -> Result<()> {
         self.0
@@ -234,7 +292,7 @@ impl PipelineNode<DataChunk> for SharedBuildSink {
 /// The bounded channel moves `DataChunk` handles; Arrow buffers remain shared.
 /// `finished` lets source readers stop after a downstream limit has completed.
 struct ChannelPipelineNode {
-    sender: flume::Sender<DataChunk>,
+    sender: flume::Sender<DataChunkView>,
     finished: Arc<AtomicBool>,
 }
 
@@ -383,14 +441,14 @@ impl PipelineExecutionSchedule {
 
 /// Guards the first probe push (or empty-input flush) with graph prerequisites.
 struct PipelineDependencyGuard {
-    inner: Box<dyn PipelineNode<DataChunk>>,
+    inner: Box<dyn PipelineNode<DataChunkView>>,
     dependencies: Vec<(PipelineId, Arc<AtomicBool>)>,
     checked: bool,
 }
 
 impl PipelineDependencyGuard {
     fn new(
-        inner: Box<dyn PipelineNode<DataChunk>>,
+        inner: Box<dyn PipelineNode<DataChunkView>>,
         dependencies: Vec<(PipelineId, Arc<AtomicBool>)>,
     ) -> Self {
         Self {
@@ -419,10 +477,10 @@ impl PipelineDependencyGuard {
     }
 }
 
-impl PipelineNode<DataChunk> for PipelineDependencyGuard {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+impl PipelineNode<DataChunkView> for PipelineDependencyGuard {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.ensure_ready()?;
-        self.inner.push(chunk)
+        self.inner.push(view)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -435,10 +493,10 @@ impl PipelineNode<DataChunk> for PipelineDependencyGuard {
     }
 }
 
-impl PipelineNode<DataChunk> for ChannelPipelineNode {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+impl PipelineNode<DataChunkView> for ChannelPipelineNode {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.sender
-            .send(chunk)
+            .send(view)
             .map_err(|_| VeinError::cancelled())
     }
     fn flush(&mut self) -> Result<()> {
@@ -451,17 +509,17 @@ impl PipelineNode<DataChunk> for ChannelPipelineNode {
 
 /// Counts active rows and chunks entering a join without inspecting or cloning columns.
 struct JoinProbeCounter {
-    inner: Box<dyn PipelineNode<DataChunk>>,
+    inner: Box<dyn PipelineNode<DataChunkView>>,
     rows: Arc<AtomicU64>,
     batches: Arc<AtomicU64>,
 }
 
-impl PipelineNode<DataChunk> for JoinProbeCounter {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+impl PipelineNode<DataChunkView> for JoinProbeCounter {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.rows
-            .fetch_add(chunk.num_rows() as u64, Ordering::Relaxed);
+            .fetch_add(view.num_rows() as u64, Ordering::Relaxed);
         self.batches.fetch_add(1, Ordering::Relaxed);
-        self.inner.push(chunk)
+        self.inner.push(view)
     }
     fn flush(&mut self) -> Result<()> {
         self.inner.flush()
@@ -518,7 +576,7 @@ impl DefaultTaskExecutor {
     fn execute_input<'a>(
         &'a self,
         input: &'a Arc<PhysicalPlanNode>,
-        mut next: Box<dyn PipelineNode<DataChunk>>,
+        mut next: Box<dyn PipelineNode<DataChunkView>>,
         task: &'a ExecuteTask,
         cancel: &'a CancellationToken,
         span: &'a tracing::Span,
@@ -575,28 +633,29 @@ impl DefaultTaskExecutor {
                                     };
                                     let mut source =
                                         builder.build_source(&source_spec, task_id, attempt)?;
-                                    let next: Box<dyn PipelineNode<DataChunk>> = Box::new(
+                                    let channel: Box<dyn PipelineNode<DataChunkView>> = Box::new(
                                         SuppressFlush::new(Box::new(ChannelPipelineNode {
                                             sender: sender.clone(),
                                             finished: Arc::clone(&finished),
                                         })),
                                     );
                                     let result = if program.instructions.is_empty() {
-                                        let mut next = next;
+                                        let mut next = ChunkToViewNode(channel);
                                         runtime.block_on(async {
                                             tokio::select! {
                                                 biased;
                                                 _ = cancel.cancelled() => Err(VeinError::cancelled()),
-                                                result = source.execute(&mut *next).instrument(span.clone()) => result,
+                                                result = source.execute(&mut next).instrument(span.clone()) => result,
                                             }
                                         })
                                     } else {
-                                        let mut vm = builder.build_vm(&program, next)?;
+                                        let vm = builder.build_view_vm(&program, channel)?;
+                                        let mut next = ChunkToViewNode(vm);
                                         runtime.block_on(async {
                                             tokio::select! {
                                                 biased;
                                                 _ = cancel.cancelled() => Err(VeinError::cancelled()),
-                                                result = source.execute(&mut *vm).instrument(span.clone()) => result,
+                                                result = source.execute(&mut next).instrument(span.clone()) => result,
                                             }
                                         })
                                     };
@@ -621,7 +680,7 @@ impl DefaultTaskExecutor {
                                     worker_error.get_or_insert_with(VeinError::cancelled);
                                     break;
                                 }
-                                message = receiver.recv_async(), if receiver_open => {
+                                        message = receiver.recv_async(), if receiver_open => {
                                     match message {
                                         Ok(chunk) => {
                                             if let Err(error) = next.push(chunk) {
@@ -672,20 +731,22 @@ impl DefaultTaskExecutor {
                         self.builder
                             .build_source(data_source, task.task_id, task.attempt)?;
                     if program.instructions.is_empty() {
+                        let mut source_next = ChunkToViewNode(next);
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => Err(VeinError::cancelled()),
-                            result = source.execute(&mut *next).instrument(span.clone()) => {
+                            result = source.execute(&mut source_next).instrument(span.clone()) => {
                                 result?;
                                 Ok(source.bytes_read())
                             }
                         }
                     } else {
-                        let mut vm = self.builder.build_vm(program, next)?;
+                        let vm = self.builder.build_view_vm(program, next)?;
+                        let mut source_next = ChunkToViewNode(vm);
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => Err(VeinError::cancelled()),
-                            result = source.execute(&mut *vm).instrument(span.clone()) => {
+                            result = source.execute(&mut source_next).instrument(span.clone()) => {
                                 result?;
                                 Ok(source.bytes_read())
                             }
@@ -693,7 +754,7 @@ impl DefaultTaskExecutor {
                     }
                 }
                 PhysicalPlanOperator::Transform { input, program } => {
-                    let transform = self.builder.build_vm(program, next)?;
+                    let transform = self.builder.build_view_vm(program, next)?;
                     let bytes = self
                         .execute_input(
                             input,
@@ -715,6 +776,8 @@ impl DefaultTaskExecutor {
                         "aggregate"
                     };
                     let (accumulator, handle) = aggregate::shared(plan.clone())?;
+                    let handle: Box<dyn PipelineNode<DataChunkView>> =
+                        Box::new(ViewToChunkNode(handle));
                     let bytes = self
                         .execute_input(child, handle, task, cancel, span, schedule, depth + 1)
                         .await?;
@@ -732,7 +795,7 @@ impl DefaultTaskExecutor {
                         (groups, accumulator.metrics(), accumulator.group_count())
                     };
                     for batch in groups {
-                        next.push(batch)?;
+                        next.push(DataChunkView::from_chunk(batch)?)?;
                     }
                     next.flush()?;
                     tracing::info!(
@@ -782,15 +845,19 @@ impl DefaultTaskExecutor {
                     let output_columns = usize::try_from(*output_columns).map_err(|_| {
                         VeinError::planning("recursive sort output width is invalid", None)
                     })?;
+                    let sort_next: Box<dyn PipelineNode<DataChunk>> =
+                        Box::new(ChunkToViewNode(next));
                     let sort: Box<dyn PipelineNode<DataChunk>> =
                         Box::new(SortTransform::with_output_columns(
                             plan.clone(),
                             Some(output_columns),
-                            next,
+                            sort_next,
                         ));
-                    let next: Box<dyn PipelineNode<DataChunk>> = match key_program {
+                    let sort: Box<dyn PipelineNode<DataChunkView>> =
+                        Box::new(ViewToChunkNode(sort));
+                    let next: Box<dyn PipelineNode<DataChunkView>> = match key_program {
                         Some(program) => {
-                            Box::new(TransformHandle(self.builder.build_vm(program, sort)?))
+                            Box::new(TransformHandle(self.builder.build_view_vm(program, sort)?))
                         }
                         None => sort,
                     };
@@ -856,7 +923,7 @@ impl DefaultTaskExecutor {
                         next,
                     );
                     let join = install_join_residual(self.builder.as_ref(), plan, join)?;
-                    let join: Box<dyn PipelineNode<DataChunk>> = Box::new(
+                    let join: Box<dyn PipelineNode<DataChunkView>> = Box::new(
                         PipelineDependencyGuard::new(
                             Box::new(join),
                             schedule.dependencies_for_operator(input)?,
@@ -941,10 +1008,11 @@ impl DefaultTaskExecutor {
             task_id = %task.task_id,
             attempt = task.attempt,
         );
-        let head: Box<dyn PipelineNode<DataChunk>> = Box::new(CancelGuard::new(
+        let chunk_head: Box<dyn PipelineNode<DataChunk>> = Box::new(CancelGuard::new(
             Box::new(SinkHandle(Arc::clone(&sink))),
             cancel.clone(),
         ));
+        let head: Box<dyn PipelineNode<DataChunkView>> = Box::new(MaterializeViewNode(chunk_head));
         let run_started = Instant::now();
         let source_started = Instant::now();
         let bytes_read = self
@@ -1002,7 +1070,7 @@ fn install_join_residual(
         return Ok(join);
     };
     let collector = JoinFilterCollector::default();
-    let vm = builder.build_vm(&residual.program, Box::new(collector.clone()))?;
+    let vm = builder.build_view_vm(&residual.program, Box::new(collector.clone()))?;
     Ok(join.with_residual_filter(join_outputs(&residual.input_columns), vm, collector))
 }
 
@@ -1201,6 +1269,14 @@ mod tests {
             self.inner.build_vm(program, next)
         }
 
+        fn build_view_vm(
+            &self,
+            program: &Arc<MicroProgram>,
+            next: Box<dyn PipelineNode<DataChunkView>>,
+        ) -> Result<Box<dyn Transform<DataChunkView>>> {
+            self.inner.build_view_vm(program, next)
+        }
+
         fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>> {
             self.inner.build_sink(sink)
         }
@@ -1307,6 +1383,14 @@ mod tests {
             next: Box<dyn PipelineNode<DataChunk>>,
         ) -> Result<Box<dyn Transform<DataChunk>>> {
             self.inner.build_vm(program, next)
+        }
+
+        fn build_view_vm(
+            &self,
+            program: &Arc<MicroProgram>,
+            next: Box<dyn PipelineNode<DataChunkView>>,
+        ) -> Result<Box<dyn Transform<DataChunkView>>> {
+            self.inner.build_view_vm(program, next)
         }
 
         fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>> {
@@ -2278,26 +2362,26 @@ mod tests {
             .expect("recursive left join with residual predicate should execute");
 
         assert_eq!(result.row_count, 5);
-        let probe = result.output[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("probe output");
-        let build = result.output[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("build output");
-        assert_eq!(
-            (0..probe.len()).map(|i| probe.value(i)).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5]
-        );
-        assert_eq!(
-            (0..build.len())
-                .map(|i| build.is_valid(i).then(|| build.value(i)))
-                .collect::<Vec<_>>(),
-            vec![Some(1), Some(2), None, None, None]
-        );
+        let mut probe_rows = Vec::new();
+        let mut build_rows = Vec::new();
+        for batch in &result.output {
+            let probe = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("probe output");
+            let build = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("build output");
+            for row in 0..batch.num_rows() {
+                probe_rows.push(probe.value(row));
+                build_rows.push(build.is_valid(row).then(|| build.value(row)));
+            }
+        }
+        assert_eq!(probe_rows, vec![1, 2, 3, 4, 5]);
+        assert_eq!(build_rows, vec![Some(1), Some(2), None, None, None]);
     }
 
     #[tokio::test]

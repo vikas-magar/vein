@@ -68,6 +68,8 @@ impl Datum for RegValue {
 pub struct RegisterFile {
     /// The register slots.
     slots: Vec<RegValue>,
+    /// Shared placeholder used to clear registers not mounted for this batch.
+    empty: ArrayRef,
     /// Row count of the mounted chunk; broadcast scalars expand to this length.
     chunk_len: usize,
 }
@@ -79,9 +81,9 @@ impl RegisterFile {
     /// valid references without repeated allocation.
     pub fn new(register_count: RegId) -> Self {
         let count = register_count as usize;
-        let dummy: ArrayRef = Arc::new(NullArray::new(0));
-        let slots = vec![RegValue::Array(dummy); count];
-        Self { slots, chunk_len: 0 }
+        let empty: ArrayRef = Arc::new(NullArray::new(0));
+        let slots = vec![RegValue::Array(Arc::clone(&empty)); count];
+        Self { slots, empty, chunk_len: 0 }
     }
 
     /// Total number of registers in this register file.
@@ -106,17 +108,39 @@ impl RegisterFile {
     ///
     /// Returns an error if the chunk contains more vectors than available registers.
     pub fn mount_chunk(&mut self, chunk: &DataChunk) -> Result<()> {
-        if chunk.vectors.len() > self.slots.len() {
-            return Err(VeinError::internal(format!(
-                "DataChunk has {} columns but register file only has {} slots",
-                chunk.vectors.len(),
-                self.slots.len()
-            )));
-        }
+        self.mount_columns(
+            chunk.physical_len(),
+            chunk.vectors.iter().cloned().enumerate().map(|(register, array)| (register as RegId, array)),
+        )
+    }
 
-        self.chunk_len = chunk.physical_len();
-        for (i, col) in chunk.vectors.iter().enumerate() {
-            self.slots[i] = RegValue::Array(col.clone());
+    /// Mounts selected input columns into their corresponding registers.
+    ///
+    /// This is used when an operator can identify the input columns its program
+    /// reads. Unused view columns then remain references and are not gathered
+    /// into Arrow arrays for VM execution.
+    pub fn mount_columns(
+        &mut self,
+        chunk_len: usize,
+        columns: impl IntoIterator<Item=(RegId, ArrayRef)>,
+    ) -> Result<()> {
+        self.chunk_len = chunk_len;
+        self.slots.fill(RegValue::Array(Arc::clone(&self.empty)));
+        for (register, array) in columns {
+            let index = register as usize;
+            if index >= self.slots.len() {
+                return Err(VeinError::internal(format!(
+                    "input register R{register} exceeds register file capacity {}",
+                    self.slots.len()
+                )));
+            }
+            if array.len() != chunk_len {
+                return Err(VeinError::internal(format!(
+                    "input register R{register} has {} rows, expected {chunk_len}",
+                    array.len()
+                )));
+            }
+            self.slots[index] = RegValue::Array(array);
         }
         Ok(())
     }

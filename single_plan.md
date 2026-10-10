@@ -247,17 +247,20 @@ After the optimizer reaches its fixpoint, any remaining subquery is reported wit
 
 #### Task 4.1 — Introduce a composable row/column reference view
 
-- [ ] Design a batch view that can reference columns in multiple source chunks and describe output rows through compact row mappings.
-- [ ] Support probe/build column selection, duplicate output columns, unmatched outer-join rows, and nullable extension without copying unchanged payload arrays.
-- [ ] Define lifetime/ownership so referenced input chunks stay alive exactly as long as downstream consumers need them.
-- [ ] Keep the view batch-oriented; do not create one heap object per output cell or copy row payload values into a row store.
+- [x] Design a batch view that can reference columns in multiple source chunks and describe output rows through compact row mappings.
+- [x] Support probe/build column selection, duplicate output columns, unmatched outer-join rows, and nullable extension without copying unchanged payload arrays.
+- [x] Define lifetime/ownership so referenced input chunks stay alive exactly as long as downstream consumers need them.
+- [x] Keep the view batch-oriented; do not create one heap object per output cell or copy row payload values into a row store.
 - **Acceptance:** Join output can represent arbitrary matches and outer nulls as references plus validity/selection metadata, with no copied payload arrays.
 - **Tests:** View tests cover same-chunk and cross-chunk references, repeated rows, duplicate projected columns, empty inputs, null extension, and retained buffer identity.
+- **Validation/status:** `crates/exec/src/pipeline/view.rs` provides the composable representation and regression tests; RustRover `Test` (`test --workspace`), `Check` (`check --workspace`), and incremental project build passed. This task establishes the API only: join and sort runtime adoption and the output boundary remain in Tasks 4.2 and 4.3.
 
 #### Task 4.2 — Adapt operators to consume views or request explicit materialization
 
+**Progress (2026-10-10):** `DataChunkView` is the direct VM input/output type for reference-backed batches; the temporary `DataBatch` enum has been removed so operators no longer branch on a `Chunk`/`View` wrapper. The VM identifies input registers at construction, materializes only referenced view columns at the Arrow-kernel boundary, and preserves untouched projected columns as source references. Contiguous identity mappings are sliced without copying; other mappings use Arrow interleave, including null-extended rows. `DataChunkView::from_chunk` now retains materialized input arrays by reference, and `to_data_chunk` is the explicit conversion point for operators that require arrays. Tests cover sparse selections, NULL filtering/extensions, computed outputs, passthrough buffer identity, selective materialization, and both conversion boundaries. This remains an operator/API slice: planner/runtime joins and sort output are not yet routed through `DataChunkView`, so Task 4.2 remains open.
+
 - [ ] Let direct projections, filters, limits, and compatible VM operations work over reference-backed inputs.
-- [ ] Add one explicit materialization interface for kernels/operators that require contiguous Arrow arrays.
+- [x] Add one explicit materialization interface for kernels/operators that require Arrow arrays (`DataChunkView::to_data_chunk` and per-column kernel materialization).
 - [ ] Ensure computed expressions allocate only their result columns; untouched source columns remain references.
 - [ ] Make sort retain row references until final output conversion instead of eagerly gathering all payload columns.
 - **Acceptance:** Operators declare whether they preserve views or materialize, and the planner/runtime can account for that behavior.

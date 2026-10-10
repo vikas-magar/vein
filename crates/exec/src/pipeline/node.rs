@@ -6,10 +6,10 @@ use common::Result;
 /// The synchronous trait implemented by all CPU-bound operators (Transforms
 /// and Sinks).
 ///
-/// Generic over the batch unit `B` so a pipeline can process any columnar
-/// representation (e.g. [`DataChunk`](super::DataChunk) today). Implementations must NEVER yield
-/// to an asynchronous scheduler; they process the batch and immediately return
-/// or push to the next operator.
+/// Generic over the batch unit `B` so a pipeline can process either materialized
+/// chunks or reference-backed views. Implementations must NEVER yield to an
+/// asynchronous scheduler; they process the batch and immediately return or
+/// push to the next operator.
 pub trait PipelineNode<B>: Send + Sync {
     /// Pushes a chunk of data into the operator.
     fn push(&mut self, batch: B) -> Result<()>;

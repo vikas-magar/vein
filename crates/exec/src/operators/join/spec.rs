@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use crate::pipeline::{DataChunk, PipelineNode};
+use crate::pipeline::{DataChunkView, PipelineNode};
 
 use super::gather::OutputColumn;
 use super::hash_join::{BuildSink, HashJoin};
@@ -49,7 +49,7 @@ impl JoinSpec {
     pub fn into_probe(
         self,
         table: Arc<HashTable>,
-        next: Box<dyn PipelineNode<DataChunk>>,
+        next: Box<dyn PipelineNode<DataChunkView>>,
     ) -> HashJoin {
         HashJoin::new(
             table,
@@ -67,6 +67,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use arrow::array::{Array, ArrayRef, Int64Array};
+    use crate::pipeline::DataChunk;
 
     use super::*;
 
@@ -76,6 +77,20 @@ mod tests {
     impl PipelineNode<DataChunk> for Collect {
         fn push(&mut self, chunk: DataChunk) -> Result<(), error::VeinError> {
             self.0.lock().expect("collect lock").push(chunk);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), error::VeinError> {
+            Ok(())
+        }
+    }
+
+    impl PipelineNode<DataChunkView> for Collect {
+        fn push(&mut self, view: DataChunkView) -> Result<(), error::VeinError> {
+            self.0
+                .lock()
+                .expect("collect lock")
+                .push(view.to_data_chunk()?);
             Ok(())
         }
 
@@ -118,17 +133,17 @@ mod tests {
 
         let mut build = spec.build_sink();
         build
-            .push(DataChunk::from_vectors(vec![
+            .push(DataChunkView::from_chunk(DataChunk::from_vectors(vec![
                 ints(&[100, 200]),
                 ints(&[7, 8]),
-            ]))
+            ])).expect("build view"))
             .expect("build");
         let table = build.finish();
 
         let sink = Collect::default();
         let mut probe = spec.into_probe(Arc::new(table), Box::new(sink.clone()));
         probe
-            .push(DataChunk::from_vectors(vec![ints(&[8])]))
+            .push(DataChunkView::from_chunk(DataChunk::from_vectors(vec![ints(&[8])])).expect("probe view"))
             .expect("probe");
         probe.flush().expect("flush");
 

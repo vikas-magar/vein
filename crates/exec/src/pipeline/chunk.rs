@@ -8,11 +8,12 @@ use common::arrow::SelectionVector;
 use common::Result;
 use error::VeinError;
 
-/// A horizontal slice of data processed in a pipeline.
+/// A materialized Arrow batch used by operators that need ordinary arrays.
 ///
-/// The single in-flight unit flowing through a pipeline: Arrow columns plus a
-/// [`SelectionVector`] selecting the active rows. Passing columns through or
-/// changing only the selection can retain their Arrow buffers by reference.
+/// It stores Arrow columns plus a [`SelectionVector`] selecting the active
+/// rows. Passing columns through or changing only the selection can retain
+/// their Arrow buffers by reference. Pipelines that preserve arbitrary row
+/// references across source batches use [`super::DataChunkView`].
 /// Operators that compute values or gather rows may allocate new arrays;
 /// [`DataChunk::materialize`] slices contiguous selections and uses `take` for
 /// sparse selections.
@@ -142,7 +143,7 @@ mod tests {
             schema(),
             vec![Arc::clone(&input)],
         )
-        .expect("valid input batch");
+            .expect("valid input batch");
 
         let chunk = DataChunk::from_record_batch(batch);
 

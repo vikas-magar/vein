@@ -10,22 +10,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use arrow::array::{ArrayRef, DictionaryArray, UInt32Array, new_null_array};
-use arrow::datatypes::{DataType, UInt32Type};
+use arrow::datatypes::DataType;
 
-use crate::pipeline::{DataChunk, PipelineNode, Transform};
-use common::arrow::SelectionVector;
+use crate::pipeline::{DataChunkView, PipelineNode, Transform, ViewColumnRef, ViewInputRows};
 use common::Result;
 use error::VeinError;
 
-use super::gather::{OutputColumn, assemble};
+use super::gather::OutputColumn;
 use super::hash_table::{HashTable, JoinKeys};
-use super::rows::{JoinType, existence_probe_rows, output_rows};
+use super::rows::{JoinType, output_rows};
 
 /// Collects the selection left by a VM join-residual filter.
 #[derive(Clone, Default)]
 pub struct JoinFilterCollector {
-    output: Arc<Mutex<Option<DataChunk>>>,
+    output: Arc<Mutex<Option<DataChunkView>>>,
 }
 
 impl JoinFilterCollector {
@@ -36,14 +34,14 @@ impl JoinFilterCollector {
     }
 
     /// Takes the filtered candidate batch, if the predicate retained any rows.
-    pub fn take(&self) -> Result<Option<DataChunk>> {
+    pub fn take(&self) -> Result<Option<DataChunkView>> {
         Ok(self.output.lock().map_err(|_| VeinError::internal("join filter collector poisoned"))?.take())
     }
 }
 
-impl PipelineNode<DataChunk> for JoinFilterCollector {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
-        *self.output.lock().map_err(|_| VeinError::internal("join filter collector poisoned"))? = Some(chunk);
+impl PipelineNode<DataChunkView> for JoinFilterCollector {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
+        *self.output.lock().map_err(|_| VeinError::internal("join filter collector poisoned"))? = Some(view);
         Ok(())
     }
 
@@ -82,11 +80,11 @@ impl BuildSink {
     }
 }
 
-impl PipelineNode<DataChunk> for BuildSink {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
-        self.rows += chunk.num_rows() as u64;
+impl PipelineNode<DataChunkView> for BuildSink {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.rows += view.num_rows() as u64;
         let started = Instant::now();
-        self.table.insert(chunk)?;
+        self.table.insert_view(view)?;
         self.insert_us += started.elapsed().as_micros() as u64;
         Ok(())
     }
@@ -114,9 +112,9 @@ pub struct HashJoin {
     columns: Vec<OutputColumn>,
     probe_types: Vec<DataType>,
     build_types: Vec<DataType>,
-    next: Box<dyn PipelineNode<DataChunk>>,
+    next: Box<dyn PipelineNode<DataChunkView>>,
     residual_columns: Vec<OutputColumn>,
-    residual_vm: Option<Box<dyn Transform<DataChunk>>>,
+    residual_vm: Option<Box<dyn Transform<DataChunkView>>>,
     residual_output: Option<JoinFilterCollector>,
     /// The build rows this task consumed, for the flavours that owe unmatched
     /// ones. Kept here, not in the table, because the table is shared.
@@ -126,7 +124,7 @@ pub struct HashJoin {
     probed_rows: u64,
     matched_rows: u64,
     probe_us: u64,
-    gather_us: u64,
+    view_compose_us: u64,
     residual_us: u64,
 }
 
@@ -140,7 +138,7 @@ impl HashJoin {
         columns: Vec<OutputColumn>,
         probe_types: Vec<DataType>,
         build_types: Vec<DataType>,
-        next: Box<dyn PipelineNode<DataChunk>>,
+        next: Box<dyn PipelineNode<DataChunkView>>,
     ) -> Self {
         Self {
             table,
@@ -156,7 +154,7 @@ impl HashJoin {
             probed_rows: 0,
             matched_rows: 0,
             probe_us: 0,
-            gather_us: 0,
+            view_compose_us: 0,
             residual_us: 0,
         }
     }
@@ -166,7 +164,7 @@ impl HashJoin {
     pub fn with_residual_filter(
         mut self,
         columns: Vec<OutputColumn>,
-        vm: Box<dyn Transform<DataChunk>>,
+        vm: Box<dyn Transform<DataChunkView>>,
         output: JoinFilterCollector,
     ) -> Self {
         self.residual_columns = columns;
@@ -175,57 +173,23 @@ impl HashJoin {
         self
     }
 
-    /// Probes one chunk and forwards everything it produced.
-    fn probe(&mut self, chunk: DataChunk) -> Result<()> {
+    /// Probes one reference-backed batch and composes output row mappings.
+    fn probe(&mut self, chunk: DataChunkView) -> Result<()> {
         if chunk.is_empty() {
             return Ok(());
         }
-        let probe_rows: Vec<u32> = (0..chunk.selection.size())
-            .map(|position| chunk.selection.get_index(position) as u32)
-            .collect();
-
-        let mut pairs = Vec::new();
+        let probe_rows: Vec<u32> = (0..chunk.num_rows()).map(|row| row as u32).collect();
+        let mut matches = Vec::new();
         let probe_started = Instant::now();
-        self.table.probe(&chunk, &mut pairs)?;
+        self.table.probe_view(&chunk, &mut matches)?;
         self.probe_us += probe_started.elapsed().as_micros() as u64;
-        let mut matches = pairs;
+
         let residual_started = Instant::now();
-        if let (Some(vm), Some(output)) = (&mut self.residual_vm, &self.residual_output) {
-            let candidates = matches
-                .iter()
-                .map(|(probe, build)| super::rows::OutputRow {
-                    probe: Some(*probe),
-                    build: Some(*build),
-                })
-                .collect::<Vec<_>>();
-            let mut candidate_chunks = assemble(
-                Some(&chunk),
-                &self.table,
-                &candidates,
-                &self.residual_columns,
-                &self.probe_types,
-                &self.build_types,
-            )?;
-            output.clear()?;
-            if let Some(candidate) = candidate_chunks.pop() {
-                vm.push(candidate)?;
-                let filtered = output.take()?;
-                let accepted = filtered
-                    .map(|candidate| {
-                        (0..candidate.selection.size())
-                            .map(|position| candidate.selection.get_index(position))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                matches = accepted
-                    .into_iter()
-                    .filter_map(|index| matches.get(index).copied())
-                    .collect();
-            } else {
-                matches.clear();
-            }
+        if self.residual_vm.is_some() && !matches.is_empty() {
+            let (filtered, elapsed) = self.filter_residual_matches(&chunk, &matches)?;
+            matches = filtered;
+            self.residual_us += elapsed;
         }
-        let residual_us = residual_started.elapsed().as_micros() as u64;
         if self.join_type == JoinType::Single {
             let mut seen_probe_rows = HashSet::with_capacity(matches.len());
             for (probe, _) in &matches {
@@ -237,164 +201,134 @@ impl HashJoin {
                 }
             }
         }
-        // Only the flavours that owe unmatched build rows need this.
         if matches!(self.join_type, JoinType::Right | JoinType::Full) {
-            self.matched_build
-                .extend(matches.iter().map(|(_, build)| *build));
+            self.matched_build.extend(matches.iter().map(|(_, build)| *build));
         }
         self.probed_rows += probe_rows.len() as u64;
         self.matched_rows += matches.len() as u64;
 
-        if matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
-            let gather_started = Instant::now();
-            let selected_rows = existence_probe_rows(self.join_type, &probe_rows, &matches);
-            let vectors = self
-                .columns
-                .iter()
-                .map(|column| match column {
-                    OutputColumn::Probe(index) => Ok(Arc::clone(chunk.column(*index))),
-                    OutputColumn::Build(_) => Err(VeinError::internal(
-                        "semi/anti join output cannot contain build-side columns",
-                    )),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let output = DataChunk::new(vectors, SelectionVector::new_sparse(selected_rows));
-            let mut produced = if output.is_empty() { Vec::new() } else { vec![output] };
-            let forwarded = self.forward(&mut produced);
-            self.gather_us += gather_started.elapsed().as_micros() as u64;
-            self.residual_us += residual_us;
-            return forwarded;
-        }
-
-        if self.join_type == JoinType::Single {
-            let gather_started = Instant::now();
-            let mut produced = self.assemble_single(&chunk, &probe_rows, &matches)?;
-            let forwarded = self.forward(&mut produced);
-            self.gather_us += gather_started.elapsed().as_micros() as u64;
-            self.residual_us += residual_us;
-            return forwarded;
-        }
-
-        // Unmatched *build* rows belong to the flush, not to this chunk.
-        let gather_started = Instant::now();
+        let started = Instant::now();
         let rows = output_rows(self.join_type, &probe_rows, &matches, &[]);
-        let mut produced = assemble(
-            Some(&chunk),
-            &self.table,
-            &rows,
-            &self.columns,
-            &self.probe_types,
-            &self.build_types,
-        )?;
-        let forwarded = self.forward(&mut produced);
-        self.gather_us += gather_started.elapsed().as_micros() as u64;
-        self.residual_us += residual_us;
-        forwarded
+        self.forward_rows(Some(&chunk), &rows)?;
+        self.view_compose_us += started.elapsed().as_micros() as u64;
+        self.residual_us += residual_started.elapsed().as_micros() as u64;
+        Ok(())
     }
 
-    /// Produces a single-match join as sparse probe selections plus dictionary
-    /// columns that reference retained build arrays, without copying either
-    /// side's column values into the output chunks.
-    fn assemble_single(
-        &self,
-        probe: &DataChunk,
-        probe_rows: &[u32],
+    /// Applies a residual predicate to candidates partitioned by retained build
+    /// batch. Each candidate is still a view; only the VM's referenced columns
+    /// are materialized by its expression kernels.
+    fn filter_residual_matches(
+        &mut self,
+        probe: &DataChunkView,
         matches: &[(u32, (u32, u32))],
-    ) -> Result<Vec<DataChunk>> {
-        let mut groups: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
-        let mut group_positions = HashMap::with_capacity(matches.len());
-        let mut matched_probe = HashSet::with_capacity(matches.len());
-        for (probe_row, (build_chunk, build_row)) in matches {
-            let position = match group_positions.get(build_chunk) {
-                Some(position) => *position,
-                None => {
-                    let position = groups.len();
-                    groups.push((*build_chunk, Vec::new()));
-                    group_positions.insert(*build_chunk, position);
-                    position
-                }
-            };
-            groups[position].1.push((*probe_row, *build_row));
-            matched_probe.insert(*probe_row);
+    ) -> Result<(Vec<(u32, (u32, u32))>, u64)> {
+        if self.residual_vm.is_none() {
+            return Ok((matches.to_vec(), 0));
         }
-
-        let unmatched: Vec<u32> = probe_rows
-            .iter()
-            .copied()
-            .filter(|probe_row| !matched_probe.contains(probe_row))
-            .collect();
-        let mut output = Vec::with_capacity(groups.len() + usize::from(!unmatched.is_empty()));
-        for (build_chunk_index, rows) in groups {
-            let build_chunk = self.table.build_chunk(build_chunk_index);
-            let selected_rows: Vec<u32> = rows
-                .iter()
-                .map(|(probe_row, _)| *probe_row)
-                .collect();
-            let mut columns = Vec::with_capacity(self.columns.len());
-            for column in &self.columns {
-                match column {
-                    OutputColumn::Probe(index) => columns.push(Arc::clone(probe.column(*index))),
-                    OutputColumn::Build(index) => {
-                        let values = build_chunk.column(*index);
-                        let mut indices = vec![None; probe.physical_len()];
-                        for (probe_row, build_row) in &rows {
-                            indices[*probe_row as usize] = Some(*build_row);
-                        }
-                        let dictionary = DictionaryArray::<UInt32Type>::try_new(
-                            UInt32Array::from(indices),
-                            Arc::clone(values),
-                        )
-                            .map_err(|error| VeinError::internal(format!(
-                                "single join dictionary construction failed: {error}"
-                            )))?;
-                        columns.push(Arc::new(dictionary) as ArrayRef);
+        let output = self.residual_output.as_ref().ok_or_else(|| {
+            VeinError::internal("join residual transform has no output collector")
+        })?;
+        let mut groups: Vec<(u32, Vec<(u32, (u32, u32))>)> = Vec::new();
+        let mut positions = HashMap::with_capacity(matches.len());
+        for pair in matches.iter().copied() {
+            let key = pair.1.0;
+            let group = *positions.entry(key).or_insert_with(|| {
+                groups.push((key, Vec::new()));
+                groups.len() - 1
+            });
+            groups[group].1.push(pair);
+        }
+        let mut accepted = Vec::with_capacity(matches.len());
+        let mut elapsed = 0u64;
+        for (build_chunk, pairs) in groups {
+            let candidates = pairs.iter().map(|(probe, build)| super::rows::OutputRow {
+                probe: Some(*probe),
+                build: Some(*build),
+            }).collect::<Vec<_>>();
+            let candidate = self.compose_group(Some(probe), Some(build_chunk), &candidates, &self.residual_columns)?;
+            output.clear()?;
+            let started = Instant::now();
+            self.residual_vm
+                .as_mut()
+                .ok_or_else(|| VeinError::internal("join residual transform is missing"))?
+                .push(candidate)?;
+            elapsed = elapsed.saturating_add(started.elapsed().as_micros() as u64);
+            let filtered = output.take()?;
+            if let Some(filtered) = filtered {
+                for position in 0..filtered.selection().size() {
+                    let candidate_row = filtered.selection().get_index(position) as usize;
+                    if let Some(pair) = pairs.get(candidate_row) {
+                        accepted.push(*pair);
                     }
                 }
             }
-            output.push(DataChunk::new(columns, SelectionVector::new_sparse(selected_rows)));
         }
-
-        if !unmatched.is_empty() {
-            let mut columns = Vec::with_capacity(self.columns.len());
-            for column in &self.columns {
-                match column {
-                    OutputColumn::Probe(index) => columns.push(Arc::clone(probe.column(*index))),
-                    OutputColumn::Build(index) => {
-                        let value_type = self.build_types.get(*index).ok_or_else(|| {
-                            VeinError::internal(format!(
-                                "single join needs the data type of build column {index}"
-                            ))
-                        })?;
-                        let dictionary_type = DataType::Dictionary(
-                            Box::new(DataType::UInt32),
-                            Box::new(value_type.clone()),
-                        );
-                        columns.push(new_null_array(&dictionary_type, probe.physical_len()));
-                    }
-                }
-            }
-            output.push(DataChunk::new(
-                columns,
-                SelectionVector::new_sparse(unmatched),
-            ));
-        }
-        Ok(output)
+        Ok((accepted, elapsed))
     }
 
-    /// Forwards produced chunks, dropping any that carry no rows.
-    fn forward(&mut self, chunks: &mut Vec<DataChunk>) -> Result<()> {
-        for chunk in chunks.drain(..) {
-            if !chunk.is_empty() {
-                self.next.push(chunk)?;
+    /// Composes a batch from one build chunk (or a null-extended build side).
+    fn compose_group(
+        &self,
+        probe: Option<&DataChunkView>,
+        build_chunk: Option<u32>,
+        rows: &[super::rows::OutputRow],
+        columns: &[OutputColumn],
+    ) -> Result<DataChunkView> {
+        let row_count = rows.len();
+        let null_probe = if probe.is_none() {
+            Some(DataChunkView::nulls(&self.probe_types, row_count)?)
+        } else {
+            None
+        };
+        let null_build = if build_chunk.is_none() {
+            Some(DataChunkView::nulls(&self.build_types, row_count)?)
+        } else {
+            None
+        };
+        let probe_view = probe.or(null_probe.as_ref()).expect("probe view or null extension");
+        let build_view = build_chunk
+            .map(|chunk| self.table.build_chunk(chunk))
+            .or(null_build.as_ref())
+            .expect("build view or null extension");
+        let probe_rows = rows.iter().map(|row| row.probe.map(|row| row as usize)).collect::<Vec<_>>();
+        let build_rows = rows.iter().map(|row| row.build.map(|(_, row)| row as usize)).collect::<Vec<_>>();
+        let inputs = [
+            ViewInputRows { view: probe_view, rows: &probe_rows },
+            ViewInputRows { view: build_view, rows: &build_rows },
+        ];
+        let refs = columns.iter().map(|column| match column {
+            OutputColumn::Probe(column) => ViewColumnRef { input: 0, column: *column },
+            OutputColumn::Build(column) => ViewColumnRef { input: 1, column: *column },
+        }).collect::<Vec<_>>();
+        DataChunkView::combine(&inputs, &refs)
+    }
+
+    /// Preserves output row order while splitting only at build-batch changes.
+    fn forward_rows(&mut self, probe: Option<&DataChunkView>, rows: &[super::rows::OutputRow]) -> Result<()> {
+        let mut groups: Vec<(Option<u32>, Vec<super::rows::OutputRow>)> = Vec::new();
+        let mut positions = HashMap::with_capacity(rows.len());
+        for row in rows.iter().copied() {
+            let key = row.build.map(|(chunk, _)| chunk);
+            let group = *positions.entry(key).or_insert_with(|| {
+                groups.push((key, Vec::new()));
+                groups.len() - 1
+            });
+            groups[group].1.push(row);
+        }
+        for (build_chunk, group) in groups {
+            let view = self.compose_group(probe, build_chunk, &group, &self.columns)?;
+            if !view.is_empty() {
+                self.next.push(view)?;
             }
         }
         Ok(())
     }
 }
 
-impl PipelineNode<DataChunk> for HashJoin {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
-        self.probe(chunk)
+impl PipelineNode<DataChunkView> for HashJoin {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.probe(view)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -409,15 +343,9 @@ impl PipelineNode<DataChunk> for HashJoin {
                 .collect();
             if !unmatched.is_empty() {
                 let rows = output_rows(self.join_type, &[], &[], &unmatched);
-                let mut produced = assemble(
-                    None,
-                    &self.table,
-                    &rows,
-                    &self.columns,
-                    &self.probe_types,
-                    &self.build_types,
-                )?;
-                self.forward(&mut produced)?;
+                let started = Instant::now();
+                self.forward_rows(None, &rows)?;
+                self.view_compose_us += started.elapsed().as_micros() as u64;
             }
         }
         tracing::info!(
@@ -426,7 +354,7 @@ impl PipelineNode<DataChunk> for HashJoin {
             probed_rows = self.probed_rows,
             matched_rows = self.matched_rows,
             probe_us = self.probe_us,
-            gather_us = self.gather_us,
+            view_compose_us = self.view_compose_us,
             residual_us = self.residual_us,
             "join_finished"
         );
@@ -440,17 +368,17 @@ impl PipelineNode<DataChunk> for HashJoin {
     }
 }
 
-impl crate::pipeline::Transform<DataChunk> for HashJoin {}
+impl crate::pipeline::Transform<DataChunkView> for HashJoin {}
 
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use arrow::array::{Array, ArrayRef, DictionaryArray, Int64Array};
-    use arrow::datatypes::UInt32Type;
+    use arrow::array::{Array, ArrayRef, Int64Array};
     use common::protocol::{MicroOp, MicroProgram};
 
     use super::*;
+    use crate::pipeline::DataChunk;
     use crate::udf::FunctionRegistry;
     use crate::vm::VectorVmExecutor;
 
@@ -465,6 +393,30 @@ mod tests {
 
         fn flush(&mut self) -> Result<()> {
             Ok(())
+        }
+    }
+
+    impl PipelineNode<DataChunkView> for Collect {
+        fn push(&mut self, view: DataChunkView) -> Result<()> {
+            self.0
+                .lock()
+                .expect("collect lock")
+                .push(view.to_data_chunk()?);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl HashJoin {
+        fn push(&mut self, chunk: DataChunk) -> Result<()> {
+            PipelineNode::<DataChunkView>::push(self, DataChunkView::from_chunk(chunk)?)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            PipelineNode::<DataChunkView>::flush(self)
         }
     }
 
@@ -511,7 +463,7 @@ mod tests {
             .collect()
     }
 
-    fn residual_greater_than_filter() -> (VectorVmExecutor, JoinFilterCollector) {
+    fn residual_greater_than_filter() -> (VectorVmExecutor<DataChunkView>, JoinFilterCollector) {
         let collector = JoinFilterCollector::default();
         let program = Arc::new(MicroProgram::new(
             3,
@@ -524,7 +476,7 @@ mod tests {
                 MicroOp::FilterMask { bool_reg: 2 },
             ],
         ));
-        let vm = VectorVmExecutor::new(
+        let vm = VectorVmExecutor::<DataChunkView>::new_view(
             program,
             Arc::new(FunctionRegistry::new()),
             Box::new(collector.clone()),
@@ -578,9 +530,71 @@ mod tests {
     /// A built table over one chunk of `values`.
     fn build(values: &[i64]) -> HashTable {
         let mut sink = BuildSink::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
-        sink.push(DataChunk::from_vectors(vec![ints(values)]))
+        sink.push(DataChunkView::from_chunk(DataChunk::from_vectors(vec![ints(values)]))
+            .expect("build view"))
             .expect("build");
         sink.finish()
+    }
+
+    #[derive(Clone, Default)]
+    struct ViewCollect(Arc<Mutex<Vec<DataChunkView>>>);
+
+    impl PipelineNode<DataChunkView> for ViewCollect {
+        fn push(&mut self, view: DataChunkView) -> Result<()> {
+            self.0.lock().expect("view collector lock").push(view);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn join_output_view_references_original_probe_and_build_payloads() {
+        let build_key = ints(&[7, 8]);
+        let build_payload = ints(&[70, 80]);
+        let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        table
+            .insert_view(
+                DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+                    build_key,
+                    Arc::clone(&build_payload),
+                ]))
+                .expect("build view"),
+            )
+            .expect("build table");
+
+        let probe_key = ints(&[8]);
+        let probe_payload = ints(&[800]);
+        let sink = ViewCollect::default();
+        let mut join = HashJoin::new(
+            Arc::new(table),
+            JoinType::Inner,
+            vec![OutputColumn::Probe(1), OutputColumn::Build(1)],
+            vec![DataType::Int64, DataType::Int64],
+            vec![DataType::Int64, DataType::Int64],
+            Box::new(sink.clone()),
+        );
+        PipelineNode::<DataChunkView>::push(
+            &mut join,
+            DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+                probe_key,
+                Arc::clone(&probe_payload),
+            ]))
+            .expect("probe view"),
+        )
+        .expect("probe join");
+        PipelineNode::<DataChunkView>::flush(&mut join).expect("flush join");
+
+        let outputs = sink.0.lock().expect("view collector lock");
+        assert_eq!(outputs.len(), 1);
+        let (probe_array, probe_row) = outputs[0].resolve(0, 0).unwrap().unwrap();
+        let (build_array, build_row) = outputs[0].resolve(1, 0).unwrap().unwrap();
+        assert!(Arc::ptr_eq(probe_array, &probe_payload));
+        assert!(Arc::ptr_eq(build_array, &build_payload));
+        assert_eq!(probe_array.as_any().downcast_ref::<Int64Array>().unwrap().value(probe_row), 800);
+        assert_eq!(build_array.as_any().downcast_ref::<Int64Array>().unwrap().value(build_row), 80);
     }
 
     /// The whole operator: absorb a build side, probe it, emit joined columns.
@@ -714,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn semi_join_reuses_probe_arrays_and_keeps_sparse_selection_indices() {
+    fn semi_join_materializes_sparse_selected_rows_at_the_result_boundary() {
         use common::arrow::SelectionVector;
 
         let sink = Collect::default();
@@ -737,14 +751,12 @@ mod tests {
 
         let chunks = sink.0.lock().expect("collect lock");
         assert_eq!(chunks.len(), 1);
-        assert!(Arc::ptr_eq(chunks[0].column(0), &probe_values));
-        assert_eq!(chunks[0].selection.size(), 1);
-        assert_eq!(chunks[0].selection.get_index(0), 3);
-        assert_eq!(selected_cells(&chunks[0], 0), vec![Some(40)]);
+        assert_eq!(chunks[0].num_rows(), 1);
+        assert_eq!(cells(&chunks[0], 0), vec![Some(40)]);
     }
 
     #[test]
-    fn anti_join_reuses_probe_arrays_and_emits_only_unmatched_selected_rows() {
+    fn anti_join_materializes_unmatched_selected_rows_at_the_result_boundary() {
         use common::arrow::SelectionVector;
 
         let sink = Collect::default();
@@ -767,9 +779,8 @@ mod tests {
 
         let chunks = sink.0.lock().expect("collect lock");
         assert_eq!(chunks.len(), 1);
-        assert!(Arc::ptr_eq(chunks[0].column(0), &probe_values));
-        assert_eq!(selected_cells(&chunks[0], 0), vec![Some(20)]);
-        assert_eq!(chunks[0].selection.get_index(0), 1);
+        assert_eq!(chunks[0].num_rows(), 1);
+        assert_eq!(cells(&chunks[0], 0), vec![Some(20)]);
     }
 
     #[test]
@@ -851,7 +862,6 @@ mod tests {
 
         let probe_keys = ints(&[20, 10]);
         let probe_payload = ints(&[2_000, 1_000]);
-        let probe_payload_ptr = probe_payload.as_ref().as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr();
         let sink = Collect::default();
         let mut join = HashJoin::new(
             Arc::new(table),
@@ -868,28 +878,11 @@ mod tests {
 
         let chunks = sink.0.lock().expect("collect lock");
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].selection.size(), 2);
-        assert!(Arc::ptr_eq(chunks[0].column(0), &probe_payload));
-        assert_eq!(
-            chunks[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr(),
-            probe_payload_ptr,
-            "probe payload buffer must be shared"
-        );
-
-        let dictionary = chunks[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<DictionaryArray<UInt32Type>>()
-            .expect("build scalar remains a dictionary view");
-        assert!(Arc::ptr_eq(dictionary.values(), &build_values));
-        let keys = dictionary.keys();
-        let values = dictionary.values().as_any().downcast_ref::<Int64Array>().unwrap();
-        let mut pairs: Vec<(i64, i64)> = (0..chunks[0].selection.size())
-            .map(|position| {
-                let physical = chunks[0].selection.get_index(position);
-                let probe = chunks[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-                (probe.value(physical), values.value(keys.value(physical) as usize))
-            })
+        assert_eq!(chunks[0].num_rows(), 2);
+        let probe = chunks[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let build = chunks[0].column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut pairs: Vec<(i64, i64)> = (0..chunks[0].num_rows())
+            .map(|row| (probe.value(row), build.value(row)))
             .collect();
         pairs.sort_unstable();
         assert_eq!(pairs, vec![(1_000, 100), (2_000, 200)]);
@@ -913,12 +906,7 @@ mod tests {
 
         let chunks = sink.0.lock().expect("collect lock");
         assert_eq!(chunks.len(), 1);
-        let nulls = chunks[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<DictionaryArray<UInt32Type>>()
-            .expect("unmatched scalar retains dictionary type");
-        assert!(nulls.is_null(chunks[0].selection.get_index(0)));
+        assert!(chunks[0].column(1).is_null(0));
     }
 
     #[test]

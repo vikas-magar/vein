@@ -11,7 +11,7 @@ use arrow::record_batch::RecordBatch;
 use crate::operators::sink::{CollectSink, DiscardSink, WriteSink, WriteStorage};
 use crate::operators::source::scan::ScanFile;
 use crate::operators::source::ScanSource;
-use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
+use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Sink, Source, Transform};
 use crate::runtime::ExecutorBuilder;
 use crate::udf::FunctionRegistry;
 use crate::vm::VectorVmExecutor;
@@ -215,6 +215,18 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         next: Box<dyn PipelineNode<DataChunk>>,
     ) -> Result<Box<dyn Transform<DataChunk>>> {
         Ok(Box::new(VectorVmExecutor::new(
+            program.clone(),
+            self.registry.clone(),
+            next,
+        )))
+    }
+
+    fn build_view_vm(
+        &self,
+        program: &Arc<MicroProgram>,
+        next: Box<dyn PipelineNode<DataChunkView>>,
+    ) -> Result<Box<dyn Transform<DataChunkView>>> {
+        Ok(Box::new(VectorVmExecutor::<DataChunkView>::new_view(
             program.clone(),
             self.registry.clone(),
             next,

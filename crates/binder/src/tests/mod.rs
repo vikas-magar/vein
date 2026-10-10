@@ -447,6 +447,52 @@ mod join_and_sources {
         }
     }
 
+    #[tokio::test]
+    async fn join_output_nullability_follows_join_flavor() {
+        for (flavor, left_nullable, right_nullable) in [
+            ("JOIN", false, false),
+            ("LEFT JOIN", false, true),
+            ("RIGHT JOIN", true, false),
+            ("FULL JOIN", true, true),
+        ] {
+            let query = format!(
+                "FROM users |> {flavor} orders ON users.id = orders.user_id"
+            );
+            let plan = bind(&query).await;
+            let LogicalPlan::Join { schema, .. } = plan else {
+                panic!("expected a Join plan for {flavor}");
+            };
+
+            assert_eq!(schema.fields.len(), 6, "{flavor}");
+            assert!(
+                schema.fields[..3]
+                    .iter()
+                    .all(|field| field.nullable == left_nullable),
+                "left-side nullability mismatch for {flavor}: {:?}",
+                &schema.fields[..3]
+            );
+            assert!(
+                schema.fields[3..]
+                    .iter()
+                    .all(|field| field.nullable == right_nullable),
+                "right-side nullability mismatch for {flavor}: {:?}",
+                &schema.fields[3..]
+            );
+        }
+
+        let projected = bind(
+            "FROM users |> LEFT JOIN orders ON users.id = orders.user_id |> SELECT orders.amount",
+        )
+            .await;
+        let LogicalPlan::Project { schema, .. } = projected else {
+            panic!("expected a Project above the left join");
+        };
+        assert!(
+            schema.fields[0].nullable,
+            "projecting a null-extended input column must retain nullable metadata"
+        );
+    }
+
     /// Qualified self-join references must resolve to their respective input scopes.
     #[tokio::test]
     async fn qualified_self_join_columns_resolve_to_each_side() {

@@ -92,12 +92,19 @@ pub async fn bind_select<'a>(
     let mut bound_exprs = Vec::with_capacity(plain_items.len());
     let mut new_fields = Vec::with_capacity(plain_items.len());
     for (expr, name) in plain_items {
-        new_fields.push(std::sync::Arc::new(ResolvedColumn::new(
-            context.next_id(),
-            name.unwrap_or_else(|| "_col".to_string()),
-            None,
-            expr.data_type(),
-        )));
+        let nullable = match &expr {
+            LogicalExpr::Column(column) | LogicalExpr::OuterColumn(column) => column.nullable,
+            _ => false,
+        };
+        new_fields.push(std::sync::Arc::new(
+            ResolvedColumn::new(
+                context.next_id(),
+                name.unwrap_or_else(|| "_col".to_string()),
+                None,
+                expr.data_type(),
+            )
+                .with_nullable(nullable),
+        ));
         bound_exprs.push(expr);
     }
 
@@ -296,9 +303,35 @@ pub async fn bind_join<'a>(
     };
 
     // 4. Output schema: left ++ right (USING de-duplicates the join columns).
-    let output_fields = merged.columns.clone();
+    // Outer joins make columns from the non-preserved side nullable. The ON
+    // predicate was bound against the original input fields above; downstream
+    // pipes must see the null-extended output fields.
+    let left_field_count = left_fields.len();
+    let output_fields: Vec<ResolvedColumnRef> = merged
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let null_extended = match &join.join_type {
+                parser::ast::pipe_op::JoinType::Left
+                | parser::ast::pipe_op::JoinType::Single => index >= left_field_count,
+                parser::ast::pipe_op::JoinType::Right => index < left_field_count,
+                parser::ast::pipe_op::JoinType::Full => true,
+                parser::ast::pipe_op::JoinType::Inner
+                | parser::ast::pipe_op::JoinType::Cross
+                | parser::ast::pipe_op::JoinType::Semi
+                | parser::ast::pipe_op::JoinType::Anti => false,
+            };
+            if null_extended && !field.nullable {
+                std::sync::Arc::new(field.as_ref().clone().with_nullable(true))
+            } else {
+                std::sync::Arc::clone(field)
+            }
+        })
+        .collect();
 
-    // 5. Push the merged scope so downstream pipes see both sides.
+    // 5. Push the output scope so downstream pipes see outer-join nullability.
+    merged.columns = output_fields.clone();
     scopes.push(merged);
 
     Ok(LogicalPlan::Join {

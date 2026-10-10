@@ -12,7 +12,7 @@
 
 use arrow::array::{Array, Int64Array, StringArray};
 
-use crate::pipeline::DataChunk;
+use crate::pipeline::{DataChunk, DataChunkView};
 use common::Result;
 use error::VeinError;
 use types::{HashJoinKeyType, VeinDataType};
@@ -109,10 +109,12 @@ struct ChunkKeys {
 }
 
 impl ChunkKeys {
-    fn resolve(keys: &JoinKeys, chunk: &DataChunk) -> Result<Self> {
+    fn resolve(keys: &JoinKeys, chunk: &DataChunkView) -> Result<Self> {
         let mut columns = Vec::with_capacity(keys.columns.len());
         for index in &keys.columns {
-            let array = chunk.column(*index);
+            // Only the join keys cross an Arrow-kernel boundary; payload arrays
+            // stay retained by the reference-backed view.
+            let array = chunk.materialize_column(*index)?;
             let data_type = VeinDataType::try_from(array.data_type()).map_err(|error| {
                 VeinError::internal(format!(
                     "join key column {index} has an unsupported Arrow type {:?}: {error}",
@@ -197,7 +199,7 @@ pub struct HashTable {
     /// Key columns of a probe chunk, resolved separately because the key need
     /// not sit at the same position on each side.
     probe_keys: JoinKeys,
-    chunks: Vec<DataChunk>,
+    chunks: Vec<DataChunkView>,
     keys_by_chunk: Vec<ChunkKeys>,
     entries: Vec<Entry>,
     hashes: Vec<u64>,
@@ -257,6 +259,11 @@ impl HashTable {
     /// the probe. A row with a null key is entered — an outer join still has to
     /// emit it — but is left out of the buckets, so no probe can ever match it.
     pub fn insert(&mut self, chunk: DataChunk) -> Result<()> {
+        self.insert_view(DataChunkView::from_chunk(chunk)?)
+    }
+
+    /// Retains a reference-backed build batch and indexes its active rows.
+    pub fn insert_view(&mut self, chunk: DataChunkView) -> Result<()> {
         let keys = ChunkKeys::resolve(&self.build_keys, &chunk)?;
         let chunk_index = self.chunks.len() as u32;
         // The keys stay a local, so the loop below can mutate the table's
@@ -265,10 +272,8 @@ impl HashTable {
         // row — three times what the table itself stores.
         self.chunks.push(chunk);
 
-        for position in 0..self.chunks[chunk_index as usize].selection.size() {
-            let row = self.chunks[chunk_index as usize]
-                .selection
-                .get_index(position) as u32;
+        for position in 0..self.chunks[chunk_index as usize].num_rows() {
+            let row = position as u32;
             if keys.any_null(row as usize) {
                 self.null_keyed.push((chunk_index, row));
                 continue;
@@ -396,10 +401,16 @@ impl HashTable {
     ///
     /// A probe row with a null key contributes nothing.
     pub fn probe(&self, probe: &DataChunk, matches: &mut Vec<(u32, (u32, u32))>) -> Result<()> {
+        self.probe_view(&DataChunkView::from_chunk(probe.clone())?, matches)
+    }
+
+    /// Probes a reference-backed batch. Returned rows are logical positions in
+    /// the selected input batches.
+    pub fn probe_view(&self, probe: &DataChunkView, matches: &mut Vec<(u32, (u32, u32))>) -> Result<()> {
         let probe_keys = ChunkKeys::resolve(&self.probe_keys, probe)?;
         let inline = self.inline_keys() && probe_keys.is_single_i64();
-        for position in 0..probe.selection.size() {
-            let row = probe.selection.get_index(position) as u32;
+        for position in 0..probe.num_rows() {
+            let row = position as u32;
             if probe_keys.any_null(row as usize) {
                 continue;
             }
@@ -443,7 +454,7 @@ impl HashTable {
     }
 
     /// The retained chunk an entry belongs to, for gathering build columns.
-    pub fn build_chunk(&self, chunk: u32) -> &DataChunk {
+    pub fn build_chunk(&self, chunk: u32) -> &DataChunkView {
         &self.chunks[chunk as usize]
     }
 
@@ -589,7 +600,8 @@ mod tests {
         table
             .insert(DataChunk::from_vectors(vec![Arc::clone(&key)]))
             .expect("insert");
-        assert!(Arc::ptr_eq(table.build_chunk(0).column(0), &key));
+        let (retained, _) = table.build_chunk(0).resolve(0, 0).expect("resolve row").unwrap();
+        assert!(Arc::ptr_eq(retained, &key));
     }
 
     /// The bucket table grows with the build side, so probing stays short-chained

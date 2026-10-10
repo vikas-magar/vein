@@ -6,11 +6,12 @@
 use super::ops;
 use super::register::RegisterFile;
 use crate::operators::sink::DiscardSink;
-use crate::pipeline::{DataChunk, PipelineNode, Transform};
+use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Transform};
 use crate::udf::FunctionRegistry;
 use arrow::array::ArrayRef;
 use common::Result;
 use common::protocol::{MicroOp, MicroProgram, RegId};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -31,12 +32,36 @@ struct VmStats {
 ///
 /// Holds the pre-allocated virtual register file and compiles/interprets the
 /// [`MicroProgram`] instructions on incoming batches without steady-state allocations.
-pub struct VectorVmExecutor {
+pub struct VectorVmExecutor<B = DataChunk> {
     program: Arc<MicroProgram>,
     registers: RegisterFile,
     registry: Arc<FunctionRegistry>,
-    next: Box<dyn PipelineNode<DataChunk>>,
+    next: Box<dyn PipelineNode<B>>,
+    input_registers: Vec<RegId>,
+    written_registers: HashSet<RegId>,
+    projection: Option<Vec<RegId>>,
     stats: VmStats,
+}
+
+impl<B> VectorVmExecutor<B> {
+    fn with_next(
+        program: Arc<MicroProgram>,
+        registry: Arc<FunctionRegistry>,
+        next: Box<dyn PipelineNode<B>>,
+    ) -> Self {
+        let register_count = program.register_count;
+        let (input_registers, written_registers, projection) = analyze_registers(&program);
+        Self {
+            program,
+            registers: RegisterFile::new(register_count),
+            registry,
+            next,
+            input_registers,
+            written_registers,
+            projection,
+            stats: VmStats::default(),
+        }
+    }
 }
 
 impl VectorVmExecutor {
@@ -46,15 +71,7 @@ impl VectorVmExecutor {
         registry: Arc<FunctionRegistry>,
         next: Box<dyn PipelineNode<DataChunk>>,
     ) -> Self {
-        let register_count = program.register_count;
-        let registers = RegisterFile::new(register_count);
-        Self {
-            program,
-            registers,
-            registry,
-            next,
-            stats: VmStats::default(),
-        }
+        Self::with_next(program, registry, next)
     }
 
     /// Borrows the active [`MicroProgram`].
@@ -89,6 +106,27 @@ impl VectorVmExecutor {
     }
 }
 
+impl VectorVmExecutor<DataChunkView> {
+    /// Constructs a VM pipeline node that accepts and emits reference-backed views.
+    pub fn new_view(
+        program: Arc<MicroProgram>,
+        registry: Arc<FunctionRegistry>,
+        next: Box<dyn PipelineNode<DataChunkView>>,
+    ) -> Self {
+        Self::with_next(program, registry, next)
+    }
+
+    /// Borrows the active [`MicroProgram`].
+    pub fn program(&self) -> &MicroProgram {
+        &self.program
+    }
+
+    /// Borrows the register file holding the most recently executed batch.
+    pub fn registers(&self) -> &RegisterFile {
+        &self.registers
+    }
+}
+
 /// Stores an instruction result, keeping a single-element result as a broadcast
 /// scalar whenever the chunk has more than one row.
 ///
@@ -102,10 +140,123 @@ fn store_result(registers: &mut RegisterFile, dst: RegId, array: ArrayRef) -> Re
     }
 }
 
-impl VectorVmExecutor {
+/// Finds registers that need an input value, registers written by the program,
+/// and the final requested projection. This runs once when the VM node is built
+/// so view batches only materialize input columns that the program reads.
+fn analyze_registers(
+    program: &MicroProgram,
+) -> (Vec<RegId>, HashSet<RegId>, Option<Vec<RegId>>) {
+    let mut defined = HashSet::new();
+    let mut reads = HashSet::new();
+    let mut writes = HashSet::new();
+    let mut projection = None;
+
+    macro_rules! read {
+        ($register:expr) => {{
+            let register = $register;
+            if !defined.contains(&register) {
+                reads.insert(register);
+            }
+        }};
+    }
+    macro_rules! write {
+        ($register:expr) => {{
+            let register = $register;
+            defined.insert(register);
+            writes.insert(register);
+        }};
+    }
+
+    for instruction in &program.instructions {
+        match instruction {
+            MicroOp::LoadConstant { dst, .. } => write!(*dst),
+            MicroOp::CopyRegister { dst, src } => {
+                read!(*src);
+                write!(*dst);
+            }
+            MicroOp::Cast { dst, src, .. }
+            | MicroOp::Neg { dst, src }
+            | MicroOp::Not { dst, src }
+            | MicroOp::IsNull { dst, src }
+            | MicroOp::IsNotNull { dst, src } => {
+                read!(*src);
+                write!(*dst);
+            }
+            MicroOp::Add { dst, src1, src2 }
+            | MicroOp::Sub { dst, src1, src2 }
+            | MicroOp::Mul { dst, src1, src2 }
+            | MicroOp::Div { dst, src1, src2 }
+            | MicroOp::Mod { dst, src1, src2 }
+            | MicroOp::CmpEq { dst, src1, src2 }
+            | MicroOp::CmpNeq { dst, src1, src2 }
+            | MicroOp::CmpLt { dst, src1, src2 }
+            | MicroOp::CmpLte { dst, src1, src2 }
+            | MicroOp::CmpGt { dst, src1, src2 }
+            | MicroOp::CmpGte { dst, src1, src2 }
+            | MicroOp::And { dst, src1, src2 }
+            | MicroOp::Or { dst, src1, src2 }
+            | MicroOp::VectorCosineDistance { dst, src1, src2 }
+            | MicroOp::VectorL2Distance { dst, src1, src2 }
+            | MicroOp::VectorDotProduct { dst, src1, src2 } => {
+                read!(*src1);
+                read!(*src2);
+                write!(*dst);
+            }
+            MicroOp::Like { dst, src, pattern, .. } => {
+                read!(*src);
+                read!(*pattern);
+                write!(*dst);
+            }
+            MicroOp::InList { dst, value, candidates, .. } => {
+                read!(*value);
+                for register in candidates { read!(*register); }
+                write!(*dst);
+            }
+            MicroOp::Case { dst, when_regs, then_regs, else_reg, .. } => {
+                for register in when_regs { read!(*register); }
+                for register in then_regs { read!(*register); }
+                if let Some(register) = else_reg { read!(*register); }
+                write!(*dst);
+            }
+            MicroOp::CallUdf { dst, arg_regs, .. } => {
+                for register in arg_regs { read!(*register); }
+                write!(*dst);
+            }
+            MicroOp::FilterMask { bool_reg } => read!(*bool_reg),
+            MicroOp::ProjectRegisters { out_regs } => {
+                projection = Some(out_regs.clone());
+            }
+            MicroOp::StateBuild { key_regs, payload_regs, .. } => {
+                for register in key_regs { read!(*register); }
+                for register in payload_regs { read!(*register); }
+            }
+            MicroOp::StateProbe { key_regs, out_regs, .. } => {
+                for register in key_regs { read!(*register); }
+                for register in out_regs { write!(*register); }
+            }
+            MicroOp::StateFold { agg_regs, .. } => {
+                for register in agg_regs {
+                    read!(*register);
+                    write!(*register);
+                }
+            }
+        }
+    }
+
+    let mut input_registers = reads.into_iter().collect::<Vec<_>>();
+    input_registers.sort_unstable();
+    (input_registers, writes, projection)
+}
+
+impl<B> VectorVmExecutor<B> {
     /// Evaluates `chunk` through the program, leaving results in the registers.
     fn eval_chunk(&mut self, chunk: &mut DataChunk) -> Result<()> {
         self.registers.mount_chunk(chunk)?;
+        self.eval_mounted_chunk(chunk)
+    }
+
+    /// Evaluates a program after its input registers have been mounted.
+    fn eval_mounted_chunk(&mut self, chunk: &mut DataChunk) -> Result<()> {
         for op in &self.program.instructions {
             match op {
                 MicroOp::LoadConstant { dst, value } => {
@@ -371,9 +522,96 @@ impl PipelineNode<DataChunk> for VectorVmExecutor {
 
 impl Transform<DataChunk> for VectorVmExecutor {}
 
+impl PipelineNode<DataChunkView> for VectorVmExecutor<DataChunkView> {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
+        if view.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        let rows_in = view.num_rows();
+        let input_columns = view.num_columns();
+        let active_view = view.compact_active_rows()?;
+        let row_count = active_view.num_rows();
+        let mounted = self
+            .input_registers
+            .iter()
+            .copied()
+            .filter(|register| (*register as usize) < input_columns)
+            .map(|register| {
+                active_view
+                    .materialize_column(register as usize)
+                    .map(|array| (register, array))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut chunk = DataChunk::new(
+            Vec::new(),
+            common::arrow::SelectionVector::new_dense(row_count),
+        );
+        self.registers.mount_columns(row_count, mounted)?;
+        self.eval_mounted_chunk(&mut chunk)?;
+        let result = if chunk.selection.is_empty() {
+            None
+        } else {
+            let output_registers = self
+                .projection
+                .clone()
+                .unwrap_or_else(|| (0..input_columns).map(|index| index as RegId).collect());
+            let mut output_columns = Vec::with_capacity(output_registers.len());
+            let mut computed = Vec::new();
+            for register in output_registers {
+                let input_column = (register as usize) < input_columns
+                    && !self.written_registers.contains(&register);
+                if input_column {
+                    output_columns.push(Some(register as usize));
+                } else {
+                    output_columns.push(None);
+                    computed.push(self.registers.to_array(register)?);
+                }
+            }
+            Some(active_view.project_with_arrays(
+                &output_columns,
+                computed,
+                chunk.selection,
+            )?)
+        };
+        self.stats.chunks += 1;
+        self.stats.rows_in += rows_in as u64;
+        self.stats.eval_us += started.elapsed().as_micros() as u64;
+        if let Some(view) = result {
+            self.stats.rows_out += view.num_rows() as u64;
+            self.next.push(view)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        let stats = std::mem::take(&mut self.stats);
+        if stats.chunks > 0 {
+            tracing::info!(
+                target: "vein.audit",
+                event = "vm_finished",
+                chunks = stats.chunks,
+                rows_in = stats.rows_in,
+                rows_out = stats.rows_out,
+                eval_us = stats.eval_us,
+                "vm_finished"
+            );
+        }
+        self.next.flush()
+    }
+
+    fn finished(&self) -> bool {
+        self.next.finished()
+    }
+}
+
+impl Transform<DataChunkView> for VectorVmExecutor<DataChunkView> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::{DataChunkView, RowMapping, ViewColumn};
     use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
     use types::LogicalLiteral;
     use std::sync::Mutex;
@@ -392,6 +630,87 @@ mod tests {
         fn flush(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    struct CollectViewNode {
+        views: Arc<Mutex<Vec<DataChunkView>>>,
+    }
+
+    impl PipelineNode<DataChunkView> for CollectViewNode {
+        fn push(&mut self, view: DataChunkView) -> Result<()> {
+            self.views.lock().unwrap().push(view);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn view_vm_filters_and_computes_while_preserving_passthrough_arrays() {
+        let numbers: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(3), None, Some(4)]));
+        let labels: ArrayRef = Arc::new(StringArray::from(vec!["A", "B", "C", "D"]));
+        let mapping = Arc::new(RowMapping::identity(Arc::from(vec![4]), 0, 4).unwrap());
+        let number_column = ViewColumn::new(
+            vec![Arc::clone(&numbers)],
+            numbers.data_type().clone(),
+            Arc::clone(&mapping),
+        )
+            .unwrap();
+        let label_column = ViewColumn::new(
+            vec![Arc::clone(&labels)],
+            labels.data_type().clone(),
+            mapping,
+        )
+            .unwrap();
+        let view = DataChunkView::new(
+            4,
+            vec![number_column, label_column],
+            common::arrow::SelectionVector::new_sparse(vec![3, 1, 2, 0]),
+        )
+            .unwrap();
+        let program = MicroProgram {
+            register_count: 5,
+            instructions: vec![
+                MicroOp::LoadConstant { dst: 2, value: LogicalLiteral::Int64(2) },
+                MicroOp::CmpGt { dst: 3, src1: 0, src2: 2 },
+                MicroOp::FilterMask { bool_reg: 3 },
+                MicroOp::Add { dst: 4, src1: 0, src2: 2 },
+                MicroOp::ProjectRegisters { out_regs: vec![1, 4] },
+            ],
+        };
+        let views = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = VectorVmExecutor::new_view(
+            Arc::new(program),
+            Arc::new(FunctionRegistry::new()),
+            Box::new(CollectViewNode { views: Arc::clone(&views) }),
+        );
+
+        vm.push(view).expect("view VM pipeline should run");
+        vm.flush().expect("view VM pipeline should flush");
+
+        let views = views.lock().unwrap();
+        let output = &views[0];
+        assert_eq!(output.num_rows(), 2);
+        assert_eq!(output.num_columns(), 2);
+        let mut output_labels = Vec::new();
+        for row in 0..output.num_rows() {
+            let (array, physical_row) = output.resolve(0, row).unwrap().unwrap();
+            assert!(Arc::ptr_eq(array, &labels));
+            output_labels.push(
+                array.as_any().downcast_ref::<StringArray>().unwrap().value(physical_row),
+            );
+        }
+        assert_eq!(output_labels, vec!["D", "B"]);
+        let computed = output.materialize_column(1).unwrap();
+        let computed = computed.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(computed.values(), &[6, 5]);
+        assert_eq!(
+            vm.registers().get(1).unwrap().physical_len(),
+            0,
+            "passthrough output should not be gathered into a VM input register",
+        );
     }
 
     #[test]

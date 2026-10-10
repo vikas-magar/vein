@@ -117,8 +117,8 @@ fn build_column(
 ) -> Result<ArrayRef> {
     let chunk_count = table.chunk_count();
     let chunks: Vec<ArrayRef> = (0..chunk_count)
-        .map(|chunk| std::sync::Arc::clone(table.build_chunk(chunk as u32).column(index)))
-        .collect();
+        .map(|chunk| table.build_chunk(chunk as u32).materialize_column(index))
+        .collect::<Result<_>>()?;
 
     let null = if rows.iter().any(|row| row.build.is_none()) {
         let data_type = chunks
@@ -269,7 +269,8 @@ mod tests {
             .as_ptr();
         let build_values = table
             .build_chunk(0)
-            .column(0)
+            .materialize_column(0)
+            .expect("materialize build test column")
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("build values")
