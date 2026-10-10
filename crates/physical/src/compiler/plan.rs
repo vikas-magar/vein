@@ -259,10 +259,12 @@ impl PipelineCompiler {
         compiler: &mut BytecodeCompiler,
     ) -> Result<VeinSchema> {
         match plan {
-            LogicalPlan::Filter { input, predicate } => {
-                if Self::aggregate(input)?.is_none() {
-                    compiler.compile_filter(predicate, input_schema)?;
-                }
+            LogicalPlan::Filter { input: _, predicate } => {
+                // Recursive input plans execute this transform immediately
+                // after its child. For a filter above an aggregate, the child
+                // schema is the aggregate output, so compile the predicate here
+                // instead of relying on the linear task's post-aggregate VM.
+                compiler.compile_filter(predicate, input_schema)?;
                 Ok(input_schema.clone())
             }
             LogicalPlan::Project { exprs, schema, .. } => {

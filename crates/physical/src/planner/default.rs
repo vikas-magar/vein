@@ -252,6 +252,146 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_aggregate_over_join_to_recursive_join_planning() {
+        let left_key = Arc::new(ResolvedColumn::new(
+            ColumnId(10),
+            "left_key",
+            Some("left".to_string()),
+            VeinDataType::Int64,
+        ));
+        let left_value = Arc::new(ResolvedColumn::new(
+            ColumnId(11),
+            "left_value",
+            Some("left".to_string()),
+            VeinDataType::Int64,
+        ));
+        let right_key = Arc::new(ResolvedColumn::new(
+            ColumnId(20),
+            "right_key",
+            Some("right".to_string()),
+            VeinDataType::Int64,
+        ));
+        let right_value = Arc::new(ResolvedColumn::new(
+            ColumnId(21),
+            "right_value",
+            Some("right".to_string()),
+            VeinDataType::Int64,
+        ));
+        let scan = |name: &str, fields: Vec<Arc<ResolvedColumn>>| {
+            let schema = Arc::new(VeinSchema::new(fields));
+            let table = Arc::new(
+                plan::TableMetadata::new(name, Arc::clone(&schema))
+                    .with_format(plan::TableFormat::Parquet),
+            );
+            LogicalPlan::Scan {
+                table,
+                projection: None,
+                filters: Vec::new(),
+                schema: Box::new((*schema).clone()),
+            }
+        };
+        let left = scan("left", vec![Arc::clone(&left_key), Arc::clone(&left_value)]);
+        let right = scan(
+            "right",
+            vec![Arc::clone(&right_key), Arc::clone(&right_value)],
+        );
+        let join_schema = Box::new(VeinSchema::new(vec![
+            Arc::clone(&left_key),
+            Arc::clone(&left_value),
+            Arc::clone(&right_key),
+            Arc::clone(&right_value),
+        ]));
+        let join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(left),
+            right: Box::new(right),
+            on: Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&left_key))),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(Arc::clone(&right_key))),
+                return_type: VeinDataType::Boolean,
+            }),
+            using: Vec::new(),
+            schema: join_schema,
+        };
+        let group_key = Arc::new(ResolvedColumn::new(
+            ColumnId(30),
+            "left_key",
+            None,
+            VeinDataType::Int64,
+        ));
+        let row_count = Arc::new(ResolvedColumn::new(
+            ColumnId(31),
+            "row_count",
+            None,
+            VeinDataType::Int64,
+        ));
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(join),
+            grouping_sets: vec![vec![LogicalExpr::Column(Arc::clone(&left_key))]],
+            aggs: vec![LogicalExpr::FunctionCall {
+                name: "count".to_string(),
+                args: vec![LogicalExpr::Column(right_value)],
+                is_aggregate: true,
+                distinct: false,
+                return_type: VeinDataType::Int64,
+            }],
+            schema: Box::new(VeinSchema::new(vec![group_key, row_count])),
+        };
+
+        let job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), aggregate.clone())
+            .expect("aggregate over a join should use recursive join planning");
+        let input = job.stage().tasks()[0]
+            .input_plan
+            .as_ref()
+            .expect("recursive aggregate input plan");
+        let common::protocol::PhysicalInputPlan::Aggregate { input, .. } = input.as_ref() else {
+            panic!("the recursive input root should be an aggregate");
+        };
+        let common::protocol::PhysicalInputPlan::Transform { input, .. } = input.as_ref() else {
+            panic!("aggregate arguments should be projected by a transform");
+        };
+        assert!(
+            matches!(input.as_ref(), common::protocol::PhysicalInputPlan::Join { .. }),
+            "the aggregate transform must consume the planned join"
+        );
+
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(aggregate),
+            predicate: LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::new(ResolvedColumn::new(
+                    ColumnId(31),
+                    "row_count",
+                    None,
+                    VeinDataType::Int64,
+                )))),
+                op: parser::ast::expr::BinaryOp::Gt,
+                right: Box::new(LogicalExpr::Literal(plan::LogicalLiteral::Int64(2))),
+                return_type: VeinDataType::Boolean,
+            },
+        };
+        let filtered_job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), filtered)
+            .expect("HAVING over an aggregate join should plan");
+        let filtered_input = filtered_job.stage().tasks()[0]
+            .input_plan
+            .as_ref()
+            .expect("recursive filtered input");
+        let common::protocol::PhysicalInputPlan::Transform { input, program } = filtered_input.as_ref() else {
+            panic!("HAVING should be represented as a transform above the aggregate");
+        };
+        assert!(matches!(
+            input.as_ref(),
+            common::protocol::PhysicalInputPlan::Aggregate { .. }
+        ));
+        assert!(
+            program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::FilterMask { .. })),
+            "HAVING transform must contain its filter instruction"
+        );
+    }
+
+    #[test]
     fn plans_filter_against_aggregate_output_in_a_separate_program() {
         let input = mock_scan_plan();
         let argument = match &input {

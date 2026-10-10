@@ -149,7 +149,8 @@ impl DefaultPipelineStageBuilder {
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::SubqueryAlias { input, .. }
             | LogicalPlan::Sort { input, .. }
-            | LogicalPlan::Limit { input, .. } => Self::contains_join(input),
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Aggregate { input, .. } => Self::contains_join(input),
             _ => false,
         }
     }
@@ -523,11 +524,46 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::split_file_scan_source;
+    use super::{split_file_scan_source, DefaultPipelineStageBuilder};
     use common::identifiers::TaskId;
     use common::protocol::{DataSource, FileFormat, FileScanTask};
     use plan::schema::VeinSchema;
+    use plan::{LogicalExpr, LogicalPlan};
     use std::sync::Arc;
+
+    fn scan_plan() -> LogicalPlan {
+        let schema = Arc::new(VeinSchema::empty());
+        let table = Arc::new(
+            plan::TableMetadata::new("empty", Arc::clone(&schema))
+                .with_format(plan::TableFormat::Parquet),
+        );
+        LogicalPlan::Scan {
+            table,
+            projection: None,
+            filters: Vec::new(),
+            schema: Box::new((*schema).clone()),
+        }
+    }
+
+    #[test]
+    fn detects_join_under_aggregate_for_recursive_planning() {
+        let join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(scan_plan()),
+            right: Box::new(scan_plan()),
+            on: None,
+            using: Vec::new(),
+            schema: Box::new(VeinSchema::empty()),
+        };
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(join),
+            grouping_sets: vec![Vec::new()],
+            aggs: Vec::<LogicalExpr>::new(),
+            schema: Box::new(VeinSchema::empty()),
+        };
+
+        assert!(DefaultPipelineStageBuilder::contains_join(&aggregate));
+    }
 
     #[test]
     fn splits_multi_file_scan_into_stable_single_file_units() {
