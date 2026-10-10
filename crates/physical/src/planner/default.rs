@@ -90,15 +90,19 @@ mod tests {
     use plan::LogicalExpr;
 
     fn mock_scan_plan() -> LogicalPlan {
+        mock_scan_plan_with_column_id_offset(0)
+    }
+
+    fn mock_scan_plan_with_column_id_offset(column_id_offset: usize) -> LogicalPlan {
         let schema = Box::new(VeinSchema::new(vec![
             std::sync::Arc::new(ResolvedColumn::new(
-                ColumnId(0),
+                ColumnId(column_id_offset),
                 "id",
                 None,
                 VeinDataType::Int64,
             )),
             std::sync::Arc::new(ResolvedColumn::new(
-                ColumnId(1),
+                ColumnId(column_id_offset + 1),
                 "name",
                 None,
                 VeinDataType::Utf8,
@@ -536,9 +540,94 @@ mod tests {
     }
 
     #[test]
+    fn plans_distinct_over_join_as_recursive_aggregate() {
+        let left_key = Arc::new(ResolvedColumn::new(
+            ColumnId(10),
+            "left_key",
+            Some("left".to_string()),
+            VeinDataType::Int64,
+        ));
+        let left_value = Arc::new(ResolvedColumn::new(
+            ColumnId(11),
+            "left_value",
+            Some("left".to_string()),
+            VeinDataType::Int64,
+        ));
+        let right_key = Arc::new(ResolvedColumn::new(
+            ColumnId(20),
+            "right_key",
+            Some("right".to_string()),
+            VeinDataType::Int64,
+        ));
+        let right_value = Arc::new(ResolvedColumn::new(
+            ColumnId(21),
+            "right_value",
+            Some("right".to_string()),
+            VeinDataType::Int64,
+        ));
+        let scan = |name: &str, fields: Vec<Arc<ResolvedColumn>>| {
+            let schema = Arc::new(VeinSchema::new(fields));
+            let table = Arc::new(
+                plan::TableMetadata::new(name, Arc::clone(&schema))
+                    .with_format(plan::TableFormat::Parquet),
+            );
+            LogicalPlan::Scan {
+                table,
+                projection: None,
+                filters: Vec::new(),
+                schema: Box::new((*schema).clone()),
+            }
+        };
+        let left = scan("left", vec![Arc::clone(&left_key), Arc::clone(&left_value)]);
+        let right = scan("right", vec![Arc::clone(&right_key), Arc::clone(&right_value)]);
+        let schema = Box::new(VeinSchema::new(vec![
+            left_key.clone(),
+            left_value,
+            right_key.clone(),
+            right_value,
+        ]));
+        let join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(left),
+            right: Box::new(right),
+            on: Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(left_key)),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(right_key)),
+                return_type: VeinDataType::Boolean,
+            }),
+            using: Vec::new(),
+            schema: schema.clone(),
+        };
+        let distinct = LogicalPlan::Distinct {
+            input: Box::new(join),
+            schema,
+        };
+
+        let job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), distinct)
+            .expect("distinct over a join should use recursive planning");
+        let input = job.stage().tasks()[0]
+            .input_plan
+            .as_ref()
+            .expect("recursive distinct input");
+        let common::protocol::PhysicalInputPlan::Aggregate { input, plan } = input.as_ref() else {
+            panic!("distinct should be represented as an aggregate pipeline breaker");
+        };
+        assert_eq!(plan.groups, 4);
+        assert_eq!(plan.grouping_sets, Some(vec![vec![0, 1, 2, 3]]));
+        assert!(plan.aggs.is_empty());
+        assert!(matches!(
+            input.as_ref(),
+            common::protocol::PhysicalInputPlan::Transform { input, .. }
+                if matches!(input.as_ref(), common::protocol::PhysicalInputPlan::Join { .. })
+        ));
+    }
+
+    #[test]
     fn plans_projection_above_an_intermediate_join_as_a_streaming_transform() {
-        let left = mock_scan_plan();
-        let right = mock_scan_plan();
+        let left = mock_scan_plan_with_column_id_offset(0);
+        let right = mock_scan_plan_with_column_id_offset(2);
         let base_schema = match &left {
             LogicalPlan::Scan { schema, .. } => schema.clone(),
             _ => unreachable!(),
@@ -562,7 +651,7 @@ mod tests {
             schema: base_schema.clone(),
         };
         let projected_key = Arc::new(ResolvedColumn::new(
-            ColumnId(2),
+            ColumnId(4),
             "projected_id",
             None,
             VeinDataType::Int64,
@@ -573,7 +662,7 @@ mod tests {
             exprs: vec![LogicalExpr::Column(left_key)],
             schema: projected_schema.clone(),
         };
-        let outer_right = mock_scan_plan();
+        let outer_right = mock_scan_plan_with_column_id_offset(5);
         let outer_right_key = match &outer_right {
             LogicalPlan::Scan { schema, .. } => schema.fields[0].clone(),
             _ => unreachable!(),

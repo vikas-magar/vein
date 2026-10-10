@@ -120,6 +120,25 @@ pub enum PhysicalInputPlan {
         /// Grouping and reduction instructions for the input batches.
         plan: AggregatePlan,
     },
+    /// A global ordering boundary over a recursively produced input.
+    Sort {
+        /// Input batches collected and ordered by this node.
+        input: Box<PhysicalInputPlan>,
+        /// Sort keys over the input, including appended computed-key columns.
+        plan: SortPlan,
+        /// Optional VM program that appends computed sort keys.
+        #[serde(default)]
+        key_program: Option<Arc<MicroProgram>>,
+        /// Number of input columns to retain after removing computed keys.
+        output_columns: u32,
+    },
+    /// A row window applied to a recursively produced input.
+    Limit {
+        /// Input batches to window.
+        input: Box<PhysicalInputPlan>,
+        /// Offset and maximum number of rows to emit.
+        spec: LimitSpec,
+    },
     /// A hash join over two recursively executable inputs.
     Join {
         /// Input streamed through the probe side of this join.
@@ -317,6 +336,10 @@ pub struct JoinPlan {
     pub probe_keys: Vec<u32>,
     /// Key columns of the build input.
     pub build_keys: Vec<u32>,
+    /// Candidate-pair predicate evaluated after hash-key matches and before
+    /// unmatched rows are determined. Input columns are ordered as listed.
+    #[serde(default)]
+    pub residual: Option<JoinResidualPlan>,
     /// Output columns, in output order.
     pub outputs: Vec<JoinOutput>,
     /// The data type of every probe column the output may reference, so a null
@@ -324,6 +347,15 @@ pub struct JoinPlan {
     pub probe_types: Vec<types::VeinDataType>,
     /// The data type of every build column the output may reference.
     pub build_types: Vec<types::VeinDataType>,
+}
+
+/// Vector predicate for the non-key terms of a join condition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JoinResidualPlan {
+    /// Columns gathered from the probe and build rows for predicate evaluation.
+    pub input_columns: Vec<JoinOutput>,
+    /// VM program that filters candidate pairs in place through its selection.
+    pub program: Arc<MicroProgram>,
 }
 
 /// The row window a task emits: skip `offset` rows, then emit at most `count`.
@@ -381,12 +413,22 @@ pub struct AggregatePlan {
     /// participates in the group. `Some` carries explicit grouping sets.
     #[serde(default)]
     pub grouping_sets: Option<Vec<Vec<u32>>>,
+    /// Whether an empty grouping set produces a row when the input is empty.
+    ///
+    /// SQL scalar aggregates emit an empty-input row, while DISTINCT over an
+    /// empty projection does not. Older plans retain scalar aggregate behavior.
+    #[serde(default = "default_emit_empty_group")]
+    pub emit_empty_group_on_empty_input: bool,
     /// One op per column after the keys, in column order.
     pub aggs: Vec<AggOpCode>,
     /// The physical input type for each aggregate argument, in aggregate order.
     pub aggregate_input_types: Vec<types::VeinDataType>,
     /// The type of every output column: the keys first, then one per aggregate.
     pub types: Vec<types::VeinDataType>,
+}
+
+fn default_emit_empty_group() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -422,6 +464,7 @@ mod tests {
             groups: 1,
             estimated_groups: Some(12),
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Count],
             aggregate_input_types: vec![types::VeinDataType::Int64],
             types: vec![types::VeinDataType::Int64; 2],
@@ -431,10 +474,15 @@ mod tests {
             .as_object_mut()
             .expect("aggregate plan object")
             .remove("estimated_groups");
+        value
+            .as_object_mut()
+            .expect("aggregate plan object")
+            .remove("emit_empty_group_on_empty_input");
 
         let decoded: AggregatePlan =
             serde_json::from_value(value).expect("deserialize legacy aggregate plan");
 
         assert_eq!(decoded.estimated_groups, None);
+        assert!(decoded.emit_empty_group_on_empty_input);
     }
 }

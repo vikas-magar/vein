@@ -7,17 +7,48 @@
 //! instruction: the VM sees one chunk at a time and has no second input.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arrow::datatypes::DataType;
 
-use crate::pipeline::{DataChunk, PipelineNode};
+use crate::pipeline::{DataChunk, PipelineNode, Transform};
 use common::Result;
+use error::VeinError;
 
 use super::gather::{OutputColumn, assemble};
 use super::hash_table::{HashTable, JoinKeys};
 use super::rows::{JoinType, output_rows};
+
+/// Collects the selection left by a VM join-residual filter.
+#[derive(Clone, Default)]
+pub struct JoinFilterCollector {
+    output: Arc<Mutex<Option<DataChunk>>>,
+}
+
+impl JoinFilterCollector {
+    /// Clears the previous candidate batch before evaluating another one.
+    pub fn clear(&self) -> Result<()> {
+        *self.output.lock().map_err(|_| VeinError::internal("join filter collector poisoned"))? = None;
+        Ok(())
+    }
+
+    /// Takes the filtered candidate batch, if the predicate retained any rows.
+    pub fn take(&self) -> Result<Option<DataChunk>> {
+        Ok(self.output.lock().map_err(|_| VeinError::internal("join filter collector poisoned"))?.take())
+    }
+}
+
+impl PipelineNode<DataChunk> for JoinFilterCollector {
+    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+        *self.output.lock().map_err(|_| VeinError::internal("join filter collector poisoned"))? = Some(chunk);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
 
 /// Consumes the build side into a hash table.
 pub struct BuildSink {
@@ -82,6 +113,9 @@ pub struct HashJoin {
     probe_types: Vec<DataType>,
     build_types: Vec<DataType>,
     next: Box<dyn PipelineNode<DataChunk>>,
+    residual_columns: Vec<OutputColumn>,
+    residual_vm: Option<Box<dyn Transform<DataChunk>>>,
+    residual_output: Option<JoinFilterCollector>,
     /// The build rows this task consumed, for the flavours that owe unmatched
     /// ones. Kept here, not in the table, because the table is shared.
     matched_build: HashSet<(u32, u32)>,
@@ -91,6 +125,7 @@ pub struct HashJoin {
     matched_rows: u64,
     probe_us: u64,
     gather_us: u64,
+    residual_us: u64,
 }
 
 impl HashJoin {
@@ -112,12 +147,30 @@ impl HashJoin {
             probe_types,
             build_types,
             next,
+            residual_columns: Vec::new(),
+            residual_vm: None,
+            residual_output: None,
             matched_build: HashSet::new(),
             probed_rows: 0,
             matched_rows: 0,
             probe_us: 0,
             gather_us: 0,
+            residual_us: 0,
         }
+    }
+
+    /// Installs a vectorized residual predicate that filters hash candidates
+    /// before the join decides which rows are unmatched.
+    pub fn with_residual_filter(
+        mut self,
+        columns: Vec<OutputColumn>,
+        vm: Box<dyn Transform<DataChunk>>,
+        output: JoinFilterCollector,
+    ) -> Self {
+        self.residual_columns = columns;
+        self.residual_vm = Some(vm);
+        self.residual_output = Some(output);
+        self
     }
 
     /// Probes one chunk and forwards everything it produced.
@@ -133,7 +186,44 @@ impl HashJoin {
         let probe_started = Instant::now();
         self.table.probe(&chunk, &mut pairs)?;
         self.probe_us += probe_started.elapsed().as_micros() as u64;
-        let matches = pairs;
+        let mut matches = pairs;
+        let residual_started = Instant::now();
+        if let (Some(vm), Some(output)) = (&mut self.residual_vm, &self.residual_output) {
+            let candidates = matches
+                .iter()
+                .map(|(probe, build)| super::rows::OutputRow {
+                    probe: Some(*probe),
+                    build: Some(*build),
+                })
+                .collect::<Vec<_>>();
+            let mut candidate_chunks = assemble(
+                Some(&chunk),
+                &self.table,
+                &candidates,
+                &self.residual_columns,
+                &self.probe_types,
+                &self.build_types,
+            )?;
+            output.clear()?;
+            if let Some(candidate) = candidate_chunks.pop() {
+                vm.push(candidate)?;
+                let filtered = output.take()?;
+                let accepted = filtered
+                    .map(|candidate| {
+                        (0..candidate.selection.size())
+                            .map(|position| candidate.selection.get_index(position))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                matches = accepted
+                    .into_iter()
+                    .filter_map(|index| matches.get(index).copied())
+                    .collect();
+            } else {
+                matches.clear();
+            }
+        }
+        let residual_us = residual_started.elapsed().as_micros() as u64;
         // Only the flavours that owe unmatched build rows need this.
         if matches!(self.join_type, JoinType::Right | JoinType::Full) {
             self.matched_build
@@ -155,6 +245,7 @@ impl HashJoin {
         )?;
         let forwarded = self.forward(&mut produced);
         self.gather_us += gather_started.elapsed().as_micros() as u64;
+        self.residual_us += residual_us;
         forwarded
     }
 
@@ -204,6 +295,7 @@ impl PipelineNode<DataChunk> for HashJoin {
             matched_rows = self.matched_rows,
             probe_us = self.probe_us,
             gather_us = self.gather_us,
+            residual_us = self.residual_us,
             "join_finished"
         );
         self.next.flush()

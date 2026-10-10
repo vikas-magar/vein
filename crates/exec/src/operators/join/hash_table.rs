@@ -389,13 +389,13 @@ impl HashTable {
                 let entry = self.entries[head as usize];
                 let same = self.hashes[head as usize] == hash
                     && match value {
-                        Some(value) => self.keys[head as usize] == value,
-                        None => self.keys_by_chunk[entry.chunk as usize].equals(
-                            entry.row as usize,
-                            &probe_keys,
-                            row as usize,
-                        ),
-                    };
+                    Some(value) => self.keys[head as usize] == value,
+                    None => self.keys_by_chunk[entry.chunk as usize].equals(
+                        entry.row as usize,
+                        &probe_keys,
+                        row as usize,
+                    ),
+                };
                 if same {
                     matches.push((row, (entry.chunk, entry.row)));
                 }
@@ -645,6 +645,32 @@ mod tests {
             left.all_build_rows(),
             vec![(0, 0), (0, 1), (1, 0), (2, 0), (2, 1)],
             "every row of both tables must survive the rebase, null-keyed included"
+        );
+    }
+
+    #[test]
+    fn composite_keys_match_only_when_every_key_column_matches() {
+        let mut table = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
+        table
+            .insert(DataChunk::from_vectors(vec![
+                ints(&[1, 1, 2]),
+                ints(&[10, 20, 10]),
+            ]))
+            .expect("insert composite build keys");
+
+        let probe = DataChunk::from_vectors(vec![ints(&[1, 1, 2, 2]), ints(&[20, 99, 10, 11])]);
+        let mut pairs = Vec::new();
+        table.probe(&probe, &mut pairs).expect("probe composite keys");
+
+        let mut matches: Vec<(u32, u32)> = pairs
+            .iter()
+            .map(|(probe_row, (_, build_row))| (*probe_row, *build_row))
+            .collect();
+        matches.sort();
+        assert_eq!(
+            matches,
+            vec![(0, 1), (2, 2)],
+            "matching just one component must not produce a join match"
         );
     }
 

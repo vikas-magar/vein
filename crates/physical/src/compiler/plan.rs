@@ -5,8 +5,8 @@ use std::sync::Arc;
 use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{
-    AggOpCode, AggregatePlan, DataSource, FileFormat, FileScanTask, LimitSpec, MicroProgram, RegId,
-    ScanPredicate, SortKey as PhysicalSortKey, SortPlan,
+    AggOpCode, AggregatePlan, DataSource, FileFormat, FileScanTask, JoinOutput, JoinResidualPlan,
+    LimitSpec, MicroProgram, RegId, ScanPredicate, SortKey as PhysicalSortKey, SortPlan,
 };
 use error::VeinError;
 use plan::schema::VeinSchema;
@@ -18,6 +18,71 @@ use super::expr::BytecodeCompiler;
 pub struct PipelineCompiler;
 
 impl PipelineCompiler {
+    /// Compiles the non-key conjuncts of a hash join condition against only the
+    /// columns they reference. The probe key is retained as a row-count carrier
+    /// when a residual is constant-only.
+    pub fn compile_join_residual(
+        predicates: &[LogicalExpr],
+        probe: &VeinSchema,
+        build: &VeinSchema,
+        probe_key: u32,
+    ) -> Result<Option<JoinResidualPlan>> {
+        if predicates.is_empty() {
+            return Ok(None);
+        }
+
+        let mut required = HashSet::new();
+        for predicate in predicates {
+            Self::collect_column_ids(predicate, &mut required);
+        }
+
+        let mut input_schema = VeinSchema::empty();
+        let mut input_columns = Vec::new();
+        for (schema, is_probe) in [(probe, true), (build, false)] {
+            for field in &schema.fields {
+                if required.remove(&field.id) {
+                    input_schema.fields.push(Arc::clone(field));
+                    let position = schema.position_of_id(field.id).ok_or_else(|| {
+                        VeinError::planning("join residual column is absent from its input", None)
+                    })?;
+                    let position = u32::try_from(position).map_err(|_| {
+                        VeinError::planning("join input has too many columns", None)
+                    })?;
+                    input_columns.push(if is_probe {
+                        JoinOutput::Probe(position)
+                    } else {
+                        JoinOutput::Build(position)
+                    });
+                }
+            }
+        }
+        if !required.is_empty() {
+            return Err(VeinError::planning(
+                "join residual predicate references a column absent from both inputs",
+                None,
+            ));
+        }
+        if input_schema.fields.is_empty() {
+            let key = probe.fields.get(probe_key as usize).ok_or_else(|| {
+                VeinError::planning("join residual has no row-count input column", None)
+            })?;
+            input_schema.fields.push(Arc::clone(key));
+            input_columns.push(JoinOutput::Probe(probe_key));
+        }
+
+        let register_count = RegId::try_from(input_schema.fields.len())
+            .map_err(|_| VeinError::planning("join residual has too many input columns", None))?;
+        let mut compiler = BytecodeCompiler::new(register_count);
+        compiler.set_input_schema(&input_schema);
+        for predicate in predicates {
+            compiler.compile_filter(predicate, &input_schema)?;
+        }
+        Ok(Some(JoinResidualPlan {
+            input_columns,
+            program: Arc::new(compiler.finish()),
+        }))
+    }
+
     /// The row window the plan applies, if the executor can apply it where it
     /// places one: above the whole pipeline program.
     ///
@@ -85,6 +150,7 @@ impl PipelineCompiler {
                     groups: keys.len() as u32,
                     estimated_groups,
                     grouping_sets: Some(grouping_sets),
+                    emit_empty_group_on_empty_input: true,
                     aggs,
                     aggregate_input_types,
                     types: schema.fields.iter().map(|f| f.data_type.clone()).collect(),
@@ -96,6 +162,7 @@ impl PipelineCompiler {
                 groups: schema.fields.len() as u32,
                 estimated_groups: None,
                 grouping_sets: Some(vec![(0..schema.fields.len() as u32).collect()]),
+                emit_empty_group_on_empty_input: false,
                 aggs: Vec::new(),
                 aggregate_input_types: Vec::new(),
                 types: schema.fields.iter().map(|f| f.data_type.clone()).collect(),
@@ -125,51 +192,25 @@ impl PipelineCompiler {
         let Some((sort_keys, schema)) = root_sort(plan)? else {
             return Ok(None);
         };
-        let mut computed_index = 0usize;
-        let keys = sort_keys
-            .iter()
-            .map(|key| {
-                let position = match &key.expr {
-                    LogicalExpr::Column(column) => schema
-                        .position_of_id(column.id)
-                        .or_else(|| {
-                            schema
-                                .fields
-                                .iter()
-                                .position(|field| field.name == column.name)
-                        })
-                        .ok_or_else(|| {
-                            VeinError::planning(
-                                format!(
-                                    "ORDER BY column '{}' is absent from its output schema",
-                                    column.name
-                                ),
-                                None,
-                            )
-                        })?,
-                    _ => {
-                        let position = schema.fields.len() + computed_index;
-                        computed_index += 1;
-                        position
-                    }
-                };
-                let column = u32::try_from(position).map_err(|_| {
-                    VeinError::planning("ORDER BY has too many output columns", None)
-                })?;
-                Ok(PhysicalSortKey {
-                    column,
-                    ascending: key.asc,
-                    nulls_first: key.nulls_first,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if keys.is_empty() {
-            return Err(VeinError::planning(
-                "ORDER requires at least one sort key",
-                None,
-            ));
-        }
-        Ok(Some(SortPlan { keys }))
+        Ok(Some(compile_sort_plan(sort_keys, schema)?))
+    }
+
+    /// Compiles the sort operator at this node without imposing root-pipeline
+    /// restrictions on operators below it. Recursive inputs retain the exact
+    /// logical order, including a limit that precedes a sort.
+    pub fn recursive_sort(
+        plan: &LogicalPlan,
+    ) -> Result<Option<(SortPlan, Option<MicroProgram>)>> {
+        let LogicalPlan::Sort {
+            sort_keys, schema, ..
+        } = plan
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            compile_sort_plan(sort_keys, schema)?,
+            compile_sort_key_program(sort_keys, schema)?,
+        )))
     }
 
     /// Evaluates computed ORDER expressions once and appends them as temporary
@@ -178,25 +219,9 @@ impl PipelineCompiler {
         let Some((sort_keys, schema)) = root_sort(plan)? else {
             return Ok(None);
         };
-        if sort_keys
-            .iter()
-            .all(|key| matches!(&key.expr, LogicalExpr::Column(_)))
-        {
-            return Ok(None);
-        }
-
-        let mut compiler = BytecodeCompiler::new(schema.fields.len() as RegId);
-        let mut output_registers = (0..schema.fields.len())
-            .map(|index| index as RegId)
-            .collect::<Vec<_>>();
-        for key in sort_keys {
-            if !matches!(&key.expr, LogicalExpr::Column(_)) {
-                output_registers.push(compiler.compile_expr(&key.expr, schema)?);
-            }
-        }
-        compiler.compile_projection_registers(output_registers);
-        Ok(Some(compiler.finish()))
+        compile_sort_key_program(sort_keys, schema)
     }
+
 
     /// Compiles a linear logical plan into its Parquet source and vector program.
     pub fn compile(plan: &LogicalPlan) -> Result<(DataSource, MicroProgram, VeinSchema)> {
@@ -287,10 +312,23 @@ impl PipelineCompiler {
                 compiler.compile_projection_with_schema(&projected, input_schema, schema)?;
                 Ok((**schema).clone())
             }
+            LogicalPlan::Distinct { schema, .. } => {
+                let projected = input_schema
+                    .fields
+                    .iter()
+                    .cloned()
+                    .map(LogicalExpr::Column)
+                    .collect::<Vec<_>>();
+                compiler.compile_projection_with_schema(&projected, input_schema, schema)?;
+                Ok((**schema).clone())
+            }
             LogicalPlan::Join { schema, .. }
             | LogicalPlan::Scan { schema, .. }
             | LogicalPlan::ExternalScan { schema, .. } => Ok((**schema).clone()),
-            LogicalPlan::Limit { .. } | LogicalPlan::Sort { .. } => Ok(input_schema.clone()),
+            LogicalPlan::Limit { .. } | LogicalPlan::Sort { .. } => Err(VeinError::planning(
+                "recursive LIMIT and ORDER require dedicated physical input nodes",
+                None,
+            )),
             LogicalPlan::SubqueryAlias { schema, .. } => {
                 if schema.fields.len() != input_schema.fields.len() {
                     return Err(VeinError::planning(
@@ -666,6 +704,74 @@ fn compile_post_aggregate_node(
     }
 }
 
+fn compile_sort_plan(sort_keys: &[LogicalSortKey], schema: &VeinSchema) -> Result<SortPlan> {
+    let mut computed_index = 0usize;
+    let keys = sort_keys
+        .iter()
+        .map(|key| {
+            let position = match &key.expr {
+                LogicalExpr::Column(column) => schema
+                    .position_of_id(column.id)
+                    .or_else(|| {
+                        schema
+                            .fields
+                            .iter()
+                            .position(|field| field.name == column.name)
+                    })
+                    .ok_or_else(|| {
+                        VeinError::planning(
+                            format!(
+                                "ORDER BY column '{}' is absent from its output schema",
+                                column.name
+                            ),
+                            None,
+                        )
+                    })?,
+                _ => {
+                    let position = schema.fields.len() + computed_index;
+                    computed_index += 1;
+                    position
+                }
+            };
+            let column = u32::try_from(position)
+                .map_err(|_| VeinError::planning("ORDER BY has too many output columns", None))?;
+            Ok(PhysicalSortKey {
+                column,
+                ascending: key.asc,
+                nulls_first: key.nulls_first,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if keys.is_empty() {
+        return Err(VeinError::planning("ORDER requires at least one sort key", None));
+    }
+    Ok(SortPlan { keys })
+}
+
+fn compile_sort_key_program(
+    sort_keys: &[LogicalSortKey],
+    schema: &VeinSchema,
+) -> Result<Option<MicroProgram>> {
+    if sort_keys
+        .iter()
+        .all(|key| matches!(&key.expr, LogicalExpr::Column(_)))
+    {
+        return Ok(None);
+    }
+
+    let mut compiler = BytecodeCompiler::new(schema.fields.len() as RegId);
+    let mut output_registers = (0..schema.fields.len())
+        .map(|index| index as RegId)
+        .collect::<Vec<_>>();
+    for key in sort_keys {
+        if !matches!(&key.expr, LogicalExpr::Column(_)) {
+            output_registers.push(compiler.compile_expr(&key.expr, schema)?);
+        }
+    }
+    compiler.compile_projection_registers(output_registers);
+    Ok(Some(compiler.finish()))
+}
+
 fn contains_sort(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Sort { .. } => true,
@@ -832,7 +938,7 @@ mod tests {
     use std::sync::Arc;
 
     use catalog::{ColumnStatistics, TableMetadata, TableStatistics};
-    use common::protocol::{SortKey as PhysicalSortKey, SortPlan};
+    use common::protocol::{JoinOutput, MicroOp, SortKey as PhysicalSortKey, SortPlan};
     use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
     use plan::{LogicalExpr, LogicalLiteral, LogicalPlan, SortKey as LogicalSortKey};
 
@@ -910,7 +1016,7 @@ mod tests {
             &plan,
             &built_child_schema,
         )
-        .expect("the project must bind against the already-built filtered join schema");
+            .expect("the project must bind against the already-built filtered join schema");
 
         assert_eq!(output_schema.fields.len(), 1);
         assert!(!program.instructions.iter().any(|instruction| matches!(
@@ -942,6 +1048,36 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[test]
+    fn compiles_recursive_sort_after_a_limit_without_reordering_the_nodes() {
+        let (schema, column) = schema();
+        let limited = LogicalPlan::Limit {
+            input: Box::new(external_scan(&schema)),
+            offset: 1,
+            count: 2,
+            schema: Box::new(schema.clone()),
+        };
+        let sort = LogicalPlan::Sort {
+            input: Box::new(limited),
+            sort_keys: vec![LogicalSortKey {
+                expr: LogicalExpr::Column(column),
+                asc: true,
+                nulls_first: false,
+            }],
+            schema: Box::new(schema),
+        };
+
+        let (plan, key_program) = PipelineCompiler::recursive_sort(&sort)
+            .expect("recursive sort planning")
+            .expect("sort node should compile");
+
+        assert_eq!(plan.keys[0].column, 1);
+        assert!(plan.keys[0].ascending);
+        assert!(key_program.is_none());
+        assert!(PipelineCompiler::sort(&sort).is_err(),
+            "root ORDER keeps its existing sort-after-limit validation");
     }
 
     #[test]
@@ -1178,5 +1314,43 @@ mod tests {
             .expect("plan unestimated aggregate")
             .expect("aggregate plan");
         assert_eq!(unestimated.estimated_groups, None);
+    }
+
+    #[test]
+    fn zero_column_distinct_plan_does_not_seed_empty_input_group() {
+        let schema = VeinSchema::empty();
+        let distinct = LogicalPlan::Distinct {
+            input: Box::new(external_scan(&schema)),
+            schema: Box::new(schema),
+        };
+
+        let plan = PipelineCompiler::aggregate(&distinct)
+            .expect("plan distinct")
+            .expect("distinct uses aggregate state");
+
+        assert_eq!(plan.groups, 0);
+        assert!(!plan.emit_empty_group_on_empty_input);
+    }
+
+    #[test]
+    fn compiles_join_residual_against_only_referenced_build_columns() {
+        let probe_key = Arc::new(ResolvedColumn::new(ColumnId(1), "probe_key", None, VeinDataType::Int64));
+        let build_key = Arc::new(ResolvedColumn::new(ColumnId(2), "build_key", None, VeinDataType::Int64));
+        let build_comment = Arc::new(ResolvedColumn::new(ColumnId(3), "comment", None, VeinDataType::Utf8));
+        let probe = VeinSchema::new(vec![Arc::clone(&probe_key)]);
+        let build = VeinSchema::new(vec![Arc::clone(&build_key), Arc::clone(&build_comment)]);
+        let predicate = LogicalExpr::Like {
+            expr: Box::new(LogicalExpr::Column(build_comment)),
+            pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String("%special%requests%".into()))),
+            negated: true,
+        };
+
+        let residual = PipelineCompiler::compile_join_residual(&[predicate], &probe, &build, 0)
+            .expect("join residual should compile")
+            .expect("predicate should produce a residual plan");
+
+        assert_eq!(residual.input_columns, vec![JoinOutput::Build(1)]);
+        assert!(residual.program.instructions.iter().any(|op| matches!(op, MicroOp::Like { negated: true, .. })));
+        assert!(residual.program.instructions.iter().any(|op| matches!(op, MicroOp::FilterMask { .. })));
     }
 }

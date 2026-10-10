@@ -17,6 +17,6 @@ pub mod spec;
 
 pub use gather::{OutputColumn, assemble};
 pub use hash_table::{HashTable, JoinKeys};
-pub use hash_join::{BuildSink, HashJoin};
+pub use hash_join::{BuildSink, HashJoin, JoinFilterCollector};
 pub use rows::{JoinType, OutputRow, output_rows};
 pub use spec::JoinSpec;

@@ -7,7 +7,7 @@ use common::Result;
 use common::identifiers::{PartitionId, StageId, TaskId};
 use common::protocol::{
     DataSink, DataSource, JoinKind, JoinOutput, JoinPlan, LimitSpec, MicroProgram,
-    PhysicalInputPlan, SortPlan,
+    PhysicalInputPlan,
 };
 use error::VeinError;
 use parser::ast::expr::BinaryOp;
@@ -49,9 +49,6 @@ impl DefaultPipelineStageBuilder {
     fn build_join(
         &self,
         plan: &LogicalPlan,
-        limit: Option<LimitSpec>,
-        sort: Option<SortPlan>,
-        sort_key_program: Option<Arc<MicroProgram>>,
     ) -> Result<Stage> {
         let (input_plan, schema) = self.compile_join_input_or_leaf(plan)?;
 
@@ -66,10 +63,7 @@ impl DefaultPipelineStageBuilder {
                     schema: Arc::new(schema.clone()),
                 }),
             )
-                .with_input_plan(Arc::new(input_plan))
-                .with_limit(limit)
-                .with_sort(sort)
-                .with_sort_key_program(sort_key_program, Some(schema.fields.len() as u32)),
+                .with_input_plan(Arc::new(input_plan)),
         );
         Ok(stage)
     }
@@ -93,15 +87,36 @@ impl DefaultPipelineStageBuilder {
 
         let mut probe_keys = Vec::new();
         let mut build_keys = Vec::new();
+        let residual;
         if using.is_empty() {
-            let (probe_key, build_key) = equality_keys(on.as_ref(), &probe_schema, &build_schema)?;
-            probe_keys.push(probe_key);
-            build_keys.push(build_key);
+            let mut conjuncts = Vec::new();
+            if let Some(on) = on {
+                flatten_conjunction(on, &mut conjuncts);
+            }
+            let (keys, residual_conjuncts) =
+                extract_equi_join_keys(&conjuncts, &probe_schema, &build_schema)?;
+            (probe_keys, build_keys) = keys;
+            residual = PipelineCompiler::compile_join_residual(
+                &residual_conjuncts,
+                &probe_schema,
+                &build_schema,
+                probe_keys[0],
+            )?;
         } else {
             for column in using {
                 probe_keys.push(position(&probe_schema, &column.name)?);
                 build_keys.push(position(&build_schema, &column.name)?);
             }
+            let mut conjuncts = Vec::new();
+            if let Some(on) = on {
+                flatten_conjunction(on, &mut conjuncts);
+            }
+            residual = PipelineCompiler::compile_join_residual(
+                &conjuncts.into_iter().cloned().collect::<Vec<_>>(),
+                &probe_schema,
+                &build_schema,
+                probe_keys[0],
+            )?;
         }
 
         let (outputs, output_schema) = available_join_outputs(schema, &probe_schema, &build_schema);
@@ -131,6 +146,7 @@ impl DefaultPipelineStageBuilder {
             join_type: join_kind(join_type)?,
             probe_keys,
             build_keys,
+            residual,
             outputs,
             probe_types: probe_schema.fields.iter().map(|field| field.data_type.clone()).collect(),
             build_types: build_schema.fields.iter().map(|field| field.data_type.clone()).collect(),
@@ -150,7 +166,8 @@ impl DefaultPipelineStageBuilder {
             | LogicalPlan::SubqueryAlias { input, .. }
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
-            | LogicalPlan::Aggregate { input, .. } => Self::contains_join(input),
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. } => Self::contains_join(input),
             _ => false,
         }
     }
@@ -161,24 +178,29 @@ impl DefaultPipelineStageBuilder {
     ) -> Result<(PhysicalInputPlan, VeinSchema)> {
         match plan {
             LogicalPlan::Join { .. } => self.compile_join_input(plan),
-            LogicalPlan::Aggregate { input, .. } if Self::contains_join(input) => {
-                let (child, child_schema) = self.compile_join_input_or_leaf(input)?;
-                let (program, output_schema) =
-                    PipelineCompiler::compile_join_transform(plan, &child_schema)?;
-                let aggregate = PipelineCompiler::aggregate(plan)?.ok_or_else(|| {
-                    VeinError::planning("aggregate input did not produce an aggregate plan", None)
-                })?;
-                Ok((
-                    PhysicalInputPlan::Aggregate {
-                        input: Box::new(PhysicalInputPlan::Transform {
-                            input: Box::new(child),
-                            program: Arc::new(program),
-                        }),
-                        plan: aggregate,
-                    },
-                    output_schema,
-                ))
-            }
+            LogicalPlan::Aggregate { input, .. } | LogicalPlan::Distinct { input, .. }
+            if Self::contains_join(input) =>
+                {
+                    let (child, child_schema) = self.compile_join_input_or_leaf(input)?;
+                    let (program, output_schema) =
+                        PipelineCompiler::compile_join_transform(plan, &child_schema)?;
+                    let aggregate = PipelineCompiler::aggregate(plan)?.ok_or_else(|| {
+                        VeinError::planning(
+                            "recursive aggregate input did not produce an aggregate plan",
+                            None,
+                        )
+                    })?;
+                    Ok((
+                        PhysicalInputPlan::Aggregate {
+                            input: Box::new(PhysicalInputPlan::Transform {
+                                input: Box::new(child),
+                                program: Arc::new(program),
+                            }),
+                            plan: aggregate,
+                        },
+                        output_schema,
+                    ))
+                }
             LogicalPlan::Aggregate { .. } => {
                 let (source, program, output_schema) = self.compile_pipeline(plan)?;
                 let aggregate = PipelineCompiler::aggregate(plan)?.ok_or_else(|| {
@@ -195,11 +217,40 @@ impl DefaultPipelineStageBuilder {
                     output_schema,
                 ))
             }
+            // Keep ordering and row-window boundaries in the recursive tree:
+            // moving them to task-level metadata can change their order relative
+            // to joins and blocking operators such as aggregates.
+            LogicalPlan::Sort { input, .. } if Self::contains_join(input) => {
+                let (child, child_schema) = self.compile_join_input_or_leaf(input)?;
+                let (sort_plan, key_program) = PipelineCompiler::recursive_sort(plan)?.ok_or_else(|| {
+                    VeinError::planning("recursive sort did not produce a sort plan", None)
+                })?;
+                let output_columns = u32::try_from(child_schema.fields.len()).map_err(|_| {
+                    VeinError::planning("recursive sort input has too many columns", None)
+                })?;
+                Ok((
+                    PhysicalInputPlan::Sort {
+                        input: Box::new(child),
+                        plan: sort_plan,
+                        key_program: key_program.map(Arc::new),
+                        output_columns,
+                    },
+                    child_schema,
+                ))
+            }
+            LogicalPlan::Limit { input, offset, count, .. } if Self::contains_join(input) => {
+                let (child, schema) = self.compile_join_input_or_leaf(input)?;
+                Ok((
+                    PhysicalInputPlan::Limit {
+                        input: Box::new(child),
+                        spec: LimitSpec { offset: *offset, count: *count },
+                    },
+                    schema,
+                ))
+            }
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::SubqueryAlias { input, .. }
-            | LogicalPlan::Sort { input, .. }
-            | LogicalPlan::Limit { input, .. }
             if Self::contains_join(input) =>
                 {
                     let (child, child_schema) = self.compile_join_input_or_leaf(input)?;
@@ -225,6 +276,67 @@ impl DefaultPipelineStageBuilder {
             }
         }
     }
+}
+
+fn flatten_conjunction<'a>(expression: &'a LogicalExpr, output: &mut Vec<&'a LogicalExpr>) {
+    if let LogicalExpr::BinaryOp {
+        left,
+        op: BinaryOp::And,
+        right,
+        ..
+    } = expression
+    {
+        flatten_conjunction(left, output);
+        flatten_conjunction(right, output);
+    } else {
+        output.push(expression);
+    }
+}
+
+fn is_column_equality(expression: &LogicalExpr) -> bool {
+    matches!(
+        expression,
+        LogicalExpr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } if matches!(left.as_ref(), LogicalExpr::Column(_))
+            && matches!(right.as_ref(), LogicalExpr::Column(_))
+    )
+}
+
+/// Extract all column equalities that compare one probe column with one build
+/// column. Other conjuncts remain residual predicates, so same-side equalities
+/// and non-equality conditions still participate in the complete `ON` test.
+fn extract_equi_join_keys(
+    conjuncts: &[&LogicalExpr],
+    probe: &VeinSchema,
+    build: &VeinSchema,
+) -> Result<((Vec<u32>, Vec<u32>), Vec<LogicalExpr>)> {
+    let mut probe_keys = Vec::new();
+    let mut build_keys = Vec::new();
+    let mut residual = Vec::new();
+
+    for conjunct in conjuncts {
+        if is_column_equality(conjunct) {
+            if let Ok((probe_key, build_key)) = equality_keys(Some(conjunct), probe, build) {
+                probe_keys.push(probe_key);
+                build_keys.push(build_key);
+                continue;
+            }
+        }
+        residual.push((*conjunct).clone());
+    }
+
+    if probe_keys.is_empty() {
+        return Err(VeinError::planning(
+            "a hash join needs at least one equality between probe-side and build-side columns in its ON condition",
+            None,
+        ));
+    }
+
+    Ok(((probe_keys, build_keys), residual))
 }
 
 /// The protocol's join flavour, refusing the ones this engine cannot run rather
@@ -273,19 +385,24 @@ fn equality_keys(
             None,
         ));
     };
-    let probe_key =
-        probe
-            .position_of_id(left.id)
-            .ok_or_else(|| {
-                VeinError::planning(format!("join key {} is not on the probe side", left.name), None)
-            })? as u32;
-    let build_key =
-        build
-            .position_of_id(right.id)
-            .ok_or_else(|| {
-                VeinError::planning(format!("join key {} is not on the build side", right.name), None)
-            })? as u32;
-    Ok((probe_key, build_key))
+    let left_probe = probe.position_of_id(left.id);
+    let left_build = build.position_of_id(left.id);
+    let right_probe = probe.position_of_id(right.id);
+    let right_build = build.position_of_id(right.id);
+
+    match (
+        (left_probe, left_build),
+        (right_probe, right_build),
+    ) {
+        ((Some(probe_key), None), (None, Some(build_key)))
+        | ((None, Some(build_key)), (Some(probe_key), None)) => {
+            Ok((probe_key as u32, build_key as u32))
+        }
+        _ => Err(VeinError::planning(
+            "join equality must compare one probe-side column with one build-side column",
+            None,
+        )),
+    }
 }
 
 fn position(schema: &VeinSchema, name: &str) -> Result<u32> {
@@ -434,14 +551,14 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
         &self,
         plan: &LogicalPlan,
     ) -> Result<Stage> {
+        if Self::contains_join(plan) {
+            return self.build_join(plan);
+        }
         let limit = PipelineCompiler::window(plan)?;
         let aggregate = PipelineCompiler::aggregate(plan)?;
         let sort = PipelineCompiler::sort(plan)?;
         let sort_key_program = PipelineCompiler::sort_key_program(plan)?.map(Arc::new);
         let post_aggregate_program = PipelineCompiler::post_aggregate_program(plan)?.map(Arc::new);
-        if Self::contains_join(plan) {
-            return self.build_join(plan, limit, sort, sort_key_program);
-        }
         let (source, program, out_schema) = self.compile_pipeline(plan)?;
         let sort_output_columns = sort_key_program
             .as_ref()
@@ -524,12 +641,196 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_file_scan_source, DefaultPipelineStageBuilder};
+    use super::{
+        equality_keys, extract_equi_join_keys, split_file_scan_source,
+        DefaultPipelineStageBuilder, PipelineStageBuilder,
+    };
     use common::identifiers::TaskId;
-    use common::protocol::{DataSource, FileFormat, FileScanTask};
-    use plan::schema::VeinSchema;
-    use plan::{LogicalExpr, LogicalPlan};
+    use common::protocol::{DataSource, FileFormat, FileScanTask, PhysicalInputPlan};
+    use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
+    use plan::{LogicalExpr, LogicalPlan, SortKey as LogicalSortKey};
     use std::sync::Arc;
+
+    fn test_column(id: usize, name: &str) -> Arc<ResolvedColumn> {
+        Arc::new(ResolvedColumn::new(
+            ColumnId(id),
+            name,
+            None,
+            VeinDataType::Int64,
+        ))
+    }
+
+    fn equality(left: Arc<ResolvedColumn>, right: Arc<ResolvedColumn>) -> LogicalExpr {
+        LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(left)),
+            op: parser::ast::expr::BinaryOp::Eq,
+            right: Box::new(LogicalExpr::Column(right)),
+            return_type: VeinDataType::Boolean,
+        }
+    }
+
+    fn join_key_schemas() -> (VeinSchema, VeinSchema, Arc<ResolvedColumn>, Arc<ResolvedColumn>) {
+        let probe_key = test_column(11, "key");
+        let build_key = test_column(21, "key");
+        let probe_schema = VeinSchema::new(vec![test_column(10, "other"), Arc::clone(&probe_key)]);
+        let build_schema = VeinSchema::new(vec![Arc::clone(&build_key), test_column(22, "other")]);
+        (probe_schema, build_schema, probe_key, build_key)
+    }
+
+    #[test]
+    fn resolves_probe_to_build_equality_keys() {
+        let (probe, build, probe_key, build_key) = join_key_schemas();
+
+        assert_eq!(
+            equality_keys(Some(&equality(probe_key, build_key)), &probe, &build)
+                .expect("probe-to-build equality should resolve"),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn resolves_build_to_probe_equality_keys() {
+        let (probe, build, probe_key, build_key) = join_key_schemas();
+
+        assert_eq!(
+            equality_keys(Some(&equality(build_key, probe_key)), &probe, &build)
+                .expect("build-to-probe equality should resolve"),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn extracts_composite_equi_join_keys_and_keeps_other_conjuncts_residual() {
+        let probe_key = test_column(11, "probe_key");
+        let probe_region = test_column(12, "probe_region");
+        let probe_value = test_column(10, "probe_value");
+        let build_key = test_column(21, "build_key");
+        let build_region = test_column(23, "build_region");
+        let build_value = test_column(22, "build_value");
+        let probe = VeinSchema::new(vec![
+            Arc::clone(&probe_value),
+            Arc::clone(&probe_key),
+            Arc::clone(&probe_region),
+        ]);
+        let build = VeinSchema::new(vec![
+            Arc::clone(&build_key),
+            Arc::clone(&build_value),
+            Arc::clone(&build_region),
+        ]);
+        let residual = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(probe_value)),
+            op: parser::ast::expr::BinaryOp::Gt,
+            right: Box::new(LogicalExpr::Column(build_value)),
+            return_type: VeinDataType::Boolean,
+        };
+        let conjuncts = [
+            equality(Arc::clone(&probe_key), Arc::clone(&build_key)),
+            equality(Arc::clone(&build_region), Arc::clone(&probe_region)),
+            residual.clone(),
+        ];
+        let conjunct_refs: Vec<_> = conjuncts.iter().collect();
+
+        let ((probe_keys, build_keys), residuals) =
+            extract_equi_join_keys(&conjunct_refs, &probe, &build)
+                .expect("both cross-input equalities should be hash keys");
+
+        assert_eq!(probe_keys, vec![1, 2]);
+        assert_eq!(build_keys, vec![0, 2]);
+        assert_eq!(residuals, vec![residual]);
+    }
+
+    #[test]
+    fn keeps_same_side_equality_residual_when_extracting_join_keys() {
+        let probe_key = test_column(11, "probe_key");
+        let probe_value = test_column(10, "probe_value");
+        let build_key = test_column(21, "build_key");
+        let probe = VeinSchema::new(vec![Arc::clone(&probe_value), Arc::clone(&probe_key)]);
+        let build = VeinSchema::new(vec![Arc::clone(&build_key)]);
+        let same_side = equality(Arc::clone(&probe_value), Arc::clone(&probe_key));
+        let cross_side = equality(Arc::clone(&build_key), Arc::clone(&probe_key));
+        let conjuncts = [same_side.clone(), cross_side];
+        let conjunct_refs: Vec<_> = conjuncts.iter().collect();
+
+        let ((probe_keys, build_keys), residuals) =
+            extract_equi_join_keys(&conjunct_refs, &probe, &build)
+                .expect("cross-input equality should provide the hash key");
+
+        assert_eq!(probe_keys, vec![1]);
+        assert_eq!(build_keys, vec![0]);
+        assert_eq!(residuals, vec![same_side]);
+    }
+
+    #[test]
+    fn rejects_equality_keys_from_the_same_input_side() {
+        let (probe, build, probe_key, _) = join_key_schemas();
+
+        let error = equality_keys(
+            Some(&equality(Arc::clone(&probe_key), probe_key)),
+            &probe,
+            &build,
+        )
+            .expect_err("same-side equality cannot be a hash join key");
+
+        assert!(error.to_string().contains("one probe-side column"));
+    }
+
+    #[test]
+    fn builds_recursive_sort_and_limit_nodes_without_duplicate_task_windows() {
+        let probe_column = test_column(1, "probe_key");
+        let build_column = test_column(2, "build_key");
+        let probe_schema = VeinSchema::new(vec![Arc::clone(&probe_column)]);
+        let build_schema = VeinSchema::new(vec![Arc::clone(&build_column)]);
+        let output_schema = VeinSchema::new(vec![Arc::clone(&probe_column), Arc::clone(&build_column)]);
+        let scan = |url: &str, schema: &VeinSchema| LogicalPlan::ExternalScan {
+            url: url.to_owned(),
+            options: Vec::new(),
+            files: Vec::new(),
+            schema: Box::new(schema.clone()),
+        };
+        let join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(scan("probe", &probe_schema)),
+            right: Box::new(scan("build", &build_schema)),
+            on: Some(equality(Arc::clone(&probe_column), Arc::clone(&build_column))),
+            using: Vec::new(),
+            schema: Box::new(output_schema.clone()),
+        };
+        let sort = |input| LogicalPlan::Sort {
+            input: Box::new(input),
+            sort_keys: vec![LogicalSortKey {
+                expr: LogicalExpr::Column(Arc::clone(&probe_column)),
+                asc: true,
+                nulls_first: false,
+            }],
+            schema: Box::new(output_schema.clone()),
+        };
+        let limit = |input| LogicalPlan::Limit {
+            input: Box::new(input),
+            offset: 1,
+            count: 2,
+            schema: Box::new(output_schema.clone()),
+        };
+
+        for plan in [limit(sort(join.clone())), sort(limit(join))] {
+            let stage = DefaultPipelineStageBuilder::new()
+                .build(&plan)
+                .expect("recursive join with sort and limit should plan");
+            let task = stage.tasks.first().expect("join stage task");
+
+            assert!(task.limit.is_none(), "recursive limit must not be applied twice");
+            assert!(task.sort.is_none(), "recursive sort must not be applied twice");
+            let input = task.input_plan.as_deref().expect("recursive input plan");
+            match (&plan, input) {
+                (LogicalPlan::Limit { .. }, PhysicalInputPlan::Limit { input, .. }) => {
+                    assert!(matches!(input.as_ref(), PhysicalInputPlan::Sort { .. }));
+                }
+                (LogicalPlan::Sort { .. }, PhysicalInputPlan::Sort { input, .. }) => {
+                    assert!(matches!(input.as_ref(), PhysicalInputPlan::Limit { .. }));
+                }
+                _ => panic!("root operator order must be preserved by recursive plan"),
+            }
+        }
+    }
 
     fn scan_plan() -> LogicalPlan {
         let schema = Arc::new(VeinSchema::empty());

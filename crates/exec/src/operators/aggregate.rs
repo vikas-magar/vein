@@ -1356,7 +1356,7 @@ impl AggregateSink {
 
     /// The finished groups, as one chunk in the plan's output types.
     pub fn finish(&mut self) -> Result<Vec<DataChunk>> {
-        if self.groups.is_empty() {
+        if self.groups.is_empty() && self.plan.emit_empty_group_on_empty_input {
             let empty_sets: Vec<usize> = self
                 .grouping_sets
                 .iter()
@@ -1385,16 +1385,19 @@ impl AggregateSink {
                         .saturating_add(self.plan.groups as u64);
                 }
             }
-            if self.groups.is_empty() {
-                return Ok(Vec::new());
-            }
+        }
+        if self.groups.is_empty() {
+            return Ok(Vec::new());
         }
         let output_materialize_started = Instant::now();
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.plan.types.len());
         for (column, data_type) in self.plan.types.iter().enumerate() {
             arrays.push(self.column(column, data_type)?);
         }
-        let output = vec![DataChunk::from_vectors(arrays)];
+        let output = vec![DataChunk::new(
+            arrays,
+            SelectionVector::new_dense(self.groups.len()),
+        )];
         self.metrics.output_materialize_ns = self
             .metrics
             .output_materialize_ns
@@ -1767,6 +1770,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max],
             aggregate_input_types: vec![VeinDataType::Decimal256(76, 0); 3],
             types: vec![VeinDataType::Decimal256(76, 0); 3],
@@ -1808,6 +1812,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Decimal256(76, 2)],
             types: vec![VeinDataType::Float64],
@@ -1843,6 +1848,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Decimal256(76, 0)],
             types: vec![VeinDataType::Decimal256(76, 0)],
@@ -1868,6 +1874,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Float16; 4],
             types: vec![
@@ -1929,6 +1936,7 @@ mod tests {
                 groups: 0,
                 estimated_groups: None,
                 grouping_sets: None,
+                emit_empty_group_on_empty_input: true,
                 aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
                 aggregate_input_types: vec![$data_type.clone(); 4],
                 types: vec![
@@ -2000,6 +2008,7 @@ mod tests {
                 groups: 1,
                 estimated_groups: None,
                 grouping_sets: None,
+                emit_empty_group_on_empty_input: true,
                 aggs: vec![AggOpCode::Sum],
                 aggregate_input_types: vec![VeinDataType::Int64],
                 types: vec![$data_type, VeinDataType::Int64],
@@ -2051,6 +2060,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::UInt64],
             types: vec![VeinDataType::UInt64],
@@ -2067,6 +2077,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::UInt64],
             types: vec![VeinDataType::Float64],
@@ -2097,6 +2108,7 @@ mod tests {
             groups: 1,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64, VeinDataType::Int64],
@@ -2138,6 +2150,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max],
             aggregate_input_types: vec![VeinDataType::Int64; 3],
             types: vec![VeinDataType::Int64; 3],
@@ -2181,6 +2194,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Decimal128(38, 2)],
             types: vec![VeinDataType::Decimal128(38, 2)],
@@ -2210,6 +2224,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Decimal128(15, 2)],
             types: vec![VeinDataType::Float64],
@@ -2234,6 +2249,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Float64],
@@ -2270,6 +2286,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Decimal128(19, 0)],
             types: vec![VeinDataType::Float64],
@@ -2295,6 +2312,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Float32],
             types: vec![VeinDataType::Float64],
@@ -2319,6 +2337,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Float32],
             types: vec![VeinDataType::Float64],
@@ -2346,6 +2365,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum, AggOpCode::Min, AggOpCode::Max, AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Int32; 4],
             types: vec![
@@ -2413,6 +2433,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![
                 AggOpCode::Sum,
                 AggOpCode::Min,
@@ -2540,6 +2561,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![
                 AggOpCode::Sum,
                 AggOpCode::Min,
@@ -2579,6 +2601,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64],
@@ -2600,6 +2623,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Decimal128(38, 0)],
             types: vec![VeinDataType::Decimal128(38, 0)],
@@ -2619,6 +2643,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![
                 AggOpCode::Count,
                 AggOpCode::Sum,
@@ -2696,6 +2721,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Count, AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64, VeinDataType::Float64],
             types: vec![VeinDataType::Int64, VeinDataType::Float64],
@@ -2726,11 +2752,41 @@ mod tests {
     }
 
     #[test]
+    fn zero_column_distinct_emits_one_row_only_for_nonempty_input() {
+        let distinct_plan = || AggregatePlan {
+            groups: 0,
+            estimated_groups: None,
+            grouping_sets: Some(vec![vec![]]),
+            emit_empty_group_on_empty_input: false,
+            aggs: Vec::new(),
+            aggregate_input_types: Vec::new(),
+            types: Vec::new(),
+        };
+
+        let mut empty = AggregateSink::new(distinct_plan()).expect("create empty distinct sink");
+        assert!(empty.finish().expect("finish empty distinct").is_empty());
+
+        let mut nonempty = AggregateSink::new(distinct_plan()).expect("create distinct sink");
+        nonempty
+            .accumulate(DataChunk::new(
+                Vec::new(),
+                SelectionVector::new_dense(4),
+            ))
+            .expect("accumulate zero-column input rows");
+        let output = nonempty.finish().expect("finish distinct");
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].num_columns(), 0);
+        assert_eq!(output[0].num_rows(), 1);
+    }
+
+    #[test]
     fn empty_global_average_uses_its_declared_input_type() {
         let plan = AggregatePlan {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Avg],
             aggregate_input_types: vec![VeinDataType::Float32],
             types: vec![VeinDataType::Float64],
@@ -2755,6 +2811,7 @@ mod tests {
             groups: 2,
             estimated_groups: None,
             grouping_sets: Some(vec![vec![0, 1], vec![0], vec![]]),
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64, VeinDataType::Utf8, VeinDataType::Int64],
@@ -2811,6 +2868,7 @@ mod tests {
             groups: 1,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Utf8, VeinDataType::Int64],
@@ -2881,6 +2939,7 @@ mod tests {
             groups: 1,
             estimated_groups: None,
             grouping_sets: Some(vec![vec![0], vec![]]),
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Count],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64, VeinDataType::Int64],
@@ -2914,6 +2973,7 @@ mod tests {
             groups: 1,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Sum],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64, VeinDataType::Int64],
@@ -2976,6 +3036,7 @@ mod tests {
             groups: 1,
             estimated_groups: Some(4),
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Count],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64, VeinDataType::Int64],
@@ -2998,6 +3059,7 @@ mod tests {
             groups: 1,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Count],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64, VeinDataType::Int64],
@@ -3024,6 +3086,7 @@ mod tests {
             groups: 1,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Count],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64, VeinDataType::Int64],

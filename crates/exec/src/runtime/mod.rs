@@ -19,7 +19,7 @@ use tracing::Instrument;
 
 use crate::operators::{LimitTransform, SortTransform};
 use crate::operators::aggregate;
-use crate::operators::join::{BuildSink, HashJoin, HashTable, JoinKeys, JoinType, OutputColumn};
+use crate::operators::join::{BuildSink, HashJoin, HashTable, JoinFilterCollector, JoinKeys, JoinType, OutputColumn};
 use crate::operators::sink::WriteReceipt;
 use crate::pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
 use common::Result;
@@ -423,6 +423,45 @@ impl DefaultTaskExecutor {
                     );
                     Ok(bytes)
                 }
+                PhysicalInputPlan::Sort {
+                    input,
+                    plan,
+                    key_program,
+                    output_columns,
+                } => {
+                    let output_columns = usize::try_from(*output_columns).map_err(|_| {
+                        VeinError::planning("recursive sort output width is invalid", None)
+                    })?;
+                    let sort: Box<dyn PipelineNode<DataChunk>> = Box::new(
+                        SortTransform::with_output_columns(
+                            plan.clone(),
+                            Some(output_columns),
+                            next,
+                        ),
+                    );
+                    let next: Box<dyn PipelineNode<DataChunk>> = match key_program {
+                        Some(program) => Box::new(TransformHandle(
+                            self.builder.build_vm(program, sort)?,
+                        )),
+                        None => sort,
+                    };
+                    let bytes = self
+                        .execute_input(input, next, task, cancel, span, depth + 1)
+                        .await?;
+                    Ok(bytes)
+                }
+                PhysicalInputPlan::Limit { input, spec } => {
+                    let limit = LimitTransform::new(spec.offset, spec.count, next);
+                    self.execute_input(
+                        input,
+                        Box::new(limit),
+                        task,
+                        cancel,
+                        span,
+                        depth + 1,
+                    )
+                    .await
+                }
                 PhysicalInputPlan::Join { probe, build, plan } => {
                     let started = Instant::now();
                     let build_sink = Arc::new(Mutex::new(Some(BuildSink::new(
@@ -453,6 +492,7 @@ impl DefaultTaskExecutor {
                         join_types(&plan.build_types),
                         next,
                     );
+                    let join = install_join_residual(self.builder.as_ref(), plan, join)?;
                     let probe_rows = Arc::new(AtomicU64::new(0));
                     let probe_batches = Arc::new(AtomicU64::new(0));
                     let probe_started = Instant::now();
@@ -550,7 +590,7 @@ impl DefaultTaskExecutor {
             )?;
 
             let vm_started = Instant::now();
-            let mut vm = HashJoin::new(
+            let vm = HashJoin::new(
                 Arc::clone(&table),
                 kind,
                 columns.clone(),
@@ -558,6 +598,10 @@ impl DefaultTaskExecutor {
                 build_types.clone(),
                 head,
             );
+            let plan = task.join.as_ref().ok_or_else(|| {
+                VeinError::internal("join plan missing while building its probe pipeline")
+            })?;
+            let mut vm = install_join_residual(self.builder.as_ref(), plan, vm)?;
             vm_build_us += vm_started.elapsed().as_micros() as u64;
 
             let source_started = Instant::now();
@@ -942,6 +986,23 @@ impl DefaultTaskExecutor {
     }
 }
 
+fn install_join_residual(
+    builder: &dyn ExecutorBuilder,
+    plan: &JoinPlan,
+    join: HashJoin,
+) -> Result<HashJoin> {
+    let Some(residual) = &plan.residual else {
+        return Ok(join);
+    };
+    let collector = JoinFilterCollector::default();
+    let vm = builder.build_vm(&residual.program, Box::new(collector.clone()))?;
+    Ok(join.with_residual_filter(
+        join_outputs(&residual.input_columns),
+        vm,
+        collector,
+    ))
+}
+
 #[async_trait]
 impl TaskExecutor for DefaultTaskExecutor {
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult> {
@@ -1070,11 +1131,12 @@ fn join_types(types: &[VeinDataType]) -> Vec<DataType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
     use crate::operators::source::MemorySource;
     use common::identifiers::{QueryId, RequestId, StageId, TaskId};
     use common::protocol::{
-        AggOpCode, AggregatePlan, ExecutionMode, JoinKind, JoinOutput, JoinPlan, MicroOp,
-        PhysicalInputPlan,
+        AggOpCode, AggregatePlan, ExecutionMode, JoinKind, JoinOutput, JoinPlan, LimitSpec,
+        MicroOp, PhysicalInputPlan, SortKey, SortPlan,
     };
 
     /// A builder whose only difference from the default is that it can
@@ -1197,6 +1259,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: Some(vec![vec![]]),
+            emit_empty_group_on_empty_input: true,
             aggs: vec![AggOpCode::Count],
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![VeinDataType::Int64],
@@ -1302,6 +1365,7 @@ mod tests {
             groups: 0,
             estimated_groups: None,
             grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
             aggs: vec![common::protocol::AggOpCode::Count],
             aggregate_input_types: vec![types::VeinDataType::Int64],
             types: vec![types::VeinDataType::Int64],
@@ -1360,6 +1424,7 @@ mod tests {
             join_type: JoinKind::Inner,
             probe_keys: vec![0],
             build_keys: vec![0],
+            residual: None,
             outputs: vec![JoinOutput::Probe(0)],
             probe_types: vec![types::VeinDataType::Int64],
             build_types: vec![types::VeinDataType::Int64],
@@ -1406,6 +1471,7 @@ mod tests {
             join_type: JoinKind::Inner,
             probe_keys: vec![0],
             build_keys: vec![0],
+            residual: None,
             outputs: vec![JoinOutput::Probe(0)],
             probe_types: vec![types::VeinDataType::Int64],
             build_types: vec![types::VeinDataType::Int64],
@@ -1441,6 +1507,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recursive_left_join_applies_residual_before_preserving_unmatched_probe_rows() {
+        let leaf = || PhysicalInputPlan::Pipeline {
+            source: DataSource::Memory,
+            program: Arc::new(MicroProgram::empty()),
+        };
+        let mut task = task();
+        task.program = Arc::new(MicroProgram::empty());
+        task.input_plan = Some(Arc::new(PhysicalInputPlan::Join {
+            probe: Box::new(leaf()),
+            build: Box::new(leaf()),
+            plan: JoinPlan {
+                join_type: JoinKind::Left,
+                probe_keys: vec![0],
+                build_keys: vec![0],
+                residual: Some(common::protocol::JoinResidualPlan {
+                    input_columns: vec![JoinOutput::Build(0)],
+                    program: Arc::new(MicroProgram::new(
+                        3,
+                        vec![
+                            common::protocol::MicroOp::LoadConstant {
+                                dst: 1,
+                                value: types::LogicalLiteral::Int64(3),
+                            },
+                            common::protocol::MicroOp::CmpLt { dst: 2, src1: 0, src2: 1 },
+                            common::protocol::MicroOp::FilterMask { bool_reg: 2 },
+                        ],
+                    )),
+                }),
+                outputs: vec![JoinOutput::Probe(0), JoinOutput::Build(0)],
+                probe_types: vec![types::VeinDataType::Int64],
+                build_types: vec![types::VeinDataType::Int64],
+            },
+        }));
+
+        let result = runner()
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("recursive left join with residual predicate should execute");
+
+        assert_eq!(result.row_count, 5);
+        let probe = result.output[0].column(0)
+            .as_any().downcast_ref::<arrow::array::Int64Array>().expect("probe output");
+        let build = result.output[0].column(1)
+            .as_any().downcast_ref::<arrow::array::Int64Array>().expect("build output");
+        assert_eq!((0..probe.len()).map(|i| probe.value(i)).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        assert_eq!((0..build.len()).map(|i| build.is_valid(i).then(|| build.value(i))).collect::<Vec<_>>(), vec![Some(1), Some(2), None, None, None]);
+    }
+
+    #[tokio::test]
+    async fn recursive_right_join_does_not_mark_residual_rejections_as_matches() {
+        let leaf = || PhysicalInputPlan::Pipeline {
+            source: DataSource::Memory,
+            program: Arc::new(MicroProgram::empty()),
+        };
+        let mut task = task();
+        task.program = Arc::new(MicroProgram::empty());
+        task.input_plan = Some(Arc::new(PhysicalInputPlan::Join {
+            probe: Box::new(leaf()),
+            build: Box::new(leaf()),
+            plan: JoinPlan {
+                join_type: JoinKind::Right,
+                probe_keys: vec![0],
+                build_keys: vec![0],
+                residual: Some(common::protocol::JoinResidualPlan {
+                    input_columns: vec![JoinOutput::Build(0)],
+                    program: Arc::new(MicroProgram::new(
+                        3,
+                        vec![
+                            common::protocol::MicroOp::LoadConstant {
+                                dst: 1,
+                                value: types::LogicalLiteral::Int64(3),
+                            },
+                            common::protocol::MicroOp::CmpLt { dst: 2, src1: 0, src2: 1 },
+                            common::protocol::MicroOp::FilterMask { bool_reg: 2 },
+                        ],
+                    )),
+                }),
+                outputs: vec![JoinOutput::Probe(0), JoinOutput::Build(0)],
+                probe_types: vec![types::VeinDataType::Int64],
+                build_types: vec![types::VeinDataType::Int64],
+            },
+        }));
+
+        let result = runner()
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("recursive right join with residual predicate should execute");
+
+        assert_eq!(result.row_count, 5);
+        let probe_rows = result.output.iter().flat_map(|batch| {
+            let probe = batch.column(0)
+                .as_any().downcast_ref::<arrow::array::Int64Array>().expect("probe output");
+            (0..probe.len()).map(|i| probe.is_valid(i).then(|| probe.value(i))).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        let build_rows = result.output.iter().flat_map(|batch| {
+            let build = batch.column(1)
+                .as_any().downcast_ref::<arrow::array::Int64Array>().expect("build output");
+            (0..build.len()).map(|i| build.value(i)).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        assert_eq!(probe_rows, vec![Some(1), Some(2), None, None, None]);
+        assert_eq!(build_rows, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
     async fn aggregates_recursive_input_before_forwarding_batches() {
         let mut task = task();
         task.program = Arc::new(MicroProgram::empty());
@@ -1453,6 +1623,7 @@ mod tests {
                 groups: 0,
                 estimated_groups: None,
                 grouping_sets: Some(vec![vec![]]),
+                emit_empty_group_on_empty_input: true,
                 aggs: vec![AggOpCode::Count],
                 aggregate_input_types: vec![types::VeinDataType::Int64],
                 types: vec![types::VeinDataType::Int64],
@@ -1471,5 +1642,217 @@ mod tests {
             .downcast_ref::<arrow::array::Int64Array>()
             .expect("count result should be int64");
         assert_eq!(count.value(0), 5);
+    }
+
+    #[tokio::test]
+    async fn distinct_aggregate_removes_duplicate_rows_from_recursive_join() {
+        let leaf = || PhysicalInputPlan::Pipeline {
+            source: DataSource::Memory,
+            program: Arc::new(MicroProgram::empty()),
+        };
+        let mut task = task();
+        task.program = Arc::new(MicroProgram::empty());
+        task.input_plan = Some(Arc::new(PhysicalInputPlan::Aggregate {
+            input: Box::new(PhysicalInputPlan::Join {
+                probe: Box::new(leaf()),
+                build: Box::new(leaf()),
+                plan: JoinPlan {
+                    join_type: JoinKind::Inner,
+                    probe_keys: vec![0],
+                    build_keys: vec![0],
+                    residual: None,
+                    outputs: vec![JoinOutput::Probe(0), JoinOutput::Build(0)],
+                    probe_types: vec![types::VeinDataType::Int64],
+                    build_types: vec![types::VeinDataType::Int64],
+                },
+            }),
+            plan: AggregatePlan {
+                groups: 2,
+                estimated_groups: None,
+                grouping_sets: Some(vec![vec![0, 1]]),
+                emit_empty_group_on_empty_input: false,
+                aggs: Vec::new(),
+                aggregate_input_types: Vec::new(),
+                types: vec![types::VeinDataType::Int64, types::VeinDataType::Int64],
+            },
+        }));
+
+        let result = runner_with_values(vec![1, 1, 2])
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("distinct aggregate should consume duplicate recursive join rows");
+
+        assert_eq!(result.row_count, 2);
+        let left = result.output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("left distinct key");
+        let right = result.output[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("right distinct key");
+        let rows: Vec<_> = (0..result.output[0].num_rows())
+            .map(|row| (left.value(row), right.value(row)))
+            .collect();
+        assert_eq!(rows, vec![(1, 1), (2, 2)]);
+    }
+
+    #[tokio::test]
+    async fn recursive_sort_and_limit_run_in_logical_order_over_join_output() {
+        let leaf = || PhysicalInputPlan::Pipeline {
+            source: DataSource::Memory,
+            program: Arc::new(MicroProgram::empty()),
+        };
+        let join = || PhysicalInputPlan::Join {
+            probe: Box::new(leaf()),
+            build: Box::new(leaf()),
+            plan: JoinPlan {
+                join_type: JoinKind::Inner,
+                probe_keys: vec![0],
+                build_keys: vec![0],
+                residual: None,
+                outputs: vec![JoinOutput::Probe(0)],
+                probe_types: vec![VeinDataType::Int64],
+                build_types: vec![VeinDataType::Int64],
+            },
+        };
+        let sort = |input| PhysicalInputPlan::Sort {
+            input: Box::new(input),
+            plan: SortPlan {
+                keys: vec![SortKey {
+                    column: 0,
+                    ascending: true,
+                    nulls_first: false,
+                }],
+            },
+            key_program: None,
+            output_columns: 1,
+        };
+        let mut task = task();
+        task.program = Arc::new(MicroProgram::empty());
+        task.input_plan = Some(Arc::new(PhysicalInputPlan::Limit {
+            input: Box::new(sort(join())),
+            spec: LimitSpec { offset: 1, count: 2 },
+        }));
+
+        let result = runner_with_values(vec![4, 1, 5, 2, 3])
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("recursive sort then limit should execute");
+
+        assert_eq!(result.row_count, 2);
+        let values = result.output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("sorted output column");
+        assert_eq!((0..values.len()).map(|row| values.value(row)).collect::<Vec<_>>(), vec![2, 3]);
+
+        // A limit below the sort selects the first two input rows, then orders
+        // only those rows. This must produce a different result from above.
+        task.input_plan = Some(Arc::new(sort(PhysicalInputPlan::Limit {
+            input: Box::new(join()),
+            spec: LimitSpec { offset: 0, count: 2 },
+        })));
+        let result = runner_with_values(vec![4, 1, 5, 2, 3])
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("recursive limit then sort should execute");
+        let values = result.output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("limited sorted output column");
+        assert_eq!((0..values.len()).map(|row| values.value(row)).collect::<Vec<_>>(), vec![1, 4]);
+    }
+
+    #[tokio::test]
+    async fn recursive_aggregate_filter_sort_limit_execute_once_in_order() {
+        let leaf = || PhysicalInputPlan::Pipeline {
+            source: DataSource::Memory,
+            program: Arc::new(MicroProgram::empty()),
+        };
+        let join = PhysicalInputPlan::Join {
+            probe: Box::new(leaf()),
+            build: Box::new(leaf()),
+            plan: JoinPlan {
+                join_type: JoinKind::Inner,
+                probe_keys: vec![0],
+                build_keys: vec![0],
+                residual: None,
+                outputs: vec![JoinOutput::Probe(0), JoinOutput::Probe(0)],
+                probe_types: vec![VeinDataType::Int64],
+                build_types: vec![VeinDataType::Int64],
+            },
+        };
+        let aggregate = PhysicalInputPlan::Aggregate {
+            input: Box::new(join),
+            plan: AggregatePlan {
+                groups: 1,
+                estimated_groups: None,
+                grouping_sets: Some(vec![vec![0]]),
+                emit_empty_group_on_empty_input: false,
+                aggs: vec![AggOpCode::Count],
+                aggregate_input_types: vec![VeinDataType::Int64],
+                types: vec![VeinDataType::Int64, VeinDataType::Int64],
+            },
+        };
+        let filtered = PhysicalInputPlan::Transform {
+            input: Box::new(aggregate),
+            program: Arc::new(MicroProgram::new(
+                4,
+                vec![
+                    MicroOp::LoadConstant {
+                        dst: 2,
+                        value: types::LogicalLiteral::Int64(1),
+                    },
+                    MicroOp::CmpGt {
+                        dst: 3,
+                        src1: 1,
+                        src2: 2,
+                    },
+                    MicroOp::FilterMask { bool_reg: 3 },
+                ],
+            )),
+        };
+        let sorted = PhysicalInputPlan::Sort {
+            input: Box::new(filtered),
+            plan: SortPlan {
+                keys: vec![SortKey {
+                    column: 1,
+                    ascending: false,
+                    nulls_first: false,
+                }],
+            },
+            key_program: None,
+            output_columns: 2,
+        };
+        let mut task = task();
+        task.program = Arc::new(MicroProgram::empty());
+        task.input_plan = Some(Arc::new(PhysicalInputPlan::Limit {
+            input: Box::new(sorted),
+            spec: LimitSpec { offset: 0, count: 1 },
+        }));
+
+        let result = runner_with_values(vec![3, 1, 1, 2])
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("recursive aggregate, filter, sort, and limit should execute");
+
+        assert_eq!(result.row_count, 1);
+        let key = result.output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("group key");
+        let count = result.output[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("group count");
+        assert_eq!(key.value(0), 1);
+        assert_eq!(count.value(0), 4);
     }
 }

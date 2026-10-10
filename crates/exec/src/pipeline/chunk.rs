@@ -3,7 +3,7 @@
 use arrow::array::{ArrayRef, UInt32Array};
 use arrow::compute::take;
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use common::arrow::SelectionVector;
 use common::Result;
 use error::VeinError;
@@ -86,7 +86,8 @@ impl DataChunk {
             columns.push(materialized);
         }
 
-        RecordBatch::try_new(schema, columns)
+        let options = RecordBatchOptions::new().with_row_count(Some(selected));
+        RecordBatch::try_new_with_options(schema, columns, &options)
             .map_err(|error| VeinError::internal(format!("materialize record batch failed: {error}")))
     }
 
@@ -113,5 +114,35 @@ impl DataChunk {
     /// Borrow the column array at `index`.
     pub fn column(&self, index: usize) -> &ArrayRef {
         &self.vectors[index]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataChunk;
+    use arrow::datatypes::Schema;
+    use common::arrow::SelectionVector;
+    use std::sync::Arc;
+
+    #[test]
+    fn materializes_zero_column_chunks_with_their_row_count() {
+        let chunk = DataChunk::new(Vec::new(), SelectionVector::new_dense(3));
+        let batch = chunk
+            .materialize(Arc::new(Schema::empty()))
+            .expect("zero-column batch should materialize");
+
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[test]
+    fn materializes_empty_zero_column_chunks_as_zero_rows() {
+        let chunk = DataChunk::new(Vec::new(), SelectionVector::new_dense(0));
+        let batch = chunk
+            .materialize(Arc::new(Schema::empty()))
+            .expect("empty zero-column batch should materialize");
+
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 0);
     }
 }

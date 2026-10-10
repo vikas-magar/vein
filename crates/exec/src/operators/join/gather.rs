@@ -56,7 +56,10 @@ pub fn assemble(
             OutputColumn::Build(index) => build_column(table, *index, rows, build_types)?,
         });
     }
-    Ok(vec![DataChunk::from_vectors(arrays)])
+    Ok(vec![DataChunk::new(
+        arrays,
+        common::arrow::SelectionVector::new_dense(rows.len()),
+    )])
 }
 
 /// Gathers one column from the probe chunk, or from a typed null when a row has
@@ -205,6 +208,26 @@ mod tests {
         assert_eq!(chunks.len(), 1, "a probe chunk yields one output chunk");
         assert_eq!(cells(&chunks[0], 0), vec![Some(20)]);
         assert_eq!(cells(&chunks[0], 1), vec![Some(20)]);
+    }
+
+    #[test]
+    fn zero_column_join_output_retains_joined_row_count() {
+        let (table, probe) = fixture(&[20], &[20, 30]);
+        let rows = output_rows(JoinType::Inner, &[0], &[(0, (0, 0))], &[]);
+
+        let chunks = assemble(
+            Some(&probe),
+            &table,
+            &rows,
+            &[],
+            &[DataType::Int64],
+            &[DataType::Int64],
+        )
+            .expect("assemble zero-column join output");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].num_columns(), 0);
+        assert_eq!(chunks[0].num_rows(), 1);
     }
 
     /// A probe chunk matching several build chunks still emits one chunk.

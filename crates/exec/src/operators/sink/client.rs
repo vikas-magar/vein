@@ -175,3 +175,27 @@ impl Sink<DataChunk> for CollectSink {
         self.rows_emitted
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CollectSink;
+    use crate::pipeline::{DataChunk, PipelineNode, Sink};
+    use common::arrow::SelectionVector;
+
+    #[test]
+    fn client_sink_preserves_zero_column_rows() {
+        let mut sink = CollectSink::new();
+        sink.push(DataChunk::new(
+            Vec::new(),
+            SelectionVector::new_dense(2),
+        ))
+            .expect("push zero-column chunk");
+
+        let batches = sink.collect();
+
+        assert_eq!(sink.row_count(), 2);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_columns(), 0);
+        assert_eq!(batches[0].num_rows(), 2);
+    }
+}
