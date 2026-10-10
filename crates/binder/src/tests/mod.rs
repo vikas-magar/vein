@@ -962,6 +962,24 @@ mod aggregate_types {
             expected
         );
     }
+
+    #[tokio::test]
+    async fn decimal_comparison_binds_both_sides_to_a_common_type() {
+        let plan = bind("FROM decimal_values |> WHERE amount > amount * 0.0001").await;
+        let LogicalPlan::Filter { predicate, .. } = plan else {
+            panic!("expected Filter plan");
+        };
+        let LogicalExpr::BinaryOp { left, right, .. } = predicate else {
+            panic!("expected a comparison predicate");
+        };
+        let common_type = left.data_type();
+        assert_eq!(right.data_type(), common_type);
+        assert_eq!(common_type, VeinDataType::Decimal128(35, 8));
+        assert!(
+            matches!(left.as_ref(), LogicalExpr::Cast { target_type, .. } if *target_type == common_type),
+            "the narrower decimal operand must be cast to the comparison type: {left:?}"
+        );
+    }
 }
 
 #[cfg(test)]

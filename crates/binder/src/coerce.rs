@@ -81,7 +81,18 @@ pub fn coerce_arithmetic(
         return Ok((right, left, right_type));
     }
 
-    coerce_types(left, right)
+    let (left, right, common_type) = coerce_types(left, right)?;
+    let result_type = if op == BinaryOp::Multiply {
+        types::coercion::decimal_multiply_result_type(
+            &left.data_type(),
+            &right.data_type(),
+        )?
+        .unwrap_or(common_type)
+    } else {
+        common_type
+    };
+
+    Ok((left, right, result_type))
 }
 
 /// Wraps `expr` in a `Cast` if its type differs from `target` (no-op otherwise).

@@ -58,6 +58,51 @@ pub fn unify_types(left: &VeinDataType, right: &VeinDataType) -> Result<VeinData
     ))
 }
 
+/// Returns Arrow's result type for multiplying two already-coerced decimal
+/// operands. Arrow grows precision by one digit beyond the sum of input
+/// precisions and adds the operand scales; result precision is capped at the
+/// selected decimal width's maximum, as in Arrow's decimal kernels.
+///
+/// Returns `Ok(None)` for non-decimal operands. An unrepresentable result scale
+/// is rejected during binding instead of failing later in vector execution.
+pub fn decimal_multiply_result_type(
+    left: &VeinDataType,
+    right: &VeinDataType,
+) -> Result<Option<VeinDataType>> {
+    if !matches!(left, VeinDataType::Decimal128(_, _) | VeinDataType::Decimal256(_, _))
+        || !matches!(right, VeinDataType::Decimal128(_, _) | VeinDataType::Decimal256(_, _))
+    {
+        return Ok(None);
+    }
+
+    let Some((left_precision, left_scale, left_is_decimal256)) = decimal_shape(left) else {
+        return Ok(None);
+    };
+    let Some((right_precision, right_scale, right_is_decimal256)) = decimal_shape(right) else {
+        return Ok(None);
+    };
+
+    let is_decimal256 = left_is_decimal256 || right_is_decimal256;
+    let max_precision = if is_decimal256 { 76 } else { 38 };
+    let precision = (left_precision + right_precision + 1).min(max_precision);
+    let scale = left_scale + right_scale;
+    if scale < 0 || scale > max_precision || precision < scale {
+        return Err(VeinError::semantic(
+            format!(
+                "decimal multiplication result cannot be represented: precision {precision}, scale {scale}"
+            ),
+            None,
+        ));
+    }
+
+    let result = if is_decimal256 {
+        VeinDataType::Decimal256(precision as u8, scale as i8)
+    } else {
+        VeinDataType::Decimal128(precision as u8, scale as i8)
+    };
+    Ok(Some(result))
+}
+
 fn common_timestamp_unit(left: TimeUnit, right: TimeUnit) -> TimeUnit {
     use TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
     let precision = |unit| match unit {
@@ -215,6 +260,31 @@ mod tests {
             unify_types(&VeinDataType::Int64, &VeinDataType::Decimal128(38, 20)).unwrap(),
             VeinDataType::Decimal256(39, 20)
         );
+    }
+
+    #[test]
+    fn decimal_multiplication_matches_arrow_precision_and_scale() {
+        assert_eq!(
+            decimal_multiply_result_type(
+                &VeinDataType::Decimal128(17, 4),
+                &VeinDataType::Decimal128(17, 4),
+            )
+                .unwrap(),
+            Some(VeinDataType::Decimal128(35, 8))
+        );
+        assert_eq!(
+            decimal_multiply_result_type(
+                &VeinDataType::Decimal256(40, 4),
+                &VeinDataType::Decimal256(40, 4),
+            )
+                .unwrap(),
+            Some(VeinDataType::Decimal256(76, 8))
+        );
+        assert!(decimal_multiply_result_type(
+            &VeinDataType::Decimal128(38, 20),
+            &VeinDataType::Decimal128(38, 20),
+        )
+            .is_err());
     }
 
     #[test]
