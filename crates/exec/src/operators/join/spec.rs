@@ -16,10 +16,18 @@ use arrow::datatypes::DataType;
 
 use crate::pipeline::{DataChunkView, PipelineNode};
 
-use super::gather::OutputColumn;
 use super::hash_join::{BuildSink, HashJoin};
 use super::hash_table::{HashTable, JoinKeys};
 use super::rows::JoinType;
+
+/// Maps an output column to its source side without materializing its values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputColumn {
+    /// A column of the probe view.
+    Probe(usize),
+    /// A column present in every retained build view.
+    Build(usize),
+}
 
 /// Everything a hash join needs that the planner decides.
 #[derive(Debug, Clone)]

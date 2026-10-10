@@ -52,7 +52,8 @@ pub async fn bind_extend<'a>(
                 name.unwrap_or_else(|| "_col".to_string()),
                 None,
                 expr.data_type(),
-            )),
+            )
+                .with_nullable(expr.nullable())),
         };
         new_fields.push(field);
         bound_exprs.push(expr);
@@ -100,7 +101,7 @@ pub async fn bind_set<'a>(
                 qualifier: col.qualifier.clone(),
                 data_type: bound_expr.data_type(),
                 is_factorized: false,
-                nullable: col.nullable,
+                nullable: bound_expr.nullable(),
             });
 
             if let Some(pos) = new_fields.iter().position(|f| f.name == col.name) {

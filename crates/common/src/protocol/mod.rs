@@ -17,6 +17,7 @@ pub use catalog::CatalogSnapshotToken;
 pub use task::{
     AggregatePlan, DataSink, DataSource, ExecuteTask, ExecutionMode, FileFormat, FileScanTask,
     KeyValue, JoinOutput, JoinPlan, JoinResidualPlan, LimitSpec, PhysicalPlan,
+    InputMaterialization, OperatorDataFlow, OutputRepresentation,
     PhysicalPlanNode, PhysicalPlanOperator, ScanPredicate, SortKey, SortPlan, StorageTarget,
     StreamSource,
 };

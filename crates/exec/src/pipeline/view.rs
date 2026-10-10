@@ -12,12 +12,48 @@ use std::sync::Arc;
 
 use arrow::array::{new_empty_array, new_null_array, Array, ArrayRef};
 use arrow::compute::interleave;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, SchemaRef};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use common::arrow::SelectionVector;
 use common::Result;
 use error::VeinError;
 
 use super::chunk::DataChunk;
+
+/// Describes the array work performed by an explicit view-to-chunk conversion.
+///
+/// Gathered output buffer bytes are Arrow's reported buffer footprint, not an
+/// exact count of bytes copied or newly allocated: dictionary and nested arrays
+/// may retain shared buffers. Shared slices and empty outputs contribute zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaterializationReport {
+    /// Columns produced by slicing existing source buffers without copying values.
+    pub shared_columns: usize,
+    /// Columns produced by gathering mapped rows into an Arrow array.
+    pub gathered_columns: usize,
+    /// Typed empty columns produced when there are no active rows.
+    pub empty_columns: usize,
+    /// Arrow buffer footprint of gathered outputs, excluding shared slices.
+    pub gathered_output_buffer_bytes: usize,
+}
+
+impl MaterializationReport {
+    pub(crate) fn accumulate(&mut self, other: Self) {
+        self.shared_columns = self.shared_columns.saturating_add(other.shared_columns);
+        self.gathered_columns = self.gathered_columns.saturating_add(other.gathered_columns);
+        self.empty_columns = self.empty_columns.saturating_add(other.empty_columns);
+        self.gathered_output_buffer_bytes = self
+            .gathered_output_buffer_bytes
+            .saturating_add(other.gathered_output_buffer_bytes);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ColumnMaterialization {
+    Shared,
+    Gathered,
+    Empty,
+}
 
 /// One physical source row, or the null extension for an outer join.
 ///
@@ -441,6 +477,125 @@ impl DataChunkView {
         Self::new(row_count, output, SelectionVector::new_dense(row_count))
     }
 
+    /// Composes output rows from several views while retaining their source arrays.
+    ///
+    /// `rows` contains `(input_index, logical_row)` pairs. Unlike [`Self::combine`],
+    /// each output column may draw rows from any input view, which is useful for
+    /// operators such as global sort that reorder rows across batches. Only row
+    /// mapping metadata and `Arc` handles are created; Arrow payload arrays are
+    /// never gathered here.
+    pub fn compose_rows(
+        inputs: &[&DataChunkView],
+        rows: &[(usize, usize)],
+        output_columns: usize,
+    ) -> Result<Self> {
+        if inputs.is_empty() && !rows.is_empty() {
+            return Err(VeinError::internal(
+                "composed view rows require at least one input view",
+            ));
+        }
+
+        for (output_row, (input_index, logical_row)) in rows.iter().copied().enumerate() {
+            let input = inputs.get(input_index).ok_or_else(|| {
+                VeinError::internal(format!(
+                    "composed output row {output_row} references missing input view {input_index}"
+                ))
+            })?;
+            if logical_row >= input.num_rows() {
+                return Err(VeinError::internal(format!(
+                    "composed output row {output_row} references logical row {logical_row}, but input view {input_index} has {} selected rows",
+                    input.num_rows()
+                )));
+            }
+        }
+
+        if let Some(first) = inputs.first() {
+            for (input_index, input) in inputs.iter().enumerate() {
+                if input.num_columns() < output_columns {
+                    return Err(VeinError::internal(format!(
+                        "composed input view {input_index} has {} columns, expected at least {output_columns}",
+                        input.num_columns()
+                    )));
+                }
+                for column_index in 0..output_columns {
+                    let expected = &first.columns[column_index].data_type;
+                    let actual = &input.columns[column_index].data_type;
+                    if actual != expected {
+                        return Err(VeinError::internal(format!(
+                            "composed input view {input_index} column {column_index} has type {actual:?}, expected {expected:?}"
+                        )));
+                    }
+                }
+            }
+        } else if output_columns != 0 {
+            return Err(VeinError::internal(
+                "composed output columns require at least one input view",
+            ));
+        }
+
+        let mut output = Vec::with_capacity(output_columns);
+        for column_index in 0..output_columns {
+            let data_type = inputs[0].columns[column_index].data_type.clone();
+            let mut arrays = Vec::<ArrayRef>::new();
+            let mut source_lengths = Vec::<usize>::new();
+            let mut source_by_pointer = HashMap::<usize, u32>::new();
+            let mut source_remap = inputs
+                .iter()
+                .map(|input| vec![None; input.columns[column_index].arrays.len()])
+                .collect::<Vec<Vec<Option<u32>>>>();
+
+            let mut mapped_rows = Vec::with_capacity(rows.len());
+            for (input_index, logical_row) in rows.iter().copied() {
+                let input = inputs[input_index];
+                let column = &input.columns[column_index];
+                let physical_row = input.selection.get_index(logical_row);
+                let source_row = column.mapping.source_row(physical_row)?;
+                let mapped = if let Some((source, row)) = source_row.indexes() {
+                    let source_index = source as usize;
+                    let array = column.arrays.get(source_index).ok_or_else(|| {
+                        VeinError::internal(format!(
+                            "composed view input {input_index} column {column_index} references missing source array {source}"
+                        ))
+                    })?;
+                    let global_source = if let Some(global_source) = source_remap[input_index][source_index] {
+                        global_source
+                    } else {
+                        let pointer = Arc::as_ptr(array) as *const () as usize;
+                        let global_source = if let Some(global_source) = source_by_pointer.get(&pointer) {
+                            *global_source
+                        } else {
+                            let global_source = u32::try_from(arrays.len()).map_err(|_| {
+                                VeinError::internal(
+                                    "composed view has more source arrays than its row mapping can represent",
+                                )
+                            })?;
+                            if global_source == u32::MAX {
+                                return Err(VeinError::internal(
+                                    "composed view source index exceeds the row mapping range",
+                                ));
+                            }
+                            arrays.push(Arc::clone(array));
+                            source_lengths.push(array.len());
+                            source_by_pointer.insert(pointer, global_source);
+                            global_source
+                        };
+                        source_remap[input_index][source_index] = Some(global_source);
+                        global_source
+                    };
+                    Some(SourceRow::new(global_source, row)?)
+                } else {
+                    None
+                };
+                mapped_rows.push(mapped);
+            }
+
+            let mapping = Arc::new(RowMapping::new(Arc::from(source_lengths), mapped_rows)?);
+            output.push(ViewColumn::new(arrays, data_type, mapping)?);
+        }
+
+        Self::new(rows.len(), output, SelectionVector::new_dense(rows.len()))
+    }
+
     /// Number of active output rows.
     pub fn num_rows(&self) -> usize {
         self.selection.size()
@@ -454,6 +609,14 @@ impl DataChunkView {
     /// Number of output columns.
     pub fn num_columns(&self) -> usize {
         self.columns.len()
+    }
+
+    /// The Arrow type of a logical output column, including null-extended columns.
+    pub fn column_data_type(&self, column: usize) -> Result<&DataType> {
+        self.columns
+            .get(column)
+            .map(|column| &column.data_type)
+            .ok_or_else(|| VeinError::internal(format!("view column {column} is out of bounds")))
     }
 
     /// The shared active-row selection.
@@ -483,11 +646,37 @@ impl DataChunkView {
     /// view payloads reference-backed until a consumer explicitly requests an
     /// array.
     pub fn materialize_column(&self, column_index: usize) -> Result<ArrayRef> {
+        self.materialize_column_impl(column_index).map(|(array, _)| array)
+    }
+
+    /// Materializes one active column and reports whether its buffers were
+    /// shared, gathered, or empty. Computed result allocations are not included.
+    pub fn materialize_column_with_report(
+        &self,
+        column_index: usize,
+    ) -> Result<(ArrayRef, MaterializationReport)> {
+        let (array, materialization) = self.materialize_column_impl(column_index)?;
+        let mut report = MaterializationReport::default();
+        match materialization {
+            ColumnMaterialization::Shared => report.shared_columns = 1,
+            ColumnMaterialization::Empty => report.empty_columns = 1,
+            ColumnMaterialization::Gathered => {
+                report.gathered_columns = 1;
+                report.gathered_output_buffer_bytes = array.get_buffer_memory_size();
+            }
+        }
+        Ok((array, report))
+    }
+
+    fn materialize_column_impl(
+        &self,
+        column_index: usize,
+    ) -> Result<(ArrayRef, ColumnMaterialization)> {
         let column = self.columns.get(column_index).ok_or_else(|| {
             VeinError::internal(format!("view column {column_index} is out of bounds"))
         })?;
         if self.selection.is_empty() {
-            return Ok(new_empty_array(&column.data_type));
+            return Ok((new_empty_array(&column.data_type), ColumnMaterialization::Empty));
         }
         if let Some((source, start, len)) =
             column.mapping.contiguous_source_range(&self.selection)
@@ -495,7 +684,7 @@ impl DataChunkView {
             let array = column.arrays.get(source).ok_or_else(|| {
                 VeinError::internal(format!("view source index {source} is out of bounds"))
             })?;
-            return Ok(array.slice(start, len));
+            return Ok((array.slice(start, len), ColumnMaterialization::Shared));
         }
 
         let mut source_arrays: Vec<&dyn Array> = column
@@ -533,13 +722,14 @@ impl DataChunkView {
 
         if can_slice {
             if let Some((array, start, len)) = contiguous {
-                return Ok(array.slice(start, len));
+                return Ok((array.slice(start, len), ColumnMaterialization::Shared));
             }
         }
 
         let null_array = new_null_array(&column.data_type, 1);
         source_arrays.push(null_array.as_ref());
         interleave(&source_arrays, &indexes)
+            .map(|array| (array, ColumnMaterialization::Gathered))
             .map_err(|error| VeinError::internal(format!("materialize view column failed: {error}")))
     }
 
@@ -547,13 +737,99 @@ impl DataChunkView {
     /// requires Arrow arrays. Contiguous source ranges remain zero-copy slices;
     /// mapped rows and null extensions are gathered by `materialize_column`.
     pub fn to_data_chunk(&self) -> Result<DataChunk> {
-        let columns = (0..self.num_columns())
-            .map(|column| self.materialize_column(column))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(DataChunk::new(
-            columns,
-            SelectionVector::new_dense(self.num_rows()),
+        self.to_data_chunk_with_report().map(|(chunk, _)| chunk)
+    }
+
+    /// Converts active rows once and reports whether columns shared or gathered
+    /// source buffers. The report is collected at the actual conversion branch;
+    /// it does not infer copying from the size of a potentially shared slice.
+    pub fn to_data_chunk_with_report(&self) -> Result<(DataChunk, MaterializationReport)> {
+        let (columns, report) = self.materialize_columns_with_report()?;
+        Ok((
+            DataChunk::new(columns, SelectionVector::new_dense(self.num_rows())),
+            report,
         ))
+    }
+
+    /// Checks the result schema against active rows without flattening the view.
+    ///
+    /// Non-nullable fields are checked only against selected rows, so excluded
+    /// source NULLs do not invalidate an otherwise valid result.
+    pub fn validate_schema(&self, schema: &arrow::datatypes::Schema) -> Result<()> {
+        self.validate_schema_types(schema)?;
+        for (index, field) in schema.fields().iter().enumerate() {
+            if !field.is_nullable() {
+                // Dense/contiguous non-NULL source ranges need no per-row scan.
+                let column = &self.columns[index];
+                if let Some((source, _, _)) =
+                    column.mapping.contiguous_source_range(&self.selection)
+                {
+                    if column.arrays[source].null_count() == 0 {
+                        continue;
+                    }
+                }
+                for row in 0..self.num_rows() {
+                    let null = match self.resolve(index, row)? {
+                        Some((array, source_row)) => array.is_null(source_row),
+                        None => true,
+                    };
+                    if null {
+                        return Err(VeinError::internal(format!(
+                            "view result column {index} ('{}') is non-nullable but contains NULL",
+                            field.name()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_schema_types(&self, schema: &arrow::datatypes::Schema) -> Result<()> {
+        if schema.fields().len() != self.num_columns() {
+            return Err(VeinError::internal(format!(
+                "view result has {} columns, schema requires {}",
+                self.num_columns(), schema.fields().len()
+            )));
+        }
+        for (index, field) in schema.fields().iter().enumerate() {
+            let actual = self.column_data_type(index)?;
+            if actual != field.data_type() {
+                return Err(VeinError::internal(format!(
+                    "view result column {index} ('{}') has type {actual:?}, expected {:?}",
+                    field.name(), field.data_type()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Converts active rows directly into a RecordBatch at the Arrow boundary.
+    ///
+    /// Uses the same conversion branches as kernel and chunk materialization:
+    /// contiguous mappings share buffers, arbitrary mappings gather once, and
+    /// zero-column results preserve their explicit selected row count.
+    pub fn to_record_batch_with_report(
+        &self,
+        schema: SchemaRef,
+    ) -> Result<(RecordBatch, MaterializationReport)> {
+        self.validate_schema_types(&schema)?;
+        let (columns, report) = self.materialize_columns_with_report()?;
+        let options = RecordBatchOptions::new().with_row_count(Some(self.num_rows()));
+        let batch = RecordBatch::try_new_with_options(schema, columns, &options)
+            .map_err(|error| VeinError::internal(format!("view result batch failed: {error}")))?;
+        Ok((batch, report))
+    }
+
+    fn materialize_columns_with_report(&self) -> Result<(Vec<ArrayRef>, MaterializationReport)> {
+        let mut columns = Vec::with_capacity(self.num_columns());
+        let mut report = MaterializationReport::default();
+        for column in 0..self.num_columns() {
+            let (array, column_report) = self.materialize_column_with_report(column)?;
+            report.accumulate(column_report);
+            columns.push(array);
+        }
+        Ok((columns, report))
     }
 
     /// Compacts the active logical rows into a dense view mapping without
@@ -1004,6 +1280,133 @@ mod tests {
             .expect("int64 output");
         assert_eq!(values, &Int64Array::from(vec![Some(20), None, Some(30)]));
         assert_eq!(chunk.num_rows(), 3);
+    }
+
+    #[test]
+    fn materialization_report_distinguishes_shared_buffers_and_null_extended_gathers() {
+        let source = ints(&[10, 20, 30]);
+        let shared = int64_mapping(&[3], &[
+            Some(SourceRow::new(0, 0).unwrap()),
+            Some(SourceRow::new(0, 1).unwrap()),
+            Some(SourceRow::new(0, 2).unwrap()),
+        ]);
+        let gathered = int64_mapping(&[3], &[
+            Some(SourceRow::new(0, 2).unwrap()),
+            None,
+            Some(SourceRow::new(0, 0).unwrap()),
+        ]);
+        let view = DataChunkView::new(3, vec![
+            view_column(vec![Arc::clone(&source)], shared),
+            view_column(vec![Arc::clone(&source)], gathered),
+        ], SelectionVector::new_dense(3)).unwrap();
+        let (chunk, report) = view.to_data_chunk_with_report().unwrap();
+        let mut column_reports = MaterializationReport::default();
+        for column in 0..view.num_columns() {
+            let (array, report) = view.materialize_column_with_report(column).unwrap();
+            assert_eq!(array.to_data(), chunk.column(column).to_data());
+            column_reports.accumulate(report);
+        }
+        assert_eq!(column_reports, report);
+        assert!(view.materialize_column_with_report(view.num_columns()).is_err());
+        let shared = chunk.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let gathered = chunk.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let original = source.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(shared.values().as_ptr(), original.values().as_ptr());
+        assert_eq!(gathered, &Int64Array::from(vec![Some(30), None, Some(10)]));
+        assert_eq!(report.shared_columns, 1);
+        assert_eq!(report.gathered_columns, 1);
+        assert_eq!(report.empty_columns, 0);
+        assert_eq!(report.gathered_output_buffer_bytes, gathered.get_buffer_memory_size());
+        assert!(report.gathered_output_buffer_bytes > 0);
+    }
+
+    #[test]
+    fn materialization_report_handles_empty_and_zero_column_batches() {
+        let empty = DataChunkView::from_chunk(DataChunk::new(
+            vec![ints(&[10, 20])], SelectionVector::new_sparse(vec![]),
+        )).unwrap();
+        let (chunk, report) = empty.to_data_chunk_with_report().unwrap();
+        assert_eq!(chunk.num_rows(), 0);
+        assert_eq!(chunk.column(0).data_type(), &DataType::Int64);
+        assert_eq!(report, MaterializationReport { empty_columns: 1, ..Default::default() });
+
+        let view = DataChunkView::new(3, vec![], SelectionVector::new_dense(3)).unwrap();
+        let (chunk, report) = view.to_data_chunk_with_report().unwrap();
+        assert_eq!(chunk.num_rows(), 3);
+        assert_eq!(chunk.num_columns(), 0);
+        assert_eq!(report, MaterializationReport::default());
+    }
+
+    #[test]
+    fn composing_reordered_rows_across_views_keeps_original_arrays() {
+        let first = ints(&[10, 99, 20]);
+        let second = ints(&[30, 40]);
+        let first_view = DataChunkView::from_chunk(DataChunk::new(
+            vec![Arc::clone(&first)],
+            SelectionVector::new_sparse(vec![2, 0]),
+        ))
+            .expect("first sparse view");
+        let second_view = DataChunkView::from_chunk(DataChunk::new(
+            vec![Arc::clone(&second)],
+            SelectionVector::new_dense(2),
+        ))
+            .expect("second view");
+
+        let output = DataChunkView::compose_rows(
+            &[&first_view, &second_view],
+            &[(1, 1), (0, 0), (0, 1), (1, 0)],
+            1,
+        )
+            .expect("compose reordered rows");
+
+        assert_eq!(
+            (0..output.num_rows())
+                .map(|row| int_at(&output, 0, row))
+                .collect::<Vec<_>>(),
+            vec![Some(40), Some(20), Some(10), Some(30)],
+        );
+        for row in 0..output.num_rows() {
+            let (array, _) = output.resolve(0, row).unwrap().unwrap();
+            assert!(Arc::ptr_eq(array, &first) || Arc::ptr_eq(array, &second));
+        }
+    }
+
+    #[test]
+    fn composing_rows_preserves_null_extensions_and_present_source_arrays() {
+        let null_extended_values = ints(&[10, 20]);
+        let present_values = ints(&[30, 40]);
+        let null_extended = DataChunkView::new(
+            2,
+            vec![view_column(
+                vec![Arc::clone(&null_extended_values)],
+                int64_mapping(
+                    &[2],
+                    &[Some(SourceRow::new(0, 1).unwrap()), None],
+                ),
+            )],
+            SelectionVector::new_dense(2),
+        )
+            .expect("outer-join view with a null-extended row");
+        let present = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+            Arc::clone(&present_values),
+        ]))
+            .expect("present input view");
+
+        let output = DataChunkView::compose_rows(
+            &[&null_extended, &present],
+            &[(0, 1), (1, 0)],
+            1,
+        )
+            .expect("compose a null extension and a present row");
+
+        assert!(output.is_null(0, 0).expect("preserved null extension"));
+        assert_eq!(int_at(&output, 0, 1), Some(30));
+        let (array, _) = output.resolve(0, 1).expect("resolve present row").unwrap();
+        assert!(Arc::ptr_eq(array, &present_values));
+        assert!(Arc::ptr_eq(
+            output.columns[0].source_arrays().first().unwrap(),
+            &present_values
+        ));
     }
 
     #[test]

@@ -12,4 +12,4 @@ pub mod view;
 pub use batch::PipelineBatch;
 pub use chunk::DataChunk;
 pub use node::{PipelineNode, Sink, Source, Transform};
-pub use view::{DataChunkView, RowMapping, SourceRow, ViewColumn, ViewColumnRef, ViewInputRows};
+pub use view::{DataChunkView, MaterializationReport, RowMapping, SourceRow, ViewColumn, ViewColumnRef, ViewInputRows};

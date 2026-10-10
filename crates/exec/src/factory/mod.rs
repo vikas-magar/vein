@@ -12,7 +12,7 @@ use crate::operators::sink::{CollectSink, DiscardSink, WriteSink, WriteStorage};
 use crate::operators::source::scan::ScanFile;
 use crate::operators::source::ScanSource;
 use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Sink, Source, Transform};
-use crate::runtime::ExecutorBuilder;
+use crate::runtime::{ExecutorBuilder, MaterializeViewNode};
 use crate::udf::FunctionRegistry;
 use crate::vm::VectorVmExecutor;
 use catalog::MetadataStore;
@@ -233,22 +233,19 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         )))
     }
 
-    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>> {
+    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunkView>>> {
         match sink {
             DataSink::Discard => Ok(Box::new(DiscardSink::new())),
             DataSink::Client { schema } => {
-                let field_names = schema
-                    .fields
-                    .iter()
-                    .map(|column| column.name.clone())
-                    .collect();
-                Ok(Box::new(CollectSink::with_field_names(field_names)))
+                Ok(Box::new(CollectSink::new(Arc::new(schema.to_arrow()))))
             }
             DataSink::Storage(target) => {
                 let storage = self.storage.as_ref().ok_or_else(|| {
                     VeinError::internal("WRITE requires a configured table storage backend")
                 })?;
-                Ok(Box::new(WriteSink::new(target.clone(), storage.clone())?))
+                Ok(Box::new(MaterializeViewNode::new(
+                    Box::new(WriteSink::new(target.clone(), storage.clone())?), "storage",
+                )))
             }
         }
     }
@@ -257,16 +254,11 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         &self,
         sink: &DataSink,
         output: flume::Sender<RecordBatch>,
-    ) -> Result<Box<dyn Sink<DataChunk>>> {
+    ) -> Result<Box<dyn Sink<DataChunkView>>> {
         match sink {
             DataSink::Client { schema } => {
-                let field_names = schema
-                    .fields
-                    .iter()
-                    .map(|column| column.name.clone())
-                    .collect();
-                Ok(Box::new(CollectSink::with_field_names_and_sender(
-                    field_names,
+                Ok(Box::new(CollectSink::with_sender(
+                    Arc::new(schema.to_arrow()),
                     output,
                 )))
             }

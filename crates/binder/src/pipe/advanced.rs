@@ -35,7 +35,8 @@ pub async fn bind_pivot<'a>(
             format!("{}_{}", alias.unwrap_or("pivot"), i),
             None,
             pivot_type.clone(),
-        )));
+        )
+            .with_nullable(aggregate_expr.nullable())));
     }
     scopes.push(Scope::unqualified(fields.clone()));
     Ok(LogicalPlan::Pivot {

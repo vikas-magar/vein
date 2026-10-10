@@ -6,7 +6,7 @@
 use super::ops;
 use super::register::RegisterFile;
 use crate::operators::sink::DiscardSink;
-use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Transform};
+use crate::pipeline::{DataChunk, DataChunkView, MaterializationReport, PipelineNode, Transform};
 use crate::udf::FunctionRegistry;
 use arrow::array::ArrayRef;
 use common::Result;
@@ -26,6 +26,10 @@ struct VmStats {
     rows_out: u64,
     /// Time spent evaluating instructions.
     eval_us: u64,
+    /// Array conversions for referenced view inputs, excluding computed outputs.
+    input_materialization: MaterializationReport,
+    /// Time spent converting referenced view input columns.
+    input_materialize_us: u64,
 }
 
 /// Vector VM Executor node in the physical execution pipeline.
@@ -533,6 +537,8 @@ impl PipelineNode<DataChunkView> for VectorVmExecutor<DataChunkView> {
         let input_columns = view.num_columns();
         let active_view = view.compact_active_rows()?;
         let row_count = active_view.num_rows();
+        let materialize_started = Instant::now();
+        let mut report = MaterializationReport::default();
         let mounted = self
             .input_registers
             .iter()
@@ -540,10 +546,17 @@ impl PipelineNode<DataChunkView> for VectorVmExecutor<DataChunkView> {
             .filter(|register| (*register as usize) < input_columns)
             .map(|register| {
                 active_view
-                    .materialize_column(register as usize)
-                    .map(|array| (register, array))
+                    .materialize_column_with_report(register as usize)
+                    .map(|(array, column_report)| {
+                        report.accumulate(column_report);
+                        (register, array)
+                    })
             })
             .collect::<Result<Vec<_>>>()?;
+        self.stats.input_materialization.accumulate(report);
+        self.stats.input_materialize_us = self.stats.input_materialize_us.saturating_add(
+            u64::try_from(materialize_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
         let mut chunk = DataChunk::new(
             Vec::new(),
             common::arrow::SelectionVector::new_dense(row_count),
@@ -595,6 +608,11 @@ impl PipelineNode<DataChunkView> for VectorVmExecutor<DataChunkView> {
                 rows_in = stats.rows_in,
                 rows_out = stats.rows_out,
                 eval_us = stats.eval_us,
+                input_shared_columns = stats.input_materialization.shared_columns,
+                input_gathered_columns = stats.input_materialization.gathered_columns,
+                input_empty_columns = stats.input_materialization.empty_columns,
+                input_gathered_output_buffer_bytes = stats.input_materialization.gathered_output_buffer_bytes,
+                input_materialize_us = stats.input_materialize_us,
                 "vm_finished"
             );
         }
@@ -688,7 +706,11 @@ mod tests {
         );
 
         vm.push(view).expect("view VM pipeline should run");
+        assert_eq!(vm.stats.input_materialization.gathered_columns, 1);
+        assert_eq!(vm.stats.input_materialization.shared_columns, 0);
+        assert!(vm.stats.input_materialization.gathered_output_buffer_bytes > 0);
         vm.flush().expect("view VM pipeline should flush");
+        assert_eq!(vm.stats.input_materialization, MaterializationReport::default());
 
         let views = views.lock().unwrap();
         let output = &views[0];
@@ -711,6 +733,41 @@ mod tests {
             0,
             "passthrough output should not be gathered into a VM input register",
         );
+    }
+
+    #[test]
+    fn view_vm_reports_shared_inputs_once_and_skips_projection_only_inputs() {
+        let source: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
+        for compute in [false, true] {
+            let instructions = if compute {
+                vec![
+                    MicroOp::Add { dst: 1, src1: 0, src2: 0 },
+                    MicroOp::ProjectRegisters { out_regs: vec![0, 1] },
+                ]
+            } else {
+                vec![MicroOp::ProjectRegisters { out_regs: vec![0, 0] }]
+            };
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let mut vm = VectorVmExecutor::new_view(
+                Arc::new(MicroProgram { register_count: 2, instructions }),
+                Arc::new(FunctionRegistry::new()),
+                Box::new(CollectViewNode { views: Arc::clone(&output) }),
+            );
+            for _ in 0..2 {
+                vm.push(DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(&source)])).unwrap()).unwrap();
+            }
+            assert_eq!(vm.stats.input_materialization.shared_columns, if compute { 2 } else { 0 });
+            assert_eq!(vm.stats.input_materialization.gathered_columns, 0);
+            assert_eq!(vm.stats.input_materialization.gathered_output_buffer_bytes, 0);
+            let views = output.lock().unwrap();
+            assert_eq!(views.len(), 2);
+            for view in views.iter() {
+                assert!(Arc::ptr_eq(view.resolve(0, 0).unwrap().unwrap().0, &source));
+                let values = view.materialize_column(1).unwrap();
+                let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
+                assert_eq!(values.values(), if compute { &[20, 40, 60] } else { &[10, 20, 30] });
+            }
+        }
     }
 
     #[test]

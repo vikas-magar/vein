@@ -92,10 +92,7 @@ pub async fn bind_select<'a>(
     let mut bound_exprs = Vec::with_capacity(plain_items.len());
     let mut new_fields = Vec::with_capacity(plain_items.len());
     for (expr, name) in plain_items {
-        let nullable = match &expr {
-            LogicalExpr::Column(column) | LogicalExpr::OuterColumn(column) => column.nullable,
-            _ => false,
-        };
+        let nullable = expr.nullable();
         new_fields.push(std::sync::Arc::new(
             ResolvedColumn::new(
                 context.next_id(),
@@ -153,7 +150,8 @@ pub async fn bind_aggregate<'a>(
                     name,
                     None,
                     bound_expr.data_type(),
-                )));
+                )
+                    .with_nullable(bound_expr.nullable())));
             }
             bound_grouping_set.push(bound_expr);
         }
@@ -179,7 +177,8 @@ pub async fn bind_aggregate<'a>(
             col_name,
             None,
             bound_expr.data_type(),
-        )));
+        )
+            .with_nullable(bound_expr.nullable())));
         bound_aggs.push(bound_expr);
     }
 

@@ -140,7 +140,8 @@ fn lift_window_calls(
                 alias_hint.unwrap_or(name.as_str()).to_string(),
                 None,
                 return_type.clone(),
-            );
+            )
+                .with_nullable(mapped.nullable());
             let output_column = std::sync::Arc::new(output_column);
             window_exprs.push(WindowExpr {
                 call: mapped.clone(),

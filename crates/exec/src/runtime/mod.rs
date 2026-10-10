@@ -22,15 +22,18 @@ use crate::operators::aggregate;
 use crate::operators::join::{
     BuildSink, HashJoin, JoinFilterCollector, JoinKeys, JoinType, OutputColumn,
 };
-use crate::operators::sink::WriteReceipt;
+use crate::operators::sink::{ClientOutput, CollectSink, ViewResultBatch, WriteReceipt};
 use crate::operators::{LimitTransform, SortTransform};
-use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Sink, Source, Transform};
+use crate::pipeline::{
+    DataChunk, DataChunkView, MaterializationReport, PipelineNode, Sink, Source, Transform,
+};
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
 use common::protocol::{
-    DataSink, DataSource, DerivedPipelineGraph, ExecuteTask, JoinKind, JoinOutput, JoinPlan,
-    MicroProgram, PhysicalPlanNode, PhysicalPlanOperator, PipelineBoundaryKind, PipelineId,
+    DataSink, DataSource, DerivedPipelineGraph, ExecuteTask, InputMaterialization, JoinKind,
+    JoinOutput, JoinPlan, MicroProgram, OutputRepresentation, PhysicalPlanNode,
+    PhysicalPlanOperator, PipelineBoundaryKind, PipelineId,
 };
 use error::VeinError;
 use types::VeinDataType;
@@ -45,16 +48,27 @@ pub struct TaskMetrics {
 }
 
 /// The outcome of running a single task to completion.
-#[derive(Debug, Clone, Default)]
-pub struct TaskResult {
+#[derive(Debug, Clone)]
+pub struct TaskResult<O = RecordBatch> {
     /// Number of rows produced by the pipeline.
     pub row_count: u64,
     /// Captured output batches (populated by a [`Sink`] that retains results).
-    pub output: Vec<RecordBatch>,
+    pub output: Vec<O>,
     /// Execution metrics (bytes read, duration).
     pub metrics: TaskMetrics,
     /// Present only after a storage sink has committed successfully.
     pub write_receipt: Option<WriteReceipt>,
+}
+
+impl<O> Default for TaskResult<O> {
+    fn default() -> Self {
+        Self {
+            row_count: 0,
+            output: Vec::new(),
+            metrics: TaskMetrics::default(),
+            write_receipt: None,
+        }
+    }
 }
 
 /// Builds pipeline stages for a task from the wire protocol.
@@ -97,7 +111,7 @@ pub trait ExecutorBuilder: Send + Sync {
     /// Build a sink from the task's [`DataSink`]. The sink is the terminal
     /// stage; a sink that returns data (e.g. `DataSink::Client`) exposes it via
     /// [`Sink::collect`].
-    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>>;
+    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunkView>>>;
 
     /// Build a sink that forwards client batches through a bounded output channel.
     ///
@@ -107,9 +121,31 @@ pub trait ExecutorBuilder: Send + Sync {
         &self,
         sink: &DataSink,
         output: flume::Sender<RecordBatch>,
-    ) -> Result<Box<dyn Sink<DataChunk>>> {
+    ) -> Result<Box<dyn Sink<DataChunkView>>> {
         let _ = output;
         self.build_sink(sink)
+    }
+
+    /// Builds an internal client result sink which retains views without gathering.
+    ///
+    /// Storage/discard destinations are rejected because this API returns client
+    /// results. Both collected and streaming view results use the same sink.
+    fn build_view_result_sink(
+        &self,
+        sink: &DataSink,
+        output: Option<flume::Sender<ViewResultBatch>>,
+    ) -> Result<Box<dyn Sink<DataChunkView, ViewResultBatch>>> {
+        let DataSink::Client { schema } = sink else {
+            return Err(VeinError::planning(
+                "view results require a client sink",
+                None,
+            ));
+        };
+        let schema = Arc::new(schema.to_arrow());
+        Ok(Box::new(match output {
+            Some(sender) => CollectSink::with_sender(schema, sender),
+            None => CollectSink::new(schema),
+        }))
     }
 }
 
@@ -125,6 +161,21 @@ pub trait ExecutorBuilder: Send + Sync {
 pub trait TaskExecutor: Send + Sync {
     /// Run one task, driving its source through the operator chain.
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult>;
+
+    /// Executes the same canonical plan while retaining client result views.
+    async fn execute_views(
+        &self,
+        task: &ExecuteTask,
+        cancel: CancellationToken,
+    ) -> Result<TaskResult<ViewResultBatch>>;
+
+    /// Streams reference-backed results through a bounded channel.
+    async fn execute_views_streaming(
+        &self,
+        task: &ExecuteTask,
+        cancel: CancellationToken,
+        output: flume::Sender<ViewResultBatch>,
+    ) -> Result<TaskResult<ViewResultBatch>>;
 
     /// Execute a task while forwarding client batches through a bounded channel.
     ///
@@ -179,9 +230,9 @@ impl<B> PipelineNode<B> for CancelGuard<B> {
 
 /// A [`PipelineNode`] adapter that forwards pushes into a shared sink, so the
 /// runner can retrieve the sink's result via [`Sink::collect`] after execution.
-struct SinkHandle<B>(Arc<Mutex<Box<dyn Sink<B>>>>);
+struct SinkHandle<B, O = RecordBatch>(Arc<Mutex<Box<dyn Sink<B, O>>>>);
 
-impl<B> PipelineNode<B> for SinkHandle<B> {
+impl<B, O> PipelineNode<B> for SinkHandle<B, O> {
     fn push(&mut self, batch: B) -> Result<()> {
         self.0
             .lock()
@@ -231,37 +282,100 @@ impl PipelineNode<DataChunk> for ChunkToViewNode {
     }
 }
 
-/// Materializes a view only where an existing blocking operator requires arrays.
-struct ViewToChunkNode(Box<dyn PipelineNode<DataChunk>>);
+/// Explicit array boundary for blocking operators and RecordBatch result sinks.
+/// Reports conversion work once per flush, inside the owning task's trace span.
+pub(crate) struct MaterializeViewNode<
+    N: PipelineNode<DataChunk> + ?Sized = dyn PipelineNode<DataChunk>,
+> {
+    next: Box<N>,
+    boundary: &'static str,
+    report: MaterializationReport,
+    batches: u64,
+    rows: u64,
+    conversion_us: u64,
+}
 
-impl PipelineNode<DataChunkView> for ViewToChunkNode {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
-        self.0.push(view.to_data_chunk()?)
+impl<N: PipelineNode<DataChunk> + ?Sized> MaterializeViewNode<N> {
+    /// Only whole-batch consumers may install this adapter. Deriving the policy
+    /// prevents runtime wiring from silently bypassing an operator's contract.
+    fn for_operator(next: Box<N>, operator: &PhysicalPlanOperator) -> Result<Self> {
+        let contract = operator.data_flow();
+        if contract.input_materialization != InputMaterialization::WholeBatch {
+            return Err(VeinError::planning(
+                format!(
+                    "operator '{}' does not require whole-batch materialization",
+                    contract.operator
+                ),
+                None,
+            ));
+        }
+        let boundary = if contract.output == OutputRepresentation::Sink {
+            "result"
+        } else {
+            contract.operator
+        };
+        Ok(Self::new(next, boundary))
     }
 
-    fn flush(&mut self) -> Result<()> {
-        self.0.flush()
-    }
-
-    fn finished(&self) -> bool {
-        self.0.finished()
+    pub(crate) fn new(next: Box<N>, boundary: &'static str) -> Self {
+        Self {
+            next,
+            boundary,
+            report: MaterializationReport::default(),
+            batches: 0,
+            rows: 0,
+            conversion_us: 0,
+        }
     }
 }
 
-/// The final result sink is an explicit materialization boundary.
-struct MaterializeViewNode(Box<dyn PipelineNode<DataChunk>>);
-
-impl PipelineNode<DataChunkView> for MaterializeViewNode {
+impl<N: PipelineNode<DataChunk> + ?Sized> PipelineNode<DataChunkView> for MaterializeViewNode<N> {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
-        self.0.push(view.to_data_chunk()?)
+        let started = Instant::now();
+        let (chunk, report) = view.to_data_chunk_with_report()?;
+        self.conversion_us = self
+            .conversion_us
+            .saturating_add(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        self.report.accumulate(report);
+        self.batches = self.batches.saturating_add(1);
+        self.rows = self.rows.saturating_add(view.num_rows() as u64);
+        self.next.push(chunk)
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.0.flush()
+        self.next.flush()?;
+        tracing::info!(
+            target: "vein.audit",
+            event = "view_materialization",
+            boundary = self.boundary,
+            batches = self.batches,
+            rows = self.rows,
+            shared_columns = self.report.shared_columns,
+            gathered_columns = self.report.gathered_columns,
+            empty_columns = self.report.empty_columns,
+            gathered_output_buffer_bytes = self.report.gathered_output_buffer_bytes,
+            conversion_us = self.conversion_us,
+            "view_materialization"
+        );
+        Ok(())
     }
 
     fn finished(&self) -> bool {
-        self.0.finished()
+        self.next.finished()
+    }
+}
+
+impl<N: Sink<DataChunk> + ?Sized> Sink<DataChunkView> for MaterializeViewNode<N> {
+    fn collect(&mut self) -> Vec<RecordBatch> {
+        self.next.collect()
+    }
+
+    fn row_count(&self) -> u64 {
+        self.next.row_count()
+    }
+
+    fn write_receipt(&self) -> Option<&WriteReceipt> {
+        self.next.write_receipt()
     }
 }
 
@@ -359,9 +473,15 @@ impl PipelineExecutionSchedule {
                 .iter()
                 .filter(|dependency| dependency.dependent == pipeline_id)
             {
-                let state = self.completed.get(dependency.prerequisite.0).ok_or_else(|| {
-                    VeinError::planning("pipeline dependency references an unknown pipeline", None)
-                })?;
+                let state = self
+                    .completed
+                    .get(dependency.prerequisite.0)
+                    .ok_or_else(|| {
+                        VeinError::planning(
+                            "pipeline dependency references an unknown pipeline",
+                            None,
+                        )
+                    })?;
                 if !dependencies
                     .iter()
                     .any(|(id, _): &(PipelineId, Arc<AtomicBool>)| *id == dependency.prerequisite)
@@ -379,18 +499,26 @@ impl PipelineExecutionSchedule {
         kind: PipelineBoundaryKind,
     ) -> Result<()> {
         let mut completed_any = false;
-        for pipeline in self.graph.pipelines().iter().filter(|pipeline| {
-            pipeline.sink.kind == kind && Arc::ptr_eq(&pipeline.sink.node, node)
-        }) {
+        for pipeline in
+            self.graph.pipelines().iter().filter(|pipeline| {
+                pipeline.sink.kind == kind && Arc::ptr_eq(&pipeline.sink.node, node)
+            })
+        {
             for dependency in self
                 .graph
                 .dependencies()
                 .iter()
                 .filter(|dependency| dependency.dependent == pipeline.id)
             {
-                let state = self.completed.get(dependency.prerequisite.0).ok_or_else(|| {
-                    VeinError::planning("pipeline dependency references an unknown pipeline", None)
-                })?;
+                let state = self
+                    .completed
+                    .get(dependency.prerequisite.0)
+                    .ok_or_else(|| {
+                        VeinError::planning(
+                            "pipeline dependency references an unknown pipeline",
+                            None,
+                        )
+                    })?;
                 if !state.load(Ordering::Acquire) {
                     return Err(VeinError::internal(format!(
                         "pipeline {:?} reached boundary {:?} before prerequisite {:?}",
@@ -495,9 +623,7 @@ impl PipelineNode<DataChunkView> for PipelineDependencyGuard {
 
 impl PipelineNode<DataChunkView> for ChannelPipelineNode {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
-        self.sender
-            .send(view)
-            .map_err(|_| VeinError::cancelled())
+        self.sender.send(view).map_err(|_| VeinError::cancelled())
     }
     fn flush(&mut self) -> Result<()> {
         Ok(())
@@ -567,6 +693,22 @@ pub struct DefaultTaskExecutor {
 }
 
 impl DefaultTaskExecutor {
+    fn trace_data_flow(node: &PhysicalPlanNode, task: &ExecuteTask, depth: usize) {
+        let contract = node.operator.data_flow();
+        tracing::debug!(
+            target: "vein.audit",
+            event = "physical_operator_data_flow",
+            query_id = %task.query_id,
+            task_id = %task.task_id,
+            depth,
+            operator = contract.operator,
+            input_materialization = ?contract.input_materialization,
+            output_representation = ?contract.output,
+            output_columns = node.output_schema.fields.len(),
+            "physical_operator_data_flow"
+        );
+    }
+
     /// Create a task executor that builds pipelines with `builder`.
     pub fn new(builder: Arc<dyn ExecutorBuilder>) -> Self {
         Self { builder }
@@ -582,11 +724,14 @@ impl DefaultTaskExecutor {
         span: &'a tracing::Span,
         schedule: &'a PipelineExecutionSchedule,
         depth: usize,
-    ) -> Pin<Box<dyn Future<Output=Result<u64>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return Err(VeinError::cancelled());
             }
+            // Execution depth starts at the sink's child; diagnostics include
+            // the sink itself as canonical tree depth zero.
+            Self::trace_data_flow(input, task, depth.saturating_add(1));
             match &input.operator {
                 PhysicalPlanOperator::Pipeline {
                     source: data_source,
@@ -595,11 +740,7 @@ impl DefaultTaskExecutor {
                 } => {
                     let sources = split_scan(data_source);
                     if sources.len() > 1 {
-                        let worker_count = self
-                            .builder
-                            .max_parallelism()
-                            .max(1)
-                            .min(sources.len());
+                        let worker_count = self.builder.max_parallelism().max(1).min(sources.len());
                         let pending = Arc::new(Mutex::new(VecDeque::from(sources)));
                         let finished = Arc::new(AtomicBool::new(false));
                         let (sender, receiver) = flume::bounded(worker_count);
@@ -770,22 +911,24 @@ impl DefaultTaskExecutor {
                 }
                 PhysicalPlanOperator::Aggregate { input: child, plan }
                 | PhysicalPlanOperator::Distinct { input: child, plan } => {
-                    let operator = if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
-                        "distinct"
-                    } else {
-                        "aggregate"
-                    };
+                    let operator =
+                        if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
+                            "distinct"
+                        } else {
+                            "aggregate"
+                        };
                     let (accumulator, handle) = aggregate::shared(plan.clone())?;
                     let handle: Box<dyn PipelineNode<DataChunkView>> =
-                        Box::new(ViewToChunkNode(handle));
+                        Box::new(MaterializeViewNode::for_operator(handle, &input.operator)?);
                     let bytes = self
                         .execute_input(child, handle, task, cancel, span, schedule, depth + 1)
                         .await?;
-                    let boundary = if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
-                        PipelineBoundaryKind::DistinctInput
-                    } else {
-                        PipelineBoundaryKind::AggregateInput
-                    };
+                    let boundary =
+                        if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
+                            PipelineBoundaryKind::DistinctInput
+                        } else {
+                            PipelineBoundaryKind::AggregateInput
+                        };
                     schedule.complete_boundary(input, boundary)?;
                     let (groups, metrics, group_count) = {
                         let mut accumulator = accumulator
@@ -845,16 +988,12 @@ impl DefaultTaskExecutor {
                     let output_columns = usize::try_from(*output_columns).map_err(|_| {
                         VeinError::planning("recursive sort output width is invalid", None)
                     })?;
-                    let sort_next: Box<dyn PipelineNode<DataChunk>> =
-                        Box::new(ChunkToViewNode(next));
-                    let sort: Box<dyn PipelineNode<DataChunk>> =
+                    let sort: Box<dyn PipelineNode<DataChunkView>> =
                         Box::new(SortTransform::with_output_columns(
                             plan.clone(),
                             Some(output_columns),
-                            sort_next,
+                            next,
                         ));
-                    let sort: Box<dyn PipelineNode<DataChunkView>> =
-                        Box::new(ViewToChunkNode(sort));
                     let next: Box<dyn PipelineNode<DataChunkView>> = match key_program {
                         Some(program) => {
                             Box::new(TransformHandle(self.builder.build_view_vm(program, sort)?))
@@ -878,7 +1017,7 @@ impl DefaultTaskExecutor {
                         schedule,
                         depth + 1,
                     )
-                        .await
+                    .await
                 }
                 PhysicalPlanOperator::Sink { .. } => Err(VeinError::planning(
                     "sink operator may only appear at the physical plan root",
@@ -923,12 +1062,11 @@ impl DefaultTaskExecutor {
                         next,
                     );
                     let join = install_join_residual(self.builder.as_ref(), plan, join)?;
-                    let join: Box<dyn PipelineNode<DataChunkView>> = Box::new(
-                        PipelineDependencyGuard::new(
+                    let join: Box<dyn PipelineNode<DataChunkView>> =
+                        Box::new(PipelineDependencyGuard::new(
                             Box::new(join),
                             schedule.dependencies_for_operator(input)?,
-                        ),
-                    );
+                        ));
                     let probe_rows = Arc::new(AtomicU64::new(0));
                     let probe_batches = Arc::new(AtomicU64::new(0));
                     let probe_started = Instant::now();
@@ -968,17 +1106,22 @@ impl DefaultTaskExecutor {
         })
     }
 
-    async fn execute_with_output(
+    async fn execute_with_output<O: ClientOutput>(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
-        output_sender: Option<flume::Sender<RecordBatch>>,
-    ) -> Result<TaskResult> {
+        make_sink: impl FnOnce(
+            &dyn ExecutorBuilder,
+            &DataSink,
+        ) -> Result<Box<dyn Sink<DataChunkView, O>>>
+        + Send,
+    ) -> Result<TaskResult<O>> {
         let start = Instant::now();
         if cancel.is_cancelled() {
             return Err(VeinError::cancelled());
         }
         task.plan.validate()?;
+        Self::trace_data_flow(&task.plan.root, task, 0);
         let PhysicalPlanOperator::Sink {
             input,
             sink: sink_plan,
@@ -992,12 +1135,8 @@ impl DefaultTaskExecutor {
         let schedule = PipelineExecutionSchedule::derive(&task.plan)?;
 
         let sink_started = Instant::now();
-        let sink = if let Some(sender) = output_sender {
-            self.builder.build_streaming_sink(sink_plan, sender)?
-        } else {
-            self.builder.build_sink(sink_plan)?
-        };
-        let sink: Arc<Mutex<Box<dyn Sink<DataChunk>>>> = Arc::new(Mutex::new(sink));
+        let sink = make_sink(self.builder.as_ref(), sink_plan)?;
+        let sink: Arc<Mutex<Box<dyn Sink<DataChunkView, O>>>> = Arc::new(Mutex::new(sink));
         let sink_build_us = sink_started.elapsed().as_micros() as u64;
         let task_span = tracing::info_span!(
             target: "vein.audit",
@@ -1008,11 +1147,10 @@ impl DefaultTaskExecutor {
             task_id = %task.task_id,
             attempt = task.attempt,
         );
-        let chunk_head: Box<dyn PipelineNode<DataChunk>> = Box::new(CancelGuard::new(
+        let head: Box<dyn PipelineNode<DataChunkView>> = Box::new(CancelGuard::new(
             Box::new(SinkHandle(Arc::clone(&sink))),
             cancel.clone(),
         ));
-        let head: Box<dyn PipelineNode<DataChunkView>> = Box::new(MaterializeViewNode(chunk_head));
         let run_started = Instant::now();
         let source_started = Instant::now();
         let bytes_read = self
@@ -1077,7 +1215,31 @@ fn install_join_residual(
 #[async_trait]
 impl TaskExecutor for DefaultTaskExecutor {
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult> {
-        self.execute_with_output(task, cancel, None).await
+        self.execute_with_output(task, cancel, |builder, sink| builder.build_sink(sink))
+            .await
+    }
+
+    async fn execute_views(
+        &self,
+        task: &ExecuteTask,
+        cancel: CancellationToken,
+    ) -> Result<TaskResult<ViewResultBatch>> {
+        self.execute_with_output(task, cancel, |builder, sink| {
+            builder.build_view_result_sink(sink, None)
+        })
+        .await
+    }
+
+    async fn execute_views_streaming(
+        &self,
+        task: &ExecuteTask,
+        cancel: CancellationToken,
+        output: flume::Sender<ViewResultBatch>,
+    ) -> Result<TaskResult<ViewResultBatch>> {
+        self.execute_with_output(task, cancel, move |builder, sink| {
+            builder.build_view_result_sink(sink, Some(output))
+        })
+        .await
     }
 
     async fn execute_streaming(
@@ -1086,7 +1248,10 @@ impl TaskExecutor for DefaultTaskExecutor {
         cancel: CancellationToken,
         output: flume::Sender<RecordBatch>,
     ) -> Result<TaskResult> {
-        self.execute_with_output(task, cancel, Some(output)).await
+        self.execute_with_output(task, cancel, move |builder, sink| {
+            builder.build_streaming_sink(sink, output)
+        })
+        .await
     }
 }
 
@@ -1158,10 +1323,166 @@ mod tests {
     use arrow::array::Array;
     use common::identifiers::{QueryId, RequestId, StageId, TaskId};
     use common::protocol::{
-        AggOpCode, AggregatePlan, ExecutionMode, JoinKind, JoinOutput, JoinPlan, LimitSpec,
-        FileFormat, FileScanTask, MicroOp, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator,
+        AggOpCode, AggregatePlan, ExecutionMode, FileFormat, FileScanTask, JoinKind, JoinOutput,
+        JoinPlan, LimitSpec, MicroOp, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator,
         SortKey, SortPlan,
     };
+
+    struct MaterializationCollector {
+        chunks: Arc<Mutex<Vec<DataChunk>>>,
+        flushed: Arc<AtomicBool>,
+    }
+
+    impl PipelineNode<DataChunk> for MaterializationCollector {
+        fn push(&mut self, chunk: DataChunk) -> Result<()> {
+            self.chunks.lock().unwrap().push(chunk);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.flushed.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn finished(&self) -> bool {
+            self.flushed.load(Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn whole_batch_adapter_checks_the_canonical_operator_contract() {
+        let source = Arc::new(PhysicalPlanNode {
+            output_schema: Arc::new(types::VeinSchema::empty()),
+            operator: PhysicalPlanOperator::Pipeline {
+                source: Arc::new(DataSource::Memory),
+                input_schema: Arc::new(types::VeinSchema::empty()),
+                program: Arc::new(MicroProgram::empty()),
+            },
+        });
+        let aggregate = AggregatePlan {
+            groups: 0,
+            estimated_groups: None,
+            grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
+            aggs: Vec::new(),
+            aggregate_input_types: Vec::new(),
+            types: Vec::new(),
+        };
+        let sink = || {
+            Box::new(MaterializationCollector {
+                chunks: Arc::new(Mutex::new(Vec::new())),
+                flushed: Arc::new(AtomicBool::new(false)),
+            }) as Box<dyn PipelineNode<DataChunk>>
+        };
+        for (operator, boundary) in [
+            (
+                PhysicalPlanOperator::Aggregate {
+                    input: Arc::clone(&source),
+                    plan: aggregate.clone(),
+                },
+                "aggregate",
+            ),
+            (
+                PhysicalPlanOperator::Distinct {
+                    input: Arc::clone(&source),
+                    plan: aggregate,
+                },
+                "distinct",
+            ),
+        ] {
+            let adapter = MaterializeViewNode::for_operator(sink(), &operator).unwrap();
+            assert_eq!(adapter.boundary, boundary);
+        }
+        let limit = PhysicalPlanOperator::Limit {
+            input: Arc::clone(&source),
+            spec: LimitSpec {
+                offset: 0,
+                count: 1,
+            },
+        };
+        let discard = PhysicalPlanOperator::Sink {
+            input: Arc::clone(&source),
+            sink: Arc::new(DataSink::Discard),
+        };
+        let client = PhysicalPlanOperator::Sink {
+            input: Arc::clone(&source),
+            sink: Arc::new(DataSink::Client {
+                schema: Arc::new(types::VeinSchema::empty()),
+            }),
+        };
+        for operator in [&source.operator, &limit, &discard, &client] {
+            let error = MaterializeViewNode::for_operator(sink(), operator)
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not require whole-batch materialization")
+            );
+            assert!(error.to_string().contains(operator.data_flow().operator));
+        }
+    }
+
+    #[test]
+    fn materialization_boundary_preserves_values_and_accumulates_conversion_work() {
+        use arrow::array::Int64Array;
+        use common::arrow::SelectionVector;
+
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let flushed = Arc::new(AtomicBool::new(false));
+        let mut node = MaterializeViewNode::new(
+            Box::new(MaterializationCollector {
+                chunks: Arc::clone(&chunks),
+                flushed: Arc::clone(&flushed),
+            }),
+            "result",
+        );
+        let source: arrow::array::ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
+        for selection in [
+            SelectionVector::new_dense(3),
+            SelectionVector::new_sparse(vec![2, 0]),
+        ] {
+            node.push(
+                DataChunkView::from_chunk(DataChunk::new(vec![Arc::clone(&source)], selection))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(node.batches, 2);
+        assert_eq!(node.rows, 5);
+        assert_eq!(node.report.shared_columns, 1);
+        assert_eq!(node.report.gathered_columns, 1);
+        let output = chunks.lock().unwrap();
+        let shared = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let gathered = output[1]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            shared.values().as_ptr(),
+            source
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .as_ptr()
+        );
+        assert_eq!(gathered, &Int64Array::from(vec![30, 10]));
+        assert_eq!(
+            node.report.gathered_output_buffer_bytes,
+            gathered.get_buffer_memory_size()
+        );
+        drop(output);
+        assert!(!node.finished());
+        node.flush().unwrap();
+        assert!(flushed.load(Ordering::Relaxed));
+        assert!(node.finished());
+    }
 
     #[test]
     fn physical_join_kinds_map_to_their_executor_types() {
@@ -1177,7 +1498,10 @@ mod tests {
         ];
 
         for (physical, executor) in mappings {
-            assert_eq!(join_type(physical).expect("join flavor is supported"), executor);
+            assert_eq!(
+                join_type(physical).expect("join flavor is supported"),
+                executor
+            );
         }
     }
 
@@ -1277,7 +1601,7 @@ mod tests {
             self.inner.build_view_vm(program, next)
         }
 
-        fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>> {
+        fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunkView>>> {
             self.inner.build_sink(sink)
         }
 
@@ -1285,7 +1609,7 @@ mod tests {
             &self,
             sink: &DataSink,
             output: flume::Sender<RecordBatch>,
-        ) -> Result<Box<dyn Sink<DataChunk>>> {
+        ) -> Result<Box<dyn Sink<DataChunkView>>> {
             self.inner.build_streaming_sink(sink, output)
         }
     }
@@ -1393,7 +1717,7 @@ mod tests {
             self.inner.build_view_vm(program, next)
         }
 
-        fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunk>>> {
+        fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunkView>>> {
             self.inner.build_sink(sink)
         }
 
@@ -1401,7 +1725,7 @@ mod tests {
             &self,
             sink: &DataSink,
             output: flume::Sender<RecordBatch>,
-        ) -> Result<Box<dyn Sink<DataChunk>>> {
+        ) -> Result<Box<dyn Sink<DataChunkView>>> {
             self.inner.build_streaming_sink(sink, output)
         }
     }
@@ -1473,9 +1797,11 @@ mod tests {
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
                 .expect("int64 output");
-            assert!(source_arrays.iter().any(|source| {
-                source.values().as_ptr() == output.values().as_ptr()
-            }));
+            assert!(
+                source_arrays
+                    .iter()
+                    .any(|source| { source.values().as_ptr() == output.values().as_ptr() })
+            );
         }
     }
 
@@ -1489,7 +1815,11 @@ mod tests {
             Arc::clone(&schema),
             PhysicalPlanOperator::Pipeline {
                 source: Arc::new(DataSource::File(FileScanTask {
-                    files: vec!["1.parquet".into(), "invalid.parquet".into(), "2.parquet".into()],
+                    files: vec![
+                        "1.parquet".into(),
+                        "invalid.parquet".into(),
+                        "2.parquet".into(),
+                    ],
                     format: FileFormat::Parquet,
                     byte_range: None,
                     projected: Arc::clone(&schema),
@@ -1508,9 +1838,9 @@ mod tests {
             std::time::Duration::from_secs(2),
             runner.execute(&task, CancellationToken::new()),
         )
-            .await
-            .expect("failed scan workers must not leave peers blocked")
-            .expect_err("an invalid source work item should fail the task");
+        .await
+        .expect("failed scan workers must not leave peers blocked")
+        .expect_err("an invalid source work item should fail the task");
         assert!(result.to_string().contains("invalid value"));
     }
 
@@ -1549,8 +1879,8 @@ mod tests {
             std::time::Duration::from_secs(2),
             runner.execute(&task, cancel),
         )
-            .await
-            .expect("cancelled scans must release bounded-channel senders");
+        .await
+        .expect("cancelled scans must release bounded-channel senders");
         assert!(result.is_err());
         assert_eq!(builder.active_sources.load(Ordering::Relaxed), 0);
     }
@@ -1596,12 +1926,11 @@ mod tests {
         );
 
         let values = vec![Some(1), None, Some(3), Some(4), Some(5)];
-        let fused_runner = DefaultTaskExecutor::new(Arc::new(MemoryFeedBuilder::with_nullable_values(
-            values.clone(),
-        )));
-        let recursive_runner = DefaultTaskExecutor::new(Arc::new(
-            MemoryFeedBuilder::with_nullable_values(values),
+        let fused_runner = DefaultTaskExecutor::new(Arc::new(
+            MemoryFeedBuilder::with_nullable_values(values.clone()),
         ));
+        let recursive_runner =
+            DefaultTaskExecutor::new(Arc::new(MemoryFeedBuilder::with_nullable_values(values)));
         let fused = fused_runner
             .execute(&fused_task, CancellationToken::new())
             .await
@@ -1630,7 +1959,9 @@ mod tests {
             .downcast_ref::<arrow::array::Int64Array>()
             .expect("projected values should remain Int64");
         assert_eq!(
-            (0..values.len()).map(|row| values.value(row)).collect::<Vec<_>>(),
+            (0..values.len())
+                .map(|row| values.value(row))
+                .collect::<Vec<_>>(),
             vec![3, 4, 5]
         );
     }
@@ -1642,37 +1973,51 @@ mod tests {
             vec![MicroOp::ProjectRegisters { out_regs: vec![0] }],
         ));
         let values = vec![Some(1), None, Some(3)];
+        let nullable_schema = Arc::new(types::VeinSchema::new(vec![Arc::new(
+            types::ResolvedColumn::new(types::ColumnId(0), "column_0", None, VeinDataType::Int64)
+                .with_nullable(true),
+        )]));
         let mut fused_task = task();
-        set_input_plan(
-            &mut fused_task,
-            InputPlanFixture::Pipeline {
-                source: DataSource::Memory,
-                program: Arc::clone(&program),
-            },
+        fused_task.plan = plan_with_input(
+            &fused_task,
+            plan_node(
+                Arc::clone(&nullable_schema),
+                PhysicalPlanOperator::Pipeline {
+                    source: Arc::new(DataSource::Memory),
+                    input_schema: Arc::clone(&nullable_schema),
+                    program: Arc::clone(&program),
+                },
+            ),
         );
         let mut recursive_task = task();
-        set_input_plan(
-            &mut recursive_task,
-            InputPlanFixture::Transform {
-                input: Box::new(InputPlanFixture::Pipeline {
-                    source: DataSource::Memory,
-                    program: Arc::new(MicroProgram::empty()),
-                }),
-                program,
-            },
+        recursive_task.plan = plan_with_input(
+            &recursive_task,
+            plan_node(
+                Arc::clone(&nullable_schema),
+                PhysicalPlanOperator::Transform {
+                    input: plan_node(
+                        Arc::clone(&nullable_schema),
+                        PhysicalPlanOperator::Pipeline {
+                            source: Arc::new(DataSource::Memory),
+                            input_schema: nullable_schema,
+                            program: Arc::new(MicroProgram::empty()),
+                        },
+                    ),
+                    program,
+                },
+            ),
         );
         let fused = DefaultTaskExecutor::new(Arc::new(MemoryFeedBuilder::with_nullable_values(
             values.clone(),
         )))
-            .execute(&fused_task, CancellationToken::new())
-            .await
-            .expect("fused projection should preserve NULL values");
-        let recursive = DefaultTaskExecutor::new(Arc::new(
-            MemoryFeedBuilder::with_nullable_values(values),
-        ))
-            .execute(&recursive_task, CancellationToken::new())
-            .await
-            .expect("recursive projection should preserve NULL values");
+        .execute(&fused_task, CancellationToken::new())
+        .await
+        .expect("fused projection should preserve NULL values");
+        let recursive =
+            DefaultTaskExecutor::new(Arc::new(MemoryFeedBuilder::with_nullable_values(values)))
+                .execute(&recursive_task, CancellationToken::new())
+                .await
+                .expect("recursive projection should preserve NULL values");
 
         let fused_values = fused.output[0]
             .column(0)
@@ -1843,10 +2188,7 @@ mod tests {
                                             .get(*index as usize)
                                             .expect("test join probe output exists"),
                                     ),
-                                    matches!(
-                                        plan.join_type,
-                                        JoinKind::Right | JoinKind::Full
-                                    ),
+                                    matches!(plan.join_type, JoinKind::Right | JoinKind::Full),
                                 ),
                                 JoinOutput::Build(index) => (
                                     Arc::clone(
@@ -1872,11 +2214,7 @@ mod tests {
                 ));
                 plan_node(
                     output_schema,
-                    PhysicalPlanOperator::Join {
-                        probe,
-                        build,
-                        plan,
-                    },
+                    PhysicalPlanOperator::Join { probe, build, plan },
                 )
             }
             InputPlanFixture::Sort {
@@ -2189,6 +2527,196 @@ mod tests {
         assert!(receiver.is_empty());
         assert_eq!(result.row_count, 3);
         assert!(result.output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn view_and_arrow_results_share_execution_for_join_sort_limit() {
+        use arrow::array::Int64Array;
+
+        let builder = Arc::new(MultiFileFeedBuilder::new());
+        let runner = DefaultTaskExecutor::new(builder.clone());
+        let schema = int64_schema();
+        let leaf = || {
+            plan_node(
+                Arc::clone(&schema),
+                PhysicalPlanOperator::Pipeline {
+                    source: Arc::new(DataSource::File(FileScanTask {
+                        files: vec!["3.parquet".into(), "1.parquet".into(), "2.parquet".into()],
+                        format: FileFormat::Parquet,
+                        byte_range: None,
+                        projected: Arc::clone(&schema),
+                        dictionary_columns: Vec::new(),
+                        pushdown: None,
+                        task_id: TaskId::new(),
+                        catalog_snapshot: None,
+                    })),
+                    input_schema: Arc::clone(&schema),
+                    program: Arc::new(MicroProgram::empty()),
+                },
+            )
+        };
+        let join = plan_node(
+            Arc::clone(&schema),
+            PhysicalPlanOperator::Join {
+                probe: leaf(),
+                build: leaf(),
+                plan: JoinPlan {
+                    join_type: JoinKind::Inner,
+                    probe_keys: vec![0],
+                    build_keys: vec![0],
+                    residual: None,
+                    outputs: vec![JoinOutput::Probe(0)],
+                    probe_types: vec![VeinDataType::Int64],
+                    build_types: vec![VeinDataType::Int64],
+                },
+            },
+        );
+        let sort = plan_node(
+            Arc::clone(&schema),
+            PhysicalPlanOperator::Sort {
+                input: join,
+                plan: SortPlan {
+                    keys: vec![SortKey {
+                        column: 0,
+                        ascending: true,
+                        nulls_first: false,
+                    }],
+                },
+                key_program: None,
+                output_columns: 1,
+            },
+        );
+        let input = plan_node(
+            schema,
+            PhysicalPlanOperator::Limit {
+                input: sort,
+                spec: LimitSpec {
+                    offset: 1,
+                    count: 2,
+                },
+            },
+        );
+        let mut task = task();
+        task.plan = plan_with_input(&task, input);
+        let views = runner
+            .execute_views(&task, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(views.row_count, 2);
+        let mut actual = Vec::new();
+        let source_arrays = builder.source_arrays.lock().unwrap();
+        for batch in &views.output {
+            for row in 0..batch.num_rows() {
+                let (array, source_row) = batch.view().resolve(0, row).unwrap().unwrap();
+                let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                assert!(
+                    source_arrays
+                        .iter()
+                        .any(|source| std::ptr::eq(source.as_ref(), values))
+                );
+                actual.push(values.value(source_row));
+            }
+        }
+        assert_eq!(actual, vec![2, 3]);
+        drop(source_arrays);
+        let arrow = runner
+            .execute(&task, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(arrow.row_count, views.row_count);
+        assert_eq!(arrow.output.len(), views.output.len());
+        for (batch, view) in arrow.output.iter().zip(&views.output) {
+            let (converted, report) = view.to_record_batch_with_report().unwrap();
+            assert_eq!(&converted, batch);
+            assert_eq!(
+                report.gathered_columns, 1,
+                "payloads gather only at the Arrow boundary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn view_results_stream_without_retention_and_propagate_cancellation_and_channel_errors() {
+        let (sender, receiver) = flume::bounded(1);
+        let result = runner()
+            .execute_views_streaming(&task(), CancellationToken::new(), sender)
+            .await
+            .unwrap();
+        let batch = receiver.recv().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(result.row_count, 3);
+        assert!(result.output.is_empty());
+        assert!(receiver.is_empty());
+        let (sender, receiver) = flume::bounded(1);
+        drop(receiver);
+        let error = runner()
+            .execute_views_streaming(&task(), CancellationToken::new(), sender)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("client result channel closed"));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            runner().execute_views(&task(), cancel).await,
+            Err(VeinError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn view_results_reject_non_client_destinations() {
+        let mut task = task();
+        let PhysicalPlanOperator::Sink { input, .. } = &task.plan.root.operator else {
+            panic!("client task fixture requires a sink");
+        };
+        let input = Arc::clone(input);
+        task.plan = PhysicalPlan {
+            root: plan_node(
+                Arc::clone(&input.output_schema),
+                PhysicalPlanOperator::Sink {
+                    input,
+                    sink: Arc::new(DataSink::Discard),
+                },
+            ),
+        };
+        let error = runner()
+            .execute_views(&task, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("view results require a client sink")
+        );
+    }
+
+    #[tokio::test]
+    async fn both_result_apis_preserve_zero_column_counts_and_empty_input() {
+        let mut task = task();
+        let input = plan_node(Arc::new(types::VeinSchema::empty()),
+            PhysicalPlanOperator::Pipeline {
+                source: Arc::new(DataSource::Memory),
+                input_schema: int64_schema(),
+                program: Arc::new(MicroProgram::new(1, vec![
+                    MicroOp::ProjectRegisters { out_regs: Vec::new() },
+                ])),
+            },
+        );
+        task.plan = plan_with_input(&task, input);
+        for values in [vec![], vec![1, 2, 3]] {
+            let runner = runner_with_values(values.clone());
+            let arrow = runner.execute(&task, CancellationToken::new()).await.unwrap();
+            let views = runner.execute_views(&task, CancellationToken::new()).await.unwrap();
+            assert_eq!(arrow.row_count, values.len() as u64);
+            assert_eq!(views.row_count, arrow.row_count);
+            assert_eq!(arrow.output.len(), usize::from(!values.is_empty()));
+            assert_eq!(views.output.len(), arrow.output.len());
+            for (batch, view) in arrow.output.iter().zip(&views.output) {
+                assert_eq!(batch.num_columns(), 0);
+                assert_eq!(batch.num_rows(), values.len());
+                assert_eq!(view.view().num_columns(), 0);
+                assert_eq!(view.num_rows(), values.len());
+            }
+        }
     }
 
     #[tokio::test]

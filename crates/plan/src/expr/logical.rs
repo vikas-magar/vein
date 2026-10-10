@@ -205,6 +205,62 @@ fn is_volatile_builtin(name: &str) -> bool {
 }
 
 impl LogicalExpr {
+    /// Returns whether this expression can produce NULL.
+    ///
+    /// Column references and literals have exact nullability. Operators whose
+    /// result nullability depends on their operands propagate that information;
+    /// function calls and subqueries remain conservatively nullable because
+    /// their signatures do not yet describe NULL behavior.
+    pub fn nullable(&self) -> bool {
+        Self::nullable_at_depth(self, 0)
+    }
+
+    fn nullable_at_depth(expr: &LogicalExpr, depth: usize) -> bool {
+        if depth >= MAX_VOLATILITY_DEPTH {
+            // A deeply nested expression cannot be proven non-null cheaply or
+            // safely, so choose the schema that permits NULL values.
+            return true;
+        }
+
+        let child_nullable = |child: &LogicalExpr| Self::nullable_at_depth(child, depth + 1);
+        match expr {
+            LogicalExpr::Column(column) | LogicalExpr::OuterColumn(column) => column.nullable,
+            LogicalExpr::Literal(LogicalLiteral::Null(_)) => true,
+            LogicalExpr::Literal(_) => false,
+            LogicalExpr::BinaryOp { left, right, .. } => {
+                child_nullable(left) || child_nullable(right)
+            }
+            LogicalExpr::Cast { expr, .. }
+            | LogicalExpr::Not { expr }
+            | LogicalExpr::Negate { expr } => child_nullable(expr),
+            LogicalExpr::IsNull { .. }
+            | LogicalExpr::IsNotNull { .. }
+            | LogicalExpr::Exists { .. } => false,
+            LogicalExpr::InList { expr, list, .. } => {
+                child_nullable(expr) || list.iter().any(child_nullable)
+            }
+            LogicalExpr::Like { expr, pattern, .. } => {
+                child_nullable(expr) || child_nullable(pattern)
+            }
+            LogicalExpr::Case { then, else_, .. } => {
+                else_.is_none()
+                    || then.iter().any(child_nullable)
+                    || else_.as_deref().is_some_and(child_nullable)
+            }
+            // These nodes have independent NULL behavior that is not captured
+            // in the logical expression yet. In particular, scalar subqueries
+            // can return no rows and therefore yield NULL.
+            LogicalExpr::FunctionCall { .. }
+            | LogicalExpr::WindowCall { .. }
+            | LogicalExpr::AiOperator { .. }
+            | LogicalExpr::WasmUdf { .. }
+            | LogicalExpr::EbpfUdf { .. }
+            | LogicalExpr::PythonUdf { .. }
+            | LogicalExpr::Lambda { .. }
+            | LogicalExpr::ScalarSubquery(_) => true,
+        }
+    }
+
     /// Returns a list of child expressions for traversal
     pub fn children(&self) -> Vec<&LogicalExpr> {
         match self {
@@ -570,7 +626,7 @@ impl LogicalExpr {
 mod tests {
     use super::*;
     use crate::expr::LogicalLiteral;
-    use crate::schema::VeinDataType;
+    use crate::schema::{ColumnId, ResolvedColumn, VeinDataType};
 
     fn func(name: &str) -> LogicalExpr {
         LogicalExpr::FunctionCall {
@@ -608,6 +664,53 @@ mod tests {
             return_type: VeinDataType::Float64,
         };
         assert!(inner.is_volatile());
+    }
+
+    #[test]
+    fn nullability_tracks_known_inputs_and_is_conservative_for_calls() {
+        let nullable_column = LogicalExpr::Column(std::sync::Arc::new(
+            ResolvedColumn::new(
+                ColumnId(1),
+                "nullable_value",
+                None,
+                VeinDataType::Utf8,
+            )
+                .with_nullable(true),
+        ));
+        let non_nullable_literal = LogicalExpr::Literal(LogicalLiteral::Int64(1));
+        let nullable_arithmetic = LogicalExpr::BinaryOp {
+            left: Box::new(nullable_column.clone()),
+            op: BinaryOp::Plus,
+            right: Box::new(non_nullable_literal.clone()),
+            return_type: VeinDataType::Int64,
+        };
+        let null_check = LogicalExpr::IsNull {
+            expr: Box::new(nullable_column.clone()),
+        };
+
+        assert!(nullable_column.nullable());
+        assert!(!non_nullable_literal.nullable());
+        assert!(nullable_arithmetic.nullable());
+        assert!(!null_check.nullable());
+        assert!(func("any_registered_function").nullable());
+    }
+
+    #[test]
+    fn deeply_nested_nullability_defaults_to_nullable_without_unbounded_recursion() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let mut expr = LogicalExpr::Literal(LogicalLiteral::Int64(1));
+                for _ in 0..200_000 {
+                    expr = LogicalExpr::Not {
+                        expr: Box::new(expr),
+                    };
+                }
+                assert!(expr.nullable());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

@@ -57,9 +57,9 @@ pub trait Transform<B>: PipelineNode<B> {}
 /// A sink is the terminal stage of a pipeline. A sink that must hand its result
 /// back to the caller (e.g. `DataSink::Client`) overrides [`Sink::collect`] to
 /// return the produced batches — analogous to Spark's `collect()`.
-pub trait Sink<B>: PipelineNode<B> {
+pub trait Sink<B, O = RecordBatch>: PipelineNode<B> {
     /// Retrieve the sink's produced output, if any. Defaults to no output.
-    fn collect(&mut self) -> Vec<RecordBatch> {
+    fn collect(&mut self) -> Vec<O> {
         Vec::new()
     }
 

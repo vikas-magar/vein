@@ -1,18 +1,17 @@
 //! The build side of a hash join, as a table of references.
 //!
-//! Zero copy is the constraint this module exists to satisfy. A build row is
-//! entered as a `(chunk, row)` reference — twelve bytes — pointing into chunks
-//! that stay alive, and its key hash is computed once, straight from the Arrow
-//! buffers. Comparing a probe key reads the build buffers directly, so probing
-//! never materialises a build row and never copies a build column.
+//! Build payloads stay in reference-backed views. Key resolution shares contiguous
+//! Arrow buffers or gathers mapped key rows; the single-Int64 fast path also
+//! copies keys into the hash index. These allocations are distinct from payload
+//! copying. Probe keys are execution-local, keeping the shared table immutable.
 //!
-//! What the table deliberately does not do: assemble output. Matching produces
-//! `(probe row, build entry)` pairs, which the join operator turns into columns
-//! with `take`. That is the only materialisation a join causes.
+//! Matching produces row references. The join operator composes output views;
+//! ordinary Arrow payload arrays are requested only at an explicit boundary.
 
 use arrow::array::{Array, Int64Array, StringArray};
 
-use crate::pipeline::{DataChunk, DataChunkView};
+use crate::pipeline::{DataChunk, DataChunkView, MaterializationReport};
+use std::time::Instant;
 use common::Result;
 use error::VeinError;
 use types::{HashJoinKeyType, VeinDataType};
@@ -109,12 +108,15 @@ struct ChunkKeys {
 }
 
 impl ChunkKeys {
-    fn resolve(keys: &JoinKeys, chunk: &DataChunkView) -> Result<Self> {
+    fn resolve(keys: &JoinKeys, chunk: &DataChunkView) -> Result<(Self, MaterializationReport, u64)> {
+        let started = Instant::now();
+        let mut report = MaterializationReport::default();
         let mut columns = Vec::with_capacity(keys.columns.len());
         for index in &keys.columns {
             // Only the join keys cross an Arrow-kernel boundary; payload arrays
             // stay retained by the reference-backed view.
-            let array = chunk.materialize_column(*index)?;
+            let (array, column_report) = chunk.materialize_column_with_report(*index)?;
+            report.accumulate(column_report);
             let data_type = VeinDataType::try_from(array.data_type()).map_err(|error| {
                 VeinError::internal(format!(
                     "join key column {index} has an unsupported Arrow type {:?}: {error}",
@@ -147,7 +149,7 @@ impl ChunkKeys {
             };
             columns.push(resolved);
         }
-        Ok(Self { columns })
+        Ok((Self { columns }, report, u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)))
     }
 
     /// Whether any key column is null at `row`. A null key matches nothing.
@@ -214,6 +216,9 @@ pub struct HashTable {
     /// fixed-width type"). Only the key is copied; payload columns stay
     /// columnar and shared.
     keys: Vec<i64>,
+    /// Build key array conversions, excluding inline-key/index allocations.
+    build_key_materialization: MaterializationReport,
+    build_key_materialize_us: u64,
 }
 
 impl HashTable {
@@ -235,6 +240,8 @@ impl HashTable {
             buckets: vec![NONE; INITIAL_BUCKETS],
             null_keyed: Vec::new(),
             keys: Vec::new(),
+            build_key_materialization: MaterializationReport::default(),
+            build_key_materialize_us: 0,
         }
     }
 
@@ -264,7 +271,9 @@ impl HashTable {
 
     /// Retains a reference-backed build batch and indexes its active rows.
     pub fn insert_view(&mut self, chunk: DataChunkView) -> Result<()> {
-        let keys = ChunkKeys::resolve(&self.build_keys, &chunk)?;
+        let (keys, report, materialize_us) = ChunkKeys::resolve(&self.build_keys, &chunk)?;
+        self.build_key_materialization.accumulate(report);
+        self.build_key_materialize_us = self.build_key_materialize_us.saturating_add(materialize_us);
         let chunk_index = self.chunks.len() as u32;
         // The keys stay a local, so the loop below can mutate the table's
         // vectors while still reading the chunk's resolved keys. Building a
@@ -357,6 +366,8 @@ impl HashTable {
         }
 
         let self_inline = self.inline_keys();
+        self.build_key_materialization.accumulate(other.build_key_materialization);
+        self.build_key_materialize_us = self.build_key_materialize_us.saturating_add(other.build_key_materialize_us);
         let other_inline = other.inline_keys();
         let offset = self.chunks.len() as u32;
 
@@ -401,13 +412,15 @@ impl HashTable {
     ///
     /// A probe row with a null key contributes nothing.
     pub fn probe(&self, probe: &DataChunk, matches: &mut Vec<(u32, (u32, u32))>) -> Result<()> {
-        self.probe_view(&DataChunkView::from_chunk(probe.clone())?, matches)
+        self.probe_view(&DataChunkView::from_chunk(probe.clone())?, matches).map(|_| ())
     }
 
     /// Probes a reference-backed batch. Returned rows are logical positions in
     /// the selected input batches.
-    pub fn probe_view(&self, probe: &DataChunkView, matches: &mut Vec<(u32, (u32, u32))>) -> Result<()> {
-        let probe_keys = ChunkKeys::resolve(&self.probe_keys, probe)?;
+    /// Returns the probe key conversion report and resolution time in microseconds.
+    /// The report excludes hash/index allocations and never mutates build metrics.
+    pub fn probe_view(&self, probe: &DataChunkView, matches: &mut Vec<(u32, (u32, u32))>) -> Result<(MaterializationReport, u64)> {
+        let (probe_keys, report, materialize_us) = ChunkKeys::resolve(&self.probe_keys, probe)?;
         let inline = self.inline_keys() && probe_keys.is_single_i64();
         for position in 0..probe.num_rows() {
             let row = position as u32;
@@ -434,7 +447,12 @@ impl HashTable {
                 head = entry.next;
             }
         }
-        Ok(())
+        Ok((report, materialize_us))
+    }
+
+    /// Accumulated build key conversion work, including merged build tables.
+    pub(crate) fn build_key_materialization(&self) -> (MaterializationReport, u64) {
+        (self.build_key_materialization, self.build_key_materialize_us)
     }
 
     /// Every build row the table holds, as `(chunk, row)`.
@@ -486,6 +504,76 @@ mod tests {
         DataChunk::from_vectors(vec![column])
     }
 
+    #[test]
+    fn key_reports_cover_composite_null_keys_sparse_probes_and_table_merges() {
+        use common::arrow::SelectionVector;
+
+        let numbers: ArrayRef = Arc::new(Int64Array::from(vec![Some(7), None, Some(8)]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["A", "B", "C"]));
+        let payload = ints(&[70, 0, 80]);
+        let make_view = |selection| DataChunkView::from_chunk(DataChunk::new(
+            vec![Arc::clone(&numbers), Arc::clone(&strings), Arc::clone(&payload)], selection,
+        )).unwrap();
+        let mut left = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
+        left.insert_view(make_view(SelectionVector::new_dense(3))).unwrap();
+        let (shared, shared_us) = left.build_key_materialization();
+        assert_eq!(shared.shared_columns, 2);
+        assert_eq!(shared.gathered_columns, 0);
+        let mut right = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
+        let sparse = make_view(SelectionVector::new_sparse(vec![2, 1, 0]));
+        let (_, first) = sparse.materialize_column_with_report(0).unwrap();
+        let (_, second) = sparse.materialize_column_with_report(1).unwrap();
+        let expected_bytes = first.gathered_output_buffer_bytes + second.gathered_output_buffer_bytes;
+        right.insert_view(sparse.clone()).unwrap();
+        let (gathered, gathered_us) = right.build_key_materialization();
+        assert_eq!(gathered.gathered_columns, 2);
+        assert_eq!(gathered.gathered_output_buffer_bytes, expected_bytes);
+        assert!(expected_bytes > 0);
+        left.merge(right).unwrap();
+        let mut expected = shared;
+        expected.accumulate(gathered);
+        assert_eq!(left.build_key_materialization(), (expected, shared_us.saturating_add(gathered_us)));
+        for index in 0..2 {
+            assert!(Arc::ptr_eq(left.build_chunk(index).resolve(2, 0).unwrap().unwrap().0, &payload));
+        }
+
+        let before = left.build_key_materialization();
+        let mut matches = Vec::new();
+        let (report, _) = left.probe_view(&sparse, &mut matches).unwrap();
+        assert_eq!(report, gathered);
+        matches.sort_unstable();
+        assert_eq!(matches, vec![(0, (0, 2)), (0, (1, 0)), (2, (0, 0)), (2, (1, 2))]);
+        assert_eq!(left.build_key_materialization(), before, "probing must not mutate the shared build table");
+        matches.clear();
+        let (report, _) = left.probe_view(&make_view(SelectionVector::new_dense(3)), &mut matches).unwrap();
+        assert_eq!(report, shared);
+        let mut incompatible = HashTable::new(JoinKeys::new(vec![2]), JoinKeys::new(vec![2]));
+        incompatible.insert_view(make_view(SelectionVector::new_dense(3))).unwrap();
+        assert!(left.merge(incompatible).is_err());
+        assert_eq!(left.build_key_materialization(), before);
+    }
+
+    #[test]
+    fn key_reports_handle_empty_batches_and_keyless_joins() {
+        use common::arrow::SelectionVector;
+
+        let empty = DataChunkView::from_chunk(DataChunk::new(vec![ints(&[1])], SelectionVector::new_sparse(vec![]))).unwrap();
+        let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        table.insert_view(empty.clone()).unwrap();
+        let expected = MaterializationReport { empty_columns: 1, ..Default::default() };
+        assert_eq!(table.build_key_materialization().0, expected);
+        let mut matches = Vec::new();
+        assert_eq!(table.probe_view(&empty, &mut matches).unwrap().0, expected);
+        assert!(matches.is_empty());
+
+        let mut keyless = HashTable::new(JoinKeys::new(vec![]), JoinKeys::new(vec![]));
+        let view = DataChunkView::from_chunk(chunk(ints(&[1, 2]))).unwrap();
+        keyless.insert_view(view.clone()).unwrap();
+        assert_eq!(keyless.build_key_materialization().0, MaterializationReport::default());
+        assert_eq!(keyless.probe_view(&view, &mut matches).unwrap().0, MaterializationReport::default());
+        assert_eq!(matches.len(), 4);
+    }
+
     /// A probe row finds exactly the build rows whose key equals it.
     #[test]
     fn probe_finds_equal_keys() {
@@ -519,6 +607,7 @@ mod tests {
 
         assert!(error.to_string().contains("not supported by hash join"));
         assert!(error.to_string().contains("Int32"));
+        assert_eq!(table.build_key_materialization(), (MaterializationReport::default(), 0));
     }
 
     /// A null key never matches, on either side of the join.

@@ -1,10 +1,9 @@
 //! Blocking Arrow row sort that retains input column buffers until final gather.
 
-use arrow::array::{Array, ArrayRef};
+use arrow::array::ArrayRef;
 use arrow::compute::SortOptions;
 use arrow::error::ArrowError;
 use arrow_row::{RowConverter, Rows, SortField};
-use common::arrow::SelectionVector;
 use common::Result;
 use common::protocol::{LimitSpec, SortPlan};
 use error::VeinError;
@@ -12,8 +11,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::time::Instant;
 
-use crate::operators::join::gather::gather;
-use crate::pipeline::{DataChunk, PipelineNode, Transform};
+use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode, Transform};
 
 const OUTPUT_BATCH_ROWS: usize = 8192;
 
@@ -100,23 +98,27 @@ impl<T: Ord> BoundedTopN<T> {
     }
 }
 
-/// Collects one task's chunks, sorts references to their rows, then gathers output.
+/// Collects one task's views, sorts references to their rows, then composes output views.
 ///
-/// Input arrays stay shared while the keys are encoded and sorted. The only full
-/// column materialization is the final Arrow interleave into output batches.
+/// Input arrays stay shared while the keys are encoded and sorted. Sort-key
+/// arrays and encoded keys may be materialized, but payload columns remain
+/// references until a downstream operator explicitly requests Arrow arrays.
 pub struct SortTransform {
     plan: SortPlan,
     output_columns: Option<usize>,
-    chunks: Vec<Option<DataChunk>>,
+    chunks: Vec<Option<DataChunkView>>,
     top_n_references: Vec<usize>,
     top_n: Option<BoundedTopN<TopNEntry>>,
     row_converter: Option<RowConverter>,
     metrics: SortMetrics,
-    next: Box<dyn PipelineNode<DataChunk>>,
+    next: Box<dyn PipelineNode<DataChunkView>>,
 }
 
 #[derive(Default)]
 struct SortMetrics {
+    /// Sort-key array conversions, excluding encoded row keys and payloads.
+    key_materialization: MaterializationReport,
+    key_materialize_us: u64,
     input_batches: u64,
     input_rows: u64,
     candidate_rows_examined: u64,
@@ -133,7 +135,7 @@ struct SortMetrics {
 
 impl SortTransform {
     /// Create a global sort boundary for one task's input stream.
-    pub fn new(plan: SortPlan, next: Box<dyn PipelineNode<DataChunk>>) -> Self {
+    pub fn new(plan: SortPlan, next: Box<dyn PipelineNode<DataChunkView>>) -> Self {
         Self::with_output_columns(plan, None, next)
     }
 
@@ -141,7 +143,7 @@ impl SortTransform {
     pub fn with_output_columns(
         plan: SortPlan,
         output_columns: Option<usize>,
-        next: Box<dyn PipelineNode<DataChunk>>,
+        next: Box<dyn PipelineNode<DataChunkView>>,
     ) -> Self {
         Self::with_limit(plan, output_columns, None, next)
     }
@@ -152,7 +154,7 @@ impl SortTransform {
         plan: SortPlan,
         output_columns: Option<usize>,
         limit: Option<LimitSpec>,
-        next: Box<dyn PipelineNode<DataChunk>>,
+        next: Box<dyn PipelineNode<DataChunkView>>,
     ) -> Self {
         let candidate_limit = limit.map(|limit| {
             if limit.count == 0 {
@@ -173,7 +175,7 @@ impl SortTransform {
         }
     }
 
-    fn sort_fields(&self, first: &DataChunk) -> Result<Vec<SortField>> {
+    fn sort_fields(&self, first: &DataChunkView) -> Result<Vec<SortField>> {
         if self.plan.keys.is_empty() {
             return Err(VeinError::planning("ORDER requires at least one sort key", None));
         }
@@ -182,14 +184,14 @@ impl SortTransform {
             .keys
             .iter()
             .map(|key| {
-                let column = first.vectors.get(key.column as usize).ok_or_else(|| {
+                let data_type = first.column_data_type(key.column as usize).map_err(|_| {
                     VeinError::planning(
                         format!("ORDER BY column {} is outside the input schema", key.column),
                         None,
                     )
                 })?;
                 Ok(SortField::new_with_options(
-                    column.data_type().clone(),
+                    data_type.clone(),
                     SortOptions {
                         descending: !key.ascending,
                         nulls_first: key.nulls_first,
@@ -199,19 +201,28 @@ impl SortTransform {
             .collect()
     }
 
-    fn sort_key_columns(&self, chunk: &DataChunk) -> Result<Vec<ArrayRef>> {
-        self.plan
+    fn sort_key_columns(&self, chunk: &DataChunkView) -> Result<(Vec<ArrayRef>, MaterializationReport, u64)> {
+        let started = Instant::now();
+        let mut report = MaterializationReport::default();
+        let columns = self.plan
             .keys
             .iter()
             .map(|key| {
-                chunk.vectors.get(key.column as usize).cloned().ok_or_else(|| {
-                    VeinError::planning(
-                        format!("ORDER BY column {} is outside the input schema", key.column),
-                        None,
-                    )
-                })
+                chunk
+                    .materialize_column_with_report(key.column as usize)
+                    .map(|(array, column_report)| {
+                        report.accumulate(column_report);
+                        array
+                    })
+                    .map_err(|_| {
+                        VeinError::planning(
+                            format!("ORDER BY column {} is outside the input schema", key.column),
+                            None,
+                        )
+                    })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((columns, report, u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)))
     }
 
     fn sort_and_emit(&mut self) -> Result<()> {
@@ -244,8 +255,8 @@ impl SortTransform {
         let Some(first) = self.chunks.iter().find_map(Option::as_ref) else {
             return Ok(Vec::new());
         };
-        let output_columns = self.output_columns.unwrap_or(first.vectors.len());
-        if output_columns > first.vectors.len() {
+        let output_columns = self.output_columns.unwrap_or(first.num_columns());
+        if output_columns > first.num_columns() {
             return Err(VeinError::planning(
                 "ORDER output width exceeds the sort input schema",
                 None,
@@ -261,14 +272,16 @@ impl SortTransform {
             let Some(chunk) = chunk else {
                 continue;
             };
-            let key_columns = self.sort_key_columns(chunk)?;
+            let (key_columns, report, materialize_us) = self.sort_key_columns(chunk)?;
+            self.metrics.key_materialization.accumulate(report);
+            self.metrics.key_materialize_us = self.metrics.key_materialize_us.saturating_add(materialize_us);
             let keys = converter
                 .convert_columns(&key_columns)
                 .map_err(row_sort_error)?;
-            for active_row in 0..chunk.selection.size() {
+            for active_row in 0..chunk.num_rows() {
                 order.push(RowRef {
                     chunk: chunk_index,
-                    row: chunk.selection.get_index(active_row),
+                    row: active_row,
                 });
             }
             encoded_keys.push(keys);
@@ -298,40 +311,22 @@ impl SortTransform {
         let first = self.chunks[first_row.chunk]
             .as_ref()
             .ok_or_else(|| VeinError::internal("sort candidate references a released input chunk"))?;
-        let output_columns = self.output_columns.unwrap_or(first.vectors.len());
-        if output_columns > first.vectors.len() {
+        let output_columns = self.output_columns.unwrap_or(first.num_columns());
+        if output_columns > first.num_columns() {
             return Err(VeinError::planning(
                 "ORDER output width exceeds the sort input schema",
                 None,
             ));
         }
 
-        if order.iter().all(|row| row.chunk == first_row.chunk) {
-            let vectors: Vec<ArrayRef> = first
-                .vectors
-                .iter()
-                .take(output_columns)
-                .cloned()
-                .collect();
-            for rows in order.chunks(OUTPUT_BATCH_ROWS) {
-                let selection = SelectionVector::new_sparse(
-                    rows.iter().map(|row| row.row as u32).collect(),
-                );
-                self.next
-                    .push(DataChunk::new(vectors.clone(), selection))?;
-            }
-            return Ok(());
-        }
-
         let mut chunk_positions = vec![None; self.chunks.len()];
-        let mut arrays = Vec::new();
+        let mut inputs = Vec::new();
         for (index, chunk) in self.chunks.iter().enumerate() {
-            if let Some(chunk) = chunk {
-                chunk_positions[index] = Some(arrays.len());
-                arrays.push(chunk);
+            if let Some(view) = chunk {
+                chunk_positions[index] = Some(inputs.len());
+                inputs.push(view);
             }
         }
-        let column_count = output_columns;
         for rows in order.chunks(OUTPUT_BATCH_ROWS) {
             let indices: Vec<(usize, usize)> = rows
                 .iter()
@@ -343,21 +338,17 @@ impl SortTransform {
                         })
                 })
                 .collect::<Result<_>>()?;
-            let mut output = Vec::with_capacity(column_count);
-            for column_index in 0..column_count {
-                let values: Vec<&dyn Array> = arrays
-                    .iter()
-                    .map(|chunk| chunk.vectors[column_index].as_ref())
-                    .collect();
-                output.push(gather(&values, &indices)?);
-            }
-            self.next.push(DataChunk::from_vectors(output))?;
+            self.next.push(DataChunkView::compose_rows(
+                &inputs,
+                &indices,
+                output_columns,
+            )?)?;
         }
         Ok(())
     }
 
-    fn push_top_n(&mut self, chunk: DataChunk) -> Result<()> {
-        if chunk.selection.is_empty() {
+    fn push_top_n(&mut self, chunk: DataChunkView) -> Result<()> {
+        if chunk.is_empty() {
             return Ok(());
         }
         let Some(top_n) = self.top_n.as_ref() else {
@@ -370,12 +361,14 @@ impl SortTransform {
         self.metrics.input_rows = self
             .metrics
             .input_rows
-            .saturating_add(chunk.selection.size() as u64);
+            .saturating_add(chunk.num_rows() as u64);
 
         if self.row_converter.is_none() {
             self.row_converter = Some(RowConverter::new(self.sort_fields(&chunk)?).map_err(row_sort_error)?);
         }
-        let key_columns = self.sort_key_columns(&chunk)?;
+        let (key_columns, report, materialize_us) = self.sort_key_columns(&chunk)?;
+        self.metrics.key_materialization.accumulate(report);
+        self.metrics.key_materialize_us = self.metrics.key_materialize_us.saturating_add(materialize_us);
         let encode_started = Instant::now();
         let keys = self
             .row_converter
@@ -391,23 +384,21 @@ impl SortTransform {
         let chunk_index = self.chunks.len();
         self.chunks.push(Some(chunk));
         self.top_n_references.push(0);
-        let selection = self.chunks[chunk_index]
+        let row_count = self.chunks[chunk_index]
             .as_ref()
-            .expect("new chunk is retained")
-            .selection
-            .clone();
+            .expect("new view is retained")
+            .num_rows();
         let top_n = self.top_n.as_mut().expect("Top-N selector checked above");
         let selection_started = Instant::now();
-        for active_row in 0..selection.size() {
+        for active_row in 0..row_count {
             self.metrics.candidate_rows_examined = self
                 .metrics
                 .candidate_rows_examined
                 .saturating_add(1);
-            let row = selection.get_index(active_row);
-            let key = keys.row(row).data();
+            let key = keys.row(active_row).data();
             let candidate_row = RowRef {
                 chunk: chunk_index,
-                row,
+                row: active_row,
             };
             let replaced_row = if top_n.is_full() {
                 let Some(worst) = top_n.peek() else {
@@ -481,16 +472,16 @@ fn row_sort_error(error: ArrowError) -> VeinError {
     VeinError::planning(format!("ORDER BY key cannot be sorted: {error}"), None)
 }
 
-impl PipelineNode<DataChunk> for SortTransform {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+impl PipelineNode<DataChunkView> for SortTransform {
+    fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         if self.top_n.is_some() {
             self.push_top_n(chunk)
-        } else if !chunk.selection.is_empty() {
+        } else if !chunk.is_empty() {
             self.metrics.input_batches = self.metrics.input_batches.saturating_add(1);
             self.metrics.input_rows = self
                 .metrics
                 .input_rows
-                .saturating_add(chunk.selection.size() as u64);
+                .saturating_add(chunk.num_rows() as u64);
             self.chunks.push(Some(chunk));
             Ok(())
         } else {
@@ -514,6 +505,11 @@ impl PipelineNode<DataChunk> for SortTransform {
             candidate_key_bytes_copied = self.metrics.candidate_key_bytes_copied,
             output_rows = self.metrics.output_rows,
             key_encode_us = self.metrics.key_encode_us,
+            key_shared_columns = self.metrics.key_materialization.shared_columns,
+            key_gathered_columns = self.metrics.key_materialization.gathered_columns,
+            key_empty_columns = self.metrics.key_materialization.empty_columns,
+            key_gathered_output_buffer_bytes = self.metrics.key_materialization.gathered_output_buffer_bytes,
+            key_materialize_us = self.metrics.key_materialize_us,
             selection_us = self.metrics.selection_us,
             sort_us = self.metrics.sort_us,
             emit_us = self.metrics.emit_us,
@@ -531,25 +527,26 @@ impl PipelineNode<DataChunk> for SortTransform {
     }
 }
 
-impl Transform<DataChunk> for SortTransform {}
+impl Transform<DataChunkView> for SortTransform {}
 
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Array, Int64Array, StringArray};
     use common::arrow::SelectionVector;
     use common::protocol::{LimitSpec, SortKey, SortPlan};
 
     use super::*;
     use crate::operators::transform::limit::LimitTransform;
+    use crate::pipeline::DataChunk;
 
     #[derive(Clone)]
-    struct Collect(Arc<Mutex<Vec<DataChunk>>>);
+    struct Collect(Arc<Mutex<Vec<DataChunkView>>>);
 
-    impl PipelineNode<DataChunk> for Collect {
-        fn push(&mut self, chunk: DataChunk) -> Result<()> {
-            self.0.lock().unwrap().push(chunk);
+    impl PipelineNode<DataChunkView> for Collect {
+        fn push(&mut self, view: DataChunkView) -> Result<()> {
+            self.0.lock().unwrap().push(view);
             Ok(())
         }
 
@@ -564,6 +561,34 @@ mod tests {
 
     fn integers(values: &[i64]) -> ArrayRef {
         Arc::new(Int64Array::from(values.to_vec()))
+    }
+
+    fn view(chunk: DataChunk) -> DataChunkView {
+        DataChunkView::from_chunk(chunk).expect("materialized fixture becomes a view")
+    }
+
+    fn int_at(view: &DataChunkView, column: usize, row: usize) -> Option<i64> {
+        let Some((array, physical_row)) = view.resolve(column, row).expect("resolve view cell") else {
+            return None;
+        };
+        let values = array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 view column");
+        values.is_valid(physical_row).then(|| values.value(physical_row))
+    }
+
+    fn string_at(view: &DataChunkView, column: usize, row: usize) -> Option<String> {
+        let Some((array, physical_row)) = view.resolve(column, row).expect("resolve view cell") else {
+            return None;
+        };
+        let values = array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string view column");
+        values
+            .is_valid(physical_row)
+            .then(|| values.value(physical_row).to_owned())
     }
 
     #[test]
@@ -584,15 +609,15 @@ mod tests {
             ],
         };
         let mut sort = SortTransform::new(plan, Box::new(Collect(output.clone())));
-        sort.push(DataChunk::new(
+        sort.push(view(DataChunk::new(
             vec![strings(&[Some("b"), Some("a")]), integers(&[1, 1])],
             SelectionVector::new_dense(2),
-        ))
+        )))
             .unwrap();
-        sort.push(DataChunk::new(
+        sort.push(view(DataChunk::new(
             vec![strings(&[Some("b"), None]), integers(&[3, 9])],
             SelectionVector::new_dense(2),
-        ))
+        )))
             .unwrap();
 
         sort.flush().unwrap();
@@ -600,23 +625,68 @@ mod tests {
         let chunks = output.lock().unwrap();
         let labels: Vec<Option<String>> = chunks
             .iter()
-            .flat_map(|chunk| {
-                let values = chunk.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-                (0..values.len())
-                    .map(|row| values.is_valid(row).then(|| values.value(row).to_owned()))
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|view| (0..view.num_rows()).map(|row| string_at(view, 0, row)))
             .collect();
         let tie_breakers: Vec<i64> = chunks
             .iter()
-            .flat_map(|chunk| {
-                let values = chunk.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-                (0..values.len()).map(|row| values.value(row)).collect::<Vec<_>>()
-            })
+            .flat_map(|view| (0..view.num_rows()).map(|row| int_at(view, 1, row).unwrap()))
             .collect();
 
         assert_eq!(labels, vec![Some("a".into()), Some("b".into()), Some("b".into()), None]);
         assert_eq!(tie_breakers, vec![1, 3, 1, 9]);
+    }
+
+    #[test]
+    fn sort_composes_cross_batch_payload_references_with_sparse_selections() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let first_keys = integers(&[4, 999, 1]);
+        let first_payload = integers(&[40, 9_990, 10]);
+        let second_keys = integers(&[3, 2]);
+        let second_payload = integers(&[30, 20]);
+        let mut sort = SortTransform::new(
+            SortPlan {
+                keys: vec![SortKey {
+                    column: 0,
+                    ascending: true,
+                    nulls_first: false,
+                }],
+            },
+            Box::new(Collect(output.clone())),
+        );
+        sort.push(view(DataChunk::new(
+            vec![Arc::clone(&first_keys), Arc::clone(&first_payload)],
+            SelectionVector::new_sparse(vec![0, 2]),
+        )))
+            .expect("push first sparse input view");
+        sort.push(view(DataChunk::new(
+            vec![Arc::clone(&second_keys), Arc::clone(&second_payload)],
+            SelectionVector::new_dense(2),
+        )))
+            .expect("push second input view");
+
+        sort.flush().expect("sort sparse input views");
+
+        let output = output.lock().unwrap();
+        let sorted_keys = output
+            .iter()
+            .flat_map(|view| (0..view.num_rows()).map(|row| int_at(view, 0, row).unwrap()))
+            .collect::<Vec<_>>();
+        let sorted_payload = output
+            .iter()
+            .flat_map(|view| (0..view.num_rows()).map(|row| int_at(view, 1, row).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(sorted_keys, vec![1, 2, 3, 4]);
+        assert_eq!(sorted_payload, vec![10, 20, 30, 40]);
+        for view in output.iter() {
+            for row in 0..view.num_rows() {
+                let (array, _) = view.resolve(1, row).unwrap().unwrap();
+                assert!(
+                    Arc::ptr_eq(array, &first_payload)
+                        || Arc::ptr_eq(array, &second_payload),
+                    "sorted payload must still reference an input array"
+                );
+            }
+        }
     }
 
     #[test]
@@ -633,21 +703,51 @@ mod tests {
             },
             Box::new(Collect(output.clone())),
         );
-        sort.push(DataChunk::from_vectors(vec![values.clone()]))
+        sort.push(view(DataChunk::from_vectors(vec![values.clone()])))
             .unwrap();
 
         sort.flush().unwrap();
 
         let chunks = output.lock().unwrap();
         assert_eq!(chunks.len(), 1);
-        assert!(Arc::ptr_eq(&chunks[0].vectors[0], &values));
-        let selected: Vec<i64> = (0..chunks[0].selection.size())
-            .map(|index| {
-                let row = chunks[0].selection.get_index(index);
-                values.as_any().downcast_ref::<Int64Array>().unwrap().value(row)
-            })
+        let (array, _) = chunks[0].resolve(0, 0).unwrap().unwrap();
+        assert!(Arc::ptr_eq(array, &values));
+        let selected: Vec<i64> = (0..chunks[0].num_rows())
+            .map(|row| int_at(&chunks[0], 0, row).unwrap())
             .collect();
         assert_eq!(selected, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn full_sort_and_top_n_report_only_sort_key_conversions() {
+        for top_n in [false, true] {
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let keys = integers(&[30, 10, 20]);
+            let payload = integers(&[300, 100, 200]);
+            let mut sort = SortTransform::with_limit(
+                SortPlan { keys: vec![SortKey { column: 0, ascending: true, nulls_first: false }] },
+                None,
+                top_n.then_some(LimitSpec { offset: 0, count: 2 }),
+                Box::new(Collect(Arc::clone(&output))),
+            );
+            for selection in [SelectionVector::new_dense(3), SelectionVector::new_sparse(vec![2, 0])] {
+                sort.push(view(DataChunk::new(vec![Arc::clone(&keys), Arc::clone(&payload)], selection))).unwrap();
+            }
+            sort.flush().unwrap();
+            assert_eq!(sort.metrics.key_materialization.shared_columns, 1);
+            assert_eq!(sort.metrics.key_materialization.gathered_columns, 1);
+            assert_eq!(sort.metrics.key_materialization.empty_columns, 0);
+            assert!(sort.metrics.key_materialization.gathered_output_buffer_bytes > 0);
+            let views = output.lock().unwrap();
+            let rows: Vec<_> = views.iter().flat_map(|view| (0..view.num_rows()).map(|row| {
+                assert!(Arc::ptr_eq(view.resolve(1, row).unwrap().unwrap().0, &payload));
+                (int_at(view, 0, row).unwrap(), int_at(view, 1, row).unwrap())
+            })).collect();
+            let expected = if top_n { vec![(10, 100), (20, 200)] } else {
+                vec![(10, 100), (20, 200), (20, 200), (30, 300), (30, 300)]
+            };
+            assert_eq!(rows, expected);
+        }
     }
 
     #[test]
@@ -668,21 +768,17 @@ mod tests {
             Some(LimitSpec { offset: 1, count: 2 }),
             window,
         );
-        sort.push(DataChunk::from_vectors(vec![values.clone()]))
+        sort.push(view(DataChunk::from_vectors(vec![values.clone()])))
             .unwrap();
 
         sort.flush().unwrap();
 
         let chunks = output.lock().unwrap();
         assert_eq!(chunks.len(), 1);
-        assert!(Arc::ptr_eq(&chunks[0].vectors[0], &values));
-        let values = chunks[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let sorted: Vec<i64> = (0..chunks[0].selection.size())
-            .map(|index| values.value(chunks[0].selection.get_index(index)))
+        let (array, _) = chunks[0].resolve(0, 0).unwrap().unwrap();
+        assert!(Arc::ptr_eq(array, &values));
+        let sorted: Vec<i64> = (0..chunks[0].num_rows())
+            .map(|row| int_at(&chunks[0], 0, row).unwrap())
             .collect();
         assert_eq!(sorted, vec![2, 3]);
     }
@@ -703,9 +799,9 @@ mod tests {
             Some(LimitSpec { offset: 0, count: 1 }),
             Box::new(Collect(output.clone())),
         );
-        sort.push(DataChunk::from_vectors(vec![integers(&[8, 9])]))
+        sort.push(view(DataChunk::from_vectors(vec![integers(&[8, 9])])))
             .unwrap();
-        sort.push(DataChunk::from_vectors(vec![winner.clone()]))
+        sort.push(view(DataChunk::from_vectors(vec![winner.clone()])))
             .unwrap();
 
         assert!(sort.chunks[0].is_none());
@@ -714,7 +810,8 @@ mod tests {
 
         let chunks = output.lock().unwrap();
         assert_eq!(chunks.len(), 1);
-        assert!(Arc::ptr_eq(&chunks[0].vectors[0], &winner));
+        let (array, _) = chunks[0].resolve(0, 0).unwrap().unwrap();
+        assert!(Arc::ptr_eq(array, &winner));
     }
 
     #[test]
@@ -732,7 +829,9 @@ mod tests {
             Some(LimitSpec { offset: 0, count: 3 }),
             Box::new(Collect(output.clone())),
         );
-        sort.push(DataChunk::from_vectors(vec![integers(&[4, 1])]))
+        let first = integers(&[4, 1]);
+        let second = integers(&[3, 2]);
+        sort.push(view(DataChunk::from_vectors(vec![first.clone()])))
             .unwrap();
         let evicted_key_buffer = sort
             .top_n
@@ -742,7 +841,7 @@ mod tests {
             .unwrap()
             .key
             .as_ptr();
-        sort.push(DataChunk::from_vectors(vec![integers(&[3, 2])]))
+        sort.push(view(DataChunk::from_vectors(vec![second.clone()])))
             .unwrap();
 
         let replacement = sort
@@ -769,18 +868,15 @@ mod tests {
         let chunks = output.lock().unwrap();
         let sorted: Vec<i64> = chunks
             .iter()
-            .flat_map(|chunk| {
-                chunk
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .values()
-                    .iter()
-                    .copied()
-            })
+            .flat_map(|view| (0..view.num_rows()).map(|row| int_at(view, 0, row).unwrap()))
             .collect();
         assert_eq!(sorted, vec![1, 2, 3]);
+        for output in chunks.iter() {
+            for row in 0..output.num_rows() {
+                let (array, _) = output.resolve(0, row).unwrap().unwrap();
+                assert!(Arc::ptr_eq(array, &first) || Arc::ptr_eq(array, &second));
+            }
+        }
     }
 
     #[test]
@@ -800,7 +896,7 @@ mod tests {
         );
 
         assert!(sort.finished());
-        sort.push(DataChunk::from_vectors(vec![integers(&[3, 1, 2])]))
+        sort.push(view(DataChunk::from_vectors(vec![integers(&[3, 1, 2])])))
             .unwrap();
         sort.flush().unwrap();
 

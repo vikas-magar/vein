@@ -176,14 +176,14 @@ mod window {
     async fn select_lifts_window_below_projection() {
         let plan = bind("FROM users |> SELECT id, SUM(age) OVER () AS total_age").await;
         assert_chain(&plan, &["Project", "Window", "Scan"]);
-        assert_schema(&plan, &[("id", None, false), ("total_age", None, false)]);
+        assert_schema(&plan, &[("id", None, false), ("total_age", None, true)]);
     }
 
     #[tokio::test]
     async fn select_window_without_alias_uses_fn_name() {
         let plan = bind("FROM users |> SELECT SUM(age) OVER ()").await;
         assert_chain(&plan, &["Project", "Window", "Scan"]);
-        assert_schema(&plan, &[("sum", None, false)]);
+        assert_schema(&plan, &[("sum", None, true)]);
     }
 
     /// EXTEND keeps the input columns and appends the window output.
@@ -198,7 +198,7 @@ mod window {
                 ("id", Some("users"), false),
                 ("name", Some("users"), false),
                 ("age", Some("users"), false),
-                ("total_age", None, false),
+                ("total_age", None, true),
             ],
         );
     }
@@ -259,7 +259,7 @@ mod window {
         let plan =
             bind("FROM users |> SELECT SUM(age) OVER () AS total_age, COUNT(*) OVER () AS n").await;
         assert_chain(&plan, &["Project", "Window", "Scan"]);
-        assert_schema(&plan, &[("total_age", None, false), ("n", None, false)]);
+        assert_schema(&plan, &[("total_age", None, true), ("n", None, true)]);
     }
 
     /// Conflicting OVER clauses in one operator are a semantic error.
@@ -407,6 +407,21 @@ mod projection_mutations {
                 ("age", Some("users"), false),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn computed_projection_mutations_preserve_expression_nullability() {
+        let select = bind("FROM users |> SELECT id + 1 AS next_id, LOWER(name) AS lowered").await;
+        assert_schema(
+            &select,
+            &[("next_id", None, false), ("lowered", None, true)],
+        );
+
+        let extend = bind("FROM users |> EXTEND LOWER(name) AS lowered").await;
+        assert!(extend.schema().fields.last().unwrap().nullable);
+
+        let set = bind("FROM users |> SET name = LOWER(name)").await;
+        assert!(set.schema().fields[1].nullable);
     }
 
     /// SET of an unknown column is a semantic error.
@@ -960,6 +975,22 @@ mod aggregate_types {
         assert_eq!(schema.fields[0].data_type, VeinDataType::Int64);
         assert_eq!(schema.fields[1].data_type, VeinDataType::Int64);
         assert_eq!(schema.fields[2].data_type, VeinDataType::Float64);
+    }
+
+    #[tokio::test]
+    async fn aggregate_result_nullability_is_conservative_and_grouping_is_inferred() {
+        let plan = bind(
+            "FROM users |> AGGREGATE SUM(age) AS total, COUNT(*) AS n GROUP BY age + 1",
+        )
+            .await;
+        let LogicalPlan::Aggregate { schema, .. } = plan else {
+            panic!("expected Aggregate plan");
+        };
+
+        assert_eq!(schema.fields.len(), 3);
+        assert!(schema.fields[1].nullable, "SUM can return NULL on empty input");
+        assert!(schema.fields[2].nullable, "function nullability is conservative");
+        assert!(!schema.fields[0].nullable, "non-null grouping inputs stay non-null");
     }
 
     #[tokio::test]

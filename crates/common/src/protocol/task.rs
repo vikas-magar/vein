@@ -179,6 +179,79 @@ pub enum PhysicalPlanOperator {
     },
 }
 
+/// Which view inputs an operator may convert to ordinary Arrow arrays.
+///
+/// Conversion can share contiguous buffers or gather mapped rows. This describes
+/// conversion scope, not bytes copied, memory usage, or computed allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMaterialization {
+    /// Reads row/column references without converting input arrays.
+    None,
+    /// Converts only columns required by kernels, keys, or residual expressions.
+    KernelColumns,
+    /// Requires every active input column as an ordinary Arrow array.
+    WholeBatch,
+    /// Client consumers choose between retaining views and requesting Arrow arrays.
+    ConsumerBoundary,
+}
+
+/// How an operator represents output payloads in the current single-node runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputRepresentation {
+    /// Output rows reference existing payload arrays, including NULL extension.
+    References,
+    /// Unchanged payloads remain references; computed columns may allocate arrays.
+    ReferencesAndComputed,
+    /// Produces result arrays which the runtime wraps in a view.
+    ResultArrays,
+    /// Consumes the batch at the client, storage, or discard boundary.
+    Sink,
+}
+
+/// Derived data-flow contract of a canonical physical operator.
+///
+/// This is computed from operator semantics rather than serialized or stored as
+/// an independent plan setting. It describes current runtime behavior; it does
+/// not claim that hash keys, encoded sort keys, or aggregate state are zero-copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorDataFlow {
+    /// Stable operator label used in runtime diagnostics.
+    pub operator: &'static str,
+    /// Scope of input view conversion required by the implementation.
+    pub input_materialization: InputMaterialization,
+    /// Output payload representation used by the implementation.
+    pub output: OutputRepresentation,
+}
+
+impl PhysicalPlanOperator {
+    /// Derives the view/materialization contract from this canonical operator.
+    ///
+    /// Kernel conversions are conditional: direct VM projections do not need
+    /// arrays, and Cross joins with no residual do not need hash-key conversion.
+    /// Sort includes any computed-key program. Aggregate/storage boundaries need
+    /// arrays; clients choose their result format and discard consumes references.
+    pub fn data_flow(&self) -> OperatorDataFlow {
+        use InputMaterialization::{ConsumerBoundary, KernelColumns, None, WholeBatch};
+        use OutputRepresentation::{References, ReferencesAndComputed, ResultArrays, Sink};
+
+        let (operator, input_materialization, output) = match self {
+            Self::Pipeline { .. } => ("pipeline", KernelColumns, ReferencesAndComputed),
+            Self::Transform { .. } => ("transform", KernelColumns, ReferencesAndComputed),
+            Self::Join { .. } => ("join", KernelColumns, References),
+            Self::Sort { .. } => ("sort", KernelColumns, References),
+            Self::Limit { .. } => ("limit", None, References),
+            Self::Aggregate { .. } => ("aggregate", WholeBatch, ResultArrays),
+            Self::Distinct { .. } => ("distinct", WholeBatch, ResultArrays),
+            Self::Sink { sink, .. } => ("sink", match sink.as_ref() {
+                DataSink::Client { .. } => ConsumerBoundary,
+                DataSink::Storage(_) => WholeBatch,
+                DataSink::Discard => None,
+            }, Sink),
+        };
+        OperatorDataFlow { operator, input_materialization, output }
+    }
+}
+
 /// Key-value option pair for storage and scan configurations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyValue {
@@ -422,6 +495,7 @@ mod tests {
     use super::{
         AggOpCode, AggregatePlan, DataSink, DataSource, JoinKind, JoinOutput, JoinPlan, LimitSpec,
         MicroProgram, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator, SortKey, SortPlan,
+        InputMaterialization, OutputRepresentation,
     };
     use std::sync::Arc;
     use types::VeinSchema;
@@ -484,7 +558,50 @@ mod tests {
         })
     }
 
+    #[test]
+    fn sink_contracts_follow_their_consumer_boundary() {
+        let input = node(PhysicalPlanOperator::Pipeline {
+            source: Arc::new(DataSource::Memory),
+            input_schema: Arc::new(VeinSchema::empty()),
+            program: Arc::new(MicroProgram::empty()),
+        });
+        for (sink, expected) in [
+            (DataSink::Discard, InputMaterialization::None),
+            (DataSink::Client { schema: Arc::new(VeinSchema::empty()) },
+                InputMaterialization::ConsumerBoundary),
+            (DataSink::Storage(super::StorageTarget::new(
+                "test", Vec::new(), Arc::new(VeinSchema::empty()),
+            )), InputMaterialization::WholeBatch),
+        ] {
+            let operator = PhysicalPlanOperator::Sink { input: Arc::clone(&input), sink: Arc::new(sink) };
+            let contract = operator.data_flow();
+            assert_eq!(contract.input_materialization, expected);
+            assert_eq!(contract.output, OutputRepresentation::Sink);
+        }
+    }
+
     fn operator_names(node: &PhysicalPlanNode, names: &mut Vec<&'static str>) {
+        let contract = node.operator.data_flow();
+        // Exhaustive against the operator enum: a new variant requires both a
+        // production contract and regression expectations, without a wildcard.
+        let (input, output) = match &node.operator {
+            PhysicalPlanOperator::Pipeline { .. } | PhysicalPlanOperator::Transform { .. } =>
+                (InputMaterialization::KernelColumns, OutputRepresentation::ReferencesAndComputed),
+            PhysicalPlanOperator::Join { .. } | PhysicalPlanOperator::Sort { .. } =>
+                (InputMaterialization::KernelColumns, OutputRepresentation::References),
+            PhysicalPlanOperator::Limit { .. } =>
+                (InputMaterialization::None, OutputRepresentation::References),
+            PhysicalPlanOperator::Aggregate { .. } | PhysicalPlanOperator::Distinct { .. } =>
+                (InputMaterialization::WholeBatch, OutputRepresentation::ResultArrays),
+            PhysicalPlanOperator::Sink { sink, .. } =>
+                (match sink.as_ref() {
+                    DataSink::Client { .. } => InputMaterialization::ConsumerBoundary,
+                    DataSink::Storage(_) => InputMaterialization::WholeBatch,
+                    DataSink::Discard => InputMaterialization::None,
+                }, OutputRepresentation::Sink),
+        };
+        assert_eq!(contract.input_materialization, input);
+        assert_eq!(contract.output, output);
         match &node.operator {
             PhysicalPlanOperator::Pipeline { .. } => names.push("pipeline"),
             PhysicalPlanOperator::Transform { input, .. } => {
@@ -517,6 +634,7 @@ mod tests {
                 names.push("sink");
             }
         }
+        assert_eq!(names.last().copied(), Some(contract.operator));
     }
 
     #[test]
@@ -596,6 +714,9 @@ mod tests {
         };
 
         let encoded = serde_json::to_vec(&plan).expect("serialize canonical physical plan");
+        let wire = std::str::from_utf8(&encoded).unwrap();
+        assert!(!wire.contains("input_materialization"));
+        assert!(!wire.contains("output_representation"));
         let decoded: PhysicalPlan =
             serde_json::from_slice(&encoded).expect("deserialize canonical physical plan");
         let mut names = Vec::new();
