@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arrow::array::{
-    Array, ArrayRef, Decimal128Array, DictionaryArray, Float16Array, Float32Array, Float64Array,
+    new_null_array, Array, ArrayRef, Decimal128Array, DictionaryArray, Float16Array, Float32Array, Float64Array,
     Int16Array, Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array,
     UInt8Array, Decimal256Array,
 };
@@ -247,6 +247,7 @@ impl<T: AggregateValue> NumericAccumulator<T> {
             AggOpCode::Max => {
                 self.value = Some(self.value.map_or(value, |current| current.maximum(value)));
             }
+            AggOpCode::SingleValue => unreachable!("single-value uses a retained Arrow value"),
         }
         Ok(())
     }
@@ -258,6 +259,7 @@ impl<T: AggregateValue> NumericAccumulator<T> {
 /// physical layout while rows are folded into their groups.
 #[derive(Clone, Copy)]
 enum AggregateInput<'a> {
+    Any(&'a ArrayRef),
     Count(&'a ArrayRef),
     Int8(&'a Int8Array),
     Int16(&'a Int16Array),
@@ -280,6 +282,9 @@ impl<'a> AggregateInput<'a> {
         input_type: &VeinDataType,
         array: &'a ArrayRef,
     ) -> Result<Self> {
+        if op == AggOpCode::SingleValue {
+            return Ok(Self::Any(array));
+        }
         if op == AggOpCode::Count {
             return Ok(Self::Count(array));
         }
@@ -424,6 +429,7 @@ fn average_values<T: AggregateValue>(states: &[NumericAccumulator<T>]) -> Vec<Op
 
 /// A typed state vector selected once when the aggregate sink is created.
 enum AggregateStateColumn {
+    SingleValue(Vec<Option<(ArrayRef, usize)>>),
     Count(Vec<i64>),
     Int64 {
         op: AggOpCode,
@@ -465,6 +471,9 @@ impl AggregateStateColumn {
         input_type: &VeinDataType,
         result_type: &VeinDataType,
     ) -> Result<Self> {
+        if op == AggOpCode::SingleValue {
+            return Ok(Self::SingleValue(Vec::new()));
+        }
         if op == AggOpCode::Count {
             return Ok(Self::Count(Vec::new()));
         }
@@ -556,6 +565,7 @@ impl AggregateStateColumn {
 
     fn push_group(&mut self) {
         match self {
+            Self::SingleValue(states) => states.push(None),
             Self::Count(states) => states.push(0),
             Self::Int64 { op, states } => states.push(NumericAccumulator::new(*op, 0, false)),
             Self::Int128Avg { states } => {
@@ -588,6 +598,18 @@ impl AggregateStateColumn {
         group_rows: GroupRows<'_>,
     ) -> Result<()> {
         match (self, input) {
+            (Self::SingleValue(states), AggregateInput::Any(array)) => {
+                for (slot, row) in group_rows {
+                    if states[slot].is_some() {
+                        return Err(VeinError::stage(
+                            "aggregate",
+                            "scalar subquery returned more than one row",
+                        ));
+                    }
+                    states[slot] = Some((Arc::clone(array), row));
+                }
+                Ok(())
+            }
             (Self::Count(states), AggregateInput::Count(array)) => {
                 for (slot, row) in group_rows {
                     if !array.is_null(row) {
@@ -718,6 +740,15 @@ impl AggregateStateColumn {
     }
 
     fn to_array(&self, op: AggOpCode, data_type: &VeinDataType) -> Result<ArrayRef> {
+        if let (Self::SingleValue(states), AggOpCode::SingleValue) = (self, op) {
+            return match states.as_slice() {
+                [Some((array, row))] => Ok(array.slice(*row, 1)),
+                [None] => Ok(new_null_array(&data_type.to_arrow(), 1)),
+                _ => Err(VeinError::internal(
+                    "SINGLE_VALUE requires exactly one global aggregate group",
+                )),
+            };
+        }
         Ok(match (self, op, data_type) {
             (Self::Count(states), AggOpCode::Count, VeinDataType::Int64) => {
                 Arc::new(Int64Array::from_iter_values(states.iter().copied()))
@@ -919,6 +950,11 @@ impl AggregateSink {
             )));
         }
         let groups = plan.groups as usize;
+        if plan.aggs.contains(&AggOpCode::SingleValue) && groups != 0 {
+            return Err(VeinError::internal(
+                "SINGLE_VALUE currently requires a global aggregate",
+            ));
+        }
         let grouping_sets = plan.grouping_sets.clone().unwrap_or_else(|| {
             vec![(0..plan.groups).collect()]
         });
@@ -3105,5 +3141,64 @@ mod tests {
         };
         assert_eq!(retained.values().as_ptr(), source_values);
         assert_eq!(sink.metrics().string_key_bytes_copied, 0);
+    }
+
+    fn single_value_plan() -> AggregatePlan {
+        AggregatePlan {
+            groups: 0,
+            estimated_groups: None,
+            grouping_sets: None,
+            emit_empty_group_on_empty_input: true,
+            aggs: vec![AggOpCode::SingleValue],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Int64],
+        }
+    }
+
+    #[test]
+    fn single_value_retains_the_only_arrow_scalar_without_copying() {
+        let input = Arc::new(Int64Array::from(vec![42]));
+        let input_values = input.values().as_ptr();
+        let mut sink = AggregateSink::new(single_value_plan()).expect("create scalar aggregate");
+        sink.accumulate(DataChunk::from_vectors(vec![Arc::clone(&input) as ArrayRef]))
+            .expect("accumulate scalar row");
+
+        let output = sink.finish().expect("finish scalar aggregate");
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("scalar output is int64");
+        assert_eq!(values.value(0), 42);
+        assert_eq!(values.values().as_ptr(), input_values);
+    }
+
+    #[test]
+    fn single_value_returns_typed_null_for_empty_input() {
+        let mut sink = AggregateSink::new(single_value_plan()).expect("create scalar aggregate");
+        sink.accumulate(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(
+            Vec::<i64>::new(),
+        ))]))
+        .expect("accumulate empty input");
+
+        let output = sink.finish().expect("finish empty scalar aggregate");
+        let values = output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("scalar output retains its declared type");
+        assert_eq!(values.len(), 1);
+        assert!(values.is_null(0));
+    }
+
+    #[test]
+    fn single_value_errors_when_input_has_multiple_rows_across_batches() {
+        let mut sink = AggregateSink::new(single_value_plan()).expect("create scalar aggregate");
+        sink.accumulate(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(vec![1]))]))
+            .expect("first row is valid");
+        let error = sink
+            .accumulate(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(vec![2]))]))
+            .expect_err("second row must violate scalar cardinality");
+        assert!(error.to_string().contains("scalar subquery returned more than one row"));
     }
 }

@@ -1104,6 +1104,7 @@ fn join_type(kind: JoinKind) -> Result<JoinType> {
         JoinKind::Full => JoinType::Full,
         JoinKind::Semi => JoinType::Semi,
         JoinKind::Anti => JoinType::Anti,
+        JoinKind::Single => JoinType::Single,
         JoinKind::Cross => JoinType::Cross,
     })
 }

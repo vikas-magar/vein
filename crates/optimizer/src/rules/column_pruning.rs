@@ -224,6 +224,18 @@ fn prune_plan(plan: LogicalPlan, required: &RequiredColumns) -> LogicalPlan {
                 }
             }
 
+            // Make the pruned output contract explicit. Join keys and residual
+            // predicate inputs remain required from their children above, but
+            // only parent-visible columns belong in this join's output schema.
+            let schema = Box::new(VeinSchema {
+                fields: schema
+                    .fields
+                    .iter()
+                    .filter(|field| required.contains(&field.id))
+                    .cloned()
+                    .collect(),
+            });
+
             LogicalPlan::Join {
                 join_type,
                 left: Box::new(prune_plan(*left, &left_required)),
@@ -565,6 +577,87 @@ mod tests {
             panic!("expected scan");
         };
         assert_eq!(projection, Some(vec![ColumnId(1)]));
+    }
+
+    #[test]
+    fn prunes_join_outputs_while_retaining_columns_needed_for_join_keys() {
+        let left_value = field(1, "left_value");
+        let left_key = field(2, "left_key");
+        let right_key = field(3, "right_key");
+        let right_value = field(4, "right_value");
+        let scan = |name: &str, fields: Vec<ResolvedColumnRef>| {
+            let schema = Box::new(VeinSchema { fields });
+            LogicalPlan::Scan {
+                table: std::sync::Arc::new(TableMetadata::new(
+                    name,
+                    std::sync::Arc::new(*schema.clone()),
+                )),
+                projection: None,
+                filters: Vec::new(),
+                schema,
+            }
+        };
+        let join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Inner,
+            left: Box::new(scan(
+                "left",
+                vec![Arc::clone(&left_value), Arc::clone(&left_key)],
+            )),
+            right: Box::new(scan(
+                "right",
+                vec![Arc::clone(&right_key), Arc::clone(&right_value)],
+            )),
+            on: Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&left_key))),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(Arc::clone(&right_key))),
+                return_type: VeinDataType::Boolean,
+            }),
+            using: Vec::new(),
+            schema: Box::new(VeinSchema::new(vec![
+                Arc::clone(&left_value),
+                Arc::clone(&right_value),
+                Arc::clone(&left_key),
+                Arc::clone(&right_key),
+            ])),
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(join),
+            exprs: vec![LogicalExpr::Column(Arc::clone(&left_value))],
+            schema: Box::new(VeinSchema::new(vec![field(10, "result")])),
+        };
+
+        let pruned = prune_plan(plan, &[ColumnId(10)].into_iter().collect());
+
+        let LogicalPlan::Project { input, .. } = pruned else {
+            panic!("expected output projection");
+        };
+        let LogicalPlan::Join {
+            left,
+            right,
+            schema,
+            ..
+        } = *input
+        else {
+            panic!("expected join under output projection");
+        };
+        assert_eq!(
+            schema.fields.iter().map(|field| field.id).collect::<Vec<_>>(),
+            vec![left_value.id],
+            "join schema should explicitly expose only parent-required outputs"
+        );
+
+        let LogicalPlan::Scan { projection: left_projection, .. } = *left else {
+            panic!("expected left scan");
+        };
+        let LogicalPlan::Scan { projection: right_projection, .. } = *right else {
+            panic!("expected right scan");
+        };
+        assert!(
+            left_projection.is_none(),
+            "all left scan columns are required, so an explicit projection is unnecessary"
+        );
+        assert_eq!(right_projection, Some(vec![right_key.id]));
     }
 
     #[test]

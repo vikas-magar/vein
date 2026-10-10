@@ -25,6 +25,8 @@ pub enum JoinType {
     Semi,
     /// Each unmatched probe row once, without build-side columns.
     Anti,
+    /// One build row per probe row, or a cardinality error for multiple matches.
+    Single,
     /// Every probe row paired with every build row.
     Cross,
 }
@@ -75,7 +77,7 @@ pub fn output_rows(
         build: Some(*build),
     }));
 
-    if matches!(join_type, JoinType::Left | JoinType::Full) {
+    if matches!(join_type, JoinType::Left | JoinType::Full | JoinType::Single) {
         let matched: std::collections::HashSet<u32> =
             matches.iter().map(|(probe, _)| *probe).collect();
         rows.extend(

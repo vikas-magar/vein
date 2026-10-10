@@ -18,6 +18,8 @@ pub enum JoinType {
     Semi,
     /// Internal optimizer join that emits left rows with no match.
     Anti,
+    /// Internal optimizer join that emits at most one build row per left row.
+    Single,
 }
 
 /// A single pipe operator (`|>`) in a query pipeline.

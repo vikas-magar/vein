@@ -18,6 +18,7 @@ pub struct ScalarAggregateDecorrelationRule;
 struct Decorrelation {
     right: LogicalPlan,
     correlation: Option<(ResolvedColumnRef, ResolvedColumnRef)>,
+    single_correlation: Option<Vec<(ResolvedColumnRef, ResolvedColumnRef)>>,
     value: ResolvedColumnRef,
     aggregate_name: String,
 }
@@ -36,79 +37,156 @@ impl OptimizerRule for ScalarAggregateDecorrelationRule {
     }
 
     fn apply(&self, plan: &LogicalPlan, _context: &OptimizerContext) -> Result<Option<LogicalPlan>> {
-        let LogicalPlan::Filter { input, predicate } = plan else {
-            return Ok(None);
-        };
-
-        let mut decorrelations = Vec::new();
-        let (predicate, changed) =
-            rewrite_expression(predicate.clone(), input.schema(), &mut decorrelations)?;
-        if !changed {
-            return Ok(None);
-        }
-
-        let outer_schema = input.schema().clone();
-        let mut input = (**input).clone();
-        let needs_outer_projection = decorrelations
-            .iter()
-            .any(|item| item.correlation.is_none());
-        for decorrelation in decorrelations {
-            let mut fields = input.schema().fields.clone();
-            fields.extend(decorrelation.right.schema().fields.iter().map(|field| {
-                if decorrelation.correlation.is_some() {
-                    nullable_column(field)
-                } else {
-                    ResolvedColumnRef::clone(field)
+        match plan {
+            LogicalPlan::Filter { input, predicate } => {
+                let mut decorrelations = Vec::new();
+                let (predicate, changed) =
+                    rewrite_expression(predicate.clone(), input.schema(), &mut decorrelations)?;
+                if !changed {
+                    return Ok(None);
                 }
-            }));
-            let schema = VeinSchema::new(fields);
-            let (join_type, on) = match decorrelation.correlation {
-                Some((outer_key, inner_key)) => (
-                    parser::ast::pipe_op::JoinType::Left,
-                    Some(LogicalExpr::BinaryOp {
-                        left: Box::new(LogicalExpr::Column(outer_key)),
-                        op: BinaryOp::Eq,
-                        right: Box::new(LogicalExpr::Column(inner_key)),
-                        return_type: VeinDataType::Boolean,
-                    }),
-                ),
-                None => (parser::ast::pipe_op::JoinType::Cross, None),
-            };
-            tracing::debug!(
-                target: "vein.audit",
-                event = "scalar_aggregate_decorrelated",
-                aggregate = %decorrelation.aggregate_name,
-                "scalar_aggregate_decorrelated"
-            );
-            input = LogicalPlan::Join {
-                join_type,
-                left: Box::new(input),
-                right: Box::new(decorrelation.right),
-                on,
-                using: Vec::new(),
-                schema: Box::new(schema),
-            };
-        }
 
-        let filtered = LogicalPlan::Filter {
-            input: Box::new(input),
-            predicate,
-        };
-        if needs_outer_projection {
-            let exprs = outer_schema
-                .fields
-                .iter()
-                .cloned()
-                .map(LogicalExpr::Column)
-                .collect();
-            return Ok(Some(LogicalPlan::Project {
-                input: Box::new(filtered),
+                let outer_schema = input.schema().clone();
+                let input = attach_scalar_joins((**input).clone(), decorrelations);
+                let filtered = LogicalPlan::Filter {
+                    input: Box::new(input),
+                    predicate,
+                };
+                let exprs = outer_schema
+                    .fields
+                    .iter()
+                    .cloned()
+                    .map(LogicalExpr::Column)
+                    .collect();
+                Ok(Some(LogicalPlan::Project {
+                    input: Box::new(filtered),
+                    exprs,
+                    schema: Box::new(outer_schema),
+                }))
+            }
+            LogicalPlan::Project {
+                input,
                 exprs,
-                schema: Box::new(outer_schema),
-            }));
+                schema,
+            } => {
+                let mut decorrelations = Vec::new();
+                let mut changed = false;
+                let exprs = exprs
+                    .iter()
+                    .map(|expr| {
+                        let (expr, expr_changed) =
+                            rewrite_expression(expr.clone(), input.schema(), &mut decorrelations)?;
+                        changed |= expr_changed;
+                        Ok(expr)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if !changed {
+                    return Ok(None);
+                }
+
+                let input = attach_scalar_joins((**input).clone(), decorrelations);
+                Ok(Some(LogicalPlan::Project {
+                    input: Box::new(input),
+                    exprs,
+                    schema: schema.clone(),
+                }))
+            }
+            LogicalPlan::Sort {
+                input,
+                sort_keys,
+                schema,
+            } => {
+                let mut decorrelations = Vec::new();
+                let mut changed = false;
+                let sort_keys = sort_keys
+                    .iter()
+                    .map(|key| {
+                        let (expr, expr_changed) = rewrite_expression(
+                            key.expr.clone(),
+                            input.schema(),
+                            &mut decorrelations,
+                        )?;
+                        changed |= expr_changed;
+                        Ok(plan::SortKey {
+                            expr,
+                            asc: key.asc,
+                            nulls_first: key.nulls_first,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if !changed {
+                    return Ok(None);
+                }
+
+                let output_schema = schema.clone();
+                let input = attach_scalar_joins((**input).clone(), decorrelations);
+                let sort_schema = Box::new(input.schema().clone());
+                let sorted = LogicalPlan::Sort {
+                    input: Box::new(input),
+                    sort_keys,
+                    schema: sort_schema,
+                };
+                let exprs = output_schema
+                    .fields
+                    .iter()
+                    .cloned()
+                    .map(LogicalExpr::Column)
+                    .collect();
+                Ok(Some(LogicalPlan::Project {
+                    input: Box::new(sorted),
+                    exprs,
+                    schema: output_schema,
+                }))
+            }
+            _ => Ok(None),
         }
-        Ok(Some(filtered))
     }
+}
+
+/// Adds each decorrelated scalar input beneath the expression that consumes it.
+/// The join schema includes only outer columns and the scalar helper columns;
+/// the caller restores its original output schema above this node.
+fn attach_scalar_joins(mut input: LogicalPlan, decorrelations: Vec<Decorrelation>) -> LogicalPlan {
+    for decorrelation in decorrelations {
+        let mut fields = input.schema().fields.clone();
+        fields.extend(decorrelation.right.schema().fields.iter().map(|field| {
+            if decorrelation.correlation.is_some() || decorrelation.single_correlation.is_some() {
+                nullable_column(field)
+            } else {
+                ResolvedColumnRef::clone(field)
+            }
+        }));
+        let schema = VeinSchema::new(fields);
+        let (join_type, on) = if let Some(keys) = decorrelation.single_correlation {
+            let predicates = keys
+                .into_iter()
+                .map(|(outer, inner)| equality_expr(outer, inner))
+                .collect();
+            (parser::ast::pipe_op::JoinType::Single, conjunction(predicates))
+        } else if let Some((inner_key, outer_key)) = decorrelation.correlation {
+            (
+                parser::ast::pipe_op::JoinType::Left,
+                Some(equality_expr(outer_key, inner_key)),
+            )
+        } else {
+            (parser::ast::pipe_op::JoinType::Cross, None)
+        };
+        tracing::debug!(
+            target: "vein.audit",
+            event = "scalar_subquery_decorrelated",
+            kind = %decorrelation.aggregate_name,
+            "scalar_subquery_decorrelated"
+        );
+        input = LogicalPlan::Join {
+            join_type,
+            left: Box::new(input),
+            right: Box::new(decorrelation.right),
+            on,
+            using: Vec::new(),
+            schema: Box::new(schema),
+        };
+    }
+    input
 }
 
 fn rewrite_expression(
@@ -118,6 +196,16 @@ fn rewrite_expression(
 ) -> Result<(LogicalExpr, bool)> {
     if let LogicalExpr::ScalarSubquery(subquery) = expr {
         if let Some(decorrelation) = decorrelate_scalar_aggregate(&subquery, outer_schema) {
+            let value = LogicalExpr::Column(ResolvedColumnRef::clone(&decorrelation.value));
+            decorrelations.push(decorrelation);
+            return Ok((value, true));
+        }
+        if let Some(decorrelation) = decorrelate_uncorrelated_scalar(&subquery) {
+            let value = LogicalExpr::Column(ResolvedColumnRef::clone(&decorrelation.value));
+            decorrelations.push(decorrelation);
+            return Ok((value, true));
+        }
+        if let Some(decorrelation) = decorrelate_correlated_scalar_row(&subquery, outer_schema) {
             let value = LogicalExpr::Column(ResolvedColumnRef::clone(&decorrelation.value));
             decorrelations.push(decorrelation);
             return Ok((value, true));
@@ -132,6 +220,59 @@ fn rewrite_expression(
         Ok(child)
     })?;
     Ok((rewritten, changed))
+}
+
+/// Converts a one-column, uncorrelated row subquery into a one-row global
+/// aggregate. SINGLE_VALUE preserves scalar cardinality errors while letting
+/// the normal relational planner execute the subquery once for the whole query.
+fn decorrelate_uncorrelated_scalar(subquery: &LogicalPlan) -> Option<Decorrelation> {
+    if !supports_uncorrelated_scalar_input(subquery) || subquery.schema().fields.len() != 1 {
+        return None;
+    }
+    let source_value = ResolvedColumnRef::clone(subquery.schema().fields.first()?);
+    let value = nullable_column(&source_value);
+    let aggregate = LogicalPlan::Aggregate {
+        input: Box::new(subquery.clone()),
+        grouping_sets: vec![Vec::new()],
+        aggs: vec![LogicalExpr::FunctionCall {
+            name: "single_value".to_string(),
+            args: vec![LogicalExpr::Column(source_value)],
+            is_aggregate: true,
+            distinct: false,
+            return_type: value.data_type.clone(),
+        }],
+        schema: Box::new(VeinSchema::new(vec![Arc::clone(&value)])),
+    };
+    Some(Decorrelation {
+        right: aggregate,
+        correlation: None,
+        single_correlation: None,
+        value,
+        aggregate_name: "SINGLE_VALUE".to_string(),
+    })
+}
+
+/// Only traverse relational shapes whose expressions and schemas are preserved
+/// by the scalar rewrite. Unknown operators stay untouched for a clear planner
+/// boundary instead of risking an incorrect correlation rewrite.
+fn supports_uncorrelated_scalar_input(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan { filters, .. } => filters.iter().all(is_local_scalar_input_expr),
+        LogicalPlan::ExternalScan { .. } => true,
+        LogicalPlan::Filter { input, predicate } => {
+            is_local_scalar_input_expr(predicate) && supports_uncorrelated_scalar_input(input)
+        }
+        LogicalPlan::Project { input, exprs, .. } => {
+            exprs.iter().all(is_local_scalar_input_expr)
+                && supports_uncorrelated_scalar_input(input)
+        }
+        LogicalPlan::SubqueryAlias { input, .. } => supports_uncorrelated_scalar_input(input),
+        _ => false,
+    }
+}
+
+fn is_local_scalar_input_expr(expr: &LogicalExpr) -> bool {
+    !contains_outer_column(expr) && expr.subquery_plans().is_empty()
 }
 
 fn decorrelate_scalar_aggregate(
@@ -224,7 +365,7 @@ fn decorrelate_scalar_aggregate(
         &mut replacement_count,
         &mut grouped_aggs,
     )
-    .ok()?;
+        .ok()?;
     if replacement_count != 1 || grouped_aggs.len() != 1 {
         return None;
     }
@@ -266,9 +407,128 @@ fn decorrelate_scalar_aggregate(
     Some(Decorrelation {
         right,
         correlation,
+        single_correlation: None,
         value: projected_value,
         aggregate_name: name.clone(),
     })
+}
+
+/// Rewrites a one-column correlated row subquery to a single-match join.
+/// The right projection carries its value and the required key columns as
+/// Arrow array references; it does not materialize joined row values.
+fn decorrelate_correlated_scalar_row(
+    subquery: &LogicalPlan,
+    outer_schema: &VeinSchema,
+) -> Option<Decorrelation> {
+    let LogicalPlan::Project { input, exprs, schema } = subquery else {
+        return None;
+    };
+    if exprs.len() != 1 || schema.fields.len() != 1 {
+        return None;
+    }
+    let LogicalExpr::Column(source_value) = &exprs[0] else {
+        return None;
+    };
+    let mut value = nullable_column(&schema.fields[0]);
+
+    let mut predicates = Vec::new();
+    let mut base = input.as_ref();
+    while let LogicalPlan::Filter { input, predicate } = base {
+        split_conjunction(predicate, &mut predicates);
+        base = input;
+    }
+    let LogicalPlan::Scan { filters, .. } = base else {
+        return None;
+    };
+    for filter in filters {
+        split_conjunction(filter, &mut predicates);
+    }
+    if !base.schema().fields.iter().any(|field| field.id == source_value.id) {
+        return None;
+    }
+
+    let mut correlations = Vec::new();
+    let mut local_filters = Vec::new();
+    for predicate in predicates {
+        if let Some((inner, outer)) = equality_correlation(&predicate) {
+            if base.schema().position_of_id(inner.id).is_none()
+                || outer_schema.position_of_id(outer.id).is_none()
+            {
+                return None;
+            }
+            if !correlations.iter().any(|(existing_outer, existing_inner): &(ResolvedColumnRef, ResolvedColumnRef)| {
+                existing_outer.id == outer.id && existing_inner.id == inner.id
+            }) {
+                correlations.push((outer, inner));
+            }
+        } else if contains_outer_column(&predicate)
+            || predicate.is_volatile()
+            || !predicate.subquery_plans().is_empty()
+        {
+            return None;
+        } else {
+            local_filters.push(predicate);
+        }
+    }
+    if correlations.is_empty() {
+        return None;
+    }
+    if let Some((_, key)) = correlations.iter().find(|(_, key)| key.id == source_value.id) {
+        // The joined relation already carries this array as its key column.
+        // Reuse that column ID for the scalar reference instead of emitting a
+        // duplicate schema field for an aliased projection.
+        value = nullable_column(key);
+    }
+
+    // Reapply deterministic local filters once above the scan, while removing
+    // correlation predicates that cannot be evaluated in the shared build.
+    let mut right_base = base.clone();
+    if let LogicalPlan::Scan { filters, .. } = &mut right_base {
+        filters.clear();
+    }
+    let mut right = right_base;
+    if let Some(predicate) = conjunction(local_filters) {
+        right = LogicalPlan::Filter {
+            input: Box::new(right),
+            predicate,
+        };
+    }
+
+    let mut right_exprs = Vec::with_capacity(correlations.len() + 1);
+    let mut right_fields = Vec::with_capacity(correlations.len() + 1);
+    for (_, inner) in &correlations {
+        if right_fields.iter().any(|field: &ResolvedColumnRef| field.id == inner.id) {
+            continue;
+        }
+        right_exprs.push(LogicalExpr::Column(ResolvedColumnRef::clone(inner)));
+        right_fields.push(ResolvedColumnRef::clone(inner));
+    }
+    if !right_fields.iter().any(|field| field.id == source_value.id) {
+        right_exprs.push(LogicalExpr::Column(ResolvedColumnRef::clone(source_value)));
+        right_fields.push(ResolvedColumnRef::clone(&schema.fields[0]));
+    }
+    right = LogicalPlan::Project {
+        input: Box::new(right),
+        exprs: right_exprs,
+        schema: Box::new(VeinSchema::new(right_fields)),
+    };
+
+    Some(Decorrelation {
+        right,
+        correlation: None,
+        single_correlation: Some(correlations),
+        value,
+        aggregate_name: "SINGLE_ROW".to_string(),
+    })
+}
+
+fn equality_expr(left: ResolvedColumnRef, right: ResolvedColumnRef) -> LogicalExpr {
+    LogicalExpr::BinaryOp {
+        left: Box::new(LogicalExpr::Column(left)),
+        op: BinaryOp::Eq,
+        right: Box::new(LogicalExpr::Column(right)),
+        return_type: VeinDataType::Boolean,
+    }
 }
 
 fn collect_aggregate_calls(expr: &LogicalExpr, output: &mut Vec<LogicalExpr>) {
@@ -441,7 +701,11 @@ mod tests {
             .apply(&filter, &OptimizerContext::default())
             .expect("decorrelation should not fail")
             .expect("supported scalar aggregate should decorrelate");
-        let LogicalPlan::Filter { input, predicate } = rewritten else {
+        let LogicalPlan::Project { input, schema: output_schema, .. } = rewritten else {
+            panic!("rewrite must hide the aggregate helper columns");
+        };
+        assert_eq!(output_schema.fields, vec![Arc::clone(&outer_key), Arc::clone(&outer_value)]);
+        let LogicalPlan::Filter { input, predicate } = input.as_ref() else {
             panic!("rewrite should preserve the filter");
         };
         let LogicalPlan::Join {
@@ -596,6 +860,432 @@ mod tests {
         assert!(ScalarAggregateDecorrelationRule
             .apply(&filter, &OptimizerContext::default())
             .expect("unsupported forms should be left to another implementation")
+            .is_none());
+    }
+
+    #[test]
+    fn decorrelates_uncorrelated_row_subquery_with_single_value_cardinality_check() {
+        let outer = field(71, "outer_value", "outer_fixture");
+        let scalar = field(72, "scalar_value", "inner_fixture");
+        let inner = scan("inner_fixture", vec![Arc::clone(&scalar)]);
+        let subquery = LogicalPlan::Project {
+            input: Box::new(inner),
+            exprs: vec![LogicalExpr::Column(Arc::clone(&scalar))],
+            schema: Box::new(VeinSchema::new(vec![Arc::clone(&scalar)])),
+        };
+        let filter = LogicalPlan::Filter {
+            input: Box::new(scan("outer_fixture", vec![Arc::clone(&outer)])),
+            predicate: LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&outer))),
+                op: BinaryOp::Eq,
+                right: Box::new(LogicalExpr::ScalarSubquery(Box::new(subquery))),
+                return_type: VeinDataType::Boolean,
+            },
+        };
+
+        let rewritten = ScalarAggregateDecorrelationRule
+            .apply(&filter, &OptimizerContext::default())
+            .expect("uncorrelated scalar row query should be supported")
+            .expect("scalar row query must be rewritten");
+        let LogicalPlan::Project { input, .. } = rewritten else {
+            panic!("cross-joined scalar output must be projected away after filtering");
+        };
+        let LogicalPlan::Filter { input, predicate } = input.as_ref() else {
+            panic!("outer predicate must remain above the scalar join");
+        };
+        assert!(matches!(predicate, LogicalExpr::BinaryOp { right, .. }
+            if matches!(right.as_ref(), LogicalExpr::Column(column) if column.id == scalar.id)));
+        let LogicalPlan::Join { join_type, right, .. } = input.as_ref() else {
+            panic!("uncorrelated scalar result must join once with outer input");
+        };
+        assert_eq!(*join_type, parser::ast::pipe_op::JoinType::Cross);
+        assert!(matches!(right.as_ref(), LogicalPlan::Aggregate { grouping_sets, aggs, schema, .. }
+            if grouping_sets == &vec![Vec::new()]
+                && schema.fields.len() == 1
+                && schema.fields[0].nullable
+                && matches!(aggs.as_slice(), [LogicalExpr::FunctionCall { name, .. }] if name.eq_ignore_ascii_case("single_value"))));
+    }
+
+    #[test]
+    fn decorrelates_correlated_row_scalar_with_single_join_and_local_filter() {
+        let outer_key = field(91, "outer_key", "outer_fixture");
+        let outer_group = field(92, "outer_group", "outer_fixture");
+        let outer_value = field(93, "outer_value", "outer_fixture");
+        let inner_key = field(94, "inner_key", "inner_fixture");
+        let inner_group = field(95, "inner_group", "inner_fixture");
+        let inner_value = field(96, "inner_value", "inner_fixture");
+        let scalar = field(97, "scalar_value", "inner_fixture");
+        let local_filter = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(Arc::clone(&inner_value))),
+            op: BinaryOp::Gt,
+            right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(0))),
+            return_type: VeinDataType::Boolean,
+        };
+        let correlations = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&inner_key))),
+                op: BinaryOp::Eq,
+                right: Box::new(LogicalExpr::OuterColumn(Arc::clone(&outer_key))),
+                return_type: VeinDataType::Boolean,
+            }),
+            op: BinaryOp::And,
+            right: Box::new(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::BinaryOp {
+                    left: Box::new(LogicalExpr::OuterColumn(Arc::clone(&outer_group))),
+                    op: BinaryOp::Eq,
+                    right: Box::new(LogicalExpr::Column(Arc::clone(&inner_group))),
+                    return_type: VeinDataType::Boolean,
+                }),
+                op: BinaryOp::And,
+                right: Box::new(LogicalExpr::BinaryOp {
+                    left: Box::new(LogicalExpr::OuterColumn(Arc::clone(&outer_key))),
+                    op: BinaryOp::Eq,
+                    right: Box::new(LogicalExpr::Column(Arc::clone(&inner_key))),
+                    return_type: VeinDataType::Boolean,
+                }),
+                return_type: VeinDataType::Boolean,
+            }),
+            return_type: VeinDataType::Boolean,
+        };
+        let inner = scan(
+            "inner_fixture",
+            vec![Arc::clone(&inner_key), Arc::clone(&inner_group), Arc::clone(&inner_value)],
+        );
+        let subquery = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::Filter {
+                    input: Box::new(inner),
+                    predicate: local_filter,
+                }),
+                predicate: correlations,
+            }),
+            exprs: vec![LogicalExpr::Column(Arc::clone(&inner_value))],
+            schema: Box::new(VeinSchema::new(vec![Arc::clone(&scalar)])),
+        };
+        let outer = scan(
+            "outer_fixture",
+            vec![Arc::clone(&outer_key), Arc::clone(&outer_group), Arc::clone(&outer_value)],
+        );
+        let filter = LogicalPlan::Filter {
+            input: Box::new(outer),
+            predicate: LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&outer_value))),
+                op: BinaryOp::Gt,
+                right: Box::new(LogicalExpr::ScalarSubquery(Box::new(subquery))),
+                return_type: VeinDataType::Boolean,
+            },
+        };
+
+        let rewritten = ScalarAggregateDecorrelationRule
+            .apply(&filter, &OptimizerContext::default())
+            .expect("supported correlated scalar should rewrite")
+            .expect("correlated one-column row scalar should be decorrelated");
+        let LogicalPlan::Project { input, schema, .. } = rewritten else {
+            panic!("scalar and key helpers must be projected away");
+        };
+        assert_eq!(schema.fields, vec![Arc::clone(&outer_key), Arc::clone(&outer_group), Arc::clone(&outer_value)]);
+        let LogicalPlan::Filter { input, predicate } = input.as_ref() else {
+            panic!("the outer predicate must remain above the scalar join");
+        };
+        assert!(matches!(predicate, LogicalExpr::BinaryOp { right, .. }
+            if matches!(right.as_ref(), LogicalExpr::Column(column) if column.id == scalar.id && column.nullable)));
+        let LogicalPlan::Join { join_type, on, schema, right, .. } = input.as_ref() else {
+            panic!("correlated scalar must become a join");
+        };
+        assert_eq!(*join_type, parser::ast::pipe_op::JoinType::Single);
+        assert_eq!(schema.fields.len(), 6, "outer columns plus two keys and scalar value");
+        assert!(schema.fields[3..].iter().all(|field| field.nullable));
+        let Some(on) = on else { panic!("single join must carry its correlation keys"); };
+        let mut join_key_terms = Vec::new();
+        split_conjunction(on, &mut join_key_terms);
+        assert_eq!(join_key_terms.len(), 2, "duplicate equalities must not duplicate hash keys");
+        let LogicalPlan::Project { input: right_input, exprs, schema: right_schema } = right.as_ref() else {
+            panic!("the build side must project just required keys and scalar value");
+        };
+        assert_eq!(exprs.len(), 3);
+        assert_eq!(right_schema.fields.len(), 3);
+        let LogicalPlan::Filter { input: local_input, predicate: local } = right_input.as_ref() else {
+            panic!("inner-only filters should remain on the build side");
+        };
+        assert!(matches!(local, LogicalExpr::BinaryOp { op: BinaryOp::Gt, .. }));
+        let LogicalPlan::Scan { filters, .. } = local_input.as_ref() else {
+            panic!("the inner base should remain a scan");
+        };
+        assert!(filters.is_empty(), "moved filters must not be duplicated at the scan");
+    }
+
+    #[test]
+    fn leaves_correlated_scalar_with_non_equality_reference_unchanged() {
+        let outer_key = field(101, "outer_key", "outer_fixture");
+        let inner_key = field(102, "inner_key", "inner_fixture");
+        let inner_value = field(103, "inner_value", "inner_fixture");
+        let scalar = field(104, "scalar_value", "inner_fixture");
+        let subquery = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan(
+                    "inner_fixture",
+                    vec![Arc::clone(&inner_key), Arc::clone(&inner_value)],
+                )),
+                predicate: LogicalExpr::BinaryOp {
+                    left: Box::new(LogicalExpr::Column(Arc::clone(&inner_key))),
+                    op: BinaryOp::Gt,
+                    right: Box::new(LogicalExpr::OuterColumn(Arc::clone(&outer_key))),
+                    return_type: VeinDataType::Boolean,
+                },
+            }),
+            exprs: vec![LogicalExpr::Column(Arc::clone(&inner_value))],
+            schema: Box::new(VeinSchema::new(vec![scalar])),
+        };
+        let filter = LogicalPlan::Filter {
+            input: Box::new(scan("outer_fixture", vec![outer_key])),
+            predicate: LogicalExpr::ScalarSubquery(Box::new(subquery)),
+        };
+        assert!(ScalarAggregateDecorrelationRule
+            .apply(&filter, &OptimizerContext::default())
+            .expect("unsupported correlation must not cause an optimizer failure")
+            .is_none());
+    }
+
+    #[test]
+    fn correlated_scalar_projection_reuses_a_value_that_is_also_a_join_key() {
+        let outer_key = field(111, "outer_key", "outer_fixture");
+        let inner_key = field(112, "inner_key", "inner_fixture");
+        let scalar = field(113, "scalar_value", "inner_fixture");
+        let subquery = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan("inner_fixture", vec![Arc::clone(&inner_key)])),
+                predicate: LogicalExpr::BinaryOp {
+                    left: Box::new(LogicalExpr::Column(Arc::clone(&inner_key))),
+                    op: BinaryOp::Eq,
+                    right: Box::new(LogicalExpr::OuterColumn(Arc::clone(&outer_key))),
+                    return_type: VeinDataType::Boolean,
+                },
+            }),
+            exprs: vec![LogicalExpr::Column(Arc::clone(&inner_key))],
+            schema: Box::new(VeinSchema::new(vec![Arc::clone(&scalar)])),
+        };
+        let filter = LogicalPlan::Filter {
+            input: Box::new(scan("outer_fixture", vec![Arc::clone(&outer_key)])),
+            predicate: LogicalExpr::ScalarSubquery(Box::new(subquery)),
+        };
+        let rewritten = ScalarAggregateDecorrelationRule
+            .apply(&filter, &OptimizerContext::default())
+            .expect("key/value reuse should be a valid rewrite")
+            .expect("correlated scalar key projection should decorrelate");
+        let LogicalPlan::Project { input, .. } = rewritten else {
+            panic!("original outer schema must be preserved");
+        };
+        let LogicalPlan::Filter { input, .. } = input.as_ref() else {
+            unreachable!();
+        };
+        let LogicalPlan::Join { right, schema, .. } = input.as_ref() else {
+            unreachable!();
+        };
+        assert_eq!(right.schema().fields.len(), 1, "key and scalar share one physical column");
+        assert_eq!(schema.fields.len(), 2);
+    }
+
+    #[test]
+    fn decorrelates_uncorrelated_scalar_in_project_to_single_value_cross_join() {
+        let outer = field(121, "outer_value", "outer_fixture");
+        let inner = field(122, "inner_value", "inner_fixture");
+        let scalar = field(123, "scalar_value", "inner_fixture");
+        let projected_scalar = Arc::new(ResolvedColumn::new(
+            plan::ColumnId(124),
+            "selected_value",
+            None,
+            VeinDataType::Int64,
+        ));
+        let subquery = LogicalPlan::Project {
+            input: Box::new(scan("inner_fixture", vec![Arc::clone(&inner)])),
+            exprs: vec![LogicalExpr::Column(Arc::clone(&inner))],
+            schema: Box::new(VeinSchema::new(vec![Arc::clone(&scalar)])),
+        };
+        let input = scan("outer_fixture", vec![Arc::clone(&outer)]);
+        let output_schema = Box::new(VeinSchema::new(vec![
+            Arc::clone(&outer),
+            Arc::clone(&projected_scalar),
+        ]));
+        let project = LogicalPlan::Project {
+            input: Box::new(input),
+            exprs: vec![
+                LogicalExpr::Column(Arc::clone(&outer)),
+                LogicalExpr::ScalarSubquery(Box::new(subquery)),
+            ],
+            schema: output_schema.clone(),
+        };
+
+        let rewritten = ScalarAggregateDecorrelationRule
+            .apply(&project, &OptimizerContext::default())
+            .expect("uncorrelated scalar projection should be supported")
+            .expect("scalar projection must be rewritten");
+        let LogicalPlan::Project { input, exprs, schema } = rewritten else {
+            panic!("the original projection should remain above the scalar join");
+        };
+        assert_eq!(schema.fields, output_schema.fields);
+        assert!(matches!(
+            exprs.get(1),
+            Some(LogicalExpr::Column(column)) if column.id == scalar.id
+        ));
+        let LogicalPlan::Join {
+            join_type,
+            right,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("uncorrelated scalar projection should use a cross join");
+        };
+        assert_eq!(*join_type, parser::ast::pipe_op::JoinType::Cross);
+        assert!(matches!(
+            right.as_ref(),
+            LogicalPlan::Aggregate { grouping_sets, aggs, .. }
+                if grouping_sets == &vec![Vec::new()]
+                    && matches!(aggs.as_slice(), [LogicalExpr::FunctionCall { name, .. }] if name.eq_ignore_ascii_case("single_value"))
+        ));
+    }
+
+    #[test]
+    fn decorrelates_correlated_scalar_in_project_to_single_match_join() {
+        let outer_key = field(131, "outer_key", "outer_fixture");
+        let inner_key = field(132, "inner_key", "inner_fixture");
+        let inner_value = field(133, "inner_value", "inner_fixture");
+        let scalar = field(134, "scalar_value", "inner_fixture");
+        let subquery = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan(
+                    "inner_fixture",
+                    vec![Arc::clone(&inner_key), Arc::clone(&inner_value)],
+                )),
+                predicate: LogicalExpr::BinaryOp {
+                    left: Box::new(LogicalExpr::Column(Arc::clone(&inner_key))),
+                    op: BinaryOp::Eq,
+                    right: Box::new(LogicalExpr::OuterColumn(Arc::clone(&outer_key))),
+                    return_type: VeinDataType::Boolean,
+                },
+            }),
+            exprs: vec![LogicalExpr::Column(Arc::clone(&inner_value))],
+            schema: Box::new(VeinSchema::new(vec![Arc::clone(&scalar)])),
+        };
+        let input = scan("outer_fixture", vec![Arc::clone(&outer_key)]);
+        let project = LogicalPlan::Project {
+            input: Box::new(input),
+            exprs: vec![LogicalExpr::ScalarSubquery(Box::new(subquery))],
+            schema: Box::new(VeinSchema::new(vec![Arc::clone(&scalar)])),
+        };
+
+        let rewritten = ScalarAggregateDecorrelationRule
+            .apply(&project, &OptimizerContext::default())
+            .expect("correlated scalar projection should be supported")
+            .expect("correlated scalar projection must be rewritten");
+        let LogicalPlan::Project { input, exprs, schema } = rewritten else {
+            panic!("the original projection should remain above the scalar join");
+        };
+        assert_eq!(schema.fields.len(), 1);
+        assert!(matches!(
+            exprs.as_slice(),
+            [LogicalExpr::Column(column)] if column.id == scalar.id && column.nullable
+        ));
+        let LogicalPlan::Join {
+            join_type,
+            on,
+            right,
+            schema: join_schema,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("correlated scalar projection should use a single-match join");
+        };
+        assert_eq!(*join_type, parser::ast::pipe_op::JoinType::Single);
+        assert!(on.is_some(), "single-match join must retain its correlation key");
+        assert!(join_schema.fields[1..].iter().all(|field| field.nullable));
+        assert_eq!(right.schema().fields.len(), 2, "build side needs only its key and scalar value");
+    }
+
+    #[test]
+    fn decorrelates_correlated_scalar_aggregate_in_sort_key() {
+        let outer_key = field(141, "outer_key", "outer_fixture");
+        let inner_key = field(142, "inner_key", "inner_fixture");
+        let inner_measure = field(143, "inner_measure", "inner_fixture");
+        let scalar = field(144, "minimum_value", "inner_fixture");
+        let input = scan("outer_fixture", vec![Arc::clone(&outer_key)]);
+        let output_schema = Box::new(VeinSchema::new(vec![Arc::clone(&outer_key)]));
+        let sort = LogicalPlan::Sort {
+            input: Box::new(input),
+            sort_keys: vec![plan::SortKey {
+                expr: LogicalExpr::ScalarSubquery(Box::new(correlated_min_subquery(
+                    &inner_key,
+                    &inner_measure,
+                    &outer_key,
+                    &scalar,
+                ))),
+                asc: false,
+                nulls_first: false,
+            }],
+            schema: output_schema.clone(),
+        };
+
+        let rewritten = ScalarAggregateDecorrelationRule
+            .apply(&sort, &OptimizerContext::default())
+            .expect("correlated scalar sort key should be supported")
+            .expect("scalar subquery in a sort key must be rewritten");
+        let LogicalPlan::Project {
+            input: sorted,
+            exprs,
+            schema,
+        } = rewritten
+        else {
+            panic!("original output columns should be restored above the sort");
+        };
+        assert_eq!(schema.fields, output_schema.fields);
+        assert!(matches!(
+            exprs.as_slice(),
+            [LogicalExpr::Column(column)] if column.id == outer_key.id
+        ));
+        let LogicalPlan::Sort {
+            input: joined,
+            sort_keys,
+            schema: sort_schema,
+        } = sorted.as_ref()
+        else {
+            panic!("decorrelated input should still sort after its scalar join");
+        };
+        assert_eq!(
+            sort_schema.fields.len(),
+            3,
+            "sort retains the outer key and the scalar join key/value columns"
+        );
+        assert!(matches!(
+            sort_keys.as_slice(),
+            [plan::SortKey { expr: LogicalExpr::Column(column), asc: false, nulls_first: false }]
+                if column.id == scalar.id && column.nullable
+        ));
+        assert!(matches!(
+            joined.as_ref(),
+            LogicalPlan::Join { join_type: parser::ast::pipe_op::JoinType::Left, .. }
+        ));
+    }
+
+    #[test]
+    fn does_not_mistake_nested_subqueries_for_uncorrelated_scalar_input() {
+        let outer = field(81, "outer_value", "outer_fixture");
+        let scalar = field(82, "scalar_value", "inner_fixture");
+        let nested_value = field(83, "nested_value", "nested_fixture");
+        let subquery = LogicalPlan::Project {
+            input: Box::new(scan("inner_fixture", vec![Arc::clone(&scalar)])),
+            exprs: vec![LogicalExpr::ScalarSubquery(Box::new(scan(
+                "nested_fixture",
+                vec![Arc::clone(&nested_value)],
+            )))],
+            schema: Box::new(VeinSchema::new(vec![Arc::clone(&scalar)])),
+        };
+        let filter = LogicalPlan::Filter {
+            input: Box::new(scan("outer_fixture", vec![Arc::clone(&outer)])),
+            predicate: LogicalExpr::ScalarSubquery(Box::new(subquery)),
+        };
+
+        assert!(ScalarAggregateDecorrelationRule
+            .apply(&filter, &OptimizerContext::default())
+            .expect("nested unsupported shape is not an optimizer error")
             .is_none());
     }
 }

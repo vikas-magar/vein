@@ -120,9 +120,8 @@ impl PipelineCompiler {
     /// An aggregate is a pipeline breaker the executor drives, not a program the
     /// VM runs, so the executor needs the key and argument columns in one piece.
     ///
-    /// Filters above it are compiled separately to run after the groups exist.
-    /// Projections remain unsupported until the physical plan carries their
-    /// output schema through the post-aggregate pipeline.
+    /// Filters and projections above it are compiled separately to run after
+    /// the groups exist.
     pub fn aggregate(plan: &LogicalPlan) -> Result<Option<AggregatePlan>> {
         match plan {
             LogicalPlan::Limit { input, .. } | LogicalPlan::Sort { input, .. } => {
@@ -168,18 +167,7 @@ impl PipelineCompiler {
                 types: schema.fields.iter().map(|f| f.data_type.clone()).collect(),
             })),
             LogicalPlan::Filter { input, .. } => Self::aggregate(input),
-            LogicalPlan::Project { input, .. } => {
-                if Self::aggregate(input)?.is_some() {
-                    Err(VeinError::planning(
-                        "an operator above an aggregate is not supported yet: the aggregate's groups \
-                         are built after the vector program runs, so anything above it would have to \
-                         run after that too",
-                        None,
-                    ))
-                } else {
-                    Ok(None)
-                }
-            }
+            LogicalPlan::Project { input, .. } => Self::aggregate(input),
             _ => Ok(None),
         }
     }
@@ -645,7 +633,13 @@ impl PipelineCompiler {
                 schema,
             } => {
                 let input_schema = Self::compile_node(input, input_schema, compiler)?;
-                compiler.compile_projection_with_schema(exprs, &input_schema, schema)?;
+                // Aggregate state is built after this input program runs. A
+                // projection above that boundary belongs to the post-aggregate
+                // program, not the program that produces grouping keys and
+                // aggregate arguments.
+                if Self::aggregate(input)?.is_none() {
+                    compiler.compile_projection_with_schema(exprs, &input_schema, schema)?;
+                }
                 Ok((**schema).clone())
             }
             other => Err(VeinError::planning(
@@ -664,6 +658,7 @@ fn aggregate_output_schema(plan: &LogicalPlan) -> Option<VeinSchema> {
         }
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::SubqueryAlias { input, .. }
         | LogicalPlan::Write { input, .. } => aggregate_output_schema(input),
@@ -693,10 +688,15 @@ fn compile_post_aggregate_node(
             compile_post_aggregate_node(input, compiler)?;
             Ok((**schema).clone())
         }
-        LogicalPlan::Project { .. } => Err(VeinError::planning(
-            "projection above an aggregate is not supported yet",
-            None,
-        )),
+        LogicalPlan::Project {
+            input,
+            exprs,
+            schema,
+        } => {
+            let input_schema = compile_post_aggregate_node(input, compiler)?;
+            compiler.compile_projection_with_schema(exprs, &input_schema, schema)?;
+            Ok((**schema).clone())
+        }
         other => Err(VeinError::planning(
             format!("unsupported operator above an aggregate: {other:?}"),
             None,
@@ -878,6 +878,7 @@ fn agg_op(name: &str) -> Result<AggOpCode> {
         "MIN" => AggOpCode::Min,
         "MAX" => AggOpCode::Max,
         "AVG" => AggOpCode::Avg,
+        "SINGLE_VALUE" => AggOpCode::SingleValue,
         other => {
             return Err(VeinError::planning(
                 format!("aggregate {other} is not implemented"),
@@ -1077,7 +1078,7 @@ mod tests {
         assert!(plan.keys[0].ascending);
         assert!(key_program.is_none());
         assert!(PipelineCompiler::sort(&sort).is_err(),
-            "root ORDER keeps its existing sort-after-limit validation");
+                "root ORDER keeps its existing sort-after-limit validation");
     }
 
     #[test]
@@ -1330,6 +1331,113 @@ mod tests {
 
         assert_eq!(plan.groups, 0);
         assert!(!plan.emit_empty_group_on_empty_input);
+    }
+
+    #[test]
+    fn compiles_project_above_aggregate_after_grouping_with_having_order_and_limit() {
+        let (input_schema, value) = schema();
+        let group = Arc::clone(&input_schema.fields[0]);
+        let group_output = Arc::new(ResolvedColumn::new(
+            ColumnId(10),
+            "group_alias",
+            None,
+            VeinDataType::Utf8,
+        ));
+        let count_output = Arc::new(ResolvedColumn::new(
+            ColumnId(11),
+            "row_count",
+            None,
+            VeinDataType::Int64,
+        ));
+        let aggregate_schema = Box::new(VeinSchema::new(vec![
+            Arc::clone(&group_output),
+            Arc::clone(&count_output),
+        ]));
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(external_scan(&input_schema)),
+            grouping_sets: vec![vec![LogicalExpr::Column(group)]],
+            aggs: vec![LogicalExpr::FunctionCall {
+                name: "count".to_owned(),
+                args: vec![LogicalExpr::Column(value)],
+                is_aggregate: true,
+                distinct: false,
+                return_type: VeinDataType::Int64,
+            }],
+            schema: aggregate_schema,
+        };
+        let aliased_group = Arc::new(ResolvedColumn::new(
+            ColumnId(20),
+            "group_name",
+            None,
+            VeinDataType::Utf8,
+        ));
+        let adjusted_count = Arc::new(ResolvedColumn::new(
+            ColumnId(21),
+            "adjusted_count",
+            None,
+            VeinDataType::Int64,
+        ));
+        let projection_schema = Box::new(VeinSchema::new(vec![
+            Arc::clone(&aliased_group),
+            Arc::clone(&adjusted_count),
+        ]));
+        let projection = LogicalPlan::Project {
+            input: Box::new(aggregate),
+            exprs: vec![
+                LogicalExpr::Column(group_output),
+                LogicalExpr::BinaryOp {
+                    left: Box::new(LogicalExpr::Column(Arc::clone(&count_output))),
+                    op: parser::ast::expr::BinaryOp::Plus,
+                    right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(1))),
+                    return_type: VeinDataType::Int64,
+                },
+            ],
+            schema: projection_schema.clone(),
+        };
+        let having = LogicalPlan::Filter {
+            input: Box::new(projection),
+            predicate: LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&adjusted_count))),
+                op: parser::ast::expr::BinaryOp::Gt,
+                right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(1))),
+                return_type: VeinDataType::Boolean,
+            },
+        };
+        let ordered = LogicalPlan::Sort {
+            input: Box::new(having),
+            sort_keys: vec![LogicalSortKey {
+                expr: LogicalExpr::Column(adjusted_count),
+                asc: false,
+                nulls_first: false,
+            }],
+            schema: projection_schema.clone(),
+        };
+        let limited = LogicalPlan::Limit {
+            input: Box::new(ordered),
+            offset: 0,
+            count: 10,
+            schema: projection_schema,
+        };
+
+        let aggregate_plan = PipelineCompiler::aggregate(&limited)
+            .expect("aggregate under post-aggregate operators should plan")
+            .expect("aggregate plan");
+        assert_eq!(aggregate_plan.types, vec![VeinDataType::Utf8, VeinDataType::Int64]);
+
+        let (_, input_program, output_schema) = PipelineCompiler::compile(&limited)
+            .expect("compile aggregate input program");
+        assert_eq!(output_schema.fields[1].name, "adjusted_count");
+        assert!(
+            !input_program.instructions.iter().any(|instruction| matches!(instruction, MicroOp::Add { .. })),
+            "computed projection must not execute before aggregate groups are built"
+        );
+
+        let post_aggregate = PipelineCompiler::post_aggregate_program(&limited)
+            .expect("compile post-aggregate operators")
+            .expect("project and HAVING require a post-aggregate program");
+        assert!(post_aggregate.instructions.iter().any(|instruction| matches!(instruction, MicroOp::Add { .. })));
+        assert!(post_aggregate.instructions.iter().any(|instruction| matches!(instruction, MicroOp::FilterMask { .. })));
+        assert!(post_aggregate.instructions.iter().any(|instruction| matches!(instruction, MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 2)));
     }
 
     #[test]

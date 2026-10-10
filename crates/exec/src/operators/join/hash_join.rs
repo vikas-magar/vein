@@ -6,11 +6,12 @@
 //! completion, then probe — which is precisely why a join cannot be a VM
 //! instruction: the VM sees one chunk at a time and has no second input.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use arrow::datatypes::DataType;
+use arrow::array::{ArrayRef, DictionaryArray, UInt32Array, new_null_array};
+use arrow::datatypes::{DataType, UInt32Type};
 
 use crate::pipeline::{DataChunk, PipelineNode, Transform};
 use common::arrow::SelectionVector;
@@ -225,6 +226,17 @@ impl HashJoin {
             }
         }
         let residual_us = residual_started.elapsed().as_micros() as u64;
+        if self.join_type == JoinType::Single {
+            let mut seen_probe_rows = HashSet::with_capacity(matches.len());
+            for (probe, _) in &matches {
+                if !seen_probe_rows.insert(*probe) {
+                    return Err(VeinError::stage(
+                        "join",
+                        "scalar subquery returned more than one row",
+                    ));
+                }
+            }
+        }
         // Only the flavours that owe unmatched build rows need this.
         if matches!(self.join_type, JoinType::Right | JoinType::Full) {
             self.matched_build
@@ -254,6 +266,15 @@ impl HashJoin {
             return forwarded;
         }
 
+        if self.join_type == JoinType::Single {
+            let gather_started = Instant::now();
+            let mut produced = self.assemble_single(&chunk, &probe_rows, &matches)?;
+            let forwarded = self.forward(&mut produced);
+            self.gather_us += gather_started.elapsed().as_micros() as u64;
+            self.residual_us += residual_us;
+            return forwarded;
+        }
+
         // Unmatched *build* rows belong to the flush, not to this chunk.
         let gather_started = Instant::now();
         let rows = output_rows(self.join_type, &probe_rows, &matches, &[]);
@@ -269,6 +290,95 @@ impl HashJoin {
         self.gather_us += gather_started.elapsed().as_micros() as u64;
         self.residual_us += residual_us;
         forwarded
+    }
+
+    /// Produces a single-match join as sparse probe selections plus dictionary
+    /// columns that reference retained build arrays, without copying either
+    /// side's column values into the output chunks.
+    fn assemble_single(
+        &self,
+        probe: &DataChunk,
+        probe_rows: &[u32],
+        matches: &[(u32, (u32, u32))],
+    ) -> Result<Vec<DataChunk>> {
+        let mut groups: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
+        let mut group_positions = HashMap::with_capacity(matches.len());
+        let mut matched_probe = HashSet::with_capacity(matches.len());
+        for (probe_row, (build_chunk, build_row)) in matches {
+            let position = match group_positions.get(build_chunk) {
+                Some(position) => *position,
+                None => {
+                    let position = groups.len();
+                    groups.push((*build_chunk, Vec::new()));
+                    group_positions.insert(*build_chunk, position);
+                    position
+                }
+            };
+            groups[position].1.push((*probe_row, *build_row));
+            matched_probe.insert(*probe_row);
+        }
+
+        let unmatched: Vec<u32> = probe_rows
+            .iter()
+            .copied()
+            .filter(|probe_row| !matched_probe.contains(probe_row))
+            .collect();
+        let mut output = Vec::with_capacity(groups.len() + usize::from(!unmatched.is_empty()));
+        for (build_chunk_index, rows) in groups {
+            let build_chunk = self.table.build_chunk(build_chunk_index);
+            let selected_rows: Vec<u32> = rows
+                .iter()
+                .map(|(probe_row, _)| *probe_row)
+                .collect();
+            let mut columns = Vec::with_capacity(self.columns.len());
+            for column in &self.columns {
+                match column {
+                    OutputColumn::Probe(index) => columns.push(Arc::clone(probe.column(*index))),
+                    OutputColumn::Build(index) => {
+                        let values = build_chunk.column(*index);
+                        let mut indices = vec![None; probe.physical_len()];
+                        for (probe_row, build_row) in &rows {
+                            indices[*probe_row as usize] = Some(*build_row);
+                        }
+                        let dictionary = DictionaryArray::<UInt32Type>::try_new(
+                            UInt32Array::from(indices),
+                            Arc::clone(values),
+                        )
+                        .map_err(|error| VeinError::internal(format!(
+                            "single join dictionary construction failed: {error}"
+                        )))?;
+                        columns.push(Arc::new(dictionary) as ArrayRef);
+                    }
+                }
+            }
+            output.push(DataChunk::new(columns, SelectionVector::new_sparse(selected_rows)));
+        }
+
+        if !unmatched.is_empty() {
+            let mut columns = Vec::with_capacity(self.columns.len());
+            for column in &self.columns {
+                match column {
+                    OutputColumn::Probe(index) => columns.push(Arc::clone(probe.column(*index))),
+                    OutputColumn::Build(index) => {
+                        let value_type = self.build_types.get(*index).ok_or_else(|| {
+                            VeinError::internal(format!(
+                                "single join needs the data type of build column {index}"
+                            ))
+                        })?;
+                        let dictionary_type = DataType::Dictionary(
+                            Box::new(DataType::UInt32),
+                            Box::new(value_type.clone()),
+                        );
+                        columns.push(new_null_array(&dictionary_type, probe.physical_len()));
+                    }
+                }
+            }
+            output.push(DataChunk::new(
+                columns,
+                SelectionVector::new_sparse(unmatched),
+            ));
+        }
+        Ok(output)
     }
 
     /// Forwards produced chunks, dropping any that carry no rows.
@@ -336,7 +446,8 @@ impl crate::pipeline::Transform<DataChunk> for HashJoin {}
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use arrow::array::{Array, ArrayRef, Int64Array};
+    use arrow::array::{Array, ArrayRef, DictionaryArray, Int64Array};
+    use arrow::datatypes::UInt32Type;
 
     use super::*;
 
@@ -560,5 +671,107 @@ mod tests {
         let build: Vec<Option<i64>> = chunks.iter().flat_map(|c| cells(c, 1)).collect();
         assert_eq!(probe, vec![Some(20), None], "the match, then a null probe row");
         assert_eq!(build, vec![Some(20), Some(40)], "build 40 matched nothing");
+    }
+
+    #[test]
+    fn single_join_checks_cardinality_and_keeps_both_input_buffers() {
+        let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        let build_keys = ints(&[10, 20]);
+        let build_values = ints(&[100, 200]);
+        table
+            .insert(DataChunk::from_vectors(vec![build_keys, Arc::clone(&build_values)]))
+            .expect("insert single-match build rows");
+
+        let probe_keys = ints(&[20, 10]);
+        let probe_payload = ints(&[2_000, 1_000]);
+        let probe_payload_ptr = probe_payload.as_ref().as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr();
+        let sink = Collect::default();
+        let mut join = HashJoin::new(
+            Arc::new(table),
+            JoinType::Single,
+            vec![OutputColumn::Probe(1), OutputColumn::Build(1)],
+            vec![DataType::Int64, DataType::Int64],
+            vec![DataType::Int64, DataType::Int64],
+            Box::new(sink.clone()),
+        );
+
+        join.push(DataChunk::from_vectors(vec![probe_keys, Arc::clone(&probe_payload)]))
+            .expect("single match should not multiply probe rows");
+        join.flush().expect("flush single join");
+
+        let chunks = sink.0.lock().expect("collect lock");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].selection.size(), 2);
+        assert!(Arc::ptr_eq(chunks[0].column(0), &probe_payload));
+        assert_eq!(
+            chunks[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().as_ptr(),
+            probe_payload_ptr,
+            "probe payload buffer must be shared"
+        );
+
+        let dictionary = chunks[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .expect("build scalar remains a dictionary view");
+        assert!(Arc::ptr_eq(dictionary.values(), &build_values));
+        let keys = dictionary.keys();
+        let values = dictionary.values().as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut pairs: Vec<(i64, i64)> = (0..chunks[0].selection.size())
+            .map(|position| {
+                let physical = chunks[0].selection.get_index(position);
+                let probe = chunks[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                (probe.value(physical), values.value(keys.value(physical) as usize))
+            })
+            .collect();
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(1_000, 100), (2_000, 200)]);
+    }
+
+    #[test]
+    fn single_join_returns_null_for_an_unmatched_probe_row() {
+        let sink = Collect::default();
+        let mut join = HashJoin::new(
+            Arc::new(build(&[20])),
+            JoinType::Single,
+            vec![OutputColumn::Probe(0), OutputColumn::Build(0)],
+            vec![DataType::Int64],
+            vec![DataType::Int64],
+            Box::new(sink.clone()),
+        );
+
+        join.push(DataChunk::from_vectors(vec![ints(&[10])]))
+            .expect("unmatched probe should produce a null scalar");
+        join.flush().expect("flush single join");
+
+        let chunks = sink.0.lock().expect("collect lock");
+        assert_eq!(chunks.len(), 1);
+        let nulls = chunks[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .expect("unmatched scalar retains dictionary type");
+        assert!(nulls.is_null(chunks[0].selection.get_index(0)));
+    }
+
+    #[test]
+    fn single_join_errors_on_multiple_matches_across_build_chunks() {
+        let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
+        table.insert(DataChunk::from_vectors(vec![ints(&[20])])).expect("first build batch");
+        table.insert(DataChunk::from_vectors(vec![ints(&[20])])).expect("second build batch");
+        let sink = Collect::default();
+        let mut join = HashJoin::new(
+            Arc::new(table),
+            JoinType::Single,
+            vec![OutputColumn::Probe(0), OutputColumn::Build(0)],
+            vec![DataType::Int64],
+            vec![DataType::Int64],
+            Box::new(sink),
+        );
+
+        let error = join
+            .push(DataChunk::from_vectors(vec![ints(&[20])]))
+            .expect_err("two inner rows violate scalar cardinality");
+        assert!(error.to_string().contains("scalar subquery returned more than one row"));
     }
 }

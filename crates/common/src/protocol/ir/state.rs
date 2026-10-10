@@ -40,6 +40,8 @@ pub enum JoinKind {
     Semi,
     /// Left anti join.
     Anti,
+    /// Single join that errors when one probe row has multiple matches.
+    Single,
     /// Cartesian product: every probe row paired with every build row.
     Cross,
 }
@@ -57,4 +59,6 @@ pub enum AggOpCode {
     Max,
     /// AVG(input).
     Avg,
+    /// Enforce scalar-subquery cardinality and return its only input value.
+    SingleValue,
 }

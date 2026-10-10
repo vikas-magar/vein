@@ -340,7 +340,10 @@ mod tests {
                 distinct: false,
                 return_type: VeinDataType::Int64,
             }],
-            schema: Box::new(VeinSchema::new(vec![group_key, row_count])),
+            schema: Box::new(VeinSchema::new(vec![
+                Arc::clone(&group_key),
+                Arc::clone(&row_count),
+            ])),
         };
 
         let job = DefaultPhysicalPlanner::new()
@@ -359,6 +362,61 @@ mod tests {
         assert!(
             matches!(input.as_ref(), common::protocol::PhysicalInputPlan::Join { .. }),
             "the aggregate transform must consume the planned join"
+        );
+
+        let projected_group = Arc::new(ResolvedColumn::new(
+            ColumnId(32),
+            "group_alias",
+            None,
+            VeinDataType::Int64,
+        ));
+        let adjusted_count = Arc::new(ResolvedColumn::new(
+            ColumnId(33),
+            "adjusted_count",
+            None,
+            VeinDataType::Int64,
+        ));
+        let projected = LogicalPlan::Project {
+            input: Box::new(aggregate.clone()),
+            exprs: vec![
+                LogicalExpr::Column(Arc::clone(&group_key)),
+                LogicalExpr::BinaryOp {
+                    left: Box::new(LogicalExpr::Column(Arc::clone(&row_count))),
+                    op: parser::ast::expr::BinaryOp::Plus,
+                    right: Box::new(LogicalExpr::Literal(plan::LogicalLiteral::Int64(1))),
+                    return_type: VeinDataType::Int64,
+                },
+            ],
+            schema: Box::new(VeinSchema::new(vec![
+                Arc::clone(&projected_group),
+                Arc::clone(&adjusted_count),
+            ])),
+        };
+        let projected_job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), projected)
+            .expect("computed projection above aggregate over join should plan");
+        let projected_input = projected_job.stage().tasks()[0]
+            .input_plan
+            .as_ref()
+            .expect("recursive projected input");
+        let common::protocol::PhysicalInputPlan::Transform {
+            input,
+            program,
+        } = projected_input.as_ref()
+        else {
+            panic!("projection should be represented as a transform above the aggregate");
+        };
+        assert!(matches!(
+            input.as_ref(),
+            common::protocol::PhysicalInputPlan::Aggregate { .. }
+        ));
+        assert!(
+            program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::Add { .. })),
+            "computed projection must run against aggregate output"
+        );
+        assert!(
+            program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 2)),
+            "projection must preserve both aliased output columns"
         );
 
         let filtered = LogicalPlan::Filter {
@@ -700,6 +758,81 @@ mod tests {
             common::protocol::PhysicalInputPlan::Transform { input, .. }
                 if matches!(input.as_ref(), common::protocol::PhysicalInputPlan::Join { .. })
         ));
+    }
+
+    #[test]
+    fn plans_projection_over_single_match_join_as_a_transform() {
+        let left = mock_scan_plan_with_column_id_offset(0);
+        let right = mock_scan_plan_with_column_id_offset(2);
+        let (left_key, left_value) = match &left {
+            LogicalPlan::Scan { schema, .. } => (
+                Arc::clone(&schema.fields[0]),
+                Arc::clone(&schema.fields[1]),
+            ),
+            _ => unreachable!(),
+        };
+        let (right_key, right_value) = match &right {
+            LogicalPlan::Scan { schema, .. } => (
+                Arc::clone(&schema.fields[0]),
+                Arc::clone(&schema.fields[1]),
+            ),
+            _ => unreachable!(),
+        };
+        let join = LogicalPlan::Join {
+            join_type: parser::ast::pipe_op::JoinType::Single,
+            left: Box::new(left),
+            right: Box::new(right),
+            on: Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(Arc::clone(&left_key))),
+                op: parser::ast::expr::BinaryOp::Eq,
+                right: Box::new(LogicalExpr::Column(Arc::clone(&right_key))),
+                return_type: VeinDataType::Boolean,
+            }),
+            using: Vec::new(),
+            schema: Box::new(VeinSchema::new(vec![
+                Arc::clone(&left_key),
+                Arc::clone(&left_value),
+                Arc::new(right_key.as_ref().clone().with_nullable(true)),
+                Arc::new(right_value.as_ref().clone().with_nullable(true)),
+            ])),
+        };
+        let projected_key = Arc::new(ResolvedColumn::new(
+            ColumnId(4),
+            "outer_id",
+            None,
+            VeinDataType::Int64,
+        ));
+        let projected_scalar = Arc::new(
+            ResolvedColumn::new(ColumnId(5), "scalar_value", None, VeinDataType::Utf8)
+                .with_nullable(true),
+        );
+        let projected = LogicalPlan::Project {
+            input: Box::new(join),
+            exprs: vec![
+                LogicalExpr::Column(left_key),
+                LogicalExpr::Column(right_value),
+            ],
+            schema: Box::new(VeinSchema::new(vec![projected_key, projected_scalar])),
+        };
+
+        let job = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), projected)
+            .expect("projection above a scalar single-match join should plan");
+        let input = job.stage().tasks()[0]
+            .input_plan
+            .as_ref()
+            .expect("recursive projected input");
+        let common::protocol::PhysicalInputPlan::Transform { input, program } = input.as_ref() else {
+            panic!("the projection should compile as a transform above the join");
+        };
+        assert!(matches!(
+            input.as_ref(),
+            common::protocol::PhysicalInputPlan::Join { .. }
+        ));
+        assert!(program.instructions.iter().any(|op| matches!(
+            op,
+            common::protocol::MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 2
+        )));
     }
 
     #[test]

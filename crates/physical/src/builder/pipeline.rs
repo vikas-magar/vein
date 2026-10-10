@@ -127,29 +127,8 @@ impl DefaultPipelineStageBuilder {
             )?;
         }
 
-        let (outputs, output_schema) = available_join_outputs(schema, &probe_schema, &build_schema);
-        if output_schema.fields.len() != schema.fields.len() {
-            let unavailable = schema
-                .fields
-                .iter()
-                .filter(|field| {
-                    output_schema
-                        .position_of_id(field.id)
-                        .is_none()
-                })
-                .map(|field| format!("{}#{}", field.name, field.id.0))
-                .collect::<Vec<_>>();
-            tracing::debug!(
-                target: "vein.physical",
-                event = "physical_join_outputs_pruned",
-                declared_output_count = schema.fields.len(),
-                available_output_count = output_schema.fields.len(),
-                unavailable_outputs = ?unavailable,
-                probe_columns = ?probe_schema.fields.iter().map(|field| (&field.name, field.id.0)).collect::<Vec<_>>(),
-                build_columns = ?build_schema.fields.iter().map(|field| (&field.name, field.id.0)).collect::<Vec<_>>(),
-                "physical_join_outputs_pruned"
-            );
-        }
+        let (outputs, output_schema) =
+            available_join_outputs(schema, &probe_schema, &build_schema)?;
         let join = JoinPlan {
             join_type: join_kind(join_type),
             probe_keys,
@@ -372,6 +351,7 @@ fn join_kind(join_type: &JoinType) -> JoinKind {
         JoinType::Full => JoinKind::Full,
         JoinType::Semi => JoinKind::Semi,
         JoinType::Anti => JoinKind::Anti,
+        JoinType::Single => JoinKind::Single,
         JoinType::Cross => JoinKind::Cross,
     }
 }
@@ -434,14 +414,15 @@ fn position(schema: &VeinSchema, name: &str) -> Result<u32> {
         })
 }
 
-/// Builds a join output layout from fields that survived input pruning.
-/// Probe-first preserves `USING` semantics; unavailable logical fields are
-/// omitted because no downstream operator can reference them.
+/// Maps every declared join output to its physical input position.
+/// Probe-first preserves `USING` semantics. Column pruning narrows the logical
+/// join schema to parent-required outputs, so a missing declared field violates
+/// the plan contract and must fail here rather than disappear silently.
 fn available_join_outputs(
     schema: &VeinSchema,
     probe: &VeinSchema,
     build: &VeinSchema,
-) -> (Vec<JoinOutput>, VeinSchema) {
+) -> Result<(Vec<JoinOutput>, VeinSchema)> {
     let mut outputs = Vec::with_capacity(schema.fields.len());
     let mut fields = Vec::with_capacity(schema.fields.len());
     for field in &schema.fields {
@@ -451,7 +432,10 @@ fn available_join_outputs(
             })
         });
         if let Some(index) = probe_index {
-            outputs.push(JoinOutput::Probe(index as u32));
+            let index = u32::try_from(index).map_err(|_| {
+                VeinError::planning("join probe input has too many columns", None)
+            })?;
+            outputs.push(JoinOutput::Probe(index));
             fields.push(Arc::clone(field));
             continue;
         }
@@ -461,11 +445,23 @@ fn available_join_outputs(
             })
         });
         if let Some(index) = build_index {
-            outputs.push(JoinOutput::Build(index as u32));
+            let index = u32::try_from(index).map_err(|_| {
+                VeinError::planning("join build input has too many columns", None)
+            })?;
+            outputs.push(JoinOutput::Build(index));
             fields.push(Arc::clone(field));
+            continue;
         }
+
+        return Err(VeinError::planning(
+            format!(
+                "join output column '{}' (ColumnId({})) is missing from both physical inputs",
+                field.name, field.id.0
+            ),
+            None,
+        ));
     }
-    (outputs, VeinSchema::new(fields))
+    Ok((outputs, VeinSchema::new(fields)))
 }
 
 /// The output layout: each field of the join's schema, probe side matched first.
@@ -662,7 +658,7 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        equality_keys, extract_equi_join_keys, split_file_scan_source,
+        available_join_outputs, equality_keys, extract_equi_join_keys, split_file_scan_source,
         DefaultPipelineStageBuilder, PipelineStageBuilder,
     };
     use common::identifiers::TaskId;
@@ -717,6 +713,50 @@ mod tests {
                 .expect("build-to-probe equality should resolve"),
             (1, 0)
         );
+    }
+
+    #[test]
+    fn join_output_mapping_rejects_declared_columns_missing_from_both_inputs() {
+        let probe_key = test_column(11, "probe_key");
+        let build_key = test_column(21, "build_key");
+        let missing_output = test_column(99, "required_value");
+        let probe = VeinSchema::new(vec![Arc::clone(&probe_key)]);
+        let build = VeinSchema::new(vec![Arc::clone(&build_key)]);
+        let declared_output = VeinSchema::new(vec![missing_output]);
+
+        let error = available_join_outputs(&declared_output, &probe, &build)
+            .expect_err("a declared but unavailable output must fail planning");
+
+        let message = error.to_string();
+        assert!(message.contains("required_value"), "{message}");
+        assert!(message.contains("ColumnId(99)"), "{message}");
+        assert!(message.contains("both physical inputs"), "{message}");
+    }
+
+    #[test]
+    fn join_output_mapping_preserves_only_declared_pruned_outputs() {
+        let probe_key = test_column(11, "probe_key");
+        let probe_value = test_column(12, "probe_value");
+        let build_key = test_column(21, "build_key");
+        let unused_build_value = test_column(22, "unused_build_value");
+        let probe = VeinSchema::new(vec![Arc::clone(&probe_key), Arc::clone(&probe_value)]);
+        let build = VeinSchema::new(vec![
+            Arc::clone(&build_key),
+            Arc::clone(&unused_build_value),
+        ]);
+        let declared_output = VeinSchema::new(vec![Arc::clone(&probe_value)]);
+
+        let (outputs, output_schema) =
+            available_join_outputs(&declared_output, &probe, &build)
+                .expect("a narrowed join output should map successfully");
+
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(outputs[0], common::protocol::JoinOutput::Probe(1)));
+        assert_eq!(
+            output_schema.fields.iter().map(|field| field.id).collect::<Vec<_>>(),
+            vec![probe_value.id]
+        );
+        assert!(Arc::ptr_eq(&output_schema.fields[0], &probe_value));
     }
 
     #[test]
