@@ -559,7 +559,7 @@ impl DefaultTaskExecutor {
         // fanned out: every chain would otherwise emit the window on its own.
         let sources = if task.limit.is_none()
             && task.sort.is_none()
-            && matches!(kind, JoinType::Inner | JoinType::Left)
+            && matches!(kind, JoinType::Inner | JoinType::Left | JoinType::Cross)
         {
             split_scan(&task.source)
         } else {
@@ -1095,20 +1095,16 @@ fn split_scan(source: &DataSource) -> Vec<DataSource> {
 
 /// A plan's join flavour as the operator's.
 ///
-/// The semi and anti flavours are refused rather than mapped onto the nearest
-/// outer join: they emit a probe row *once*, with no build columns, which is a
-/// different output shape, not a variation of this one.
+/// Semi and anti emit each qualifying probe row once and expose no build columns.
 fn join_type(kind: JoinKind) -> Result<JoinType> {
     Ok(match kind {
         JoinKind::Inner => JoinType::Inner,
         JoinKind::Left => JoinType::Left,
         JoinKind::Right => JoinType::Right,
         JoinKind::Full => JoinType::Full,
-        JoinKind::Semi | JoinKind::Anti => {
-            return Err(VeinError::internal(format!(
-                "the hash join does not implement {kind:?} yet"
-            )));
-        }
+        JoinKind::Semi => JoinType::Semi,
+        JoinKind::Anti => JoinType::Anti,
+        JoinKind::Cross => JoinType::Cross,
     })
 }
 

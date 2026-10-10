@@ -14,6 +14,10 @@ pub enum JoinType {
     Full,
     /// CROSS JOIN
     Cross,
+    /// Internal optimizer join that emits each matching left row once.
+    Semi,
+    /// Internal optimizer join that emits left rows with no match.
+    Anti,
 }
 
 /// A single pipe operator (`|>`) in a query pipeline.

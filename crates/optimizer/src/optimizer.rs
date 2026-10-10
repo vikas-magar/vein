@@ -22,7 +22,7 @@ use plan::{LogicalPlan, PlanTraversal};
 use crate::context::{OptimizationDiagnostics, OptimizerConfig, OptimizerContext, RuleExecution};
 use crate::rule::{OptimizerRule, RuleType};
 use crate::rules::{
-    ColumnPruningRule, ConstantFoldingRule, ExpressionSimplificationRule, FilterNormalizationRule,
+    ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule, FilterNormalizationRule,
     JoinPredicateTransitivityRule, PredicatePushdownRule, ScanFilterPushdownRule,
     ScanStatisticsPruningRule, ScalarAggregateDecorrelationRule,
 };
@@ -78,6 +78,7 @@ impl OptimizerPipeline {
             Arc::new(FilterNormalizationRule),
             Arc::new(ScanStatisticsPruningRule),
             Arc::new(JoinPredicateTransitivityRule),
+            Arc::new(ExistsDecorrelationRule),
             Arc::new(ScalarAggregateDecorrelationRule),
             Arc::new(PredicatePushdownRule),
             Arc::new(ScanFilterPushdownRule),

@@ -6,6 +6,7 @@
 pub mod arithmetic;
 pub mod cast;
 pub mod comparison;
+pub mod conditional;
 pub mod constant;
 pub mod logic;
 pub mod mask;
@@ -17,6 +18,7 @@ pub use cast::eval_cast;
 pub use comparison::{
     eval_cmp_eq, eval_cmp_gt, eval_cmp_gte, eval_cmp_lt, eval_cmp_lte, eval_cmp_neq, eval_like,
 };
+pub use conditional::{eval_case, eval_in_list};
 pub use constant::{literal_to_array, literal_to_scalar};
 pub use logic::{eval_and, eval_is_not_null, eval_is_null, eval_not, eval_or};
 pub use mask::apply_filter_mask;

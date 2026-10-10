@@ -148,6 +148,43 @@ impl BytecodeCompiler {
                 });
                 Ok(dst)
             }
+            LogicalExpr::InList { expr, list, negated } => {
+                let value = self.compile_expr(expr, schema)?;
+                let mut candidates = Vec::with_capacity(list.len());
+                for candidate in list {
+                    candidates.push(self.compile_expr(candidate, schema)?);
+                }
+                let dst = self.allocator.allocate()?;
+                self.instructions.push(MicroOp::InList {
+                    dst,
+                    value,
+                    candidates,
+                    negated: *negated,
+                });
+                Ok(dst)
+            }
+            LogicalExpr::Case { when, then, else_, return_type } => {
+                let mut when_regs = Vec::with_capacity(when.len());
+                let mut then_regs = Vec::with_capacity(then.len());
+                for condition in when {
+                    when_regs.push(self.compile_expr(condition, schema)?);
+                }
+                for result in then {
+                    then_regs.push(self.compile_expr(result, schema)?);
+                }
+                let else_reg = else_.as_ref()
+                    .map(|result| self.compile_expr(result, schema))
+                    .transpose()?;
+                let dst = self.allocator.allocate()?;
+                self.instructions.push(MicroOp::Case {
+                    dst,
+                    when_regs,
+                    then_regs,
+                    else_reg,
+                    return_type: return_type.clone(),
+                });
+                Ok(dst)
+            }
             LogicalExpr::FunctionCall { name, args, .. }
             | LogicalExpr::AiOperator { name, args, .. } => {
                 let mut arg_regs = Vec::with_capacity(args.len());
@@ -441,6 +478,53 @@ mod tests {
                 }
             ]
         ));
+    }
+
+    #[test]
+    fn compile_in_list_emits_membership_instruction() {
+        let schema = test_schema();
+        let expr = LogicalExpr::InList {
+            expr: Box::new(LogicalExpr::Column(schema.fields[0].clone())),
+            list: vec![
+                LogicalExpr::Literal(LogicalLiteral::Int64(10)),
+                LogicalExpr::Literal(LogicalLiteral::Int64(20)),
+            ],
+            negated: true,
+        };
+        let mut compiler = BytecodeCompiler::new(schema.fields.len() as RegId);
+        compiler.set_input_schema(&schema);
+
+        let output = compiler.compile_expr(&expr, &schema).unwrap();
+        let program = compiler.finish();
+        assert_eq!(program.instructions.last(), Some(&MicroOp::InList {
+            dst: output,
+            value: 0,
+            candidates: vec![2, 3],
+            negated: true,
+        }));
+    }
+
+    #[test]
+    fn compile_case_emits_typed_case_instruction() {
+        let schema = test_schema();
+        let expr = LogicalExpr::Case {
+            when: vec![LogicalExpr::Literal(LogicalLiteral::Boolean(true))],
+            then: vec![LogicalExpr::Literal(LogicalLiteral::Int64(7))],
+            else_: Some(Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(0)))),
+            return_type: VeinDataType::Int64,
+        };
+        let mut compiler = BytecodeCompiler::new(schema.fields.len() as RegId);
+        compiler.set_input_schema(&schema);
+
+        let output = compiler.compile_expr(&expr, &schema).unwrap();
+        let program = compiler.finish();
+        assert_eq!(program.instructions.last(), Some(&MicroOp::Case {
+            dst: output,
+            when_regs: vec![2],
+            then_regs: vec![3],
+            else_reg: Some(4),
+            return_type: VeinDataType::Int64,
+        }));
     }
 
     #[test]

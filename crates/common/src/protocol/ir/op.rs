@@ -125,6 +125,30 @@ pub enum MicroOp {
         /// Whether to negate the match (NOT LIKE).
         negated: bool,
     },
+    /// SQL membership test over candidate registers: `dst = value [NOT] IN (...)`.
+    InList {
+        /// Destination boolean register.
+        dst: RegId,
+        /// Register containing the value being tested.
+        value: RegId,
+        /// Registers containing the candidate values.
+        candidates: Vec<RegId>,
+        /// Whether to negate the membership result.
+        negated: bool,
+    },
+    /// SQL searched CASE expression. WHEN arms are evaluated eagerly and in source order.
+    Case {
+        /// Destination register.
+        dst: RegId,
+        /// Boolean WHEN-condition registers.
+        when_regs: Vec<RegId>,
+        /// THEN-value registers corresponding to `when_regs`.
+        then_regs: Vec<RegId>,
+        /// ELSE-value register, or None for a typed NULL result.
+        else_reg: Option<RegId>,
+        /// Common result type selected by binding.
+        return_type: VeinDataType,
+    },
     /// Vector comparison: `dst = src1 < src2`
     CmpLt {
         /// Destination register.

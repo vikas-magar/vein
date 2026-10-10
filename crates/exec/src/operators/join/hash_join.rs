@@ -13,12 +13,13 @@ use std::time::Instant;
 use arrow::datatypes::DataType;
 
 use crate::pipeline::{DataChunk, PipelineNode, Transform};
+use common::arrow::SelectionVector;
 use common::Result;
 use error::VeinError;
 
 use super::gather::{OutputColumn, assemble};
 use super::hash_table::{HashTable, JoinKeys};
-use super::rows::{JoinType, output_rows};
+use super::rows::{JoinType, existence_probe_rows, output_rows};
 
 /// Collects the selection left by a VM join-residual filter.
 #[derive(Clone, Default)]
@@ -232,6 +233,27 @@ impl HashJoin {
         self.probed_rows += probe_rows.len() as u64;
         self.matched_rows += matches.len() as u64;
 
+        if matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
+            let gather_started = Instant::now();
+            let selected_rows = existence_probe_rows(self.join_type, &probe_rows, &matches);
+            let vectors = self
+                .columns
+                .iter()
+                .map(|column| match column {
+                    OutputColumn::Probe(index) => Ok(Arc::clone(chunk.column(*index))),
+                    OutputColumn::Build(_) => Err(VeinError::internal(
+                        "semi/anti join output cannot contain build-side columns",
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let output = DataChunk::new(vectors, SelectionVector::new_sparse(selected_rows));
+            let mut produced = if output.is_empty() { Vec::new() } else { vec![output] };
+            let forwarded = self.forward(&mut produced);
+            self.gather_us += gather_started.elapsed().as_micros() as u64;
+            self.residual_us += residual_us;
+            return forwarded;
+        }
+
         // Unmatched *build* rows belong to the flush, not to this chunk.
         let gather_started = Instant::now();
         let rows = output_rows(self.join_type, &probe_rows, &matches, &[]);
@@ -347,6 +369,20 @@ mod tests {
             .collect()
     }
 
+    fn selected_cells(chunk: &DataChunk, column: usize) -> Vec<Option<i64>> {
+        let array = chunk
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 output");
+        (0..chunk.selection.size())
+            .map(|logical_row| {
+                let physical_row = chunk.selection.get_index(logical_row);
+                array.is_valid(physical_row).then(|| array.value(physical_row))
+            })
+            .collect()
+    }
+
     /// A built table over one chunk of `values`.
     fn build(values: &[i64]) -> HashTable {
         let mut sink = BuildSink::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
@@ -375,6 +411,130 @@ mod tests {
         let chunks = sink.0.lock().expect("collect lock");
         let all: Vec<Option<i64>> = chunks.iter().flat_map(|chunk| cells(chunk, 0)).collect();
         assert_eq!(all, vec![Some(20)], "only the matching probe row survives");
+    }
+
+    #[test]
+    fn semi_join_emits_a_probe_row_once_despite_duplicate_build_matches() {
+        let sink = Collect::default();
+        let mut join = HashJoin::new(
+            Arc::new(build(&[20, 20, 30])),
+            JoinType::Semi,
+            vec![OutputColumn::Probe(0)],
+            vec![DataType::Int64],
+            vec![DataType::Int64],
+            Box::new(sink.clone()),
+        );
+
+        join.push(DataChunk::from_vectors(vec![ints(&[20, 10, 30])]))
+            .expect("probe");
+        join.flush().expect("flush");
+
+        let chunks = sink.0.lock().expect("collect lock");
+        let rows: Vec<Option<i64>> = chunks.iter().flat_map(|chunk| selected_cells(chunk, 0)).collect();
+        assert_eq!(rows, vec![Some(20), Some(30)]);
+        assert!(chunks.iter().all(|chunk| chunk.num_columns() == 1));
+    }
+
+    #[test]
+    fn semi_join_reuses_probe_arrays_and_keeps_sparse_selection_indices() {
+        use common::arrow::SelectionVector;
+
+        let sink = Collect::default();
+        let probe_values = ints(&[10, 20, 30, 40]);
+        let probe = DataChunk::new(
+            vec![Arc::clone(&probe_values)],
+            SelectionVector::new_sparse(vec![1, 3]),
+        );
+        let mut join = HashJoin::new(
+            Arc::new(build(&[40, 40])),
+            JoinType::Semi,
+            vec![OutputColumn::Probe(0)],
+            vec![DataType::Int64],
+            vec![DataType::Int64],
+            Box::new(sink.clone()),
+        );
+
+        join.push(probe).expect("probe");
+        join.flush().expect("flush");
+
+        let chunks = sink.0.lock().expect("collect lock");
+        assert_eq!(chunks.len(), 1);
+        assert!(Arc::ptr_eq(chunks[0].column(0), &probe_values));
+        assert_eq!(chunks[0].selection.size(), 1);
+        assert_eq!(chunks[0].selection.get_index(0), 3);
+        assert_eq!(selected_cells(&chunks[0], 0), vec![Some(40)]);
+    }
+
+    #[test]
+    fn anti_join_reuses_probe_arrays_and_emits_only_unmatched_selected_rows() {
+        use common::arrow::SelectionVector;
+
+        let sink = Collect::default();
+        let probe_values = ints(&[10, 20, 30, 40]);
+        let probe = DataChunk::new(
+            vec![Arc::clone(&probe_values)],
+            SelectionVector::new_sparse(vec![1, 3]),
+        );
+        let mut join = HashJoin::new(
+            Arc::new(build(&[40])),
+            JoinType::Anti,
+            vec![OutputColumn::Probe(0)],
+            vec![DataType::Int64],
+            vec![DataType::Int64],
+            Box::new(sink.clone()),
+        );
+
+        join.push(probe).expect("probe");
+        join.flush().expect("flush");
+
+        let chunks = sink.0.lock().expect("collect lock");
+        assert_eq!(chunks.len(), 1);
+        assert!(Arc::ptr_eq(chunks[0].column(0), &probe_values));
+        assert_eq!(selected_cells(&chunks[0], 0), vec![Some(20)]);
+        assert_eq!(chunks[0].selection.get_index(0), 1);
+    }
+
+    #[test]
+    fn semi_join_emits_no_chunk_when_no_probe_key_matches() {
+        let sink = Collect::default();
+        let mut join = HashJoin::new(
+            Arc::new(build(&[20])),
+            JoinType::Semi,
+            vec![OutputColumn::Probe(0)],
+            vec![DataType::Int64],
+            vec![DataType::Int64],
+            Box::new(sink.clone()),
+        );
+
+        join.push(DataChunk::from_vectors(vec![ints(&[10, 30])]))
+            .expect("probe");
+        join.flush().expect("flush");
+
+        assert!(sink.0.lock().expect("collect lock").is_empty());
+    }
+
+    #[test]
+    fn anti_join_keeps_nonmatching_and_null_probe_keys() {
+        let sink = Collect::default();
+        let mut join = HashJoin::new(
+            Arc::new(build(&[20, 20])),
+            JoinType::Anti,
+            vec![OutputColumn::Probe(0)],
+            vec![DataType::Int64],
+            vec![DataType::Int64],
+            Box::new(sink.clone()),
+        );
+
+        join.push(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(vec![
+            Some(20), Some(10), None,
+        ]))]))
+            .expect("probe");
+        join.flush().expect("flush");
+
+        let chunks = sink.0.lock().expect("collect lock");
+        let rows: Vec<Option<i64>> = chunks.iter().flat_map(|chunk| selected_cells(chunk, 0)).collect();
+        assert_eq!(rows, vec![Some(10), None]);
+        assert!(chunks.iter().all(|chunk| chunk.num_columns() == 1));
     }
 
     /// A right join owes its unmatched build rows, and emits them at flush with

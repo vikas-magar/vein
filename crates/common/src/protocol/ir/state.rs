@@ -40,6 +40,8 @@ pub enum JoinKind {
     Semi,
     /// Left anti join.
     Anti,
+    /// Cartesian product: every probe row paired with every build row.
+    Cross,
 }
 
 /// Aggregate accumulation opcodes.

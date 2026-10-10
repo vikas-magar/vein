@@ -179,6 +179,52 @@ impl VectorVmExecutor {
                     )?;
                     store_result(&mut self.registers, *dst, res)?;
                 }
+                MicroOp::InList {
+                    dst,
+                    value,
+                    candidates,
+                    negated,
+                } => {
+                    let value = self.registers.get(*value)?.clone();
+                    let candidates = candidates
+                        .iter()
+                        .map(|register| self.registers.get(*register).cloned())
+                        .collect::<Result<Vec<_>>>()?;
+                    let res = ops::eval_in_list(
+                        &value,
+                        &candidates,
+                        self.registers.chunk_len(),
+                        *negated,
+                    )?;
+                    store_result(&mut self.registers, *dst, res)?;
+                }
+                MicroOp::Case {
+                    dst,
+                    when_regs,
+                    then_regs,
+                    else_reg,
+                    return_type,
+                } => {
+                    let conditions = when_regs
+                        .iter()
+                        .map(|register| self.registers.get(*register).cloned())
+                        .collect::<Result<Vec<_>>>()?;
+                    let results = then_regs
+                        .iter()
+                        .map(|register| self.registers.get(*register).cloned())
+                        .collect::<Result<Vec<_>>>()?;
+                    let otherwise = else_reg
+                        .map(|register| self.registers.get(register).cloned())
+                        .transpose()?;
+                    let res = ops::eval_case(
+                        &conditions,
+                        &results,
+                        otherwise.as_ref(),
+                        &return_type.to_arrow(),
+                        self.registers.chunk_len(),
+                    )?;
+                    store_result(&mut self.registers, *dst, res)?;
+                }
                 MicroOp::CmpGt { dst, src1, src2 } => {
                     let res =
                         ops::eval_cmp_gt(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
@@ -533,5 +579,66 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![true, false, true]
         );
+    }
+
+    #[test]
+    fn vector_vm_executes_in_list_and_case_in_projected_expression() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(2), None, Some(4)]));
+        let chunk = DataChunk::from_vectors(vec![values]);
+        let program = MicroProgram {
+            register_count: 8,
+            instructions: vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Int64(2),
+                },
+                MicroOp::LoadConstant {
+                    dst: 2,
+                    value: LogicalLiteral::Null(VeinDataType::Int64),
+                },
+                MicroOp::InList {
+                    dst: 3,
+                    value: 0,
+                    candidates: vec![1, 2],
+                    negated: false,
+                },
+                MicroOp::LoadConstant {
+                    dst: 4,
+                    value: LogicalLiteral::String("matched".into()),
+                },
+                MicroOp::LoadConstant {
+                    dst: 5,
+                    value: LogicalLiteral::String("other".into()),
+                },
+                MicroOp::Case {
+                    dst: 6,
+                    when_regs: vec![3],
+                    then_regs: vec![4],
+                    else_reg: Some(5),
+                    return_type: VeinDataType::Utf8,
+                },
+                MicroOp::ProjectRegisters { out_regs: vec![3, 6] },
+            ],
+        };
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let sink = Box::new(CollectNode { chunks: collected.clone() });
+        let mut vm = VectorVmExecutor::new(
+            Arc::new(program),
+            Arc::new(FunctionRegistry::new()),
+            sink,
+        );
+
+        vm.push(chunk).expect("conditional instructions should execute");
+        vm.flush().expect("conditional results should flush");
+
+        let chunks = collected.lock().unwrap();
+        let membership = chunks[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert_eq!(membership, &arrow::array::BooleanArray::from(vec![None, Some(true), None, None]));
+        let labels = chunks[0].column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(labels, &StringArray::from(vec![Some("other"), Some("matched"), Some("other"), Some("other")]));
     }
 }

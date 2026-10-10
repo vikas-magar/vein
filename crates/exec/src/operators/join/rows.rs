@@ -8,8 +8,9 @@
 
 /// The join flavours a hash join implements.
 ///
-/// A cross join is deliberately absent: it has no key, so it is a different
-/// operator (every probe row against every build row), not a case of this one.
+/// CROSS has no key and emits every probe/build pair. It shares row assembly
+/// with the keyed join operator, while the planner/runtime preserve its
+/// distinct semantics and enforce that it carries no hash keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
     /// Only matched rows.
@@ -20,6 +21,12 @@ pub enum JoinType {
     Right,
     /// Both of the above.
     Full,
+    /// Each matching probe row once, without build-side columns.
+    Semi,
+    /// Each unmatched probe row once, without build-side columns.
+    Anti,
+    /// Every probe row paired with every build row.
+    Cross,
 }
 
 /// One output row, as references into the probe chunk and the retained build
@@ -50,7 +57,19 @@ pub fn output_rows(
 ) -> Vec<OutputRow> {
     let mut rows = Vec::new();
 
-    // Every join flavour emits its matches.
+    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+        rows.extend(
+            existence_probe_rows(join_type, probe_rows, matches)
+                .into_iter()
+                .map(|probe| OutputRow {
+                    probe: Some(probe),
+                    build: None,
+                }),
+        );
+        return rows;
+    }
+
+    // Inner and outer join flavours emit each accepted match pair.
     rows.extend(matches.iter().map(|(probe, build)| OutputRow {
         probe: Some(*probe),
         build: Some(*build),
@@ -78,6 +97,26 @@ pub fn output_rows(
     }
 
     rows
+}
+
+/// Returns selected physical probe rows for a semi/anti join. Match pairs may
+/// contain multiple build rows for the same probe row; existence only records
+/// whether at least one accepted pair survived residual filtering.
+pub fn existence_probe_rows(
+    join_type: JoinType,
+    probe_rows: &[u32],
+    matches: &[(u32, (u32, u32))],
+) -> Vec<u32> {
+    debug_assert!(matches!(join_type, JoinType::Semi | JoinType::Anti));
+    let matched: std::collections::HashSet<u32> =
+        matches.iter().map(|(probe, _)| *probe).collect();
+    probe_rows
+        .iter()
+        .filter_map(|probe| {
+            let has_match = matched.contains(probe);
+            (has_match == (join_type == JoinType::Semi)).then_some(*probe)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -156,6 +195,75 @@ mod tests {
                 OutputRow { probe: Some(0), build: None },
                 OutputRow { probe: Some(1), build: None },
             ]
+        );
+    }
+
+    #[test]
+    fn semi_emits_each_matched_probe_once_even_for_duplicate_inner_matches() {
+        let rows = output_rows(
+            JoinType::Semi,
+            &[0, 1, 2],
+            &[(0, (0, 4)), (0, (0, 5)), (2, (1, 6))],
+            &[],
+        );
+        assert_eq!(
+            rows,
+            vec![
+                OutputRow { probe: Some(0), build: None },
+                OutputRow { probe: Some(2), build: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn anti_emits_unmatched_and_null_keyed_probe_rows_once() {
+        // A NULL key creates no hash match, so it remains eligible for NOT EXISTS.
+        let rows = output_rows(JoinType::Anti, &[0, 1, 2], &[(0, (0, 4)), (0, (0, 5))], &[]);
+        assert_eq!(
+            rows,
+            vec![
+                OutputRow { probe: Some(1), build: None },
+                OutputRow { probe: Some(2), build: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn semi_and_anti_preserve_probe_order_and_ignore_matches_outside_the_input_selection() {
+        let probes = [7, 2, 9];
+        let matches = [(2, (0, 0)), (2, (0, 1)), (8, (0, 2))];
+
+        assert_eq!(
+            existence_probe_rows(JoinType::Semi, &probes, &matches),
+            vec![2]
+        );
+        assert_eq!(
+            existence_probe_rows(JoinType::Anti, &probes, &matches),
+            vec![7, 9]
+        );
+        assert_eq!(existence_probe_rows(JoinType::Semi, &probes, &[]), Vec::<u32>::new());
+        assert_eq!(existence_probe_rows(JoinType::Anti, &probes, &[]), probes);
+    }
+
+    #[test]
+    fn cross_join_emits_every_pair_and_no_unmatched_rows() {
+        let matches = [
+            (0, (0, 0)),
+            (0, (0, 1)),
+            (1, (0, 0)),
+            (1, (0, 1)),
+        ];
+        let rows = output_rows(JoinType::Cross, &[0, 1], &matches, &[(0, 2)]);
+
+        assert_eq!(
+            rows,
+            vec![
+                OutputRow { probe: Some(0), build: Some((0, 0)) },
+                OutputRow { probe: Some(0), build: Some((0, 1)) },
+                OutputRow { probe: Some(1), build: Some((0, 0)) },
+                OutputRow { probe: Some(1), build: Some((0, 1)) },
+            ],
+            "CROSS JOIN emits the product and does not append unmatched outer rows"
         );
     }
 }

@@ -88,7 +88,15 @@ impl DefaultPipelineStageBuilder {
         let mut probe_keys = Vec::new();
         let mut build_keys = Vec::new();
         let residual;
-        if using.is_empty() {
+        if *join_type == JoinType::Cross {
+            if on.is_some() || !using.is_empty() {
+                return Err(VeinError::planning(
+                    "CROSS JOIN cannot contain an ON or USING condition",
+                    None,
+                ));
+            }
+            residual = None;
+        } else if using.is_empty() {
             let mut conjuncts = Vec::new();
             if let Some(on) = on {
                 flatten_conjunction(on, &mut conjuncts);
@@ -143,7 +151,7 @@ impl DefaultPipelineStageBuilder {
             );
         }
         let join = JoinPlan {
-            join_type: join_kind(join_type)?,
+            join_type: join_kind(join_type),
             probe_keys,
             build_keys,
             residual,
@@ -168,6 +176,20 @@ impl DefaultPipelineStageBuilder {
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Distinct { input, .. } => Self::contains_join(input),
+            _ => false,
+        }
+    }
+
+    /// Whether this subtree contains a node whose output is produced by a
+    /// recursive pipeline boundary rather than the ordinary scan VM.
+    fn contains_recursive_boundary(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join { .. } | LogicalPlan::Aggregate { .. } | LogicalPlan::Distinct { .. } => true,
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::SubqueryAlias { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => Self::contains_recursive_boundary(input),
             _ => false,
         }
     }
@@ -220,7 +242,7 @@ impl DefaultPipelineStageBuilder {
             // Keep ordering and row-window boundaries in the recursive tree:
             // moving them to task-level metadata can change their order relative
             // to joins and blocking operators such as aggregates.
-            LogicalPlan::Sort { input, .. } if Self::contains_join(input) => {
+            LogicalPlan::Sort { input, .. } if Self::contains_recursive_boundary(input) => {
                 let (child, child_schema) = self.compile_join_input_or_leaf(input)?;
                 let (sort_plan, key_program) = PipelineCompiler::recursive_sort(plan)?.ok_or_else(|| {
                     VeinError::planning("recursive sort did not produce a sort plan", None)
@@ -238,7 +260,9 @@ impl DefaultPipelineStageBuilder {
                     child_schema,
                 ))
             }
-            LogicalPlan::Limit { input, offset, count, .. } if Self::contains_join(input) => {
+            LogicalPlan::Limit { input, offset, count, .. }
+                if Self::contains_recursive_boundary(input) =>
+            {
                 let (child, schema) = self.compile_join_input_or_leaf(input)?;
                 Ok((
                     PhysicalInputPlan::Limit {
@@ -251,7 +275,7 @@ impl DefaultPipelineStageBuilder {
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::SubqueryAlias { input, .. }
-            if Self::contains_join(input) =>
+            if Self::contains_recursive_boundary(input) =>
                 {
                     let (child, child_schema) = self.compile_join_input_or_leaf(input)?;
                     let (program, output_schema) =
@@ -339,21 +363,17 @@ fn extract_equi_join_keys(
     Ok(((probe_keys, build_keys), residual))
 }
 
-/// The protocol's join flavour, refusing the ones this engine cannot run rather
-/// than mapping them onto the nearest outer join.
-fn join_kind(join_type: &JoinType) -> Result<JoinKind> {
-    Ok(match join_type {
+/// Maps each parser join flavor to its physical-plan counterpart.
+fn join_kind(join_type: &JoinType) -> JoinKind {
+    match join_type {
         JoinType::Inner => JoinKind::Inner,
         JoinType::Left => JoinKind::Left,
         JoinType::Right => JoinKind::Right,
         JoinType::Full => JoinKind::Full,
-        other => {
-            return Err(VeinError::planning(
-                format!("the local engine does not plan {other:?} joins yet"),
-                None,
-            ));
-        }
-    })
+        JoinType::Semi => JoinKind::Semi,
+        JoinType::Anti => JoinKind::Anti,
+        JoinType::Cross => JoinKind::Cross,
+    }
 }
 
 /// The two key columns of an equality `ON`.

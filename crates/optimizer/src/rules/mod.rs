@@ -27,6 +27,9 @@ pub mod scan_statistics_pruning;
 /// Decorrelation of supported correlated scalar aggregates into grouped joins.
 pub mod scalar_aggregate_decorrelation;
 
+/// Decorrelation of correlated EXISTS predicates into semi/anti joins.
+pub mod exists_decorrelation;
+
 /// Equality-based predicate propagation across inner joins.
 pub mod join_transitivity;
 
@@ -39,3 +42,4 @@ pub use predicate_pushdown::PredicatePushdownRule;
 pub use scan_filter_pushdown::ScanFilterPushdownRule;
 pub use scan_statistics_pruning::ScanStatisticsPruningRule;
 pub use scalar_aggregate_decorrelation::ScalarAggregateDecorrelationRule;
+pub use exists_decorrelation::ExistsDecorrelationRule;
