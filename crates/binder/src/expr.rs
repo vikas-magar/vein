@@ -197,13 +197,25 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 let low = Box::pin(self.bind(low)).await?;
                 let high = Box::pin(self.bind(high)).await?;
 
-                let (ge_low, _, _) = coerce_types(bound.clone(), low)?;
-                let (le_high, _, _) = coerce_types(bound, high)?;
+                let (ge_left, ge_right, _) = coerce_types(bound.clone(), low)?;
+                let (le_left, le_right, _) = coerce_types(bound, high)?;
 
-                let mut result = LogicalExpr::BinaryOp {
-                    left: Box::new(ge_low),
+                let lower_bound = LogicalExpr::BinaryOp {
+                    left: Box::new(ge_left),
                     op: AstBinaryOp::Geq,
-                    right: Box::new(le_high),
+                    right: Box::new(ge_right),
+                    return_type: VeinDataType::Boolean,
+                };
+                let upper_bound = LogicalExpr::BinaryOp {
+                    left: Box::new(le_left),
+                    op: AstBinaryOp::Leq,
+                    right: Box::new(le_right),
+                    return_type: VeinDataType::Boolean,
+                };
+                let mut result = LogicalExpr::BinaryOp {
+                    left: Box::new(lower_bound),
+                    op: AstBinaryOp::And,
+                    right: Box::new(upper_bound),
                     return_type: VeinDataType::Boolean,
                 };
                 if *negated {

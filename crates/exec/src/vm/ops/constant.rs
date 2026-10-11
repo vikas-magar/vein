@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int64Array,
-    IntervalMonthDayNanoArray, ListArray, NullArray, StringArray, Time64MicrosecondArray,
+    IntervalMonthDayNanoArray, ListArray, new_null_array, StringArray, Time64MicrosecondArray,
     TimestampMicrosecondArray,
 };
 use arrow::array::types::IntervalMonthDayNano;
@@ -32,7 +32,7 @@ pub fn literal_to_scalar(literal: &LogicalLiteral) -> Result<ArrayRef> {
 /// input to a UDF or a projected output column.
 pub fn literal_to_array(literal: &LogicalLiteral, row_count: usize) -> Result<ArrayRef> {
     let array: ArrayRef = match literal {
-        LogicalLiteral::Null(_) => Arc::new(NullArray::new(row_count)),
+        LogicalLiteral::Null(data_type) => new_null_array(&data_type.to_arrow(), row_count),
         LogicalLiteral::Boolean(v) => Arc::new(BooleanArray::from(vec![*v; row_count])),
         LogicalLiteral::Int64(v) => Arc::new(Int64Array::from(vec![*v; row_count])),
         LogicalLiteral::Float64(v) => Arc::new(Float64Array::from(vec![*v; row_count])),
@@ -112,6 +112,33 @@ mod tests {
         assert_eq!(array.value(0), 1234);
         assert_eq!(array.precision(), 15);
         assert_eq!(array.scale(), 2);
+    }
+
+    #[test]
+    fn typed_null_literal_preserves_its_arrow_type_and_nulls() {
+        let boolean = literal_to_array(&LogicalLiteral::Null(types::VeinDataType::Boolean), 3)
+            .expect("typed Boolean NULL should materialize");
+        let values = boolean
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("Boolean NULL should use a BooleanArray");
+        assert_eq!(values, &BooleanArray::from(vec![None, None, None]));
+
+        let decimal = literal_to_array(
+            &LogicalLiteral::Null(types::VeinDataType::Decimal128(15, 2)),
+            2,
+        )
+            .expect("typed decimal NULL should materialize");
+        assert_eq!(
+            decimal.data_type(),
+            &DataType::Decimal128(15, 2),
+            "typed NULL must retain its logical decimal precision and scale"
+        );
+        assert_eq!(decimal.null_count(), 2);
+
+        let untyped = literal_to_array(&LogicalLiteral::Null(types::VeinDataType::Null), 1)
+            .expect("untyped NULL should materialize");
+        assert_eq!(untyped.data_type(), &DataType::Null);
     }
 
     #[test]

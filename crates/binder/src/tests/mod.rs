@@ -723,6 +723,97 @@ mod extended_features {
         }
     }
 
+    fn between_bounds(
+        expr: &LogicalExpr,
+    ) -> (&LogicalExpr, &LogicalExpr, &LogicalExpr, &LogicalExpr) {
+        let LogicalExpr::BinaryOp {
+            left,
+            op: parser::ast::expr::BinaryOp::And,
+            right,
+            ..
+        } = expr
+        else {
+            panic!("BETWEEN should lower to an AND of its inclusive bounds: {expr:?}");
+        };
+        let LogicalExpr::BinaryOp {
+            left: lower_value,
+            op: parser::ast::expr::BinaryOp::Geq,
+            right: lower,
+            ..
+        } = left.as_ref()
+        else {
+            panic!("BETWEEN lower bound should use >=: {left:?}");
+        };
+        let LogicalExpr::BinaryOp {
+            left: upper_value,
+            op: parser::ast::expr::BinaryOp::Leq,
+            right: upper,
+            ..
+        } = right.as_ref()
+        else {
+            panic!("BETWEEN upper bound should use <=: {right:?}");
+        };
+        (lower_value, lower, upper_value, upper)
+    }
+
+    #[tokio::test]
+    async fn between_binds_both_inclusive_bounds_and_not_between_negates_them() {
+        for (query, negated) in [
+            ("FROM users |> SELECT age BETWEEN 18 AND 30", false),
+            ("FROM users |> SELECT age NOT BETWEEN 18 AND 30", true),
+        ] {
+            let plan = bind(query).await;
+            let expr = expr_of(&plan);
+            let range = match (negated, expr) {
+                (false, expr) => expr,
+                (true, LogicalExpr::Not { expr }) => expr.as_ref(),
+                (true, other) => panic!("NOT BETWEEN should negate the range: {other:?}"),
+            };
+            let (lower_value, lower, upper_value, upper) = between_bounds(range);
+
+            assert_eq!(lower_value, upper_value, "both bounds must compare the input value");
+            assert!(matches!(lower_value, LogicalExpr::Column(column) if column.name == "age"));
+            assert!(matches!(lower, LogicalExpr::Literal(LogicalLiteral::Int64(18))));
+            assert!(matches!(upper, LogicalExpr::Literal(LogicalLiteral::Int64(30))));
+        }
+    }
+
+    #[tokio::test]
+    async fn between_preserves_null_input_for_three_valued_logic() {
+        let plan = bind("FROM users |> SELECT NULL BETWEEN 1 AND 2").await;
+        let expr = expr_of(&plan);
+        let (lower_value, _, upper_value, _) = between_bounds(expr);
+
+        assert!(matches!(lower_value, LogicalExpr::Literal(LogicalLiteral::Null(_))));
+        assert!(matches!(upper_value, LogicalExpr::Literal(LogicalLiteral::Null(_))));
+        assert!(expr.nullable(), "a NULL input must remain nullable through BETWEEN");
+    }
+
+    #[tokio::test]
+    async fn between_coerces_each_decimal_bound_to_the_input_type() {
+        let plan = bind("FROM decimal_values |> SELECT amount BETWEEN 0.05 AND 0.07").await;
+        let (lower_value, lower, upper_value, upper) = between_bounds(expr_of(&plan));
+        let decimal_type = plan::VeinDataType::Decimal128(15, 2);
+
+        assert!(matches!(lower_value, LogicalExpr::Column(column) if column.name == "amount"));
+        assert_eq!(lower_value.data_type(), decimal_type);
+        assert_eq!(upper_value.data_type(), decimal_type);
+        assert_eq!(lower.data_type(), decimal_type);
+        assert_eq!(upper.data_type(), decimal_type);
+        assert!(matches!(
+            lower,
+            LogicalExpr::Cast { expr, target_type }
+                if *target_type == decimal_type
+                    && matches!(expr.as_ref(), LogicalExpr::Literal(LogicalLiteral::Decimal(5, 2, 2)))
+        ));
+        assert!(matches!(
+            upper,
+            LogicalExpr::Cast { expr, target_type }
+                if *target_type == decimal_type
+                    && matches!(expr.as_ref(), LogicalExpr::Literal(LogicalLiteral::Decimal(7, 2, 2)))
+        ));
+    }
+
     #[tokio::test]
     async fn decimal_literal_binds_exactly_and_compares_with_decimal_column() {
         let projection = bind("FROM decimal_values |> SELECT 0.05 AS threshold").await;

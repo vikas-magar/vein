@@ -630,7 +630,7 @@ impl Transform<DataChunkView> for VectorVmExecutor<DataChunkView> {}
 mod tests {
     use super::*;
     use crate::pipeline::{DataChunkView, RowMapping, ViewColumn};
-    use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
     use types::LogicalLiteral;
     use std::sync::Mutex;
     use types::VeinDataType;
@@ -996,6 +996,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![true, false, true]
         );
+    }
+
+    #[test]
+    fn vector_vm_projects_typed_null_boolean_without_losing_its_type() {
+        let input: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let chunk = DataChunk::from_vectors(vec![input]);
+        let program = MicroProgram {
+            register_count: 2,
+            instructions: vec![
+                MicroOp::LoadConstant {
+                    dst: 1,
+                    value: LogicalLiteral::Null(VeinDataType::Boolean),
+                },
+                MicroOp::ProjectRegisters { out_regs: vec![1] },
+            ],
+        };
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = VectorVmExecutor::new(
+            Arc::new(program),
+            Arc::new(FunctionRegistry::new()),
+            Box::new(CollectNode {
+                chunks: Arc::clone(&collected),
+            }),
+        );
+
+        vm.push(chunk)
+            .expect("projecting a typed NULL boolean should preserve its schema type");
+        vm.flush().expect("typed NULL boolean output should flush");
+
+        let chunks = collected.lock().unwrap();
+        assert_eq!(chunks.len(), 1);
+        let result = chunks[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("projected typed NULL should be boolean");
+        assert_eq!(result, &BooleanArray::from(vec![None, None, None]));
     }
 
     #[test]
