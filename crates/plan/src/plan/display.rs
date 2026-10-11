@@ -464,6 +464,7 @@ fn format_literal(lit: &crate::LogicalLiteral) -> String {
         crate::LogicalLiteral::Null(_) => "NULL".to_string(),
         crate::LogicalLiteral::Boolean(b) => b.to_string(),
         crate::LogicalLiteral::Int64(v) => v.to_string(),
+        crate::LogicalLiteral::UInt64(v) => v.to_string(),
         crate::LogicalLiteral::Float64(v) => v.to_string(),
         crate::LogicalLiteral::String(s) => format!("\"{}\"", s.escape_default()),
         crate::LogicalLiteral::Date(d) => format!("DATE {d}"),

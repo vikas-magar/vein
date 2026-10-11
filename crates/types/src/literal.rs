@@ -1,5 +1,6 @@
 //! Literal values of the engine's data types.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 use arrow::datatypes::TimeUnit;
 
@@ -21,6 +22,8 @@ pub enum LogicalLiteral {
     Boolean(bool),
     /// A 64-bit integer literal
     Int64(i64),
+    /// A 64-bit unsigned integer literal, retained exactly for statistics.
+    UInt64(u64),
     /// A 64-bit float literal
     Float64(f64),
     /// A string literal
@@ -52,12 +55,42 @@ pub enum LogicalLiteral {
     Vector(Vec<f32>),
 }
 
+impl LogicalLiteral {
+    /// Compares compatible scalar literals without lossy numeric coercion.
+    ///
+    /// This is intended for metadata and optimizer reasoning. Incompatible
+    /// literal kinds, non-finite floats, and decimal rescaling overflow return
+    /// `None`; callers must treat an unknown comparison conservatively.
+    pub fn try_cmp(&self, other: &Self) -> Option<Ordering> {
+        use LogicalLiteral::*;
+        match (self, other) {
+            (Boolean(left), Boolean(right)) => Some(left.cmp(right)),
+            (Int64(left), Int64(right)) => Some(left.cmp(right)),
+            (UInt64(left), UInt64(right)) => Some(left.cmp(right)),
+            (Float64(left), Float64(right)) => left.partial_cmp(right),
+            (String(left), String(right)) => Some(left.cmp(right)),
+            (Date(left), Date(right)) => Some(left.cmp(right)),
+            (Time(left), Time(right)) | (Timestamp(left), Timestamp(right)) => {
+                Some(left.cmp(right))
+            }
+            (Decimal(left, _, left_scale), Decimal(right, _, right_scale)) => {
+                let scale = (*left_scale).max(*right_scale);
+                let left_factor = 10_i128.checked_pow((scale as i16 - *left_scale as i16) as u32)?;
+                let right_factor = 10_i128.checked_pow((scale as i16 - *right_scale as i16) as u32)?;
+                Some(left.checked_mul(left_factor)?.cmp(&right.checked_mul(right_factor)?))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Returns the logical data type represented by a literal value.
 pub fn literal_type(literal: &LogicalLiteral) -> VeinDataType {
     match literal {
         LogicalLiteral::Null(data_type) => data_type.clone(),
         LogicalLiteral::Boolean(_) => VeinDataType::Boolean,
         LogicalLiteral::Int64(_) => VeinDataType::Int64,
+        LogicalLiteral::UInt64(_) => VeinDataType::UInt64,
         LogicalLiteral::Float64(_) => VeinDataType::Float64,
         LogicalLiteral::String(_) => VeinDataType::Utf8,
         LogicalLiteral::Date(_) => VeinDataType::Date32,
@@ -137,6 +170,19 @@ mod tests {
             literal_type(&LogicalLiteral::Decimal(123, 76, 20)),
             VeinDataType::Decimal128(76, 20)
         );
+    }
+
+    #[test]
+    fn compatible_literals_compare_without_lossy_decimal_or_float_handling() {
+        assert_eq!(LogicalLiteral::Decimal(125, 5, 2).try_cmp(&LogicalLiteral::Decimal(1250, 6, 3)), Some(Ordering::Equal));
+        assert_eq!(LogicalLiteral::Int64(4).try_cmp(&LogicalLiteral::Int64(5)), Some(Ordering::Less));
+        assert_eq!(
+            LogicalLiteral::UInt64(u64::MAX).try_cmp(&LogicalLiteral::UInt64(u64::MAX - 1)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(LogicalLiteral::Float64(f64::NAN).try_cmp(&LogicalLiteral::Float64(1.0)), None);
+        assert_eq!(LogicalLiteral::Date(1).try_cmp(&LogicalLiteral::Int64(1)), None);
+        assert_eq!(literal_type(&LogicalLiteral::UInt64(u64::MAX)), VeinDataType::UInt64);
     }
 
     #[test]

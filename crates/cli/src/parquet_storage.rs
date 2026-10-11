@@ -9,16 +9,21 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use common::{Result, VeinError};
 use common::protocol::StorageTarget;
+use common::statistics::{schema_fingerprint, StatisticsCollector, StatisticsConfig};
+use catalog::{AnalyzedTableStatistics, StatisticsSourceIdentity};
 use exec::operators::sink::{WriteReceipt, WriteStorage, WriteTransaction};
 use parquet::arrow::ArrowWriter;
+use plan::VeinSchema;
 use serde::{Deserialize, Serialize};
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TableManifest {
     pub revision: u64,
     pub files: Vec<String>,
+    #[serde(default)]
+    pub statistics: Option<AnalyzedTableStatistics>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +49,30 @@ impl ParquetStorage {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(VeinError::io(format!("read table manifest '{}'", path.display()), error)),
         }
+    }
+
+    fn source_identity(&self, relative_path: &str) -> Result<StatisticsSourceIdentity> {
+        let path = resolve_manifest_file(&self.root, relative_path)?;
+        let metadata = fs::metadata(&path)
+            .map_err(|error| VeinError::io(format!("read source identity for '{}'", path.display()), error))?;
+        let modified_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        Ok(StatisticsSourceIdentity {
+            identifier: relative_path.to_owned(),
+            version: format!("{}:{modified_nanos}", metadata.len()),
+        })
+    }
+
+    pub(crate) fn source_identities(&self, files: &[String]) -> Result<Vec<StatisticsSourceIdentity>> {
+        let mut identities = files
+            .iter()
+            .map(|file| self.source_identity(file))
+            .collect::<Result<Vec<_>>>()?;
+        identities.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+        Ok(identities)
     }
 }
 
@@ -72,6 +101,31 @@ impl WriteStorage for ParquetStorage {
             return Err(VeinError::planning(format!("target '{}' already exists outside Vein's managed catalog", self.root.join(&table).display()), None));
         }
         let schema = decode_schema(&target.schema_ipc)?;
+        let logical_schema = VeinSchema::try_from(schema.as_ref())?;
+        let fingerprint = schema_fingerprint(&logical_schema);
+        let statistics = if mode == "append" {
+            let prior = base_manifest.as_ref().and_then(|manifest| {
+                let analyzed = manifest.statistics.as_ref()?;
+                let identities = self.source_identities(&manifest.files).ok()?;
+                (analyzed.source_revision == manifest.revision
+                    && analyzed.schema_fingerprint == fingerprint
+                    && analyzed.source_identities == identities)
+                    .then_some(analyzed)
+            });
+            prior.and_then(|analyzed| {
+                StatisticsCollector::restore(
+                    Arc::clone(&schema),
+                    StatisticsConfig::default(),
+                    &analyzed.statistics,
+                )
+                    .ok()
+            })
+        } else {
+            Some(StatisticsCollector::new(
+                Arc::clone(&schema),
+                StatisticsConfig::default(),
+            )?)
+        };
 
         let epoch_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -91,6 +145,8 @@ impl WriteStorage for ParquetStorage {
             writer: None,
             rows: 0,
             schema,
+            schema_fingerprint: fingerprint,
+            statistics,
         }))
     }
 }
@@ -105,6 +161,8 @@ struct ParquetWriteTransaction {
     writer: Option<ArrowWriter<BufWriter<File>>>,
     schema: SchemaRef,
     rows: u64,
+    schema_fingerprint: String,
+    statistics: Option<StatisticsCollector>,
 }
 
 impl WriteTransaction for ParquetWriteTransaction {
@@ -114,6 +172,9 @@ impl WriteTransaction for ParquetWriteTransaction {
         }
         let rows = self.rows.checked_add(batch.num_rows() as u64)
             .ok_or_else(|| VeinError::internal("WRITE row count overflow"))?;
+        if let Some(statistics) = &mut self.statistics {
+            statistics.update(batch)?;
+        }
         if self.writer.is_none() {
             let path = self.staging_dir.join("part.parquet");
             let file = OpenOptions::new().write(true).create_new(true).open(&path)
@@ -183,7 +244,50 @@ impl WriteTransaction for ParquetWriteTransaction {
                 .ok_or_else(|| VeinError::internal("table catalog revision overflow"))?,
             None => 1,
         };
-        let manifest = TableManifest { revision, files };
+        let mut source_identities = if self.statistics.is_some() && self.mode == "append" {
+            self.base_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.statistics.as_ref())
+                .map(|statistics| statistics.source_identities.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let analyzed_statistics = if let Some(statistics) = self.statistics.take() {
+            source_identities.push(self.storage.source_identity(&relative_file.to_string_lossy())?);
+            source_identities.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+            let statistics = statistics.finish();
+            tracing::debug!(
+                target: "vein.audit",
+                event = "statistics_analysis_completed",
+                table = %self.table,
+                revision,
+                row_count = statistics.num_rows.unwrap_or_default(),
+                column_count = statistics.column_statistics.len(),
+                distinct_columns = statistics.column_statistics.values()
+                    .filter(|column| column.distinct_count.is_some()).count(),
+                bounded_columns = statistics.column_statistics.values()
+                    .filter(|column| column.min_max_complete == Some(true)).count(),
+                numeric_columns = statistics.column_statistics.values()
+                    .filter(|column| column.numeric.is_some()).count(),
+                variable_length_columns = statistics.column_statistics.values()
+                    .filter(|column| column.byte_length.is_some()).count(),
+                "statistics_analysis_completed"
+            );
+            Some(AnalyzedTableStatistics {
+                source_revision: revision,
+                schema_fingerprint: self.schema_fingerprint.clone(),
+                source_identities,
+                statistics,
+            })
+        } else {
+            None
+        };
+        let manifest = TableManifest {
+            revision,
+            files,
+            statistics: analyzed_statistics,
+        };
         if let Err(error) = publish_manifest(&self.storage.manifest_path(&self.table)?, &manifest, &self.generation) {
             if !matches!(&error, VeinError::CommitOutcomeUnknown { .. }) {
                 let _ = fs::remove_dir_all(&final_dir);
@@ -435,8 +539,18 @@ mod tests {
         let created = storage.read_manifest("events").expect("read committed catalog").expect("created manifest");
         assert_eq!(created.revision, 1);
         assert_eq!(created.files.len(), 1);
+        let created_statistics = created.statistics.as_ref().expect("create statistics");
+        assert_eq!(created_statistics.source_revision, created.revision);
+        assert_eq!(created_statistics.statistics.num_rows, Some(2));
+        assert_eq!(created_statistics.statistics.column_statistics["id"].distinct_count, Some(2));
+        assert_eq!(created_statistics.statistics.column_statistics["id"].min_value, Some(plan::LogicalLiteral::Int64(1)));
+        assert_eq!(created_statistics.statistics.column_statistics["id"].max_value, Some(plan::LogicalLiteral::Int64(2)));
+        assert_eq!(created_statistics.statistics.column_statistics["id"].numeric.as_ref().unwrap().mean, Some(1.5));
         let catalog = crate::parquet_catalog::ParquetCatalog::new(root.path());
-        assert_eq!(catalog.get_table("events").await.expect("read created table").files.len(), 1);
+        let created_table = catalog.get_table("events").await.expect("read created table");
+        assert_eq!(created_table.files.len(), 1);
+        assert_eq!(created_table.statistics.as_ref().unwrap().column_statistics["id"].distinct_count, Some(2));
+        assert_eq!(created_table.statistics.as_ref().unwrap().column_statistics["id"].numeric.as_ref().unwrap().m2, Some(0.5));
 
         assert!(storage.begin_write(&target(None)).is_err());
         let mut append = storage.begin_write(&target(Some("append"))).expect("begin append");
@@ -445,7 +559,18 @@ mod tests {
         let appended = storage.read_manifest("events").expect("read appended catalog").expect("appended manifest");
         assert_eq!(appended.revision, 2);
         assert_eq!(appended.files.len(), 2);
-        assert_eq!(catalog.get_table("events").await.expect("read appended table").files.len(), 2);
+        let appended_statistics = appended.statistics.as_ref().expect("append statistics");
+        assert_eq!(appended_statistics.source_revision, appended.revision);
+        assert_eq!(appended_statistics.statistics.num_rows, Some(3));
+        assert_eq!(appended_statistics.statistics.column_statistics["id"].distinct_count, Some(3));
+        assert_eq!(appended_statistics.statistics.column_statistics["id"].min_value, Some(plan::LogicalLiteral::Int64(1)));
+        assert_eq!(appended_statistics.statistics.column_statistics["id"].max_value, Some(plan::LogicalLiteral::Int64(3)));
+        assert_eq!(appended_statistics.statistics.column_statistics["id"].numeric.as_ref().unwrap().mean, Some(2.0));
+        assert_eq!(appended_statistics.statistics.column_statistics["id"].numeric.as_ref().unwrap().m2, Some(2.0));
+        let appended_table = catalog.get_table("events").await.expect("read appended table");
+        assert_eq!(appended_table.files.len(), 2);
+        assert_eq!(appended_table.statistics.as_ref().unwrap().column_statistics["id"].distinct_count, Some(3));
+        assert_eq!(appended_table.statistics.as_ref().unwrap().column_statistics["id"].min_value, Some(plan::LogicalLiteral::Int64(1)));
 
         let mut overwrite = storage.begin_write(&target(Some("overwrite"))).expect("begin overwrite");
         overwrite.write_batch(&batch(vec![9])).expect("write overwrite batch");
@@ -453,7 +578,45 @@ mod tests {
         let replaced = storage.read_manifest("events").expect("read overwritten catalog").expect("overwritten manifest");
         assert_eq!(replaced.revision, 3);
         assert_eq!(replaced.files.len(), 1);
-        assert_eq!(catalog.get_table("events").await.expect("read overwritten table").files.len(), 1);
+        let replaced_statistics = replaced.statistics.as_ref().expect("overwrite statistics");
+        assert_eq!(replaced_statistics.source_revision, replaced.revision);
+        assert_eq!(replaced_statistics.statistics.num_rows, Some(1));
+        assert_eq!(replaced_statistics.statistics.column_statistics["id"].distinct_count, Some(1));
+        assert_eq!(replaced_statistics.statistics.column_statistics["id"].min_value, Some(plan::LogicalLiteral::Int64(9)));
+        assert_eq!(replaced_statistics.statistics.column_statistics["id"].max_value, Some(plan::LogicalLiteral::Int64(9)));
+        assert_eq!(replaced_statistics.statistics.column_statistics["id"].numeric.as_ref().unwrap().mean, Some(9.0));
+        let replaced_table = catalog.get_table("events").await.expect("read overwritten table");
+        assert_eq!(replaced_table.files.len(), 1);
+        assert_eq!(replaced_table.statistics.as_ref().unwrap().column_statistics["id"].distinct_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn stale_source_identity_discards_whole_table_statistics_on_append() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let storage = ParquetStorage::new(root.path());
+        let mut create = storage.begin_write(&target(None)).expect("begin create");
+        create.write_batch(&batch(vec![1, 2])).expect("write create batch");
+        create.commit().expect("commit create");
+
+        let mut manifest = storage.read_manifest("events").expect("read manifest").expect("created table");
+        let analyzed = manifest.statistics.as_mut().expect("analyzed statistics");
+        analyzed.source_identities[0].version.push_str("-stale");
+        fs::write(storage.manifest_path("events").expect("manifest path"), serde_json::to_vec(&manifest).unwrap())
+            .expect("persist stale test identity");
+
+        let mut append = storage.begin_write(&target(Some("append"))).expect("begin append with stale stats");
+        append.write_batch(&batch(vec![3])).expect("write append batch");
+        append.commit().expect("commit append without stale stats");
+
+        let manifest = storage.read_manifest("events").expect("read appended manifest").expect("appended table");
+        assert!(manifest.statistics.is_none(), "incomplete analysis must not be published as table-wide statistics");
+        let table = crate::parquet_catalog::ParquetCatalog::new(root.path())
+            .get_table("events")
+            .await
+            .expect("read table with stale analysis");
+        let statistics = table.statistics.as_ref().expect("footer row count remains available");
+        assert_eq!(statistics.num_rows, Some(3));
+        assert_eq!(statistics.column_statistics["id"].distinct_count, None);
     }
 
     #[test]

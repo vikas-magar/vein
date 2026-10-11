@@ -18,22 +18,7 @@ pub(crate) fn reverse(op: BinaryOp) -> BinaryOp {
 /// Comparisons are exact for supported, compatible types. Decimal scale changes
 /// are checked; unsupported types or overflow leave estimates unknown.
 pub(crate) fn compare(a: &LogicalLiteral, b: &LogicalLiteral) -> Option<Ordering> {
-    use LogicalLiteral::*;
-    match (a, b) {
-        (Boolean(a), Boolean(b)) => Some(a.cmp(b)),
-        (Int64(a), Int64(b)) => Some(a.cmp(b)),
-        (Float64(a), Float64(b)) if a.is_finite() && b.is_finite() => a.partial_cmp(b),
-        (String(a), String(b)) => Some(a.cmp(b)),
-        (Date(a), Date(b)) => Some(a.cmp(b)),
-        (Time(a), Time(b)) | (Timestamp(a), Timestamp(b)) => Some(a.cmp(b)),
-        (Decimal(a, _, sa), Decimal(b, _, sb)) => {
-            let scale = (*sa).max(*sb);
-            let a = a.checked_mul(10_i128.checked_pow((scale as i16 - *sa as i16) as u32)?)?;
-            let b = b.checked_mul(10_i128.checked_pow((scale as i16 - *sb as i16) as u32)?)?;
-            Some(a.cmp(&b))
-        }
-        _ => None,
-    }
+    a.try_cmp(b)
 }
 
 /// Subtract before conversion so close large integers do not collapse to the

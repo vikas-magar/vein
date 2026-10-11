@@ -14,11 +14,13 @@ mod join;
 mod selectivity;
 
 pub use estimate::{Estimate, EstimateConfidence, EstimateSource};
+pub(crate) use join::inner_join;
 pub use selectivity::{ColumnStatisticsLookup, PredicateEstimate, SelectivityEstimator, StatisticsSelectivity};
 
 use plan::{LogicalPlan, PlanTraversal};
 use crate::context::StatisticsProvider;
-use columns::{ColumnEstimate, RelationEstimate};
+use columns::ColumnEstimate;
+pub(crate) use columns::RelationEstimate;
 
 impl ColumnStatisticsLookup for std::collections::HashMap<plan::ColumnId, ColumnEstimate<'_>> {
     fn distribution(&self, id: plan::ColumnId) -> Option<(Option<f64>, Option<f64>)> {
@@ -69,10 +71,28 @@ impl<'a, P: StatisticsProvider + ?Sized, S: SelectivityEstimator> StatisticsEsti
     pub fn with_selectivity(provider: &'a P, selectivity: S) -> Self {
         Self { provider, selectivity }
     }
-}
 
-impl<P: StatisticsProvider + ?Sized, S: SelectivityEstimator> CardinalityEstimator for StatisticsEstimator<'_, P, S> {
-    fn estimate_plan(&self, plan: &LogicalPlan) -> Vec<NodeEstimate> {
+    /// Estimates a borrowed subtree and returns its compact relation summary.
+    ///
+    /// This is the shared estimate path used by cost-based alternatives; it
+    /// reads only metadata and never constructs candidate logical plans.
+    pub(crate) fn estimate_relation<'b>(
+        &self,
+        plan: &'b LogicalPlan,
+    ) -> RelationEstimate<'b>
+    where
+        'a: 'b,
+    {
+        self.estimate_tree(plan).1
+    }
+
+    fn estimate_tree<'b>(
+        &self,
+        plan: &'b LogicalPlan,
+    ) -> (Vec<NodeEstimate>, RelationEstimate<'b>)
+    where
+        'a: 'b,
+    {
         let mut pending = vec![(plan, None)];
         let mut relations: Vec<RelationEstimate<'_>> = Vec::new();
         let mut estimates = Vec::new();
@@ -101,7 +121,14 @@ impl<P: StatisticsProvider + ?Sized, S: SelectivityEstimator> CardinalityEstimat
             });
             relations.push(result);
         }
-        estimates
+        let relation = relations.pop().unwrap_or_else(RelationEstimate::unknown);
+        (estimates, relation)
+    }
+}
+
+impl<P: StatisticsProvider + ?Sized, S: SelectivityEstimator> CardinalityEstimator for StatisticsEstimator<'_, P, S> {
+    fn estimate_plan(&self, plan: &LogicalPlan) -> Vec<NodeEstimate> {
+        self.estimate_tree(plan).0
     }
 }
 

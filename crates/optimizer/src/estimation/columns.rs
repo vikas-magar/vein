@@ -5,7 +5,7 @@ use plan::{ColumnId, ColumnStatistics, LogicalExpr, LogicalLiteral, VeinSchema};
 use parser::ast::expr::BinaryOp;
 use super::{Estimate, EstimateSource};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ColumnEstimate<'a> {
     pub distinct: Option<f64>,
     pub null_fraction: Option<f64>,
@@ -36,7 +36,7 @@ impl<'a> ColumnEstimate<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RelationEstimate<'a> {
     pub rows: Estimate,
     pub columns: HashMap<ColumnId, ColumnEstimate<'a>>,
@@ -57,6 +57,13 @@ impl<'a> RelationEstimate<'a> {
 
     pub fn retain_schema(&mut self, schema: &VeinSchema) {
         self.columns.retain(|id, _| schema.fields.iter().any(|c| c.id == *id));
+    }
+
+    /// Checks whether both summaries provide the same inputs to a later join estimate.
+    /// Selectivity is excluded because the join estimator uses row counts and
+    /// column distributions/bounds, then recomputes selectivity for each join.
+    pub fn has_same_join_summary(&self, other: &Self) -> bool {
+        self.rows == other.rows && self.columns == other.columns
     }
 
     /// Propagates predicate-implied distributions without reading any values.
@@ -101,5 +108,41 @@ impl<'a> RelationEstimate<'a> {
 
     pub fn unknown() -> Self {
         Self::new(Estimate::unknown(EstimateSource::UnsupportedOperator))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plan::ColumnId;
+
+    use super::*;
+    use crate::estimation::EstimateConfidence;
+
+    fn relation(distinct: f64) -> RelationEstimate<'static> {
+        let mut relation = RelationEstimate::new(Estimate::known(
+            50.0,
+            EstimateSource::Join,
+            EstimateConfidence::Model,
+        ));
+        relation.columns.insert(
+            ColumnId(1),
+            ColumnEstimate {
+                distinct: Some(distinct),
+                null_fraction: Some(0.0),
+                min: None,
+                max: None,
+            },
+        );
+        relation
+    }
+
+    #[test]
+    fn join_summary_comparison_includes_column_distributions() {
+        let first = relation(20.0);
+        let equivalent = relation(20.0);
+        let different_distribution = relation(10.0);
+
+        assert!(first.has_same_join_summary(&equivalent));
+        assert!(!first.has_same_join_summary(&different_distribution));
     }
 }

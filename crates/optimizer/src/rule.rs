@@ -3,14 +3,14 @@
 use error::Result;
 use plan::LogicalPlan;
 
-use crate::context::{OptimizerContext, OptimizerPhase};
+use crate::context::{JoinOrderDecision, OptimizerContext, OptimizerPhase};
 
 /// Defines the category of an optimizer rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleType {
     /// Heuristic rules (RBO) that always improve the plan, e.g. constant folding.
     Heuristic,
-    /// Rules that generate alternative plans for a future cost-based optimizer.
+    /// Rules that compare legal alternatives using estimates or a cost model.
     CostBased,
 }
 
@@ -22,8 +22,8 @@ pub enum RuleType {
 /// detected structurally, so rules must only return `Some` when the node
 /// actually differs from the input.
 ///
-/// Rules marked [`RuleType::CostBased`] are reserved for the future
-/// cost-based optimizer and are not executed by [`OptimizerPipeline`](crate::OptimizerPipeline).
+/// Cost-based rules run once after heuristic rules converge, so each search
+/// sees a normalized logical plan and cannot oscillate with heuristic rewrites.
 pub trait OptimizerRule: Send + Sync {
     /// The name of the rule, useful for telemetry and debugging.
     fn name(&self) -> &str;
@@ -58,6 +58,22 @@ pub trait OptimizerRule: Send + Sync {
         _context: &OptimizerContext,
     ) -> Result<Option<LogicalPlan>> {
         Ok(None)
+    }
+
+    /// Applies a plan-scoped rule while transferring ownership of the plan.
+    ///
+    /// Rules that can move existing plan nodes may override this method to
+    /// avoid cloning the logical tree. The default preserves the borrowed
+    /// plan-rule interface.
+    fn apply_owned_plan(
+        &self,
+        plan: LogicalPlan,
+        context: &OptimizerContext,
+    ) -> Result<(LogicalPlan, bool, Vec<JoinOrderDecision>)> {
+        match self.apply_plan(&plan, context)? {
+            Some(rewritten) => Ok((rewritten, true, Vec::new())),
+            None => Ok((plan, false, Vec::new())),
+        }
     }
 
     /// Attempts to rewrite a single plan node.

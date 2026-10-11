@@ -20,13 +20,14 @@ use error::{Result, VeinError};
 use plan::{LogicalPlan, PlanTraversal};
 
 use crate::context::{CatalogStatisticsProvider, OptimizationDiagnostics, OptimizerConfig,
-    OptimizerContext, RuleExecution, StatisticsProvider};
+                     OptimizerContext, RuleExecution, StatisticsProvider};
 use crate::rule::{OptimizerRule, RuleType};
 use crate::rules::{
     ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule, FilterNormalizationRule,
     JoinPredicateTransitivityRule, PredicatePushdownRule, ScanFilterPushdownRule,
     ScanStatisticsPruningRule, ScalarAggregateDecorrelationRule,
 };
+use crate::rules::join_order::JoinOrderRule;
 
 /// The engine-facing optimizer seam.
 ///
@@ -77,7 +78,8 @@ impl OptimizerPipeline {
         self
     }
 
-    /// The default production pipeline: heuristic rules only.
+    /// The default production pipeline: heuristic rewrites followed by
+    /// bounded statistics-driven join-order selection.
     ///
     /// Installs constant folding followed by expression simplification.
     pub fn production() -> Self {
@@ -92,6 +94,7 @@ impl OptimizerPipeline {
             Arc::new(PredicatePushdownRule),
             Arc::new(ScanFilterPushdownRule),
             Arc::new(ColumnPruningRule),
+            Arc::new(JoinOrderRule::default()),
         ])
     }
 }
@@ -116,6 +119,11 @@ impl OptimizerPipeline {
             .iter()
             .filter(|rule| rule.rule_type() == RuleType::Heuristic)
             .collect();
+        let cost_rules: Vec<_> = self
+            .rules
+            .iter()
+            .filter(|rule| rule.rule_type() == RuleType::CostBased)
+            .collect();
 
         let mut diagnostics = OptimizationDiagnostics::default();
         let mut current = plan;
@@ -123,6 +131,7 @@ impl OptimizerPipeline {
             target: "vein.audit",
             event = "optimizer_started",
             rule_count = rules.len(),
+            cost_rule_count = cost_rules.len(),
             max_sweeps = context.config().max_sweeps,
             "optimizer_started"
         );
@@ -133,7 +142,7 @@ impl OptimizerPipeline {
 
             for rule in &rules {
                 let started = Instant::now();
-                let (result, any_changed) = apply_rule(rule.as_ref(), next, &context)?;
+                let (result, any_changed, _) = apply_rule(rule.as_ref(), next, &context)?;
                 next = result;
                 changed |= any_changed;
                 let elapsed = started.elapsed();
@@ -169,8 +178,34 @@ impl OptimizerPipeline {
 
             diagnostics.sweeps = sweep;
             if !changed {
-                validate_lowered_subqueries(&next)?;
-                diagnostics.cardinalities = context.estimate_plan(&next);
+                let mut optimized = next;
+                for rule in &cost_rules {
+                    let started = Instant::now();
+                    let (result, any_changed, join_decisions) =
+                        apply_rule(rule.as_ref(), optimized, &context)?;
+                    optimized = result;
+                    diagnostics.join_order_decisions.extend(join_decisions);
+                    let elapsed = started.elapsed();
+                    tracing::debug!(
+                        target: "vein.optimizer",
+                        event = "optimizer_rule_applied",
+                        rule = rule.name(),
+                        phase = ?rule.phase(),
+                        sweep,
+                        changed = any_changed,
+                        duration_us = elapsed.as_micros() as u64,
+                        "optimizer_rule_applied"
+                    );
+                    diagnostics.rule_executions.push(RuleExecution {
+                        rule_name: rule.name().to_string(),
+                        phase: rule.phase(),
+                        sweep,
+                        changed: any_changed,
+                        elapsed,
+                    });
+                }
+                validate_lowered_subqueries(&optimized)?;
+                diagnostics.cardinalities = context.estimate_plan(&optimized);
                 tracing::info!(
                     target: "vein.audit",
                     event = "optimizer_converged",
@@ -178,7 +213,7 @@ impl OptimizerPipeline {
                     rule_executions = diagnostics.rule_executions.len(),
                     "optimizer_converged"
                 );
-                return Ok((next, diagnostics));
+                return Ok((optimized, diagnostics));
             }
             current = next;
         }
@@ -232,12 +267,9 @@ fn apply_rule(
     rule: &dyn OptimizerRule,
     plan: LogicalPlan,
     context: &OptimizerContext,
-) -> Result<(LogicalPlan, bool)> {
+) -> Result<(LogicalPlan, bool, Vec<crate::context::JoinOrderDecision>)> {
     if rule.is_plan_rule() {
-        return Ok(match rule.apply_plan(&plan, context)? {
-            Some(rewritten) => (rewritten, true),
-            None => (plan, false),
-        });
+        return rule.apply_owned_plan(plan, context);
     }
 
     let changed = Cell::new(false);
@@ -250,7 +282,7 @@ fn apply_rule(
             None => node,
         })
     })?;
-    Ok((result, changed.get()))
+    Ok((result, changed.get(), Vec::new()))
 }
 
 /// Rewrites every node of the plan with `f`, children before parents.

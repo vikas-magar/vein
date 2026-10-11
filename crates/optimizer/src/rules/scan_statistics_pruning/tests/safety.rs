@@ -47,6 +47,8 @@ fn decimal_bounds_use_the_shared_checked_comparator() {
             max_value: Some(LogicalLiteral::Decimal(200, 15, 2)),
             null_count: Some(0),
             distinct_count: Some(10),
+            nan_count: None,
+            ..ColumnStatistics::default()
         })].into(),
         ..Default::default()
     };

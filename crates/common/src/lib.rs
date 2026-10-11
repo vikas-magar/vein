@@ -22,5 +22,8 @@ pub mod partition;
 /// Apache Arrow data handling.
 pub mod arrow;
 
+/// Format-neutral, streaming statistics over borrowed Arrow batches.
+pub mod statistics;
+
 /// Re-export unified error type from the `error` crate.
 pub use error::{Result, VeinError};

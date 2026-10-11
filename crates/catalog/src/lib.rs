@@ -40,8 +40,10 @@ pub mod store;
 
 pub use contract::{CatalogProvider, CatalogRevision, PlanningSession};
 pub use metadata::{
-    ColumnSortKey, ColumnStatistics, TableFormat, TableMetadata, TableMetadataRef, TableStatistics,
-    TableType,
+    AnalyzedTableStatistics, ByteLengthStatistics, ColumnSortKey, ColumnStatistics,
+    ColumnStorageStatistics, DataUnitStatistics, NumericStatistics, SerializedSketch,
+    StatisticsSourceIdentity, StatisticsUnitKind, TableFormat, TableMetadata,
+    TableMetadataRef, TableStatistics, TableType,
 };
 pub use snapshot::CatalogSnapshotToken;
 pub use store::{DEFAULT_CAPACITY, MetadataKey, MetadataKind, MetadataStore};

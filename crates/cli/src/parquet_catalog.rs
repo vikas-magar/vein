@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use crate::parquet_storage::{ParquetStorage, resolve_manifest_file};
 use async_trait::async_trait;
-use catalog::{MetadataKey, MetadataStore, TableStatistics};
+use catalog::{AnalyzedTableStatistics, MetadataKey, MetadataStore, StatisticsSourceIdentity};
+use common::statistics::schema_fingerprint;
 use error::{Result, VeinError};
 use exec::operators::source::scan::PARQUET_FOOTER;
 use parquet::arrow::arrow_reader::{
@@ -16,6 +17,8 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::file::metadata::ParquetMetaData;
 use plan::{CatalogProvider, TableFormat, TableMetadata, VeinSchema};
+
+mod statistics;
 
 /// Catalog which resolves table names beneath a local data root.
 #[derive(Debug, Clone)]
@@ -71,7 +74,17 @@ impl CatalogProvider for ParquetCatalog {
                     discover_us = discover_started.elapsed().as_micros() as u64,
                     "catalog_discovery"
                 );
-                inspect_table_files(&name, &path, files, &metadata_store)
+                let mut metadata = inspect_table_files(&name, &path, files, &metadata_store)?;
+                if let Some(analyzed) = manifest.statistics.as_ref() {
+                    let identities = storage.source_identities(&manifest.files)?;
+                    apply_analyzed_statistics(
+                        &mut metadata,
+                        manifest.revision,
+                        analyzed,
+                        &identities,
+                    );
+                }
+                Ok(metadata)
             } else {
                 inspect_table(&name, &path, &metadata_store)
             }
@@ -117,6 +130,140 @@ fn inspect_table(name: &str, path: &Path, metadata_store: &MetadataStore) -> Res
     inspect_table_files(name, path, files, metadata_store)
 }
 
+/// Publishes value-derived statistics only when the managed snapshot, schema,
+/// row count, and all source object versions still match their analyzed inputs.
+fn apply_analyzed_statistics(
+    metadata: &mut TableMetadata,
+    manifest_revision: u64,
+    analyzed: &AnalyzedTableStatistics,
+    source_identities: &[StatisticsSourceIdentity],
+) -> bool {
+    let logical_schema_fingerprint = schema_fingerprint(&metadata.schema);
+    let Some(table_statistics) = metadata.statistics.as_mut() else {
+        return false;
+    };
+    let rejection = if analyzed.source_revision != manifest_revision {
+        Some("catalog revision changed")
+    } else if analyzed.schema_fingerprint != logical_schema_fingerprint {
+        Some("logical schema changed")
+    } else if analyzed.source_identities != source_identities {
+        Some("source file version changed")
+    } else if analyzed.statistics.num_rows != table_statistics.num_rows {
+        Some("analyzed row count disagrees with storage metadata")
+    } else {
+        None
+    };
+    if let Some(reason) = rejection {
+        tracing::debug!(
+            target: "vein.audit",
+            event = "catalog_statistics_rejected",
+            table = %metadata.name,
+            revision = manifest_revision,
+            reason,
+            "catalog_statistics_rejected"
+        );
+        return false;
+    }
+
+    let Some(rows) = table_statistics.num_rows else {
+        return false;
+    };
+    if analyzed.statistics.column_statistics.len() != metadata.schema.fields.len() {
+        tracing::debug!(
+            target: "vein.audit",
+            event = "catalog_statistics_rejected",
+            table = %metadata.name,
+            revision = manifest_revision,
+            reason = "analyzed column set is incomplete",
+            "catalog_statistics_rejected"
+        );
+        return false;
+    }
+    for field in &metadata.schema.fields {
+        let Some(summary) = analyzed.statistics.column_statistics.get(&field.name) else {
+            return false;
+        };
+        let Some(nulls) = summary.null_count else {
+            return false;
+        };
+        if summary.nan_count.is_none()
+            || summary.min_max_complete.is_none()
+            || !summary.is_consistent_with_rows(rows)
+        {
+            tracing::debug!(
+                target: "vein.audit",
+                event = "catalog_statistics_rejected",
+                table = %metadata.name,
+                column = %field.name,
+                revision = manifest_revision,
+                reason = "analyzed column statistics are inconsistent",
+                "catalog_statistics_rejected"
+            );
+            return false;
+        }
+        if table_statistics
+            .column_statistics
+            .get(&field.name)
+            .and_then(|column| column.null_count)
+            .is_some_and(|footer_nulls| footer_nulls != nulls)
+        {
+            tracing::debug!(
+                target: "vein.audit",
+                event = "catalog_statistics_rejected",
+                table = %metadata.name,
+                column = %field.name,
+                revision = manifest_revision,
+                reason = "footer and analyzed null counts disagree",
+                "catalog_statistics_rejected"
+            );
+            return false;
+        }
+    }
+
+    for (name, source) in &analyzed.statistics.column_statistics {
+        let target = table_statistics
+            .column_statistics
+            .entry(name.clone())
+            .or_default();
+        target.null_count = target.null_count.or(source.null_count);
+        target.nan_count = target.nan_count.or(source.nan_count);
+        target.distinct_count = source.distinct_count;
+        target.distinct_count_relative_error = source.distinct_count_relative_error;
+        target.distinct_sketch.clone_from(&source.distinct_sketch);
+        if source.min_max_complete == Some(true) {
+            target.min_value.clone_from(&source.min_value);
+            target.max_value.clone_from(&source.max_value);
+            target.min_max_complete = Some(true);
+        } else if source.min_max_complete == Some(false) {
+            target.min_max_complete = Some(false);
+        }
+        target.numeric.clone_from(&source.numeric);
+        target.byte_length.clone_from(&source.byte_length);
+    }
+    tracing::info!(
+        target: "vein.audit",
+        event = "catalog_statistics_loaded",
+        table = %metadata.name,
+        revision = manifest_revision,
+        row_count = rows,
+        column_count = analyzed.statistics.column_statistics.len(),
+        distinct_columns = analyzed.statistics.column_statistics.values()
+            .filter(|column| column.distinct_count.is_some())
+            .count(),
+        bounded_columns = analyzed.statistics.column_statistics.values()
+            .filter(|column| column.min_max_complete == Some(true))
+            .count(),
+        numeric_columns = analyzed.statistics.column_statistics.values()
+            .filter(|column| column.numeric.is_some())
+            .count(),
+        variable_length_columns = analyzed.statistics.column_statistics.values()
+            .filter(|column| column.byte_length.is_some())
+            .count(),
+        "catalog_statistics_loaded"
+    );
+    true
+}
+
 fn inspect_table_files(
     name: &str,
     path: &Path,
@@ -132,6 +279,7 @@ fn inspect_table_files(
     }
 
     let stat_started = Instant::now();
+    let mut file_sizes = Vec::with_capacity(files.len());
     for file in &files {
         if !file.is_file() {
             return Err(VeinError::not_found(format!(
@@ -139,21 +287,25 @@ fn inspect_table_files(
                 file.display()
             )));
         }
+        let file_metadata = fs::metadata(file).map_err(|error| {
+            VeinError::io(format!("read Parquet file metadata '{}'", file.display()), error)
+        })?;
+        file_sizes.push(file_metadata.len());
     }
     let stat_us = stat_started.elapsed().as_micros() as u64;
 
     let footer_started = Instant::now();
-    let schemas = parquet_schemas(&files, metadata_store)?;
+    let footers = parquet_schemas(&files, metadata_store)?;
     let footer_us = footer_started.elapsed().as_micros() as u64;
 
-    let footer_hits = schemas
+    let footer_hits = footers
         .iter()
         .filter(|(_, _, served_from_store)| *served_from_store)
         .count() as u64;
-    let footer_misses = schemas.len() as u64 - footer_hits;
+    let footer_misses = footers.len() as u64 - footer_hits;
 
-    let expected_schema = Arc::clone(&schemas[0].0);
-    for (file, (schema, _, _)) in files.iter().zip(schemas.iter()).skip(1) {
+    let expected_schema = Arc::clone(&footers[0].0);
+    for (file, (schema, _, _)) in files.iter().zip(footers.iter()).skip(1) {
         if schema.as_ref() != expected_schema.as_ref() {
             return Err(VeinError::internal(format!(
                 "Parquet schema mismatch in '{}'; all files in one table must have identical schemas",
@@ -161,10 +313,28 @@ fn inspect_table_files(
             )));
         }
     }
-    let num_rows = schemas.iter().try_fold(0u64, |total, (_, file_rows, _)| {
-        total.checked_add((*file_rows)?)
-    });
     let file_count = files.len();
+
+    let mut data_units = Vec::new();
+    for (file_ordinal, ((schema, footer, _), file_bytes)) in
+        footers.iter().zip(file_sizes.iter()).enumerate()
+    {
+        let first_unit = data_units.len();
+        let mut file_units = statistics::file_units(file_ordinal, *file_bytes, schema, footer);
+        for unit in &mut file_units {
+            if let Some(parent) = &mut unit.parent {
+                *parent += first_unit;
+            }
+        }
+        data_units.extend(file_units);
+    }
+    let table_statistics = statistics::table_statistics(data_units, expected_schema.as_ref());
+    let row_group_count = table_statistics.row_group_count.unwrap_or(0);
+    let column_statistics_count = table_statistics.column_statistics.len();
+    let table_rows = table_statistics.num_rows;
+    let table_bytes = table_statistics.total_bytes;
+    let compressed_bytes = table_statistics.compressed_bytes;
+    let uncompressed_bytes = table_statistics.uncompressed_bytes;
 
     let table_schema = Arc::new(VeinSchema::try_from(expected_schema.as_ref())?);
     let files = files
@@ -175,18 +345,19 @@ fn inspect_table_files(
         .with_location(path.to_string_lossy())
         .with_format(TableFormat::Parquet)
         .with_files(files);
-    if let Some(num_rows) = num_rows {
-        metadata = metadata.with_statistics(TableStatistics {
-            num_rows: Some(num_rows),
-            ..TableStatistics::default()
-        });
-    }
+    metadata = metadata.with_statistics(table_statistics);
 
     tracing::info!(
         target: "vein.audit",
         event = "catalog_schema",
         table = %name,
         file_count,
+        row_group_count,
+        table_rows,
+        table_bytes,
+        compressed_bytes,
+        uncompressed_bytes,
+        column_statistics_count,
         stat_us,
         footer_us,
         footer_hits,
@@ -197,8 +368,8 @@ fn inspect_table_files(
     Ok(metadata)
 }
 
-/// Parses every file's footer concurrently, returning each file's schema, row
-/// count, and whether the catalog's store already held the parsed metadata.
+/// Parses every file's footer concurrently, returning each file's schema,
+/// shared footer, and whether the catalog's store already held the metadata.
 ///
 /// Reading a footer opens and decodes one file, which costs hundreds of
 /// microseconds and depends on no other file. Reading them one after another
@@ -213,8 +384,10 @@ fn inspect_table_files(
 fn parquet_schemas(
     files: &[PathBuf],
     metadata_store: &MetadataStore,
-) -> Result<Vec<(Arc<arrow::datatypes::Schema>, Option<u64>, bool)>> {
-    let slots: Mutex<Vec<Option<Result<(Arc<arrow::datatypes::Schema>, Option<u64>, bool)>>>> =
+) -> Result<Vec<(Arc<arrow::datatypes::Schema>, Arc<ParquetMetaData>, bool)>> {
+    let slots: Mutex<
+        Vec<Option<Result<(Arc<arrow::datatypes::Schema>, Arc<ParquetMetaData>, bool)>>>,
+    > =
         Mutex::new((0..files.len()).map(|_| None).collect());
     let next = AtomicUsize::new(0);
     let workers = std::thread::available_parallelism()
@@ -257,27 +430,26 @@ fn parquet_schemas(
         .collect()
 }
 
-/// Returns the Arrow schema and row count of `path`, plus whether the catalog's
-/// store served its footer metadata.
+/// Returns the Arrow schema and shared Parquet footer for `path`, plus whether
+/// the catalog's store served its footer metadata.
 ///
 /// The parsed footer is published under [`PARQUET_FOOTER`] so the scan reading
 /// the same file reuses it instead of parsing the footer a second time.
 fn parquet_schema(
     path: &Path,
     metadata_store: &MetadataStore,
-) -> Result<(Arc<arrow::datatypes::Schema>, Option<u64>, bool)> {
+) -> Result<(Arc<arrow::datatypes::Schema>, Arc<ParquetMetaData>, bool)> {
     let key = MetadataKey::for_file(PARQUET_FOOTER, path);
     if let Some(key) = &key {
         if let Some(metadata) = metadata_store.get::<ParquetMetaData>(key) {
-            let num_rows = parquet_num_rows(&metadata);
-            let reader = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
+            let reader = ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::new())
                 .map_err(|error| {
                     VeinError::internal(format!(
                         "derive Arrow schema from '{}': {error}",
                         path.display()
                     ))
                 })?;
-            return Ok((reader.schema().clone(), num_rows, true));
+            return Ok((reader.schema().clone(), metadata, true));
         }
     }
 
@@ -290,9 +462,9 @@ fn parquet_schema(
         ))
     })?;
     let schema = reader.schema().clone();
-    let num_rows = parquet_num_rows(reader.metadata());
+    let metadata = Arc::clone(reader.metadata());
     if let Some(key) = key {
-        metadata_store.insert(key, Arc::clone(reader.metadata()));
+        metadata_store.insert(key, Arc::clone(&metadata));
         tracing::debug!(
             target: "vein.audit",
             event = "parquet_footer_parsed",
@@ -300,11 +472,7 @@ fn parquet_schema(
             "parquet_footer_parsed"
         );
     }
-    Ok((schema, num_rows, false))
-}
-
-fn parquet_num_rows(metadata: &ParquetMetaData) -> Option<u64> {
-    u64::try_from(metadata.file_metadata().num_rows()).ok()
+    Ok((schema, metadata, false))
 }
 
 fn collect_parquet_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -368,6 +536,26 @@ mod tests {
         writer.close().expect("finish test parquet file");
     }
 
+    fn write_parquet_with_row_groups(path: &Path, values: Vec<Option<i64>>) {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+            .expect("test batch is valid");
+        let file = File::create(path).expect("create test parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
+        const ROW_GROUP_ROWS: usize = 2;
+        for offset in (0..batch.num_rows()).step_by(ROW_GROUP_ROWS) {
+            let rows = ROW_GROUP_ROWS.min(batch.num_rows() - offset);
+            writer
+                .write(&batch.slice(offset, rows))
+                .expect("write test row group");
+            writer.flush().expect("flush test row group");
+        }
+        writer.close().expect("finish test parquet file");
+    }
+
     #[tokio::test]
     async fn resolves_sorted_parquet_directory_and_ignores_hidden_entries() {
         let root = tempfile::tempdir().expect("temporary root");
@@ -407,5 +595,144 @@ mod tests {
             .await
             .expect_err("mixed schemas must fail");
         assert!(error.to_string().contains("schema mismatch"));
+    }
+
+    #[tokio::test]
+    async fn collects_footer_statistics_at_file_row_group_and_table_scopes() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let table = root.path().join("measurements");
+        fs::create_dir_all(&table).expect("create table directory");
+        write_parquet_with_row_groups(
+            &table.join("a.parquet"),
+            vec![Some(1), None, Some(4), Some(5)],
+        );
+        write_parquet_with_row_groups(&table.join("b.parquet"), vec![Some(8), Some(9)]);
+
+        let catalog = ParquetCatalog::new(root.path());
+        let metadata = catalog
+            .get_table("measurements")
+            .await
+            .expect("table resolves");
+        let statistics = metadata.statistics.as_ref().expect("footer statistics");
+
+        assert_eq!(statistics.num_rows, Some(6));
+        assert_eq!(statistics.file_count, Some(2));
+        assert_eq!(statistics.row_group_count, Some(3));
+        assert!(statistics.total_bytes.is_some_and(|bytes| bytes > 0));
+        assert!(statistics.compressed_bytes.is_some_and(|bytes| bytes > 0));
+        assert!(statistics.uncompressed_bytes.is_some_and(|bytes| bytes > 0));
+        assert_eq!(statistics.data_units.len(), 5);
+        assert_eq!(statistics.data_units[0].kind, catalog::StatisticsUnitKind::File);
+        assert_eq!(statistics.data_units[1].parent, Some(0));
+        assert_eq!(statistics.data_units[3].kind, catalog::StatisticsUnitKind::File);
+        assert_eq!(statistics.data_units[4].parent, Some(3));
+
+        let column = &statistics.column_statistics["value"];
+        assert_eq!(column.null_count, Some(1));
+        assert_eq!(column.min_value, Some(plan::LogicalLiteral::Int64(1)));
+        assert_eq!(column.max_value, Some(plan::LogicalLiteral::Int64(9)));
+        assert_eq!(column.distinct_count, None);
+
+        let row_group = &statistics.data_units[1];
+        let column_storage = &row_group.column_storage["value"];
+        assert_eq!(column_storage.num_values, Some(2));
+        assert!(column_storage.compressed_bytes.is_some_and(|bytes| bytes > 0));
+        assert!(column_storage.uncompressed_bytes.is_some_and(|bytes| bytes > 0));
+        assert!(column_storage.compression.is_some());
+        assert!(!column_storage.encodings.is_empty());
+        assert_eq!(column_storage.has_statistics, Some(true));
+    }
+
+    #[test]
+    fn analyzed_column_statistics_reject_contradictory_synopses() {
+        let valid = catalog::ColumnStatistics {
+            null_count: Some(1),
+            distinct_count: Some(4),
+            nan_count: Some(0),
+            min_value: Some(plan::LogicalLiteral::Int64(1)),
+            max_value: Some(plan::LogicalLiteral::Int64(9)),
+            min_max_complete: Some(true),
+            numeric: Some(catalog::NumericStatistics {
+                finite_count: 9,
+                non_finite_count: 0,
+                sum: Some(45.0),
+                mean: Some(5.0),
+                m2: Some(60.0),
+            }),
+            ..catalog::ColumnStatistics::default()
+        };
+        assert!(valid.is_consistent_with_rows(10));
+
+        let mut invalid = valid.clone();
+        invalid.numeric.as_mut().unwrap().finite_count = 8;
+        assert!(!invalid.is_consistent_with_rows(10));
+
+        let mut invalid = valid.clone();
+        invalid.numeric.as_mut().unwrap().m2 = Some(-1.0);
+        assert!(!invalid.is_consistent_with_rows(10));
+
+        let mut invalid = valid.clone();
+        invalid.min_value = Some(plan::LogicalLiteral::Int64(10));
+        assert!(!invalid.is_consistent_with_rows(10));
+
+        let mut invalid = valid.clone();
+        invalid.min_value = None;
+        invalid.max_value = None;
+        assert!(
+            !invalid.is_consistent_with_rows(10),
+            "complete bounds cannot be absent when ordered values exist"
+        );
+
+        let mut invalid = valid.clone();
+        invalid.min_max_complete = Some(false);
+        assert!(
+            !invalid.is_consistent_with_rows(10),
+            "incomplete bounds cannot retain a misleading min/max pair"
+        );
+
+        let all_nan = catalog::ColumnStatistics {
+            null_count: Some(0),
+            distinct_count: Some(1),
+            nan_count: Some(2),
+            min_max_complete: Some(true),
+            numeric: Some(catalog::NumericStatistics {
+                finite_count: 0,
+                non_finite_count: 2,
+                sum: Some(0.0),
+                mean: None,
+                m2: None,
+            }),
+            ..catalog::ColumnStatistics::default()
+        };
+        assert!(all_nan.is_consistent_with_rows(2));
+
+        let empty = catalog::ColumnStatistics {
+            null_count: Some(0),
+            nan_count: Some(0),
+            min_max_complete: Some(true),
+            ..catalog::ColumnStatistics::default()
+        };
+        assert!(empty.is_consistent_with_rows(0));
+
+        let mut invalid = valid.clone();
+        invalid.distinct_count = None;
+        invalid.distinct_count_relative_error = Some(0.1);
+        assert!(
+            !invalid.is_consistent_with_rows(10),
+            "an estimate error requires a corresponding distinct estimate"
+        );
+
+        let invalid_lengths = catalog::ColumnStatistics {
+            null_count: Some(1),
+            byte_length: Some(catalog::ByteLengthStatistics {
+                value_count: 9,
+                total_bytes: Some(8),
+                min_bytes: Some(1),
+                max_bytes: Some(2),
+                contains_non_ascii: None,
+            }),
+            ..catalog::ColumnStatistics::default()
+        };
+        assert!(!invalid_lengths.is_consistent_with_rows(10));
     }
 }

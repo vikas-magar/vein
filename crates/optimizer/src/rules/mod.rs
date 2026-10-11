@@ -33,6 +33,9 @@ pub mod exists_decorrelation;
 /// Equality-based predicate propagation across inner joins.
 pub mod join_transitivity;
 
+/// Bounded cost-based enumeration for safe inner equijoins.
+pub mod join_order;
+
 pub use column_pruning::ColumnPruningRule;
 pub use constant_fold::ConstantFoldingRule;
 pub use expression_simplify::ExpressionSimplificationRule;

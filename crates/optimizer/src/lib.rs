@@ -23,8 +23,10 @@ pub mod optimizer;
 pub mod rules;
 
 pub use context::{
-    CatalogStatisticsProvider, OptimizationDiagnostics, OptimizerConfig, OptimizerContext,
-    OptimizerPhase, RuleExecution, StatisticsFreshness, StatisticsProvider, StatisticsSnapshot,
+    CatalogStatisticsProvider, JoinCardinalityAssumption, JoinCostBreakdown,
+    JoinOrderAlternative, JoinOrderConfig, JoinOrderDecision, JoinOrderOutcome,
+    OptimizationDiagnostics, OptimizerConfig, OptimizerContext, OptimizerPhase, RuleExecution,
+    StatisticsFreshness, StatisticsProvider, StatisticsSnapshot,
 };
 pub use optimizer::{Optimizer, OptimizerPipeline};
 pub use rule::{OptimizerRule, RuleType};
@@ -35,4 +37,9 @@ pub use rules::{
     scan_filter_pushdown::ScanFilterPushdownRule,
     scan_statistics_pruning::ScanStatisticsPruningRule,
     scalar_aggregate_decorrelation::ScalarAggregateDecorrelationRule,
+};
+
+/// Join-order cost model extension point and default cumulative-cardinality model.
+pub use rules::join_order::{
+    CumulativeCardinalityCost, JoinCostInput, JoinCostModel, JoinOrderRule,
 };

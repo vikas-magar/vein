@@ -38,17 +38,38 @@ All tasks are pending unless marked complete. Each logic change must include reg
 
 **Vein reference:** `crates/optimizer/src/optimizer.rs`, `crates/optimizer/src/rule.rs`, `crates/optimizer/src/context.rs`.
 
-### P0.2 — Implement cost-based join ordering
+### P0.2 — Implement cost-based join ordering — Complete
 
-**Current state:** Vein keeps the logical join order; the production optimizer applies heuristic rules only.
+**Current state:** The production optimizer runs a bounded exact subset search once after heuristic convergence. It reorders only connected regions of inner joins with column-to-column equality predicates and no `USING` clause. Outer, semi, anti, cross, correlated, and residual-predicate shapes remain boundaries. The default cumulative-cardinality model uses the shared P0.1 estimates. Search limits, an injectable cost-model trait, diagnostics, and safe original-order fallback are implemented.
 
 **Tasks**
-- Build a join-graph representation from reorderable joins and their predicates.
-- Enumerate alternative orders using estimates from P0.1 and a bounded, extensible search strategy.
-- Preserve semantics for outer, semi, anti, cross, correlated, and residual-predicate joins; only reorder shapes proven safe.
-- Fall back to the original logical order when estimates or legality checks are insufficient.
-- Expose the chosen order, alternatives considered, and cost inputs through optimizer diagnostics.
-- Add tests for selective and skewed inputs, multi-join plans, ambiguous estimates, and non-reorderable joins.
+- [x] Build a join-graph representation from reorderable joins and their predicates.
+- [x] Enumerate alternative orders using P0.1 estimates and bounded subset search; make the cost model replaceable through a trait.
+- [x] Preserve non-reorderable join regions as boundaries and move only equality predicates whose relation inputs are validated.
+- [x] Fall back to the original logical order when estimates, legality checks, estimate consistency, or configured search limits are insufficient.
+- [x] Report the selected order, original/selected cumulative costs, candidate split count, and bounded per-alternative inputs and cost breakdowns.
+- [x] Add regressions for beneficial reorderings, predicate/schema preservation, ambiguous decompositions, missing statistics, search limits, outer joins, residual predicates, and the NDV model's sensitivity to skew.
+- [x] Run a representative Query-configuration workload, compare results with DuckDB, and measure warm query times. Record whether the optimizer reordered or safely fell back.
+
+**Implementation and limits**
+
+- The graph is built from stable `ColumnId` identities and verified child schemas; table names do not control legality or cardinality estimates.
+- The subset search rejects disconnected graphs and is bounded by configurable relation and candidate-split limits. It builds replacement logical nodes by moving existing subtrees; it does not copy execution batches or column buffers.
+- Every legal split for each subset is estimated through the same P0.1 join estimator. The rule falls back if alternate decompositions disagree on rows or on column distributions/bounds used by later estimates, avoiding a path-dependent DP decision.
+- Predicate placement and root schema identity/order are preserved. Tests assert each equality predicate survives exactly once through a selected reorder.
+- Cost-based rules execute once after the heuristic fixpoint. `OptimizationDiagnostics` retains each decision and its bounded alternatives; tracing reports the assumption, outcome, costs, and alternatives. A custom `JoinCostModel` can expose a local cost term or leave it unknown.
+- The current equijoin estimate assumes uniform non-null key frequencies and overlap between the smaller and larger NDV domains unless min/max proves disjointness. The skew regression demonstrates the limit: with 100 rows and NDV 10 on both sides, the model estimates 1,000 matches; a synthetic aligned-skew distribution has 8,290. Frequency-aware join estimates are not implemented.
+- Parquet catalog statistics intentionally do not publish table-wide NDV by summing row-group NDVs: values shared between groups would be double-counted, and Parquet footers do not contain mergeable distinct sketches. Current TPC-H snapshots therefore leave the join-key distribution inputs unknown and the search safely keeps the original order.
+- Vein-managed writes now feed Arrow batches into a format-neutral collector. It records exact row/null/NaN counts, mergeable table-wide HyperLogLog NDV, exact representable min/max bounds, approximate finite numeric sum/mean/M2, and exact variable-width byte-length summaries. Appends merge compatible state; overwrite starts new state; source revision, logical schema fingerprint, and file identities gate catalog publication.
+- The collector reads borrowed Arrow arrays and keeps only bounded sketch/scalar state. This is the shared computation interface for future readers and formats; Parquet is the only current writer/catalog adapter wired to persistence. Existing external TPC-H directories still have footer facts but no analyzed table-wide NDV because a generic ANALYZE scan and catalog persistence path do not exist yet.
+- Frequency/MCV statistics, histograms/quantiles, multi-column NDV/correlation, and a generic ANALYZE/persistence interface remain open. Do not infer these from row-group summaries or label the current synopsis set comprehensive.
+
+**Validation (2026-10-11)**
+
+- The complete workspace `Test` configuration passed, including beneficial reorder, fallback, diagnostic alternatives/cost breakdown, and synthetic skew-limit regressions. The existing workspace `Check` configuration and RustRover incremental project build passed.
+- The existing `Query` configuration ran TPC-H Query 5 against Vein data. Vein and DuckDB returned the same five country/revenue rows. Join-order diagnostics reported `InsufficientStatistics` for the connected join regions, so this workload did not exercise a reordered plan.
+- Three warm Vein CLI query-completion measurements were 1,290 ms, 1,224 ms, and 1,276 ms (median 1,276 ms). Three DuckDB CLI `.timer` measurements, with all statements run in one process, were 73 ms, 57 ms, and 54 ms (median 57 ms). The timer boundaries are not guaranteed to be identical; on these observations Vein took about 22.4x as long. P0.2 did not improve this query because the available catalog statistics do not support a trustworthy join-cardinality choice. These are workload measurements, not a general engine benchmark.
+- P0.2's bounded search, cost-model extension point, decision diagnostics, and safe fallback are complete. The generic collector now supplies mergeable table-wide NDV for Vein-managed writes; the external TPC-H directory used in the measurements still needs an ANALYZE path before the optimizer can use those distributions. Frequency-aware join estimates also need MCV/frequency evidence. Do not infer table NDV by adding row-group NDVs; preserve unknown/fallback behavior when evidence is absent.
 
 **DuckDB reference:** `optimizer/join_order/join_order_optimizer.cpp`; `optimizer/optimizer.cpp:355-360`.
 
@@ -233,7 +254,7 @@ All tasks are pending unless marked complete. Each logic change must include reg
 - Validate representative Vein queries with the existing **Query** configuration and compare results with DuckDB when the query is supported by both.
 - Record plan shape, rows read/filtered, bytes, memory, spill activity, and elapsed time. Separate engine execution time from process/build startup time.
 - Do not add run configurations for these tasks.
-- Do not enable a rewrite by default until correctness, fallback behavior, and measured benefit are established.
+- Keep default cost-based rewrites restricted to proven-safe shapes, explicit fallback behavior, and strict estimated-cost improvements. Do not claim runtime benefit or relax search bounds until representative workload measurements establish it.
 
 ## Source review snapshot
 
