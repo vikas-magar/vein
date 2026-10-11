@@ -347,6 +347,8 @@ The memory budget is an estimate for operator-managed state, not a process-RSS c
 - **Acceptance:** Common failures do not emit an unbounded tree dump and identify the node and missing/invalid contract.
 - **Tests:** Assert stable error category and concise message for unsupported node, missing column, invalid key, cardinality violation, memory limit, and sink mismatch.
 
+**Planner diagnostic progress (2026-10-11):** Added exhaustive `LogicalPlan::operator_name()` and `LogicalExpr::kind_name()` APIs and replaced full logical plan/expression debug dumps in physical planner/compiler errors with concise operator-specific diagnostics. Regression coverage checks unsupported root, source, recursive transform, pipeline, post-aggregate, and scalar-subquery contexts, including that nested scan metadata is omitted. Planner failures now emit a concise `physical_planning_failed` audit event with query/request IDs and root operator while returning the original error; the trace regression checks those fields and that plan details are omitted. The trace regression, expression-label regression, all 13 planner tests, and all 61 physical crate tests pass. One full workspace `Test` run passed; a later full run exited 101, and the IDE preview did not include the failing target. `Check` and incremental `build_project` pass; the existing `Build` run configuration failed to start. Task 5.3 remains in progress: broader error categories and the acceptance-matrix tests still need completion.
+
 ### Phase 6 — Close known operator and workload gaps
 
 #### Task 6.1 — Complete the open items in `physical_issue.md`

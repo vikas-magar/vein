@@ -60,7 +60,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
             "physical_planning_started"
         );
 
-        match &logical_plan {
+        let result = match &logical_plan {
             LogicalPlan::Scan { .. }
             | LogicalPlan::ExternalScan { .. }
             | LogicalPlan::Filter { .. }
@@ -92,10 +92,27 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 Ok(Job::new(request_id, query_id, stage, ExecutionMode::Batch))
             }
             other => Err(VeinError::planning(
-                format!("Logical plan node not yet supported by physical planner: {other:?}"),
+                format!(
+                    "{} is not supported by the physical planner yet; add physical lowering for this operator",
+                    other.operator_name()
+                ),
                 None,
             )),
+        };
+
+        if let Err(error) = &result {
+            tracing::error!(
+                target: "vein.audit",
+                event = "physical_planning_failed",
+                %request_id,
+                %query_id,
+                operator = logical_plan.operator_name(),
+                error = %error,
+                "physical_planning_failed"
+            );
         }
+
+        result
     }
 }
 
@@ -104,6 +121,31 @@ mod tests {
     use super::*;
     use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
     use plan::LogicalExpr;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     fn task_input(task: &crate::task::Task) -> &common::protocol::PhysicalPlanNode {
         let common::protocol::PhysicalPlanOperator::Sink { input, .. } = &task.plan.root.operator else {
@@ -904,5 +946,71 @@ mod tests {
             !error.to_string().contains("JOIN is not supported"),
             "joins must no longer be refused wholesale: {error}"
         );
+    }
+
+    #[test]
+    fn unsupported_root_error_names_operator_without_dumping_plan() {
+        let input = mock_scan_plan();
+        let schema = match &input {
+            LogicalPlan::Scan { schema, .. } => schema.clone(),
+            _ => unreachable!(),
+        };
+        let explain = LogicalPlan::Explain {
+            input: Box::new(input),
+            schema,
+        };
+
+        let error = DefaultPhysicalPlanner::new()
+            .create_physical_plan(RequestId::new(), explain)
+            .expect_err("EXPLAIN has no physical execution path");
+        let message = error.to_string();
+
+        assert!(message.contains("Explain"), "{message}");
+        assert!(message.contains("add physical lowering"), "{message}");
+        assert!(!message.contains("users"), "full scan metadata leaked: {message}");
+        assert!(!message.contains("Scan {"), "full plan was formatted: {message}");
+    }
+
+    #[test]
+    fn planning_failure_trace_has_lineage_and_preserves_concise_error() {
+        let input = mock_scan_plan();
+        let schema = match &input {
+            LogicalPlan::Scan { schema, .. } => schema.clone(),
+            _ => unreachable!(),
+        };
+        let explain = LogicalPlan::Explain {
+            input: Box::new(input),
+            schema,
+        };
+        let request_id = RequestId::from_raw(0xfeed);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(SharedLogBuffer(Arc::clone(&output)))
+            .finish();
+
+        let error = tracing::subscriber::with_default(subscriber, || {
+            DefaultPhysicalPlanner::new()
+                .create_physical_plan(request_id, explain)
+                .expect_err("EXPLAIN has no physical execution path")
+        });
+        let message = error.to_string();
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let failure = logs
+            .lines()
+            .find(|line| line.contains("physical_planning_failed"))
+            .expect("planner should emit a failure event");
+
+        assert!(failure.contains("query_id="), "{failure}");
+        assert!(failure.contains("request_id=feed"), "{failure}");
+        assert!(
+            failure.contains("operator=") && failure.contains("Explain"),
+            "{failure}"
+        );
+        assert!(failure.contains(&message), "{failure}");
+        assert!(!failure.contains("users"), "plan details leaked: {failure}");
+        assert!(message.contains("Explain"), "{message}");
+        assert!(message.contains("add physical lowering"), "{message}");
     }
 }

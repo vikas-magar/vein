@@ -219,8 +219,11 @@ impl BytecodeCompiler {
                 });
                 Ok(dst)
             }
-            other => Err(VeinError::planning(
-                format!("Logical expression lowering not yet implemented: {other:?}"),
+            unsupported => Err(VeinError::planning(
+                format!(
+                    "expression kind {} is not supported by VM bytecode lowering; route it through relational lowering",
+                    unsupported.kind_name()
+                ),
                 None,
             )),
         }
@@ -242,7 +245,7 @@ impl BytecodeCompiler {
                 let mut matches = self.register_columns.iter().filter(|(field, _)| {
                     field.name == name
                         && qualifier
-                            .is_none_or(|qualifier| field.qualifier.as_deref() == Some(qualifier))
+                        .is_none_or(|qualifier| field.qualifier.as_deref() == Some(qualifier))
                 });
                 let (_, register) = matches.next()?;
                 if matches.next().is_some() {
@@ -376,7 +379,7 @@ fn missing_column_message(kind: &str, id: ColumnId, name: &str, schema: &VeinSch
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plan::LogicalLiteral;
+    use plan::{LogicalLiteral, LogicalPlan};
     use plan::schema::{ColumnId, ResolvedColumn, VeinDataType};
 
     fn test_schema() -> VeinSchema {
@@ -394,6 +397,26 @@ mod tests {
                 VeinDataType::Int64,
             )),
         ])
+    }
+
+    #[test]
+    fn unsupported_subquery_error_does_not_dump_embedded_plan() {
+        let expr = LogicalExpr::ScalarSubquery(Box::new(LogicalPlan::ExternalScan {
+            url: "private_source_marker".to_string(),
+            options: Vec::new(),
+            files: Vec::new(),
+            schema: Box::new(VeinSchema::empty()),
+        }));
+        let mut compiler = BytecodeCompiler::new(0);
+
+        let error = compiler
+            .compile_expr(&expr, &VeinSchema::empty())
+            .expect_err("scalar subqueries require relational lowering");
+        let message = error.to_string();
+
+        assert!(message.contains("ScalarSubquery"), "{message}");
+        assert!(message.contains("relational lowering"), "{message}");
+        assert!(!message.contains("private_source_marker"), "{message}");
     }
 
     #[test]

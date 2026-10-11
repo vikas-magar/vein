@@ -16,3 +16,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 catalog = { path = "../catalog" }
+tracing-subscriber = { workspace = true }

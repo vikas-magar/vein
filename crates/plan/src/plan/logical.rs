@@ -306,11 +306,71 @@ pub enum LogicalPlan {
 }
 
 impl LogicalPlan {
+    /// Returns the stable name of this logical operator without formatting its
+    /// inputs, schemas, or other potentially large plan metadata.
+    pub fn operator_name(&self) -> &'static str {
+        match self {
+            LogicalPlan::Scan { .. } => "Scan",
+            LogicalPlan::ExternalScan { .. } => "ExternalScan",
+            LogicalPlan::Filter { .. } => "Filter",
+            LogicalPlan::Project { .. } => "Project",
+            LogicalPlan::Aggregate { .. } => "Aggregate",
+            LogicalPlan::Window { .. } => "Window",
+            LogicalPlan::Join { .. } => "Join",
+            LogicalPlan::Sort { .. } => "Sort",
+            LogicalPlan::Limit { .. } => "Limit",
+            LogicalPlan::Distinct { .. } => "Distinct",
+            LogicalPlan::SubqueryAlias { .. } => "SubqueryAlias",
+            LogicalPlan::Explain { .. } => "Explain",
+            LogicalPlan::SetOp { .. } => "SetOp",
+            LogicalPlan::Sample { .. } => "Sample",
+            LogicalPlan::Assert { .. } => "Assert",
+            LogicalPlan::Pivot { .. } => "Pivot",
+            LogicalPlan::Unpivot { .. } => "Unpivot",
+            LogicalPlan::Fork { .. } => "Fork",
+            LogicalPlan::Tee { .. } => "Tee",
+            LogicalPlan::SemanticFilter { .. } => "SemanticFilter",
+            LogicalPlan::SemanticJoin { .. } => "SemanticJoin",
+            LogicalPlan::SemanticCalibrate { .. } => "SemanticCalibrate",
+            LogicalPlan::Write { .. } => "Write",
+            LogicalPlan::Call { .. } => "Call",
+        }
+    }
+
     /// Returns the table name if this plan node is a table `Scan`.
     pub fn table_name(&self) -> Option<&str> {
         match self {
             LogicalPlan::Scan { table, .. } => Some(&table.name),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LogicalPlan;
+    use crate::schema::VeinSchema;
+
+    #[test]
+    fn operator_name_is_stable_and_does_not_format_plan_contents() {
+        let plan = LogicalPlan::Explain {
+            input: Box::new(LogicalPlan::Call {
+                input: Box::new(LogicalPlan::Scan {
+                    table: std::sync::Arc::new(catalog::TableMetadata::new(
+                        "sensitive_table_name",
+                        std::sync::Arc::new(VeinSchema::empty()),
+                    )),
+                    projection: None,
+                    filters: Vec::new(),
+                    schema: Box::new(VeinSchema::empty()),
+                }),
+                name: "custom_function".to_string(),
+                args: Vec::new(),
+                schema: Box::new(VeinSchema::empty()),
+            }),
+            schema: Box::new(VeinSchema::empty()),
+        };
+
+        assert_eq!(plan.operator_name(), "Explain");
     }
 }

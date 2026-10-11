@@ -363,7 +363,10 @@ impl PipelineCompiler {
                 Ok((**schema).clone())
             }
             other => Err(VeinError::planning(
-                format!("unsupported recursive join transform: {other:?}"),
+                format!(
+                    "unsupported recursive join transform '{}'; add transform lowering for this operator",
+                    other.operator_name()
+                ),
                 None,
             )),
         }
@@ -464,7 +467,10 @@ impl PipelineCompiler {
                 Self::collect_leaf_source(input, dictionary_group_ids)
             }
             other => Err(VeinError::planning(
-                format!("unsupported source node in Parquet pipeline: {other:?}"),
+                format!(
+                    "unsupported source operator '{}' in Parquet pipeline; provide a supported scan source",
+                    other.operator_name()
+                ),
                 None,
             )),
         }
@@ -672,7 +678,10 @@ impl PipelineCompiler {
                 Ok((**schema).clone())
             }
             other => Err(VeinError::planning(
-                format!("unsupported operator in Parquet pipeline: {other:?}"),
+                format!(
+                    "unsupported operator '{}' in Parquet pipeline; add pipeline lowering for this operator",
+                    other.operator_name()
+                ),
                 None,
             )),
         }
@@ -727,7 +736,10 @@ fn compile_post_aggregate_node(
             Ok((**schema).clone())
         }
         other => Err(VeinError::planning(
-            format!("unsupported operator above an aggregate: {other:?}"),
+            format!(
+                "unsupported operator '{}' above an aggregate; add post-aggregate lowering for this operator",
+                other.operator_name()
+            ),
             None,
         )),
     }
@@ -975,6 +987,7 @@ mod tests {
     use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
     use plan::{LogicalExpr, LogicalLiteral, LogicalPlan, SortKey as LogicalSortKey};
 
+    use crate::compiler::BytecodeCompiler;
     use super::PipelineCompiler;
 
     fn schema() -> (VeinSchema, Arc<ResolvedColumn>) {
@@ -991,6 +1004,34 @@ mod tests {
             VeinDataType::Int64,
         ));
         (VeinSchema::new(vec![first, second.clone()]), second)
+    }
+
+    fn unsupported_explain_plan() -> LogicalPlan {
+        let schema = VeinSchema::empty();
+        let scan = LogicalPlan::Scan {
+            table: Arc::new(
+                TableMetadata::new("private_table_marker", Arc::new(schema.clone()))
+                    .with_format(plan::TableFormat::Parquet),
+            ),
+            projection: None,
+            filters: Vec::new(),
+            schema: Box::new(schema.clone()),
+        };
+        LogicalPlan::Explain {
+            input: Box::new(scan),
+            schema: Box::new(schema),
+        }
+    }
+
+    fn assert_concise_operator_error(error: impl std::fmt::Display, context: &str) {
+        let message = error.to_string();
+        assert!(message.contains("Explain"), "{message}");
+        assert!(message.contains(context), "{message}");
+        assert!(
+            !message.contains("private_table_marker"),
+            "nested scan metadata leaked into the error: {message}"
+        );
+        assert!(!message.contains("Scan {"), "full plan was formatted: {message}");
     }
 
     fn external_scan(schema: &VeinSchema) -> LogicalPlan {
@@ -1647,5 +1688,53 @@ mod tests {
         assert!(message.contains("recursive filter"), "{message}");
         assert!(message.contains("ps_supplycost#39"), "{message}");
         assert!(message.contains("input schema [p_partkey#1]"), "{message}");
+    }
+
+    #[test]
+    fn unsupported_source_error_names_operator_without_dumping_nested_scan() {
+        let error = PipelineCompiler::collect_leaf_source(
+            &unsupported_explain_plan(),
+            &mut Vec::new(),
+        )
+            .expect_err("EXPLAIN cannot be used as a Parquet source");
+
+        assert_concise_operator_error(&error, "source operator");
+        assert!(
+            error.to_string().contains("supported scan source"),
+            "diagnostic should give a next action: {error}"
+        );
+    }
+
+    #[test]
+    fn unsupported_recursive_transform_error_names_operator_concisely() {
+        let error = PipelineCompiler::compile_recursive_transform(
+            &unsupported_explain_plan(),
+            &VeinSchema::empty(),
+        )
+            .expect_err("EXPLAIN has no recursive join transform");
+
+        assert_concise_operator_error(&error, "recursive join transform");
+    }
+
+    #[test]
+    fn unsupported_pipeline_operator_error_names_operator_concisely() {
+        let mut compiler = BytecodeCompiler::new(0);
+        let error = PipelineCompiler::compile_node(
+            &unsupported_explain_plan(),
+            VeinSchema::empty(),
+            &mut compiler,
+        )
+            .expect_err("EXPLAIN has no Parquet pipeline lowering");
+
+        assert_concise_operator_error(&error, "pipeline");
+    }
+
+    #[test]
+    fn unsupported_post_aggregate_operator_error_names_operator_concisely() {
+        let mut compiler = BytecodeCompiler::new(0);
+        let error = super::compile_post_aggregate_node(&unsupported_explain_plan(), &mut compiler)
+            .expect_err("EXPLAIN has no post-aggregate lowering");
+
+        assert_concise_operator_error(&error, "post-aggregate");
     }
 }

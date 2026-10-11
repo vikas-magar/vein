@@ -2042,6 +2042,7 @@ dependencies = [
  "parser",
  "plan",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

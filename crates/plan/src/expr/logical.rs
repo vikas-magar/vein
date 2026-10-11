@@ -205,6 +205,33 @@ fn is_volatile_builtin(name: &str) -> bool {
 }
 
 impl LogicalExpr {
+    /// Returns the stable kind name without formatting nested expression or plan data.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            LogicalExpr::Column(_) => "Column",
+            LogicalExpr::OuterColumn(_) => "OuterColumn",
+            LogicalExpr::Literal(_) => "Literal",
+            LogicalExpr::BinaryOp { .. } => "BinaryOp",
+            LogicalExpr::Cast { .. } => "Cast",
+            LogicalExpr::Not { .. } => "Not",
+            LogicalExpr::Negate { .. } => "Negate",
+            LogicalExpr::IsNull { .. } => "IsNull",
+            LogicalExpr::IsNotNull { .. } => "IsNotNull",
+            LogicalExpr::InList { .. } => "InList",
+            LogicalExpr::Like { .. } => "Like",
+            LogicalExpr::Case { .. } => "Case",
+            LogicalExpr::FunctionCall { .. } => "FunctionCall",
+            LogicalExpr::WindowCall { .. } => "WindowCall",
+            LogicalExpr::AiOperator { .. } => "AiOperator",
+            LogicalExpr::WasmUdf { .. } => "WasmUdf",
+            LogicalExpr::EbpfUdf { .. } => "EbpfUdf",
+            LogicalExpr::PythonUdf { .. } => "PythonUdf",
+            LogicalExpr::Lambda { .. } => "Lambda",
+            LogicalExpr::ScalarSubquery(_) => "ScalarSubquery",
+            LogicalExpr::Exists { .. } => "Exists",
+        }
+    }
+
     /// Returns whether this expression can produce NULL.
     ///
     /// Column references and literals have exact nullability. Operators whose
@@ -636,6 +663,13 @@ mod tests {
             distinct: false,
             return_type: VeinDataType::Float64,
         }
+    }
+
+    #[test]
+    fn kind_name_returns_stable_expression_label() {
+        let expr = LogicalExpr::Literal(LogicalLiteral::Int64(42));
+
+        assert_eq!(expr.kind_name(), "Literal");
     }
 
     #[test]
