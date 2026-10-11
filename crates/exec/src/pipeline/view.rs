@@ -7,7 +7,7 @@
 //! original arrays instead of building a chain of per-row objects or copying
 //! payload values.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{new_empty_array, new_null_array, Array, ArrayRef};
@@ -253,6 +253,16 @@ pub struct ViewColumn {
     arrays: Arc<[ArrayRef]>,
     data_type: DataType,
     mapping: Arc<RowMapping>,
+    memory_leases: Vec<Option<Arc<dyn ViewMemoryLease>>>,
+}
+
+/// Keeps an external memory reservation alive while a view retains its source array.
+///
+/// The trait keeps view ownership independent from the query memory tracker and
+/// permits other allocation-accounting strategies to provide the same lifetime
+/// behavior.
+pub(crate) trait ViewMemoryLease: std::fmt::Debug + Send + Sync {
+    fn tracker_id(&self) -> usize;
 }
 
 impl ViewColumn {
@@ -286,6 +296,7 @@ impl ViewColumn {
             }
         }
         Ok(Self {
+            memory_leases: vec![None; arrays.len()],
             arrays,
             data_type,
             mapping,
@@ -300,6 +311,26 @@ impl ViewColumn {
     /// Returns the source arrays. Cloning this `Arc` does not copy payload data.
     pub fn source_arrays(&self) -> &Arc<[ArrayRef]> {
         &self.arrays
+    }
+
+    /// The accounting lease associated with each retained source array.
+    fn memory_leases(&self) -> &[Option<Arc<dyn ViewMemoryLease>>] {
+        &self.memory_leases
+    }
+
+    /// Replace this column's source leases with entries keyed by array identity.
+    fn attach_memory_leases(
+        &mut self,
+        leases: &HashMap<usize, Arc<dyn ViewMemoryLease>>,
+    ) {
+        self.memory_leases = self
+            .arrays
+            .iter()
+            .map(|array| {
+                let identity = Arc::as_ptr(array) as *const () as usize;
+                leases.get(&identity).cloned()
+            })
+            .collect();
     }
 
     /// The shared row mapping used by this column.
@@ -467,11 +498,13 @@ impl DataChunkView {
                 composed_mappings.insert(mapping_key, Arc::clone(&mapping));
                 mapping
             };
-            output.push(ViewColumn::new(
+            let mut output_column = ViewColumn::new(
                 Arc::clone(&input_column.arrays),
                 input_column.data_type.clone(),
                 mapping,
-            )?);
+            )?;
+            output_column.memory_leases = input_column.memory_leases.clone();
+            output.push(output_column);
         }
 
         Self::new(row_count, output, SelectionVector::new_dense(row_count))
@@ -537,6 +570,7 @@ impl DataChunkView {
         for column_index in 0..output_columns {
             let data_type = inputs[0].columns[column_index].data_type.clone();
             let mut arrays = Vec::<ArrayRef>::new();
+            let mut memory_leases = Vec::<Option<Arc<dyn ViewMemoryLease>>>::new();
             let mut source_lengths = Vec::<usize>::new();
             let mut source_by_pointer = HashMap::<usize, u32>::new();
             let mut source_remap = inputs
@@ -575,10 +609,17 @@ impl DataChunkView {
                                 ));
                             }
                             arrays.push(Arc::clone(array));
+                            memory_leases.push(
+                                column.memory_leases()[source_index].clone(),
+                            );
                             source_lengths.push(array.len());
                             source_by_pointer.insert(pointer, global_source);
                             global_source
                         };
+                        if memory_leases[global_source as usize].is_none() {
+                            memory_leases[global_source as usize] =
+                                column.memory_leases()[source_index].clone();
+                        }
                         source_remap[input_index][source_index] = Some(global_source);
                         global_source
                     };
@@ -590,7 +631,9 @@ impl DataChunkView {
             }
 
             let mapping = Arc::new(RowMapping::new(Arc::from(source_lengths), mapped_rows)?);
-            output.push(ViewColumn::new(arrays, data_type, mapping)?);
+            let mut output_column = ViewColumn::new(arrays, data_type, mapping)?;
+            output_column.memory_leases = memory_leases;
+            output.push(output_column);
         }
 
         Self::new(rows.len(), output, SelectionVector::new_dense(rows.len()))
@@ -617,6 +660,81 @@ impl DataChunkView {
             .get(column)
             .map(|column| &column.data_type)
             .ok_or_else(|| VeinError::internal(format!("view column {column} is out of bounds")))
+    }
+
+    /// Arrow footprint estimates for distinct retained source arrays.
+    ///
+    /// Array identity deduplicates repeated references to the same Arrow array.
+    /// Distinct arrays that internally share buffers may be counted more than
+    /// once; these are conservative estimates rather than allocator telemetry.
+    pub(crate) fn source_array_memory_sizes(&self) -> Result<Vec<(usize, usize)>> {
+        let mut seen = HashSet::new();
+        self.columns
+            .iter()
+            .flat_map(|column| column.arrays.iter())
+            .try_fold(Vec::new(), |mut sizes, array| {
+                let identity = Arc::as_ptr(array) as *const () as usize;
+                if !seen.insert(identity) {
+                    return Ok(sizes);
+                }
+                sizes.push((identity, array.get_array_memory_size()));
+                Ok(sizes)
+            })
+    }
+
+    /// Attach shared reservations to the distinct source arrays retained by this
+    /// view. Existing leases from the same tracker are kept; leases from another
+    /// tracker are replaced so hash-table merges can transfer ownership.
+    pub(crate) fn account_source_arrays(
+        &mut self,
+        tracker_id: usize,
+        mut acquire: impl FnMut(usize, usize) -> Result<Arc<dyn ViewMemoryLease>>,
+    ) -> Result<()> {
+        let sizes = self.source_array_memory_sizes()?;
+        let mut leases_by_array = HashMap::<usize, Arc<dyn ViewMemoryLease>>::new();
+
+        for column in &self.columns {
+            for (array, lease) in column.arrays.iter().zip(&column.memory_leases) {
+                if let Some(lease) = lease.as_ref().filter(|lease| lease.tracker_id() == tracker_id) {
+                    let identity = Arc::as_ptr(array) as *const () as usize;
+                    leases_by_array
+                        .entry(identity)
+                        .or_insert_with(|| Arc::clone(lease));
+                }
+            }
+        }
+
+        for (identity, bytes) in sizes {
+            if !leases_by_array.contains_key(&identity) {
+                leases_by_array.insert(identity, acquire(identity, bytes)?);
+            }
+        }
+
+        for column in &mut self.columns {
+            for (array, lease) in column.arrays.iter().zip(&mut column.memory_leases) {
+                let identity = Arc::as_ptr(array) as *const () as usize;
+                let shared = leases_by_array.get(&identity).ok_or_else(|| {
+                    VeinError::internal("retained array is missing its memory lease")
+                })?;
+                if lease
+                    .as_ref()
+                    .is_none_or(|current| current.tracker_id() != tracker_id)
+                {
+                    *lease = Some(Arc::clone(shared));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attach RAII accounting leases to source arrays by their shared identity.
+    pub(crate) fn attach_memory_leases(
+        &mut self,
+        leases: &HashMap<usize, Arc<dyn ViewMemoryLease>>,
+    ) {
+        for column in &mut self.columns {
+            column.attach_memory_leases(leases);
+        }
     }
 
     /// The shared active-row selection.

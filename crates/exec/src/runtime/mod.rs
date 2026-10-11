@@ -24,6 +24,7 @@ use crate::operators::join::{
 };
 use crate::operators::sink::{ClientOutput, CollectSink, ViewResultBatch, WriteReceipt};
 use crate::operators::{LimitTransform, SortTransform};
+use crate::memory::QueryMemoryTracker;
 use crate::pipeline::{
     DataChunk, DataChunkView, MaterializationReport, PipelineNode, Sink, Source, Transform,
 };
@@ -690,6 +691,7 @@ impl<B> PipelineNode<B> for SuppressFlush<B> {
 /// [`TaskResult`].
 pub struct DefaultTaskExecutor {
     builder: Arc<dyn ExecutorBuilder>,
+    memory_limit: usize,
 }
 
 impl DefaultTaskExecutor {
@@ -711,7 +713,18 @@ impl DefaultTaskExecutor {
 
     /// Create a task executor that builds pipelines with `builder`.
     pub fn new(builder: Arc<dyn ExecutorBuilder>) -> Self {
-        Self { builder }
+        Self {
+            builder,
+            memory_limit: usize::MAX,
+        }
+    }
+
+    /// Create a task executor with a per-execution budget for blocking state.
+    pub fn with_memory_limit(builder: Arc<dyn ExecutorBuilder>, memory_limit: usize) -> Self {
+        Self {
+            builder,
+            memory_limit,
+        }
     }
 
     /// Execute a recursive input tree with bounded batches between operators.
@@ -721,10 +734,11 @@ impl DefaultTaskExecutor {
         mut next: Box<dyn PipelineNode<DataChunkView>>,
         task: &'a ExecuteTask,
         cancel: &'a CancellationToken,
+        memory: &'a QueryMemoryTracker,
         span: &'a tracing::Span,
         schedule: &'a PipelineExecutionSchedule,
         depth: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output=Result<u64>> + Send + 'a>> {
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return Err(VeinError::cancelled());
@@ -902,6 +916,7 @@ impl DefaultTaskExecutor {
                             Box::new(TransformHandle(transform)),
                             task,
                             cancel,
+                            memory,
                             span,
                             schedule,
                             depth + 1,
@@ -917,11 +932,12 @@ impl DefaultTaskExecutor {
                         } else {
                             "aggregate"
                         };
-                    let (accumulator, handle) = aggregate::shared(plan.clone())?;
+                    let (accumulator, handle) =
+                        aggregate::shared_with_memory_tracker(plan.clone(), memory.clone())?;
                     let handle: Box<dyn PipelineNode<DataChunkView>> =
                         Box::new(MaterializeViewNode::for_operator(handle, &input.operator)?);
                     let bytes = self
-                        .execute_input(child, handle, task, cancel, span, schedule, depth + 1)
+                        .execute_input(child, handle, task, cancel, memory, span, schedule, depth + 1)
                         .await?;
                     let boundary =
                         if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
@@ -930,16 +946,15 @@ impl DefaultTaskExecutor {
                             PipelineBoundaryKind::AggregateInput
                         };
                     schedule.complete_boundary(input, boundary)?;
-                    let (groups, metrics, group_count) = {
+                    let (metrics, group_count) = {
                         let mut accumulator = accumulator
                             .lock()
                             .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
-                        let groups = accumulator.finish()?;
-                        (groups, accumulator.metrics(), accumulator.group_count())
+                        accumulator.finish_with(aggregate::AGGREGATE_BATCH_ROWS, |batch| {
+                            next.push(DataChunkView::from_chunk(batch)?)
+                        })?;
+                        (accumulator.metrics(), accumulator.group_count())
                     };
-                    for batch in groups {
-                        next.push(DataChunkView::from_chunk(batch)?)?;
-                    }
                     next.flush()?;
                     tracing::info!(
                         target: "vein.audit",
@@ -989,11 +1004,12 @@ impl DefaultTaskExecutor {
                         VeinError::planning("recursive sort output width is invalid", None)
                     })?;
                     let sort: Box<dyn PipelineNode<DataChunkView>> =
-                        Box::new(SortTransform::with_output_columns(
+                        Box::new(SortTransform::with_memory_tracker(
                             plan.clone(),
                             Some(output_columns),
+                            memory.clone(),
                             next,
-                        ));
+                        )?);
                     let next: Box<dyn PipelineNode<DataChunkView>> = match key_program {
                         Some(program) => {
                             Box::new(TransformHandle(self.builder.build_view_vm(program, sort)?))
@@ -1001,7 +1017,7 @@ impl DefaultTaskExecutor {
                         None => sort,
                     };
                     let bytes = self
-                        .execute_input(child, next, task, cancel, span, schedule, depth + 1)
+                        .execute_input(child, next, task, cancel, memory, span, schedule, depth + 1)
                         .await?;
                     schedule.complete_boundary(input, PipelineBoundaryKind::SortInput)?;
                     Ok(bytes)
@@ -1013,11 +1029,12 @@ impl DefaultTaskExecutor {
                         Box::new(limit),
                         task,
                         cancel,
+                        memory,
                         span,
                         schedule,
                         depth + 1,
                     )
-                    .await
+                        .await
                 }
                 PhysicalPlanOperator::Sink { .. } => Err(VeinError::planning(
                     "sink operator may only appear at the physical plan root",
@@ -1025,16 +1042,18 @@ impl DefaultTaskExecutor {
                 )),
                 PhysicalPlanOperator::Join { probe, build, plan } => {
                     let started = Instant::now();
-                    let build_sink = Arc::new(Mutex::new(Some(BuildSink::new(
+                    let build_sink = Arc::new(Mutex::new(Some(BuildSink::with_memory_tracker(
                         join_keys(&plan.probe_keys),
                         join_keys(&plan.build_keys),
-                    ))));
+                        memory.clone(),
+                    )?)));
                     let build_bytes = self
                         .execute_input(
                             build,
                             Box::new(SharedBuildSink(Arc::clone(&build_sink))),
                             task,
                             cancel,
+                            memory,
                             span,
                             schedule,
                             depth + 1,
@@ -1080,6 +1099,7 @@ impl DefaultTaskExecutor {
                             }),
                             task,
                             cancel,
+                            memory,
                             span,
                             schedule,
                             depth + 1,
@@ -1133,6 +1153,7 @@ impl DefaultTaskExecutor {
             ));
         };
         let schedule = PipelineExecutionSchedule::derive(&task.plan)?;
+        let memory = QueryMemoryTracker::new(self.memory_limit, cancel.clone());
 
         let sink_started = Instant::now();
         let sink = make_sink(self.builder.as_ref(), sink_plan)?;
@@ -1154,7 +1175,7 @@ impl DefaultTaskExecutor {
         let run_started = Instant::now();
         let source_started = Instant::now();
         let bytes_read = self
-            .execute_input(input, head, task, &cancel, &task_span, &schedule, 0)
+            .execute_input(input, head, task, &cancel, &memory, &task_span, &schedule, 0)
             .await?;
         schedule.complete_boundary(&task.plan.root, PipelineBoundaryKind::ResultSink)?;
         schedule.verify_complete()?;
@@ -1184,6 +1205,9 @@ impl DefaultTaskExecutor {
             rows = row_count,
             output_batches = output.len(),
             bytes_read,
+            memory_limit_bytes = memory.limit(),
+            memory_peak_bytes = memory.peak(),
+            memory_reserved_bytes = memory.used(),
             total_us = duration_ns / 1000,
             "task_finished"
         );
@@ -1227,7 +1251,7 @@ impl TaskExecutor for DefaultTaskExecutor {
         self.execute_with_output(task, cancel, |builder, sink| {
             builder.build_view_result_sink(sink, None)
         })
-        .await
+            .await
     }
 
     async fn execute_views_streaming(
@@ -1239,7 +1263,7 @@ impl TaskExecutor for DefaultTaskExecutor {
         self.execute_with_output(task, cancel, move |builder, sink| {
             builder.build_view_result_sink(sink, Some(output))
         })
-        .await
+            .await
     }
 
     async fn execute_streaming(
@@ -1251,7 +1275,7 @@ impl TaskExecutor for DefaultTaskExecutor {
         self.execute_with_output(task, cancel, move |builder, sink| {
             builder.build_streaming_sink(sink, output)
         })
-        .await
+            .await
     }
 }
 
@@ -1446,7 +1470,7 @@ mod tests {
                 DataChunkView::from_chunk(DataChunk::new(vec![Arc::clone(&source)], selection))
                     .unwrap(),
             )
-            .unwrap();
+                .unwrap();
         }
         assert_eq!(node.batches, 2);
         assert_eq!(node.rows, 5);
@@ -1838,9 +1862,9 @@ mod tests {
             std::time::Duration::from_secs(2),
             runner.execute(&task, CancellationToken::new()),
         )
-        .await
-        .expect("failed scan workers must not leave peers blocked")
-        .expect_err("an invalid source work item should fail the task");
+            .await
+            .expect("failed scan workers must not leave peers blocked")
+            .expect_err("an invalid source work item should fail the task");
         assert!(result.to_string().contains("invalid value"));
     }
 
@@ -1879,8 +1903,8 @@ mod tests {
             std::time::Duration::from_secs(2),
             runner.execute(&task, cancel),
         )
-        .await
-        .expect("cancelled scans must release bounded-channel senders");
+            .await
+            .expect("cancelled scans must release bounded-channel senders");
         assert!(result.is_err());
         assert_eq!(builder.active_sources.load(Ordering::Relaxed), 0);
     }
@@ -2010,9 +2034,9 @@ mod tests {
         let fused = DefaultTaskExecutor::new(Arc::new(MemoryFeedBuilder::with_nullable_values(
             values.clone(),
         )))
-        .execute(&fused_task, CancellationToken::new())
-        .await
-        .expect("fused projection should preserve NULL values");
+            .execute(&fused_task, CancellationToken::new())
+            .await
+            .expect("fused projection should preserve NULL values");
         let recursive =
             DefaultTaskExecutor::new(Arc::new(MemoryFeedBuilder::with_nullable_values(values)))
                 .execute(&recursive_task, CancellationToken::new())
@@ -2693,13 +2717,13 @@ mod tests {
     async fn both_result_apis_preserve_zero_column_counts_and_empty_input() {
         let mut task = task();
         let input = plan_node(Arc::new(types::VeinSchema::empty()),
-            PhysicalPlanOperator::Pipeline {
-                source: Arc::new(DataSource::Memory),
-                input_schema: int64_schema(),
-                program: Arc::new(MicroProgram::new(1, vec![
-                    MicroOp::ProjectRegisters { out_regs: Vec::new() },
-                ])),
-            },
+                              PhysicalPlanOperator::Pipeline {
+                                  source: Arc::new(DataSource::Memory),
+                                  input_schema: int64_schema(),
+                                  program: Arc::new(MicroProgram::new(1, vec![
+                                      MicroOp::ProjectRegisters { out_regs: Vec::new() },
+                                  ])),
+                              },
         );
         task.plan = plan_with_input(&task, input);
         for values in [vec![], vec![1, 2, 3]] {
@@ -3319,5 +3343,37 @@ mod tests {
             .expect("group count");
         assert_eq!(key.value(0), 1);
         assert_eq!(count.value(0), 4);
+    }
+
+    #[tokio::test]
+    async fn configured_memory_limit_reaches_recursive_aggregate_state() {
+        let input = InputPlanFixture::Pipeline {
+            source: DataSource::Memory,
+            program: Arc::new(MicroProgram::empty()),
+        };
+        let aggregate = InputPlanFixture::Aggregate {
+            input: Box::new(input),
+            plan: AggregatePlan {
+                groups: 0,
+                estimated_groups: None,
+                grouping_sets: Some(vec![Vec::new()]),
+                emit_empty_group_on_empty_input: true,
+                aggs: vec![AggOpCode::Count],
+                aggregate_input_types: vec![VeinDataType::Int64],
+                types: vec![VeinDataType::Int64],
+            },
+        };
+        let mut task = task();
+        set_input_plan(&mut task, aggregate);
+        let runner = DefaultTaskExecutor::with_memory_limit(
+            Arc::new(MemoryFeedBuilder::with_values(vec![1, 2, 3])),
+            0,
+        );
+
+        let error = runner
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect_err("recursive aggregate must use the configured execution budget");
+        assert!(matches!(error, VeinError::ResourceExhausted { .. }));
     }
 }

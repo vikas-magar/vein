@@ -173,6 +173,20 @@ impl GroupIndex {
             .insert_unique(entry.hash, entry, |existing| existing.hash);
     }
 
+    /// Removes one entry when the aggregate cannot finish committing its batch.
+    pub(super) fn remove(&mut self, hash: u64, slot: usize) -> bool {
+        match self
+            .entries
+            .find_entry(hash, |entry| entry.hash == hash && entry.slot == slot)
+        {
+            Ok(entry) => {
+                entry.remove();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.entries.len()

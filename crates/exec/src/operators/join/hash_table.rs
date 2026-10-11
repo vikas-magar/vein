@@ -9,9 +9,11 @@
 //! ordinary Arrow payload arrays are requested only at an explicit boundary.
 
 use arrow::array::{Array, Int64Array, StringArray};
-
-use crate::pipeline::{DataChunk, DataChunkView, MaterializationReport};
+use std::mem::size_of;
 use std::time::Instant;
+
+use crate::memory::{MemoryReservation, QueryMemoryTracker};
+use crate::pipeline::{DataChunk, DataChunkView, MaterializationReport};
 use common::Result;
 use error::VeinError;
 use types::{HashJoinKeyType, VeinDataType};
@@ -194,7 +196,7 @@ struct Entry {
 }
 
 /// A build side indexed by key hash, holding references rather than rows.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HashTable {
     /// Key columns of a build chunk.
     build_keys: JoinKeys,
@@ -219,6 +221,8 @@ pub struct HashTable {
     /// Build key array conversions, excluding inline-key/index allocations.
     build_key_materialization: MaterializationReport,
     build_key_materialize_us: u64,
+    tracker: QueryMemoryTracker,
+    memory: MemoryReservation,
 }
 
 impl HashTable {
@@ -230,19 +234,44 @@ impl HashTable {
     /// probe through the build's positions would compare the wrong columns and
     /// return wrong rows.
     pub fn new(build_keys: JoinKeys, probe_keys: JoinKeys) -> Self {
-        Self {
+        Self::with_memory_tracker(
+            build_keys,
+            probe_keys,
+            QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new()),
+        )
+            .expect("unlimited join budget must fit initial buckets")
+    }
+
+    /// Create a hash table that charges owned index state to `tracker`.
+    pub fn with_memory_tracker(
+        build_keys: JoinKeys,
+        probe_keys: JoinKeys,
+        tracker: QueryMemoryTracker,
+    ) -> Result<Self> {
+        let bucket_bytes = INITIAL_BUCKETS
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| VeinError::internal("initial join bucket size overflow"))?;
+        let memory = tracker.reserve(bucket_bytes, "hash join buckets")?;
+        let mut buckets = Vec::new();
+        buckets.try_reserve_exact(INITIAL_BUCKETS).map_err(|error| {
+            VeinError::internal(format!("cannot allocate initial hash join buckets: {error}"))
+        })?;
+        buckets.resize(INITIAL_BUCKETS, NONE);
+        Ok(Self {
             build_keys,
             probe_keys,
             chunks: Vec::new(),
             keys_by_chunk: Vec::new(),
             entries: Vec::new(),
             hashes: Vec::new(),
-            buckets: vec![NONE; INITIAL_BUCKETS],
+            buckets,
             null_keyed: Vec::new(),
             keys: Vec::new(),
             build_key_materialization: MaterializationReport::default(),
             build_key_materialize_us: 0,
-        }
+            tracker: tracker.clone(),
+            memory,
+        })
     }
 
     /// Whether the build key is a single `Int64`, so [`Self::keys`] is usable.
@@ -270,7 +299,13 @@ impl HashTable {
     }
 
     /// Retains a reference-backed build batch and indexes its active rows.
-    pub fn insert_view(&mut self, chunk: DataChunkView) -> Result<()> {
+    pub fn insert_view(&mut self, mut chunk: DataChunkView) -> Result<()> {
+        let tracker_id = self.tracker.identity();
+        chunk.account_source_arrays(tracker_id, |identity, bytes| {
+            let lease: std::sync::Arc<dyn crate::pipeline::view::ViewMemoryLease> =
+                self.tracker.lease_retained_array(identity, bytes, "hash join retained arrays")?;
+            Ok(lease)
+        })?;
         let (keys, report, materialize_us) = ChunkKeys::resolve(&self.build_keys, &chunk)?;
         self.build_key_materialization.accumulate(report);
         self.build_key_materialize_us = self.build_key_materialize_us.saturating_add(materialize_us);
@@ -279,17 +314,27 @@ impl HashTable {
         // vectors while still reading the chunk's resolved keys. Building a
         // `(row, hash, is_null)` scratch vector instead cost 24 bytes per build
         // row — three times what the table itself stores.
+        self.memory.grow(size_of::<DataChunkView>(), "hash join chunk references")?;
         self.chunks.push(chunk);
 
         for position in 0..self.chunks[chunk_index as usize].num_rows() {
             let row = position as u32;
             if keys.any_null(row as usize) {
+                self.memory.grow(size_of::<(u32, u32)>(), "hash join null-key index")?;
                 self.null_keyed.push((chunk_index, row));
                 continue;
             }
             // Grown per row rather than sized up front, so no count pass is
             // needed; the doubling makes it amortised constant.
-            self.grow_if_needed(1);
+            self.grow_if_needed(1)?;
+            let inline_key = keys.single_i64(row as usize);
+            let entry_bytes = size_of::<Entry>()
+                .checked_add(size_of::<u64>())
+                .and_then(|bytes| {
+                    bytes.checked_add(inline_key.map_or(0, |_| size_of::<i64>()))
+                })
+                .ok_or_else(|| VeinError::internal("join index entry size overflow"))?;
+            self.memory.grow(entry_bytes, "hash join row index")?;
             let hash = keys.hash(row as usize);
             let index = self.entries.len() as u32;
             let bucket = bucket_of(hash, self.buckets.len());
@@ -301,7 +346,7 @@ impl HashTable {
                 next,
             });
             self.hashes.push(hash);
-            if let Some(value) = keys.single_i64(row as usize) {
+            if let Some(value) = inline_key {
                 self.keys.push(value);
             }
         }
@@ -319,16 +364,29 @@ impl HashTable {
     /// Called once per chunk, sized for the entries about to arrive, so a large
     /// build side does not degrade into one long chain per bucket. Null-keyed
     /// rows are not in the table to rehash.
-    fn grow_if_needed(&mut self, additional: usize) {
-        let wanted = (self.entries.len() + additional) * 2;
+    fn grow_if_needed(&mut self, additional: usize) -> Result<()> {
+        let wanted = self.entries.len().checked_add(additional)
+            .and_then(|entries| entries.checked_mul(2))
+            .ok_or_else(|| VeinError::internal("hash join bucket count overflow"))?;
         if wanted <= self.buckets.len() {
-            return;
+            return Ok(());
         }
         let mut size = self.buckets.len();
         while size < wanted {
-            size *= 2;
+            size = size.checked_mul(2)
+                .ok_or_else(|| VeinError::internal("hash join bucket count overflow"))?;
         }
-        self.rebucket(size);
+        let new_bytes = size.checked_mul(size_of::<u32>())
+            .ok_or_else(|| VeinError::internal("hash join bucket bytes overflow"))?;
+        let old_bytes = self.buckets.len().checked_mul(size_of::<u32>())
+            .ok_or_else(|| VeinError::internal("hash join bucket bytes overflow"))?;
+        self.memory.grow(new_bytes, "hash join buckets")?;
+        if let Err(error) = self.rebucket(size) {
+            self.memory.shrink(new_bytes);
+            return Err(error);
+        }
+        self.memory.shrink(old_bytes);
+        Ok(())
     }
 
     /// Rebuilds the buckets from the stored hashes.
@@ -336,17 +394,23 @@ impl HashTable {
     /// O(entries) and allocation-free apart from the bucket vector itself: the
     /// hashes are already computed, so nothing is re-hashed. Null-keyed rows are
     /// not in `entries`, so they are correctly left out.
-    fn rebucket(&mut self, size: usize) {
+    fn rebucket(&mut self, size: usize) -> Result<()> {
         // `bucket_of` masks, so the count must be a power of two. A caller's
         // "entries times two" is not one, and rounding up here keeps the
         // invariant in a single place rather than at every call site.
         let size = size.max(1).next_power_of_two();
-        self.buckets = vec![NONE; size];
+        let mut buckets = Vec::new();
+        buckets.try_reserve_exact(size).map_err(|error| {
+            VeinError::internal(format!("cannot allocate hash join buckets: {error}"))
+        })?;
+        buckets.resize(size, NONE);
+        self.buckets = buckets;
         for index in 0..self.entries.len() {
             let bucket = bucket_of(self.hashes[index], size);
             self.entries[index].next = self.buckets[bucket];
             self.buckets[bucket] = index as u32;
         }
+        Ok(())
     }
 
     /// Absorbs `other` into this table.
@@ -358,17 +422,34 @@ impl HashTable {
     ///
     /// Both tables must have been built on the same key; combining different
     /// keys would silently compare the wrong columns.
-    pub fn merge(&mut self, other: HashTable) -> Result<()> {
+    pub fn merge(&mut self, mut other: HashTable) -> Result<()> {
         if self.build_keys != other.build_keys || self.probe_keys != other.probe_keys {
             return Err(VeinError::internal(
                 "cannot merge hash tables built on different keys",
             ));
         }
-
+        if self.tracker.identity() != other.tracker.identity() {
+            for chunk in &mut other.chunks {
+                let tracker_id = self.tracker.identity();
+                chunk.account_source_arrays(tracker_id, |identity, bytes| {
+                    let lease: std::sync::Arc<dyn crate::pipeline::view::ViewMemoryLease> = self
+                        .tracker
+                        .lease_retained_array(identity, bytes, "merged hash join retained arrays")?;
+                    Ok(lease)
+                })?;
+            }
+        }
         let self_inline = self.inline_keys();
+        let other_inline = other.inline_keys();
+        let replaced_bucket_bytes = self
+            .buckets
+            .len()
+            .checked_add(other.buckets.len())
+            .and_then(|count| count.checked_mul(size_of::<u32>()))
+            .ok_or_else(|| VeinError::internal("merged join bucket bytes overflow"))?;
+        self.memory.absorb(other.memory)?;
         self.build_key_materialization.accumulate(other.build_key_materialization);
         self.build_key_materialize_us = self.build_key_materialize_us.saturating_add(other.build_key_materialize_us);
-        let other_inline = other.inline_keys();
         let offset = self.chunks.len() as u32;
 
         self.chunks.extend(other.chunks);
@@ -393,12 +474,26 @@ impl HashTable {
             self.keys.clear();
         }
 
-        self.rebucket(
-            self.buckets
-                .len()
-                .max(self.entries.len() * 2)
-                .max(INITIAL_BUCKETS),
-        );
+        let wanted_buckets = self.entries.len()
+            .checked_mul(2)
+            .ok_or_else(|| VeinError::internal("merged join bucket count overflow"))?;
+        let bucket_count = self
+            .buckets
+            .len()
+            .max(wanted_buckets)
+            .max(INITIAL_BUCKETS)
+            .max(1)
+            .next_power_of_two();
+        let new_bucket_bytes = bucket_count
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| VeinError::internal("merged join bucket bytes overflow"))?;
+        self.memory.grow(new_bucket_bytes, "hash join buckets")?;
+        if let Err(error) = self.rebucket(bucket_count) {
+            self.memory.shrink(new_bucket_bytes);
+            self.memory.shrink(other.buckets.len() * size_of::<u32>());
+            return Err(error);
+        }
+        self.memory.shrink(replaced_bucket_bytes);
         Ok(())
     }
 
@@ -816,5 +911,271 @@ mod tests {
         let mut left = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
         let right = HashTable::new(JoinKeys::new(vec![1]), JoinKeys::new(vec![1]));
         assert!(left.merge(right).is_err());
+    }
+
+    #[test]
+    fn build_index_respects_budget_and_releases_reservation_on_error() {
+        let cancel = common::cancellation::CancellationToken::new();
+        let budget = QueryMemoryTracker::new(INITIAL_BUCKETS * size_of::<u32>(), cancel);
+        let mut table = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            budget.clone(),
+        )
+            .expect("initial bucket table fits the configured budget");
+        assert_eq!(budget.used(), INITIAL_BUCKETS * size_of::<u32>());
+
+        let error = table
+            .insert(chunk(ints(&[1])))
+            .expect_err("the row index must not exceed the budget");
+        assert!(matches!(error, VeinError::ResourceExhausted { .. }));
+        drop(table);
+        assert_eq!(budget.used(), 0, "failed build state releases all reservations");
+    }
+
+    #[test]
+    fn retained_build_arrays_are_charged_once_across_views_and_live_through_outputs() {
+        let source = ints(&[10, 20]);
+        let source_bytes = source.get_array_memory_size();
+        let tracker = QueryMemoryTracker::new(
+            1 << 20,
+            common::cancellation::CancellationToken::new(),
+        );
+        let mut table = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            tracker.clone(),
+        )
+            .expect("create budgeted table");
+        let initial_bytes = tracker.used();
+
+        for _ in 0..2 {
+            let view = DataChunkView::from_chunk(chunk(Arc::clone(&source)))
+                .expect("wrap retained source array");
+            table.insert_view(view).expect("retain build view");
+        }
+        let after_build = tracker.used();
+        assert!(
+            after_build >= initial_bytes + source_bytes,
+            "retained Arrow source array must be included in query memory"
+        );
+
+        let output = DataChunkView::compose_rows(&[table.build_chunk(0)], &[(0, 1)], 1)
+            .expect("output keeps the source array reference");
+        drop(table);
+        assert!(
+            tracker.used() >= source_bytes,
+            "the result view keeps the source-array lease alive after the hash table drops"
+        );
+        assert_eq!(
+            output.resolve(0, 0).expect("resolve output").unwrap().1,
+            1,
+            "the output maps to the requested source row"
+        );
+        drop(output);
+        assert_eq!(tracker.used(), 0, "the last retaining view releases all state");
+    }
+
+    #[test]
+    fn equal_sized_distinct_build_arrays_each_consume_their_own_budget() {
+        let shared_tracker = QueryMemoryTracker::new(
+            1 << 20,
+            common::cancellation::CancellationToken::new(),
+        );
+        let mut shared_table = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            shared_tracker.clone(),
+        )
+            .expect("create shared-array table");
+        let source = ints(&[10, 20]);
+        let array_bytes = source.get_array_memory_size();
+        let initial_shared_bytes = shared_tracker.used();
+
+        for _ in 0..2 {
+            shared_table
+                .insert_view(
+                    DataChunkView::from_chunk(chunk(Arc::clone(&source)))
+                        .expect("shared array view"),
+                )
+                .expect("insert shared array");
+        }
+        let shared_bytes = shared_tracker.used() - initial_shared_bytes;
+
+        let distinct_tracker = QueryMemoryTracker::new(
+            1 << 20,
+            common::cancellation::CancellationToken::new(),
+        );
+        let mut distinct_table = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            distinct_tracker.clone(),
+        )
+            .expect("create distinct-array table");
+        let initial_distinct_bytes = distinct_tracker.used();
+        for _ in 0..2 {
+            distinct_table
+                .insert_view(
+                    DataChunkView::from_chunk(chunk(ints(&[10, 20])))
+                        .expect("distinct array view"),
+                )
+                .expect("insert distinct array");
+        }
+        let distinct_bytes = distinct_tracker.used() - initial_distinct_bytes;
+
+        assert_eq!(
+            distinct_bytes - shared_bytes,
+            array_bytes,
+            "only the distinct source array adds another retained-array reservation"
+        );
+    }
+
+    #[test]
+    fn retained_build_array_budget_failure_happens_before_retaining_the_view() {
+        let source = ints(&[10, 20]);
+        let source_bytes = source.get_array_memory_size();
+        let initial_buckets = INITIAL_BUCKETS * size_of::<u32>();
+        let tracker = QueryMemoryTracker::new(
+            initial_buckets + source_bytes - 1,
+            common::cancellation::CancellationToken::new(),
+        );
+        let mut table = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            tracker.clone(),
+        )
+            .expect("initial buckets fit the budget");
+        let view = DataChunkView::from_chunk(chunk(source)).expect("wrap build array");
+
+        let error = table
+            .insert_view(view)
+            .expect_err("the retained source array must respect the query budget");
+        assert!(matches!(error, VeinError::ResourceExhausted { .. }));
+        assert_eq!(tracker.used(), initial_buckets, "failed insertion releases its lease");
+        drop(table);
+        assert_eq!(tracker.used(), 0);
+    }
+
+    #[test]
+    fn merging_budgeted_tables_releases_the_replaced_bucket_allocation() {
+        let tracker = QueryMemoryTracker::new(
+            1 << 20,
+            common::cancellation::CancellationToken::new(),
+        );
+        let mut left = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            tracker.clone(),
+        )
+            .expect("create left table");
+        let mut right = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            tracker.clone(),
+        )
+            .expect("create right table");
+        left.insert(chunk(ints(&[1]))).expect("insert left row");
+        right.insert(chunk(ints(&[2]))).expect("insert right row");
+        let before_merge = tracker.used();
+
+        left.merge(right).expect("merge tables sharing one tracker");
+
+        assert_eq!(
+            tracker.used(),
+            before_merge - INITIAL_BUCKETS * size_of::<u32>(),
+            "merge replaces two bucket arrays with one"
+        );
+        drop(left);
+        assert_eq!(tracker.used(), 0);
+    }
+
+    #[test]
+    fn merging_tables_from_independent_budgets_transfers_accounting() {
+        let left_tracker = QueryMemoryTracker::new(
+            1 << 20,
+            common::cancellation::CancellationToken::new(),
+        );
+        let right_tracker = QueryMemoryTracker::new(
+            1 << 20,
+            common::cancellation::CancellationToken::new(),
+        );
+        let mut left = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            left_tracker.clone(),
+        )
+            .expect("create left table");
+        let mut right = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            right_tracker.clone(),
+        )
+            .expect("create right table");
+        left.insert(chunk(ints(&[10]))).expect("insert left row");
+        right.insert(chunk(ints(&[20]))).expect("insert right row");
+        let left_before = left_tracker.used();
+        let right_before = right_tracker.used();
+
+        left.merge(right).expect("merge independently budgeted tables");
+
+        assert_eq!(right_tracker.used(), 0, "source reservation was transferred");
+        assert_eq!(
+            left_tracker.used(),
+            left_before + right_before - INITIAL_BUCKETS * size_of::<u32>(),
+            "destination owns merged state and only one bucket array"
+        );
+        let mut pairs = Vec::new();
+        left.probe(&chunk(ints(&[10, 20])), &mut pairs).expect("probe merged table");
+        assert_eq!(pairs.len(), 2);
+        drop(left);
+        assert_eq!(left_tracker.used(), 0, "merged reservation releases with table");
+    }
+
+    #[test]
+    fn merged_build_array_lease_moves_to_destination_and_outlives_the_table() {
+        let left_tracker = QueryMemoryTracker::new(
+            1 << 20,
+            common::cancellation::CancellationToken::new(),
+        );
+        let right_tracker = QueryMemoryTracker::new(
+            1 << 20,
+            common::cancellation::CancellationToken::new(),
+        );
+        let mut left = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            left_tracker.clone(),
+        )
+            .expect("create destination table");
+        let mut right = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            right_tracker.clone(),
+        )
+            .expect("create source table");
+        let source = ints(&[20, 30]);
+        let source_bytes = source.get_array_memory_size();
+        right
+            .insert_view(DataChunkView::from_chunk(chunk(Arc::clone(&source))).unwrap())
+            .expect("retain source build array");
+
+        left.merge(right).expect("transfer source table accounting");
+
+        assert_eq!(right_tracker.used(), 0, "source budget releases after merge");
+        assert!(
+            left_tracker.used() >= source_bytes,
+            "destination budget includes the merged build array"
+        );
+        let output = DataChunkView::compose_rows(&[left.build_chunk(0)], &[(0, 1)], 1)
+            .expect("compose a view over the merged array");
+        drop(left);
+
+        assert!(
+            left_tracker.used() >= source_bytes,
+            "output view keeps the destination lease alive after table drop"
+        );
+        assert_eq!(output.resolve(0, 0).unwrap().unwrap().1, 1);
+        drop(output);
+        assert_eq!(left_tracker.used(), 0, "final output drop releases destination lease");
     }
 }

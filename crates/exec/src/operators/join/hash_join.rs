@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use arrow::datatypes::DataType;
 
+use crate::memory::QueryMemoryTracker;
 use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode, Transform, ViewColumnRef, ViewInputRows};
 use common::Result;
 use error::VeinError;
@@ -62,11 +63,25 @@ impl BuildSink {
     /// A sink that keys each build chunk on `build_keys` and will be probed on
     /// `probe_keys`.
     pub fn new(probe_keys: JoinKeys, build_keys: JoinKeys) -> Self {
-        Self {
-            table: HashTable::new(build_keys, probe_keys),
+        Self::with_memory_tracker(
+            probe_keys,
+            build_keys,
+            QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new()),
+        )
+            .expect("unlimited join memory budget must create a build sink")
+    }
+
+    /// Create a build sink that charges its index to `tracker`.
+    pub fn with_memory_tracker(
+        probe_keys: JoinKeys,
+        build_keys: JoinKeys,
+        tracker: QueryMemoryTracker,
+    ) -> Result<Self> {
+        Ok(Self {
+            table: HashTable::with_memory_tracker(build_keys, probe_keys, tracker)?,
             rows: 0,
             insert_us: 0,
-        }
+        })
     }
 
     /// How many build rows have been absorbed.

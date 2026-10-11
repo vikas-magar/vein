@@ -18,6 +18,8 @@ pub mod operators;
 pub mod factory;
 /// Execution seam: stage-factory, task-executor, and expression traits.
 pub mod runtime;
+/// Query-scoped reservation accounting for blocking operator state.
+pub mod memory;
 /// Vector VM execution engine interpreting Micro-IR programs.
 pub mod vm;
 
