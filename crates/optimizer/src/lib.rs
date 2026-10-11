@@ -8,6 +8,11 @@
 /// Shared optimizer configuration and diagnostics.
 pub mod context;
 
+/// Borrowed metadata estimates and extensible cardinality/selectivity strategies.
+pub mod estimation;
+
+mod statistics;
+
 /// The optimizer rule trait and rule categories.
 pub mod rule;
 
@@ -19,7 +24,7 @@ pub mod rules;
 
 pub use context::{
     CatalogStatisticsProvider, OptimizationDiagnostics, OptimizerConfig, OptimizerContext,
-    OptimizerPhase, RuleExecution, StatisticsProvider,
+    OptimizerPhase, RuleExecution, StatisticsFreshness, StatisticsProvider, StatisticsSnapshot,
 };
 pub use optimizer::{Optimizer, OptimizerPipeline};
 pub use rule::{OptimizerRule, RuleType};

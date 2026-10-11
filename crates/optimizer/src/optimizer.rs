@@ -19,7 +19,8 @@ use std::time::Instant;
 use error::{Result, VeinError};
 use plan::{LogicalPlan, PlanTraversal};
 
-use crate::context::{OptimizationDiagnostics, OptimizerConfig, OptimizerContext, RuleExecution};
+use crate::context::{CatalogStatisticsProvider, OptimizationDiagnostics, OptimizerConfig,
+    OptimizerContext, RuleExecution, StatisticsProvider};
 use crate::rule::{OptimizerRule, RuleType};
 use crate::rules::{
     ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule, FilterNormalizationRule,
@@ -42,6 +43,7 @@ pub trait Optimizer: Send + Sync {
 pub struct OptimizerPipeline {
     rules: Vec<Arc<dyn OptimizerRule>>,
     config: OptimizerConfig,
+    statistics: Arc<dyn StatisticsProvider>,
 }
 
 impl OptimizerPipeline {
@@ -50,12 +52,19 @@ impl OptimizerPipeline {
         Self {
             rules,
             config: OptimizerConfig::default(),
+            statistics: Arc::new(CatalogStatisticsProvider),
         }
     }
 
     /// Sets the optimizer configuration.
     pub fn with_config(mut self, config: OptimizerConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Installs a statistics source shared by all planning estimates.
+    pub fn with_statistics_provider(mut self, provider: Arc<dyn StatisticsProvider>) -> Self {
+        self.statistics = provider;
         self
     }
 
@@ -100,7 +109,8 @@ impl OptimizerPipeline {
         &self,
         plan: LogicalPlan,
     ) -> Result<(LogicalPlan, OptimizationDiagnostics)> {
-        let context = OptimizerContext::new(self.config.clone());
+        let context = OptimizerContext::with_statistics_provider(
+            self.config.clone(), Arc::clone(&self.statistics));
         let rules: Vec<_> = self
             .rules
             .iter()
@@ -158,9 +168,10 @@ impl OptimizerPipeline {
             }
 
             diagnostics.sweeps = sweep;
-                if !changed {
-                    validate_lowered_subqueries(&next)?;
-                    tracing::info!(
+            if !changed {
+                validate_lowered_subqueries(&next)?;
+                diagnostics.cardinalities = context.estimate_plan(&next);
+                tracing::info!(
                     target: "vein.audit",
                     event = "optimizer_converged",
                     sweeps = sweep,

@@ -6,7 +6,8 @@ use error::Result;
 use parser::ast::expr::BinaryOp;
 use plan::{LogicalExpr, LogicalLiteral, LogicalPlan};
 
-use crate::context::OptimizerContext;
+use crate::context::{OptimizerContext, StatisticsFreshness};
+use crate::statistics::{compare, reverse as reverse_operator, valid_column};
 use crate::rule::{OptimizerRule, RuleType};
 
 /// Replaces a scan with a zero-row limit when table statistics prove that a
@@ -25,7 +26,7 @@ impl OptimizerRule for ScanStatisticsPruningRule {
     fn apply(
         &self,
         plan: &LogicalPlan,
-        _context: &OptimizerContext,
+        context: &OptimizerContext,
     ) -> Result<Option<LogicalPlan>> {
         let LogicalPlan::Filter { input, predicate } = plan else {
             return Ok(None);
@@ -37,9 +38,18 @@ impl OptimizerRule for ScanStatisticsPruningRule {
         let LogicalPlan::Scan { table, schema, .. } = input.as_ref() else {
             return Ok(None);
         };
-        let Some(statistics) = table.statistics.as_ref() else {
+        let Some(snapshot) = context.table_statistics(table) else {
             return Ok(None);
         };
+        if snapshot.freshness == StatisticsFreshness::Stale {
+            return Ok(None);
+        }
+        let statistics = snapshot.statistics;
+        let Some(rows) = statistics.num_rows else { return Ok(None); };
+        if schema.fields.iter().any(|c| statistics.column_statistics.get(&c.name)
+            .is_some_and(|stats| !valid_column(stats, rows, c.nullable))) {
+            return Ok(None);
+        }
 
         if !predicate_is_provably_empty(predicate, statistics) {
             return Ok(None);
@@ -118,15 +128,6 @@ fn predicate_is_provably_empty(
     }
 }
 
-fn reverse_operator(operator: BinaryOp) -> BinaryOp {
-    match operator {
-        BinaryOp::Lt => BinaryOp::Gt,
-        BinaryOp::Leq => BinaryOp::Geq,
-        BinaryOp::Gt => BinaryOp::Lt,
-        BinaryOp::Geq => BinaryOp::Leq,
-        operator => operator,
-    }
-}
 
 fn comparison_is_empty(
     operator: BinaryOp,
@@ -153,110 +154,6 @@ fn comparison_is_empty(
     }
 }
 
-fn compare(left: &LogicalLiteral, right: &LogicalLiteral) -> Option<Ordering> {
-    match (left, right) {
-        (LogicalLiteral::Boolean(left), LogicalLiteral::Boolean(right)) => Some(left.cmp(right)),
-        (LogicalLiteral::Int64(left), LogicalLiteral::Int64(right)) => Some(left.cmp(right)),
-        (LogicalLiteral::Float64(left), LogicalLiteral::Float64(right)) => left.partial_cmp(right),
-        (LogicalLiteral::String(left), LogicalLiteral::String(right)) => Some(left.cmp(right)),
-        (LogicalLiteral::Date(left), LogicalLiteral::Date(right)) => Some(left.cmp(right)),
-        (LogicalLiteral::Timestamp(left), LogicalLiteral::Timestamp(right)) => {
-            Some(left.cmp(right))
-        }
-        (LogicalLiteral::Time(left), LogicalLiteral::Time(right)) => Some(left.cmp(right)),
-        _ => None,
-    }
-}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use plan::{
-        ColumnId, ColumnStatistics, ResolvedColumn, ResolvedColumnRef, TableMetadata,
-        TableStatistics, VeinDataType, VeinSchema,
-    };
-    use std::sync::Arc;
-
-    fn scan_with_stats() -> (LogicalPlan, ResolvedColumnRef) {
-        let column = Arc::new(ResolvedColumn::new(ColumnId(1), "id", None, VeinDataType::Int64));
-        let schema = VeinSchema {
-            fields: vec![column.clone()],
-        };
-        let mut table_stats = TableStatistics::default();
-        table_stats.column_statistics.insert(
-            "id".to_string(),
-            ColumnStatistics {
-                min_value: Some(LogicalLiteral::Int64(10)),
-                max_value: Some(LogicalLiteral::Int64(20)),
-                null_count: Some(0),
-                ..ColumnStatistics::default()
-            },
-        );
-        table_stats.num_rows = Some(11);
-        let table = TableMetadata::new("t", Arc::new(schema.clone())).with_statistics(table_stats);
-        (
-            LogicalPlan::Scan {
-                table: Arc::new(table),
-                projection: None,
-                filters: vec![],
-                schema: Box::new(schema),
-            },
-            column,
-        )
-    }
-
-    fn predicate(column: &ResolvedColumnRef, op: BinaryOp, value: i64) -> LogicalExpr {
-        LogicalExpr::BinaryOp {
-            left: Box::new(LogicalExpr::Column(column.clone())),
-            op,
-            right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(value))),
-            return_type: VeinDataType::Boolean,
-        }
-    }
-
-    #[test]
-    fn prunes_out_of_range_equality() {
-        let (scan, column) = scan_with_stats();
-        let plan = LogicalPlan::Filter {
-            input: Box::new(scan),
-            predicate: predicate(&column, BinaryOp::Eq, 99),
-        };
-        let rewritten = ScanStatisticsPruningRule
-            .apply(&plan, &OptimizerContext::default())
-            .unwrap()
-            .expect("statistics prove empty");
-        assert!(matches!(rewritten, LogicalPlan::Limit { count: 0, .. }));
-    }
-
-    #[test]
-    fn prunes_impossible_null_checks() {
-        let (scan, column) = scan_with_stats();
-        let plan = LogicalPlan::Filter {
-            input: Box::new(scan),
-            predicate: LogicalExpr::IsNull {
-                expr: Box::new(LogicalExpr::Column(column)),
-            },
-        };
-        assert!(matches!(
-            ScanStatisticsPruningRule
-                .apply(&plan, &OptimizerContext::default())
-                .unwrap(),
-            Some(LogicalPlan::Limit { count: 0, .. })
-        ));
-    }
-
-    #[test]
-    fn preserves_uncertain_predicates() {
-        let (scan, column) = scan_with_stats();
-        let plan = LogicalPlan::Filter {
-            input: Box::new(scan),
-            predicate: predicate(&column, BinaryOp::Gt, 15),
-        };
-        assert!(
-            ScanStatisticsPruningRule
-                .apply(&plan, &OptimizerContext::default())
-                .unwrap()
-                .is_none()
-        );
-    }
-}
+mod tests;

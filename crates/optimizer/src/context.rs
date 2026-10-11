@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use plan::{TableMetadata, TableStatistics};
+use crate::estimation::{CardinalityEstimator, NodeEstimate, StatisticsEstimator};
 
 /// Optimizer execution configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,10 +19,30 @@ impl Default for OptimizerConfig {
     }
 }
 
-/// Supplies table statistics to optimizer rules.
+/// Freshness supplied by the statistics owner, independently of its estimates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatisticsFreshness {
+    /// The provider validated the snapshot against the current table revision.
+    Current,
+    /// Catalog statistics do not carry a freshness guarantee.
+    Unverified,
+    /// The provider knows the snapshot no longer describes the table.
+    Stale,
+}
+
+/// Borrowed statistics with explicit freshness; no metadata or bounds are cloned.
+#[derive(Debug, Clone, Copy)]
+pub struct StatisticsSnapshot<'a> {
+    /// Statistics owned by the catalog or provider.
+    pub statistics: &'a TableStatistics,
+    /// The provider's freshness assessment.
+    pub freshness: StatisticsFreshness,
+}
+
+/// Supplies borrowed table statistics to optimizer models.
 pub trait StatisticsProvider: Send + Sync {
     /// Returns statistics for a table when available.
-    fn table_statistics(&self, table: &TableMetadata) -> Option<TableStatistics>;
+    fn table_statistics<'a>(&'a self, table: &'a TableMetadata) -> Option<StatisticsSnapshot<'a>>;
 }
 
 /// Reads statistics directly from catalog table metadata.
@@ -29,8 +50,11 @@ pub trait StatisticsProvider: Send + Sync {
 pub struct CatalogStatisticsProvider;
 
 impl StatisticsProvider for CatalogStatisticsProvider {
-    fn table_statistics(&self, table: &TableMetadata) -> Option<TableStatistics> {
-        table.statistics.clone()
+    fn table_statistics<'a>(&'a self, table: &'a TableMetadata) -> Option<StatisticsSnapshot<'a>> {
+        table.statistics.as_ref().map(|statistics| StatisticsSnapshot {
+            statistics,
+            freshness: StatisticsFreshness::Unverified,
+        })
     }
 }
 
@@ -64,8 +88,13 @@ impl OptimizerContext {
     }
 
     /// Returns statistics for a table when available.
-    pub fn table_statistics(&self, table: &TableMetadata) -> Option<TableStatistics> {
+    pub fn table_statistics<'a>(&'a self, table: &'a TableMetadata) -> Option<StatisticsSnapshot<'a>> {
         self.statistics.table_statistics(table)
+    }
+
+    /// Estimates the authoritative logical tree using the shared provider.
+    pub fn estimate_plan(&self, plan: &plan::LogicalPlan) -> Vec<NodeEstimate> {
+        StatisticsEstimator::new(self.statistics.as_ref()).estimate_plan(plan)
     }
 }
 
@@ -102,10 +131,12 @@ pub struct RuleExecution {
 }
 
 /// Diagnostics returned with an optimized plan.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct OptimizationDiagnostics {
     /// Per-rule execution records.
     pub rule_executions: Vec<RuleExecution>,
     /// Number of completed sweeps.
     pub sweeps: usize,
+    /// Postorder cardinality estimates for the converged logical tree.
+    pub cardinalities: Vec<NodeEstimate>,
 }

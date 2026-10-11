@@ -744,6 +744,10 @@ mod tests {
         assert_eq!(metrics.materialization_ns.load(Ordering::Relaxed), 20);
 
         let mut guard = trace.execution_guard(node_id);
+        // An immediately dropped timer may share the same clock tick. Give the
+        // guard a known start interval without sleeping or changing runtime time.
+        guard.started = Instant::now().checked_sub(Duration::from_millis(1))
+            .expect("clock supports the test interval");
         guard.finish(&Ok(1));
         drop(guard);
         assert!(metrics.inclusive_elapsed_ns.load(Ordering::Relaxed) > 0);
