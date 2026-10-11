@@ -102,7 +102,7 @@ impl PipelineCompiler {
             | LogicalPlan::Write { input, .. } => Self::window(input)?,
             LogicalPlan::Filter { input, .. } => {
                 if Self::window(input)?.is_some() {
-                    return Err(VeinError::planning(
+                    return Err(VeinError::unsupported(
                         "a LIMIT below a WHERE is not supported: the engine applies a limit \
                          after the filter, so it would keep a different set of rows than the \
                          plan describes. Put the WHERE before the LIMIT.",
@@ -283,9 +283,11 @@ impl PipelineCompiler {
                         .map(|field| format!("{}#{}", field.name, field.id.0))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    VeinError::planning(
-                        format!("failed to compile recursive {operator} against input schema [{columns}]: {error}"),
-                        None,
+                    VeinError::context(
+                        format!(
+                            "failed to compile recursive {operator} against input schema [{columns}]"
+                        ),
+                        error,
                     )
                 })?;
         }
@@ -342,7 +344,7 @@ impl PipelineCompiler {
             LogicalPlan::Join { schema, .. }
             | LogicalPlan::Scan { schema, .. }
             | LogicalPlan::ExternalScan { schema, .. } => Ok((**schema).clone()),
-            LogicalPlan::Limit { .. } | LogicalPlan::Sort { .. } => Err(VeinError::planning(
+            LogicalPlan::Limit { .. } | LogicalPlan::Sort { .. } => Err(VeinError::unsupported(
                 "recursive LIMIT and ORDER require dedicated physical input nodes",
                 None,
             )),
@@ -362,7 +364,7 @@ impl PipelineCompiler {
                 compiler.compile_projection_with_schema(&projection, input_schema, schema)?;
                 Ok((**schema).clone())
             }
-            other => Err(VeinError::planning(
+            other => Err(VeinError::unsupported(
                 format!(
                     "unsupported recursive join transform '{}'; add transform lowering for this operator",
                     other.operator_name()
@@ -399,7 +401,7 @@ impl PipelineCompiler {
                     .as_ref()
                     .is_some_and(|format| format != &plan::TableFormat::Parquet)
                 {
-                    return Err(VeinError::planning(
+                    return Err(VeinError::unsupported(
                         format!("only Parquet tables are supported: '{}'", table.name),
                         None,
                     ));
@@ -425,7 +427,7 @@ impl PipelineCompiler {
                 if options.iter().any(|(key, value)| {
                     key.eq_ignore_ascii_case("format") && !value.eq_ignore_ascii_case("parquet")
                 }) {
-                    return Err(VeinError::planning(
+                    return Err(VeinError::unsupported(
                         "only Parquet external sources are supported",
                         None,
                     ));
@@ -466,7 +468,7 @@ impl PipelineCompiler {
             | LogicalPlan::Distinct { input, .. } => {
                 Self::collect_leaf_source(input, dictionary_group_ids)
             }
-            other => Err(VeinError::planning(
+            other => Err(VeinError::unsupported(
                 format!(
                     "unsupported source operator '{}' in Parquet pipeline; provide a supported scan source",
                     other.operator_name()
@@ -677,7 +679,7 @@ impl PipelineCompiler {
                 }
                 Ok((**schema).clone())
             }
-            other => Err(VeinError::planning(
+            other => Err(VeinError::unsupported(
                 format!(
                     "unsupported operator '{}' in Parquet pipeline; add pipeline lowering for this operator",
                     other.operator_name()
@@ -735,7 +737,7 @@ fn compile_post_aggregate_node(
             compiler.compile_projection_with_schema(exprs, &input_schema, schema)?;
             Ok((**schema).clone())
         }
-        other => Err(VeinError::planning(
+        other => Err(VeinError::unsupported(
             format!(
                 "unsupported operator '{}' above an aggregate; add post-aggregate lowering for this operator",
                 other.operator_name()
@@ -839,20 +841,20 @@ fn root_sort(plan: &LogicalPlan) -> Result<Option<(&[LogicalSortKey], &VeinSchem
             schema,
         } => {
             if contains_limit(input) {
-                return Err(VeinError::planning(
+                return Err(VeinError::unsupported(
                     "LIMIT before ORDER is not supported; move LIMIT after ORDER",
                     None,
                 ));
             }
             if contains_sort(input) {
-                return Err(VeinError::planning(
+                return Err(VeinError::unsupported(
                     "multiple ORDER operators in one pipeline are not supported yet",
                     None,
                 ));
             }
             Ok(Some((sort_keys, schema)))
         }
-        other if contains_sort(other) => Err(VeinError::planning(
+        other if contains_sort(other) => Err(VeinError::unsupported(
             "ORDER is currently supported at the end of a pipeline, optionally followed by LIMIT",
             None,
         )),
@@ -924,8 +926,8 @@ fn agg_op(name: &str) -> Result<AggOpCode> {
         "AVG" => AggOpCode::Avg,
         "SINGLE_VALUE" => AggOpCode::SingleValue,
         other => {
-            return Err(VeinError::planning(
-                format!("aggregate {other} is not implemented"),
+            return Err(VeinError::unsupported(
+                format!("aggregate {other} is not implemented; use a supported aggregate function"),
                 None,
             ));
         }
@@ -936,13 +938,16 @@ fn agg_op(name: &str) -> Result<AggOpCode> {
 fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr)> {
     let LogicalExpr::FunctionCall { name, args, .. } = agg else {
         return Err(VeinError::planning(
-            format!("an aggregate must be a function call, found {agg:?}"),
+            format!(
+                "aggregate expression must be a function call, found expression kind {}",
+                agg.kind_name()
+            ),
             None,
         ));
     };
     let [argument] = args.as_slice() else {
-        return Err(VeinError::planning(
-            format!("{name} takes exactly one argument in this engine"),
+        return Err(VeinError::unsupported(
+            format!("{name} currently requires exactly one argument"),
             None,
         ));
     };
@@ -1023,8 +1028,9 @@ mod tests {
         }
     }
 
-    fn assert_concise_operator_error(error: impl std::fmt::Display, context: &str) {
+    fn assert_concise_operator_error(error: &error::VeinError, context: &str) {
         let message = error.to_string();
+        assert_eq!(error.category(), error::ErrorCategory::Unsupported);
         assert!(message.contains("Explain"), "{message}");
         assert!(message.contains(context), "{message}");
         assert!(
@@ -1685,6 +1691,7 @@ mod tests {
         let error = PipelineCompiler::compile_recursive_transform(&filter, &input_schema)
             .expect_err("filter column omitted from recursive input should fail during lowering");
         let message = error.to_string();
+        assert_eq!(error.category(), error::ErrorCategory::Planning);
         assert!(message.contains("recursive filter"), "{message}");
         assert!(message.contains("ps_supplycost#39"), "{message}");
         assert!(message.contains("input schema [p_partkey#1]"), "{message}");

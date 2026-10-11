@@ -75,14 +75,32 @@ pub enum VeinError {
         span: Option<SourceSpan>,
     },
 
-    /// A planning error: the query is syntactically valid but a requested
-    /// feature is not yet supported by the planner.
-    #[error("Planning error: {message}")]
-    Planning {
-        /// Description of the unsupported feature.
+    /// A valid query requests a feature not implemented by the planner or engine.
+    #[error("Unsupported feature: {message}")]
+    Unsupported {
+        /// Description of the unsupported feature and available next action.
         message: String,
         /// The source span of the offending syntax, if known.
         span: Option<SourceSpan>,
+    },
+
+    /// A query cannot be lowered because a physical planning contract is invalid.
+    #[error("Planning error: {message}")]
+    Planning {
+        /// Description of the invalid planning contract.
+        message: String,
+        /// The source span of the offending syntax, if known.
+        span: Option<SourceSpan>,
+    },
+
+    /// Context added while preserving the category and source of another error.
+    #[error("{context}: {source}")]
+    Context {
+        /// Operation that was in progress when the source error occurred.
+        context: String,
+        /// Original typed error.
+        #[source]
+        source: Box<VeinError>,
     },
 
     // ── Execution ────────────────────────────────────────────
@@ -197,7 +215,9 @@ impl VeinError {
             Self::Serialization(_) => ErrorCategory::Data,
             Self::NotFound(_) => ErrorCategory::Catalog,
             Self::Semantic { .. } => ErrorCategory::Semantic,
+            Self::Unsupported { .. } => ErrorCategory::Unsupported,
             Self::Planning { .. } => ErrorCategory::Planning,
+            Self::Context { source, .. } => source.category(),
             Self::StageError { .. }
             | Self::Cancelled
             | Self::Timeout { .. }
@@ -213,6 +233,18 @@ impl VeinError {
             Self::Internal { .. } => ErrorCategory::Internal,
             Self::External(error) => error.category(),
         }
+    }
+
+    /// Returns the source errors below this error, from nearest to deepest.
+    ///
+    /// The iterator borrows the typed source chain and allocates nothing. It is
+    /// useful for structured logging while callers retain the original errors.
+    #[must_use]
+    pub fn causes(&self) -> impl Iterator<Item=&(dyn std::error::Error + 'static)> {
+        std::iter::successors(
+            std::error::Error::source(self),
+            |cause| std::error::Error::source(*cause),
+        )
     }
 
     /// Create an I/O error with context and underlying source.
@@ -249,12 +281,27 @@ impl VeinError {
         }
     }
 
-    /// Create a planning error (valid syntax, unsupported feature) with an
-    /// optional source span.
+    /// Create an error for an unsupported feature with an optional source span.
+    pub fn unsupported(message: impl Into<String>, span: Option<SourceSpan>) -> Self {
+        Self::Unsupported {
+            message: message.into(),
+            span,
+        }
+    }
+
+    /// Create an error for an invalid planning contract with an optional span.
     pub fn planning(message: impl Into<String>, span: Option<SourceSpan>) -> Self {
         Self::Planning {
             message: message.into(),
             span,
+        }
+    }
+
+    /// Add operation context without discarding the source error or its category.
+    pub fn context(context: impl Into<String>, source: Self) -> Self {
+        Self::Context {
+            context: context.into(),
+            source: Box::new(source),
         }
     }
 
@@ -474,8 +521,11 @@ mod tests {
     #[test]
     fn test_planning_renders_and_carries_span() {
         let span = SourceSpan::new(0, 5, 1, 1);
-        let err = VeinError::planning("WITH is not supported yet", Some(span));
-        assert_eq!(err.to_string(), "Planning error: WITH is not supported yet");
+        let err = VeinError::planning("join key is absent from its input", Some(span));
+        assert_eq!(
+            err.to_string(),
+            "Planning error: join key is absent from its input"
+        );
         assert!(matches!(
             err,
             VeinError::Planning {
@@ -483,6 +533,33 @@ mod tests {
                 ..
             } if *s == span
         ));
+    }
+
+    #[test]
+    fn unsupported_and_context_errors_preserve_category_and_source_chain() {
+        let error = VeinError::context(
+            "lowering a recursive filter",
+            VeinError::external(
+                ErrorCategory::Unsupported,
+                "VM expression lowering",
+                std::io::Error::other("expression opcode unavailable"),
+            ),
+        );
+
+        assert_eq!(
+            error.category(),
+            ErrorCategory::Unsupported,
+            "adding context must not change the underlying classification"
+        );
+        assert!(error.to_string().contains("lowering a recursive filter"));
+        assert!(error.to_string().contains("expression opcode unavailable"));
+        let causes = error.causes().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(
+            causes
+                .iter()
+                .any(|cause| cause.contains("expression opcode unavailable")),
+            "typed causes should remain reachable: {causes:?}"
+        );
     }
 
     #[test]
@@ -538,8 +615,19 @@ mod tests {
                 ErrorCategory::Semantic,
             ),
             (
-                VeinError::planning("unsupported operator", None),
+                VeinError::planning("join key is absent from its input", None),
                 ErrorCategory::Planning,
+            ),
+            (
+                VeinError::unsupported("window frames are not implemented", None),
+                ErrorCategory::Unsupported,
+            ),
+            (
+                VeinError::context(
+                    "compiling a source",
+                    VeinError::unsupported("nested loop join is not implemented", None),
+                ),
+                ErrorCategory::Unsupported,
             ),
             (VeinError::stage("scan", "failed"), ErrorCategory::Execution),
             (VeinError::cancelled(), ErrorCategory::Execution),

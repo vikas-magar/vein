@@ -341,13 +341,13 @@ The memory budget is an estimate for operator-managed state, not a process-RSS c
 
 #### Task 5.3 — Improve planning/runtime errors
 
-- [ ] Replace full-plan debug errors with operator name, relevant column/key, concise input/output schemas, and a next action.
-- [ ] Keep structured causes and query/operator IDs in tracing.
-- [ ] Distinguish unsupported logical semantics, invalid physical invariants, resource exhaustion, and execution failures.
-- **Acceptance:** Common failures do not emit an unbounded tree dump and identify the node and missing/invalid contract.
-- **Tests:** Assert stable error category and concise message for unsupported node, missing column, invalid key, cardinality violation, memory limit, and sink mismatch.
+- [x] Replace full-plan debug errors with operator name, relevant column/key, concise input/output schemas, and a next action.
+- [x] Keep structured causes and query/operator IDs in tracing.
+- [x] Distinguish unsupported logical semantics, invalid physical invariants, resource exhaustion, and execution failures.
+- [x] **Acceptance:** Common failures do not emit an unbounded tree dump and identify the node and missing/invalid contract.
+- [x] **Tests:** Stable error categories and concise messages are asserted for unsupported nodes, missing columns, invalid keys, scalar cardinality violations, memory/resource limits, and sink mismatches.
 
-**Planner diagnostic progress (2026-10-11):** Added exhaustive `LogicalPlan::operator_name()` and `LogicalExpr::kind_name()` APIs and replaced full logical plan/expression debug dumps in physical planner/compiler errors with concise operator-specific diagnostics. Regression coverage checks unsupported root, source, recursive transform, pipeline, post-aggregate, and scalar-subquery contexts, including that nested scan metadata is omitted. Planner failures now emit a concise `physical_planning_failed` audit event with query/request IDs and root operator while returning the original error; the trace regression checks those fields and that plan details are omitted. The trace regression, expression-label regression, all 13 planner tests, and all 61 physical crate tests pass. One full workspace `Test` run passed; a later full run exited 101, and the IDE preview did not include the failing target. `Check` and incremental `build_project` pass; the existing `Build` run configuration failed to start. Task 5.3 remains in progress: broader error categories and the acceptance-matrix tests still need completion.
+**Task 5.3 completed (2026-10-11):** Physical planner/compiler diagnostics use concise operator and expression labels, identify relevant columns/keys and input schemas, and give an actionable next step without formatting nested plan trees. The central `VeinError` supports distinct `Unsupported`, `Planning`, `Resource`, and `Execution` categories; context wrappers preserve category and source chains, and borrowed cause iteration supports structured failure tracing. `physical_planning_failed` includes query/request IDs, root operator, category, message, and causes while returning the original typed error. Regression coverage checks concise categories/messages for unsupported nodes, missing columns, invalid join keys, scalar-cardinality errors, memory/spill limits, and sink mismatch. RustRover workspace `Test` and `Check` pass. The full test run also exposed a flaky aggregate collision assertion that depended on randomized hash-table candidate order; the test now checks collision-path invariants while retaining exact output key/sum assertions.
 
 ### Phase 6 — Close known operator and workload gaps
 

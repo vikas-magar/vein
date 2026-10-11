@@ -60,21 +60,24 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
             "physical_planning_started"
         );
 
-        let result = match &logical_plan {
-            LogicalPlan::Scan { .. }
-            | LogicalPlan::ExternalScan { .. }
-            | LogicalPlan::Filter { .. }
-            | LogicalPlan::Project { .. }
-            | LogicalPlan::Join { .. }
-            | LogicalPlan::Limit { .. }
-            | LogicalPlan::Sort { .. }
-            | LogicalPlan::SubqueryAlias { .. }
-            | LogicalPlan::Aggregate { .. }
-            | LogicalPlan::Distinct { .. }
-            | LogicalPlan::Write { .. } => {
-                let stage = self.pipeline_builder.build(&logical_plan)?;
-                let graph = stage.pipeline_graph();
-                tracing::info!(
+        // Keep every fallible lowering and validation step inside this closure
+        // so the single failure path below records all planner errors.
+        let result = (|| -> Result<Job> {
+            match &logical_plan {
+                LogicalPlan::Scan { .. }
+                | LogicalPlan::ExternalScan { .. }
+                | LogicalPlan::Filter { .. }
+                | LogicalPlan::Project { .. }
+                | LogicalPlan::Join { .. }
+                | LogicalPlan::Limit { .. }
+                | LogicalPlan::Sort { .. }
+                | LogicalPlan::SubqueryAlias { .. }
+                | LogicalPlan::Aggregate { .. }
+                | LogicalPlan::Distinct { .. }
+                | LogicalPlan::Write { .. } => {
+                    let stage = self.pipeline_builder.build(&logical_plan)?;
+                    let graph = stage.pipeline_graph();
+                    tracing::info!(
                     target: "vein.audit",
                     event = "pipeline_graph_derived",
                     pipeline_count = graph.pipelines().len(),
@@ -86,19 +89,20 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                         .sum::<usize>(),
                     "pipeline_graph_derived"
                 );
-                for task in stage.tasks() {
-                    task.plan.validate()?;
+                    for task in stage.tasks() {
+                        task.plan.validate()?;
+                    }
+                    Ok(Job::new(request_id, query_id, stage, ExecutionMode::Batch))
                 }
-                Ok(Job::new(request_id, query_id, stage, ExecutionMode::Batch))
+                other => Err(VeinError::unsupported(
+                    format!(
+                        "{} is not supported by the physical planner yet; add physical lowering for this operator",
+                        other.operator_name()
+                    ),
+                    None,
+                )),
             }
-            other => Err(VeinError::planning(
-                format!(
-                    "{} is not supported by the physical planner yet; add physical lowering for this operator",
-                    other.operator_name()
-                ),
-                None,
-            )),
-        };
+        })();
 
         if let Err(error) = &result {
             tracing::error!(
@@ -107,7 +111,9 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 %request_id,
                 %query_id,
                 operator = logical_plan.operator_name(),
+                error_category = %error.category(),
                 error = %error,
+                causes = ?error.causes().map(|cause| format!("{cause:?}")).collect::<Vec<_>>(),
                 "physical_planning_failed"
             );
         }
@@ -124,6 +130,38 @@ mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::fmt::MakeWriter;
+
+    fn injected_lowering_failure() -> VeinError {
+        VeinError::context(
+            "lowering injected source",
+            VeinError::external(
+                error::ErrorCategory::Unsupported,
+                "test source adapter",
+                std::io::Error::other("source adapter detail"),
+            ),
+        )
+    }
+
+    #[derive(Debug)]
+    struct FailingPipelineStageBuilder;
+
+    impl PipelineStageBuilder for FailingPipelineStageBuilder {
+        fn build(&self, _plan: &LogicalPlan) -> Result<crate::stage::Stage> {
+            Err(injected_lowering_failure())
+        }
+
+        fn compile_pipeline(
+            &self,
+            _plan: &LogicalPlan,
+        ) -> Result<(
+            common::protocol::DataSource,
+            common::protocol::MicroProgram,
+            plan::schema::VeinSchema,
+            plan::schema::VeinSchema,
+        )> {
+            Err(injected_lowering_failure())
+        }
+    }
 
     #[derive(Clone)]
     struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -965,6 +1003,7 @@ mod tests {
             .expect_err("EXPLAIN has no physical execution path");
         let message = error.to_string();
 
+        assert_eq!(error.category(), error::ErrorCategory::Unsupported);
         assert!(message.contains("Explain"), "{message}");
         assert!(message.contains("add physical lowering"), "{message}");
         assert!(!message.contains("users"), "full scan metadata leaked: {message}");
@@ -1004,6 +1043,7 @@ mod tests {
 
         assert!(failure.contains("query_id="), "{failure}");
         assert!(failure.contains("request_id=feed"), "{failure}");
+        assert!(failure.contains("error_category=unsupported"), "{failure}");
         assert!(
             failure.contains("operator=") && failure.contains("Explain"),
             "{failure}"
@@ -1012,5 +1052,37 @@ mod tests {
         assert!(!failure.contains("users"), "plan details leaked: {failure}");
         assert!(message.contains("Explain"), "{message}");
         assert!(message.contains("add physical lowering"), "{message}");
+    }
+
+    #[test]
+    fn early_lowering_failure_is_logged_with_category_and_source_chain() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(SharedLogBuffer(Arc::clone(&output)))
+            .finish();
+        let request_id = RequestId::from_raw(0xbeef);
+        let planner = DefaultPhysicalPlanner::new()
+            .with_pipeline_builder(Arc::new(FailingPipelineStageBuilder));
+
+        let error = tracing::subscriber::with_default(subscriber, || {
+            planner
+                .create_physical_plan(request_id, mock_scan_plan())
+                .expect_err("the injected stage builder fails")
+        });
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let failure = logs
+            .lines()
+            .find(|line| line.contains("physical_planning_failed"))
+            .expect("the early builder failure must be logged");
+
+        assert_eq!(error.category(), error::ErrorCategory::Unsupported);
+        assert!(failure.contains("request_id=beef"), "{failure}");
+        assert!(failure.contains("query_id="), "{failure}");
+        assert!(failure.contains("operator=\"Scan\""), "{failure}");
+        assert!(failure.contains("error_category=unsupported"), "{failure}");
+        assert!(failure.contains("source adapter detail"), "{failure}");
+        assert!(failure.contains("lowering injected source"), "{failure}");
     }
 }

@@ -294,7 +294,7 @@ impl DefaultPipelineStageBuilder {
                     (*output_schema).clone(),
                 ))
             }
-            _ => Err(VeinError::planning(
+            _ => Err(VeinError::unsupported(
                 format!(
                     "logical operator '{}' is not supported by recursive physical lowering",
                     logical_node_name(plan)
@@ -392,7 +392,7 @@ fn extract_equi_join_keys(
     }
 
     if probe_keys.is_empty() {
-        return Err(VeinError::planning(
+        return Err(VeinError::unsupported(
             "hash join requires at least one equality between direct columns from opposite inputs with matching supported hash-key types; expression-only and non-equi joins are not supported",
             None,
         ));
@@ -439,7 +439,7 @@ fn equality_keys(
     };
     let (LogicalExpr::Column(left), LogicalExpr::Column(right)) = (left.as_ref(), right.as_ref())
     else {
-        return Err(VeinError::planning(
+        return Err(VeinError::unsupported(
             "join keys must be columns; expressions and constant keys are not supported yet",
             None,
         ));
@@ -454,10 +454,29 @@ fn equality_keys(
         | ((None, Some(build_key)), (Some(probe_key), None)) => {
             Ok((probe_key as u32, build_key as u32))
         }
-        _ => Err(VeinError::planning(
-            "join equality must compare one probe-side column with one build-side column",
-            None,
-        )),
+        _ => {
+            let describe_schema = |schema: &VeinSchema| {
+                schema
+                    .fields
+                    .iter()
+                    .map(|field| format!("{}#{}", field.name, field.id.0))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            Err(VeinError::planning(
+                format!(
+                    "join keys '{}#{}' and '{}#{}' must resolve to one column from each input; \
+                     check ON or USING against probe schema [{}] and build schema [{}]",
+                    left.name,
+                    left.id.0,
+                    right.name,
+                    right.id.0,
+                    describe_schema(probe),
+                    describe_schema(build),
+                ),
+                None,
+            ))
+        }
     }
 }
 
@@ -562,7 +581,7 @@ fn join_outputs(
         .iter()
         .map(|expr| {
             let LogicalExpr::Column(column) = expr else {
-                return Err(VeinError::planning(
+                return Err(VeinError::unsupported(
                     "a projection above a join must select plain columns: an expression \
                      needs a program after the join, which a task does not carry yet",
                     None,
@@ -764,6 +783,24 @@ mod tests {
                 .expect("build-to-probe equality should resolve"),
             (1, 0)
         );
+    }
+
+    #[test]
+    fn invalid_join_key_reports_a_planning_contract_error() {
+        let probe = VeinSchema::new(vec![test_column(10, "probe_key")]);
+        let build = VeinSchema::new(vec![test_column(20, "build_key")]);
+        let predicate = equality(test_column(99, "missing_key"), test_column(20, "build_key"));
+
+        let error = equality_keys(Some(&predicate), &probe, &build)
+            .expect_err("a join key absent from both inputs must fail planning");
+
+        assert_eq!(error.category(), error::ErrorCategory::Planning);
+        let message = error.to_string();
+        assert!(message.contains("missing_key#99"), "{message}");
+        assert!(message.contains("build_key#20"), "{message}");
+        assert!(message.contains("probe schema [probe_key#10]"), "{message}");
+        assert!(message.contains("build schema [build_key#20]"), "{message}");
+        assert!(message.contains("check ON or USING"), "{message}");
     }
 
     #[test]
@@ -1024,7 +1061,12 @@ mod tests {
         )
             .expect_err("same-side equality cannot be a hash join key");
 
-        assert!(error.to_string().contains("one probe-side column"));
+        assert_eq!(error.category(), error::ErrorCategory::Planning);
+        let message = error.to_string();
+        assert!(message.contains("key#11"), "{message}");
+        assert!(message.contains("must resolve to one column from each input"), "{message}");
+        assert!(message.contains("probe schema [other#10, key#11]"), "{message}");
+        assert!(message.contains("build schema [key#21, other#22]"), "{message}");
     }
 
     #[test]

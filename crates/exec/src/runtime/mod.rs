@@ -3134,6 +3134,7 @@ mod tests {
             .execute_views(&task, CancellationToken::new())
             .await
             .unwrap_err();
+        assert_eq!(error.category(), error::ErrorCategory::Planning);
         assert!(
             error
                 .to_string()
@@ -3812,7 +3813,26 @@ mod tests {
             .execute(&task, CancellationToken::new())
             .await
             .expect_err("recursive aggregate must use the configured execution budget");
-        assert!(matches!(error, VeinError::ResourceExhausted { .. }));
+        assert_eq!(error.category(), error::ErrorCategory::Resource);
+        let message = error.to_string();
+        assert!(
+            matches!(
+                &error,
+                VeinError::ResourceExhausted {
+                    resource,
+                    requested,
+                    limit: 0,
+                    unit: error::ResourceUnit::Bytes,
+                } if resource == "aggregate group state" && *requested > 0
+            ),
+            "expected a bounded aggregate-state memory error, received {error:?}"
+        );
+        assert!(
+            message.starts_with("Resource exhausted: aggregate group state, requested "),
+            "resource errors should identify the bounded state concisely: {message}"
+        );
+        assert!(message.ends_with("bytes, limit 0 bytes"), "{message}");
+        assert!(!message.contains("PhysicalPlanOperator"), "{message}");
     }
 
     fn full_join_spill_task() -> ExecuteTask {
@@ -3912,6 +3932,7 @@ mod tests {
             .await
             .expect_err("zero spill quota rejects a build-side run");
 
+        assert_eq!(error.category(), error::ErrorCategory::Resource);
         assert!(
             matches!(error, VeinError::ResourceExhausted { .. }),
             "expected spill-quota exhaustion, received {error:?}"

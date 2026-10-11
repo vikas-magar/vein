@@ -4199,9 +4199,13 @@ mod tests {
         let metrics = sink.metrics();
         assert_eq!(metrics.grouping_probes, 3);
         assert!(metrics.group_index_candidate_checks > 0);
-        assert_eq!(metrics.full_hash_matches, 3);
-        assert_eq!(metrics.group_key_comparisons, 3);
-        assert_eq!(metrics.group_collision_retries, 2);
+        // HashTable may encounter the real group before the deliberately
+        // injected colliding entry, so diagnostic counts vary with its
+        // randomized bucket layout. Assert the collision path was exercised,
+        // not a particular candidate traversal order.
+        assert!(metrics.full_hash_matches >= 2);
+        assert!(metrics.group_key_comparisons >= 2);
+        assert!(metrics.group_collision_retries >= 1);
         assert_eq!(metrics.group_index_hits, 1);
         assert_eq!(metrics.group_index_misses, 2);
 
@@ -4552,6 +4556,7 @@ mod tests {
                 vec![2],
             ))]))
             .expect_err("second row must violate scalar cardinality");
+        assert_eq!(error.category(), error::ErrorCategory::Execution);
         assert!(
             error
                 .to_string()

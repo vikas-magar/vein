@@ -219,7 +219,7 @@ impl BytecodeCompiler {
                 });
                 Ok(dst)
             }
-            unsupported => Err(VeinError::planning(
+            unsupported => Err(VeinError::unsupported(
                 format!(
                     "expression kind {} is not supported by VM bytecode lowering; route it through relational lowering",
                     unsupported.kind_name()
@@ -417,6 +417,35 @@ mod tests {
         assert!(message.contains("ScalarSubquery"), "{message}");
         assert!(message.contains("relational lowering"), "{message}");
         assert!(!message.contains("private_source_marker"), "{message}");
+        assert_eq!(error.category(), error::ErrorCategory::Unsupported);
+    }
+
+    #[test]
+    fn missing_column_error_names_column_and_concise_input_schema() {
+        let schema = VeinSchema::new(vec![std::sync::Arc::new(ResolvedColumn::new(
+            ColumnId(7),
+            "available",
+            None,
+            VeinDataType::Int64,
+        ))]);
+        let missing = std::sync::Arc::new(ResolvedColumn::new(
+            ColumnId(99),
+            "missing_value",
+            None,
+            VeinDataType::Int64,
+        ));
+        let mut compiler = BytecodeCompiler::new(1);
+        compiler.set_input_schema(&schema);
+
+        let error = compiler
+            .compile_expr(&LogicalExpr::Column(missing), &schema)
+            .expect_err("a referenced column must exist in the input schema");
+
+        assert_eq!(error.category(), error::ErrorCategory::Planning);
+        assert_eq!(
+            error.to_string(),
+            "Planning error: column missing_value#99 is not present in input schema [available#7]"
+        );
     }
 
     #[test]
