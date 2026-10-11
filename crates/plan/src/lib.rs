@@ -22,9 +22,10 @@ pub mod schema;
 // planner's expression types leaking into the contract. They are re-exported
 // here because this is where the binder and optimizer already reach for them.
 pub use ::catalog::{
-    CatalogProvider, CatalogRevision, CatalogSnapshotToken, ColumnSortKey, ColumnStatistics,
-    MetadataStore, PlanningSession, TableFormat, TableMetadata, TableMetadataRef, TableStatistics,
-    TableType,
+    CatalogProvider, CatalogRevision, CatalogSnapshotToken, ColumnGroupStatistics, ColumnSortKey,
+    ColumnStatistics, HistogramBucket, HistogramSample, HistogramStatistics, MetadataStore,
+    MostCommonValue, MostCommonValuesStatistics, PlanningSession, TableFormat, TableMetadata,
+    TableMetadataRef, TableStatistics, TableType,
 };
 pub use expr::{LogicalExpr, LogicalLiteral, Volatility};
 pub use plan::display;

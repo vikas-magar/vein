@@ -111,7 +111,10 @@ fn join_with_predicates<'a>(
     if matches!(kind, Left | Full | Single) {
         for stats in right.columns.values_mut() { stats.null_fraction = None; }
     }
-    if !matches!(kind, Semi | Anti) { left.columns.extend(right.columns); }
+    if !matches!(kind, Semi | Anti) {
+        left.columns.extend(right.columns);
+        left.joint_distinct.extend(right.joint_distinct);
+    }
     left.retain_schema(schema);
     left.rows = rows;
     left.selectivity = None;
@@ -142,6 +145,8 @@ mod tests {
                 null_fraction: Some(0.0),
                 min: None,
                 max: None,
+                synopsis: None,
+                synopsis_population: None,
             },
         );
         relation

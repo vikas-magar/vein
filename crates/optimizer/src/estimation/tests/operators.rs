@@ -1,4 +1,5 @@
 use super::*;
+use plan::ColumnGroupStatistics;
 
 #[test]
 fn grouping_ndv_is_bounded_by_rows_and_includes_a_null_group() {
@@ -113,4 +114,58 @@ fn unknown_input_with_zero_limit_has_zero_rows() {
     let plan = scan(1, None, None, None);
     let schema = Box::new(plan.schema().clone());
     assert_eq!(rows(&LogicalPlan::Limit { input: Box::new(plan), count: 0, offset: 0, schema }), Some(0.0));
+}
+
+fn scan_with_joint_statistics() -> LogicalPlan {
+    let schema = VeinSchema {
+        fields: vec![column(1, "left_key", false), column(2, "right_key", false)],
+    };
+    let statistics = TableStatistics {
+        num_rows: Some(100),
+        column_statistics: [
+            ("left_key".into(), ColumnStatistics {
+                distinct_count: Some(10), null_count: Some(0), nan_count: Some(0), ..Default::default()
+            }),
+            ("right_key".into(), ColumnStatistics {
+                distinct_count: Some(10), null_count: Some(0), nan_count: Some(0), ..Default::default()
+            }),
+        ].into(),
+        column_groups: vec![ColumnGroupStatistics {
+            columns: vec!["left_key".into(), "right_key".into()],
+            distinct_count: Some(15),
+            distinct_count_relative_error: Some(0.02),
+            distinct_sketch: None,
+        }],
+        ..Default::default()
+    };
+    let table = Arc::new(TableMetadata::new("paired", Arc::new(schema.clone()))
+        .with_statistics(statistics));
+    LogicalPlan::Scan {
+        table,
+        projection: None,
+        filters: vec![],
+        schema: Box::new(schema),
+    }
+}
+
+#[test]
+fn joint_ndv_is_used_for_grouping_and_survives_projection_lineage() {
+    let source = scan_with_joint_statistics();
+    let keys = source.schema().fields.iter().rev()
+        .cloned().map(LogicalExpr::Column).collect::<Vec<_>>();
+    assert_eq!(rows(&aggregate(source.clone(), vec![keys])), Some(15.0));
+
+    let projected_schema = Box::new(VeinSchema {
+        fields: vec![column(50, "first", false), column(51, "second", false)],
+    });
+    // New output identities verify that the optimizer maps group synopses
+    // through expression lineage rather than relying on table column names.
+    let projected = LogicalPlan::Project {
+        exprs: source.schema().fields.iter().cloned().map(LogicalExpr::Column).collect(),
+        input: Box::new(source),
+        schema: projected_schema.clone(),
+    };
+    let remapped_keys = projected_schema.fields.iter().rev()
+        .cloned().map(LogicalExpr::Column).collect();
+    assert_eq!(rows(&aggregate(projected, vec![remapped_keys])), Some(15.0));
 }

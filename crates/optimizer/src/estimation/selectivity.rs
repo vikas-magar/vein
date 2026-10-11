@@ -12,6 +12,14 @@ pub trait ColumnStatisticsLookup {
     fn distribution(&self, id: ColumnId) -> Option<(Option<f64>, Option<f64>)>;
     /// Returns borrowed minimum and maximum non-null values.
     fn bounds(&self, id: ColumnId) -> Option<(Option<&LogicalLiteral>, Option<&LogicalLiteral>)>;
+    /// Returns a validated borrowed synopsis for distribution-aware estimates.
+    fn synopsis(&self, _id: ColumnId) -> Option<&plan::ColumnStatistics> {
+        None
+    }
+    /// Returns the represented non-null, non-NaN row count for that synopsis.
+    fn synopsis_population(&self, _id: ColumnId) -> Option<u64> {
+        None
+    }
 }
 
 /// Estimated TRUE and FALSE fractions; the remaining population is UNKNOWN.
@@ -129,7 +137,20 @@ fn estimate(expr: &LogicalExpr, columns: &dyn ColumnStatisticsLookup, depth: usi
                 return PredicateEstimate::model(None, None);
             };
             let (min, max) = columns.bounds(column.id).unwrap_or((None, None));
-            super::comparison::estimate(ColumnEstimate { distinct, null_fraction, min, max }, value, op)
+            let synopsis = columns.synopsis(column.id);
+            let synopsis_population = columns.synopsis_population(column.id);
+            super::comparison::estimate(
+                ColumnEstimate {
+                    distinct,
+                    null_fraction,
+                    min,
+                    max,
+                    synopsis,
+                    synopsis_population,
+                },
+                value,
+                op,
+            )
         }
         _ => PredicateEstimate::unknown(),
     }

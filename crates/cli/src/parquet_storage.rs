@@ -9,7 +9,9 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use common::{Result, VeinError};
 use common::protocol::StorageTarget;
-use common::statistics::{schema_fingerprint, StatisticsCollector, StatisticsConfig};
+use common::statistics::{
+    schema_fingerprint, stable_identifier_hash, StatisticsCollector, StatisticsConfig,
+};
 use catalog::{AnalyzedTableStatistics, StatisticsSourceIdentity};
 use exec::operators::sink::{WriteReceipt, WriteStorage, WriteTransaction};
 use parquet::arrow::ArrowWriter;
@@ -24,6 +26,18 @@ pub(crate) struct TableManifest {
     pub files: Vec<String>,
     #[serde(default)]
     pub statistics: Option<AnalyzedTableStatistics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ExternalStatisticsSidecar {
+    pub table_name: String,
+    pub statistics: AnalyzedTableStatistics,
+}
+
+#[derive(Serialize)]
+struct ExternalStatisticsSidecarRef<'a> {
+    table_name: &'a str,
+    statistics: &'a AnalyzedTableStatistics,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +67,14 @@ impl ParquetStorage {
 
     fn source_identity(&self, relative_path: &str) -> Result<StatisticsSourceIdentity> {
         let path = resolve_manifest_file(&self.root, relative_path)?;
+        self.source_identity_for(relative_path.to_owned(), &path)
+    }
+
+    fn source_identity_for(
+        &self,
+        identifier: String,
+        path: &Path,
+    ) -> Result<StatisticsSourceIdentity> {
         let metadata = fs::metadata(&path)
             .map_err(|error| VeinError::io(format!("read source identity for '{}'", path.display()), error))?;
         let modified_nanos = metadata
@@ -61,7 +83,7 @@ impl ParquetStorage {
             .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |elapsed| elapsed.as_nanos());
         Ok(StatisticsSourceIdentity {
-            identifier: relative_path.to_owned(),
+            identifier,
             version: format!("{}:{modified_nanos}", metadata.len()),
         })
     }
@@ -73,6 +95,100 @@ impl ParquetStorage {
             .collect::<Result<Vec<_>>>()?;
         identities.sort_by(|left, right| left.identifier.cmp(&right.identifier));
         Ok(identities)
+    }
+
+    pub(crate) fn source_identities_from_paths(
+        &self,
+        files: &[String],
+    ) -> Result<Vec<StatisticsSourceIdentity>> {
+        let mut identities = files
+            .iter()
+            .map(|file| {
+                let path = Path::new(file);
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.root.join(path)
+                };
+                let canonical = path.canonicalize().map_err(|error| {
+                    VeinError::io(format!("resolve statistics source '{}'", path.display()), error)
+                })?;
+                self.source_identity_for(canonical.to_string_lossy().into_owned(), &canonical)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        identities.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+        Ok(identities)
+    }
+
+    pub(crate) fn external_statistics_path(&self, table_name: &str) -> PathBuf {
+        self.root
+            .join(".vein")
+            .join("statistics")
+            .join(format!("{:016x}.json", stable_identifier_hash(table_name)))
+    }
+
+    pub(crate) fn read_external_statistics(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<AnalyzedTableStatistics>> {
+        let path = self.external_statistics_path(table_name);
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let sidecar: ExternalStatisticsSidecar = serde_json::from_slice(&bytes)
+                    .map_err(|error| VeinError::internal(format!(
+                        "invalid external statistics sidecar '{}': {error}", path.display()
+                    )))?;
+                Ok((sidecar.table_name == table_name).then_some(sidecar.statistics))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(VeinError::io(
+                format!("read external statistics sidecar '{}'", path.display()),
+                error,
+            )),
+        }
+    }
+
+    pub(crate) fn publish_external_statistics(
+        &self,
+        table_name: &str,
+        statistics: &AnalyzedTableStatistics,
+    ) -> Result<()> {
+        let path = self.external_statistics_path(table_name);
+        let generation = next_generation()?;
+        let sidecar = ExternalStatisticsSidecarRef {
+            table_name,
+            statistics,
+        };
+        publish_json_atomic(
+            &path,
+            &sidecar,
+            &format!(".statistics-{generation}.tmp"),
+        )
+    }
+
+    pub(crate) fn publish_managed_statistics(
+        &self,
+        table_name: &str,
+        statistics: &AnalyzedTableStatistics,
+    ) -> Result<()> {
+        let _guard = table_commit_lock(&self.root, table_name)?;
+        let mut manifest = self
+            .read_manifest(table_name)?
+            .ok_or_else(|| VeinError::not_found(format!("managed table '{table_name}' no longer exists")))?;
+        if manifest.revision != statistics.source_revision
+            || self.source_identities(&manifest.files)? != statistics.source_identities
+        {
+            return Err(VeinError::planning(
+                format!("table '{table_name}' changed while ANALYZE was running; retry against the new snapshot"),
+                None,
+            ));
+        }
+        manifest.statistics = Some(statistics.clone());
+        publish_manifest(
+            &self.manifest_path(table_name)?,
+            &manifest,
+            &next_generation()?,
+        )
     }
 }
 
@@ -127,11 +243,7 @@ impl WriteStorage for ParquetStorage {
             )?)
         };
 
-        let epoch_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| VeinError::internal(format!("system clock is before Unix epoch: {error}")))?
-            .as_nanos();
-        let generation = format!("{}-{epoch_nanos}-{}", std::process::id(), NEXT_GENERATION.fetch_add(1, Ordering::Relaxed));
+        let generation = next_generation()?;
         let staging_dir = self.root.join(".vein").join("staging").join(&table).join(&generation);
         fs::create_dir_all(&staging_dir)
             .map_err(|error| VeinError::io(format!("create staging directory '{}'", staging_dir.display()), error))?;
@@ -325,27 +437,43 @@ impl Drop for ParquetWriteTransaction {
 }
 
 fn publish_manifest(path: &Path, manifest: &TableManifest, generation: &str) -> Result<()> {
+    publish_json_atomic(path, manifest, &format!(".manifest-{generation}.tmp"))
+}
+
+fn publish_json_atomic<T: Serialize>(path: &Path, value: &T, temporary_name: &str) -> Result<()> {
     let parent = path.parent().ok_or_else(|| VeinError::internal("manifest path has no parent"))?;
     fs::create_dir_all(parent).map_err(|error| VeinError::io("create catalog directory", error))?;
-    let temporary = parent.join(format!(".manifest-{generation}.tmp"));
+    let temporary = parent.join(temporary_name);
     let result = (|| {
         let file = OpenOptions::new().write(true).create_new(true).open(&temporary)
-            .map_err(|error| VeinError::io("create staged manifest", error))?;
+            .map_err(|error| VeinError::io("create staged catalog metadata", error))?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, manifest)
-            .map_err(|error| VeinError::internal(format!("serialize table manifest: {error}")))?;
-        writer.flush().map_err(|error| VeinError::io("flush staged manifest", error))?;
-        writer.get_ref().sync_all().map_err(|error| VeinError::io("sync staged manifest", error))?;
+        serde_json::to_writer(&mut writer, value)
+            .map_err(|error| VeinError::internal(format!("serialize catalog statistics: {error}")))?;
+        writer.flush().map_err(|error| VeinError::io("flush staged catalog metadata", error))?;
+        writer.get_ref().sync_all().map_err(|error| VeinError::io("sync staged catalog metadata", error))?;
         drop(writer);
-        fs::rename(&temporary, path).map_err(|error| VeinError::io("atomically publish table manifest", error))?;
+        fs::rename(&temporary, path).map_err(|error| VeinError::io("atomically publish catalog metadata", error))?;
         File::open(parent).and_then(|directory| directory.sync_all())
-            .map_err(|error| VeinError::commit_outcome_unknown(format!("manifest is visible but directory durability is uncertain: {error}")))?;
+            .map_err(|error| VeinError::commit_outcome_unknown(format!("catalog metadata is visible but directory durability is uncertain: {error}")))?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn next_generation() -> Result<String> {
+    let epoch_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| VeinError::internal(format!("system clock is before Unix epoch: {error}")))?
+        .as_nanos();
+    Ok(format!(
+        "{}-{epoch_nanos}-{}",
+        std::process::id(),
+        NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn sync_directory(path: &Path) -> Result<()> {

@@ -1,6 +1,7 @@
 //! Read-only Parquet catalog with deterministic file discovery and schema checks.
 
 use std::fs::{self, File};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,7 +9,12 @@ use std::time::Instant;
 
 use crate::parquet_storage::{ParquetStorage, resolve_manifest_file};
 use async_trait::async_trait;
-use catalog::{AnalyzedTableStatistics, MetadataKey, MetadataStore, StatisticsSourceIdentity};
+use catalog::{
+    AnalyzedTableStatistics, MetadataKey, MetadataStore, StatisticsSourceIdentity,
+};
+use common::statistics::analysis::{
+    revision_from_identities, StatisticsAnalysisProvider, StatisticsAnalysisSnapshot,
+};
 use common::statistics::schema_fingerprint;
 use error::{Result, VeinError};
 use exec::operators::source::scan::PARQUET_FOOTER;
@@ -17,6 +23,8 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::file::metadata::ParquetMetaData;
 use plan::{CatalogProvider, TableFormat, TableMetadata, VeinSchema};
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 
 mod statistics;
 
@@ -86,7 +94,13 @@ impl CatalogProvider for ParquetCatalog {
                 }
                 Ok(metadata)
             } else {
-                inspect_table(&name, &path, &metadata_store)
+                let mut metadata = inspect_table(&name, &path, &metadata_store)?;
+                if let Some(analyzed) = storage.read_external_statistics(&name)? {
+                    let identities = storage.source_identities_from_paths(&metadata.files)?;
+                    let revision = revision_from_identities(&identities);
+                    apply_analyzed_statistics(&mut metadata, revision, &analyzed, &identities);
+                }
+                Ok(metadata)
             }
         })
             .await
@@ -97,6 +111,141 @@ impl CatalogProvider for ParquetCatalog {
     fn metadata_store(&self) -> MetadataStore {
         self.metadata_store.clone()
     }
+}
+
+#[async_trait]
+impl StatisticsAnalysisProvider for ParquetCatalog {
+    async fn open_analysis(
+        &self,
+        table_name: &str,
+        batch_size: usize,
+    ) -> Result<StatisticsAnalysisSnapshot> {
+        if batch_size == 0 {
+            return Err(VeinError::internal(
+                "statistics scan batch size must be greater than zero",
+            ));
+        }
+        let metadata = self.get_table(table_name).await?;
+        let first_file = metadata.files.first().ok_or_else(|| {
+            VeinError::not_found(format!("table '{table_name}' has no Parquet files to analyze"))
+        })?;
+        let first_file = PathBuf::from(first_file);
+        let arrow_schema = tokio::task::spawn_blocking(move || {
+            let file = File::open(&first_file).map_err(|error| {
+                VeinError::io(format!("open ANALYZE source '{}'", first_file.display()), error)
+            })?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|error| VeinError::internal(format!("read ANALYZE source schema: {error}")))?;
+            Ok::<SchemaRef, VeinError>(builder.schema().clone())
+        })
+        .await
+        .map_err(|error| VeinError::internal(format!("ANALYZE schema worker failed: {error}")))??;
+
+        let manifest = self.storage.read_manifest(table_name)?;
+        let source_identities = if let Some(manifest) = &manifest {
+            self.storage.source_identities(&manifest.files)?
+        } else {
+            self.storage.source_identities_from_paths(&metadata.files)?
+        };
+        let source_revision = manifest.as_ref().map_or_else(
+            || revision_from_identities(&source_identities),
+            |manifest| manifest.revision,
+        );
+
+        let files = metadata.files.clone();
+        let expected_schema = Arc::clone(&arrow_schema);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let worker = tokio::task::spawn_blocking(move || {
+            if let Err(error) = send_parquet_batches(files, expected_schema, batch_size, sender.clone()) {
+                let _ = sender.blocking_send(Err(error));
+            }
+        });
+        let batches = Box::pin(async_stream::stream! {
+            while let Some(batch) = receiver.recv().await {
+                yield batch;
+            }
+            match worker.await {
+                Ok(()) => {}
+                Err(error) => yield Err(VeinError::internal(format!("ANALYZE batch worker failed: {error}"))),
+            }
+        });
+
+        Ok(StatisticsAnalysisSnapshot {
+            arrow_schema,
+            logical_schema: metadata.schema.as_ref().clone(),
+            source_revision,
+            source_identities,
+            expected_num_rows: metadata.statistics.as_ref().and_then(|stats| stats.num_rows),
+            batches,
+        })
+    }
+
+    async fn publish_analysis(
+        &self,
+        table_name: &str,
+        statistics: &AnalyzedTableStatistics,
+    ) -> Result<()> {
+        let metadata = self.get_table(table_name).await?;
+        let fingerprint = schema_fingerprint(&metadata.schema);
+        let manifest = self.storage.read_manifest(table_name)?;
+        let (revision, identities) = if let Some(manifest) = &manifest {
+            (manifest.revision, self.storage.source_identities(&manifest.files)?)
+        } else {
+            let identities = self.storage.source_identities_from_paths(&metadata.files)?;
+            (revision_from_identities(&identities), identities)
+        };
+        if statistics.source_revision != revision
+            || statistics.schema_fingerprint != fingerprint
+            || statistics.source_identities != identities
+            || statistics.statistics.num_rows
+                != metadata.statistics.as_ref().and_then(|stats| stats.num_rows)
+        {
+            return Err(VeinError::planning(
+                format!("table '{table_name}' changed while ANALYZE was running; retry against the current snapshot"),
+                None,
+            ));
+        }
+
+        if manifest.is_some() {
+            self.storage.publish_managed_statistics(table_name, statistics)
+        } else {
+            self.storage.publish_external_statistics(table_name, statistics)
+        }
+    }
+}
+
+fn send_parquet_batches(
+    files: Vec<String>,
+    expected_schema: SchemaRef,
+    batch_size: usize,
+    sender: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+) -> Result<()> {
+    for file_path in files {
+        let path = PathBuf::from(&file_path);
+        let file = File::open(&path)
+            .map_err(|error| VeinError::io(format!("open ANALYZE source '{}'", path.display()), error))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|error| VeinError::internal(format!("read ANALYZE source '{}': {error}", path.display())))?;
+        if builder.schema().as_ref() != expected_schema.as_ref() {
+            return Err(VeinError::internal(format!(
+                "Parquet schema changed while analyzing '{}'",
+                path.display()
+            )));
+        }
+        let reader = builder
+            .with_batch_size(batch_size)
+            .build()
+            .map_err(|error| VeinError::internal(format!("create ANALYZE reader '{}': {error}", path.display())))?;
+        for batch in reader {
+            let batch = batch.map_err(|error| VeinError::internal(format!(
+                "read ANALYZE batch from '{}': {error}", path.display()
+            )))?;
+            sender
+                .blocking_send(Ok(batch))
+                .map_err(|_| VeinError::internal("ANALYZE consumer closed its batch stream"))?;
+        }
+    }
+    Ok(())
 }
 
 fn inspect_table(name: &str, path: &Path, metadata_store: &MetadataStore) -> Result<TableMetadata> {
@@ -130,8 +279,8 @@ fn inspect_table(name: &str, path: &Path, metadata_store: &MetadataStore) -> Res
     inspect_table_files(name, path, files, metadata_store)
 }
 
-/// Publishes value-derived statistics only when the managed snapshot, schema,
-/// row count, and all source object versions still match their analyzed inputs.
+/// Loads value-derived statistics only when the snapshot, schema, row count,
+/// and all source object versions still match their analyzed inputs.
 fn apply_analyzed_statistics(
     metadata: &mut TableMetadata,
     manifest_revision: u64,
@@ -150,6 +299,14 @@ fn apply_analyzed_statistics(
         Some("source file version changed")
     } else if analyzed.statistics.num_rows != table_statistics.num_rows {
         Some("analyzed row count disagrees with storage metadata")
+    } else if table_statistics.num_rows.is_some_and(|rows| {
+        !column_groups_are_consistent(
+            &metadata.schema,
+            &analyzed.statistics.column_groups,
+            rows,
+        )
+    }) {
+        Some("analyzed multi-column statistics are inconsistent")
     } else {
         None
     };
@@ -239,7 +396,10 @@ fn apply_analyzed_statistics(
         }
         target.numeric.clone_from(&source.numeric);
         target.byte_length.clone_from(&source.byte_length);
+        target.most_common_values.clone_from(&source.most_common_values);
+        target.histogram.clone_from(&source.histogram);
     }
+    table_statistics.column_groups.clone_from(&analyzed.statistics.column_groups);
     tracing::info!(
         target: "vein.audit",
         event = "catalog_statistics_loaded",
@@ -261,6 +421,37 @@ fn apply_analyzed_statistics(
             .count(),
         "catalog_statistics_loaded"
     );
+    true
+}
+
+fn column_groups_are_consistent(
+    schema: &VeinSchema,
+    groups: &[catalog::ColumnGroupStatistics],
+    rows: u64,
+) -> bool {
+    let mut seen = HashSet::with_capacity(groups.len());
+    for group in groups {
+        if group.columns.len() < 2
+            || group.distinct_count.is_none_or(|count| count > rows)
+            || group.distinct_count_relative_error.is_none_or(|error| {
+                !error.is_finite() || !(0.0..=1.0).contains(&error)
+            })
+            || group.distinct_sketch.is_none()
+        {
+            return false;
+        }
+        let Some(positions) = group.columns.iter().map(|name| {
+            schema.fields.iter().position(|field| field.name == *name)
+        }).collect::<Option<Vec<_>>>() else {
+            return false;
+        };
+        if positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return false;
+        }
+        if !seen.insert(group.columns.iter().map(String::as_str).collect::<Vec<_>>()) {
+            return false;
+        }
+    }
     true
 }
 

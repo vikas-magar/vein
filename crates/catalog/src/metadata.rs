@@ -115,6 +115,12 @@ pub struct ColumnStatistics {
     pub numeric: Option<NumericStatistics>,
     /// Exact byte-length summaries for variable-length values.
     pub byte_length: Option<ByteLengthStatistics>,
+    /// Bounded Misra-Gries heavy-hitter candidates.
+    #[serde(default)]
+    pub most_common_values: Option<MostCommonValuesStatistics>,
+    /// Bounded sampled equi-depth histogram for ordered scalar values.
+    #[serde(default)]
+    pub histogram: Option<HistogramStatistics>,
 }
 
 impl ColumnStatistics {
@@ -201,8 +207,189 @@ impl ColumnStatistics {
             }
         }
 
+        if let Some(most_common) = &self.most_common_values {
+            let lower_count_sum = most_common
+                .candidates
+                .iter()
+                .try_fold(0_u64, |total, candidate| total.checked_add(candidate.lower_count));
+            let has_duplicate_candidates = most_common.candidates.iter().enumerate().any(|(index, candidate)| {
+                most_common.candidates[..index].iter().any(|prior| {
+                    prior.hash == candidate.hash
+                        && prior.value.try_cmp(&candidate.value).is_some_and(|order| order.is_eq())
+                })
+            });
+            if most_common.capacity == 0
+                || most_common.candidates.len() > most_common.capacity
+                || most_common.analyzed_count > non_nulls
+                || self.nan_count.is_some_and(|nans| {
+                    most_common.analyzed_count != non_nulls.saturating_sub(nans)
+                })
+                || most_common.error_bound > most_common.analyzed_count
+                || lower_count_sum.is_none_or(|sum| sum > most_common.analyzed_count)
+                || has_duplicate_candidates
+                || most_common.candidates.windows(2).any(|pair| {
+                    pair[0].lower_count < pair[1].lower_count
+                })
+                || most_common.candidates.iter().any(|candidate| {
+                    candidate.lower_count == 0 || candidate.lower_count > most_common.analyzed_count
+                })
+            {
+                return false;
+            }
+        }
+
+        if let Some(histogram) = &self.histogram {
+            let estimated_rows = histogram.buckets.iter().try_fold(0_u64, |total, bucket| {
+                total.checked_add(bucket.estimated_count)
+            });
+            let sample_capacity = u64::try_from(histogram.sample_capacity).ok();
+            let expected_sample_count = sample_capacity.map(|capacity| histogram.population_count.min(capacity));
+            let expected_bucket_count = histogram.bucket_count.min(histogram.sample_count as usize);
+            let samples_ordered = histogram.samples.windows(2).all(|pair| {
+                pair[0].value.try_cmp(&pair[1].value).is_some_and(|order| !order.is_gt())
+            });
+            let priorities_unique = histogram.samples.iter().enumerate().all(|(index, sample)| {
+                !histogram.samples[..index].iter().any(|prior| {
+                    (prior.priority, prior.tie_breaker) == (sample.priority, sample.tie_breaker)
+                })
+            });
+            let buckets_match_sample = histogram.buckets.iter().enumerate().all(|(bucket_index, bucket)| {
+                let sample_count = histogram.sample_count as usize;
+                if sample_count == 0 || expected_bucket_count == 0 {
+                    return false;
+                }
+                let start = bucket_index * sample_count / expected_bucket_count;
+                let end = (bucket_index + 1) * sample_count / expected_bucket_count;
+                let Some(first) = histogram.samples.get(start) else { return false };
+                let Some(last) = histogram.samples.get(end - 1) else { return false };
+                let expected_estimated = ((histogram.population_count as u128 * end as u128)
+                    / sample_count as u128)
+                    .saturating_sub((histogram.population_count as u128 * start as u128)
+                        / sample_count as u128) as u64;
+                bucket.sample_count == (end - start) as u64
+                    && bucket.estimated_count == expected_estimated
+                    && bucket.lower_bound.try_cmp(&first.value).is_some_and(|order| order.is_eq())
+                    && bucket.upper_bound.try_cmp(&last.value).is_some_and(|order| order.is_eq())
+            });
+            let expected_rank_error = (histogram.sample_count > 0).then(|| {
+                let confidence = f64::from(histogram.confidence_ppm) / 1_000_000.0;
+                ((2.0 / (1.0 - confidence)).ln()
+                    / (2.0 * histogram.sample_count as f64))
+                    .sqrt()
+                    .min(1.0)
+            });
+            if histogram.population_count > non_nulls
+                || histogram.sample_capacity == 0
+                || histogram.bucket_count == 0
+                || !(1..1_000_000).contains(&histogram.confidence_ppm)
+                || histogram.samples.len() > histogram.sample_capacity
+                || histogram.samples.len() as u64 != histogram.sample_count
+                || histogram.sample_count > histogram.population_count
+                || expected_sample_count != Some(histogram.sample_count)
+                || histogram.buckets.is_empty() != (histogram.population_count == 0)
+                || histogram.buckets.len() != expected_bucket_count
+                || estimated_rows != Some(histogram.population_count)
+                || !samples_ordered
+                || !priorities_unique
+                || !buckets_match_sample
+                || histogram.rank_error_bound != expected_rank_error
+                || histogram.rank_error_bound.is_some_and(|error| {
+                    !error.is_finite() || !(0.0..=1.0).contains(&error)
+                })
+            {
+                return false;
+            }
+        }
+
         true
     }
+}
+
+/// One frequent-value candidate and its guaranteed observed lower frequency.
+///
+/// The value is retained only when it fits the configured synopsis value budget.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MostCommonValue {
+    /// Owned, bounded candidate value.
+    pub value: LogicalLiteral,
+    /// Stable typed value hash used to find candidates without copying row data.
+    pub hash: u64,
+    /// Lower bound on the candidate's true frequency.
+    pub lower_count: u64,
+}
+
+/// Bounded mergeable frequent-value synopsis for a column.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct MostCommonValuesStatistics {
+    /// Maximum number of candidate values retained.
+    pub capacity: usize,
+    /// Non-null rows offered to this synopsis.
+    pub analyzed_count: u64,
+    /// Total Misra-Gries decrement count; bounds per-candidate undercount.
+    pub error_bound: u64,
+    /// Candidate values ordered by decreasing lower frequency.
+    pub candidates: Vec<MostCommonValue>,
+}
+
+/// One bounded sample value retained by the mergeable histogram synopsis.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HistogramSample {
+    /// Independent random priority used to retain a uniform bottom-k sample.
+    pub priority: u64,
+    /// Independent tie breaker so equal priorities remain totally ordered.
+    #[serde(default)]
+    pub tie_breaker: u64,
+    /// Owned scalar value sampled from the input.
+    pub value: LogicalLiteral,
+}
+
+/// One equal-depth histogram bucket.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HistogramBucket {
+    /// Smallest sampled value assigned to this bucket.
+    pub lower_bound: LogicalLiteral,
+    /// Largest sampled value assigned to this bucket.
+    pub upper_bound: LogicalLiteral,
+    /// Number of sampled observations assigned to this bucket.
+    pub sample_count: u64,
+    /// Population count estimated from the uniform sample.
+    pub estimated_count: u64,
+}
+
+/// Mergeable bounded sample and equi-depth histogram for ordered values.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct HistogramStatistics {
+    /// Non-null, non-NaN population represented by this synopsis.
+    pub population_count: u64,
+    /// Number of retained sample values.
+    pub sample_count: u64,
+    /// Maximum number of values retained in the reservoir.
+    pub sample_capacity: usize,
+    /// Maximum number of equal-depth buckets derived from the sample.
+    #[serde(default)]
+    pub bucket_count: usize,
+    /// Confidence level in parts per million for the rank-error bound.
+    #[serde(default)]
+    pub confidence_ppm: u32,
+    /// Uniform bottom-k sample required to merge append and parallel partitions.
+    pub samples: Vec<HistogramSample>,
+    /// Equi-depth buckets derived from `samples`.
+    pub buckets: Vec<HistogramBucket>,
+    /// Dvoretzky-Kiefer-Wolfowitz 95% rank-error bound for the sample.
+    pub rank_error_bound: Option<f64>,
+}
+
+/// Joint distinct-value synopsis for a configured set of columns.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ColumnGroupStatistics {
+    /// Column names in the canonical schema order used to hash the tuple.
+    pub columns: Vec<String>,
+    /// Estimated distinct tuples, including tuples with null components.
+    pub distinct_count: Option<u64>,
+    /// Relative standard error when the estimate is approximate.
+    pub distinct_count_relative_error: Option<f64>,
+    /// Mergeable joint NDV sketch.
+    pub distinct_sketch: Option<SerializedSketch>,
 }
 
 /// Mergeable finite-number moments represented with floating-point arithmetic.
@@ -381,6 +568,9 @@ pub struct TableStatistics {
     pub uncompressed_bytes: Option<u64>,
     /// Per-column statistics keyed by column name.
     pub column_statistics: HashMap<String, ColumnStatistics>,
+    /// Joint statistics for configured column sets.
+    #[serde(default)]
+    pub column_groups: Vec<ColumnGroupStatistics>,
     /// File, row-group, partition, or other scoped statistics in parent-first order.
     pub data_units: Vec<DataUnitStatistics>,
 }

@@ -1,5 +1,7 @@
 //! Operator models over borrowed metadata and small scalar summaries.
 
+use std::collections::HashMap;
+
 use plan::{LogicalExpr, LogicalPlan, PlanTraversal};
 use parser::ast::query::SetOpKind;
 use crate::context::{StatisticsFreshness, StatisticsProvider};
@@ -51,7 +53,62 @@ fn table_estimate<'a, P: StatisticsProvider + ?Sized>(
             input.columns.insert(column.id, summary);
         }
     }
+    for group in &snapshot.statistics.column_groups {
+        let Some(distinct) = group.distinct_count.filter(|count| {
+            *count <= rows && (*count > 0 || rows == 0)
+        }) else {
+            continue;
+        };
+        if group.columns.is_empty()
+            || group.distinct_count_relative_error.is_some_and(|error| {
+                !error.is_finite() || !(0.0..=1.0).contains(&error)
+            })
+        {
+            continue;
+        }
+        let mut ids = Vec::with_capacity(group.columns.len());
+        for name in &group.columns {
+            let Some(column) = schema.fields.iter().find(|column| column.name == *name) else {
+                ids.clear();
+                break;
+            };
+            ids.push(column.id);
+        }
+        if ids.len() != group.columns.len() {
+            continue;
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() != group.columns.len() {
+            continue;
+        }
+        input.joint_distinct.insert(
+            ids,
+            Estimate::known(
+                distinct as f64,
+                EstimateSource::Statistics,
+                EstimateConfidence::Statistics,
+            ),
+        );
+    }
     input
+}
+
+fn remap_relation<'a>(
+    input: &RelationEstimate<'a>,
+    mapping: impl IntoIterator<Item = (plan::ColumnId, plan::ColumnId)>,
+    schema: &plan::VeinSchema,
+) -> RelationEstimate<'a> {
+    let mapping = mapping.into_iter().collect::<HashMap<_, _>>();
+    let mut result = RelationEstimate::new(input.rows);
+    for (source, output) in &mapping {
+        if let Some(statistics) = input.columns.get(source) {
+            result.columns.insert(*output, *statistics);
+        }
+    }
+    result.joint_distinct = input.remap_joint_distinct(&mapping);
+    result.retain_schema(schema);
+    result
 }
 fn filter(input: &mut RelationEstimate<'_>, fraction: Estimate) {
     let fraction = if fraction.value().is_some_and(|v| v > 1.0) {
@@ -86,24 +143,25 @@ pub(super) fn derive<'a, P: StatisticsProvider + ?Sized>(
             input
         }
         LogicalPlan::Project { exprs, schema, .. } => {
-            let mut result = RelationEstimate::new(input.rows);
-            for (expr, output) in exprs.iter().zip(&schema.fields) {
-                if let LogicalExpr::Column(column) = expr {
-                    if let Some(stats) = input.columns.get(&column.id) {
-                        result.columns.insert(output.id, *stats);
+            remap_relation(
+                &input,
+                exprs.iter().zip(&schema.fields).filter_map(|(expr, output)| {
+                    if let LogicalExpr::Column(column) = expr {
+                        Some((column.id, output.id))
+                    } else {
+                        None
                     }
-                }
-            }
-            result
+                }),
+                schema,
+            )
         }
         LogicalPlan::SubqueryAlias { input: source, schema, .. } => {
-            let mut result = RelationEstimate::new(input.rows);
-            for (original, output) in source.schema().fields.iter().zip(&schema.fields) {
-                if let Some(stats) = input.columns.get(&original.id) {
-                    result.columns.insert(output.id, *stats);
-                }
-            }
-            result
+            remap_relation(
+                &input,
+                source.schema().fields.iter().zip(&schema.fields)
+                    .map(|(original, output)| (original.id, output.id)),
+                schema,
+            )
         }
         LogicalPlan::Aggregate { grouping_sets, schema, .. } =>
             super::aggregate::aggregate(input, grouping_sets, schema),

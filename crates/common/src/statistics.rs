@@ -5,6 +5,9 @@
 //! buffers; collection reads borrowed scalars and retains only bounded synopsis
 //! state.
 
+/// Generic streaming analysis orchestration and source/publisher contracts.
+pub mod analysis;
+
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
     Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
@@ -17,10 +20,14 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use catalog::{
-    ByteLengthStatistics, ColumnStatistics, NumericStatistics, SerializedSketch, TableStatistics,
+    ByteLengthStatistics, ColumnGroupStatistics, ColumnStatistics, HistogramBucket,
+    HistogramSample, HistogramStatistics, MostCommonValue, MostCommonValuesStatistics,
+    NumericStatistics, SerializedSketch, TableStatistics,
 };
 use error::VeinError;
 use types::LogicalLiteral;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 use crate::Result;
 
@@ -43,21 +50,51 @@ pub fn schema_fingerprint(schema: &types::VeinSchema) -> String {
     format!("{:016x}", stable_hash(0xfe, identity.as_bytes()))
 }
 
+/// Stable non-cryptographic key for adapter-owned statistics sidecars.
+///
+/// Persistent consumers must store and validate the original identifier too;
+/// this compact key is for path selection, not an identity proof.
+pub fn stable_identifier_hash(identifier: &str) -> u64 {
+    stable_hash(0xfc, identifier.as_bytes())
+}
+
 /// Configuration shared by the statistics collectors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatisticsConfig {
+    /// Maximum number of rows requested from an analysis source per batch.
+    pub scan_batch_size: usize,
     /// HyperLogLog precision. More registers reduce error and increase memory.
     pub distinct_precision: u8,
     /// Maximum string bound retained as an optimizer literal. Longer values
     /// keep length statistics but make the column bounds explicitly unknown.
     pub max_bound_value_bytes: usize,
+    /// Maximum candidate count in each mergeable frequent-value synopsis.
+    pub most_common_capacity: usize,
+    /// Maximum uniformly sampled values retained for each ordered column.
+    pub histogram_sample_size: usize,
+    /// Maximum equal-depth histogram buckets emitted per ordered column.
+    pub histogram_bucket_count: usize,
+    /// Maximum owned scalar bytes retained by frequency and histogram synopses.
+    pub max_synopsis_value_bytes: usize,
+    /// Confidence level in parts per million for the histogram rank-error bound.
+    pub histogram_confidence_ppm: u32,
+    /// Explicit multi-column groups to analyze. Empty by default to keep cost
+    /// proportional to selected groups instead of generating a quadratic set.
+    pub multi_column_sets: Vec<Vec<String>>,
 }
 
 impl Default for StatisticsConfig {
     fn default() -> Self {
         Self {
+            scan_batch_size: 8192,
             distinct_precision: 12,
             max_bound_value_bytes: 4096,
+            most_common_capacity: 16,
+            histogram_sample_size: 256,
+            histogram_bucket_count: 32,
+            max_synopsis_value_bytes: 256,
+            histogram_confidence_ppm: 950_000,
+            multi_column_sets: Vec::new(),
         }
     }
 }
@@ -236,6 +273,16 @@ pub trait ArrowValueEncoder: Send + Sync {
         _index: usize,
         _bound: &LogicalLiteral,
     ) -> Option<std::cmp::Ordering> { None }
+    /// Whether a borrowed scalar equals a retained scalar without copying the
+    /// input value. Encoders can override this for unordered scalar values.
+    fn equals_bound(
+        &self,
+        array: &dyn Array,
+        index: usize,
+        bound: &LogicalLiteral,
+    ) -> Option<bool> {
+        self.compare_bound(array, index, bound).map(|order| order.is_eq())
+    }
     /// Return an approximate finite numeric value for moments.
     fn numeric_value(&self, _array: &dyn Array, _index: usize) -> Option<f64> { None }
     /// Whether numeric moments apply to this logical Arrow type.
@@ -786,6 +833,299 @@ impl ByteLengthAccumulator {
     }
 }
 
+#[derive(Clone)]
+struct MostCommonAccumulator {
+    summary: MostCommonValuesStatistics,
+}
+
+impl MostCommonAccumulator {
+    fn new(capacity: usize) -> Self {
+        Self {
+            summary: MostCommonValuesStatistics {
+                capacity,
+                ..MostCommonValuesStatistics::default()
+            },
+        }
+    }
+
+    fn update<E: ArrowValueEncoder>(
+        &mut self,
+        encoder: &E,
+        array: &dyn Array,
+        index: usize,
+        max_value_bytes: usize,
+    ) -> Result<bool> {
+        let Some(hash) = encoder.hash_value(array, index) else {
+            return Ok(false);
+        };
+        let next_count = self.summary.analyzed_count.checked_add(1)
+            .ok_or_else(|| VeinError::internal("most-common analyzed count overflow"))?;
+        let mut matching = None;
+        for (candidate_index, candidate) in self.summary.candidates.iter().enumerate() {
+            if candidate.hash != hash {
+                continue;
+            }
+            match encoder.equals_bound(array, index, &candidate.value) {
+                Some(true) => {
+                    matching = Some(candidate_index);
+                    break;
+                }
+                Some(false) => {}
+                None => return Ok(false),
+            }
+        }
+        self.summary.analyzed_count = next_count;
+
+        if let Some(candidate_index) = matching {
+            let candidate = &mut self.summary.candidates[candidate_index];
+            candidate.lower_count = candidate.lower_count.checked_add(1)
+                .ok_or_else(|| VeinError::internal("most-common candidate count overflow"))?;
+            return Ok(true);
+        }
+
+        if self.summary.candidates.len() < self.summary.capacity {
+            let Some(value) = encoder.bound_value(array, index, max_value_bytes) else {
+                return Ok(false);
+            };
+            self.summary.candidates.push(MostCommonValue {
+                value,
+                hash,
+                lower_count: 1,
+            });
+            return Ok(true);
+        }
+
+        self.summary.error_bound = self.summary.error_bound.checked_add(1)
+            .ok_or_else(|| VeinError::internal("most-common error bound overflow"))?;
+        self.summary.candidates.retain_mut(|candidate| {
+            candidate.lower_count -= 1;
+            candidate.lower_count > 0
+        });
+        Ok(true)
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        if self.summary.capacity != other.summary.capacity {
+            return Err(VeinError::internal("cannot merge most-common synopses with different capacities"));
+        }
+        self.summary.analyzed_count = self.summary.analyzed_count.checked_add(other.summary.analyzed_count)
+            .ok_or_else(|| VeinError::internal("most-common analyzed count overflow"))?;
+        self.summary.error_bound = self.summary.error_bound.checked_add(other.summary.error_bound)
+            .ok_or_else(|| VeinError::internal("most-common error bound overflow"))?;
+
+        for right in &other.summary.candidates {
+            if let Some(left) = self.summary.candidates.iter_mut().find(|candidate| {
+                candidate.hash == right.hash && literals_equal(&candidate.value, &right.value)
+            }) {
+                left.lower_count = left.lower_count.checked_add(right.lower_count)
+                    .ok_or_else(|| VeinError::internal("most-common candidate count overflow"))?;
+            } else {
+                self.summary.candidates.push(right.clone());
+            }
+        }
+
+        while self.summary.candidates.len() > self.summary.capacity {
+            let decrement = self.summary.candidates.iter().map(|candidate| candidate.lower_count).min()
+                .ok_or_else(|| VeinError::internal("empty most-common candidate reduction"))?;
+            self.summary.error_bound = self.summary.error_bound.checked_add(decrement)
+                .ok_or_else(|| VeinError::internal("most-common error bound overflow"))?;
+            self.summary.candidates.retain_mut(|candidate| {
+                candidate.lower_count -= decrement;
+                candidate.lower_count > 0
+            });
+        }
+        self.summary.candidates.sort_by(|left, right| right.lower_count.cmp(&left.lower_count));
+        Ok(())
+    }
+
+    fn restore(summary: &MostCommonValuesStatistics, expected_capacity: usize) -> Result<Self> {
+        if summary.capacity != expected_capacity
+            || summary.candidates.len() > summary.capacity
+            || summary.error_bound > summary.analyzed_count
+            || summary.candidates.iter().any(|candidate| candidate.lower_count == 0)
+        {
+            return Err(VeinError::internal("invalid most-common synopsis state"));
+        }
+        Ok(Self { summary: summary.clone() })
+    }
+}
+
+#[derive(Clone)]
+struct PrioritySample(HistogramSample);
+
+impl PartialEq for PrioritySample {
+    fn eq(&self, other: &Self) -> bool {
+        (self.0.priority, self.0.tie_breaker) == (other.0.priority, other.0.tie_breaker)
+    }
+}
+
+impl Eq for PrioritySample {}
+
+impl PartialOrd for PrioritySample {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PrioritySample {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.0.priority, self.0.tie_breaker)
+            .cmp(&(other.0.priority, other.0.tie_breaker))
+    }
+}
+
+#[derive(Clone)]
+struct HistogramAccumulator {
+    population_count: u64,
+    sample_capacity: usize,
+    bucket_count: usize,
+    confidence_ppm: u32,
+    samples: BinaryHeap<PrioritySample>,
+}
+
+impl HistogramAccumulator {
+    fn new(sample_capacity: usize, bucket_count: usize, confidence_ppm: u32) -> Self {
+        Self {
+            population_count: 0,
+            sample_capacity,
+            bucket_count,
+            confidence_ppm,
+            samples: BinaryHeap::with_capacity(sample_capacity),
+        }
+    }
+
+    fn update(&mut self, value: impl FnOnce() -> Option<LogicalLiteral>) -> Result<bool> {
+        self.population_count = self.population_count.checked_add(1)
+            .ok_or_else(|| VeinError::internal("histogram population count overflow"))?;
+        if self.sample_capacity == 0 {
+            return Ok(false);
+        }
+        let priority = rand::random();
+        let tie_breaker = rand::random();
+        let sample_key = (priority, tie_breaker);
+        if self.samples.len() < self.sample_capacity {
+            let Some(value) = value() else { return Ok(false) };
+            self.samples.push(PrioritySample(HistogramSample {
+                priority,
+                tie_breaker,
+                value,
+            }));
+        } else if self.samples.peek().is_some_and(|largest| {
+            sample_key < (largest.0.priority, largest.0.tie_breaker)
+        }) {
+            let Some(value) = value() else { return Ok(false) };
+            self.samples.pop();
+            self.samples.push(PrioritySample(HistogramSample {
+                priority,
+                tie_breaker,
+                value,
+            }));
+        }
+        Ok(true)
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        if self.sample_capacity != other.sample_capacity
+            || self.bucket_count != other.bucket_count
+            || self.confidence_ppm != other.confidence_ppm
+        {
+            return Err(VeinError::internal("cannot merge histograms with different configurations"));
+        }
+        self.population_count = self.population_count.checked_add(other.population_count)
+            .ok_or_else(|| VeinError::internal("histogram population count overflow"))?;
+        for sample in &other.samples {
+            if self.samples.len() < self.sample_capacity {
+                self.samples.push(sample.clone());
+            } else if self.samples.peek().is_some_and(|largest| sample < largest) {
+                self.samples.pop();
+                self.samples.push(sample.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn restore(summary: &HistogramStatistics, config: &StatisticsConfig) -> Result<Self> {
+        if summary.sample_capacity != config.histogram_sample_size
+            || summary.bucket_count != config.histogram_bucket_count
+            || summary.confidence_ppm != config.histogram_confidence_ppm
+            || summary.samples.len() > summary.sample_capacity
+            || summary.sample_count != summary.samples.len() as u64
+            || summary.sample_count > summary.population_count
+        {
+            return Err(VeinError::internal("invalid or incompatible histogram synopsis state"));
+        }
+        let mut accumulator = Self::new(
+            summary.sample_capacity,
+            summary.bucket_count,
+            summary.confidence_ppm,
+        );
+        accumulator.population_count = summary.population_count;
+        accumulator.samples.extend(summary.samples.iter().cloned().map(PrioritySample));
+        Ok(accumulator)
+    }
+
+    fn finish(self) -> Option<HistogramStatistics> {
+        let mut samples = self.samples.into_vec();
+        samples.sort_by(|left, right| {
+            left.0.value.try_cmp(&right.0.value).unwrap_or(Ordering::Equal)
+        });
+        if samples.windows(2).any(|pair| pair[0].0.value.try_cmp(&pair[1].0.value).is_none()) {
+            return None;
+        }
+
+        let sample_count = samples.len();
+        if self.population_count > 0 && (sample_count == 0 || self.bucket_count == 0) {
+            return None;
+        }
+        let bucket_count = self.bucket_count.min(sample_count);
+        let mut buckets = Vec::with_capacity(bucket_count);
+        for bucket_index in 0..bucket_count {
+            let start = bucket_index * sample_count / bucket_count;
+            let end = (bucket_index + 1) * sample_count / bucket_count;
+            let estimate_at = |sample_index: usize| -> u64 {
+                ((self.population_count as u128 * sample_index as u128) / sample_count as u128) as u64
+            };
+            let estimated_count = estimate_at(end).saturating_sub(estimate_at(start));
+            buckets.push(HistogramBucket {
+                lower_bound: samples[start].0.value.clone(),
+                upper_bound: samples[end - 1].0.value.clone(),
+                sample_count: (end - start) as u64,
+                estimated_count,
+            });
+        }
+        let rank_error_bound = (sample_count > 0).then(|| {
+            let confidence = f64::from(self.confidence_ppm) / 1_000_000.0;
+            ((2.0 / (1.0 - confidence)).ln() / (2.0 * sample_count as f64)).sqrt().min(1.0)
+        });
+        Some(HistogramStatistics {
+            population_count: self.population_count,
+            sample_count: sample_count as u64,
+            sample_capacity: self.sample_capacity,
+            bucket_count: self.bucket_count,
+            confidence_ppm: self.confidence_ppm,
+            samples: samples.into_iter().map(|sample| sample.0).collect(),
+            buckets,
+            rank_error_bound,
+        })
+    }
+}
+
+fn literals_equal(left: &LogicalLiteral, right: &LogicalLiteral) -> bool {
+    match (left, right) {
+        (LogicalLiteral::Float64(left), LogicalLiteral::Float64(right)) => {
+            canonical_float(*left) == canonical_float(*right)
+        }
+        _ => left == right,
+    }
+}
+
+struct GroupCollector<S> {
+    columns: Vec<usize>,
+    names: Vec<String>,
+    sketch: Option<S>,
+    complete: bool,
+}
+
 struct ColumnCollector<S> {
     name: String,
     data_type: DataType,
@@ -798,6 +1138,8 @@ struct ColumnCollector<S> {
     max_value: Option<LogicalLiteral>,
     numeric: Option<NumericAccumulator>,
     byte_length: Option<ByteLengthAccumulator>,
+    most_common: Option<MostCommonAccumulator>,
+    histogram: Option<HistogramAccumulator>,
 }
 
 /// Streaming statistics for a logical table.
@@ -808,6 +1150,7 @@ pub struct StatisticsCollector<S = HyperLogLog, E = ArrowScalarEncoder> {
     schema: SchemaRef,
     rows: u64,
     columns: Vec<ColumnCollector<S>>,
+    groups: Vec<GroupCollector<S>>,
     config: StatisticsConfig,
     encoder: E,
 }
@@ -819,11 +1162,17 @@ where
 {
     /// Create a collector for an Arrow schema and a pluggable scalar encoder.
     pub fn with_encoder(schema: SchemaRef, config: StatisticsConfig, encoder: E) -> Result<Self> {
+        if config.scan_batch_size == 0 {
+            return Err(VeinError::internal("statistics scan batch size must be greater than zero"));
+        }
         if !(4..=16).contains(&config.distinct_precision) {
             return Err(VeinError::internal(format!(
                 "distinct sketch precision must be between 4 and 16, got {}",
                 config.distinct_precision
             )));
+        }
+        if !(1..1_000_000).contains(&config.histogram_confidence_ppm) {
+            return Err(VeinError::internal("histogram confidence must be between 0 and 1,000,000 ppm"));
         }
         let mut columns = Vec::with_capacity(schema.fields().len());
         for field in schema.fields() {
@@ -845,12 +1194,52 @@ where
                 byte_length: byte_length.then(|| ByteLengthAccumulator::for_type(
                     encoder.supports_non_ascii_tracking(field.data_type()),
                 )),
+                most_common: (bounds_supported && config.most_common_capacity > 0)
+                    .then(|| MostCommonAccumulator::new(config.most_common_capacity)),
+                histogram: (bounds_supported
+                    && config.histogram_sample_size > 0
+                    && config.histogram_bucket_count > 0)
+                    .then(|| HistogramAccumulator::new(
+                        config.histogram_sample_size,
+                        config.histogram_bucket_count,
+                        config.histogram_confidence_ppm,
+                    )),
+            });
+        }
+        let mut groups = Vec::with_capacity(config.multi_column_sets.len());
+        for configured_names in &config.multi_column_sets {
+            if configured_names.len() < 2 {
+                return Err(VeinError::internal("multi-column statistics require at least two columns"));
+            }
+            let mut indices = Vec::with_capacity(configured_names.len());
+            for name in configured_names {
+                let mut matches = schema.fields().iter().enumerate().filter(|(_, field)| field.name() == name);
+                let Some((index, _)) = matches.next() else {
+                    return Err(VeinError::internal(format!("multi-column statistics reference unknown column '{name}'")));
+                };
+                if matches.next().is_some() || indices.contains(&index) {
+                    return Err(VeinError::internal(format!("multi-column statistics contain an ambiguous or duplicate column '{name}'")));
+                }
+                indices.push(index);
+            }
+            indices.sort_unstable();
+            if groups.iter().any(|group: &GroupCollector<S>| group.columns == indices) {
+                return Err(VeinError::internal("duplicate multi-column statistics group"));
+            }
+            let complete = indices.iter().all(|index| encoder.supports(schema.field(*index).data_type()));
+            let names = indices.iter().map(|index| schema.field(*index).name().clone()).collect();
+            groups.push(GroupCollector {
+                columns: indices,
+                names,
+                sketch: complete.then(|| S::with_config(&config)).transpose()?,
+                complete,
             });
         }
         Ok(Self {
             schema,
             rows: 0,
             columns,
+            groups,
             config,
             encoder,
         })
@@ -921,6 +1310,37 @@ where
                     }
                 }
 
+                if byte_length_value.is_some_and(|length| {
+                    length > self.config.max_synopsis_value_bytes as u64
+                }) {
+                    column.most_common = None;
+                    column.histogram = None;
+                }
+
+                if !is_nan {
+                    if let Some(most_common) = &mut column.most_common {
+                        if !most_common.update(
+                            &self.encoder,
+                            array.as_ref(),
+                            row,
+                            self.config.max_synopsis_value_bytes,
+                        )? {
+                            column.most_common = None;
+                        }
+                    }
+                    if let Some(histogram) = &mut column.histogram {
+                        if !histogram.update(|| {
+                            self.encoder.bound_value(
+                                array.as_ref(),
+                                row,
+                                self.config.max_synopsis_value_bytes,
+                            )
+                        })? {
+                            column.histogram = None;
+                        }
+                    }
+                }
+
                 if column.min_max_complete && !is_nan {
                     let comparison = match (&column.min_value, &column.max_value) {
                         (None, None) => None,
@@ -966,6 +1386,46 @@ where
                 }
             }
         }
+        for group in &mut self.groups {
+            if !group.complete || group.sketch.is_none() { continue }
+            let mut group_complete = true;
+            for row in 0..batch.num_rows() {
+                let mut tuple_hash = stable_hash(0xfc, &(group.columns.len() as u64).to_le_bytes());
+                for (ordinal, column_index) in group.columns.iter().copied().enumerate() {
+                    let array = batch.column(column_index);
+                    let Some(tag) = type_tag(array.data_type()) else {
+                        group_complete = false;
+                        break;
+                    };
+                    let value_hash = if array.is_null(row) {
+                        stable_hash(0xfb, &[tag, 0])
+                    } else if let Some(hash) = self.encoder.hash_value(array.as_ref(), row) {
+                        let mut tagged_hash = [0_u8; 9];
+                        tagged_hash[0] = tag;
+                        tagged_hash[1..].copy_from_slice(&hash.to_le_bytes());
+                        stable_hash(0xfb, &tagged_hash)
+                    } else {
+                        group_complete = false;
+                        break;
+                    };
+                    let mut tuple_part = [0_u8; 24];
+                    tuple_part[..8].copy_from_slice(&tuple_hash.to_le_bytes());
+                    tuple_part[8..16].copy_from_slice(&(ordinal as u64).to_le_bytes());
+                    tuple_part[16..].copy_from_slice(&value_hash.to_le_bytes());
+                    tuple_hash = stable_hash(0xfa, &tuple_part);
+                }
+                if !group_complete {
+                    break;
+                }
+                if let Some(sketch) = &mut group.sketch {
+                    sketch.update_hash(tuple_hash);
+                }
+            }
+            if !group_complete {
+                group.complete = false;
+                group.sketch = None;
+            }
+        }
         self.rows = next_rows;
         Ok(())
     }
@@ -985,6 +1445,7 @@ where
         let rows = statistics
             .num_rows
             .ok_or_else(|| VeinError::internal("cannot append to statistics without row count"))?;
+        let restore_config = collector.config.clone();
         for column in &mut collector.columns {
             let summary = statistics.column_statistics.get(&column.name).ok_or_else(|| {
                 VeinError::internal(format!(
@@ -1052,6 +1513,16 @@ where
                 )))?;
                 *byte_length = ByteLengthAccumulator::restore(summary);
             }
+            if column.most_common.is_some() {
+                column.most_common = summary.most_common_values.as_ref()
+                    .map(|summary| MostCommonAccumulator::restore(summary, restore_config.most_common_capacity))
+                    .transpose()?;
+            }
+            if column.histogram.is_some() {
+                column.histogram = summary.histogram.as_ref()
+                    .map(|summary| HistogramAccumulator::restore(summary, &restore_config))
+                    .transpose()?;
+            }
             if column.sketch.is_some() {
                 let state = summary.distinct_sketch.as_ref().ok_or_else(|| {
                     VeinError::internal(format!(
@@ -1066,6 +1537,27 @@ where
                         column.name
                     )));
                 }
+            }
+        }
+        for group in &mut collector.groups {
+            let mut matches = statistics.column_groups.iter()
+                .filter(|summary| summary.columns == group.names);
+            if let Some(summary) = matches.next() {
+                if matches.next().is_some() {
+                    return Err(VeinError::internal("cannot append: duplicate multi-column synopsis"));
+                }
+                match (&group.sketch, &summary.distinct_sketch) {
+                    (Some(_), Some(state)) if summary.distinct_count.is_some() => {
+                        group.sketch = Some(S::from_serialized(state)?);
+                    }
+                    _ => {
+                        group.sketch = None;
+                        group.complete = false;
+                    }
+                }
+            } else {
+                group.sketch = None;
+                group.complete = false;
             }
         }
         collector.rows = rows;
@@ -1139,6 +1631,14 @@ where
                 (None, None) => {}
                 _ => left.byte_length = None,
             }
+            match (&mut left.most_common, &right.most_common) {
+                (Some(left_values), Some(right_values)) => left_values.merge(right_values)?,
+                _ => left.most_common = None,
+            }
+            match (&mut left.histogram, &right.histogram) {
+                (Some(left_histogram), Some(right_histogram)) => left_histogram.merge(right_histogram)?,
+                _ => left.histogram = None,
+            }
             left.distinct_complete &= right.distinct_complete;
             match (&mut left.sketch, &right.sketch) {
                 (Some(left_sketch), Some(right_sketch)) if left.distinct_complete => {
@@ -1150,6 +1650,23 @@ where
                     return Err(VeinError::internal(
                         "cannot merge statistics with different synopsis support",
                     ));
+                }
+            }
+        }
+        if self.groups.len() != other.groups.len() {
+            return Err(VeinError::internal("cannot merge different multi-column statistics groups"));
+        }
+        for (left, right) in self.groups.iter_mut().zip(&other.groups) {
+            if left.names != right.names {
+                return Err(VeinError::internal("cannot merge different multi-column statistics groups"));
+            }
+            match (&mut left.sketch, &right.sketch) {
+                (Some(left_sketch), Some(right_sketch)) if left.complete && right.complete => {
+                    left_sketch.merge(right_sketch)?;
+                }
+                _ => {
+                    left.sketch = None;
+                    left.complete = false;
                 }
             }
         }
@@ -1179,9 +1696,24 @@ where
                 min_max_complete: Some(column.min_max_complete),
                 numeric: column.numeric.map(|numeric| numeric.finish()),
                 byte_length: column.byte_length.map(|byte_length| byte_length.finish()),
+                most_common_values: column.most_common.map(|most_common| {
+                    let mut summary = most_common.summary;
+                    summary.candidates.sort_by(|left, right| right.lower_count.cmp(&left.lower_count));
+                    summary
+                }),
+                histogram: column.histogram.and_then(HistogramAccumulator::finish),
                 ..ColumnStatistics::default()
             };
             statistics.column_statistics.insert(column.name, summary);
+        }
+        for group in self.groups {
+            let Some(sketch) = group.sketch.filter(|_| group.complete) else { continue };
+            statistics.column_groups.push(ColumnGroupStatistics {
+                columns: group.names,
+                distinct_count: sketch.estimate().map(|estimate| estimate.min(self.rows)),
+                distinct_count_relative_error: sketch.relative_error(),
+                distinct_sketch: Some(sketch.to_serialized()),
+            });
         }
         statistics
     }
@@ -1431,5 +1963,85 @@ mod tests {
         let mut low = HyperLogLog::new(10).unwrap();
         let high = HyperLogLog::new(11).unwrap();
         assert!(low.merge(&high).is_err());
+    }
+
+    #[test]
+    fn bounded_most_common_synopsis_tracks_heavy_hitters_and_nulls_are_excluded() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
+        let mut values = vec![Some(1); 100];
+        values.extend((2..102).map(Some));
+        values.push(None);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(values))],
+        ).expect("valid heavy-hitter batch");
+        let config = StatisticsConfig {
+            most_common_capacity: 2,
+            histogram_sample_size: 7,
+            histogram_bucket_count: 3,
+            ..StatisticsConfig::default()
+        };
+        let mut collector = StatisticsCollector::new(schema, config).expect("collector");
+        collector.update(&batch).expect("collect values");
+        let summary = collector.finish().column_statistics.remove("key").unwrap();
+        let most_common = summary.most_common_values.expect("frequency synopsis");
+
+        assert_eq!(most_common.capacity, 2);
+        assert_eq!(most_common.analyzed_count, 200);
+        assert!(most_common.error_bound > 0);
+        assert!(most_common.candidates.len() <= 2);
+        let heavy = most_common.candidates.iter()
+            .find(|candidate| candidate.value == LogicalLiteral::Int64(1))
+            .expect("frequent key remains a candidate");
+        assert!(heavy.lower_count > 0 && heavy.lower_count <= 100);
+
+        let histogram = summary.histogram.expect("histogram synopsis");
+        assert_eq!(histogram.population_count, 200);
+        assert_eq!(histogram.sample_count, 7);
+        assert_eq!(histogram.samples.len(), 7);
+        assert_eq!(histogram.buckets.len(), 3);
+        assert_eq!(histogram.buckets.iter().map(|bucket| bucket.estimated_count).sum::<u64>(), 200);
+        assert!(histogram.rank_error_bound.is_some_and(|error| error > 0.0 && error < 1.0));
+    }
+
+    #[test]
+    fn mcv_histogram_and_joint_ndv_merge_restore_and_serialize() {
+        let batch = batch();
+        let schema = batch.schema();
+        let config = StatisticsConfig {
+            most_common_capacity: 4,
+            histogram_sample_size: 8,
+            histogram_bucket_count: 2,
+            multi_column_sets: vec![vec!["label".to_owned(), "key".to_owned()]],
+            ..StatisticsConfig::default()
+        };
+        let mut left = StatisticsCollector::new(Arc::clone(&schema), config.clone()).unwrap();
+        let mut right = StatisticsCollector::new(Arc::clone(&schema), config.clone()).unwrap();
+        left.update(&batch.slice(0, 2)).unwrap();
+        right.update(&batch.slice(2, 2)).unwrap();
+        left.merge(&right).unwrap();
+
+        let merged = left.finish();
+        let encoded = serde_json::to_vec(&merged).expect("serialize statistics");
+        let merged: TableStatistics = serde_json::from_slice(&encoded).expect("restore statistics model");
+        assert!(merged.column_statistics["key"].is_consistent_with_rows(4));
+        let key = &merged.column_statistics["key"];
+        assert_eq!(key.most_common_values.as_ref().unwrap().analyzed_count, 3);
+        assert_eq!(key.histogram.as_ref().unwrap().population_count, 3);
+        assert_eq!(merged.column_groups.len(), 1);
+        assert_eq!(merged.column_groups[0].columns, vec!["key", "label"]);
+        assert_eq!(merged.column_groups[0].distinct_count, Some(3));
+
+        let mut restored = StatisticsCollector::restore(Arc::clone(&schema), config, &merged)
+            .expect("restore mergeable statistics");
+        restored.update(&batch.slice(0, 1)).unwrap();
+        let appended = restored.finish();
+        assert_eq!(appended.column_statistics["key"].most_common_values.as_ref().unwrap().analyzed_count, 4);
+        assert_eq!(appended.column_statistics["key"].histogram.as_ref().unwrap().population_count, 4);
+        assert_eq!(appended.column_groups[0].distinct_count, Some(3));
+
+        let mut malformed = appended.column_statistics["key"].clone();
+        malformed.histogram.as_mut().unwrap().buckets[0].estimated_count += 1;
+        assert!(!malformed.is_consistent_with_rows(5));
     }
 }

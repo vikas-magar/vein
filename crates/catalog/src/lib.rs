@@ -40,9 +40,10 @@ pub mod store;
 
 pub use contract::{CatalogProvider, CatalogRevision, PlanningSession};
 pub use metadata::{
-    AnalyzedTableStatistics, ByteLengthStatistics, ColumnSortKey, ColumnStatistics,
+    AnalyzedTableStatistics, ByteLengthStatistics, ColumnGroupStatistics, ColumnSortKey, ColumnStatistics,
     ColumnStorageStatistics, DataUnitStatistics, NumericStatistics, SerializedSketch,
-    StatisticsSourceIdentity, StatisticsUnitKind, TableFormat, TableMetadata,
+    HistogramBucket, HistogramSample, HistogramStatistics, MostCommonValue,
+    MostCommonValuesStatistics, StatisticsSourceIdentity, StatisticsUnitKind, TableFormat, TableMetadata,
     TableMetadataRef, TableStatistics, TableType,
 };
 pub use snapshot::CatalogSnapshotToken;

@@ -107,6 +107,7 @@ pub(super) fn table_statistics(
         compressed_bytes: complete_sum(row_groups.iter().map(|unit| unit.compressed_bytes)),
         uncompressed_bytes: complete_sum(row_groups.iter().map(|unit| unit.uncompressed_bytes)),
         column_statistics,
+        column_groups: Vec::new(),
         data_units,
     }
 }

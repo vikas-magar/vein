@@ -30,6 +30,14 @@ impl ColumnStatisticsLookup for std::collections::HashMap<plan::ColumnId, Column
     fn bounds(&self, id: plan::ColumnId) -> Option<(Option<&plan::LogicalLiteral>, Option<&plan::LogicalLiteral>)> {
         self.get(&id).map(|c| (c.min, c.max))
     }
+
+    fn synopsis(&self, id: plan::ColumnId) -> Option<&plan::ColumnStatistics> {
+        self.get(&id).and_then(|column| column.synopsis)
+    }
+
+    fn synopsis_population(&self, id: plan::ColumnId) -> Option<u64> {
+        self.get(&id).and_then(|column| column.synopsis_population)
+    }
 }
 
 /// One node's estimates in postorder, with stable indices into the same result.
