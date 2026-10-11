@@ -1,0 +1,20 @@
+  [mcp_servers.rustrover]
+    url = "http://127.0.0.1:64522/stream"
+
+[mcp_servers.rustrover.tools.apply_patch]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.execute_run_configuration]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.build_project]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.reformat_file]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.execute_tool]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.create_new_file]
+approval_mode = "approve"
