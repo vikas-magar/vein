@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use common::Result;
 use common::cancellation::CancellationToken;
@@ -56,6 +56,60 @@ struct MemoryTrackerInner {
     retained_array_requests: AtomicUsize,
 }
 
+/// Operator-owned resource counters shared with the execution trace.
+///
+/// These counters report explicit engine reservations and spill-run bytes. They
+/// are not a process allocator or RSS measurement.
+#[derive(Debug, Default)]
+pub(crate) struct OperatorResourceMetrics {
+    memory_used: AtomicUsize,
+    memory_peak: AtomicUsize,
+    spill_used: AtomicU64,
+    spill_peak: AtomicU64,
+    spill_written: AtomicU64,
+}
+
+impl OperatorResourceMetrics {
+    fn acquire_memory(&self, bytes: usize) {
+        let used = self.memory_used.fetch_add(bytes, Ordering::AcqRel).saturating_add(bytes);
+        self.memory_peak.fetch_max(used, Ordering::AcqRel);
+    }
+
+    fn release_memory(&self, bytes: usize) {
+        self.memory_used.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    pub(crate) fn memory_used(&self) -> usize {
+        self.memory_used.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn memory_peak(&self) -> usize {
+        self.memory_peak.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn spill_used(&self) -> u64 {
+        self.spill_used.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn spill_peak(&self) -> u64 {
+        self.spill_peak.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn spill_written(&self) -> u64 {
+        self.spill_written.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn acquire_spill(&self, bytes: u64) {
+        let used = self.spill_used.fetch_add(bytes, Ordering::AcqRel).saturating_add(bytes);
+        self.spill_peak.fetch_max(used, Ordering::AcqRel);
+        self.spill_written.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn release_spill(&self, bytes: u64) {
+        self.spill_used.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
+
 /// Shared byte budget for the blocking operators in one task execution.
 ///
 /// Cloning a tracker shares its counters and configured limit. Each call to
@@ -64,6 +118,7 @@ struct MemoryTrackerInner {
 #[derive(Clone, Debug)]
 pub struct QueryMemoryTracker {
     inner: Arc<MemoryTrackerInner>,
+    attribution: Option<Arc<OperatorResourceMetrics>>,
 }
 
 impl QueryMemoryTracker {
@@ -100,6 +155,7 @@ impl QueryMemoryTracker {
                 retained_arrays: Mutex::new(HashMap::new()),
                 retained_array_requests: AtomicUsize::new(0),
             }),
+            attribution: None,
         }
     }
 
@@ -174,7 +230,19 @@ impl QueryMemoryTracker {
 
     /// Shared temporary-run lifecycle for all blocking operators in this query.
     pub(crate) fn spill_manager(&self) -> SpillManager {
-        self.inner.spill.clone()
+        self.inner.spill.with_attribution(self.attribution.clone())
+    }
+
+    /// Return a cheap tracker view that charges reservations to one plan node
+    /// while still enforcing the shared query-wide budget.
+    pub(crate) fn for_operator(
+        &self,
+        attribution: Arc<OperatorResourceMetrics>,
+    ) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            attribution: Some(attribution),
+        }
     }
 
     /// Current temporary storage charged to this query.
@@ -240,6 +308,21 @@ impl QueryMemoryTracker {
             ) {
                 Ok(_) => {
                     self.inner.peak.fetch_max(next, Ordering::AcqRel);
+                    if let Some(attribution) = &self.attribution {
+                        attribution.acquire_memory(bytes);
+                    }
+                    if tracing::enabled!(target: "vein.audit", tracing::Level::DEBUG) {
+                        tracing::debug!(
+                            target: "vein.audit",
+                            event = "memory_reservation_acquired",
+                            resource,
+                            reserved_bytes = bytes,
+                            memory_used_bytes = next,
+                            memory_peak_bytes = self.inner.peak.load(Ordering::Relaxed),
+                            memory_limit_bytes = self.inner.limit,
+                            "memory_reservation_acquired"
+                        );
+                    }
                     return Ok(MemoryReservation {
                         tracker: self.clone(),
                         bytes,
@@ -284,7 +367,21 @@ impl MemoryReservation {
     pub fn shrink(&mut self, bytes: usize) {
         let released = bytes.min(self.bytes);
         self.bytes -= released;
-        self.tracker.inner.used.fetch_sub(released, Ordering::AcqRel);
+        let used = self.tracker.inner.used.fetch_sub(released, Ordering::AcqRel) - released;
+        if let Some(attribution) = &self.tracker.attribution {
+            attribution.release_memory(released);
+        }
+        if tracing::enabled!(target: "vein.audit", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "vein.audit",
+                event = "memory_reservation_released",
+                released_bytes = released,
+                memory_used_bytes = used,
+                memory_peak_bytes = self.tracker.peak(),
+                memory_limit_bytes = self.tracker.limit(),
+                "memory_reservation_released"
+            );
+        }
     }
 
     /// Transfer another reservation into this owner.
@@ -299,6 +396,19 @@ impl MemoryReservation {
             self.grow(other.bytes, "merged operator state")?;
             return Ok(());
         }
+        let same_attribution = match (&self.tracker.attribution, &other.tracker.attribution) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_attribution {
+            if let Some(attribution) = &self.tracker.attribution {
+                attribution.acquire_memory(other.bytes);
+            }
+            if let Some(attribution) = &other.tracker.attribution {
+                attribution.release_memory(other.bytes);
+            }
+        }
         self.bytes = self
             .bytes
             .checked_add(other.bytes)
@@ -310,7 +420,27 @@ impl MemoryReservation {
 
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
-        self.tracker.inner.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        let released = self.bytes;
+        let used = self
+            .tracker
+            .inner
+            .used
+            .fetch_sub(released, Ordering::AcqRel)
+            .saturating_sub(released);
+        if let Some(attribution) = &self.tracker.attribution {
+            attribution.release_memory(released);
+        }
+        if tracing::enabled!(target: "vein.audit", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "vein.audit",
+                event = "memory_reservation_released",
+                released_bytes = released,
+                memory_used_bytes = used,
+                memory_peak_bytes = self.tracker.peak(),
+                memory_limit_bytes = self.tracker.limit(),
+                "memory_reservation_released"
+            );
+        }
     }
 }
 

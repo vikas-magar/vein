@@ -35,6 +35,7 @@ use crate::pipeline::{
     DataChunk, DataChunkView, MaterializationReport, PipelineNode, Sink, Source, Transform,
 };
 use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};
+use crate::trace::{ExecutionTrace, MaterializationTrace};
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
@@ -301,6 +302,7 @@ pub(crate) struct MaterializeViewNode<
     batches: u64,
     rows: u64,
     conversion_us: u64,
+    trace: Option<MaterializationTrace>,
 }
 
 impl<N: PipelineNode<DataChunk> + ?Sized> MaterializeViewNode<N> {
@@ -333,7 +335,13 @@ impl<N: PipelineNode<DataChunk> + ?Sized> MaterializeViewNode<N> {
             batches: 0,
             rows: 0,
             conversion_us: 0,
+            trace: None,
         }
+    }
+
+    fn with_trace(mut self, trace: Option<MaterializationTrace>) -> Self {
+        self.trace = trace;
+        self
     }
 }
 
@@ -341,12 +349,16 @@ impl<N: PipelineNode<DataChunk> + ?Sized> PipelineNode<DataChunkView> for Materi
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         let started = Instant::now();
         let (chunk, report) = view.to_data_chunk_with_report()?;
+        let conversion_elapsed = started.elapsed();
         self.conversion_us = self
             .conversion_us
-            .saturating_add(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(conversion_elapsed.as_micros()).unwrap_or(u64::MAX));
         self.report.accumulate(report);
         self.batches = self.batches.saturating_add(1);
         self.rows = self.rows.saturating_add(view.num_rows() as u64);
+        if let Some(trace) = &self.trace {
+            trace.record(view.num_rows(), report, conversion_elapsed);
+        }
         self.next.push(chunk)
     }
 
@@ -355,6 +367,9 @@ impl<N: PipelineNode<DataChunk> + ?Sized> PipelineNode<DataChunkView> for Materi
         tracing::info!(
             target: "vein.audit",
             event = "view_materialization",
+            query_id = self.trace.as_ref().map(MaterializationTrace::query_id).unwrap_or(""),
+            task_id = self.trace.as_ref().map(MaterializationTrace::task_id).unwrap_or(""),
+            node_id = self.trace.as_ref().map(MaterializationTrace::node_id).unwrap_or(u32::MAX),
             boundary = self.boundary,
             batches = self.batches,
             rows = self.rows,
@@ -430,7 +445,7 @@ struct PipelineExecutionSchedule {
 }
 
 impl PipelineExecutionSchedule {
-    fn derive(plan: &common::protocol::PhysicalPlan) -> Result<Self> {
+    fn derive(plan: &common::protocol::PhysicalPlan, trace: &ExecutionTrace) -> Result<Self> {
         let graph = DerivedPipelineGraph::derive(plan)?;
         let execution_order = graph.execution_order().ok_or_else(|| {
             VeinError::planning("derived pipeline dependencies contain a cycle", None)
@@ -442,6 +457,34 @@ impl PipelineExecutionSchedule {
             dependency_count = graph.dependencies().len(),
             "pipeline_schedule_created"
         );
+        for pipeline in graph.pipelines() {
+            let operator_node_ids = pipeline
+                .operators
+                .iter()
+                .map(|node| trace.node_id(node))
+                .collect::<Vec<_>>();
+            tracing::debug!(
+                target: "vein.audit",
+                event = "derived_pipeline",
+                pipeline_id = pipeline.id.0,
+                source_node_id = trace.node_id(&pipeline.source.node),
+                source_boundary = ?pipeline.source.kind,
+                operator_node_ids = ?operator_node_ids,
+                sink_node_id = trace.node_id(&pipeline.sink.node),
+                sink_boundary = ?pipeline.sink.kind,
+                "derived_pipeline"
+            );
+        }
+        for dependency in graph.dependencies() {
+            tracing::debug!(
+                target: "vein.audit",
+                event = "pipeline_dependency",
+                prerequisite_pipeline_id = dependency.prerequisite.0,
+                dependent_pipeline_id = dependency.dependent.0,
+                dependency_kind = ?dependency.kind,
+                "pipeline_dependency"
+            );
+        }
         Ok(Self {
             completed: (0..graph.pipelines().len())
                 .map(|_| Arc::new(AtomicBool::new(false)))
@@ -932,13 +975,19 @@ pub struct DefaultTaskExecutor {
 }
 
 impl DefaultTaskExecutor {
-    fn trace_data_flow(node: &PhysicalPlanNode, task: &ExecuteTask, depth: usize) {
+    fn trace_data_flow(
+        node: &PhysicalPlanNode,
+        task: &ExecuteTask,
+        trace: &ExecutionTrace,
+        depth: usize,
+    ) {
         let contract = node.operator.data_flow();
         tracing::debug!(
             target: "vein.audit",
             event = "physical_operator_data_flow",
             query_id = %task.query_id,
             task_id = %task.task_id,
+            node_id = trace.node_id(node),
             depth,
             operator = contract.operator,
             input_materialization = ?contract.input_materialization,
@@ -987,21 +1036,50 @@ impl DefaultTaskExecutor {
     fn execute_input<'a>(
         &'a self,
         input: &'a Arc<PhysicalPlanNode>,
-        mut next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode<DataChunkView>>,
         task: &'a ExecuteTask,
         cancel: &'a CancellationToken,
         memory: &'a QueryMemoryTracker,
         span: &'a tracing::Span,
         schedule: &'a PipelineExecutionSchedule,
+        trace: &'a ExecutionTrace,
         depth: usize,
     ) -> Pin<Box<dyn Future<Output=Result<u64>> + Send + 'a>> {
+        let node_id = trace.node_id(input);
+        let operator = input.operator.data_flow().operator;
+        let node_span = tracing::debug_span!(
+            target: "vein.audit",
+            "physical_operator",
+            query_id = %task.query_id,
+            task_id = %task.task_id,
+            node_id,
+            operator,
+            depth,
+        );
+        let trace_for_metrics = trace;
         Box::pin(async move {
+            let mut execution_guard = trace_for_metrics.execution_guard(node_id);
+            let result = async move {
             if cancel.is_cancelled() {
                 return Err(VeinError::cancelled());
             }
+            tracing::debug!(
+                target: "vein.audit",
+                event = "physical_operator_started",
+                node_id,
+                operator,
+                depth,
+                "physical_operator_started"
+            );
             // Execution depth starts at the sink's child; diagnostics include
             // the sink itself as canonical tree depth zero.
-            Self::trace_data_flow(input, task, depth.saturating_add(1));
+            Self::trace_data_flow(input, task, trace, depth.saturating_add(1));
+            let mut next = trace.observer(
+                trace.node_id(input),
+                next,
+                task.query_id.to_string(),
+                task.task_id.to_string(),
+            );
             match &input.operator {
                 PhysicalPlanOperator::Pipeline {
                     source: data_source,
@@ -1136,12 +1214,13 @@ impl DefaultTaskExecutor {
                             return Err(error);
                         }
                         next.flush()?;
+                        trace.record_source_bytes(node_id, bytes);
                         return Ok(bytes);
                     }
                     let mut source =
                         self.builder
                             .build_source(data_source, task.task_id, task.attempt)?;
-                    if program.instructions.is_empty() {
+                    let bytes_read = if program.instructions.is_empty() {
                         let mut source_next = ChunkToViewNode(next);
                         tokio::select! {
                             biased;
@@ -1162,7 +1241,11 @@ impl DefaultTaskExecutor {
                                 Ok(source.bytes_read())
                             }
                         }
+                    };
+                    if let Ok(bytes) = &bytes_read {
+                        trace.record_source_bytes(node_id, *bytes);
                     }
+                    bytes_read
                 }
                 PhysicalPlanOperator::Transform { input, program } => {
                     let transform = self.builder.build_view_vm(program, next)?;
@@ -1175,6 +1258,7 @@ impl DefaultTaskExecutor {
                             memory,
                             span,
                             schedule,
+                            trace,
                             depth + 1,
                         )
                         .await?;
@@ -1182,6 +1266,7 @@ impl DefaultTaskExecutor {
                 }
                 PhysicalPlanOperator::Aggregate { input: child, plan }
                 | PhysicalPlanOperator::Distinct { input: child, plan } => {
+                    let operator_memory = trace.operator_memory(node_id, memory);
                     let operator =
                         if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
                             "distinct"
@@ -1189,9 +1274,10 @@ impl DefaultTaskExecutor {
                             "aggregate"
                         };
                     let (accumulator, handle) =
-                        aggregate::shared_with_memory_tracker(plan.clone(), memory.clone())?;
+                        aggregate::shared_with_memory_tracker(plan.clone(), operator_memory)?;
                     let handle: Box<dyn PipelineNode<DataChunkView>> =
-                        Box::new(MaterializeViewNode::for_operator(handle, &input.operator)?);
+                        Box::new(MaterializeViewNode::for_operator(handle, &input.operator)?
+                            .with_trace(trace.materialization_handle(node_id)));
                     let bytes = self
                         .execute_input(
                             child,
@@ -1201,6 +1287,7 @@ impl DefaultTaskExecutor {
                             memory,
                             span,
                             schedule,
+                            trace,
                             depth + 1,
                         )
                         .await?;
@@ -1265,6 +1352,7 @@ impl DefaultTaskExecutor {
                     key_program,
                     output_columns,
                 } => {
+                    let operator_memory = trace.operator_memory(node_id, memory);
                     let output_columns = usize::try_from(*output_columns).map_err(|_| {
                         VeinError::planning("recursive sort output width is invalid", None)
                     })?;
@@ -1272,7 +1360,7 @@ impl DefaultTaskExecutor {
                         Box::new(SortTransform::with_memory_tracker(
                             plan.clone(),
                             Some(output_columns),
-                            memory.clone(),
+                            operator_memory,
                             next,
                         )?);
                     let next: Box<dyn PipelineNode<DataChunkView>> = match key_program {
@@ -1282,7 +1370,7 @@ impl DefaultTaskExecutor {
                         None => sort,
                     };
                     let bytes = self
-                        .execute_input(child, next, task, cancel, memory, span, schedule, depth + 1)
+                        .execute_input(child, next, task, cancel, memory, span, schedule, trace, depth + 1)
                         .await?;
                     schedule.complete_boundary(input, PipelineBoundaryKind::SortInput)?;
                     Ok(bytes)
@@ -1297,6 +1385,7 @@ impl DefaultTaskExecutor {
                         memory,
                         span,
                         schedule,
+                        trace,
                         depth + 1,
                     )
                         .await
@@ -1307,11 +1396,12 @@ impl DefaultTaskExecutor {
                 )),
                 PhysicalPlanOperator::Join { probe, build, plan } => {
                     let started = Instant::now();
+                    let operator_memory = trace.operator_memory(node_id, memory);
                     let build_sink = Arc::new(Mutex::new(Some(BuildSink::with_spill_support(
                         join_keys(&plan.probe_keys),
                         join_keys(&plan.build_keys),
                         &join_types(&plan.build_types),
-                        memory.clone(),
+                        operator_memory.clone(),
                     )?)));
                     let build_bytes = self
                         .execute_input(
@@ -1322,6 +1412,7 @@ impl DefaultTaskExecutor {
                             memory,
                             span,
                             schedule,
+                            trace,
                             depth + 1,
                         )
                         .await?;
@@ -1372,7 +1463,7 @@ impl DefaultTaskExecutor {
                         BuildResult::Spilled { run, schema } => {
                             let probe_schema = JoinSpillSchema::new(&join_types(&plan.probe_types));
                             let probe_writer =
-                                JoinSpillWriter::new(memory.clone(), probe_schema.clone())?;
+                                JoinSpillWriter::new(operator_memory.clone(), probe_schema.clone())?;
                             let downstream: SharedJoinOutput = Arc::new(Mutex::new(next));
                             let spilled = SpilledJoinProbe {
                                 probe_writer: Some(probe_writer),
@@ -1381,7 +1472,7 @@ impl DefaultTaskExecutor {
                                 probe_schema,
                                 plan: plan.clone(),
                                 builder: Arc::clone(&self.builder),
-                                tracker: memory.clone(),
+                                tracker: operator_memory.clone(),
                                 next: downstream,
                             };
                             Box::new(PipelineDependencyGuard::new(
@@ -1403,6 +1494,7 @@ impl DefaultTaskExecutor {
                             memory,
                             span,
                             schedule,
+                            trace,
                             depth + 1,
                         )
                         .await?;
@@ -1424,6 +1516,9 @@ impl DefaultTaskExecutor {
                     Ok(build_bytes.saturating_add(probe_bytes))
                 }
             }
+            }.instrument(node_span).await;
+            execution_guard.finish(&result);
+            result
         })
     }
 
@@ -1441,8 +1536,14 @@ impl DefaultTaskExecutor {
         if cancel.is_cancelled() {
             return Err(VeinError::cancelled());
         }
+        let query_id = task.query_id.to_string();
+        let task_id = task.task_id.to_string();
+        let mut trace = ExecutionTrace::new(&task.plan.root, query_id.clone(), task_id.clone());
+        // Emit the compact plan before validation so malformed plans still have
+        // node IDs, schemas, mappings, and flow contracts in the debug trace.
+        trace.log_plan();
+        Self::trace_data_flow(&task.plan.root, task, &trace, 0);
         task.plan.validate()?;
-        Self::trace_data_flow(&task.plan.root, task, 0);
         let PhysicalPlanOperator::Sink {
             input,
             sink: sink_plan,
@@ -1453,13 +1554,14 @@ impl DefaultTaskExecutor {
                 None,
             ));
         };
-        let schedule = PipelineExecutionSchedule::derive(&task.plan)?;
+        let schedule = PipelineExecutionSchedule::derive(&task.plan, &trace)?;
         let spill_storage = self.spill_storage_factory.create_for_query()?;
         let memory = QueryMemoryTracker::with_spill_storage(
             self.resource_limits,
             cancel.clone(),
             spill_storage,
         );
+        trace.attach_memory_tracker(memory.clone());
 
         let sink_started = Instant::now();
         let sink = make_sink(self.builder.as_ref(), sink_plan)?;
@@ -1480,11 +1582,14 @@ impl DefaultTaskExecutor {
         ));
         let run_started = Instant::now();
         let source_started = Instant::now();
-        let bytes_read = self
+        let mut root_guard = trace.execution_guard(trace.node_id(&task.plan.root));
+        let execution_result = self
             .execute_input(
-                input, head, task, &cancel, &memory, &task_span, &schedule, 0,
+                input, head, task, &cancel, &memory, &task_span, &schedule, &trace, 0,
             )
-            .await?;
+            .await;
+        root_guard.finish(&execution_result);
+        let bytes_read = execution_result?;
         schedule.complete_boundary(&task.plan.root, PipelineBoundaryKind::ResultSink)?;
         schedule.verify_complete()?;
         let source_build_us = source_started.elapsed().as_micros() as u64;
@@ -1522,6 +1627,7 @@ impl DefaultTaskExecutor {
             total_us = duration_ns / 1000,
             "task_finished"
         );
+        trace.mark_completed();
         Ok(TaskResult {
             row_count,
             output,

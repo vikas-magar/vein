@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use common::cancellation::CancellationToken;
 use common::Result;
 use error::VeinError;
+use crate::memory::OperatorResourceMetrics;
 
 use super::storage::{SpillRunId, SpillStorage, SpillStream};
 use super::SpillErrorResolver;
@@ -23,6 +24,7 @@ struct SpillManagerInner {
 #[derive(Clone)]
 pub(crate) struct SpillManager {
     inner: Arc<SpillManagerInner>,
+    attribution: Option<Arc<OperatorResourceMetrics>>,
 }
 
 impl std::fmt::Debug for SpillManager {
@@ -49,6 +51,17 @@ impl SpillManager {
                 disk_used: AtomicU64::new(0),
                 disk_peak: AtomicU64::new(0),
             }),
+            attribution: None,
+        }
+    }
+
+    pub(crate) fn with_attribution(
+        &self,
+        attribution: Option<Arc<OperatorResourceMetrics>>,
+    ) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            attribution,
         }
     }
 
@@ -57,6 +70,7 @@ impl SpillManager {
         let (id, stream) = self.inner.storage.create()?;
         let state = Arc::new(SpillRunInner {
             manager: Arc::clone(&self.inner),
+            attribution: self.attribution.clone(),
             id,
             bytes: AtomicU64::new(0),
             deleted: AtomicBool::new(false),
@@ -142,6 +156,15 @@ impl PendingSpillRun {
             .flush()
             .map_err(|error| VeinError::internal(format!("flush spill run: {error}")))?;
         drop(writer);
+        tracing::debug!(
+            target: "vein.audit",
+            event = "spill_run_committed",
+            run_bytes = self.state.bytes.load(Ordering::Acquire),
+            spill_disk_used_bytes = self.state.manager.disk_used.load(Ordering::Acquire),
+            spill_disk_peak_bytes = self.state.manager.disk_peak.load(Ordering::Acquire),
+            spill_disk_limit_bytes = self.state.manager.disk_limit,
+            "spill_run_committed"
+        );
         Ok(SpillRun { state: self.state })
     }
 }
@@ -209,6 +232,9 @@ impl Write for SpillWriteHandle {
                 }
                 if actual_growth > 0 {
                     self.state.bytes.store(new_size, Ordering::Release);
+                    if let Some(attribution) = &self.state.attribution {
+                        attribution.acquire_spill(actual_growth);
+                    }
                 }
                 Ok(written)
             }
@@ -279,6 +305,7 @@ impl SpillRun {
 
 struct SpillRunInner {
     manager: Arc<SpillManagerInner>,
+    attribution: Option<Arc<OperatorResourceMetrics>>,
     id: SpillRunId,
     bytes: AtomicU64,
     deleted: AtomicBool,
@@ -290,9 +317,22 @@ impl Drop for SpillRunInner {
             return;
         }
         match self.manager.storage.remove(&self.id) {
-            Ok(()) => self
-                .manager
-                .release_disk(self.bytes.load(Ordering::Acquire)),
+            Ok(()) => {
+                let run_bytes = self.bytes.load(Ordering::Acquire);
+                self.manager.release_disk(run_bytes);
+                if let Some(attribution) = &self.attribution {
+                    attribution.release_spill(run_bytes);
+                }
+                tracing::debug!(
+                    target: "vein.audit",
+                    event = "spill_run_removed",
+                    run_bytes,
+                    spill_disk_used_bytes = self.manager.disk_used.load(Ordering::Acquire),
+                    spill_disk_peak_bytes = self.manager.disk_peak.load(Ordering::Acquire),
+                    spill_disk_limit_bytes = self.manager.disk_limit,
+                    "spill_run_removed"
+                );
+            }
             Err(error) => tracing::warn!(
                 target: "vein.audit",
                 event = "spill_run_cleanup_failed",

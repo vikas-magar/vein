@@ -47,11 +47,48 @@ something with no IDE equivalent.
   unless explicitly requested — a full rebuild is slow and is not part of the normal loop.
 - `get_project_modules` currently reports `EMPTY_MODULE`; rely on `list_directory_tree` and
   `get_project_dependencies` for structure instead.
+- Run validation queries with the existing `Query` configuration via
+  `execute_run_configuration`. Its launch override must include the complete Cargo command
+  arguments, followed by `--` and the quoted Vein query. For example:
+
+  ```text
+  configurationName: Query
+  programArguments: run --bin cli -- "FROM lineitem |> AGGREGATE count(*) AS n"
+  ```
+
+  Preserve the quotes around the query so it reaches the CLI as one argument. The `Query`
+  configuration already supplies `VEIN_DATA_DIR`; leave its environment override unset unless
+  the validation needs a different data root.
+- Use the other existing Cargo configurations by name with `execute_run_configuration`; omit
+  launch overrides for these workspace tasks:
+
+  ```text
+  Build: configurationName: Build   # build --workspace
+  Check: configurationName: Check   # check --workspace
+  Test:  configurationName: Test    # test --workspace
+  ```
+
+  Use `Run` to launch the CLI. When passing a query through its launch override, provide the full
+  Cargo argument string just as for `Query`; set `VEIN_DATA_DIR` in `envs` if the configured
+  environment does not already provide it:
+
+  ```text
+  configurationName: Run
+  programArguments: run --bin cli -- "FROM lineitem |> AGGREGATE count(*) AS n"
+  envs: { VEIN_DATA_DIR: /path/to/tpch }
+  ```
 
 ## Working agreement
 
-- Per issue, the loop is: explain the issue → open the file and line in the editor → explain the
-  fix and why → **wait for approval** → apply the patch → run the relevant tests → run the build.
+- Per issue, the loop is: explain the issue → open the file and line in the editor where the code changes will go →
+  explain the
+  fix and why → **wait for approval** → apply the patch -> highlight he changes → run the relevant tests → run the
+  build.
+- **Always write modular, robust efficient, abstract code, use traits. write extensible code. code should be production
+  grade**.
+- use run configurations only Test, Check, Build, Query
+- Only write at max 200 like of code in a file.
+- always check for duplicate and avoid code duplication. write reusable code.
 - Cite locations as `path:line` so they are clickable.
 - Explain design decisions (especially dependency or type changes) before making them.
 
@@ -61,3 +98,6 @@ something with no IDE equivalent.
   later phase; do not build toward it yet.
 - Zero copy is the core value proposition. Treat per-batch and per-row columnar copies as bugs,
   not optimizations. Metadata-level clones are lower priority but still worth removing.
+- Prefer modular, abstract, extensible designs that use traits and generics where they make the
+  code more reusable or remove coupling. Keep abstractions purposeful, avoid duplicate code, and
+  preserve the zero-copy data path.

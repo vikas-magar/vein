@@ -5,7 +5,7 @@
 The TPC-H Parquet dataset in this repository was generated at scale factor `0.01` with one Parquet part per table:
 
 ```bash
-tpchgen-cli parquet --scale-factor 0.10 --parts 3 --output-dir data/tpch --no-progress --quiet
+tpchgen-cli parquet --scale-factor 1.60 --parts 5 --output-dir data/tpch --no-progress --quiet
 ```
 
 Tables are discovered beneath `/Users/anvi/Next/vein/data/tpch/`, for example `orders/orders.1.parquet` and

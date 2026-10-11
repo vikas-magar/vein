@@ -25,4 +25,7 @@ pub mod spill;
 /// Vector VM execution engine interpreting Micro-IR programs.
 pub mod vm;
 
+/// Structured execution tracing for canonical plans and batch flow.
+mod trace;
+
 pub use pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
