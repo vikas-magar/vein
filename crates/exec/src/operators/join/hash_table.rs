@@ -154,29 +154,45 @@ impl ChunkKeys {
         Ok((Self { columns }, report, u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)))
     }
 
-    /// Whether any key column is null at `row`. A null key matches nothing.
+    /// Whether any key column is null at `row`.
+    ///
+    /// Build insertion uses this lightweight pass to count null rows before it
+    /// reserves index memory, keeping an allocation failure from leaving a
+    /// partially inserted batch.
     fn any_null(&self, row: usize) -> bool {
         self.columns.iter().any(|column| column.is_null(row))
     }
 
-    fn hash(&self, row: usize) -> u64 {
-        self.columns
-            .iter()
-            .fold(FNV_OFFSET, |hash, column| column.hash_into(row, hash))
+    /// Encodes one row's key in one pass over its key columns.
+    ///
+    /// Null keys do not participate in equality joins. For a single Int64 key,
+    /// return the inline value alongside its hash so callers do not read the
+    /// same Arrow value again just to prepare the fast comparison path.
+    #[inline]
+    fn hash_and_single_i64(&self, row: usize) -> Option<(u64, Option<i64>)> {
+        if let [KeyArray::Int64(array)] = self.columns.as_slice() {
+            if array.is_null(row) {
+                return None;
+            }
+            let value = array.value(row);
+            let hash = fnv1a(&value.to_ne_bytes(), FNV_OFFSET);
+            return Some((hash, Some(value)));
+        }
+
+        let mut hash = FNV_OFFSET;
+        for column in &self.columns {
+            if column.is_null(row) {
+                return None;
+            }
+            hash = column.hash_into(row, hash);
+        }
+        Some((hash, None))
     }
 
     /// Whether this is a single `Int64` key, the shape that can be compared as a
     /// plain value instead of through the encoding.
     fn is_single_i64(&self) -> bool {
         matches!(self.columns.as_slice(), [KeyArray::Int64(_)])
-    }
-
-    /// The single `Int64` key at `row`; only meaningful when [`Self::is_single_i64`].
-    fn single_i64(&self, row: usize) -> Option<i64> {
-        match self.columns.as_slice() {
-            [KeyArray::Int64(array)] => Some(array.value(row)),
-            _ => None,
-        }
     }
 
     fn equals(&self, row: usize, other: &Self, other_row: usize) -> bool {
@@ -239,11 +255,11 @@ impl HashTable {
             VeinError::internal(format!("cannot reserve join spill hashes: {error}"))
         })?;
         for row in 0..view.num_rows() {
-            hashes.push(if resolved.any_null(row) {
-                FNV_OFFSET
-            } else {
-                resolved.hash(row)
-            });
+            hashes.push(
+                resolved
+                    .hash_and_single_i64(row)
+                    .map_or(FNV_OFFSET, |(hash, _)| hash),
+            );
         }
         Ok(hashes)
     }
@@ -423,12 +439,10 @@ impl HashTable {
 
         for position in 0..row_count {
             let row = position as u32;
-            if keys.any_null(position) {
+            let Some((hash, inline_key)) = keys.hash_and_single_i64(position) else {
                 self.null_keyed.push((chunk_index, row));
                 continue;
-            }
-            let inline_key = keys.single_i64(position);
-            let hash = keys.hash(row as usize);
+            };
             let index = self.entries.len() as u32;
             let bucket = bucket_of(hash, self.buckets.len());
             let next = self.buckets[bucket];
@@ -582,11 +596,10 @@ impl HashTable {
         let inline = self.inline_keys() && probe_keys.is_single_i64();
         for position in 0..probe.num_rows() {
             let row = position as u32;
-            if probe_keys.any_null(row as usize) {
+            let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position) else {
                 continue;
-            }
-            let hash = probe_keys.hash(row as usize);
-            let value = inline.then(|| probe_keys.single_i64(row as usize).unwrap_or_default());
+            };
+            let value = inline.then(|| inline_key.unwrap_or_default());
             let mut head = self.buckets[bucket_of(hash, self.buckets.len())];
             while head != NONE {
                 let entry = self.entries[head as usize];
@@ -663,6 +676,38 @@ mod tests {
     }
 
     #[test]
+    fn row_key_encoding_hashes_composite_values_and_skips_null_keys() {
+        let single_i64 = ChunkKeys {
+            columns: vec![KeyArray::Int64(Int64Array::from(vec![Some(3), None]))],
+        };
+        let expected_i64_hash = fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET);
+        assert_eq!(
+            single_i64.hash_and_single_i64(0),
+            Some((expected_i64_hash, Some(3))),
+            "the inline Int64 comparison key shares the one-pass encoding result"
+        );
+        assert_eq!(single_i64.hash_and_single_i64(1), None);
+
+        let composite = ChunkKeys {
+            columns: vec![
+                KeyArray::Int64(Int64Array::from(vec![Some(3), Some(3), None])),
+                KeyArray::Utf8(StringArray::from(vec![Some("north"), None, Some("north")])),
+            ],
+        };
+        let expected_composite_hash = fnv1a(
+            b"north",
+            fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET),
+        );
+        assert_eq!(
+            composite.hash_and_single_i64(0),
+            Some((expected_composite_hash, None)),
+            "composite keys preserve column order in the canonical hash"
+        );
+        assert_eq!(composite.hash_and_single_i64(1), None, "a null in any key column skips the row");
+        assert_eq!(composite.hash_and_single_i64(2), None, "null leading key columns skip the row");
+    }
+
+    #[test]
     fn spill_hashes_use_the_same_composite_key_encoding_as_join_indexing() {
         let keys = JoinKeys::new(vec![0, 1]);
         let build = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
@@ -670,12 +715,12 @@ mod tests {
             Arc::new(StringArray::from(vec![Some("north"), Some("south"), Some("north")]))
                 as ArrayRef,
         ]))
-        .expect("build view");
+            .expect("build view");
         let probe = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
             Arc::new(Int64Array::from(vec![Some(3)])) as ArrayRef,
             Arc::new(StringArray::from(vec![Some("north")])) as ArrayRef,
         ]))
-        .expect("probe view");
+            .expect("probe view");
 
         let build_hashes = HashTable::hashes_for_view(&build, &keys).expect("build hashes");
         let probe_hashes = HashTable::hashes_for_view(&probe, &keys).expect("probe hashes");
@@ -1160,7 +1205,7 @@ mod tests {
             JoinKeys::new(vec![0]),
             tracker.clone(),
         )
-        .expect("initial buckets fit the budget");
+            .expect("initial buckets fit the budget");
         table
             .insert_view(DataChunkView::from_chunk(chunk(Arc::clone(&first))).unwrap())
             .expect("first build batch fits");
@@ -1179,7 +1224,7 @@ mod tests {
             .probe(&chunk(ints(&[10, 20])), &mut matches)
             .expect("existing build rows remain probeable");
         assert_eq!(matches.len(), 1);
-        assert_eq!(table.build_row(matches[0].1 .0), (0, 0));
+        assert_eq!(table.build_row(matches[0].1.0), (0, 0));
     }
 
     #[test]

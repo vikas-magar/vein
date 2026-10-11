@@ -319,7 +319,12 @@ impl HashJoin {
         if chunk.is_empty() {
             return Ok(());
         }
-        let probe_rows: Vec<u32> = (0..chunk.num_rows()).map(|row| row as u32).collect();
+        let probe_row_count = u32::try_from(chunk.num_rows()).map_err(|_| {
+            VeinError::internal(format!(
+                "hash join probe batch has {} rows, exceeding the row-index range",
+                chunk.num_rows()
+            ))
+        })?;
         let mut matches = Vec::new();
         let probe_started = Instant::now();
         let (report, materialize_us) = self.table.probe_view(&chunk, &mut matches)?;
@@ -347,11 +352,11 @@ impl HashJoin {
         if matches!(self.join_type, JoinType::Right | JoinType::Full) {
             self.matched_build.extend(matches.iter().map(|(_, build)| *build));
         }
-        self.probed_rows += probe_rows.len() as u64;
+        self.probed_rows += u64::from(probe_row_count);
         self.matched_rows += matches.len() as u64;
 
         let started = Instant::now();
-        let rows = output_rows(self.join_type, &probe_rows, &matches, &[]);
+        let rows = output_rows(self.join_type, 0..probe_row_count, &matches, &[]);
         self.forward_rows(Some(&chunk), &rows)?;
         self.view_compose_us += started.elapsed().as_micros() as u64;
         self.residual_us += residual_started.elapsed().as_micros() as u64;
@@ -485,7 +490,7 @@ impl PipelineNode<DataChunkView> for HashJoin {
                 .filter(|row| !self.matched_build.contains(row))
                 .collect();
             if !unmatched.is_empty() {
-                let rows = output_rows(self.join_type, &[], &[], &unmatched);
+                let rows = output_rows(self.join_type, 0..0, &[], &unmatched);
                 let started = Instant::now();
                 self.forward_rows(None, &rows)?;
                 self.view_compose_us += started.elapsed().as_micros() as u64;

@@ -189,8 +189,9 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
     Ok(join)
 }
 
-fn make_conjunction(mut terms: Vec<LogicalExpr>) -> Option<LogicalExpr> {
-    let mut predicate = terms.drain(..).next()?;
+fn make_conjunction(terms: Vec<LogicalExpr>) -> Option<LogicalExpr> {
+    let mut terms = terms.into_iter();
+    let mut predicate = terms.next()?;
     for term in terms {
         predicate = LogicalExpr::BinaryOp {
             left: Box::new(predicate),
@@ -393,10 +394,11 @@ mod tests {
     }
 
     #[test]
-    fn extracts_exists_from_top_level_conjunction_and_preserves_other_filter_terms() {
+    fn extracts_exists_from_top_level_conjunction_and_preserves_all_other_filter_terms() {
         let outer_key = field(40, "o_orderkey", "orders", VeinDataType::Int64);
+        let outer_value = field(42, "o_totalprice", "orders", VeinDataType::Int64);
         let inner_key = field(41, "l_orderkey", "lineitem", VeinDataType::Int64);
-        let outer = scan("orders", vec![Arc::clone(&outer_key)]);
+        let outer = scan("orders", vec![Arc::clone(&outer_key), Arc::clone(&outer_value)]);
         let inner = scan("lineitem", vec![Arc::clone(&inner_key)]);
         let exists = LogicalExpr::Exists {
             subquery: Box::new(LogicalPlan::Filter {
@@ -408,16 +410,27 @@ mod tests {
             }),
             negated: false,
         };
-        let residual = LogicalExpr::BinaryOp {
+        let first_residual = LogicalExpr::BinaryOp {
             left: Box::new(LogicalExpr::Column(outer_key)),
             op: BinaryOp::Gt,
             right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(0))),
             return_type: VeinDataType::Boolean,
         };
+        let second_residual = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(outer_value)),
+            op: BinaryOp::Lt,
+            right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(10))),
+            return_type: VeinDataType::Boolean,
+        };
         let filter = LogicalPlan::Filter {
             input: Box::new(outer),
             predicate: LogicalExpr::BinaryOp {
-                left: Box::new(residual),
+                left: Box::new(LogicalExpr::BinaryOp {
+                    left: Box::new(first_residual.clone()),
+                    op: BinaryOp::And,
+                    right: Box::new(second_residual.clone()),
+                    return_type: VeinDataType::Boolean,
+                }),
                 op: BinaryOp::And,
                 right: Box::new(exists),
                 return_type: VeinDataType::Boolean,
@@ -429,9 +442,13 @@ mod tests {
             .expect("rewrite should succeed")
             .expect("top-level EXISTS conjunct should decorrelate");
         let LogicalPlan::Filter { input, predicate } = rewritten else {
-            panic!("the other conjunct must remain as a filter");
+            panic!("the non-EXISTS conjuncts must remain as a filter");
         };
-        assert!(matches!(predicate, LogicalExpr::BinaryOp { op: BinaryOp::Gt, .. }));
+        let LogicalExpr::BinaryOp { left, op: BinaryOp::And, right, .. } = predicate else {
+            panic!("both non-EXISTS conjuncts must be preserved");
+        };
+        assert_eq!(left.as_ref(), &first_residual);
+        assert_eq!(right.as_ref(), &second_residual);
         assert!(matches!(input.as_ref(), LogicalPlan::Join { join_type: JoinType::Semi, .. }));
     }
 
