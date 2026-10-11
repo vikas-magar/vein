@@ -390,6 +390,23 @@ The memory budget is an estimate for operator-managed state, not a process-RSS c
 - **Acceptance:** The canonical plan path does not regress common scan workloads materially, join payload copies decrease as designed, and performance changes are attributable to node/pipeline metrics.
 - **Tests/benchmarks:** Use existing benchmark/run configurations where available; do not introduce a new run configuration without updating the project workflow deliberately.
 
+**Benchmark smoke run (2026-10-11):** The Criterion target now covers 16
+single-node scenarios across scan, filter/project, chained join, join plus
+aggregate, sort/limit, correlated scalar subquery, and supporting cases. The
+optimized benchmark run completed all scenario preflights, untimed diagnostic
+captures, and timed cases successfully against the configured TPC-H data using
+10 samples with 0.1-second warm-up and 0.3-second measurement settings. The
+preflight compares rows with DuckDB when its executable is available. The
+DEBUG metrics and weak-reference result-buffer probe emitted successfully.
+RustRover's existing Run wrapper appends `--format=json`, which Criterion
+rejects; the successful smoke run used RustRover's integrated terminal. The
+reproducible invocation and wrapper limitation are recorded in
+`crates/cli/benches/BENCHMARKING.md`. This smoke run verifies benchmark
+execution and metric collection, but does not compare against a prior source
+revision. It therefore does not establish scan non-regression or reduced join
+materialization; Task 7.1 remains open until those before/after results are
+captured and reviewed.
+
 #### Task 7.2 — Production readiness gate
 
 - [ ] All supported logical operators have planner, runtime, and semantic tests.
