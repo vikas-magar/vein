@@ -3,6 +3,7 @@ use std::time::Instant;
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use cli::local::LocalQueryEngine;
+use common::{Result, VeinError};
 
 /// Rows the CLI renders before summarising the rest.
 ///
@@ -11,17 +12,15 @@ use cli::local::LocalQueryEngine;
 /// CLI renders a bounded prefix and reports the true total; set `VEIN_DISPLAY_ROWS`
 /// to raise the bound, or to `0` to render every row.
 const DISPLAY_ROWS: usize = 1_000;
+const QUERY_USAGE: &str = "usage: vein \"FROM table |> SELECT *\"";
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     let args = std::env::args().skip(1);
 
     common::logging::init("cli")?;
 
-    let query = args.collect::<Vec<_>>().join(" ");
-    if query.is_empty() {
-        return Err("usage: vein \"FROM table |> SELECT *\"".into());
-    }
+    let query = query_argument(args.collect::<Vec<_>>().join(" "))?;
 
     let data_root = std::env::var_os("VEIN_DATA_DIR")
         .map(std::path::PathBuf::from)
@@ -121,6 +120,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn query_argument(query: String) -> Result<String> {
+    if query.is_empty() {
+        Err(VeinError::invalid_input(QUERY_USAGE))
+    } else {
+        Ok(query)
+    }
+}
+
 /// The row-render bound: `VEIN_DISPLAY_ROWS`, defaulting to [`DISPLAY_ROWS`], with
 /// `0` meaning render every row.
 fn display_row_limit() -> Option<usize> {
@@ -131,5 +138,25 @@ fn display_row_limit() -> Option<usize> {
             Err(_) => Some(DISPLAY_ROWS),
         },
         Err(_) => Some(DISPLAY_ROWS),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QUERY_USAGE, query_argument};
+    use common::VeinError;
+
+    #[test]
+    fn empty_query_argument_returns_central_input_error() {
+        assert!(matches!(
+            query_argument(String::new()),
+            Err(VeinError::InvalidInput(message)) if message == QUERY_USAGE
+        ));
+    }
+
+    #[test]
+    fn nonempty_query_argument_is_preserved() {
+        let query = "FROM part |> SELECT *";
+        assert_eq!(query_argument(query.to_owned()).unwrap(), query);
     }
 }

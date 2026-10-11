@@ -19,9 +19,7 @@ use arrow::datatypes::Schema;
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use common::Result;
-use error::VeinError;
-
-use manager::SpillDiskLimitExceeded;
+use error::{ErrorCategory, VeinError};
 
 pub(crate) type SpillErrorResolver = Arc<dyn Fn() -> Option<VeinError> + Send + Sync>;
 
@@ -79,27 +77,12 @@ impl<W: IpcRunOutput> IpcRunWriter<W> {
 fn resolve_spill_error(
     resolver: &Option<SpillErrorResolver>,
     operation: &'static str,
-    error: impl std::error::Error + 'static,
+    error: impl std::error::Error + Send + Sync + 'static,
 ) -> VeinError {
     resolver
         .as_ref()
         .and_then(|resolve| resolve())
-        .unwrap_or_else(|| spill_error(operation, error))
-}
-
-fn spill_error(operation: &'static str, error: impl std::error::Error + 'static) -> VeinError {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
-    while let Some(cause) = source {
-        if let Some(limit) = cause.downcast_ref::<SpillDiskLimitExceeded>() {
-            return VeinError::resource_exhausted(
-                "query spill disk",
-                usize::try_from(limit.requested).unwrap_or(usize::MAX),
-                usize::try_from(limit.limit).unwrap_or(usize::MAX),
-            );
-        }
-        source = cause.source();
-    }
-    VeinError::internal(format!("{operation}: {error}"))
+        .unwrap_or_else(|| VeinError::from_error_chain(ErrorCategory::Storage, operation, error))
 }
 
 #[cfg(test)]
@@ -116,6 +99,37 @@ mod tests {
 
     use super::IpcRunWriter;
     use super::IpcRunOutput;
+    use error::VeinError;
+
+    struct QuotaFailingOutput;
+
+    impl std::io::Write for QuotaFailingOutput {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other(VeinError::resource_exhausted(
+                "query spill disk",
+                17,
+                8,
+            )))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl std::io::Seek for QuotaFailingOutput {
+        fn seek(&mut self, _position: std::io::SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    impl IpcRunOutput for QuotaFailingOutput {
+        fn spill_error_resolver(&self) -> Option<super::SpillErrorResolver> {
+            Some(Arc::new(|| {
+                Some(VeinError::resource_exhausted("query spill disk", 17, 8))
+            }))
+        }
+    }
 
     #[test]
     fn generic_ipc_run_writer_round_trips_multiple_batches() {
@@ -146,5 +160,21 @@ mod tests {
         assert_eq!(reader.next().expect("first record batch").unwrap(), first);
         assert_eq!(reader.next().expect("second record batch").unwrap(), second);
         assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn wrapped_arrow_io_uses_query_resolver_for_resource_failure() {
+        let schema = Schema::empty();
+        let result = IpcRunWriter::new(QuotaFailingOutput, &schema, "creating spill run");
+
+        assert!(matches!(
+            result,
+            Err(VeinError::ResourceExhausted {
+                resource,
+                requested: 17,
+                limit: 8,
+                ..
+            }) if resource == "query spill disk"
+        ));
     }
 }

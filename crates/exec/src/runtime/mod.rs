@@ -822,8 +822,8 @@ impl SpilledJoinProbe {
             if bit >= u64::BITS {
                 return Err(VeinError::resource_exhausted(
                     "recursive hash join partition",
-                    bit as usize + 1,
-                    u64::BITS as usize,
+                    u128::from(bit) + 1,
+                    u128::from(u64::BITS),
                 ));
             }
             tracing::debug!(
@@ -1060,10 +1060,10 @@ impl DefaultTaskExecutor {
         Box::pin(async move {
             let mut execution_guard = trace_for_metrics.execution_guard(node_id);
             let result = async move {
-            if cancel.is_cancelled() {
-                return Err(VeinError::cancelled());
-            }
-            tracing::debug!(
+                if cancel.is_cancelled() {
+                    return Err(VeinError::cancelled());
+                }
+                tracing::debug!(
                 target: "vein.audit",
                 event = "physical_operator_started",
                 node_id,
@@ -1071,99 +1071,99 @@ impl DefaultTaskExecutor {
                 depth,
                 "physical_operator_started"
             );
-            // Execution depth starts at the sink's child; diagnostics include
-            // the sink itself as canonical tree depth zero.
-            Self::trace_data_flow(input, task, trace, depth.saturating_add(1));
-            let mut next = trace.observer(
-                trace.node_id(input),
-                next,
-                task.query_id.to_string(),
-                task.task_id.to_string(),
-            );
-            match &input.operator {
-                PhysicalPlanOperator::Pipeline {
-                    source: data_source,
-                    program,
-                    ..
-                } => {
-                    let sources = split_scan(data_source);
-                    if sources.len() > 1 {
-                        let worker_count = self.builder.max_parallelism().max(1).min(sources.len());
-                        let pending = Arc::new(Mutex::new(VecDeque::from(sources)));
-                        let finished = Arc::new(AtomicBool::new(false));
-                        let (sender, receiver) = flume::bounded(worker_count);
-                        let runtime = tokio::runtime::Handle::current();
-                        let mut workers = tokio::task::JoinSet::new();
-                        for _ in 0..worker_count {
-                            let builder = Arc::clone(&self.builder);
-                            let pending = Arc::clone(&pending);
-                            let sender = sender.clone();
-                            let finished = Arc::clone(&finished);
-                            let program = Arc::clone(program);
-                            let task_id = task.task_id;
-                            let attempt = task.attempt;
-                            let cancel = cancel.clone();
-                            let span = span.clone();
-                            let runtime = runtime.clone();
-                            workers.spawn_blocking(move || {
-                                let mut bytes = 0u64;
-                                loop {
-                                    if cancel.is_cancelled() {
-                                        return Err(VeinError::cancelled());
-                                    }
-                                    let source_spec = pending
-                                        .lock()
-                                        .map_err(|_| {
-                                            VeinError::internal("scan work queue mutex poisoned")
-                                        })?
-                                        .pop_front();
-                                    let Some(source_spec) = source_spec else {
-                                        return Ok(bytes);
-                                    };
-                                    let mut source =
-                                        builder.build_source(&source_spec, task_id, attempt)?;
-                                    let channel: Box<dyn PipelineNode<DataChunkView>> = Box::new(
-                                        SuppressFlush::new(Box::new(ChannelPipelineNode {
-                                            sender: sender.clone(),
-                                            finished: Arc::clone(&finished),
-                                        })),
-                                    );
-                                    let result = if program.instructions.is_empty() {
-                                        let mut next = ChunkToViewNode(channel);
-                                        runtime.block_on(async {
-                                            tokio::select! {
+                // Execution depth starts at the sink's child; diagnostics include
+                // the sink itself as canonical tree depth zero.
+                Self::trace_data_flow(input, task, trace, depth.saturating_add(1));
+                let mut next = trace.observer(
+                    trace.node_id(input),
+                    next,
+                    task.query_id.to_string(),
+                    task.task_id.to_string(),
+                );
+                match &input.operator {
+                    PhysicalPlanOperator::Pipeline {
+                        source: data_source,
+                        program,
+                        ..
+                    } => {
+                        let sources = split_scan(data_source);
+                        if sources.len() > 1 {
+                            let worker_count = self.builder.max_parallelism().max(1).min(sources.len());
+                            let pending = Arc::new(Mutex::new(VecDeque::from(sources)));
+                            let finished = Arc::new(AtomicBool::new(false));
+                            let (sender, receiver) = flume::bounded(worker_count);
+                            let runtime = tokio::runtime::Handle::current();
+                            let mut workers = tokio::task::JoinSet::new();
+                            for _ in 0..worker_count {
+                                let builder = Arc::clone(&self.builder);
+                                let pending = Arc::clone(&pending);
+                                let sender = sender.clone();
+                                let finished = Arc::clone(&finished);
+                                let program = Arc::clone(program);
+                                let task_id = task.task_id;
+                                let attempt = task.attempt;
+                                let cancel = cancel.clone();
+                                let span = span.clone();
+                                let runtime = runtime.clone();
+                                workers.spawn_blocking(move || {
+                                    let mut bytes = 0u64;
+                                    loop {
+                                        if cancel.is_cancelled() {
+                                            return Err(VeinError::cancelled());
+                                        }
+                                        let source_spec = pending
+                                            .lock()
+                                            .map_err(|_| {
+                                                VeinError::internal("scan work queue mutex poisoned")
+                                            })?
+                                            .pop_front();
+                                        let Some(source_spec) = source_spec else {
+                                            return Ok(bytes);
+                                        };
+                                        let mut source =
+                                            builder.build_source(&source_spec, task_id, attempt)?;
+                                        let channel: Box<dyn PipelineNode<DataChunkView>> = Box::new(
+                                            SuppressFlush::new(Box::new(ChannelPipelineNode {
+                                                sender: sender.clone(),
+                                                finished: Arc::clone(&finished),
+                                            })),
+                                        );
+                                        let result = if program.instructions.is_empty() {
+                                            let mut next = ChunkToViewNode(channel);
+                                            runtime.block_on(async {
+                                                tokio::select! {
                                                 biased;
                                                 _ = cancel.cancelled() => Err(VeinError::cancelled()),
                                                 result = source.execute(&mut next).instrument(span.clone()) => result,
                                             }
-                                        })
-                                    } else {
-                                        let vm = builder.build_view_vm(&program, channel)?;
-                                        let mut next = ChunkToViewNode(vm);
-                                        runtime.block_on(async {
-                                            tokio::select! {
+                                            })
+                                        } else {
+                                            let vm = builder.build_view_vm(&program, channel)?;
+                                            let mut next = ChunkToViewNode(vm);
+                                            runtime.block_on(async {
+                                                tokio::select! {
                                                 biased;
                                                 _ = cancel.cancelled() => Err(VeinError::cancelled()),
                                                 result = source.execute(&mut next).instrument(span.clone()) => result,
                                             }
-                                        })
-                                    };
-                                    result?;
-                                    bytes = bytes.saturating_add(source.bytes_read());
-                                    if finished.load(Ordering::Acquire) {
-                                        return Ok(bytes);
+                                            })
+                                        };
+                                        result?;
+                                        bytes = bytes.saturating_add(source.bytes_read());
+                                        if finished.load(Ordering::Acquire) {
+                                            return Ok(bytes);
+                                        }
                                     }
-                                }
-                            });
-                        }
-                        drop(sender);
+                                });
+                            }
+                            drop(sender);
 
-                        let mut active_workers = worker_count;
-                        let mut receiver_open = true;
-                        let mut bytes = 0u64;
-                        let mut worker_error = None;
-                        while active_workers > 0 || receiver_open {
-                            tokio::select! {
+                            let mut active_workers = worker_count;
+                            let mut receiver_open = true;
+                            let mut bytes = 0u64;
+                            let mut worker_error = None;
+                            while active_workers > 0 || receiver_open {
+                                tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
                                     worker_error.get_or_insert_with(VeinError::cancelled);
@@ -1206,109 +1206,109 @@ impl DefaultTaskExecutor {
                                     }
                                 }
                             }
+                            }
+                            drop(receiver);
+                            if let Some(error) = worker_error {
+                                cancel.cancel();
+                                while workers.join_next().await.is_some() {}
+                                return Err(error);
+                            }
+                            next.flush()?;
+                            trace.record_source_bytes(node_id, bytes);
+                            return Ok(bytes);
                         }
-                        drop(receiver);
-                        if let Some(error) = worker_error {
-                            cancel.cancel();
-                            while workers.join_next().await.is_some() {}
-                            return Err(error);
+                        let mut source =
+                            self.builder
+                                .build_source(data_source, task.task_id, task.attempt)?;
+                        let bytes_read = if program.instructions.is_empty() {
+                            let mut source_next = ChunkToViewNode(next);
+                            tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => Err(VeinError::cancelled()),
+                            result = source.execute(&mut source_next).instrument(span.clone()) => {
+                                result?;
+                                Ok(source.bytes_read())
+                            }
                         }
+                        } else {
+                            let vm = self.builder.build_view_vm(program, next)?;
+                            let mut source_next = ChunkToViewNode(vm);
+                            tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => Err(VeinError::cancelled()),
+                            result = source.execute(&mut source_next).instrument(span.clone()) => {
+                                result?;
+                                Ok(source.bytes_read())
+                            }
+                        }
+                        };
+                        if let Ok(bytes) = &bytes_read {
+                            trace.record_source_bytes(node_id, *bytes);
+                        }
+                        bytes_read
+                    }
+                    PhysicalPlanOperator::Transform { input, program } => {
+                        let transform = self.builder.build_view_vm(program, next)?;
+                        let bytes = self
+                            .execute_input(
+                                input,
+                                Box::new(TransformHandle(transform)),
+                                task,
+                                cancel,
+                                memory,
+                                span,
+                                schedule,
+                                trace,
+                                depth + 1,
+                            )
+                            .await?;
+                        Ok(bytes)
+                    }
+                    PhysicalPlanOperator::Aggregate { input: child, plan }
+                    | PhysicalPlanOperator::Distinct { input: child, plan } => {
+                        let operator_memory = trace.operator_memory(node_id, memory);
+                        let operator =
+                            if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
+                                "distinct"
+                            } else {
+                                "aggregate"
+                            };
+                        let (accumulator, handle) =
+                            aggregate::shared_with_memory_tracker(plan.clone(), operator_memory)?;
+                        let handle: Box<dyn PipelineNode<DataChunkView>> =
+                            Box::new(MaterializeViewNode::for_operator(handle, &input.operator)?
+                                .with_trace(trace.materialization_handle(node_id)));
+                        let bytes = self
+                            .execute_input(
+                                child,
+                                handle,
+                                task,
+                                cancel,
+                                memory,
+                                span,
+                                schedule,
+                                trace,
+                                depth + 1,
+                            )
+                            .await?;
+                        let boundary =
+                            if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
+                                PipelineBoundaryKind::DistinctInput
+                            } else {
+                                PipelineBoundaryKind::AggregateInput
+                            };
+                        schedule.complete_boundary(input, boundary)?;
+                        let (metrics, group_count) = {
+                            let mut accumulator = accumulator
+                                .lock()
+                                .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
+                            accumulator.finish_with(aggregate::AGGREGATE_BATCH_ROWS, |batch| {
+                                next.push(DataChunkView::from_chunk(batch)?)
+                            })?;
+                            (accumulator.metrics(), accumulator.group_count())
+                        };
                         next.flush()?;
-                        trace.record_source_bytes(node_id, bytes);
-                        return Ok(bytes);
-                    }
-                    let mut source =
-                        self.builder
-                            .build_source(data_source, task.task_id, task.attempt)?;
-                    let bytes_read = if program.instructions.is_empty() {
-                        let mut source_next = ChunkToViewNode(next);
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => Err(VeinError::cancelled()),
-                            result = source.execute(&mut source_next).instrument(span.clone()) => {
-                                result?;
-                                Ok(source.bytes_read())
-                            }
-                        }
-                    } else {
-                        let vm = self.builder.build_view_vm(program, next)?;
-                        let mut source_next = ChunkToViewNode(vm);
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => Err(VeinError::cancelled()),
-                            result = source.execute(&mut source_next).instrument(span.clone()) => {
-                                result?;
-                                Ok(source.bytes_read())
-                            }
-                        }
-                    };
-                    if let Ok(bytes) = &bytes_read {
-                        trace.record_source_bytes(node_id, *bytes);
-                    }
-                    bytes_read
-                }
-                PhysicalPlanOperator::Transform { input, program } => {
-                    let transform = self.builder.build_view_vm(program, next)?;
-                    let bytes = self
-                        .execute_input(
-                            input,
-                            Box::new(TransformHandle(transform)),
-                            task,
-                            cancel,
-                            memory,
-                            span,
-                            schedule,
-                            trace,
-                            depth + 1,
-                        )
-                        .await?;
-                    Ok(bytes)
-                }
-                PhysicalPlanOperator::Aggregate { input: child, plan }
-                | PhysicalPlanOperator::Distinct { input: child, plan } => {
-                    let operator_memory = trace.operator_memory(node_id, memory);
-                    let operator =
-                        if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
-                            "distinct"
-                        } else {
-                            "aggregate"
-                        };
-                    let (accumulator, handle) =
-                        aggregate::shared_with_memory_tracker(plan.clone(), operator_memory)?;
-                    let handle: Box<dyn PipelineNode<DataChunkView>> =
-                        Box::new(MaterializeViewNode::for_operator(handle, &input.operator)?
-                            .with_trace(trace.materialization_handle(node_id)));
-                    let bytes = self
-                        .execute_input(
-                            child,
-                            handle,
-                            task,
-                            cancel,
-                            memory,
-                            span,
-                            schedule,
-                            trace,
-                            depth + 1,
-                        )
-                        .await?;
-                    let boundary =
-                        if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
-                            PipelineBoundaryKind::DistinctInput
-                        } else {
-                            PipelineBoundaryKind::AggregateInput
-                        };
-                    schedule.complete_boundary(input, boundary)?;
-                    let (metrics, group_count) = {
-                        let mut accumulator = accumulator
-                            .lock()
-                            .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
-                        accumulator.finish_with(aggregate::AGGREGATE_BATCH_ROWS, |batch| {
-                            next.push(DataChunkView::from_chunk(batch)?)
-                        })?;
-                        (accumulator.metrics(), accumulator.group_count())
-                    };
-                    next.flush()?;
-                    tracing::info!(
+                        tracing::info!(
                         target: "vein.audit",
                         event = "recursive_aggregate_finished",
                         operator,
@@ -1344,69 +1344,42 @@ impl DefaultTaskExecutor {
                         output_materialize_ns = metrics.output_materialize_ns,
                         "recursive_aggregate_finished"
                     );
-                    Ok(bytes)
-                }
-                PhysicalPlanOperator::Sort {
-                    input: child,
-                    plan,
-                    key_program,
-                    output_columns,
-                } => {
-                    let operator_memory = trace.operator_memory(node_id, memory);
-                    let output_columns = usize::try_from(*output_columns).map_err(|_| {
-                        VeinError::planning("recursive sort output width is invalid", None)
-                    })?;
-                    let sort: Box<dyn PipelineNode<DataChunkView>> =
-                        Box::new(SortTransform::with_memory_tracker(
-                            plan.clone(),
-                            Some(output_columns),
-                            operator_memory,
-                            next,
-                        )?);
-                    let next: Box<dyn PipelineNode<DataChunkView>> = match key_program {
-                        Some(program) => {
-                            Box::new(TransformHandle(self.builder.build_view_vm(program, sort)?))
-                        }
-                        None => sort,
-                    };
-                    let bytes = self
-                        .execute_input(child, next, task, cancel, memory, span, schedule, trace, depth + 1)
-                        .await?;
-                    schedule.complete_boundary(input, PipelineBoundaryKind::SortInput)?;
-                    Ok(bytes)
-                }
-                PhysicalPlanOperator::Limit { input, spec } => {
-                    let limit = LimitTransform::new(spec.offset, spec.count, next);
-                    self.execute_input(
-                        input,
-                        Box::new(limit),
-                        task,
-                        cancel,
-                        memory,
-                        span,
-                        schedule,
-                        trace,
-                        depth + 1,
-                    )
-                        .await
-                }
-                PhysicalPlanOperator::Sink { .. } => Err(VeinError::planning(
-                    "sink operator may only appear at the physical plan root",
-                    None,
-                )),
-                PhysicalPlanOperator::Join { probe, build, plan } => {
-                    let started = Instant::now();
-                    let operator_memory = trace.operator_memory(node_id, memory);
-                    let build_sink = Arc::new(Mutex::new(Some(BuildSink::with_spill_support(
-                        join_keys(&plan.probe_keys),
-                        join_keys(&plan.build_keys),
-                        &join_types(&plan.build_types),
-                        operator_memory.clone(),
-                    )?)));
-                    let build_bytes = self
-                        .execute_input(
-                            build,
-                            Box::new(SharedBuildSink(Arc::clone(&build_sink))),
+                        Ok(bytes)
+                    }
+                    PhysicalPlanOperator::Sort {
+                        input: child,
+                        plan,
+                        key_program,
+                        output_columns,
+                    } => {
+                        let operator_memory = trace.operator_memory(node_id, memory);
+                        let output_columns = usize::try_from(*output_columns).map_err(|_| {
+                            VeinError::planning("recursive sort output width is invalid", None)
+                        })?;
+                        let sort: Box<dyn PipelineNode<DataChunkView>> =
+                            Box::new(SortTransform::with_memory_tracker(
+                                plan.clone(),
+                                Some(output_columns),
+                                operator_memory,
+                                next,
+                            )?);
+                        let next: Box<dyn PipelineNode<DataChunkView>> = match key_program {
+                            Some(program) => {
+                                Box::new(TransformHandle(self.builder.build_view_vm(program, sort)?))
+                            }
+                            None => sort,
+                        };
+                        let bytes = self
+                            .execute_input(child, next, task, cancel, memory, span, schedule, trace, depth + 1)
+                            .await?;
+                        schedule.complete_boundary(input, PipelineBoundaryKind::SortInput)?;
+                        Ok(bytes)
+                    }
+                    PhysicalPlanOperator::Limit { input, spec } => {
+                        let limit = LimitTransform::new(spec.offset, spec.count, next);
+                        self.execute_input(
+                            input,
+                            Box::new(limit),
                             task,
                             cancel,
                             memory,
@@ -1415,91 +1388,118 @@ impl DefaultTaskExecutor {
                             trace,
                             depth + 1,
                         )
-                        .await?;
-                    schedule.complete_boundary(input, PipelineBoundaryKind::JoinBuild)?;
-                    let build_sink = build_sink
-                        .lock()
-                        .map_err(|_| VeinError::internal("join build mutex poisoned"))?
-                        .take()
-                        .ok_or_else(|| {
-                            VeinError::internal("join build sink missing after execution")
-                        })?;
-                    let build_result = build_sink.finish_with_spill()?;
-                    let build_rows = match &build_result {
-                        BuildResult::InMemory(table) => table.len() as u64,
-                        BuildResult::Spilled { run, .. } => run.rows,
-                    };
-                    let build_us = started.elapsed().as_micros() as u64;
-                    let build_bytes = match &build_result {
-                        BuildResult::InMemory(_) => build_bytes,
-                        BuildResult::Spilled { run, .. } => {
-                            tracing::info!(
+                            .await
+                    }
+                    PhysicalPlanOperator::Sink { .. } => Err(VeinError::planning(
+                        "sink operator may only appear at the physical plan root",
+                        None,
+                    )),
+                    PhysicalPlanOperator::Join { probe, build, plan } => {
+                        let started = Instant::now();
+                        let operator_memory = trace.operator_memory(node_id, memory);
+                        let build_sink = Arc::new(Mutex::new(Some(BuildSink::with_spill_support(
+                            join_keys(&plan.probe_keys),
+                            join_keys(&plan.build_keys),
+                            &join_types(&plan.build_types),
+                            operator_memory.clone(),
+                        )?)));
+                        let build_bytes = self
+                            .execute_input(
+                                build,
+                                Box::new(SharedBuildSink(Arc::clone(&build_sink))),
+                                task,
+                                cancel,
+                                memory,
+                                span,
+                                schedule,
+                                trace,
+                                depth + 1,
+                            )
+                            .await?;
+                        schedule.complete_boundary(input, PipelineBoundaryKind::JoinBuild)?;
+                        let build_sink = build_sink
+                            .lock()
+                            .map_err(|_| VeinError::internal("join build mutex poisoned"))?
+                            .take()
+                            .ok_or_else(|| {
+                                VeinError::internal("join build sink missing after execution")
+                            })?;
+                        let build_result = build_sink.finish_with_spill()?;
+                        let build_rows = match &build_result {
+                            BuildResult::InMemory(table) => table.len() as u64,
+                            BuildResult::Spilled { run, .. } => run.rows,
+                        };
+                        let build_us = started.elapsed().as_micros() as u64;
+                        let build_bytes = match &build_result {
+                            BuildResult::InMemory(_) => build_bytes,
+                            BuildResult::Spilled { run, .. } => {
+                                tracing::info!(
                                 target: "vein.audit",
                                 event = "join_build_spill_run_ready",
                                 rows = run.rows,
                                 bytes = run.bytes,
                                 "join build spill run ready"
                             );
-                            run.bytes
-                        }
-                    };
-                    let probe_rows = Arc::new(AtomicU64::new(0));
-                    let probe_batches = Arc::new(AtomicU64::new(0));
-                    let probe_started = Instant::now();
-                    let dependencies = schedule.dependencies_for_operator(input)?;
-                    let join: Box<dyn PipelineNode<DataChunkView>> = match build_result {
-                        BuildResult::InMemory(table) => {
-                            let join = HashJoin::new(
-                                Arc::new(table),
-                                join_type(plan.join_type)?,
-                                join_outputs(&plan.outputs),
-                                join_types(&plan.probe_types),
-                                join_types(&plan.build_types),
-                                next,
-                            );
-                            let join = install_join_residual(self.builder.as_ref(), plan, join)?;
-                            Box::new(PipelineDependencyGuard::new(Box::new(join), dependencies))
-                        }
-                        BuildResult::Spilled { run, schema } => {
-                            let probe_schema = JoinSpillSchema::new(&join_types(&plan.probe_types));
-                            let probe_writer =
-                                JoinSpillWriter::new(operator_memory.clone(), probe_schema.clone())?;
-                            let downstream: SharedJoinOutput = Arc::new(Mutex::new(next));
-                            let spilled = SpilledJoinProbe {
-                                probe_writer: Some(probe_writer),
-                                build_run: run,
-                                build_schema: schema,
-                                probe_schema,
-                                plan: plan.clone(),
-                                builder: Arc::clone(&self.builder),
-                                tracker: operator_memory.clone(),
-                                next: downstream,
-                            };
-                            Box::new(PipelineDependencyGuard::new(
-                                Box::new(spilled),
-                                dependencies,
-                            ))
-                        }
-                    };
-                    let probe_bytes = self
-                        .execute_input(
-                            probe,
-                            Box::new(JoinProbeCounter {
-                                inner: join,
-                                rows: Arc::clone(&probe_rows),
-                                batches: Arc::clone(&probe_batches),
-                            }),
-                            task,
-                            cancel,
-                            memory,
-                            span,
-                            schedule,
-                            trace,
-                            depth + 1,
-                        )
-                        .await?;
-                    let probe_us = probe_started.elapsed().as_micros() as u64;
-                    tracing::info!(
+                                run.bytes
+                            }
+                        };
+                        let probe_rows = Arc::new(AtomicU64::new(0));
+                        let probe_batches = Arc::new(AtomicU64::new(0));
+                        let probe_started = Instant::now();
+                        let dependencies = schedule.dependencies_for_operator(input)?;
+                        let join: Box<dyn PipelineNode<DataChunkView>> = match build_result {
+                            BuildResult::InMemory(table) => {
+                                let join = HashJoin::new(
+                                    Arc::new(table),
+                                    join_type(plan.join_type)?,
+                                    join_outputs(&plan.outputs),
+                                    join_types(&plan.probe_types),
+                                    join_types(&plan.build_types),
+                                    next,
+                                );
+                                let join = install_join_residual(self.builder.as_ref(), plan, join)?;
+                                Box::new(PipelineDependencyGuard::new(Box::new(join), dependencies))
+                            }
+                            BuildResult::Spilled { run, schema } => {
+                                let probe_schema = JoinSpillSchema::new(&join_types(&plan.probe_types));
+                                let probe_writer =
+                                    JoinSpillWriter::new(operator_memory.clone(), probe_schema.clone())?;
+                                let downstream: SharedJoinOutput = Arc::new(Mutex::new(next));
+                                let spilled = SpilledJoinProbe {
+                                    probe_writer: Some(probe_writer),
+                                    build_run: run,
+                                    build_schema: schema,
+                                    probe_schema,
+                                    plan: plan.clone(),
+                                    builder: Arc::clone(&self.builder),
+                                    tracker: operator_memory.clone(),
+                                    next: downstream,
+                                };
+                                Box::new(PipelineDependencyGuard::new(
+                                    Box::new(spilled),
+                                    dependencies,
+                                ))
+                            }
+                        };
+                        let probe_bytes = self
+                            .execute_input(
+                                probe,
+                                Box::new(JoinProbeCounter {
+                                    inner: join,
+                                    rows: Arc::clone(&probe_rows),
+                                    batches: Arc::clone(&probe_batches),
+                                }),
+                                task,
+                                cancel,
+                                memory,
+                                span,
+                                schedule,
+                                trace,
+                                depth + 1,
+                            )
+                            .await?;
+                        let probe_us = probe_started.elapsed().as_micros() as u64;
+                        tracing::info!(
                         target: "vein.audit",
                         event = "join_node_finished",
                         depth,
@@ -1513,9 +1513,9 @@ impl DefaultTaskExecutor {
                         probe_us,
                         "join_node_finished"
                     );
-                    Ok(build_bytes.saturating_add(probe_bytes))
+                        Ok(build_bytes.saturating_add(probe_bytes))
+                    }
                 }
-            }
             }.instrument(node_span).await;
             execution_guard.finish(&result);
             result

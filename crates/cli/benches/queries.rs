@@ -3,7 +3,9 @@ use std::process::Command;
 
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
+use common::Result;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use error::{ErrorCategory, VeinError, VeinResultExt};
 use futures::StreamExt;
 use serde_json::{Map, Value};
 use tokio::runtime::Runtime;
@@ -150,7 +152,7 @@ fn validate_against_duckdb(runtime: &Runtime, data_root: &Path) {
     }
 }
 
-async fn validate_scenario(data_root: &Path, scenario: &Scenario) -> Result<(), Box<dyn std::error::Error>> {
+async fn validate_scenario(data_root: &Path, scenario: &Scenario) -> Result<()> {
     let engine = LocalQueryEngine::new(data_root.to_path_buf());
     let query = engine.prepare(scenario.pipe).await?;
     let mut stream = query.into_stream();
@@ -173,9 +175,13 @@ async fn validate_scenario(data_root: &Path, scenario: &Scenario) -> Result<(), 
         .args(["-json", ":memory:", "-c", &duckdb_sql])
         .output()?;
     if !output.status.success() {
-        return Err(std::io::Error::other(String::from_utf8_lossy(&output.stderr).trim().to_owned()).into());
+        return Err(VeinError::execution_failed(format!(
+            "DuckDB validation command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
-    let duckdb_objects: Vec<Map<String, Value>> = serde_json::from_slice(&output.stdout)?;
+    let duckdb_objects: Vec<Map<String, Value>> = serde_json::from_slice(&output.stdout)
+        .map_external_err(ErrorCategory::Data, "decoding DuckDB validation output")?;
     let Some(schema) = schema else {
         let expected: u64 = duckdb_objects
             .first()
@@ -183,9 +189,12 @@ async fn validate_scenario(data_root: &Path, scenario: &Scenario) -> Result<(), 
             .and_then(|value| {
                 value.as_u64().or_else(|| value.as_str().and_then(|text| text.parse().ok()))
             })
-            .ok_or_else(|| std::io::Error::other("DuckDB row-count output was not an integer"))?;
+            .ok_or_else(|| VeinError::serialization("DuckDB row-count output was not an integer"))?;
         if expected != vein_rows.len() as u64 {
-            return Err(std::io::Error::other(format!("row count differs: Vein {}, DuckDB {expected}", vein_rows.len())).into());
+            return Err(VeinError::execution_failed(format!(
+                "row count differs: Vein {}, DuckDB {expected}",
+                vein_rows.len()
+            )));
         }
         return Ok(());
     };
@@ -197,35 +206,39 @@ async fn validate_scenario(data_root: &Path, scenario: &Scenario) -> Result<(), 
                 .map(|index| {
                     row.get(&format!("vein_col_{index}"))
                         .cloned()
-                        .ok_or_else(|| std::io::Error::other(format!("missing DuckDB output column {index}")))
+                        .ok_or_else(|| {
+                            VeinError::serialization(format!(
+                                "missing DuckDB output column {index}"
+                            ))
+                        })
                 })
-                .collect::<Result<Vec<_>, _>>()
+                .collect::<Result<Vec<_>>>()
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     let matches = match scenario.validation {
         Validation::RowCountOnly => vein_rows.len() == duckdb_rows.len(),
         Validation::Ordered => vein_rows == duckdb_rows,
         Validation::Unordered => {
-            let mut left = canonical_rows(&vein_rows);
-            let mut right = canonical_rows(&duckdb_rows);
+            let mut left = canonical_rows(&vein_rows)?;
+            let mut right = canonical_rows(&duckdb_rows)?;
             left.sort_unstable();
             right.sort_unstable();
             left == right
         }
     };
     if !matches {
-        return Err(std::io::Error::other(format!(
+        return Err(VeinError::execution_failed(format!(
             "rows differ (Vein {}, DuckDB {}, validation {:?})",
             vein_rows.len(),
             duckdb_rows.len(),
             scenario.validation
-        )).into());
+        )));
     }
     Ok(())
 }
 
-fn batch_rows(batch: &RecordBatch) -> Result<Vec<Vec<Value>>, arrow::error::ArrowError> {
+fn batch_rows(batch: &RecordBatch) -> Result<Vec<Vec<Value>>> {
     (0..batch.num_rows())
         .map(|row| {
             batch.columns().iter().map(|column| {
@@ -239,8 +252,13 @@ fn batch_rows(batch: &RecordBatch) -> Result<Vec<Vec<Value>>, arrow::error::Arro
         .collect()
 }
 
-fn canonical_rows(rows: &[Vec<Value>]) -> Vec<String> {
-    rows.iter().map(|row| serde_json::to_string(row).expect("JSON rows serialize")).collect()
+fn canonical_rows(rows: &[Vec<Value>]) -> Result<Vec<String>> {
+    rows.iter()
+        .map(|row| {
+            serde_json::to_string(row)
+                .map_external_err(ErrorCategory::Data, "encoding validation row")
+        })
+        .collect()
 }
 
 fn validation_sql(sql: &str, data_root: &Path, schema: &arrow::datatypes::Schema) -> String {

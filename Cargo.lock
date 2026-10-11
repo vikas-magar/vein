@@ -921,7 +921,7 @@ name = "error"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "parser",
+ "serde",
  "serde_json",
  "thiserror",
 ]
@@ -2019,10 +2019,10 @@ dependencies = [
 name = "parser"
 version = "0.1.0"
 dependencies = [
+ "error",
  "ordered-float",
  "serde",
  "strum",
- "thiserror",
 ]
 
 [[package]]

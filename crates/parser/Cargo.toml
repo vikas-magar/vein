@@ -19,7 +19,7 @@ pedantic = "warn"
 unwrap_used = "deny"
 
 [dependencies]
+error = { path = "../error" }
 serde = { workspace = true }
 strum = { workspace = true }
-thiserror = { workspace = true }
 ordered-float = { workspace = true, features = ["serde"] }

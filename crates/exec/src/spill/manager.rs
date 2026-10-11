@@ -144,8 +144,8 @@ impl PendingSpillRun {
         {
             return Err(VeinError::resource_exhausted(
                 "query spill disk",
-                usize::try_from(requested).unwrap_or(usize::MAX),
-                usize::try_from(limit).unwrap_or(usize::MAX),
+                requested.into(),
+                limit.into(),
             ));
         }
         if self.state.manager.cancellation.is_cancelled() {
@@ -187,8 +187,8 @@ impl SpillWriteHandle {
             let (requested, limit) = failure.lock().ok().and_then(|failure| *failure)?;
             Some(VeinError::resource_exhausted(
                 "query spill disk",
-                usize::try_from(requested).unwrap_or(usize::MAX),
-                usize::try_from(limit).unwrap_or(usize::MAX),
+                requested.into(),
+                limit.into(),
             ))
         })
     }
@@ -213,13 +213,11 @@ impl Write for SpillWriteHandle {
         let reserved = proposed_end.saturating_sub(current_size);
         if reserved > 0 && !self.state.manager.reserve_disk(reserved) {
             self.remember_limit_error(proposed_end, self.state.manager.disk_limit);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                SpillDiskLimitExceeded {
-                    requested: proposed_end,
-                    limit: self.state.manager.disk_limit,
-                },
-            ));
+            return Err(io::Error::other(VeinError::resource_exhausted(
+                "query spill disk",
+                proposed_end.into(),
+                self.state.manager.disk_limit.into(),
+            )));
         }
 
         match self.stream.write(buffer) {
@@ -249,20 +247,6 @@ impl Write for SpillWriteHandle {
         self.stream.flush()
     }
 }
-
-#[derive(Debug)]
-pub(crate) struct SpillDiskLimitExceeded {
-    pub(crate) requested: u64,
-    pub(crate) limit: u64,
-}
-
-impl std::fmt::Display for SpillDiskLimitExceeded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "query spill disk limit exceeded")
-    }
-}
-
-impl std::error::Error for SpillDiskLimitExceeded {}
 
 impl std::io::Seek for SpillWriteHandle {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {

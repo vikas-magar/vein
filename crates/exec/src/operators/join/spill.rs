@@ -155,8 +155,8 @@ pub(crate) fn partition_runs(
     if bit >= u64::BITS {
         return Err(VeinError::resource_exhausted(
             "join spill partition depth",
-            u64::BITS as usize + 1,
-            u64::BITS as usize,
+            u128::from(u64::BITS) + 1,
+            u128::from(u64::BITS),
         ));
     }
     tracker.check_cancelled()?;

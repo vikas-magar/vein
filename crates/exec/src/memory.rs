@@ -278,11 +278,11 @@ impl QueryMemoryTracker {
                     limit_bytes = self.inner.limit,
                     "query memory reservation overflow"
                 );
-                return Err(VeinError::ResourceExhausted {
-                    resource: resource.to_owned(),
-                    requested: bytes,
-                    limit: self.inner.limit,
-                });
+                return Err(VeinError::resource_exhausted(
+                    resource,
+                    bytes as u128,
+                    self.inner.limit as u128,
+                ));
             };
             if next > self.inner.limit {
                 tracing::warn!(
@@ -294,11 +294,11 @@ impl QueryMemoryTracker {
                     limit_bytes = self.inner.limit,
                     "query memory limit exceeded"
                 );
-                return Err(VeinError::ResourceExhausted {
-                    resource: resource.to_owned(),
-                    requested: bytes,
-                    limit: self.inner.limit,
-                });
+                return Err(VeinError::resource_exhausted(
+                    resource,
+                    bytes as u128,
+                    self.inner.limit as u128,
+                ));
             }
             match self.inner.used.compare_exchange_weak(
                 used,
