@@ -226,6 +226,28 @@ pub struct HashTable {
 }
 
 impl HashTable {
+    /// Computes the join's canonical row hashes for a spill batch.
+    ///
+    /// Null keys receive a deterministic hash only to choose a spill partition;
+    /// they remain non-matching because [`Self::probe_view`] skips null keys.
+    /// Keeping this beside the in-memory key encoder prevents spill partitioning
+    /// from introducing a second, potentially incompatible key representation.
+    pub fn hashes_for_view(view: &DataChunkView, keys: &JoinKeys) -> Result<Vec<u64>> {
+        let (resolved, _, _) = ChunkKeys::resolve(keys, view)?;
+        let mut hashes = Vec::new();
+        hashes.try_reserve_exact(view.num_rows()).map_err(|error| {
+            VeinError::internal(format!("cannot reserve join spill hashes: {error}"))
+        })?;
+        for row in 0..view.num_rows() {
+            hashes.push(if resolved.any_null(row) {
+                FNV_OFFSET
+            } else {
+                resolved.hash(row)
+            });
+        }
+        Ok(hashes)
+    }
+
     /// An empty table.
     ///
     /// `build_keys` index a build chunk; `probe_keys` index a probe chunk. They
@@ -307,34 +329,105 @@ impl HashTable {
             Ok(lease)
         })?;
         let (keys, report, materialize_us) = ChunkKeys::resolve(&self.build_keys, &chunk)?;
+        let row_count = chunk.num_rows();
+        if row_count > u32::MAX as usize || self.chunks.len() > u32::MAX as usize {
+            return Err(VeinError::internal(
+                "hash join build input exceeds the row-reference index range",
+            ));
+        }
+
+        // Reserve the complete insertion before changing any index vectors.
+        // This makes a budget failure retryable by the external hash join: the
+        // caller can spill the retained input views without recovering a
+        // partially indexed batch. Counting nulls is cheaper than retaining a
+        // per-row scratch vector and does not copy payload data.
+        let null_rows = (0..row_count)
+            .filter(|row| keys.any_null(*row))
+            .count();
+        let indexed_rows = row_count - null_rows;
+        let inline_key_bytes = if keys.is_single_i64() {
+            size_of::<i64>()
+        } else {
+            0
+        };
+        let entry_bytes = size_of::<Entry>()
+            .checked_add(size_of::<u64>())
+            .and_then(|bytes| bytes.checked_add(inline_key_bytes))
+            .ok_or_else(|| VeinError::internal("join index entry size overflow"))?;
+        let index_bytes = size_of::<DataChunkView>()
+            .checked_add(null_rows.checked_mul(size_of::<(u32, u32)>()).ok_or_else(|| {
+                VeinError::internal("join null-key index size overflow")
+            })?)
+            .and_then(|bytes| bytes.checked_add(indexed_rows.checked_mul(entry_bytes)?))
+            .ok_or_else(|| VeinError::internal("join index batch size overflow"))?;
+
+        let wanted = self
+            .entries
+            .len()
+            .checked_add(indexed_rows)
+            .and_then(|entries| entries.checked_mul(2))
+            .ok_or_else(|| VeinError::internal("hash join bucket count overflow"))?;
+        let mut bucket_count = self.buckets.len();
+        while bucket_count < wanted {
+            bucket_count = bucket_count
+                .checked_mul(2)
+                .ok_or_else(|| VeinError::internal("hash join bucket count overflow"))?;
+        }
+        let bucket_bytes = if bucket_count > self.buckets.len() {
+            bucket_count
+                .checked_mul(size_of::<u32>())
+                .ok_or_else(|| VeinError::internal("hash join bucket bytes overflow"))?
+        } else {
+            0
+        };
+        self.memory.grow(
+            index_bytes
+                .checked_add(bucket_bytes)
+                .ok_or_else(|| VeinError::internal("hash join reservation size overflow"))?,
+            "hash join build batch",
+        )?;
+
+        self.chunks.try_reserve(1).map_err(|error| {
+            VeinError::internal(format!("cannot reserve hash join chunk references: {error}"))
+        })?;
+        self.keys_by_chunk.try_reserve(1).map_err(|error| {
+            VeinError::internal(format!("cannot reserve hash join key references: {error}"))
+        })?;
+        self.null_keyed.try_reserve(null_rows).map_err(|error| {
+            VeinError::internal(format!("cannot reserve null-key join rows: {error}"))
+        })?;
+        self.entries.try_reserve(indexed_rows).map_err(|error| {
+            VeinError::internal(format!("cannot reserve hash join entries: {error}"))
+        })?;
+        self.hashes.try_reserve(indexed_rows).map_err(|error| {
+            VeinError::internal(format!("cannot reserve hash join values: {error}"))
+        })?;
+        if keys.is_single_i64() && self.keys.len() == self.entries.len() {
+            self.keys.try_reserve(indexed_rows).map_err(|error| {
+                VeinError::internal(format!("cannot reserve inline hash join keys: {error}"))
+            })?;
+        }
+        if bucket_count > self.buckets.len() {
+            let old_bucket_count = self.buckets.len();
+            self.rebucket(bucket_count)?;
+            let old_bytes = old_bucket_count
+                .checked_mul(size_of::<u32>())
+                .ok_or_else(|| VeinError::internal("hash join bucket bytes overflow"))?;
+            self.memory.shrink(old_bytes);
+        }
+
         self.build_key_materialization.accumulate(report);
         self.build_key_materialize_us = self.build_key_materialize_us.saturating_add(materialize_us);
         let chunk_index = self.chunks.len() as u32;
-        // The keys stay a local, so the loop below can mutate the table's
-        // vectors while still reading the chunk's resolved keys. Building a
-        // `(row, hash, is_null)` scratch vector instead cost 24 bytes per build
-        // row — three times what the table itself stores.
-        self.memory.grow(size_of::<DataChunkView>(), "hash join chunk references")?;
         self.chunks.push(chunk);
 
-        for position in 0..self.chunks[chunk_index as usize].num_rows() {
+        for position in 0..row_count {
             let row = position as u32;
-            if keys.any_null(row as usize) {
-                self.memory.grow(size_of::<(u32, u32)>(), "hash join null-key index")?;
+            if keys.any_null(position) {
                 self.null_keyed.push((chunk_index, row));
                 continue;
             }
-            // Grown per row rather than sized up front, so no count pass is
-            // needed; the doubling makes it amortised constant.
-            self.grow_if_needed(1)?;
-            let inline_key = keys.single_i64(row as usize);
-            let entry_bytes = size_of::<Entry>()
-                .checked_add(size_of::<u64>())
-                .and_then(|bytes| {
-                    bytes.checked_add(inline_key.map_or(0, |_| size_of::<i64>()))
-                })
-                .ok_or_else(|| VeinError::internal("join index entry size overflow"))?;
-            self.memory.grow(entry_bytes, "hash join row index")?;
+            let inline_key = keys.single_i64(position);
             let hash = keys.hash(row as usize);
             let index = self.entries.len() as u32;
             let bucket = bucket_of(hash, self.buckets.len());
@@ -356,36 +449,6 @@ impl HashTable {
             self.keys.clear();
         }
         self.keys_by_chunk.push(keys);
-        Ok(())
-    }
-
-    /// Grows the bucket table so chains stay short.
-    ///
-    /// Called once per chunk, sized for the entries about to arrive, so a large
-    /// build side does not degrade into one long chain per bucket. Null-keyed
-    /// rows are not in the table to rehash.
-    fn grow_if_needed(&mut self, additional: usize) -> Result<()> {
-        let wanted = self.entries.len().checked_add(additional)
-            .and_then(|entries| entries.checked_mul(2))
-            .ok_or_else(|| VeinError::internal("hash join bucket count overflow"))?;
-        if wanted <= self.buckets.len() {
-            return Ok(());
-        }
-        let mut size = self.buckets.len();
-        while size < wanted {
-            size = size.checked_mul(2)
-                .ok_or_else(|| VeinError::internal("hash join bucket count overflow"))?;
-        }
-        let new_bytes = size.checked_mul(size_of::<u32>())
-            .ok_or_else(|| VeinError::internal("hash join bucket bytes overflow"))?;
-        let old_bytes = self.buckets.len().checked_mul(size_of::<u32>())
-            .ok_or_else(|| VeinError::internal("hash join bucket bytes overflow"))?;
-        self.memory.grow(new_bytes, "hash join buckets")?;
-        if let Err(error) = self.rebucket(size) {
-            self.memory.shrink(new_bytes);
-            return Err(error);
-        }
-        self.memory.shrink(old_bytes);
         Ok(())
     }
 
@@ -597,6 +660,29 @@ mod tests {
 
     fn chunk(column: ArrayRef) -> DataChunk {
         DataChunk::from_vectors(vec![column])
+    }
+
+    #[test]
+    fn spill_hashes_use_the_same_composite_key_encoding_as_join_indexing() {
+        let keys = JoinKeys::new(vec![0, 1]);
+        let build = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+            Arc::new(Int64Array::from(vec![Some(3), Some(3), None])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("north"), Some("south"), Some("north")]))
+                as ArrayRef,
+        ]))
+        .expect("build view");
+        let probe = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+            Arc::new(Int64Array::from(vec![Some(3)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("north")])) as ArrayRef,
+        ]))
+        .expect("probe view");
+
+        let build_hashes = HashTable::hashes_for_view(&build, &keys).expect("build hashes");
+        let probe_hashes = HashTable::hashes_for_view(&probe, &keys).expect("probe hashes");
+
+        assert_eq!(build_hashes[0], probe_hashes[0]);
+        assert_ne!(build_hashes[0], build_hashes[1]);
+        assert_eq!(build_hashes[2], FNV_OFFSET, "null keys still receive a partition hash");
     }
 
     #[test]
@@ -1054,6 +1140,46 @@ mod tests {
         assert_eq!(tracker.used(), initial_buckets, "failed insertion releases its lease");
         drop(table);
         assert_eq!(tracker.used(), 0);
+    }
+
+    #[test]
+    fn row_index_budget_failure_does_not_partially_insert_a_build_batch() {
+        let first = ints(&[10]);
+        let second = ints(&[20]);
+        let per_row_index_bytes = size_of::<DataChunkView>()
+            + size_of::<Entry>()
+            + size_of::<u64>()
+            + size_of::<i64>();
+        let per_batch_bytes = first.get_array_memory_size() + per_row_index_bytes;
+        let tracker = QueryMemoryTracker::new(
+            INITIAL_BUCKETS * size_of::<u32>() + per_batch_bytes * 2 - 1,
+            common::cancellation::CancellationToken::new(),
+        );
+        let mut table = HashTable::with_memory_tracker(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+            tracker.clone(),
+        )
+        .expect("initial buckets fit the budget");
+        table
+            .insert_view(DataChunkView::from_chunk(chunk(Arc::clone(&first))).unwrap())
+            .expect("first build batch fits");
+        let used_before = tracker.used();
+
+        let error = table
+            .insert_view(DataChunkView::from_chunk(chunk(Arc::clone(&second))).unwrap())
+            .expect_err("second row index exceeds the remaining budget");
+
+        assert!(matches!(error, VeinError::ResourceExhausted { .. }));
+        assert_eq!(table.len(), 1, "failed insertion leaves the row count intact");
+        assert_eq!(table.chunk_count(), 1, "failed insertion retains no partial chunk");
+        assert_eq!(tracker.used(), used_before, "failed batch releases its array lease");
+        let mut matches = Vec::new();
+        table
+            .probe(&chunk(ints(&[10, 20])), &mut matches)
+            .expect("existing build rows remain probeable");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(table.build_row(matches[0].1 .0), (0, 0));
     }
 
     #[test]

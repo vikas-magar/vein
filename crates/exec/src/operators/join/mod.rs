@@ -13,6 +13,7 @@ pub mod rows;
 
 pub mod hash_join;
 pub mod spec;
+pub mod spill;
 
 pub use hash_table::{HashTable, JoinKeys};
 pub use hash_join::{BuildSink, HashJoin, JoinFilterCollector};

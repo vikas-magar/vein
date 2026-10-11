@@ -11,12 +11,10 @@
 //! aggregates, which is why it has no operator of its own.
 
 use std::collections::HashSet;
-use std::fs::File;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -34,6 +32,7 @@ mod intermediate;
 mod spill;
 use intermediate::{AggregateIntermediateGroup, AggregateIntermediateState, NumericPartial};
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
+use crate::spill::SpillRun;
 use crate::pipeline::{DataChunk, PipelineNode};
 use common::Result;
 use common::arrow::SelectionVector;
@@ -1158,7 +1157,7 @@ pub struct AggregateSink {
     memory: MemoryReservation,
     tracker: QueryMemoryTracker,
     spill_schema: AggregateSpillSchema,
-    spill_runs: Vec<PathBuf>,
+    spill_runs: Vec<SpillRun>,
     metrics: AggregateMetrics,
 }
 
@@ -1853,16 +1852,15 @@ impl AggregateSink {
         self.spill_runs.try_reserve(1).map_err(|error| {
             VeinError::internal(format!("cannot reserve aggregate spill run metadata: {error}"))
         })?;
-        let (path, file) = self.tracker.create_spill_file()?;
-        let written = self.spill_schema.write_run_with(file, self.groups.len(), |slot| {
-            self.intermediate_group_state(slot)
-        });
-        if let Err(error) = written {
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
-        }
+        let mut pending = self.tracker.spill_manager().create_run()?;
+        let output = self.spill_schema.write_run_with(
+            pending.writer()?,
+            self.groups.len(),
+            |slot| self.intermediate_group_state(slot),
+        )?;
+        let run = pending.commit(output)?;
         let group_count = self.groups.len();
-        self.spill_runs.push(path);
+        self.spill_runs.push(run);
         self.release_group_state();
         tracing::info!(
             target: "vein.audit",
@@ -2006,7 +2004,7 @@ impl AggregateSink {
         plan: &AggregatePlan,
         tracker: &QueryMemoryTracker,
         schema: &AggregateSpillSchema,
-        runs: Vec<PathBuf>,
+        runs: Vec<SpillRun>,
         bit: u32,
         batch_rows: NonZeroUsize,
         emit: &mut impl FnMut(DataChunk) -> Result<()>,
@@ -2018,18 +2016,12 @@ impl AggregateSink {
         partition_plan.estimated_groups = None;
         let mut sink = AggregateSink::with_memory_tracker(partition_plan, tracker.clone())?;
         let merge_result = (|| {
-            for path in &runs {
+            for run in &runs {
                 tracker.check_cancelled()?;
-                let file = File::open(path).map_err(|error| {
-                    VeinError::internal(format!(
-                        "open aggregate spill run {}: {error}",
-                        path.display()
-                    ))
-                })?;
-                let mut reader = schema.open_reader(file)?;
-                while let Some(batch) = reader.next_batch()? {
+                let mut reader = schema.open_reader(run.open()?)?;
+                while let Some(mut batch) = reader.next_batch_charged(tracker)? {
                     tracker.check_cancelled()?;
-                    for group in batch {
+                    for group in std::mem::take(&mut batch.groups) {
                         sink.merge_spilled_group(group)?;
                     }
                 }
@@ -2041,16 +2033,9 @@ impl AggregateSink {
             Ok(()) => {
                 let finish_result = sink.finish_in_memory_with(batch_rows, emit);
                 drop(sink);
-                let cleanup_result = runs.iter().try_for_each(|path| {
-                    std::fs::remove_file(path).map_err(|error| {
-                        VeinError::internal(format!(
-                            "remove consumed aggregate spill run {}: {error}",
-                            path.display()
-                        ))
-                    })
-                });
                 finish_result?;
-                cleanup_result
+                drop(runs);
+                Ok(())
             }
             Err(error @ VeinError::ResourceExhausted { .. }) => {
                 drop(sink);
@@ -4921,12 +4906,12 @@ mod tests {
             types: vec![VeinDataType::Int64, VeinDataType::Int64],
         };
         let tracker = QueryMemoryTracker::new(
-            16 * 1024,
+            32 * 1024,
             common::cancellation::CancellationToken::new(),
         );
         let mut sink = AggregateSink::with_memory_tracker(plan, tracker.clone())
             .expect("create budgeted aggregate");
-        let input_rows = 1024_i64;
+        let input_rows = 2048_i64;
         let keys = (0..input_rows).map(|row| row % 257).collect::<Vec<_>>();
         let values = (0..input_rows).collect::<Vec<_>>();
         sink.accumulate(DataChunk::from_vectors(vec![
@@ -4938,12 +4923,12 @@ mod tests {
             !sink.spill_runs.is_empty(),
             "the small tracker budget must externalize groups"
         );
-        let spill_paths = sink.spill_runs.clone();
+        assert!(tracker.spill_bytes_used() > 0, "aggregate runs consume query spill budget");
 
         let output = sink.finish().expect("merge spill runs");
         assert!(
-            spill_paths.iter().all(|path| !path.exists()),
-            "successfully consumed aggregate runs are removed immediately"
+            tracker.spill_bytes_used() == 0,
+            "successfully consumed aggregate runs release the query spill budget"
         );
         let mut counts = std::collections::BTreeMap::new();
         for batch in output {
@@ -4976,12 +4961,12 @@ mod tests {
             types: vec![VeinDataType::Int64, VeinDataType::Int64],
         };
         let tracker = QueryMemoryTracker::new(
-            16 * 1024,
+            32 * 1024,
             common::cancellation::CancellationToken::new(),
         );
         let mut sink = AggregateSink::with_memory_tracker(plan, tracker)
             .expect("create budgeted grouping-set aggregate");
-        let input_rows = 1024_i64;
+        let input_rows = 2048_i64;
         let keys = (0..input_rows)
             .map(|row| (row % 100 != 0).then_some(row % 257))
             .collect::<Vec<_>>();

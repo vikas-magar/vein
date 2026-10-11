@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use arrow::record_batch::RecordBatch;
 
 use crate::operators::sink::{CollectSink, DiscardSink, WriteSink, WriteStorage};
+use crate::memory::ExecutionResourceLimits;
+use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};
 use crate::operators::source::scan::ScanFile;
 use crate::operators::source::ScanSource;
 use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Sink, Source, Transform};
@@ -33,6 +35,8 @@ pub struct TaskExecutorBuilder {
     registry: Arc<FunctionRegistry>,
     storage: Option<Arc<dyn WriteStorage>>,
     metadata_store: MetadataStore,
+    resource_limits: ExecutionResourceLimits,
+    spill_storage_factory: Arc<dyn SpillStorageFactory>,
 }
 
 impl TaskExecutorBuilder {
@@ -44,6 +48,8 @@ impl TaskExecutorBuilder {
             registry,
             storage: None,
             metadata_store: MetadataStore::new(),
+            resource_limits: ExecutionResourceLimits::default(),
+            spill_storage_factory: Arc::new(LocalSpillStorageFactory),
         }
     }
 
@@ -55,6 +61,18 @@ impl TaskExecutorBuilder {
     pub fn with_metadata_store(mut self, metadata_store: MetadataStore) -> Self {
         self.metadata_store = metadata_store;
         self.rebuild_default();
+        self
+    }
+
+    /// Set shared per-query memory and spill-disk budgets for blocking operators.
+    pub fn with_resource_limits(mut self, limits: ExecutionResourceLimits) -> Self {
+        self.resource_limits = limits;
+        self
+    }
+
+    /// Configure the query-local spill backend factory.
+    pub fn with_spill_storage_factory(mut self, factory: Arc<dyn SpillStorageFactory>) -> Self {
+        self.spill_storage_factory = factory;
         self
     }
 
@@ -89,7 +107,8 @@ impl TaskExecutorBuilder {
 
     /// Build the task executor.
     pub fn build(self) -> crate::runtime::DefaultTaskExecutor {
-        crate::runtime::DefaultTaskExecutor::new(self.builder)
+        crate::runtime::DefaultTaskExecutor::with_resource_limits(self.builder, self.resource_limits)
+            .with_spill_storage_factory(self.spill_storage_factory)
     }
 }
 

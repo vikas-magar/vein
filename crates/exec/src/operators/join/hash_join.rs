@@ -19,6 +19,7 @@ use error::VeinError;
 
 use super::spec::OutputColumn;
 use super::hash_table::{HashTable, JoinKeys};
+use super::spill::{JoinSpillRun, JoinSpillSchema, JoinSpillWriter};
 use super::rows::{JoinType, output_rows};
 
 /// Collects the selection left by a VM join-residual filter.
@@ -53,7 +54,12 @@ impl PipelineNode<DataChunkView> for JoinFilterCollector {
 
 /// Consumes the build side into a hash table.
 pub struct BuildSink {
-    table: HashTable,
+    table: Option<HashTable>,
+    spill_writer: Option<JoinSpillWriter>,
+    spill_schema: Option<JoinSpillSchema>,
+    spill_backup: Vec<DataChunkView>,
+    build_keys: JoinKeys,
+    tracker: QueryMemoryTracker,
     /// Rows absorbed, and the time spent hashing and inserting them.
     rows: u64,
     insert_us: u64,
@@ -77,8 +83,46 @@ impl BuildSink {
         build_keys: JoinKeys,
         tracker: QueryMemoryTracker,
     ) -> Result<Self> {
+        let table = HashTable::with_memory_tracker(build_keys.clone(), probe_keys, tracker.clone())?;
         Ok(Self {
-            table: HashTable::with_memory_tracker(build_keys, probe_keys, tracker)?,
+            table: Some(table),
+            spill_writer: None,
+            spill_schema: None,
+            spill_backup: Vec::new(),
+            build_keys,
+            tracker,
+            rows: 0,
+            insert_us: 0,
+        })
+    }
+
+    /// Create a build sink that falls back to an IPC run when retained build
+    /// state exceeds the query's memory budget.
+    pub(crate) fn with_spill_support(
+        probe_keys: JoinKeys,
+        build_keys: JoinKeys,
+        build_types: &[DataType],
+        tracker: QueryMemoryTracker,
+    ) -> Result<Self> {
+        let schema = JoinSpillSchema::new(build_types);
+        let (table, spill_writer) = match HashTable::with_memory_tracker(
+            build_keys.clone(),
+            probe_keys,
+            tracker.clone(),
+        ) {
+            Ok(table) => (Some(table), None),
+            Err(VeinError::ResourceExhausted { .. }) => {
+                (None, Some(JoinSpillWriter::new(tracker.clone(), schema.clone())?))
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            table,
+            spill_writer,
+            spill_schema: Some(schema),
+            spill_backup: Vec::new(),
+            build_keys,
+            tracker,
             rows: 0,
             insert_us: 0,
         })
@@ -91,27 +135,98 @@ impl BuildSink {
 
     /// The finished table, ready to probe.
     pub fn finish(self) -> HashTable {
-        self.table
+        self.table.expect("in-memory build sink cannot finish after spilling")
     }
+
+    /// Finish either the retained hash table or its spill run.
+    pub(crate) fn finish_with_spill(mut self) -> Result<BuildResult> {
+        if let Some(table) = self.table.take() {
+            return Ok(BuildResult::InMemory(table));
+        }
+        let run = self
+            .spill_writer
+            .take()
+            .ok_or_else(|| VeinError::internal("spilled join build has no writer"))?
+            .finish()?;
+        Ok(BuildResult::Spilled {
+            run,
+            schema: self
+                .spill_schema
+                .take()
+                .ok_or_else(|| VeinError::internal("spilled join build has no schema"))?,
+        })
+    }
+}
+
+pub(crate) enum BuildResult {
+    InMemory(HashTable),
+    Spilled { run: JoinSpillRun, schema: JoinSpillSchema },
 }
 
 impl PipelineNode<DataChunkView> for BuildSink {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.rows += view.num_rows() as u64;
         let started = Instant::now();
-        self.table.insert_view(view)?;
+        if let Some(writer) = self.spill_writer.as_mut() {
+            writer.push(&view, &self.build_keys)?;
+        } else {
+            let table = self
+                .table
+                .as_mut()
+                .ok_or_else(|| VeinError::internal("join build table is unavailable"))?;
+            match table.insert_view(view.clone()) {
+                Ok(()) => self.spill_backup.push(view),
+                Err(VeinError::ResourceExhausted { .. }) if self.spill_schema.is_some() => {
+                    let schema = self
+                        .spill_schema
+                        .as_ref()
+                        .ok_or_else(|| VeinError::internal("join spill schema is unavailable"))?
+                        .clone();
+                    let mut writer = JoinSpillWriter::new(self.tracker.clone(), schema)?;
+                    for retained in &self.spill_backup {
+                        writer.push(retained, &self.build_keys)?;
+                    }
+                    writer.push(&view, &self.build_keys)?;
+                    self.spill_writer = Some(writer);
+                    self.spill_backup.clear();
+                    self.table = None;
+                    tracing::info!(
+                        target: "vein.audit",
+                        event = "join_build_spill_started",
+                        rows = self.rows,
+                        "join_build_spill_started"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
         self.insert_us += started.elapsed().as_micros() as u64;
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        let (keys, key_materialize_us) = self.table.build_key_materialization();
+        if let Some(writer) = self.spill_writer.as_ref() {
+            tracing::info!(
+                target: "vein.audit",
+                event = "join_build_spill_finished",
+                rows = self.rows,
+                spill_rows = writer.rows(),
+                insert_us = self.insert_us,
+                "join_build_spill_finished"
+            );
+            return Ok(());
+        }
+        let table = self
+            .table
+            .as_ref()
+            .ok_or_else(|| VeinError::internal("join build table is unavailable at flush"))?;
+        let (keys, key_materialize_us) = table.build_key_materialization();
         tracing::info!(
             target: "vein.audit",
             event = "join_build_finished",
             rows = self.rows,
-            table_rows = self.table.len(),
-            build_chunks = self.table.chunk_count(),
+            table_rows = table.len(),
+            build_chunks = table.chunk_count(),
             insert_us = self.insert_us,
             key_shared_columns = keys.shared_columns,
             key_gathered_columns = keys.gathered_columns,

@@ -7,6 +7,7 @@
 //! implementations from a wire task, and a [`TaskExecutor`] runs a single
 //! task end-to-end (see `crate::pipeline`).
 
+use arrow::array::Array;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -18,16 +19,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
 
+use crate::memory::{ExecutionResourceLimits, QueryMemoryTracker};
 use crate::operators::aggregate;
+use crate::operators::join::hash_join::BuildResult;
+use crate::operators::join::spill::{
+    JoinSpillRun, JoinSpillSchema, JoinSpillWriter, open_reader, partition_runs, payload_view,
+    remove_run,
+};
 use crate::operators::join::{
-    BuildSink, HashJoin, JoinFilterCollector, JoinKeys, JoinType, OutputColumn,
+    BuildSink, HashJoin, HashTable, JoinFilterCollector, JoinKeys, JoinType, OutputColumn,
 };
 use crate::operators::sink::{ClientOutput, CollectSink, ViewResultBatch, WriteReceipt};
 use crate::operators::{LimitTransform, SortTransform};
-use crate::memory::QueryMemoryTracker;
 use crate::pipeline::{
     DataChunk, DataChunkView, MaterializationReport, PipelineNode, Sink, Source, Transform,
 };
+use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
@@ -656,6 +663,235 @@ impl PipelineNode<DataChunkView> for JoinProbeCounter {
     }
 }
 
+type SharedJoinOutput = Arc<Mutex<Box<dyn PipelineNode<DataChunkView>>>>;
+
+/// Forwards partition results into the one downstream operator instance.
+/// HashJoin flushes once per partition; this adapter defers that flush until
+/// every partition has completed.
+#[derive(Clone)]
+struct JoinPartitionOutput(SharedJoinOutput);
+
+impl PipelineNode<DataChunkView> for JoinPartitionOutput {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| VeinError::internal("join partition output mutex poisoned"))?
+            .push(view)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn finished(&self) -> bool {
+        self.0.lock().map(|next| next.finished()).unwrap_or(false)
+    }
+}
+
+/// Probe-side pipeline used after the build sink spills. It materializes the
+/// probe side once into an IPC run, then recursively executes bounded hash
+/// partitions through the same HashJoin operator used by the in-memory path.
+struct SpilledJoinProbe {
+    probe_writer: Option<JoinSpillWriter>,
+    build_run: JoinSpillRun,
+    build_schema: JoinSpillSchema,
+    probe_schema: JoinSpillSchema,
+    plan: JoinPlan,
+    builder: Arc<dyn ExecutorBuilder>,
+    tracker: QueryMemoryTracker,
+    next: SharedJoinOutput,
+}
+
+impl SpilledJoinProbe {
+    fn process_partitions(
+        &self,
+        build_runs: Vec<JoinSpillRun>,
+        probe_runs: Vec<JoinSpillRun>,
+        bit: u32,
+    ) -> Result<()> {
+        self.tracker.check_cancelled()?;
+        let mut table = HashTable::with_memory_tracker(
+            join_keys(&self.plan.build_keys),
+            join_keys(&self.plan.probe_keys),
+            self.tracker.clone(),
+        )?;
+        let mut overflow = false;
+        'build_runs: for run in &build_runs {
+            let mut reader = open_reader(run)?;
+            while let Some(batch) = reader.next() {
+                self.tracker.check_cancelled()?;
+                let batch = batch.map_err(|error| {
+                    VeinError::internal(format!("decode spilled join build batch: {error}"))
+                })?;
+                // Leasing decoded payload arrays is part of loading a partition
+                // into the hash table. It can exhaust the budget before
+                // insert_view gets a chance to reject the row references, so
+                // treat either failure as a signal to repartition.
+                let view = match payload_view(batch, &self.build_schema, &self.tracker) {
+                    Ok(view) => view,
+                    Err(VeinError::ResourceExhausted { .. }) => {
+                        overflow = true;
+                        break 'build_runs;
+                    }
+                    Err(error) => return Err(error),
+                };
+                match table.insert_view(view) {
+                    Ok(()) => {}
+                    Err(VeinError::ResourceExhausted { .. }) => {
+                        overflow = true;
+                        break 'build_runs;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        // Load the complete build partition first, but do not emit any output
+        // until the largest probe batch can coexist with it. If it cannot,
+        // repartition both sides before the downstream operator sees rows.
+        if !overflow {
+            let working_set = self.tracker.used();
+            'probe_runs: for run in &probe_runs {
+                let mut reader = open_reader(run)?;
+                while let Some(batch) = reader.next() {
+                    self.tracker.check_cancelled()?;
+                    let batch = batch.map_err(|error| {
+                        VeinError::internal(format!("decode spilled join probe batch: {error}"))
+                    })?;
+                    let batch_bytes = batch
+                        .columns()
+                        .iter()
+                        .map(|array| array.get_array_memory_size())
+                        .fold(0_usize, usize::saturating_add);
+                    if working_set
+                        .checked_add(batch_bytes)
+                        .is_none_or(|required| required > self.tracker.limit())
+                    {
+                        overflow = true;
+                        break 'probe_runs;
+                    }
+                }
+            }
+        }
+
+        if overflow {
+            drop(table);
+            if bit >= u64::BITS {
+                return Err(VeinError::resource_exhausted(
+                    "recursive hash join partition",
+                    bit as usize + 1,
+                    u64::BITS as usize,
+                ));
+            }
+            tracing::debug!(
+                target: "vein.audit",
+                event = "join_spill_repartition",
+                partition_bit = bit,
+                build_runs = build_runs.len(),
+                probe_runs = probe_runs.len(),
+                "join spill partition still exceeds memory budget"
+            );
+            let build_children = if build_runs.is_empty() {
+                [None, None]
+            } else {
+                partition_runs(&build_runs, &self.build_schema, &self.tracker, bit)?
+            };
+            let probe_children = if probe_runs.is_empty() {
+                [None, None]
+            } else {
+                partition_runs(&probe_runs, &self.probe_schema, &self.tracker, bit)?
+            };
+            for run in build_runs.into_iter().chain(probe_runs) {
+                remove_run(run)?;
+            }
+            for partition in 0..2 {
+                let build: Vec<JoinSpillRun> =
+                    build_children[partition].clone().into_iter().collect();
+                let probe: Vec<JoinSpillRun> =
+                    probe_children[partition].clone().into_iter().collect();
+                if !build.is_empty() || !probe.is_empty() {
+                    self.process_partitions(build, probe, bit + 1)?;
+                }
+            }
+            return Ok(());
+        }
+
+        let build_rows = table.len() as u64;
+        tracing::debug!(
+            target: "vein.audit",
+            event = "join_spill_partition_loaded",
+            partition_bit = bit,
+            build_rows,
+            "join spill partition loaded"
+        );
+        let join_type = join_type(self.plan.join_type)?;
+        let next = Box::new(JoinPartitionOutput(Arc::clone(&self.next)));
+        let join = HashJoin::new(
+            Arc::new(table),
+            join_type,
+            join_outputs(&self.plan.outputs),
+            join_types(&self.plan.probe_types),
+            join_types(&self.plan.build_types),
+            next,
+        );
+        let join = install_join_residual(self.builder.as_ref(), &self.plan, join)?;
+        let mut join: Box<dyn PipelineNode<DataChunkView>> = Box::new(join);
+        for run in &probe_runs {
+            let mut reader = open_reader(run)?;
+            while let Some(batch) = reader.next() {
+                self.tracker.check_cancelled()?;
+                let batch = batch.map_err(|error| {
+                    VeinError::internal(format!("decode spilled join probe batch: {error}"))
+                })?;
+                join.push(payload_view(batch, &self.probe_schema, &self.tracker)?)?;
+            }
+        }
+        join.flush()?;
+        for run in build_runs.into_iter().chain(probe_runs) {
+            remove_run(run)?;
+        }
+        Ok(())
+    }
+}
+
+impl PipelineNode<DataChunkView> for SpilledJoinProbe {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.probe_writer
+            .as_mut()
+            .ok_or_else(|| VeinError::internal("spilled join probe is already finished"))?
+            .push(&view, &join_keys(&self.plan.probe_keys))
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        let probe_run = self
+            .probe_writer
+            .take()
+            .ok_or_else(|| VeinError::internal("spilled join probe has no writer"))?
+            .finish()?;
+        tracing::info!(
+            target: "vein.audit",
+            event = "join_spill_probe_finished",
+            build_rows = self.build_run.rows,
+            build_bytes = self.build_run.bytes,
+            probe_rows = probe_run.rows,
+            probe_bytes = probe_run.bytes,
+            "join spill inputs materialized"
+        );
+        self.process_partitions(vec![self.build_run.clone()], vec![probe_run], 0)?;
+        self.next
+            .lock()
+            .map_err(|_| VeinError::internal("join spill output mutex poisoned"))?
+            .flush()
+    }
+
+    fn finished(&self) -> bool {
+        self.next
+            .lock()
+            .map(|next| next.finished())
+            .unwrap_or(false)
+    }
+}
+
 /// A [`PipelineNode`] adapter that forwards pushes and swallows the flush.
 ///
 /// A join's probe side is split into one chain per file, all feeding the one
@@ -691,7 +927,8 @@ impl<B> PipelineNode<B> for SuppressFlush<B> {
 /// [`TaskResult`].
 pub struct DefaultTaskExecutor {
     builder: Arc<dyn ExecutorBuilder>,
-    memory_limit: usize,
+    resource_limits: ExecutionResourceLimits,
+    spill_storage_factory: Arc<dyn SpillStorageFactory>,
 }
 
 impl DefaultTaskExecutor {
@@ -715,16 +952,35 @@ impl DefaultTaskExecutor {
     pub fn new(builder: Arc<dyn ExecutorBuilder>) -> Self {
         Self {
             builder,
-            memory_limit: usize::MAX,
+            resource_limits: ExecutionResourceLimits::default(),
+            spill_storage_factory: Arc::new(LocalSpillStorageFactory),
         }
     }
 
     /// Create a task executor with a per-execution budget for blocking state.
     pub fn with_memory_limit(builder: Arc<dyn ExecutorBuilder>, memory_limit: usize) -> Self {
+        Self::with_resource_limits(
+            builder,
+            ExecutionResourceLimits::new(memory_limit, u64::MAX),
+        )
+    }
+
+    /// Create a task executor with memory and spill-disk limits per execution.
+    pub fn with_resource_limits(
+        builder: Arc<dyn ExecutorBuilder>,
+        resource_limits: ExecutionResourceLimits,
+    ) -> Self {
         Self {
             builder,
-            memory_limit,
+            resource_limits,
+            spill_storage_factory: Arc::new(LocalSpillStorageFactory),
         }
+    }
+
+    /// Use a factory that creates one isolated spill backend per query.
+    pub fn with_spill_storage_factory(mut self, factory: Arc<dyn SpillStorageFactory>) -> Self {
+        self.spill_storage_factory = factory;
+        self
     }
 
     /// Execute a recursive input tree with bounded batches between operators.
@@ -937,7 +1193,16 @@ impl DefaultTaskExecutor {
                     let handle: Box<dyn PipelineNode<DataChunkView>> =
                         Box::new(MaterializeViewNode::for_operator(handle, &input.operator)?);
                     let bytes = self
-                        .execute_input(child, handle, task, cancel, memory, span, schedule, depth + 1)
+                        .execute_input(
+                            child,
+                            handle,
+                            task,
+                            cancel,
+                            memory,
+                            span,
+                            schedule,
+                            depth + 1,
+                        )
                         .await?;
                     let boundary =
                         if matches!(&input.operator, PhysicalPlanOperator::Distinct { .. }) {
@@ -1042,9 +1307,10 @@ impl DefaultTaskExecutor {
                 )),
                 PhysicalPlanOperator::Join { probe, build, plan } => {
                     let started = Instant::now();
-                    let build_sink = Arc::new(Mutex::new(Some(BuildSink::with_memory_tracker(
+                    let build_sink = Arc::new(Mutex::new(Some(BuildSink::with_spill_support(
                         join_keys(&plan.probe_keys),
                         join_keys(&plan.build_keys),
+                        &join_types(&plan.build_types),
                         memory.clone(),
                     )?)));
                     let build_bytes = self
@@ -1067,28 +1333,63 @@ impl DefaultTaskExecutor {
                         .ok_or_else(|| {
                             VeinError::internal("join build sink missing after execution")
                         })?;
-                    let table = build_sink.finish();
-                    let build_rows = table.len() as u64;
+                    let build_result = build_sink.finish_with_spill()?;
+                    let build_rows = match &build_result {
+                        BuildResult::InMemory(table) => table.len() as u64,
+                        BuildResult::Spilled { run, .. } => run.rows,
+                    };
                     let build_us = started.elapsed().as_micros() as u64;
-
-                    let kind = join_type(plan.join_type)?;
-                    let join = HashJoin::new(
-                        Arc::new(table),
-                        kind,
-                        join_outputs(&plan.outputs),
-                        join_types(&plan.probe_types),
-                        join_types(&plan.build_types),
-                        next,
-                    );
-                    let join = install_join_residual(self.builder.as_ref(), plan, join)?;
-                    let join: Box<dyn PipelineNode<DataChunkView>> =
-                        Box::new(PipelineDependencyGuard::new(
-                            Box::new(join),
-                            schedule.dependencies_for_operator(input)?,
-                        ));
+                    let build_bytes = match &build_result {
+                        BuildResult::InMemory(_) => build_bytes,
+                        BuildResult::Spilled { run, .. } => {
+                            tracing::info!(
+                                target: "vein.audit",
+                                event = "join_build_spill_run_ready",
+                                rows = run.rows,
+                                bytes = run.bytes,
+                                "join build spill run ready"
+                            );
+                            run.bytes
+                        }
+                    };
                     let probe_rows = Arc::new(AtomicU64::new(0));
                     let probe_batches = Arc::new(AtomicU64::new(0));
                     let probe_started = Instant::now();
+                    let dependencies = schedule.dependencies_for_operator(input)?;
+                    let join: Box<dyn PipelineNode<DataChunkView>> = match build_result {
+                        BuildResult::InMemory(table) => {
+                            let join = HashJoin::new(
+                                Arc::new(table),
+                                join_type(plan.join_type)?,
+                                join_outputs(&plan.outputs),
+                                join_types(&plan.probe_types),
+                                join_types(&plan.build_types),
+                                next,
+                            );
+                            let join = install_join_residual(self.builder.as_ref(), plan, join)?;
+                            Box::new(PipelineDependencyGuard::new(Box::new(join), dependencies))
+                        }
+                        BuildResult::Spilled { run, schema } => {
+                            let probe_schema = JoinSpillSchema::new(&join_types(&plan.probe_types));
+                            let probe_writer =
+                                JoinSpillWriter::new(memory.clone(), probe_schema.clone())?;
+                            let downstream: SharedJoinOutput = Arc::new(Mutex::new(next));
+                            let spilled = SpilledJoinProbe {
+                                probe_writer: Some(probe_writer),
+                                build_run: run,
+                                build_schema: schema,
+                                probe_schema,
+                                plan: plan.clone(),
+                                builder: Arc::clone(&self.builder),
+                                tracker: memory.clone(),
+                                next: downstream,
+                            };
+                            Box::new(PipelineDependencyGuard::new(
+                                Box::new(spilled),
+                                dependencies,
+                            ))
+                        }
+                    };
                     let probe_bytes = self
                         .execute_input(
                             probe,
@@ -1153,7 +1454,12 @@ impl DefaultTaskExecutor {
             ));
         };
         let schedule = PipelineExecutionSchedule::derive(&task.plan)?;
-        let memory = QueryMemoryTracker::new(self.memory_limit, cancel.clone());
+        let spill_storage = self.spill_storage_factory.create_for_query()?;
+        let memory = QueryMemoryTracker::with_spill_storage(
+            self.resource_limits,
+            cancel.clone(),
+            spill_storage,
+        );
 
         let sink_started = Instant::now();
         let sink = make_sink(self.builder.as_ref(), sink_plan)?;
@@ -1175,7 +1481,9 @@ impl DefaultTaskExecutor {
         let run_started = Instant::now();
         let source_started = Instant::now();
         let bytes_read = self
-            .execute_input(input, head, task, &cancel, &memory, &task_span, &schedule, 0)
+            .execute_input(
+                input, head, task, &cancel, &memory, &task_span, &schedule, 0,
+            )
             .await?;
         schedule.complete_boundary(&task.plan.root, PipelineBoundaryKind::ResultSink)?;
         schedule.verify_complete()?;
@@ -1208,6 +1516,9 @@ impl DefaultTaskExecutor {
             memory_limit_bytes = memory.limit(),
             memory_peak_bytes = memory.peak(),
             memory_reserved_bytes = memory.used(),
+            spill_disk_limit_bytes = memory.spill_bytes_limit(),
+            spill_disk_peak_bytes = memory.spill_bytes_peak(),
+            spill_disk_reserved_bytes = memory.spill_bytes_used(),
             total_us = duration_ns / 1000,
             "task_finished"
         );
@@ -1343,7 +1654,9 @@ fn join_types(types: &[VeinDataType]) -> Vec<DataType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use crate::operators::source::MemorySource;
+    use crate::spill::{LocalSpillStorage, SpillStorage};
     use arrow::array::Array;
     use common::identifiers::{QueryId, RequestId, StageId, TaskId};
     use common::protocol::{
@@ -1351,6 +1664,15 @@ mod tests {
         JoinPlan, LimitSpec, MicroOp, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator,
         SortKey, SortPlan,
     };
+
+    struct CountingSpillStorageFactory(Arc<AtomicUsize>);
+
+    impl SpillStorageFactory for CountingSpillStorageFactory {
+        fn create_for_query(&self) -> Result<Arc<dyn SpillStorage>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::new(LocalSpillStorage::new()))
+        }
+    }
 
     struct MaterializationCollector {
         chunks: Arc<Mutex<Vec<DataChunk>>>,
@@ -2716,20 +3038,30 @@ mod tests {
     #[tokio::test]
     async fn both_result_apis_preserve_zero_column_counts_and_empty_input() {
         let mut task = task();
-        let input = plan_node(Arc::new(types::VeinSchema::empty()),
-                              PhysicalPlanOperator::Pipeline {
-                                  source: Arc::new(DataSource::Memory),
-                                  input_schema: int64_schema(),
-                                  program: Arc::new(MicroProgram::new(1, vec![
-                                      MicroOp::ProjectRegisters { out_regs: Vec::new() },
-                                  ])),
-                              },
+        let input = plan_node(
+            Arc::new(types::VeinSchema::empty()),
+            PhysicalPlanOperator::Pipeline {
+                source: Arc::new(DataSource::Memory),
+                input_schema: int64_schema(),
+                program: Arc::new(MicroProgram::new(
+                    1,
+                    vec![MicroOp::ProjectRegisters {
+                        out_regs: Vec::new(),
+                    }],
+                )),
+            },
         );
         task.plan = plan_with_input(&task, input);
         for values in [vec![], vec![1, 2, 3]] {
             let runner = runner_with_values(values.clone());
-            let arrow = runner.execute(&task, CancellationToken::new()).await.unwrap();
-            let views = runner.execute_views(&task, CancellationToken::new()).await.unwrap();
+            let arrow = runner
+                .execute(&task, CancellationToken::new())
+                .await
+                .unwrap();
+            let views = runner
+                .execute_views(&task, CancellationToken::new())
+                .await
+                .unwrap();
             assert_eq!(arrow.row_count, values.len() as u64);
             assert_eq!(views.row_count, arrow.row_count);
             assert_eq!(arrow.output.len(), usize::from(!values.is_empty()));
@@ -2834,7 +3166,7 @@ mod tests {
             probe_keys: vec![0],
             build_keys: vec![0],
             residual: None,
-            outputs: vec![JoinOutput::Probe(0)],
+            outputs: vec![JoinOutput::Probe(0), JoinOutput::Build(0)],
             probe_types: vec![types::VeinDataType::Int64],
             build_types: vec![types::VeinDataType::Int64],
         };
@@ -2845,7 +3177,7 @@ mod tests {
                 plan: join_plan(),
             }),
             program: Arc::new(MicroProgram {
-                register_count: 1,
+                register_count: 2,
                 instructions: vec![common::protocol::MicroOp::ProjectRegisters {
                     out_regs: vec![0],
                 }],
@@ -3375,5 +3707,109 @@ mod tests {
             .await
             .expect_err("recursive aggregate must use the configured execution budget");
         assert!(matches!(error, VeinError::ResourceExhausted { .. }));
+    }
+
+    fn full_join_spill_task() -> ExecuteTask {
+        let input = || InputPlanFixture::Pipeline {
+            source: DataSource::Memory,
+            program: Arc::new(MicroProgram::empty()),
+        };
+        let plan = JoinPlan {
+            join_type: JoinKind::Full,
+            probe_keys: vec![0],
+            build_keys: vec![0],
+            residual: None,
+            outputs: vec![JoinOutput::Probe(0), JoinOutput::Build(0)],
+            probe_types: vec![VeinDataType::Int64],
+            build_types: vec![VeinDataType::Int64],
+        };
+        let mut task = task();
+        let join = InputPlanFixture::Join {
+            probe: Box::new(input()),
+            build: Box::new(input()),
+            plan,
+        };
+        set_input_plan(&mut task, join);
+        task
+    }
+
+    fn full_join_feed() -> Arc<MemoryFeedBuilder> {
+        let mut values = (0..128).map(Some).collect::<Vec<_>>();
+        values.extend([Some(20), None]);
+        Arc::new(MemoryFeedBuilder::with_nullable_values(values))
+    }
+
+    fn join_result_pairs(output: &[RecordBatch]) -> Vec<(Option<i64>, Option<i64>)> {
+        let mut pairs = output
+            .iter()
+            .flat_map(|batch| {
+                let probe = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("probe output");
+                let build = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("build output");
+                (0..batch.num_rows()).map(|row| {
+                    (
+                        probe.is_valid(row).then(|| probe.value(row)),
+                        build.is_valid(row).then(|| build.value(row)),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        pairs
+    }
+
+    #[tokio::test]
+    async fn full_join_spill_matches_in_memory_result_under_configured_budgets() {
+        let task = full_join_spill_task();
+        let in_memory = DefaultTaskExecutor::new(full_join_feed())
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("in-memory full join");
+        let spilling = DefaultTaskExecutor::with_resource_limits(
+            full_join_feed(),
+            ExecutionResourceLimits::new(20_000, 1_000_000),
+        )
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect("full join spills within configured disk quota");
+
+        assert_eq!(in_memory.row_count, 133);
+        assert_eq!(spilling.row_count, in_memory.row_count);
+        assert_eq!(
+            join_result_pairs(&spilling.output),
+            join_result_pairs(&in_memory.output),
+            "spilled output preserves duplicate matches and null extensions"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_join_spill_respects_query_disk_quota() {
+        let task = full_join_spill_task();
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let executor = DefaultTaskExecutor::with_resource_limits(
+            full_join_feed(),
+            ExecutionResourceLimits::new(20_000, 0),
+        )
+            .with_spill_storage_factory(Arc::new(CountingSpillStorageFactory(Arc::clone(
+                &factory_calls,
+            ))));
+
+        let error = executor
+            .execute(&task, CancellationToken::new())
+            .await
+            .expect_err("zero spill quota rejects a build-side run");
+
+        assert!(
+            matches!(error, VeinError::ResourceExhausted { .. }),
+            "expected spill-quota exhaustion, received {error:?}"
+        );
+        assert_eq!(factory_calls.load(Ordering::Relaxed), 1);
     }
 }

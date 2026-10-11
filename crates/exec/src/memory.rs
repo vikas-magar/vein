@@ -1,23 +1,49 @@
 //! Query-scoped accounting for memory owned by blocking operators.
 //!
 //! Reservations are acquired before an operator grows an owned data structure
-//! and released when that structure is dropped. Most source Arrow buffers are
-//! externally owned and are not charged here. Spill-decoded arrays attach a
-//! reservation lease to [`crate::pipeline::DataChunkView`] so their footprint
-//! remains charged while zero-copy output views retain those arrays.
+//! and released when that structure is dropped. Source Arrow arrays retained by
+//! blocking views receive one shared RAII lease per active array identity;
+//! spill-decoded arrays keep that lease as long as zero-copy output views retain
+//! them. The estimate uses Arrow's reported array footprint and does not include
+//! transient scan buffers or allocations made inside a decoder before it returns.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
-use std::path::PathBuf;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::Result;
 use common::cancellation::CancellationToken;
 use error::VeinError;
+use crate::spill::{SpillManager, SpillStorage};
+
+/// Per-execution budgets shared by all blocking operators.
+///
+/// These limits cover memory reservations and bytes written to temporary spill
+/// runs. They do not include unrelated scan buffers or allocations internal to
+/// Arrow before an array's reported footprint is available.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionResourceLimits {
+    /// Maximum bytes reserved by blocking operator state.
+    pub memory_bytes: usize,
+    /// Maximum bytes retained across query spill runs.
+    pub spill_disk_bytes: u64,
+}
+
+impl ExecutionResourceLimits {
+    /// Configure memory and spill-disk budgets for one query execution.
+    pub const fn new(memory_bytes: usize, spill_disk_bytes: u64) -> Self {
+        Self {
+            memory_bytes,
+            spill_disk_bytes,
+        }
+    }
+}
+
+impl Default for ExecutionResourceLimits {
+    fn default() -> Self {
+        Self::new(usize::MAX, u64::MAX)
+    }
+}
 
 #[derive(Debug)]
 struct MemoryTrackerInner {
@@ -25,83 +51,9 @@ struct MemoryTrackerInner {
     used: AtomicUsize,
     peak: AtomicUsize,
     cancel: CancellationToken,
-    spill_directory: OnceLock<std::result::Result<SpillDirectory, String>>,
+    spill: SpillManager,
     retained_arrays: Mutex<HashMap<usize, Weak<MemoryReservation>>>,
     retained_array_requests: AtomicUsize,
-}
-
-/// Owns the files written by one query's blocking operators.
-///
-/// The directory is created on the first spill and removed when the final
-/// query tracker is dropped. File creation uses `create_new` so concurrent
-/// operators cannot overwrite one another's runs.
-#[derive(Debug)]
-struct SpillDirectory {
-    path: PathBuf,
-    next_file: AtomicUsize,
-}
-
-impl SpillDirectory {
-    fn create() -> std::io::Result<Self> {
-        let root = std::env::temp_dir();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        for attempt in 0..128u32 {
-            let path = root.join(format!(
-                "vein-query-{}-{timestamp}-{attempt}",
-                std::process::id()
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => {
-                    return Ok(Self {
-                        path,
-                        next_file: AtomicUsize::new(0),
-                    });
-                }
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(std::io::Error::new(
-            ErrorKind::AlreadyExists,
-            "could not allocate a unique query spill directory",
-        ))
-    }
-
-    fn create_file(&self) -> std::io::Result<(PathBuf, File)> {
-        loop {
-            let index = self.next_file.fetch_add(1, Ordering::Relaxed);
-            let path = self.path.join(format!("run-{index}.arrow"));
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => return Ok((path, file)),
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
-
-impl Drop for SpillDirectory {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.path) {
-            if error.kind() != ErrorKind::NotFound {
-                tracing::warn!(
-                    target: "vein.audit",
-                    event = "query_spill_cleanup_failed",
-                    path = %self.path.display(),
-                    error = %error,
-                    "failed to remove query spill directory"
-                );
-            }
-        }
-    }
 }
 
 /// Shared byte budget for the blocking operators in one task execution.
@@ -117,13 +69,34 @@ pub struct QueryMemoryTracker {
 impl QueryMemoryTracker {
     /// Create a tracker with a byte limit and the execution's cancellation token.
     pub fn new(limit: usize, cancel: CancellationToken) -> Self {
+        Self::with_resource_limits(ExecutionResourceLimits::new(limit, u64::MAX), cancel)
+    }
+
+    /// Create a tracker with query memory and spill-disk budgets.
+    pub fn with_resource_limits(
+        limits: ExecutionResourceLimits,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self::with_spill_storage(
+            limits,
+            cancel,
+            Arc::new(crate::spill::LocalSpillStorage::new()),
+        )
+    }
+
+    /// Create a tracker backed by a caller-provided, query-local spill store.
+    pub fn with_spill_storage(
+        limits: ExecutionResourceLimits,
+        cancel: CancellationToken,
+        storage: Arc<dyn SpillStorage>,
+    ) -> Self {
         Self {
             inner: Arc::new(MemoryTrackerInner {
-                limit,
+                limit: limits.memory_bytes,
                 used: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
-                cancel,
-                spill_directory: OnceLock::new(),
+                cancel: cancel.clone(),
+                spill: SpillManager::with_storage(cancel, limits.spill_disk_bytes, storage),
                 retained_arrays: Mutex::new(HashMap::new()),
                 retained_array_requests: AtomicUsize::new(0),
             }),
@@ -199,33 +172,24 @@ impl QueryMemoryTracker {
         Arc::as_ptr(&self.inner) as usize
     }
 
-    /// Create a unique read/write file in this query's lazily allocated spill directory.
-    ///
-    /// The directory and all files created through this method are removed when
-    /// the last tracker clone is dropped.
-    pub fn create_spill_file(&self) -> Result<(PathBuf, File)> {
-        if self.inner.cancel.is_cancelled() {
-            return Err(VeinError::cancelled());
-        }
-
-        let directory = self
-            .inner
-            .spill_directory
-            .get_or_init(|| SpillDirectory::create().map_err(|error| error.to_string()))
-            .as_ref()
-            .map_err(|error| VeinError::internal(format!("create query spill directory: {error}")))?;
-        directory
-            .create_file()
-            .map_err(|error| VeinError::internal(format!("create query spill file: {error}")))
+    /// Shared temporary-run lifecycle for all blocking operators in this query.
+    pub(crate) fn spill_manager(&self) -> SpillManager {
+        self.inner.spill.clone()
     }
 
-    #[cfg(test)]
-    fn spill_directory_path(&self) -> Option<PathBuf> {
-        self.inner
-            .spill_directory
-            .get()
-            .and_then(|directory| directory.as_ref().ok())
-            .map(|directory| directory.path.clone())
+    /// Current temporary storage charged to this query.
+    pub fn spill_bytes_used(&self) -> u64 {
+        self.inner.spill.disk_used()
+    }
+
+    /// Peak temporary storage charged to this query.
+    pub fn spill_bytes_peak(&self) -> u64 {
+        self.inner.spill.disk_peak()
+    }
+
+    /// Configured query spill-disk limit in bytes.
+    pub fn spill_bytes_limit(&self) -> u64 {
+        self.inner.spill.disk_limit()
     }
 
     /// Reserve bytes before growing an operator-owned allocation.
@@ -472,22 +436,26 @@ mod tests {
     }
 
     #[test]
-    fn query_spill_files_are_unique_and_cleaned_with_tracker() {
+    fn query_spill_runs_are_unique_accounted_and_cleaned_with_tracker() {
         let tracker = QueryMemoryTracker::unlimited(CancellationToken::new());
-        let (first_path, mut first) = tracker.create_spill_file().expect("create first run");
-        let (second_path, second) = tracker.create_spill_file().expect("create second run");
-        assert_ne!(first_path, second_path);
-        assert_eq!(first_path.parent(), second_path.parent());
-        let directory = tracker
-            .spill_directory_path()
-            .expect("spill directory is initialized")
-            .to_owned();
+        let manager = tracker.spill_manager();
+        let mut first_pending = manager.create_run().expect("create first run");
+        let mut second_pending = manager.create_run().expect("create second run");
+        let directory = manager.local_directory().expect("local spill directory initialized");
         use std::io::Write;
-        first.write_all(b"run").expect("write run marker");
-        assert!(first_path.exists());
+        let mut writer = first_pending.writer().expect("first writer");
+        writer.write_all(b"run").expect("write run marker");
+        let first = first_pending.commit(writer).expect("commit first run");
+        let second_writer = second_pending.writer().expect("second writer");
+        let second = second_pending.commit(second_writer).expect("commit empty run");
+        assert_eq!(tracker.spill_bytes_used(), 3);
+        assert_eq!(tracker.spill_bytes_peak(), 3);
+        assert!(manager.exists(&first));
         drop(first);
         drop(second);
+        assert_eq!(tracker.spill_bytes_used(), 0);
         drop(tracker);
+        drop(manager);
         assert!(!directory.exists(), "query spill directory is removed on drop");
     }
 
@@ -497,7 +465,33 @@ mod tests {
         let tracker = QueryMemoryTracker::unlimited(cancel.clone());
         cancel.cancel();
 
-        assert!(matches!(tracker.create_spill_file(), Err(VeinError::Cancelled)));
-        assert!(tracker.spill_directory_path().is_none());
+        assert!(matches!(tracker.spill_manager().create_run(), Err(VeinError::Cancelled)));
+        assert!(tracker.spill_manager().local_directory().is_none());
+    }
+
+    #[test]
+    fn configured_spill_limit_is_enforced_and_partial_runs_are_cleaned() {
+        use std::io::Write;
+
+        let tracker = QueryMemoryTracker::with_resource_limits(
+            ExecutionResourceLimits::new(64, 4),
+            CancellationToken::new(),
+        );
+        let manager = tracker.spill_manager();
+        let mut pending = manager.create_run().expect("create bounded spill run");
+        let directory = manager.local_directory().expect("spill directory created");
+        let writer = pending.writer().expect("create writer");
+        let mut writer = writer;
+
+        assert!(writer.write_all(b"12345").is_err());
+        assert!(matches!(
+            pending.commit(writer),
+            Err(VeinError::ResourceExhausted { limit: 4, .. })
+        ));
+        assert_eq!(tracker.spill_bytes_used(), 0, "failed run releases its reservation");
+
+        drop(tracker);
+        drop(manager);
+        assert!(!directory.exists(), "failed query spill directory is removed");
     }
 }

@@ -5,10 +5,8 @@
 //! shared array references so the merge path can retain them without scalar
 //! copies.
 
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{Read, Seek, Write};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -17,13 +15,13 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use arrow::ipc::reader::FileReader;
-use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use common::Result;
 use error::VeinError;
 use types::VeinDataType;
 
-use crate::memory::QueryMemoryTracker;
+use crate::memory::{MemoryReservation, QueryMemoryTracker};
+use crate::spill::{IpcRunOutput, IpcRunWriter, SpillRun};
 use super::intermediate::AggregateIntermediateGroup;
 
 const FORMAT_METADATA_KEY: &str = "vein.aggregate.spill.format";
@@ -31,8 +29,9 @@ const FORMAT_METADATA_VALUE: &str = "2";
 const GROUPING_SET_ID_FIELD: &str = "grouping_set_id";
 const HASH_FIELD: &str = "group_hash";
 const STATE_FIELD: &str = "aggregate_state";
-/// Bound typed Arrow builders and IPC record-batch workspace per spill write.
-const SPILL_RECORD_BATCH_SIZE: usize = super::AGGREGATE_BATCH_ROWS.get();
+/// Spill batches stay smaller than normal aggregate batches because decoded
+/// runs temporarily retain key, metadata, and state arrays during partitioning.
+const SPILL_RECORD_BATCH_SIZE: usize = super::AGGREGATE_BATCH_ROWS.get() / 16;
 
 /// Describes the stable typed layout shared by all runs of one aggregate.
 #[derive(Clone)]
@@ -74,9 +73,9 @@ impl AggregateSpillSchema {
     /// The iterator should snapshot groups on demand so accumulator snapshots,
     /// Arrow builders, and record batches stay bounded by the run batch size.
     #[cfg(test)]
-    pub(super) fn write_run<W, I>(&self, output: W, groups: I) -> Result<()>
+    pub(super) fn write_run<W, I>(&self, output: W, groups: I) -> Result<W>
     where
-        W: Write + Seek,
+        W: IpcRunOutput,
         I: IntoIterator<Item=AggregateIntermediateGroup>,
     {
         let mut writer = AggregateSpillWriter::new(self, output)?;
@@ -93,9 +92,9 @@ impl AggregateSpillSchema {
         output: W,
         group_count: usize,
         mut group_at: impl FnMut(usize) -> Result<AggregateIntermediateGroup>,
-    ) -> Result<()>
+    ) -> Result<W>
     where
-        W: Write + Seek,
+        W: IpcRunOutput,
     {
         let mut writer = AggregateSpillWriter::new(self, output)?;
         for slot in 0..group_count {
@@ -111,29 +110,28 @@ impl AggregateSpillSchema {
     /// failed partition can be discarded without losing aggregate state.
     pub(super) fn partition_runs(
         &self,
-        runs: &[PathBuf],
+        runs: &[SpillRun],
         tracker: &QueryMemoryTracker,
         bit: u32,
-    ) -> Result<[Option<PathBuf>; 2]> {
+    ) -> Result<[Option<SpillRun>; 2]> {
         if bit >= u64::BITS {
             return Err(VeinError::internal("aggregate spill partition bit is out of range"));
         }
         tracker.check_cancelled()?;
-        let (zero_path, zero_file) = tracker.create_spill_file()?;
-        let (one_path, one_file) = tracker.create_spill_file()?;
-        let mut zero = AggregateSpillWriter::new(self, zero_file)?;
-        let mut one = AggregateSpillWriter::new(self, one_file)?;
+        let manager = tracker.spill_manager();
+        let mut zero_pending = manager.create_run()?;
+        let mut one_pending = manager.create_run()?;
+        let mut zero = AggregateSpillWriter::new(self, zero_pending.writer()?)?;
+        let mut one = AggregateSpillWriter::new(self, one_pending.writer()?)?;
         let mut has_zero = false;
         let mut has_one = false;
 
-        for path in runs {
+        for run in runs {
             tracker.check_cancelled()?;
-            let file = File::open(path)
-                .map_err(|error| spill_error("open aggregate spill run for partition", error))?;
-            let mut reader = self.open_reader(file)?;
-            while let Some(batch) = reader.next_batch()? {
+            let mut reader = self.open_reader(run.open()?)?;
+            while let Some(mut batch) = reader.next_batch_charged(tracker)? {
                 tracker.check_cancelled()?;
-                for group in batch {
+                for group in std::mem::take(&mut batch.groups) {
                     if group.hash & (1_u64 << bit) == 0 {
                         zero.push(group)?;
                         has_zero = true;
@@ -145,25 +143,13 @@ impl AggregateSpillSchema {
             }
         }
 
-        zero.finish()?;
-        one.finish()?;
-
-        if !has_zero {
-            fs::remove_file(&zero_path)
-                .map_err(|error| spill_error("remove empty aggregate spill partition", error))?;
-        }
-        if !has_one {
-            fs::remove_file(&one_path)
-                .map_err(|error| spill_error("remove empty aggregate spill partition", error))?;
-        }
-
-        for path in runs {
-            fs::remove_file(path)
-                .map_err(|error| spill_error("remove repartitioned aggregate run", error))?;
-        }
+        let zero_output = zero.finish()?;
+        let one_output = one.finish()?;
+        let zero_run = zero_pending.commit(zero_output)?;
+        let one_run = one_pending.commit(one_output)?;
         Ok([
-            has_zero.then_some(zero_path),
-            has_one.then_some(one_path),
+            has_zero.then_some(zero_run),
+            has_one.then_some(one_run),
         ])
     }
 
@@ -307,22 +293,51 @@ impl AggregateSpillSchema {
         }
         Ok(groups)
     }
+
+    fn reserve_decoded_batch(
+        &self,
+        batch: &RecordBatch,
+        tracker: &QueryMemoryTracker,
+    ) -> Result<(MemoryReservation, Vec<Arc<MemoryReservation>>)> {
+        let mut identities = HashSet::with_capacity(batch.num_columns());
+        let mut key_leases = Vec::with_capacity(self.key_types.len());
+        let mut workspace_bytes = 0_usize;
+        let first_key = 2;
+        let end_key = first_key + self.key_types.len();
+        for (column, array) in batch.columns().iter().enumerate() {
+            if (first_key..end_key).contains(&column) {
+                let identity = Arc::as_ptr(array) as *const () as usize;
+                if identities.insert(identity) {
+                    key_leases.push(tracker.lease_retained_array(
+                        identity,
+                        array.get_array_memory_size(),
+                        "aggregate retained spill keys",
+                    )?);
+                }
+            } else {
+                workspace_bytes = workspace_bytes
+                    .checked_add(array.get_array_memory_size())
+                    .ok_or_else(|| VeinError::internal("aggregate spill workspace size overflow"))?;
+            }
+        }
+        let workspace = tracker.reserve(workspace_bytes, "aggregate spill decode workspace")?;
+        Ok((workspace, key_leases))
+    }
 }
 
 /// Bounded, incremental IPC writer shared by flush and repartition paths.
-struct AggregateSpillWriter<'a, W: Write + Seek> {
+struct AggregateSpillWriter<'a, W: IpcRunOutput> {
     layout: &'a AggregateSpillSchema,
-    writer: Option<FileWriter<W>>,
+    writer: IpcRunWriter<W>,
     pending: Vec<AggregateIntermediateGroup>,
 }
 
-impl<'a, W: Write + Seek> AggregateSpillWriter<'a, W> {
+impl<'a, W: IpcRunOutput> AggregateSpillWriter<'a, W> {
     fn new(layout: &'a AggregateSpillSchema, output: W) -> Result<Self> {
-        let writer = FileWriter::try_new(output, &layout.schema)
-            .map_err(|error| spill_error("create aggregate IPC writer", error))?;
+        let writer = IpcRunWriter::new(output, &layout.schema, "create aggregate IPC writer")?;
         Ok(Self {
             layout,
-            writer: Some(writer),
+            writer,
             pending: Vec::with_capacity(SPILL_RECORD_BATCH_SIZE),
         })
     }
@@ -341,21 +356,14 @@ impl<'a, W: Write + Seek> AggregateSpillWriter<'a, W> {
         }
         let encoded = self.layout.encode_batch(&self.pending)?;
         self.writer
-            .as_mut()
-            .expect("writer remains live until finish")
-            .write(&encoded)
-            .map_err(|error| spill_error("write aggregate IPC batch", error))?;
+            .write_batch(&encoded, "write aggregate IPC batch")?;
         self.pending.clear();
         Ok(())
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn finish(mut self) -> Result<W> {
         self.flush()?;
-        self.writer
-            .take()
-            .expect("writer remains live until finish")
-            .finish()
-            .map_err(|error| spill_error("finish aggregate IPC run", error))
+        self.writer.finish("finish aggregate IPC run")
     }
 }
 
@@ -366,10 +374,38 @@ pub(super) struct AggregateSpillReader<R> {
     layout: AggregateSpillSchema,
 }
 
+/// Holds decoded key/state arrays and their query-memory leases together for
+/// exactly the lifetime of one consumed IPC record batch.
+pub(super) struct AggregateSpillBatch {
+    pub(super) groups: Vec<AggregateIntermediateGroup>,
+    _leases: Vec<Arc<MemoryReservation>>,
+}
+
 impl<R: Read + Seek> AggregateSpillReader<R> {
+    #[cfg(test)]
     pub(super) fn next_batch(&mut self) -> Result<Option<Vec<AggregateIntermediateGroup>>> {
         match self.reader.next() {
             Some(Ok(batch)) => self.layout.decode_batch(batch).map(Some),
+            Some(Err(error)) => Err(spill_error("read aggregate IPC batch", error)),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) fn next_batch_charged(
+        &mut self,
+        tracker: &QueryMemoryTracker,
+    ) -> Result<Option<AggregateSpillBatch>> {
+        match self.reader.next() {
+            Some(Ok(batch)) => {
+                let (workspace, key_leases) =
+                    self.layout.reserve_decoded_batch(&batch, tracker)?;
+                let groups = self.layout.decode_batch(batch)?;
+                drop(workspace);
+                Ok(Some(AggregateSpillBatch {
+                    groups,
+                    _leases: key_leases,
+                }))
+            }
             Some(Err(error)) => Err(spill_error("read aggregate IPC batch", error)),
             None => Ok(None),
         }
@@ -519,6 +555,8 @@ fn spill_error(context: &str, error: impl std::fmt::Display) -> VeinError {
 mod tests {
     use std::io::Cursor;
 
+    impl crate::spill::IpcRunOutput for &mut Cursor<Vec<u8>> {}
+
     use arrow::array::{Int64Array, StringArray};
 
     use super::*;
@@ -535,6 +573,18 @@ mod tests {
             keys: vec![key],
             aggregate_states: vec![AggregateIntermediateState::Count(count)],
         }
+    }
+
+    fn managed_run(
+        layout: &AggregateSpillSchema,
+        tracker: &QueryMemoryTracker,
+        groups: impl IntoIterator<Item=AggregateIntermediateGroup>,
+    ) -> SpillRun {
+        let mut pending = tracker.spill_manager().create_run().expect("create managed run");
+        let output = layout
+            .write_run(pending.writer().expect("managed run writer"), groups)
+            .expect("write managed run");
+        pending.commit(output).expect("commit managed run")
     }
 
     #[test]
@@ -575,6 +625,50 @@ mod tests {
         assert!(restored[2].keys[0].is_none(), "omitted grouping key stays absent");
         assert_eq!(restored[2].aggregate_states.len(), 1);
         assert!(reader.next_batch().expect("end of run").is_none());
+    }
+
+    #[test]
+    fn decoded_aggregate_spill_keys_are_charged_until_batch_release() {
+        let layout = AggregateSpillSchema::try_new(vec![VeinDataType::Int64], vec![vec![0]])
+            .expect("create typed aggregate spill schema");
+        let key: ArrayRef = Arc::new(Int64Array::from(vec![11, 23]));
+        let groups = [
+            sample_group(0, Some((Arc::clone(&key), 0)), 2),
+            sample_group(0, Some((Arc::clone(&key), 1)), 3),
+        ];
+        let mut bytes = Cursor::new(Vec::new());
+        layout.write_run(&mut bytes, groups).expect("write IPC run");
+        let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
+        let mut reader = layout
+            .open_reader(Cursor::new(bytes.into_inner()))
+            .expect("open IPC run");
+
+        let mut batch = reader
+            .next_batch_charged(&tracker)
+            .expect("read charged batch")
+            .expect("one record batch");
+        let decoded_bytes = tracker.used();
+        assert!(decoded_bytes > 0, "decoded Arrow arrays must be accounted");
+        assert_eq!(batch.groups.len(), 2);
+        let key_array = &batch.groups[0].keys[0]
+            .as_ref()
+            .expect("group retains its decoded key array")
+            .0;
+        assert_eq!(
+            decoded_bytes,
+            key_array.get_array_memory_size(),
+            "only key arrays still retained by groups remain charged after decoding"
+        );
+
+        let groups = std::mem::take(&mut batch.groups);
+        drop(groups);
+        assert_eq!(
+            tracker.used(),
+            decoded_bytes,
+            "batch leases stay live while decoded arrays are retained"
+        );
+        drop(batch);
+        assert_eq!(tracker.used(), 0, "batch leases release with the batch");
     }
 
     #[test]
@@ -668,7 +762,7 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert!(matches!(
             second[0].aggregate_states.as_slice(),
-            [AggregateIntermediateState::Count(1024)]
+            [AggregateIntermediateState::Count(count)] if *count == SPILL_RECORD_BATCH_SIZE as i64
         ));
         assert!(reader.next_batch().expect("end of run").is_none());
     }
@@ -686,14 +780,22 @@ mod tests {
                 i64::try_from(row).expect("hash fits i64"),
             )
         });
-        let (input_path, file) = tracker.create_spill_file().expect("create input run");
-        layout.write_run(file, groups).expect("write input run");
-
+        let source = managed_run(&layout, &tracker, groups);
+        let manager = tracker.spill_manager();
         let children = layout
-            .partition_runs(std::slice::from_ref(&input_path), &tracker, 0)
+            .partition_runs(std::slice::from_ref(&source), &tracker, 0)
             .expect("partition by low hash bit");
 
-        assert!(!input_path.exists(), "successful partition consumes its input runs");
+        assert!(manager.exists(&source), "source remains live until caller commits replacement");
+        drop(source);
+        assert_eq!(
+            tracker.spill_bytes_used(),
+            children
+                .iter()
+                .flatten()
+                .map(SpillRun::bytes)
+                .sum::<u64>()
+        );
         let hashes = children
             .into_iter()
             .enumerate()
@@ -702,7 +804,7 @@ mod tests {
                     return Vec::new();
                 };
                 let mut reader = layout
-                    .open_reader(File::open(path).expect("open child run"))
+                    .open_reader(path.open().expect("open child run"))
                     .expect("validate child run");
                 let mut hashes = Vec::new();
                 while let Some(batch) = reader.next_batch().expect("read child run") {
@@ -733,17 +835,18 @@ mod tests {
                 i64::try_from(row * 2).expect("even test hash fits i64"),
             )
         });
-        let (input_path, file) = tracker.create_spill_file().expect("create input run");
-        layout.write_run(file, groups).expect("write input run");
-        let directory = input_path.parent().expect("spill directory").to_owned();
+        let source = managed_run(&layout, &tracker, groups);
+        let manager = tracker.spill_manager();
+        let directory = manager.local_directory().expect("spill directory");
 
         let children = layout
-            .partition_runs(std::slice::from_ref(&input_path), &tracker, 0)
+            .partition_runs(std::slice::from_ref(&source), &tracker, 0)
             .expect("partition groups with an unused child");
 
         assert!(children[0].is_some());
         assert!(children[1].is_none());
-        let remaining_files = fs::read_dir(directory)
+        drop(source);
+        let remaining_files = std::fs::read_dir(directory)
             .expect("read spill directory")
             .count();
         assert_eq!(remaining_files, 1, "only the referenced child run remains");
@@ -756,20 +859,20 @@ mod tests {
         let cancel = common::cancellation::CancellationToken::new();
         let tracker = QueryMemoryTracker::unlimited(cancel.clone());
         let key: ArrayRef = Arc::new(Int64Array::from(vec![7]));
-        let (input_path, file) = tracker.create_spill_file().expect("create input run");
-        layout
-            .write_run(file, [sample_group(0, Some((key, 0)), 7)])
-            .expect("write input run");
+        let source = managed_run(&layout, &tracker, [sample_group(0, Some((key, 0)), 7)]);
+        let manager = tracker.spill_manager();
+        let directory = manager.local_directory().expect("spill directory");
 
         cancel.cancel();
         assert!(matches!(
-            layout.partition_runs(std::slice::from_ref(&input_path), &tracker, 0),
+            layout.partition_runs(std::slice::from_ref(&source), &tracker, 0),
             Err(VeinError::Cancelled)
         ));
-        assert!(input_path.exists(), "failed partition leaves source data intact");
+        assert!(manager.exists(&source), "failed partition leaves source data intact");
 
-        let directory = input_path.parent().expect("spill directory").to_owned();
+        drop(source);
         drop(tracker);
+        drop(manager);
         assert!(!directory.exists(), "query cleanup removes runs after cancellation");
     }
 }

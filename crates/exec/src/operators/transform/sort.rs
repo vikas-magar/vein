@@ -5,7 +5,6 @@ use arrow::compute::SortOptions;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::ipc::reader::FileReader;
-use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use arrow_row::{RowConverter, Rows, SortField};
 use common::Result;
@@ -13,14 +12,12 @@ use common::protocol::{LimitSpec, SortPlan};
 use error::VeinError;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
-use std::fs::{self, File};
-use std::io::Write;
 use std::mem::size_of;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
+use crate::spill::{IpcRunWriter, SpillRun, SpillStream};
 use crate::pipeline::view::ViewMemoryLease;
 use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode, Transform};
 
@@ -129,7 +126,7 @@ pub struct SortTransform {
     memory: MemoryReservation,
     tracker: QueryMemoryTracker,
     chunk_reservations: Vec<usize>,
-    spill_runs: Vec<PathBuf>,
+    spill_runs: Vec<SpillRun>,
     spill_schema: Option<SchemaRef>,
     spilling: bool,
     next: Box<dyn PipelineNode<DataChunkView>>,
@@ -187,7 +184,7 @@ impl SortTransform {
             QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new()),
             next,
         )
-        .expect("unlimited sort budget must construct sort state")
+            .expect("unlimited sort budget must construct sort state")
     }
 
     /// Create a global sort that charges its reference and key buffers to `tracker`.
@@ -429,11 +426,11 @@ impl SortTransform {
         if let Some(schema) = &self.spill_schema {
             if schema.fields().len() != view.num_columns()
                 || schema.fields().iter().enumerate().any(|(index, field)| {
-                    match view.column_data_type(index) {
-                        Ok(data_type) => field.data_type() != data_type,
-                        Err(_) => true,
-                    }
-                })
+                match view.column_data_type(index) {
+                    Ok(data_type) => field.data_type() != data_type,
+                    Err(_) => true,
+                }
+            })
             {
                 return Err(VeinError::internal(
                     "sort spill input schema changed between batches",
@@ -511,11 +508,10 @@ impl SortTransform {
                 .sort_us
                 .saturating_add(sort_started.elapsed().as_micros() as u64);
 
-            let (path, mut file) = self.tracker.create_spill_file()?;
+            let mut pending = self.tracker.spill_manager().create_run()?;
+            let output = pending.writer()?;
             let file_started = Instant::now();
-            let mut writer = FileWriter::try_new(&mut file, &schema).map_err(|error| {
-                VeinError::internal(format!("create sort spill writer: {error}"))
-            })?;
+            let mut writer = IpcRunWriter::new(output, &schema, "create sort spill writer")?;
             for rows in order.chunks(OUTPUT_BATCH_ROWS) {
                 self.tracker.check_cancelled()?;
                 let row_refs = rows.iter().map(|row| (0, *row)).collect::<Vec<_>>();
@@ -526,21 +522,12 @@ impl SortTransform {
                     RecordBatch::try_new(Arc::clone(&schema), chunk.vectors).map_err(|error| {
                         VeinError::internal(format!("build sort spill batch: {error}"))
                     })?;
-                writer.write(&batch).map_err(|error| {
-                    VeinError::internal(format!("write sort spill batch: {error}"))
-                })?;
+                writer.write_batch(&batch, "write sort spill batch")?;
             }
-            writer
-                .finish()
-                .map_err(|error| VeinError::internal(format!("finish sort spill run: {error}")))?;
-            drop(writer);
-            file.flush()
-                .map_err(|error| VeinError::internal(format!("flush sort spill run: {error}")))?;
-            let bytes = file
-                .metadata()
-                .map_err(|error| VeinError::internal(format!("stat sort spill run: {error}")))?
-                .len();
-            self.spill_runs.push(path);
+            let output = writer.finish("finish sort spill run")?;
+            let run = pending.commit(output)?;
+            let bytes = run.bytes();
+            self.spill_runs.push(run);
             self.metrics.spill_runs = self.metrics.spill_runs.saturating_add(1);
             self.metrics.spill_bytes = self.metrics.spill_bytes.saturating_add(bytes);
             self.metrics.emit_us = self
@@ -553,15 +540,15 @@ impl SortTransform {
         result
     }
 
-    fn spill_merged_group(&mut self, paths: &[PathBuf]) -> Result<PathBuf> {
+    fn spill_merged_group(&mut self, paths: &[SpillRun]) -> Result<SpillRun> {
         let schema = self
             .spill_schema
             .as_ref()
             .cloned()
             .ok_or_else(|| VeinError::internal("sort spill schema is missing"))?;
-        let (path, mut file) = self.tracker.create_spill_file()?;
-        let mut writer = FileWriter::try_new(&mut file, &schema)
-            .map_err(|error| VeinError::internal(format!("create merged sort run: {error}")))?;
+        let mut pending = self.tracker.spill_manager().create_run()?;
+        let output = pending.writer()?;
+        let mut writer = IpcRunWriter::new(output, &schema, "create merged sort run")?;
         let plan = self.plan.clone();
         merge_spill_group(paths, &plan, schema.fields().len(), &self.tracker, |view| {
             let chunk = view.to_data_chunk()?;
@@ -569,23 +556,14 @@ impl SortTransform {
                 RecordBatch::try_new(Arc::clone(&schema), chunk.vectors).map_err(|error| {
                     VeinError::internal(format!("build merged sort batch: {error}"))
                 })?;
-            writer
-                .write(&batch)
-                .map_err(|error| VeinError::internal(format!("write merged sort batch: {error}")))
+            writer.write_batch(&batch, "write merged sort batch")
         })?;
-        writer
-            .finish()
-            .map_err(|error| VeinError::internal(format!("finish merged sort run: {error}")))?;
-        drop(writer);
-        file.flush()
-            .map_err(|error| VeinError::internal(format!("flush merged sort run: {error}")))?;
-        let bytes = file
-            .metadata()
-            .map_err(|error| VeinError::internal(format!("stat merged sort run: {error}")))?
-            .len();
+        let output = writer.finish("finish merged sort run")?;
+        let run = pending.commit(output)?;
+        let bytes = run.bytes();
         self.metrics.spill_bytes = self.metrics.spill_bytes.saturating_add(bytes);
         self.metrics.spill_runs = self.metrics.spill_runs.saturating_add(1);
-        Ok(path)
+        Ok(run)
     }
 
     fn merge_spill_runs(&mut self) -> Result<()> {
@@ -601,11 +579,6 @@ impl SortTransform {
                     continue;
                 }
                 let merged = self.spill_merged_group(group)?;
-                for run in group {
-                    fs::remove_file(run).map_err(|error| {
-                        VeinError::internal(format!("remove consumed sort spill run: {error}"))
-                    })?;
-                }
                 next_pass.push(merged);
             }
             runs = next_pass;
@@ -632,11 +605,30 @@ impl SortTransform {
             next.push(view)
         })?;
         self.metrics.output_rows = output_rows;
-        for run in runs {
-            fs::remove_file(run).map_err(|error| {
-                VeinError::internal(format!("remove consumed sort spill run: {error}"))
-            })?;
+        Ok(())
+    }
+
+    fn account_retained_arrays(&self, view: &mut DataChunkView) -> Result<()> {
+        let tracker_id = self.tracker.identity();
+        view.account_source_arrays(tracker_id, |identity, bytes| {
+            let lease: Arc<dyn ViewMemoryLease> = self
+                .tracker
+                .lease_retained_array(identity, bytes, "sort retained arrays")?;
+            Ok(lease)
+        })
+    }
+
+    fn spill_retained_chunks(&mut self) -> Result<()> {
+        self.spilling = true;
+        for (index, retained) in std::mem::take(&mut self.chunks).into_iter().enumerate() {
+            let Some(retained) = retained else {
+                continue;
+            };
+            let reserved = self.chunk_reservations.get(index).copied().unwrap_or(0);
+            self.memory.shrink(reserved);
+            self.spill_view(&retained)?;
         }
+        self.chunk_reservations.clear();
         Ok(())
     }
 
@@ -678,6 +670,30 @@ impl SortTransform {
             .key_encode_us
             .saturating_add(encode_started.elapsed().as_micros() as u64);
 
+        let row_count = chunk.num_rows();
+        let selection_started = Instant::now();
+        let has_candidate = if top_n.is_full() {
+            let worst = top_n
+                .peek()
+                .ok_or_else(|| VeinError::internal("full Top-N heap is empty"))?;
+            (0..row_count).any(|row| keys.row(row).data() < worst.key.as_slice())
+        } else {
+            true
+        };
+        if !has_candidate {
+            self.metrics.candidate_rows_examined = self
+                .metrics
+                .candidate_rows_examined
+                .saturating_add(row_count as u64);
+            self.metrics.selection_us = self
+                .metrics
+                .selection_us
+                .saturating_add(selection_started.elapsed().as_micros() as u64);
+            return Ok(());
+        }
+
+        let mut chunk = chunk;
+        self.account_retained_arrays(&mut chunk)?;
         let chunk_index = self.chunks.len();
         let chunk_metadata = size_of::<Option<DataChunkView>>()
             .checked_add(size_of::<usize>())
@@ -685,12 +701,7 @@ impl SortTransform {
         self.memory.grow(chunk_metadata, "sort chunk references")?;
         self.chunks.push(Some(chunk));
         self.top_n_references.push(0);
-        let row_count = self.chunks[chunk_index]
-            .as_ref()
-            .expect("new view is retained")
-            .num_rows();
         let top_n = self.top_n.as_mut().expect("Top-N selector checked above");
-        let selection_started = Instant::now();
         for active_row in 0..row_count {
             self.metrics.candidate_rows_examined =
                 self.metrics.candidate_rows_examined.saturating_add(1);
@@ -780,7 +791,7 @@ fn row_sort_error(error: ArrowError) -> VeinError {
 }
 
 struct SpillMergeCursor {
-    reader: FileReader<File>,
+    reader: FileReader<Box<dyn SpillStream>>,
     view: DataChunkView,
     keys: Option<Arc<Rows>>,
     key_memory: MemoryReservation,
@@ -871,7 +882,7 @@ fn view_from_spill_batch(
 /// of reference-backed rows to the caller. The callback either writes an
 /// intermediate run or forwards the final views downstream.
 fn merge_spill_group(
-    paths: &[PathBuf],
+    paths: &[SpillRun],
     plan: &SortPlan,
     output_columns: usize,
     tracker: &QueryMemoryTracker,
@@ -883,7 +894,7 @@ fn merge_spill_group(
     let workspace_bytes = paths
         .len()
         .checked_mul(
-            size_of::<FileReader<File>>()
+            size_of::<FileReader<Box<dyn SpillStream>>>()
                 .saturating_add(size_of::<Option<DataChunkView>>())
                 .saturating_add(size_of::<SpillMergeCursor>())
                 .saturating_add(size_of::<&DataChunkView>()),
@@ -897,14 +908,9 @@ fn merge_spill_group(
     let _workspace_memory = tracker.reserve(workspace_bytes, "sort merge workspace")?;
     let mut readers = paths
         .iter()
-        .map(|path| {
-            FileReader::try_new(
-                File::open(path).map_err(|error| {
-                    VeinError::internal(format!("open sort spill run: {error}"))
-                })?,
-                None,
-            )
-            .map_err(|error| VeinError::internal(format!("read sort spill run: {error}")))
+        .map(|run| {
+            FileReader::try_new(run.open()?, None)
+                .map_err(|error| VeinError::internal(format!("read sort spill run: {error}")))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1065,6 +1071,16 @@ impl PipelineNode<DataChunkView> for SortTransform {
                 .metrics
                 .input_rows
                 .saturating_add(chunk.num_rows() as u64);
+            let mut chunk = chunk;
+            let array_accounting = self.account_retained_arrays(&mut chunk);
+            if let Err(error) = array_accounting {
+                if !matches!(error, VeinError::ResourceExhausted { .. }) {
+                    return Err(error);
+                }
+                self.spill_retained_chunks()?;
+                self.spill_view(&chunk)?;
+                return Ok(());
+            }
             let rows_bytes = chunk
                 .num_rows()
                 .checked_mul(size_of::<RowRef>())
@@ -1076,16 +1092,7 @@ impl PipelineNode<DataChunkView> for SortTransform {
                 if !matches!(error, VeinError::ResourceExhausted { .. }) {
                     return Err(error);
                 }
-                self.spilling = true;
-                for (index, retained) in std::mem::take(&mut self.chunks).into_iter().enumerate() {
-                    let Some(retained) = retained else {
-                        continue;
-                    };
-                    let reserved = self.chunk_reservations.get(index).copied().unwrap_or(0);
-                    self.memory.shrink(reserved);
-                    self.spill_view(&retained)?;
-                }
-                self.chunk_reservations.clear();
+                self.spill_retained_chunks()?;
                 self.spill_view(&chunk)?;
                 return Ok(());
             }
@@ -1237,12 +1244,12 @@ mod tests {
             vec![strings(&[Some("b"), Some("a")]), integers(&[1, 1])],
             SelectionVector::new_dense(2),
         )))
-        .unwrap();
+            .unwrap();
         sort.push(view(DataChunk::new(
             vec![strings(&[Some("b"), None]), integers(&[3, 9])],
             SelectionVector::new_dense(2),
         )))
-        .unwrap();
+            .unwrap();
 
         sort.flush().unwrap();
 
@@ -1261,6 +1268,166 @@ mod tests {
             vec![Some("a".into()), Some("b".into()), Some("b".into()), None]
         );
         assert_eq!(tie_breakers, vec![1, 3, 1, 9]);
+    }
+
+    #[test]
+    fn full_sort_accounts_distinct_source_arrays_once_across_retained_views() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
+        let source = integers(&[2, 1]);
+        let source_bytes = source.get_array_memory_size();
+        let row_reservation = 2 * size_of::<RowRef>()
+            + size_of::<Option<DataChunkView>>()
+            + size_of::<usize>();
+        let mut sort = SortTransform::with_memory_tracker(
+            SortPlan {
+                keys: vec![SortKey {
+                    column: 0,
+                    ascending: true,
+                    nulls_first: false,
+                }],
+            },
+            None,
+            tracker.clone(),
+            Box::new(Collect(Arc::clone(&output))),
+        )
+            .expect("construct sort with tracked memory");
+
+        for _ in 0..2 {
+            sort.push(view(DataChunk::from_vectors(vec![Arc::clone(&source)])))
+                .expect("retain view without copying source values");
+        }
+
+        assert_eq!(
+            tracker.used(),
+            source_bytes + 2 * row_reservation,
+            "two views share one source-array reservation"
+        );
+        sort.flush().expect("sort retained views");
+
+        let output = output.lock().unwrap();
+        let values = output
+            .iter()
+            .flat_map(|view| (0..view.num_rows()).map(|row| int_at(view, 0, row).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![1, 1, 2, 2]);
+        for view in output.iter() {
+            for row in 0..view.num_rows() {
+                let (array, _) = view.resolve(0, row).unwrap().unwrap();
+                assert!(Arc::ptr_eq(array, &source));
+            }
+        }
+    }
+
+    #[test]
+    fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mutation() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let first_key = integers(&[5]);
+        let first_payload = strings(&[Some("small")]);
+        let first_bytes = first_key.get_array_memory_size() + first_payload.get_array_memory_size();
+        let tracker = QueryMemoryTracker::new(
+            first_bytes + 1024,
+            common::cancellation::CancellationToken::new(),
+        );
+        let mut sort = SortTransform::with_limit_and_memory_tracker(
+            SortPlan {
+                keys: vec![SortKey {
+                    column: 0,
+                    ascending: true,
+                    nulls_first: false,
+                }],
+            },
+            None,
+            Some(LimitSpec {
+                offset: 0,
+                count: 1,
+            }),
+            tracker.clone(),
+            Box::new(Collect(Arc::clone(&output))),
+        )
+            .expect("construct budgeted Top-N sort");
+        sort.push(view(DataChunk::from_vectors(vec![
+            Arc::clone(&first_key),
+            Arc::clone(&first_payload),
+        ])))
+            .expect("retain first candidate");
+        let retained_bytes = tracker.used();
+
+        let large_payload = strings(&[Some(&"x".repeat(8192))]);
+        sort.push(view(DataChunk::from_vectors(vec![
+            integers(&[99]),
+            Arc::clone(&large_payload),
+        ])))
+            .expect("discard a batch that cannot enter Top-N");
+        assert_eq!(tracker.used(), retained_bytes);
+        assert_eq!(sort.chunks.len(), 1, "non-candidate view is not retained");
+
+        let error = sort
+            .push(view(DataChunk::from_vectors(vec![
+                integers(&[1]),
+                Arc::clone(&large_payload),
+            ])))
+            .expect_err("candidate source arrays exceed the query budget");
+        assert!(matches!(error, VeinError::ResourceExhausted { .. }));
+        assert_eq!(tracker.used(), retained_bytes);
+        assert_eq!(sort.chunks.len(), 1, "failed accounting leaves retained chunks intact");
+        let retained_row = sort.top_n.as_ref().unwrap().peek().unwrap().row;
+        assert_eq!(retained_row.chunk, 0);
+        assert_eq!(
+            retained_row.row, 0,
+            "failed accounting does not mutate the Top-N heap"
+        );
+
+        sort.flush().expect("emit the original retained candidate");
+        let values = output.lock().unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(int_at(&values[0], 0, 0), Some(5));
+    }
+
+    #[test]
+    fn full_sort_includes_source_arrays_when_selecting_spill_path() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let source = integers(&(0..10).rev().collect::<Vec<_>>());
+        let source_bytes = source.get_array_memory_size();
+        let row_count = 10;
+        let row_bytes = row_count * size_of::<RowRef>()
+            + size_of::<Option<DataChunkView>>()
+            + size_of::<usize>();
+        let tracker = QueryMemoryTracker::new(
+            source_bytes + row_bytes - 1,
+            common::cancellation::CancellationToken::new(),
+        );
+        let mut sort = SortTransform::with_memory_tracker(
+            SortPlan {
+                keys: vec![SortKey {
+                    column: 0,
+                    ascending: true,
+                    nulls_first: false,
+                }],
+            },
+            None,
+            tracker.clone(),
+            Box::new(Collect(Arc::clone(&output))),
+        )
+            .expect("construct constrained sort");
+
+        sort.push(view(DataChunk::from_vectors(vec![source])))
+            .expect("fall back to external sorting when retained memory is over budget");
+        assert!(sort.spilling, "source arrays are included in the sort budget");
+        assert_eq!(sort.spill_runs.len(), 1, "the batch is written as a spill run");
+        assert!(tracker.used() <= tracker.limit());
+        let spill_directory = tracker
+            .spill_manager()
+            .local_directory()
+            .expect("sort spill directory");
+
+        drop(sort);
+        drop(tracker);
+        assert!(
+            !spill_directory.exists(),
+            "the query spill directory is removed after the sort drops"
+        );
+        assert!(output.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1284,12 +1451,12 @@ mod tests {
             vec![Arc::clone(&first_keys), Arc::clone(&first_payload)],
             SelectionVector::new_sparse(vec![0, 2]),
         )))
-        .expect("push first sparse input view");
+            .expect("push first sparse input view");
         sort.push(view(DataChunk::new(
             vec![Arc::clone(&second_keys), Arc::clone(&second_payload)],
             SelectionVector::new_dense(2),
         )))
-        .expect("push second input view");
+            .expect("push second input view");
 
         sort.flush().expect("sort sparse input views");
 
@@ -1374,7 +1541,7 @@ mod tests {
                     vec![Arc::clone(&keys), Arc::clone(&payload)],
                     selection,
                 )))
-                .unwrap();
+                    .unwrap();
             }
             sort.flush().unwrap();
             assert_eq!(sort.metrics.key_materialization.shared_columns, 1);
@@ -1560,13 +1727,14 @@ mod tests {
             tracker.clone(),
             Box::new(Collect(output)),
         )
-        .expect("create budgeted Top-N sort");
+            .expect("create budgeted Top-N sort");
         let long_key = Arc::new(StringArray::from(vec!["z".repeat(128)]));
         let short_key = Arc::new(StringArray::from(vec!["a"]));
         sort.push(view(DataChunk::from_vectors(vec![long_key])))
             .expect("retain first candidate");
         let before_replacement = sort.memory.bytes();
         let chunk_metadata = size_of::<Option<DataChunkView>>() + size_of::<usize>();
+        let short_key_bytes = short_key.get_array_memory_size();
 
         sort.push(view(DataChunk::from_vectors(vec![short_key])))
             .expect("replace with better short candidate");
@@ -1576,7 +1744,11 @@ mod tests {
             before_replacement + chunk_metadata,
             "the key Vec keeps its allocation after its logical length shrinks"
         );
-        assert_eq!(tracker.used(), sort.memory.bytes());
+        assert_eq!(
+            tracker.used(),
+            sort.memory.bytes() + short_key_bytes,
+            "the current source array is budgeted separately from sort metadata"
+        );
     }
 
     #[test]
@@ -1622,7 +1794,7 @@ mod tests {
             tracker.clone(),
             Box::new(Collect(Arc::new(Mutex::new(Vec::new())))),
         )
-        .expect("empty sort state fits zero bytes");
+            .expect("empty sort state fits zero bytes");
         let error = sort
             .push(view(DataChunk::from_vectors(vec![integers(&[3, 1, 2])])))
             .expect_err("sort row references must reserve memory before growth");
@@ -1646,7 +1818,7 @@ mod tests {
             tracker.clone(),
             Box::new(Collect(Arc::new(Mutex::new(Vec::new())))),
         )
-        .expect("construct sort under a small budget");
+            .expect("construct sort under a small budget");
         sort.push(view(DataChunk::from_vectors(vec![integers(&[2])])))
             .expect("retain first row within budget");
 
@@ -1657,10 +1829,10 @@ mod tests {
         assert_eq!(sort.spill_runs.len(), 2);
         assert!(sort.spill_runs.iter().all(|path| path.exists()));
         assert!(tracker.used() <= tracker.limit());
-        let spill_directory = sort.spill_runs[0]
-            .parent()
-            .expect("spill directory")
-            .to_owned();
+        let spill_directory = tracker
+            .spill_manager()
+            .local_directory()
+            .expect("spill directory");
         drop(sort);
         drop(tracker);
         assert!(
@@ -1689,22 +1861,22 @@ mod tests {
             tracker.clone(),
             Box::new(Collect(Arc::clone(&output))),
         )
-        .expect("construct constrained sort");
+            .expect("construct constrained sort");
         sort.spilling = true;
         sort.push(view(DataChunk::from_vectors(vec![
             Arc::clone(&payload_a),
             Arc::clone(&keys_a),
         ])))
-        .expect("retain first batch within budget");
+            .expect("retain first batch within budget");
         sort.push(view(DataChunk::from_vectors(vec![
             Arc::clone(&payload_b),
             Arc::clone(&keys_b),
         ])))
-        .expect("spill after the second batch exceeds the budget");
-        let spill_directory = sort.spill_runs[0]
-            .parent()
-            .expect("spill run directory")
-            .to_owned();
+            .expect("spill after the second batch exceeds the budget");
+        let spill_directory = tracker
+            .spill_manager()
+            .local_directory()
+            .expect("spill run directory");
 
         sort.flush().expect("merge sorted spill runs");
 
@@ -1725,7 +1897,11 @@ mod tests {
             tracker.used() > 0,
             "output views retain spill array reservations"
         );
-        assert!(sort.spill_runs.iter().all(|path| !path.exists()));
+        assert_eq!(
+            tracker.spill_bytes_used(),
+            0,
+            "completed external merge releases every consumed run"
+        );
         drop(collected);
         output.lock().unwrap().clear();
         assert_eq!(
@@ -1757,7 +1933,7 @@ mod tests {
             tracker.clone(),
             Box::new(Collect(Arc::clone(&output))),
         )
-        .expect("construct constrained sort");
+            .expect("construct constrained sort");
         sort.spilling = true;
         for value in (0..68i64).rev() {
             sort.push(view(DataChunk::from_vectors(vec![integers(&[value])])))
@@ -1804,7 +1980,7 @@ mod tests {
             tracker,
             Box::new(Collect(Arc::clone(&output))),
         )
-        .expect("construct constrained sort");
+            .expect("construct constrained sort");
         sort.spilling = true;
         for (payload, key) in [
             (vec![1, 2], vec![None, Some("z")]),
@@ -1814,7 +1990,7 @@ mod tests {
                 integers(&payload),
                 strings(&key),
             ])))
-            .expect("spill input rows");
+                .expect("spill input rows");
         }
 
         sort.flush().expect("merge duplicate and NULL keys");
@@ -1844,15 +2020,15 @@ mod tests {
             tracker.clone(),
             Box::new(Collect(Arc::clone(&output))),
         )
-        .expect("construct constrained sort");
+            .expect("construct constrained sort");
         for values in [[4, 1], [3, 2]] {
             sort.push(view(DataChunk::from_vectors(vec![integers(&values)])))
                 .expect("spill input rows");
         }
-        let spill_directory = sort.spill_runs[0]
-            .parent()
-            .expect("spill run directory")
-            .to_owned();
+        let spill_directory = tracker
+            .spill_manager()
+            .local_directory()
+            .expect("spill run directory");
         cancel.cancel();
 
         assert!(matches!(sort.flush(), Err(VeinError::Cancelled)));
@@ -1881,7 +2057,7 @@ mod tests {
             tracker,
             Box::new(Collect(Arc::clone(&output))),
         )
-        .expect("construct constrained sort");
+            .expect("construct constrained sort");
         sort.spilling = true;
         for batch in (0..4i64).rev() {
             let values = (0..9_000i64)

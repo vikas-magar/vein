@@ -20,6 +20,8 @@ pub mod factory;
 pub mod runtime;
 /// Query-scoped reservation accounting for blocking operator state.
 pub mod memory;
+/// Query-scoped spill storage, accounting, and Arrow IPC run lifecycle.
+pub mod spill;
 /// Vector VM execution engine interpreting Micro-IR programs.
 pub mod vm;
 
