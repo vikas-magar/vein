@@ -18,6 +18,7 @@ fn scan_with_stats() -> (LogicalPlan, ResolvedColumnRef) {
         ColumnStatistics {
             min_value: Some(LogicalLiteral::Int64(10)),
             max_value: Some(LogicalLiteral::Int64(20)),
+            min_max_complete: Some(true),
             null_count: Some(0),
             ..ColumnStatistics::default()
         },

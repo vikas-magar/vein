@@ -37,6 +37,29 @@ fn contradictory_statistics_cannot_prune_a_scan() {
 }
 
 #[test]
+fn incomplete_min_max_bounds_cannot_prune_a_scan() {
+    let (mut scan, column) = scan_with_stats();
+    let LogicalPlan::Scan { table, .. } = &mut scan else { unreachable!(); };
+    Arc::make_mut(table)
+        .statistics
+        .as_mut()
+        .unwrap()
+        .column_statistics
+        .get_mut("id")
+        .unwrap()
+        .min_max_complete = Some(false);
+    let plan = LogicalPlan::Filter {
+        input: Box::new(scan),
+        predicate: predicate(&column, BinaryOp::Eq, 99),
+    };
+
+    assert!(ScanStatisticsPruningRule
+        .apply(&plan, &OptimizerContext::default())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn decimal_bounds_use_the_shared_checked_comparator() {
     let c = Arc::new(ResolvedColumn::new(ColumnId(1), "price", None, VeinDataType::Decimal128(15, 2)));
     let schema = VeinSchema { fields: vec![c.clone()] };
@@ -45,6 +68,7 @@ fn decimal_bounds_use_the_shared_checked_comparator() {
         column_statistics: [("price".into(), ColumnStatistics {
             min_value: Some(LogicalLiteral::Decimal(100, 15, 2)),
             max_value: Some(LogicalLiteral::Decimal(200, 15, 2)),
+            min_max_complete: Some(true),
             null_count: Some(0),
             distinct_count: Some(10),
             nan_count: None,

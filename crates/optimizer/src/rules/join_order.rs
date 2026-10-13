@@ -182,7 +182,12 @@ impl<C: JoinCostModel> JoinOrderRule<C> {
         };
 
         if graph.leaves.len() < 3 {
-            return None;
+            return Some(SearchAttempt::Fallback(graph.decision(
+                0,
+                None,
+                None,
+                JoinOrderOutcome::InsufficientRelations,
+            )));
         }
 
         let config = &context.config().join_order;
@@ -1042,13 +1047,24 @@ fn build_subset(
 }
 
 fn log_decision(decision: &JoinOrderDecision) {
+    let original_order_labels = relation_order_labels(
+        &decision.original_order,
+        &decision.relation_labels,
+    );
+    let selected_order_labels = relation_order_labels(
+        &decision.selected_order,
+        &decision.relation_labels,
+    );
     if decision.outcome == JoinOrderOutcome::Reordered {
         tracing::info!(
             target: "vein.optimizer",
             event = "optimizer_join_order_selected",
             relation_count = decision.relation_count,
+            relation_labels = ?decision.relation_labels,
             original_order = ?decision.original_order,
+            original_order_labels = ?original_order_labels,
             selected_order = ?decision.selected_order,
+            selected_order_labels = ?selected_order_labels,
             candidate_splits = decision.candidate_splits,
             original_cost = ?decision.original_cost,
             selected_cost = ?decision.selected_cost,
@@ -1063,7 +1079,9 @@ fn log_decision(decision: &JoinOrderDecision) {
             relation_count = decision.relation_count,
             relation_labels = ?decision.relation_labels,
             original_order = ?decision.original_order,
+            original_order_labels = ?original_order_labels,
             selected_order = ?decision.selected_order,
+            selected_order_labels = ?selected_order_labels,
             outcome = ?decision.outcome,
             candidate_splits = decision.candidate_splits,
             original_cost = ?decision.original_cost,
@@ -1092,6 +1110,13 @@ fn log_decision(decision: &JoinOrderDecision) {
             "optimizer_join_order_alternative"
         );
     }
+}
+
+fn relation_order_labels<'a>(order: &[usize], labels: &'a [String]) -> Vec<&'a str> {
+    order
+        .iter()
+        .filter_map(|relation| labels.get(*relation).map(String::as_str))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1251,6 +1276,33 @@ mod tests {
         optimizer_config.join_order = config;
         OptimizerPipeline::new(vec![Arc::new(JoinOrderRule::default())])
             .with_config(optimizer_config)
+    }
+
+    #[test]
+    fn binary_join_reports_that_cost_based_order_search_was_not_run() {
+        let plan = join(
+            scan("orders", 100, &[(1, "order_key", 100)]),
+            scan("lineitem", 400, &[(2, "order_key", 200)]),
+            equality(1, "order_key", 2, "order_key"),
+            JoinType::Inner,
+        );
+
+        let (_, diagnostics) = optimizer(JoinOrderConfig::default())
+            .optimize_with_diagnostics(plan)
+            .expect("binary join should be retained");
+
+        let decision = diagnostics
+            .join_order_decisions
+            .first()
+            .expect("binary join decision should be visible");
+        assert_eq!(decision.outcome, JoinOrderOutcome::InsufficientRelations);
+        assert_eq!(decision.relation_labels, vec!["orders", "lineitem"]);
+        assert!(decision.original_cost.is_none());
+        assert!(decision.selected_cost.is_none());
+        assert_eq!(
+            relation_order_labels(&decision.original_order, &decision.relation_labels),
+            vec!["orders", "lineitem"]
+        );
     }
 
     #[test]
@@ -1443,6 +1495,10 @@ mod tests {
             .expect("residual predicates must not be reassociated");
 
         assert_eq!(optimized, original);
-        assert!(diagnostics.join_order_decisions.is_empty());
+        assert_eq!(diagnostics.join_order_decisions.len(), 1);
+        let decision = &diagnostics.join_order_decisions[0];
+        assert_eq!(decision.relation_count, 2);
+        assert_eq!(decision.outcome, JoinOrderOutcome::InsufficientRelations);
+        assert_eq!(decision.original_order, decision.selected_order);
     }
 }

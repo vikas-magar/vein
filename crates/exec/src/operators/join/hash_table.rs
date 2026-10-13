@@ -8,15 +8,19 @@
 //! Matching produces row references. The join operator composes output views;
 //! ordinary Arrow payload arrays are requested only at an explicit boundary.
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray, builder::BooleanBuilder};
+use arrow::record_batch::RecordBatch;
+use std::cmp::Ordering;
 use std::mem::size_of;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
 use crate::pipeline::{DataChunk, DataChunkView, MaterializationReport};
+use crate::runtime_filter::{RuntimeFilter, RuntimeFilterBuildInput, RuntimeFilterFactory};
 use common::Result;
 use error::VeinError;
-use types::{HashJoinKeyType, VeinDataType};
+use types::{ColumnId, HashJoinKeyType, LogicalLiteral, VeinDataType};
 
 /// Which columns of a chunk form the join key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +105,26 @@ impl KeyArray {
             _ => false,
         }
     }
+
+    #[inline]
+    fn compare_values(&self, row: usize, other: &KeyArray, other_row: usize) -> Option<Ordering> {
+        match (self, other) {
+            (KeyArray::Int64(left), KeyArray::Int64(right)) => {
+                Some(left.value(row).cmp(&right.value(other_row)))
+            }
+            (KeyArray::Utf8(left), KeyArray::Utf8(right)) => {
+                Some(left.value(row).cmp(right.value(other_row)))
+            }
+            _ => None,
+        }
+    }
+
+    fn logical_literal(&self, row: usize) -> Result<LogicalLiteral> {
+        match self {
+            KeyArray::Int64(array) => Ok(LogicalLiteral::Int64(array.value(row))),
+            KeyArray::Utf8(array) => Ok(LogicalLiteral::String(array.value(row).to_owned())),
+        }
+    }
 }
 
 /// The key columns of one chunk, resolved once rather than once per row.
@@ -119,39 +143,50 @@ impl ChunkKeys {
             // stay retained by the reference-backed view.
             let (array, column_report) = chunk.materialize_column_with_report(*index)?;
             report.accumulate(column_report);
-            let data_type = VeinDataType::try_from(array.data_type()).map_err(|error| {
-                VeinError::internal(format!(
-                    "join key column {index} has an unsupported Arrow type {:?}: {error}",
-                    array.data_type()
-                ))
-            })?;
-            let resolved = match data_type.hash_join_key_type() {
-                Some(HashJoinKeyType::Int64) => {
-                    let ints = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                        VeinError::internal(format!(
-                            "join key column {index} does not match its declared Int64 type"
-                        ))
-                    })?;
-                    KeyArray::Int64(ints.clone())
-                }
-                Some(HashJoinKeyType::Utf8) => {
-                    let strings = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                        VeinError::internal(format!(
-                            "join key column {index} does not match its declared Utf8 type"
-                        ))
-                    })?;
-                    KeyArray::Utf8(strings.clone())
-                }
-                None => {
-                    return Err(VeinError::internal(format!(
-                        "join key column {index} has type {:?}, which is not supported by hash join",
-                        array.data_type()
-                    )));
-                }
-            };
-            columns.push(resolved);
+            columns.push(Self::resolve_array(*index, array)?);
         }
         Ok((Self { columns }, report, u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)))
+    }
+
+    /// Resolve Arrow references without copying their value buffers.
+    fn resolve_arrays(columns: &[ArrayRef]) -> Result<Self> {
+        let columns = columns
+            .iter()
+            .enumerate()
+            .map(|(index, array)| Self::resolve_array(index, Arc::clone(array)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { columns })
+    }
+
+    fn resolve_array(index: usize, array: ArrayRef) -> Result<KeyArray> {
+        let data_type = VeinDataType::try_from(array.data_type()).map_err(|error| {
+            VeinError::internal(format!(
+                "join key column {index} has an unsupported Arrow type {:?}: {error}",
+                array.data_type()
+            ))
+        })?;
+        match data_type.hash_join_key_type() {
+            Some(HashJoinKeyType::Int64) => {
+                let ints = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    VeinError::internal(format!(
+                        "join key column {index} does not match its declared Int64 type"
+                    ))
+                })?;
+                Ok(KeyArray::Int64(ints.clone()))
+            }
+            Some(HashJoinKeyType::Utf8) => {
+                let strings = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                    VeinError::internal(format!(
+                        "join key column {index} does not match its declared Utf8 type"
+                    ))
+                })?;
+                Ok(KeyArray::Utf8(strings.clone()))
+            }
+            None => Err(VeinError::internal(format!(
+                "join key column {index} has type {:?}, which is not supported by hash join",
+                array.data_type()
+            ))),
+        }
     }
 
     /// Whether any key column is null at `row`.
@@ -201,6 +236,423 @@ impl ChunkKeys {
             .zip(&other.columns)
             .all(|(left, right)| left.value_eq(row, right, other_row))
     }
+
+    fn has_compatible_types(&self, other: &Self) -> bool {
+        self.columns.len() == other.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(&other.columns)
+                .all(|(left, right)| matches!(
+                    (left, right),
+                    (KeyArray::Int64(_), KeyArray::Int64(_))
+                        | (KeyArray::Utf8(_), KeyArray::Utf8(_))
+                ))
+    }
+}
+
+/// Configuration for the default join-key Bloom runtime filter.
+#[derive(Debug, Clone, Copy)]
+pub struct JoinBloomFilterConfig {
+    false_positive_rate: f64,
+    max_bytes: Option<usize>,
+}
+
+impl JoinBloomFilterConfig {
+    /// Configure the target false-positive rate and optional retained-byte cap.
+    ///
+    /// The rate must be finite and strictly between zero and one. The query
+    /// memory tracker remains the authoritative limit even when `max_bytes` is
+    /// unset.
+    pub fn new(false_positive_rate: f64, max_bytes: Option<usize>) -> Result<Self> {
+        if !false_positive_rate.is_finite() || !(0.0..1.0).contains(&false_positive_rate) {
+            return Err(VeinError::internal(
+                "join Bloom filter false-positive rate must be finite and between zero and one",
+            ));
+        }
+        Ok(Self {
+            false_positive_rate,
+            max_bytes,
+        })
+    }
+
+    /// Target false-positive rate used to size new filters.
+    pub fn false_positive_rate(&self) -> f64 {
+        self.false_positive_rate
+    }
+
+    /// Optional per-filter allocation cap.
+    pub fn max_bytes(&self) -> Option<usize> {
+        self.max_bytes
+    }
+}
+
+impl Default for JoinBloomFilterConfig {
+    fn default() -> Self {
+        Self {
+            false_positive_rate: 0.01,
+            max_bytes: None,
+        }
+    }
+}
+
+/// Default runtime-filter factory for hash joins.
+#[derive(Debug, Default)]
+pub struct JoinBloomFilterFactory {
+    config: JoinBloomFilterConfig,
+}
+
+impl JoinBloomFilterFactory {
+    /// Create a factory with explicit sizing policy.
+    pub fn with_config(config: JoinBloomFilterConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl RuntimeFilterFactory for JoinBloomFilterFactory {
+    fn build_filters(
+        &self,
+        input: RuntimeFilterBuildInput<'_>,
+    ) -> Result<Vec<Arc<dyn RuntimeFilter>>> {
+        let RuntimeFilterBuildInput {
+            probe_columns,
+            build_hashes,
+            build_key_bounds,
+            memory,
+        } = input;
+        if probe_columns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut filters: Vec<Arc<dyn RuntimeFilter>> = Vec::with_capacity(2);
+        if let Some(filter) = JoinKeyRangeFilter::try_new(
+            probe_columns,
+            build_key_bounds,
+            memory,
+        )? {
+            filters.push(Arc::new(filter));
+        }
+
+        let Some((bit_count, word_count, hash_functions)) =
+            bloom_layout(build_hashes.len(), self.config.false_positive_rate)
+        else {
+            tracing::debug!(
+                target: "vein.audit",
+                event = "join_runtime_filter_skipped",
+                reason = "size_overflow",
+                build_keys = build_hashes.len(),
+                "join runtime filter skipped"
+            );
+            return Ok(filters);
+        };
+        let Some(bytes) = word_count.checked_mul(size_of::<u64>()) else {
+            return Ok(filters);
+        };
+        if self.config.max_bytes.is_some_and(|limit| bytes > limit) {
+            tracing::debug!(
+                target: "vein.audit",
+                event = "join_runtime_filter_skipped",
+                reason = "configured_memory_cap",
+                required_bytes = bytes,
+                "join runtime filter skipped"
+            );
+            return Ok(filters);
+        }
+
+        let mut reservation = match memory.reserve(bytes, "join runtime filter") {
+            Ok(reservation) => reservation,
+            Err(VeinError::ResourceExhausted { .. }) => {
+                tracing::debug!(
+                    target: "vein.audit",
+                    event = "join_runtime_filter_skipped",
+                    reason = "query_memory_budget",
+                    required_bytes = bytes,
+                    "join runtime filter skipped"
+                );
+                return Ok(filters);
+            }
+            Err(error) => return Err(error),
+        };
+
+        let mut words = Vec::new();
+        if words.try_reserve_exact(word_count).is_err() {
+            tracing::debug!(
+                target: "vein.audit",
+                event = "join_runtime_filter_skipped",
+                reason = "allocation_failed",
+                required_bytes = bytes,
+                "join runtime filter skipped"
+            );
+            return Ok(filters);
+        }
+        words.resize(word_count, 0u64);
+        let actual_bytes = words.capacity().saturating_mul(size_of::<u64>());
+        if self.config.max_bytes.is_some_and(|limit| actual_bytes > limit) {
+            return Ok(filters);
+        }
+        if actual_bytes > reservation.bytes() {
+            if let Err(error) =
+                reservation.grow(actual_bytes - reservation.bytes(), "join runtime filter")
+            {
+                if matches!(error, VeinError::ResourceExhausted { .. }) {
+                    tracing::debug!(
+                        target: "vein.audit",
+                        event = "join_runtime_filter_skipped",
+                        reason = "query_memory_budget",
+                        required_bytes = actual_bytes,
+                        "join runtime filter skipped"
+                    );
+                    return Ok(Vec::new());
+                }
+                return Err(error);
+            }
+        } else if reservation.bytes() > actual_bytes {
+            reservation.shrink(reservation.bytes() - actual_bytes);
+        }
+
+        let mut filter = JoinBloomFilter {
+            columns: Arc::from(probe_columns),
+            words,
+            bit_mask: bit_count.saturating_sub(1),
+            hash_functions,
+            memory: reservation,
+        };
+        for hash in build_hashes {
+            filter.insert(*hash);
+        }
+        filters.push(Arc::new(filter));
+        Ok(filters)
+    }
+}
+
+fn bloom_layout(items: usize, false_positive_rate: f64) -> Option<(usize, usize, usize)> {
+    if items == 0 {
+        return Some((0, 0, 0));
+    }
+    let item_count = items as f64;
+    let ln_two = std::f64::consts::LN_2;
+    let desired_bits = (-(item_count * false_positive_rate.ln()) / (ln_two * ln_two)).ceil();
+    if !desired_bits.is_finite() || desired_bits < 1.0 || desired_bits > (usize::MAX / 2) as f64 {
+        return None;
+    }
+    let bit_count = (desired_bits as usize).checked_next_power_of_two()?;
+    let word_count = bit_count.checked_add(u64::BITS as usize - 1)? / u64::BITS as usize;
+    let actual_bits = word_count.checked_mul(u64::BITS as usize)?;
+    let hash_functions = ((actual_bits as f64 / item_count) * ln_two).round();
+    if !hash_functions.is_finite() || hash_functions < 1.0 || hash_functions > usize::MAX as f64 {
+        return None;
+    }
+    Some((actual_bits, word_count, hash_functions as usize))
+}
+
+/// Bloom filter over the join's existing canonical row hashes.
+#[derive(Debug)]
+struct JoinBloomFilter {
+    columns: Arc<[ColumnId]>,
+    words: Vec<u64>,
+    bit_mask: usize,
+    hash_functions: usize,
+    memory: MemoryReservation,
+}
+
+impl JoinBloomFilter {
+    #[inline]
+    fn bit_positions(&self, hash: u64, mut visit: impl FnMut(usize)) {
+        if self.words.is_empty() {
+            return;
+        }
+        let step = hash.rotate_left(32) | 1;
+        for iteration in 0..self.hash_functions {
+            let bit = hash
+                .wrapping_add((iteration as u64).wrapping_mul(step)) as usize
+                & self.bit_mask;
+            visit(bit);
+        }
+    }
+
+    fn insert(&mut self, hash: u64) {
+        let step = hash.rotate_left(32) | 1;
+        for iteration in 0..self.hash_functions {
+            let bit = hash
+                .wrapping_add((iteration as u64).wrapping_mul(step)) as usize
+                & self.bit_mask;
+            self.words[bit / u64::BITS as usize] |= 1u64 << (bit % u64::BITS as usize);
+        }
+    }
+
+    fn may_contain(&self, hash: u64) -> bool {
+        if self.words.is_empty() {
+            return false;
+        }
+        let mut present = true;
+        self.bit_positions(hash, |bit| {
+            present &= self.words[bit / u64::BITS as usize]
+                & (1u64 << (bit % u64::BITS as usize))
+                != 0;
+        });
+        present
+    }
+}
+
+impl RuntimeFilter for JoinBloomFilter {
+    fn name(&self) -> &'static str {
+        "join_hash_bloom"
+    }
+
+    fn required_columns(&self) -> &[ColumnId] {
+        &self.columns
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.memory.bytes()
+    }
+
+    fn evaluate(
+        &self,
+        batch: &RecordBatch,
+        column_positions: &[usize],
+    ) -> Result<BooleanArray> {
+        if column_positions.len() != self.columns.len() {
+            return Err(VeinError::internal(
+                "runtime filter key positions do not match its declared columns",
+            ));
+        }
+        let arrays = column_positions
+            .iter()
+            .map(|position| {
+                batch
+                    .columns()
+                    .get(*position)
+                    .cloned()
+                    .ok_or_else(|| VeinError::internal("runtime filter key position is out of range"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let keys = ChunkKeys::resolve_arrays(&arrays)?;
+        let mut mask = BooleanBuilder::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let may_match = keys
+                .hash_and_single_i64(row)
+                .is_some_and(|(hash, _)| self.may_contain(hash));
+            mask.append_value(may_match);
+        }
+        Ok(mask.finish())
+    }
+}
+
+/// Inclusive range bounds over the build-side join keys. The filter is
+/// statistics-only: row correctness continues to be checked by the hash join,
+/// and the Bloom filter remains the row-level early rejection path.
+#[derive(Debug)]
+struct JoinKeyRangeFilter {
+    columns: Arc<[ColumnId]>,
+    bounds: Vec<Option<(LogicalLiteral, LogicalLiteral)>>,
+    memory: MemoryReservation,
+}
+
+impl JoinKeyRangeFilter {
+    fn try_new(
+        columns: &[ColumnId],
+        bounds: Vec<Option<(LogicalLiteral, LogicalLiteral)>>,
+        tracker: &QueryMemoryTracker,
+    ) -> Result<Option<Self>> {
+        if bounds.len() != columns.len() || !bounds.iter().any(Option::is_some) {
+            return Ok(None);
+        }
+
+        let scalar_bytes = bounds
+            .iter()
+            .flatten()
+            .flat_map(|(min, max)| [min, max])
+            .map(logical_literal_heap_bytes)
+            .fold(0usize, usize::saturating_add);
+        let retained_bytes = size_of::<Self>()
+            .saturating_add(columns.len().saturating_mul(size_of::<ColumnId>()))
+            .saturating_add(
+                bounds
+                    .capacity()
+                    .saturating_mul(size_of::<Option<(LogicalLiteral, LogicalLiteral)>>()),
+            )
+            .saturating_add(scalar_bytes);
+        let memory = match tracker.reserve(retained_bytes, "join key range filter") {
+            Ok(memory) => memory,
+            Err(VeinError::ResourceExhausted { .. }) => {
+                tracing::debug!(
+                    target: "vein.audit",
+                    event = "join_runtime_filter_skipped",
+                    filter = "join_key_range",
+                    reason = "query_memory_budget",
+                    required_bytes = retained_bytes,
+                    "join key range filter skipped"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(Some(Self {
+            columns: Arc::from(columns),
+            bounds,
+            memory,
+        }))
+    }
+}
+
+fn logical_literal_heap_bytes(value: &LogicalLiteral) -> usize {
+    match value {
+        LogicalLiteral::String(value) => value.capacity(),
+        _ => 0,
+    }
+}
+
+impl RuntimeFilter for JoinKeyRangeFilter {
+    fn name(&self) -> &'static str {
+        "join_key_range"
+    }
+
+    fn required_columns(&self) -> &[ColumnId] {
+        &self.columns
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.memory.bytes()
+    }
+
+    fn evaluate(
+        &self,
+        _batch: &RecordBatch,
+        _column_positions: &[usize],
+    ) -> Result<BooleanArray> {
+        Err(VeinError::internal(
+            "statistics-only join key range filter cannot evaluate rows",
+        ))
+    }
+
+    fn supports_row_evaluation(&self) -> bool {
+        false
+    }
+
+    fn statistics_predicates(&self, schema: &types::VeinSchema) -> Vec<catalog::StatisticsPredicate> {
+        let mut predicates = Vec::with_capacity(self.bounds.len().saturating_mul(2));
+        for (column_id, bounds) in self.columns.iter().zip(&self.bounds) {
+            let Some((min, max)) = bounds else {
+                continue;
+            };
+            let Some(column) = schema.fields.iter().find(|column| column.id == *column_id) else {
+                continue;
+            };
+            predicates.push(catalog::StatisticsPredicate::Comparison {
+                column: column.name.clone(),
+                comparison: catalog::StatisticsComparison::GreaterOrEqual,
+                literal: min.clone(),
+            });
+            predicates.push(catalog::StatisticsPredicate::Comparison {
+                column: column.name.clone(),
+                comparison: catalog::StatisticsComparison::LessOrEqual,
+                literal: max.clone(),
+            });
+        }
+        predicates
+    }
 }
 
 /// One build row: a reference into a retained chunk.
@@ -209,6 +661,33 @@ struct Entry {
     chunk: u32,
     row: u32,
     next: u32,
+}
+
+/// A build key endpoint kept as a row reference into an already-retained key
+/// array. Tracking endpoints this way avoids copying or retaining per-row key
+/// values solely for runtime filtering.
+#[derive(Debug, Clone, Copy)]
+struct BuildRowReference {
+    chunk: u32,
+    row: u32,
+}
+
+impl BuildRowReference {
+    fn rebase(self, offset: u32) -> Result<Self> {
+        Ok(Self {
+            chunk: self
+                .chunk
+                .checked_add(offset)
+                .ok_or_else(|| VeinError::internal("merged join key bound chunk index overflow"))?,
+            row: self.row,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BuildKeyBounds {
+    min: Option<BuildRowReference>,
+    max: Option<BuildRowReference>,
 }
 
 /// A build side indexed by key hash, holding references rather than rows.
@@ -237,6 +716,8 @@ pub struct HashTable {
     /// Build key array conversions, excluding inline-key/index allocations.
     build_key_materialization: MaterializationReport,
     build_key_materialize_us: u64,
+    /// Per-key min/max endpoints stored as references into retained build arrays.
+    key_bounds: Vec<BuildKeyBounds>,
     tracker: QueryMemoryTracker,
     memory: MemoryReservation,
 }
@@ -289,12 +770,33 @@ impl HashTable {
         let bucket_bytes = INITIAL_BUCKETS
             .checked_mul(size_of::<u32>())
             .ok_or_else(|| VeinError::internal("initial join bucket size overflow"))?;
-        let memory = tracker.reserve(bucket_bytes, "hash join buckets")?;
+        let bounds_bytes = build_keys
+            .columns
+            .len()
+            .checked_mul(size_of::<BuildKeyBounds>())
+            .ok_or_else(|| VeinError::internal("initial join key bounds size overflow"))?;
+        let initial_bytes = bucket_bytes
+            .checked_add(bounds_bytes)
+            .ok_or_else(|| VeinError::internal("initial hash join state size overflow"))?;
+        let mut memory = tracker.reserve(initial_bytes, "hash join initial state")?;
         let mut buckets = Vec::new();
         buckets.try_reserve_exact(INITIAL_BUCKETS).map_err(|error| {
             VeinError::internal(format!("cannot allocate initial hash join buckets: {error}"))
         })?;
         buckets.resize(INITIAL_BUCKETS, NONE);
+        let mut key_bounds = Vec::new();
+        key_bounds
+            .try_reserve_exact(build_keys.columns.len())
+            .map_err(|error| {
+                VeinError::internal(format!("cannot allocate initial join key bounds: {error}"))
+            })?;
+        key_bounds.resize(build_keys.columns.len(), BuildKeyBounds::default());
+        let actual_bounds_bytes = key_bounds.capacity() * size_of::<BuildKeyBounds>();
+        if actual_bounds_bytes > bounds_bytes {
+            memory.grow(actual_bounds_bytes - bounds_bytes, "hash join key bounds")?;
+        } else if bounds_bytes > actual_bounds_bytes {
+            memory.shrink(bounds_bytes - actual_bounds_bytes);
+        }
         Ok(Self {
             build_keys,
             probe_keys,
@@ -307,6 +809,7 @@ impl HashTable {
             keys: Vec::new(),
             build_key_materialization: MaterializationReport::default(),
             build_key_materialize_us: 0,
+            key_bounds,
             tracker: tracker.clone(),
             memory,
         })
@@ -317,9 +820,87 @@ impl HashTable {
         self.keys.len() == self.entries.len()
     }
 
+    fn key_array(&self, reference: BuildRowReference, key_index: usize) -> Result<&KeyArray> {
+        self.keys_by_chunk
+            .get(reference.chunk as usize)
+            .and_then(|keys| keys.columns.get(key_index))
+            .ok_or_else(|| VeinError::internal("join key bound points outside retained key arrays"))
+    }
+
+    fn compare_build_rows(
+        &self,
+        key_index: usize,
+        left: BuildRowReference,
+        right: BuildRowReference,
+    ) -> Result<Ordering> {
+        self.key_array(left, key_index)?
+            .compare_values(
+                left.row as usize,
+                self.key_array(right, key_index)?,
+                right.row as usize,
+            )
+            .ok_or_else(|| VeinError::internal("join key bound type changed during build"))
+    }
+
+    fn update_key_bounds(&mut self, current: BuildRowReference) -> Result<()> {
+        for key_index in 0..self.key_bounds.len() {
+            let Some(min) = self.key_bounds[key_index].min else {
+                self.key_bounds[key_index] = BuildKeyBounds {
+                    min: Some(current),
+                    max: Some(current),
+                };
+                continue;
+            };
+            let max = self.key_bounds[key_index]
+                .max
+                .ok_or_else(|| VeinError::internal("join key bounds have an incomplete endpoint"))?;
+            let replace_min = self.compare_build_rows(key_index, current, min)? == Ordering::Less;
+            let replace_max = self.compare_build_rows(key_index, current, max)? == Ordering::Greater;
+            if replace_min {
+                self.key_bounds[key_index].min = Some(current);
+            }
+            if replace_max {
+                self.key_bounds[key_index].max = Some(current);
+            }
+        }
+        Ok(())
+    }
+
     /// How many build rows are entered, null-keyed ones included.
     pub fn len(&self) -> usize {
         self.entries.len() + self.null_keyed.len()
+    }
+
+    /// Canonical hashes for the non-null build keys already indexed by this
+    /// table. Runtime filters reuse these values instead of rescanning build
+    /// payload columns or maintaining a second key encoder.
+    pub fn runtime_filter_hashes(&self) -> &[u64] {
+        &self.hashes
+    }
+
+    /// Inclusive bounds of each build key, derived incrementally while rows
+    /// enter the hash table. Endpoints are copied only as typed scalar
+    /// metadata; the table itself stores row references into retained arrays.
+    pub fn runtime_key_bounds(
+        &self,
+    ) -> Result<Vec<Option<(LogicalLiteral, LogicalLiteral)>>> {
+        let mut bounds = Vec::new();
+        bounds
+            .try_reserve_exact(self.key_bounds.len())
+            .map_err(|error| VeinError::internal(format!("cannot allocate join key bounds snapshot: {error}")))?;
+        for key_bounds in &self.key_bounds {
+            let (Some(min), Some(max)) = (key_bounds.min, key_bounds.max) else {
+                bounds.push(None);
+                continue;
+            };
+            let min_column = self.key_array(min, bounds.len())?;
+            let max_column = self.key_array(max, bounds.len())?;
+            bounds.push(Some((
+                min_column.logical_literal(min.row as usize)?,
+                max_column.logical_literal(max.row as usize)?,
+            )));
+        }
+        Ok(bounds)
     }
 
     /// Whether nothing has been built.
@@ -345,6 +926,15 @@ impl HashTable {
             Ok(lease)
         })?;
         let (keys, report, materialize_us) = ChunkKeys::resolve(&self.build_keys, &chunk)?;
+        if self
+            .keys_by_chunk
+            .first()
+            .is_some_and(|existing| !existing.has_compatible_types(&keys))
+        {
+            return Err(VeinError::internal(
+                "hash join build key types changed between input batches",
+            ));
+        }
         let row_count = chunk.num_rows();
         if row_count > u32::MAX as usize || self.chunks.len() > u32::MAX as usize {
             return Err(VeinError::internal(
@@ -436,10 +1026,13 @@ impl HashTable {
         self.build_key_materialize_us = self.build_key_materialize_us.saturating_add(materialize_us);
         let chunk_index = self.chunks.len() as u32;
         self.chunks.push(chunk);
+        self.keys_by_chunk.push(keys);
 
         for position in 0..row_count {
             let row = position as u32;
-            let Some((hash, inline_key)) = keys.hash_and_single_i64(position) else {
+            let Some((hash, inline_key)) = self.keys_by_chunk[chunk_index as usize]
+                .hash_and_single_i64(position)
+            else {
                 self.null_keyed.push((chunk_index, row));
                 continue;
             };
@@ -456,13 +1049,16 @@ impl HashTable {
             if let Some(value) = inline_key {
                 self.keys.push(value);
             }
+            self.update_key_bounds(BuildRowReference {
+                chunk: chunk_index,
+                row,
+            })?;
         }
         // A chunk whose key is not a single Int64 invalidates the inline array:
         // drop it rather than leave a partially filled one behind.
         if self.keys.len() != self.entries.len() {
             self.keys.clear();
         }
-        self.keys_by_chunk.push(keys);
         Ok(())
     }
 
@@ -518,6 +1114,65 @@ impl HashTable {
         }
         let self_inline = self.inline_keys();
         let other_inline = other.inline_keys();
+        let offset = u32::try_from(self.chunks.len())
+            .map_err(|_| VeinError::internal("hash join chunk index exceeds row-reference range"))?;
+        let other_bounds_bytes = other
+            .key_bounds
+            .capacity()
+            .checked_mul(size_of::<BuildKeyBounds>())
+            .ok_or_else(|| VeinError::internal("merged join key bounds bytes overflow"))?;
+        let mut merged_key_bounds = Vec::new();
+        merged_key_bounds
+            .try_reserve_exact(self.key_bounds.len())
+            .map_err(|error| VeinError::internal(format!("cannot reserve merged join key bounds: {error}")))?;
+        merged_key_bounds.extend_from_slice(&self.key_bounds);
+        for (key_index, other_bounds) in other.key_bounds.iter().copied().enumerate() {
+            let (Some(other_min), Some(other_max)) = (other_bounds.min, other_bounds.max) else {
+                continue;
+            };
+            let rebased_min = other_min.rebase(offset)?;
+            let rebased_max = other_max.rebase(offset)?;
+            match merged_key_bounds[key_index].min {
+                None => {
+                    merged_key_bounds[key_index] = BuildKeyBounds {
+                        min: Some(rebased_min),
+                        max: Some(rebased_max),
+                    };
+                }
+                Some(current_min) => {
+                    let other_min_array = other.key_array(other_min, key_index)?;
+                    let current_min_array = self.key_array(current_min, key_index)?;
+                    if other_min_array
+                        .compare_values(
+                            other_min.row as usize,
+                            current_min_array,
+                            current_min.row as usize,
+                        )
+                        .ok_or_else(|| VeinError::internal("join key bound type changed during merge"))?
+                        == Ordering::Less
+                    {
+                        merged_key_bounds[key_index].min = Some(rebased_min);
+                    }
+
+                    let current_max = merged_key_bounds[key_index]
+                        .max
+                        .ok_or_else(|| VeinError::internal("join key bounds have an incomplete endpoint"))?;
+                    let other_max_array = other.key_array(other_max, key_index)?;
+                    let current_max_array = self.key_array(current_max, key_index)?;
+                    if other_max_array
+                        .compare_values(
+                            other_max.row as usize,
+                            current_max_array,
+                            current_max.row as usize,
+                        )
+                        .ok_or_else(|| VeinError::internal("join key bound type changed during merge"))?
+                        == Ordering::Greater
+                    {
+                        merged_key_bounds[key_index].max = Some(rebased_max);
+                    }
+                }
+            }
+        }
         let replaced_bucket_bytes = self
             .buckets
             .len()
@@ -527,10 +1182,9 @@ impl HashTable {
         self.memory.absorb(other.memory)?;
         self.build_key_materialization.accumulate(other.build_key_materialization);
         self.build_key_materialize_us = self.build_key_materialize_us.saturating_add(other.build_key_materialize_us);
-        let offset = self.chunks.len() as u32;
-
         self.chunks.extend(other.chunks);
         self.keys_by_chunk.extend(other.keys_by_chunk);
+        self.key_bounds.copy_from_slice(&merged_key_bounds);
         self.entries
             .extend(other.entries.into_iter().map(|entry| Entry {
                 chunk: entry.chunk + offset,
@@ -570,7 +1224,8 @@ impl HashTable {
             self.memory.shrink(other.buckets.len() * size_of::<u32>());
             return Err(error);
         }
-        self.memory.shrink(replaced_bucket_bytes);
+        self.memory
+            .shrink(replaced_bucket_bytes.saturating_add(other_bounds_bytes));
         Ok(())
     }
 
@@ -664,6 +1319,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+    use crate::runtime_filter::RuntimeFilterSet;
 
     use super::*;
 
@@ -673,6 +1329,85 @@ mod tests {
 
     fn chunk(column: ArrayRef) -> DataChunk {
         DataChunk::from_vectors(vec![column])
+    }
+
+    fn hashes_for_arrays(columns: &[ArrayRef]) -> Vec<u64> {
+        let keys = ChunkKeys::resolve_arrays(columns).expect("resolve key arrays");
+        let rows = columns.first().map_or(0, |column| column.len());
+        (0..rows)
+            .filter_map(|row| keys.hash_and_single_i64(row).map(|(hash, _)| hash))
+            .collect()
+    }
+
+    fn query_memory(limit: usize) -> QueryMemoryTracker {
+        QueryMemoryTracker::new(
+            limit,
+            common::cancellation::CancellationToken::new(),
+        )
+    }
+
+    #[test]
+    fn bloom_runtime_filter_preserves_composite_join_keys_and_null_semantics() {
+        let build = vec![
+            Arc::new(Int64Array::from(vec![Some(5), Some(8), Some(5)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("a")])) as ArrayRef,
+        ];
+        let hashes = hashes_for_arrays(&build);
+        let memory = query_memory(1 << 20);
+        let columns = [ColumnId(11), ColumnId(12)];
+        let filters = JoinBloomFilterFactory::default()
+            .build_filters(RuntimeFilterBuildInput {
+                probe_columns: &columns,
+                build_hashes: &hashes,
+                build_key_bounds: Vec::new(),
+                memory: &memory,
+            })
+            .expect("build runtime filter");
+        assert_eq!(filters.len(), 1);
+
+        let probe = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from(vec![Some(5), Some(5), Some(8), None])) as ArrayRef,
+            ),
+            (
+                "region",
+                Arc::new(StringArray::from(vec![Some("a"), Some("missing"), Some("b"), Some("a")])) as ArrayRef,
+            ),
+        ])
+            .expect("probe key batch");
+        let selection = filters[0]
+            .evaluate(&probe, &[0, 1])
+            .expect("evaluate composite runtime filter");
+
+        assert!(selection.value(0), "every build key must survive the filter");
+        assert!(selection.value(2), "every build key must survive the filter");
+        assert!(!selection.value(3), "null join keys never match");
+        assert!(
+            filters[0].memory_bytes() > 0,
+            "filter storage is accounted while retained"
+        );
+        drop(filters);
+        assert_eq!(memory.used(), 0, "filter reservation releases on drop");
+    }
+
+    #[test]
+    fn bloom_runtime_filter_declines_optional_allocation_when_budget_is_exhausted() {
+        let hashes = [fnv1a(&7_i64.to_ne_bytes(), FNV_OFFSET)];
+        let memory = query_memory(0);
+        let columns = [ColumnId(7)];
+
+        let filters = JoinBloomFilterFactory::default()
+            .build_filters(RuntimeFilterBuildInput {
+                probe_columns: &columns,
+                build_hashes: &hashes,
+                build_key_bounds: Vec::new(),
+                memory: &memory,
+            })
+            .expect("optional filter allocation failure must fall back");
+
+        assert!(filters.is_empty());
+        assert_eq!(memory.used(), 0);
     }
 
     #[test]
@@ -853,6 +1588,101 @@ mod tests {
 
         assert_eq!(pairs.len(), 1, "only the non-null key may match");
         assert_eq!(pairs[0].0, 1, "and it is probe row 1");
+    }
+
+    #[test]
+    fn runtime_key_bounds_track_each_composite_component_and_ignore_null_rows() {
+        let mut table = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
+        table
+            .insert(DataChunk::from_vectors(vec![
+                Arc::new(Int64Array::from(vec![Some(5), None, Some(8)])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("m"), Some("z"), Some("a")])) as ArrayRef,
+            ]))
+            .expect("insert composite build rows");
+
+        assert_eq!(
+            table.runtime_key_bounds().expect("snapshot typed bounds"),
+            vec![
+                Some((LogicalLiteral::Int64(5), LogicalLiteral::Int64(8))),
+                Some((
+                    LogicalLiteral::String("a".into()),
+                    LogicalLiteral::String("m".into()),
+                )),
+            ],
+            "only fully non-null build keys can match an equijoin probe"
+        );
+    }
+
+    #[test]
+    fn range_filter_prunes_from_statistics_without_binding_a_row_mask() {
+        let memory = query_memory(1 << 20);
+        let filter = JoinKeyRangeFilter::try_new(
+            &[ColumnId(7)],
+            vec![Some((LogicalLiteral::Int64(2), LogicalLiteral::Int64(5)))],
+            &memory,
+        )
+        .expect("create bounded filter")
+        .expect("range bounds are available");
+        let filters = RuntimeFilterSet::new(vec![Arc::new(filter)]);
+        let schema = types::VeinSchema::new(vec![Arc::new(types::ResolvedColumn::new(
+            ColumnId(7),
+            "id",
+            None,
+            VeinDataType::Int64,
+        ))]);
+
+        assert!(!filters.has_row_filters());
+        assert!(filters.bind(&schema).is_none());
+        assert_eq!(
+            filters.statistics_predicates(&schema),
+            vec![
+                catalog::StatisticsPredicate::Comparison {
+                    column: "id".into(),
+                    comparison: catalog::StatisticsComparison::GreaterOrEqual,
+                    literal: LogicalLiteral::Int64(2),
+                },
+                catalog::StatisticsPredicate::Comparison {
+                    column: "id".into(),
+                    comparison: catalog::StatisticsComparison::LessOrEqual,
+                    literal: LogicalLiteral::Int64(5),
+                },
+            ]
+        );
+        assert!(filters.memory_bytes() > 0);
+        drop(filters);
+        assert_eq!(memory.used(), 0, "range filter accounting releases on drop");
+    }
+
+    #[test]
+    fn merging_hash_tables_combines_and_rebases_runtime_key_bounds() {
+        let keys = JoinKeys::new(vec![0, 1]);
+        let mut left = HashTable::new(keys.clone(), keys.clone());
+        let mut right = HashTable::new(keys.clone(), keys);
+        left.insert(DataChunk::from_vectors(vec![
+            ints(&[5, 7]),
+            Arc::new(StringArray::from(vec!["m", "z"])) as ArrayRef,
+        ]))
+        .expect("insert first worker rows");
+        right
+            .insert(DataChunk::from_vectors(vec![
+                ints(&[1, 9]),
+                Arc::new(StringArray::from(vec!["a", "y"])) as ArrayRef,
+            ]))
+            .expect("insert second worker rows");
+
+        left.merge(right).expect("combine worker hash tables");
+
+        assert_eq!(
+            left.runtime_key_bounds().expect("snapshot merged bounds"),
+            vec![
+                Some((LogicalLiteral::Int64(1), LogicalLiteral::Int64(9))),
+                Some((
+                    LogicalLiteral::String("a".into()),
+                    LogicalLiteral::String("z".into()),
+                )),
+            ],
+            "merged endpoints must resolve into the destination's rebased chunks"
+        );
     }
 
     /// The probe reports what it matched, and the table reports every build row:
@@ -1047,14 +1877,15 @@ mod tests {
     #[test]
     fn build_index_respects_budget_and_releases_reservation_on_error() {
         let cancel = common::cancellation::CancellationToken::new();
-        let budget = QueryMemoryTracker::new(INITIAL_BUCKETS * size_of::<u32>(), cancel);
+        let initial_bytes = INITIAL_BUCKETS * size_of::<u32>() + size_of::<BuildKeyBounds>();
+        let budget = QueryMemoryTracker::new(initial_bytes, cancel);
         let mut table = HashTable::with_memory_tracker(
             JoinKeys::new(vec![0]),
             JoinKeys::new(vec![0]),
             budget.clone(),
         )
             .expect("initial bucket table fits the configured budget");
-        assert_eq!(budget.used(), INITIAL_BUCKETS * size_of::<u32>());
+        assert_eq!(budget.used(), initial_bytes);
 
         let error = table
             .insert(chunk(ints(&[1])))
@@ -1165,7 +1996,7 @@ mod tests {
     fn retained_build_array_budget_failure_happens_before_retaining_the_view() {
         let source = ints(&[10, 20]);
         let source_bytes = source.get_array_memory_size();
-        let initial_buckets = INITIAL_BUCKETS * size_of::<u32>();
+        let initial_buckets = INITIAL_BUCKETS * size_of::<u32>() + size_of::<BuildKeyBounds>();
         let tracker = QueryMemoryTracker::new(
             initial_buckets + source_bytes - 1,
             common::cancellation::CancellationToken::new(),
@@ -1197,7 +2028,10 @@ mod tests {
             + size_of::<i64>();
         let per_batch_bytes = first.get_array_memory_size() + per_row_index_bytes;
         let tracker = QueryMemoryTracker::new(
-            INITIAL_BUCKETS * size_of::<u32>() + per_batch_bytes * 2 - 1,
+            INITIAL_BUCKETS * size_of::<u32>()
+                + size_of::<BuildKeyBounds>()
+                + per_batch_bytes * 2
+                - 1,
             common::cancellation::CancellationToken::new(),
         );
         let mut table = HashTable::with_memory_tracker(
@@ -1253,8 +2087,10 @@ mod tests {
 
         assert_eq!(
             tracker.used(),
-            before_merge - INITIAL_BUCKETS * size_of::<u32>(),
-            "merge replaces two bucket arrays with one"
+            before_merge
+                - INITIAL_BUCKETS * size_of::<u32>()
+                - size_of::<BuildKeyBounds>(),
+            "merge replaces the second bucket array and key-bounds vector"
         );
         drop(left);
         assert_eq!(tracker.used(), 0);
@@ -1292,8 +2128,11 @@ mod tests {
         assert_eq!(right_tracker.used(), 0, "source reservation was transferred");
         assert_eq!(
             left_tracker.used(),
-            left_before + right_before - INITIAL_BUCKETS * size_of::<u32>(),
-            "destination owns merged state and only one bucket array"
+            left_before
+                + right_before
+                - INITIAL_BUCKETS * size_of::<u32>()
+                - size_of::<BuildKeyBounds>(),
+            "destination owns merged state with one bucket array and one key-bounds vector"
         );
         let mut pairs = Vec::new();
         left.probe(&chunk(ints(&[10, 20])), &mut pairs).expect("probe merged table");

@@ -18,6 +18,7 @@ use common::statistics::analysis::{
 use common::statistics::schema_fingerprint;
 use error::{Result, VeinError};
 use exec::operators::source::scan::PARQUET_FOOTER;
+use exec::parquet_statistics::{file_units, table_statistics};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -25,8 +26,6 @@ use parquet::file::metadata::ParquetMetaData;
 use plan::{CatalogProvider, TableFormat, TableMetadata, VeinSchema};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-
-mod statistics;
 
 /// Catalog which resolves table names beneath a local data root.
 #[derive(Debug, Clone)]
@@ -511,7 +510,7 @@ fn inspect_table_files(
         footers.iter().zip(file_sizes.iter()).enumerate()
     {
         let first_unit = data_units.len();
-        let mut file_units = statistics::file_units(file_ordinal, *file_bytes, schema, footer);
+        let mut file_units = file_units(file_ordinal, *file_bytes, schema, footer);
         for unit in &mut file_units {
             if let Some(parent) = &mut unit.parent {
                 *parent += first_unit;
@@ -519,7 +518,7 @@ fn inspect_table_files(
         }
         data_units.extend(file_units);
     }
-    let table_statistics = statistics::table_statistics(data_units, expected_schema.as_ref());
+    let table_statistics = table_statistics(data_units, expected_schema.as_ref());
     let row_group_count = table_statistics.row_group_count.unwrap_or(0);
     let column_statistics_count = table_statistics.column_statistics.len();
     let table_rows = table_statistics.num_rows;

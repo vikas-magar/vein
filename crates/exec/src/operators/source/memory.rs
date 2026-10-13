@@ -1,4 +1,4 @@
-use crate::pipeline::{DataChunk, PipelineNode, Source};
+use crate::pipeline::{DataChunkView, PipelineNode, Source};
 use arrow::record_batch::RecordBatch;
 use common::Result;
 
@@ -15,11 +15,10 @@ impl MemorySource {
 }
 
 #[async_trait::async_trait]
-impl Source<DataChunk> for MemorySource {
-    async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunk>) -> Result<()> {
+impl Source<DataChunkView> for MemorySource {
+    async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunkView>) -> Result<()> {
         if let Some(batch) = self.batch.take() {
-            let chunk = DataChunk::from_record_batch(batch);
-            next.push(chunk)?;
+            next.push(DataChunkView::from_record_batch(batch)?)?;
         }
         next.flush()?;
         Ok(())

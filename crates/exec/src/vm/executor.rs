@@ -32,6 +32,20 @@ struct VmStats {
     input_materialize_us: u64,
 }
 
+impl VmStats {
+    fn accumulate(&mut self, other: Self) {
+        self.chunks = self.chunks.saturating_add(other.chunks);
+        self.rows_in = self.rows_in.saturating_add(other.rows_in);
+        self.rows_out = self.rows_out.saturating_add(other.rows_out);
+        self.eval_us = self.eval_us.saturating_add(other.eval_us);
+        self.input_materialization
+            .accumulate(other.input_materialization);
+        self.input_materialize_us = self
+            .input_materialize_us
+            .saturating_add(other.input_materialize_us);
+    }
+}
+
 /// Vector VM Executor node in the physical execution pipeline.
 ///
 /// Holds the pre-allocated virtual register file and compiles/interprets the
@@ -524,7 +538,26 @@ impl PipelineNode<DataChunk> for VectorVmExecutor {
     }
 }
 
-impl Transform<DataChunk> for VectorVmExecutor {}
+impl Transform<DataChunk> for VectorVmExecutor {
+    fn fork_transform(&self) -> Result<Option<Box<dyn Transform<DataChunk>>>> {
+        let Some(next) = self.next.fork_local()? else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(Self::with_next(
+            Arc::clone(&self.program),
+            Arc::clone(&self.registry),
+            next,
+        ))))
+    }
+
+    fn combine_transform(self: Box<Self>, canonical: &mut dyn Transform<DataChunk>) -> Result<()> {
+        let target = canonical
+            .as_any_mut()
+            .downcast_mut::<VectorVmExecutor<DataChunk>>()
+            .ok_or_else(|| common::VeinError::internal("VM local state has a mismatched target"))?;
+        combine_vm_state(self, target)
+    }
+}
 
 impl PipelineNode<DataChunkView> for VectorVmExecutor<DataChunkView> {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
@@ -622,9 +655,47 @@ impl PipelineNode<DataChunkView> for VectorVmExecutor<DataChunkView> {
     fn finished(&self) -> bool {
         self.next.finished()
     }
+
 }
 
-impl Transform<DataChunkView> for VectorVmExecutor<DataChunkView> {}
+impl Transform<DataChunkView> for VectorVmExecutor<DataChunkView> {
+    fn fork_transform(&self) -> Result<Option<Box<dyn Transform<DataChunkView>>>> {
+        let Some(next) = self.next.fork_local()? else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(Self::with_next(
+            Arc::clone(&self.program),
+            Arc::clone(&self.registry),
+            next,
+        ))))
+    }
+
+    fn combine_transform(
+        self: Box<Self>,
+        canonical: &mut dyn Transform<DataChunkView>,
+    ) -> Result<()> {
+        let target = canonical
+            .as_any_mut()
+            .downcast_mut::<VectorVmExecutor<DataChunkView>>()
+            .ok_or_else(|| common::VeinError::internal("VM local state has a mismatched target"))?;
+        combine_vm_state(self, target)
+    }
+}
+
+fn combine_vm_state<B: 'static>(
+    local: Box<VectorVmExecutor<B>>,
+    canonical: &mut VectorVmExecutor<B>,
+) -> Result<()> {
+    if !Arc::ptr_eq(&local.program, &canonical.program) {
+        return Err(common::VeinError::internal(
+            "cannot combine VM states for different programs",
+        ));
+    }
+    let VectorVmExecutor { next, stats, .. } = *local;
+    next.combine_local(canonical.next.as_mut())?;
+    canonical.stats.accumulate(stats);
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

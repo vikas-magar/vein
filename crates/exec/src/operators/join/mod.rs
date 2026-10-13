@@ -15,7 +15,7 @@ pub mod hash_join;
 pub mod spec;
 pub mod spill;
 
-pub use hash_table::{HashTable, JoinKeys};
+pub use hash_table::{HashTable, JoinBloomFilterConfig, JoinBloomFilterFactory, JoinKeys};
 pub use hash_join::{BuildSink, HashJoin, JoinFilterCollector};
 pub use rows::{JoinType, OutputRow, output_rows};
 pub use spec::{JoinSpec, OutputColumn};

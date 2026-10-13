@@ -404,6 +404,16 @@ impl DataChunkView {
         Self::new(row_count, columns, SelectionVector::new_dense(row_count))
     }
 
+    /// Wraps an Arrow batch without copying its Arrow arrays.
+    ///
+    /// The batch's column handles move into the view. This is the scan-source
+    /// constructor: readers can enter the reference-backed pipeline directly
+    /// without first creating a materialized `DataChunk`.
+    pub fn from_record_batch(batch: RecordBatch) -> Result<Self> {
+        let (_, arrays, row_count) = batch.into_parts();
+        Self::from_arrays(arrays, row_count, SelectionVector::new_dense(row_count))
+    }
+
     /// Wraps a materialized chunk without copying its Arrow arrays.
     ///
     /// The view keeps the chunk's active selection and represents each source
@@ -413,14 +423,22 @@ impl DataChunkView {
     pub fn from_chunk(chunk: DataChunk) -> Result<Self> {
         let DataChunk { vectors, selection } = chunk;
         let row_count = infer_physical_row_count(&vectors, &selection);
-        if vectors.iter().any(|array| array.len() != row_count) {
+        Self::from_arrays(vectors, row_count, selection)
+    }
+
+    fn from_arrays(
+        arrays: Vec<ArrayRef>,
+        row_count: usize,
+        selection: SelectionVector,
+    ) -> Result<Self> {
+        if arrays.iter().any(|array| array.len() != row_count) {
             return Err(VeinError::internal(
-                "materialized chunk columns have different physical row counts",
+                "batch columns have different physical row counts",
             ));
         }
         let source_lengths: Arc<[usize]> = Arc::from(vec![row_count]);
         let mapping = Arc::new(RowMapping::identity(source_lengths, 0, row_count)?);
-        let columns = vectors
+        let columns = arrays
             .into_iter()
             .map(|array| {
                 let data_type = array.data_type().clone();
@@ -1470,6 +1488,29 @@ mod tests {
         assert_eq!(view.num_rows(), 2);
         assert_eq!(int_at(&view, 0, 0), Some(30));
         assert_eq!(int_at(&view, 0, 1), Some(10));
+        assert!(Arc::ptr_eq(
+            view.columns[0].source_arrays().first().unwrap(),
+            &input
+        ));
+    }
+
+    #[test]
+    fn wrapping_a_record_batch_preserves_arrow_array_identity() {
+        let input = ints(&[10, 20, 30]);
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+                "id",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::clone(&input)],
+        )
+        .expect("valid Arrow batch");
+
+        let view = DataChunkView::from_record_batch(batch).expect("wrap batch as a view");
+
+        assert_eq!(view.num_rows(), 3);
+        assert_eq!(int_at(&view, 0, 1), Some(20));
         assert!(Arc::ptr_eq(
             view.columns[0].source_arrays().first().unwrap(),
             &input

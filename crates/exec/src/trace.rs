@@ -337,6 +337,7 @@ impl ExecutionTrace {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct MaterializationTrace {
     metrics: Arc<NodeMetrics>,
     query_id: String,
@@ -473,6 +474,37 @@ impl PipelineNode<DataChunkView> for ObservedOutputNode {
 
     fn finished(&self) -> bool {
         self.next.finished()
+    }
+
+    fn fork_local(&self) -> common::Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+        let Some(next) = self.next.fork_local()? else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(Self {
+            next,
+            metrics: Arc::clone(&self.metrics),
+            query_id: self.query_id.clone(),
+            task_id: self.task_id.clone(),
+        })))
+    }
+
+    fn combine_local(
+        self: Box<Self>,
+        canonical: &mut dyn PipelineNode<DataChunkView>,
+    ) -> common::Result<()> {
+        let target = canonical
+            .as_any_mut()
+            .downcast_mut::<ObservedOutputNode>()
+            .ok_or_else(|| error::VeinError::internal("trace local state has a mismatched target"))?;
+        if !Arc::ptr_eq(&self.metrics, &target.metrics)
+            || self.query_id != target.query_id
+            || self.task_id != target.task_id
+        {
+            return Err(error::VeinError::internal(
+                "cannot combine trace nodes from different executions",
+            ));
+        }
+        self.next.combine_local(target.next.as_mut())
     }
 }
 

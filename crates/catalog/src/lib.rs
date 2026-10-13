@@ -33,6 +33,8 @@
 pub mod contract;
 /// Standard table metadata, storage formats, sort order, and statistics.
 pub mod metadata;
+/// Format-neutral predicate evaluation against exact data-unit statistics.
+pub mod pruning;
 /// Catalog snapshot identity pinned by a query plan.
 pub mod snapshot;
 /// Bounded, self-invalidating store of parsed file metadata.
@@ -45,6 +47,10 @@ pub use metadata::{
     HistogramBucket, HistogramSample, HistogramStatistics, MostCommonValue,
     MostCommonValuesStatistics, StatisticsSourceIdentity, StatisticsUnitKind, TableFormat, TableMetadata,
     TableMetadataRef, TableStatistics, TableType,
+};
+pub use pruning::{
+    StatisticsComparison, StatisticsPredicate, comparison_may_match_bounds,
+    may_match_data_unit,
 };
 pub use snapshot::CatalogSnapshotToken;
 pub use store::{DEFAULT_CAPACITY, MetadataKey, MetadataKind, MetadataStore};

@@ -1,6 +1,6 @@
 //! Physical task definitions, execution modes, sources, and sinks.
 
-use catalog::CatalogSnapshotToken;
+use catalog::{CatalogSnapshotToken, StatisticsPredicate};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::sync::Arc;
@@ -27,6 +27,8 @@ pub enum FileFormat {
 /// and no logical plan are involved on the reading side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanPredicate {
+    /// Number of logical scan filters combined into this source predicate.
+    pub predicate_count: usize,
     /// The predicate's input columns, in register order: input column `i` is
     /// mounted into VM register `i`.
     pub input: VeinSchemaRef,
@@ -34,6 +36,10 @@ pub struct ScanPredicate {
     pub program: Arc<MicroProgram>,
     /// Register holding the boolean result.
     pub result: RegId,
+    /// Format-neutral necessary conditions for skipping data units from exact
+    /// source statistics. Unsupported logical expressions remain `Unknown`.
+    #[serde(default)]
+    pub statistics: Vec<StatisticsPredicate>,
 }
 
 /// Self-contained file scan instruction for an Executor.
@@ -45,6 +51,11 @@ pub struct FileScanTask {
     pub format: FileFormat,
     /// Optional byte range within the file.
     pub byte_range: Option<Range<u64>>,
+    /// Optional range of reader-defined, independently schedulable units in a
+    /// single file. For Parquet this addresses row groups; other scan adapters
+    /// may define their own unit ordinals. `None` means scan the whole file.
+    #[serde(default)]
+    pub scan_unit_range: Option<Range<usize>>,
     /// The projected columns, in the engine's own schema vocabulary.
     ///
     /// Refcounted so splitting one file scan into per-file tasks copies a

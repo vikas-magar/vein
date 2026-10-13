@@ -1,13 +1,12 @@
 //! Conservative statistics-based pruning for provably empty scans.
 
-use std::cmp::Ordering;
-
+use catalog::{StatisticsComparison, comparison_may_match_bounds};
 use error::Result;
 use parser::ast::expr::BinaryOp;
 use plan::{LogicalExpr, LogicalLiteral, LogicalPlan};
 
 use crate::context::{OptimizerContext, StatisticsFreshness};
-use crate::statistics::{compare, reverse as reverse_operator, valid_column};
+use crate::statistics::{reverse as reverse_operator, valid_column};
 use crate::rule::{OptimizerRule, RuleType};
 
 /// Replaces a scan with a zero-row limit when table statistics prove that a
@@ -93,6 +92,9 @@ fn predicate_is_provably_empty(
             let Some(column_statistics) = statistics.column_statistics.get(&column.name) else {
                 return false;
             };
+            if column_statistics.min_max_complete != Some(true) {
+                return false;
+            }
             let (Some(min), Some(max)) = (
                 column_statistics.min_value.as_ref(),
                 column_statistics.max_value.as_ref(),
@@ -135,23 +137,16 @@ fn comparison_is_empty(
     min: &LogicalLiteral,
     max: &LogicalLiteral,
 ) -> bool {
-    match operator {
-        BinaryOp::Eq => {
-            compare(literal, min).is_some_and(|ordering| ordering == Ordering::Less)
-                || compare(literal, max).is_some_and(|ordering| ordering == Ordering::Greater)
-        }
-        BinaryOp::Neq => {
-            compare(min, max) == Some(Ordering::Equal)
-                && compare(literal, min) == Some(Ordering::Equal)
-        }
-        BinaryOp::Lt => compare(literal, min).is_some_and(|ordering| ordering != Ordering::Greater),
-        BinaryOp::Leq => compare(literal, min).is_some_and(|ordering| ordering == Ordering::Less),
-        BinaryOp::Gt => compare(literal, max).is_some_and(|ordering| ordering != Ordering::Less),
-        BinaryOp::Geq => {
-            compare(literal, max).is_some_and(|ordering| ordering == Ordering::Greater)
-        }
-        _ => false,
-    }
+    let comparison = match operator {
+        BinaryOp::Eq => StatisticsComparison::Equal,
+        BinaryOp::Neq => StatisticsComparison::NotEqual,
+        BinaryOp::Lt => StatisticsComparison::Less,
+        BinaryOp::Leq => StatisticsComparison::LessOrEqual,
+        BinaryOp::Gt => StatisticsComparison::Greater,
+        BinaryOp::Geq => StatisticsComparison::GreaterOrEqual,
+        _ => return false,
+    };
+    !comparison_may_match_bounds(comparison, literal, min, max)
 }
 
 

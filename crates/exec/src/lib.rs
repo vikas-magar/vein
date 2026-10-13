@@ -20,6 +20,10 @@ pub mod factory;
 pub mod runtime;
 /// Query-scoped reservation accounting for blocking operator state.
 pub mod memory;
+/// Query-local runtime filters shared by joins and capable scan adapters.
+pub mod runtime_filter;
+/// Typed Parquet footer statistics shared by catalog discovery and scan pruning.
+pub mod parquet_statistics;
 /// Query-scoped spill storage, accounting, and Arrow IPC run lifecycle.
 pub mod spill;
 /// Vector VM execution engine interpreting Micro-IR programs.

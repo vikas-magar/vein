@@ -1195,6 +1195,45 @@ pub(crate) struct AggregateMetrics {
     pub(crate) output_materialize_ns: u64,
 }
 
+impl AggregateMetrics {
+    fn accumulate(&mut self, other: Self) {
+        macro_rules! add_counters {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            };
+        }
+        add_counters!(
+            input_batches,
+            input_rows,
+            grouping_sets,
+            grouping_probes,
+            group_index_candidate_checks,
+            group_index_reserve_ns,
+            group_index_capacity_growth_events,
+            group_index_entries_at_capacity_growth,
+            group_index_capacity,
+            group_index_entries_ns,
+            full_hash_matches,
+            group_key_comparisons,
+            group_collision_retries,
+            group_index_hits,
+            group_index_misses,
+            new_groups,
+            retained_key_slots_initialized,
+            string_key_bytes_copied,
+            hasher_setup_ns,
+            key_hash_ns,
+            hash_finalize_ns,
+            hash_generation_ns,
+            group_resolution_ns,
+            group_materialize_ns,
+            group_ids_distribution_ns,
+            state_update_ns,
+            output_materialize_ns,
+        );
+    }
+}
+
 impl AggregateSink {
     /// An accumulator for `plan`, refusing a shape it cannot emit.
     pub fn new(plan: AggregatePlan) -> Result<Self> {
@@ -1872,6 +1911,76 @@ impl AggregateSink {
         Ok(())
     }
 
+    /// Persists a suffix of worker-local groups without materializing a second
+    /// key representation. This is the bounded-memory combine fallback when
+    /// the canonical sink cannot retain another group's state.
+    fn write_group_suffix_to_run(&mut self, first_group: usize) -> Result<()> {
+        let group_count = self.groups.len().saturating_sub(first_group);
+        if group_count == 0 {
+            return Ok(());
+        }
+        self.tracker.check_cancelled()?;
+        self.spill_runs.try_reserve(1).map_err(|error| {
+            VeinError::internal(format!("cannot reserve aggregate spill run metadata: {error}"))
+        })?;
+        let mut pending = self.tracker.spill_manager().create_run()?;
+        let output = self.spill_schema.write_run_with(
+            pending.writer()?,
+            group_count,
+            |offset| self.intermediate_group_state(first_group + offset),
+        )?;
+        let run = pending.commit(output)?;
+        self.spill_runs.push(run);
+        Ok(())
+    }
+
+    /// Combines an independent worker sink. It first uses the normal in-memory
+    /// group index; if the query memory budget is reached, the unmerged suffix
+    /// is externalized and consumed by the existing bounded spill merge.
+    fn combine_local_state(&mut self, mut local: AggregateSink) -> Result<()> {
+        if self.plan.groups != local.plan.groups
+            || self.plan.aggs != local.plan.aggs
+            || self.plan.aggregate_input_types != local.plan.aggregate_input_types
+            || self.plan.types != local.plan.types
+            || self.grouping_sets != local.grouping_sets
+            || self.tracker.identity() != local.tracker.identity()
+        {
+            return Err(VeinError::internal(
+                "cannot combine aggregate states from different plans or memory trackers",
+            ));
+        }
+
+        self.spill_runs
+            .try_reserve(local.spill_runs.len())
+            .map_err(|error| {
+                VeinError::internal(format!("cannot reserve aggregate spill run metadata: {error}"))
+            })?;
+        self.spill_runs.append(&mut local.spill_runs);
+
+        for slot in 0..local.groups.len() {
+            let group = local.intermediate_group_state(slot)?;
+            match self.merge_spilled_group(group) {
+                Ok(()) => {}
+                Err(VeinError::ResourceExhausted { .. }) => {
+                    self.flush_current_run()?;
+                    local.write_group_suffix_to_run(slot)?;
+                    self.spill_runs
+                        .try_reserve(local.spill_runs.len())
+                        .map_err(|error| {
+                            VeinError::internal(format!(
+                                "cannot reserve aggregate spill run metadata: {error}"
+                            ))
+                        })?;
+                    self.spill_runs.append(&mut local.spill_runs);
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.metrics.accumulate(local.metrics);
+        Ok(())
+    }
+
     /// Drops group state only after its complete run is durable.
     fn release_group_state(&mut self) {
         self.index = GroupIndex::default();
@@ -2294,6 +2403,32 @@ impl AggregateSink {
 /// groups once the source has been drained.
 struct AggregateHandle(Arc<Mutex<AggregateSink>>);
 
+/// A worker-owned aggregate state. Unlike [`AggregateHandle`], this node has no
+/// shared lock in its batch path; its sink is consumed once at fan-in combine.
+struct LocalAggregateHandle(AggregateSink);
+
+impl PipelineNode<DataChunk> for LocalAggregateHandle {
+    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+        self.0.accumulate(chunk)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn combine_local(self: Box<Self>, canonical: &mut dyn PipelineNode<DataChunk>) -> Result<()> {
+        let target = canonical
+            .as_any_mut()
+            .downcast_mut::<AggregateHandle>()
+            .ok_or_else(|| VeinError::internal("aggregate local state has a mismatched target"))?;
+        let mut sink = target
+            .0
+            .lock()
+            .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
+        sink.combine_local_state(self.0)
+    }
+}
+
 impl PipelineNode<DataChunk> for AggregateHandle {
     fn push(&mut self, chunk: DataChunk) -> Result<()> {
         self.0
@@ -2306,6 +2441,21 @@ impl PipelineNode<DataChunk> for AggregateHandle {
     /// has to push them into the sink itself.
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunk>>>> {
+        let sink = self
+            .0
+            .lock()
+            .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
+        let mut local = AggregateSink::with_memory_tracker(
+            sink.plan.clone(),
+            sink.tracker.clone(),
+        )?;
+        // Group hashes are stored in each local index and reused by the
+        // canonical index during merge, so every worker must share its seed.
+        local.hash_builder = sink.hash_builder.clone();
+        Ok(Some(Box::new(LocalAggregateHandle(local))))
     }
 }
 
@@ -4952,6 +5102,88 @@ mod tests {
         );
         assert_eq!(counts, expected);
         assert!(tracker.peak() <= tracker.limit());
+    }
+
+    #[test]
+    fn worker_local_aggregate_states_combine_null_and_repeated_keys_without_copying_keys() {
+        let plan = AggregatePlan {
+            groups: 1,
+            estimated_groups: None,
+            grouping_sets: None,
+            emit_empty_group_on_empty_input: false,
+            aggs: vec![AggOpCode::Count],
+            aggregate_input_types: vec![VeinDataType::Int64],
+            types: vec![VeinDataType::Int64, VeinDataType::Int64],
+        };
+        let tracker = QueryMemoryTracker::unlimited(
+            common::cancellation::CancellationToken::new(),
+        );
+        let (accumulator, mut canonical) =
+            shared_with_memory_tracker(plan, tracker).expect("create canonical aggregate");
+        let first_keys = Arc::new(Int64Array::from(vec![Some(7), None]));
+        let second_keys = Arc::new(Int64Array::from(vec![Some(7), Some(8)]));
+        let mut first = canonical
+            .fork_local()
+            .expect("fork aggregate state")
+            .expect("aggregate supports worker-local state");
+        let mut second = canonical
+            .fork_local()
+            .expect("fork second aggregate state")
+            .expect("aggregate supports worker-local state");
+
+        first
+            .push(DataChunk::from_vectors(vec![
+                Arc::clone(&first_keys) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+            ]))
+            .expect("accumulate first worker batch");
+        second
+            .push(DataChunk::from_vectors(vec![
+                Arc::clone(&second_keys) as ArrayRef,
+                Arc::new(Int64Array::from(vec![30, 40])) as ArrayRef,
+            ]))
+            .expect("accumulate second worker batch");
+        first
+            .combine_local(canonical.as_mut())
+            .expect("combine first aggregate state");
+        second
+            .combine_local(canonical.as_mut())
+            .expect("combine second aggregate state");
+
+        let mut aggregate = accumulator.lock().expect("aggregate mutex");
+        let retained_key_buffers = aggregate
+            .group_key_batches
+            .iter()
+            .flat_map(|batch| batch.iter().flatten())
+            .filter_map(|column| match column {
+                GroupKeyColumn::Int64(values) => Some(values.values().as_ptr()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            retained_key_buffers.contains(&first_keys.values().as_ptr())
+                && retained_key_buffers.contains(&second_keys.values().as_ptr()),
+            "combining group state retains the original Arrow key buffers"
+        );
+
+        let output = aggregate.finish().expect("finish combined aggregate");
+        let mut counts = std::collections::BTreeMap::new();
+        for batch in output {
+            let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let values = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for row in 0..batch.num_rows() {
+                let key = keys.is_valid(row).then(|| keys.value(row));
+                counts.insert(key, values.value(row));
+            }
+        }
+        assert_eq!(
+            counts,
+            std::collections::BTreeMap::from([
+                (None, 1),
+                (Some(7), 2),
+                (Some(8), 1),
+            ])
+        );
     }
 
     #[test]

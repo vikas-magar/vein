@@ -60,6 +60,15 @@ impl OptimizerRule for ScanFilterPushdownRule {
         let mut scan_filters = filters.clone();
         if !scan_filters.contains(predicate) {
             scan_filters.push(predicate.clone());
+            tracing::info!(
+                target: "vein.optimizer",
+                event = "optimizer_scan_filter_pushed",
+                table = %table.name,
+                filter = ?predicate,
+                referenced_columns = ?referenced,
+                scan_filter_count = scan_filters.len(),
+                "optimizer_scan_filter_pushed"
+            );
         }
 
         Ok(Some(LogicalPlan::Scan {

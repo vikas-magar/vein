@@ -206,6 +206,15 @@ impl OptimizerPipeline {
                 }
                 validate_lowered_subqueries(&optimized)?;
                 diagnostics.cardinalities = context.estimate_plan(&optimized);
+                let filter_visibility = FilterPlacementVisibility::from_plan(&optimized);
+                tracing::info!(
+                    target: "vein.audit",
+                    event = "optimizer_filter_placement",
+                    scan_count = filter_visibility.scan_count,
+                    scan_filter_count = filter_visibility.scan_filter_count,
+                    residual_filter_count = filter_visibility.residual_filter_count,
+                    "optimizer_filter_placement"
+                );
                 tracing::info!(
                     target: "vein.audit",
                     event = "optimizer_converged",
@@ -257,6 +266,41 @@ impl Optimizer for OptimizerPipeline {
     fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         self.optimize_with_diagnostics(plan)
             .map(|(optimized, _)| optimized)
+    }
+}
+
+/// Counts filters attached to scans and filters that remain above relational
+/// operators after optimization. The latter are usually residual filters whose
+/// semantics do not permit moving them into a source.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FilterPlacementVisibility {
+    scan_count: usize,
+    scan_filter_count: usize,
+    residual_filter_count: usize,
+}
+
+impl FilterPlacementVisibility {
+    fn from_plan(plan: &LogicalPlan) -> Self {
+        fn visit(plan: &LogicalPlan, summary: &mut FilterPlacementVisibility) {
+            match plan {
+                LogicalPlan::Scan { filters, .. } => {
+                    summary.scan_count += 1;
+                    summary.scan_filter_count += filters.len();
+                }
+                LogicalPlan::Filter { .. } => summary.residual_filter_count += 1,
+                _ => {}
+            }
+            for child in plan.children() {
+                visit(child, summary);
+            }
+            for subquery in plan.subquery_plans() {
+                visit(subquery, summary);
+            }
+        }
+
+        let mut summary = Self::default();
+        visit(plan, &mut summary);
+        summary
     }
 }
 
@@ -352,6 +396,34 @@ mod tests {
             panic!("expected a Project node");
         };
         assert_eq!(exprs, vec![lit(17)]);
+    }
+
+    #[test]
+    fn filter_visibility_counts_scan_filters_and_residual_filters() {
+        let LogicalPlan::Project { input, .. } = project(vec![]) else {
+            unreachable!();
+        };
+        let LogicalPlan::Scan { table, schema, .. } = *input else {
+            unreachable!();
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                table,
+                projection: None,
+                filters: vec![lit(1)],
+                schema,
+            }),
+            predicate: lit(2),
+        };
+
+        assert_eq!(
+            FilterPlacementVisibility::from_plan(&plan),
+            FilterPlacementVisibility {
+                scan_count: 1,
+                scan_filter_count: 1,
+                residual_filter_count: 1,
+            }
+        );
     }
 
     #[test]

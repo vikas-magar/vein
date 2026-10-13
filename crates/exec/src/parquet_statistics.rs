@@ -4,7 +4,7 @@
 //! values. Parquet's typed statistics converter handles physical-to-Arrow
 //! mappings; unsupported, malformed, or inexact values remain unknown.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use arrow::array::{
     Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
@@ -16,18 +16,18 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use catalog::{
     ColumnStatistics, ColumnStorageStatistics, DataUnitStatistics, StatisticsUnitKind,
-    TableStatistics,
+    StatisticsPredicate, TableStatistics, may_match_data_unit,
 };
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
-use plan::LogicalLiteral;
+use types::LogicalLiteral;
 
 /// Extracts one file node and all its row-group children from a cached footer.
 ///
 /// The returned child indices are local to this vector; callers that append
 /// several file trees must offset their `parent` indices by the destination
 /// vector's starting length.
-pub(super) fn file_units(
+pub fn file_units(
     file_ordinal: usize,
     file_bytes: u64,
     arrow_schema: &Schema,
@@ -68,8 +68,117 @@ pub(super) fn file_units(
         units.push(unit);
     }
 
-    populate_column_statistics(arrow_schema, metadata, &mut units[1..]);
+    populate_column_statistics(arrow_schema, metadata, &mut units[1..], None);
     units
+}
+
+/// Exact row groups that may satisfy all pushed scan predicates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowGroupPruning {
+    /// Original row-group indexes to pass to the Parquet reader.
+    pub selected: Vec<usize>,
+    /// Rows in row groups skipped from their footer row counts.
+    pub skipped_rows: u64,
+    /// Compressed bytes in skipped column chunks, when the footer provides them.
+    pub estimated_compressed_bytes_skipped: u64,
+}
+
+/// Applies format-neutral statistics predicates to exact statistics from the
+/// footer currently used by the Parquet reader.
+///
+/// This reads only already-loaded footer values. It neither decodes row data nor
+/// retains/copies any Arrow column payload. Unknown or incomplete bounds keep the
+/// affected row group.
+pub fn prune_row_groups(
+    arrow_schema: &Schema,
+    metadata: &ParquetMetaData,
+    predicates: &[StatisticsPredicate],
+) -> RowGroupPruning {
+    prune_row_groups_in_range(
+        arrow_schema,
+        metadata,
+        predicates,
+        0..metadata.num_row_groups(),
+    )
+}
+
+/// Applies the same conservative pruning proof to a bounded range of the
+/// reader's data-unit ordinals. The scan scheduler uses this to avoid creating
+/// work for units it can already prove cannot match; each worker repeats the
+/// proof against its assigned range before asking the reader to decode it.
+pub fn prune_row_groups_in_range(
+    arrow_schema: &Schema,
+    metadata: &ParquetMetaData,
+    predicates: &[StatisticsPredicate],
+    range: std::ops::Range<usize>,
+) -> RowGroupPruning {
+    let row_groups = metadata.row_groups();
+    let start = range.start.min(row_groups.len());
+    let end = range.end.min(row_groups.len()).max(start);
+    if predicates.is_empty() {
+        return RowGroupPruning {
+            selected: (start..end).collect(),
+            skipped_rows: 0,
+            estimated_compressed_bytes_skipped: 0,
+        };
+    }
+
+    let mut columns = HashSet::<&str>::new();
+    for predicate in predicates {
+        predicate.collect_columns(&mut columns);
+    }
+    if columns.is_empty() {
+        return RowGroupPruning {
+            selected: (start..end).collect(),
+            skipped_rows: 0,
+            estimated_compressed_bytes_skipped: 0,
+        };
+    }
+
+    let statistics = row_group_column_statistics(arrow_schema, metadata, &columns);
+    let mut selected = Vec::with_capacity(end - start);
+    let mut skipped_rows = 0_u64;
+    let mut estimated_compressed_bytes_skipped = 0_u64;
+
+    for (ordinal, row_group) in row_groups.iter().enumerate().take(end).skip(start) {
+        let mut unit = row_group_unit(ordinal, row_group);
+        unit.column_statistics = statistics.get(ordinal).cloned().unwrap_or_default();
+        if predicates
+            .iter()
+            .all(|predicate| may_match_data_unit(predicate, &unit))
+        {
+            selected.push(ordinal);
+        } else {
+            skipped_rows = skipped_rows.saturating_add(unit.num_rows.unwrap_or(0));
+            estimated_compressed_bytes_skipped = estimated_compressed_bytes_skipped
+                .saturating_add(unit.compressed_bytes.unwrap_or(0));
+        }
+    }
+
+    RowGroupPruning {
+        selected,
+        skipped_rows,
+        estimated_compressed_bytes_skipped,
+    }
+}
+
+/// Extracts only named columns' exact statistics for every row group.
+pub fn row_group_column_statistics(
+    arrow_schema: &Schema,
+    metadata: &ParquetMetaData,
+    columns: &HashSet<&str>,
+) -> Vec<HashMap<String, ColumnStatistics>> {
+    let mut units = metadata
+        .row_groups()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, row_group)| row_group_unit(ordinal, row_group))
+        .collect::<Vec<_>>();
+    populate_column_statistics(arrow_schema, metadata, &mut units, Some(columns));
+    units
+        .into_iter()
+        .map(|unit| unit.column_statistics)
+        .collect()
 }
 
 /// Builds table-wide facts from file and row-group scopes.
@@ -78,7 +187,7 @@ pub(super) fn file_units(
 /// unit has a known value and the checked sum succeeds. NDV is intentionally
 /// omitted at table scope: summing row-group NDVs double-counts values shared
 /// by groups, and Parquet does not provide the sketches needed to merge them.
-pub(super) fn table_statistics(
+pub fn table_statistics(
     data_units: Vec<DataUnitStatistics>,
     schema: &Schema,
 ) -> TableStatistics {
@@ -135,11 +244,15 @@ fn populate_column_statistics(
     schema: &Schema,
     metadata: &ParquetMetaData,
     row_group_units: &mut [DataUnitStatistics],
+    selected_columns: Option<&HashSet<&str>>,
 ) {
     let row_groups = metadata.row_groups();
     let parquet_schema = metadata.file_metadata().schema_descr();
 
     for field in schema.fields() {
+        if selected_columns.is_some_and(|columns| !columns.contains(field.name().as_str())) {
+            continue;
+        }
         let Ok(converter) = StatisticsConverter::try_new(
             field.name(),
             schema,
@@ -192,12 +305,14 @@ fn populate_column_statistics(
                 ordinal,
                 field.data_type(),
             );
+            let min_max_complete = Some(min_value.is_some() && max_value.is_some());
             let statistics = ColumnStatistics {
                 null_count,
                 distinct_count: array_u64_at(distinct_counts.as_ref(), ordinal),
                 nan_count: array_u64_at(nan_counts.as_ref(), ordinal),
                 min_value,
                 max_value,
+                min_max_complete,
                 ..ColumnStatistics::default()
             };
             if has_values(&statistics) {
@@ -540,7 +655,12 @@ fn nonnegative(value: i64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int64Array;
     use arrow::datatypes::Field;
+    use arrow::record_batch::RecordBatch;
+    use catalog::{StatisticsComparison, StatisticsPredicate};
+    use std::sync::Arc;
+    use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 
     fn file_unit(rows: u64, bytes: u64) -> DataUnitStatistics {
         let mut unit = DataUnitStatistics::new(StatisticsUnitKind::File, 0);
@@ -644,5 +764,62 @@ mod tests {
             exact_scalar_at(Some(&values), Some(&exact), 0, &DataType::Int64),
             None
         );
+    }
+
+    #[test]
+    fn exact_footer_bounds_skip_row_groups_and_reader_returns_same_matching_rows() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let path = root.path().join("ordered.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+        let values = Int64Array::from(vec![1, 2, 10, 11, 20, 21]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)])
+            .expect("valid input batch");
+        let file = std::fs::File::create(&path).expect("create parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
+        for offset in (0..batch.num_rows()).step_by(2) {
+            writer
+                .write(&batch.slice(offset, 2))
+                .expect("write row group");
+            writer.flush().expect("finish row group");
+        }
+        writer.close().expect("finish parquet file");
+
+        let file = std::fs::File::open(&path).expect("open parquet file");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("read footer");
+        let predicate = [
+            StatisticsPredicate::Comparison {
+                column: "value".into(),
+                comparison: StatisticsComparison::GreaterOrEqual,
+                literal: LogicalLiteral::Int64(10),
+            },
+            StatisticsPredicate::Comparison {
+                column: "value".into(),
+                comparison: StatisticsComparison::Less,
+                literal: LogicalLiteral::Int64(20),
+            },
+        ];
+        let pruning = prune_row_groups(builder.schema(), builder.metadata(), &predicate);
+
+        assert_eq!(pruning.selected, vec![1]);
+        assert_eq!(pruning.skipped_rows, 4);
+        assert!(pruning.estimated_compressed_bytes_skipped > 0);
+
+        let reader = builder
+            .with_row_groups(pruning.selected)
+            .build()
+            .expect("build reader over selected groups");
+        let selected_rows = reader
+            .map(|batch| {
+                let batch = batch.expect("read selected row group");
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 output");
+                (0..values.len()).map(|row| values.value(row)).collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(selected_rows, vec![10, 11]);
     }
 }

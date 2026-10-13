@@ -8,6 +8,7 @@ use common::protocol::{
     AggOpCode, AggregatePlan, DataSource, FileFormat, FileScanTask, JoinOutput, JoinResidualPlan,
     LimitSpec, MicroProgram, RegId, ScanPredicate, SortKey as PhysicalSortKey, SortPlan,
 };
+use catalog::{StatisticsComparison, StatisticsPredicate};
 use error::VeinError;
 use plan::schema::VeinSchema;
 use plan::{LogicalExpr, LogicalPlan, SortKey as LogicalSortKey};
@@ -494,6 +495,7 @@ impl PipelineCompiler {
                 files,
                 format: FileFormat::Parquet,
                 byte_range: None,
+                scan_unit_range: None,
                 projected,
                 dictionary_columns: Vec::new(),
                 pushdown,
@@ -538,11 +540,119 @@ impl PipelineCompiler {
         let register_count = input.fields.len() as RegId;
         let mut compiler = BytecodeCompiler::new(register_count);
         let result = compiler.compile_predicate(filters, &input)?;
+        let program = Arc::new(compiler.finish());
+        let input_columns = input
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            target: "vein.optimizer",
+            event = "scan_predicate_compiled",
+            predicate_count = filters.len(),
+            input_columns = ?input_columns,
+            input_column_count = input.fields.len(),
+            register_count,
+            instruction_count = program.instructions.len(),
+            "scan_predicate_compiled"
+        );
         Ok(Some(Arc::new(ScanPredicate {
+            predicate_count: filters.len(),
             input: Arc::new(input),
-            program: Arc::new(compiler.finish()),
+            program,
             result,
+            statistics: filters
+                .iter()
+                .map(Self::statistics_predicate)
+                .collect(),
         })))
+    }
+
+    /// Lowers the subset of a logical predicate whose truth can be bounded by
+    /// exact per-column statistics. Unknown expressions are retained as an
+    /// explicit fail-open node, so combining them with safe conjuncts remains
+    /// correct while still allowing independent bounds to prune.
+    fn statistics_predicate(expression: &LogicalExpr) -> StatisticsPredicate {
+        use StatisticsPredicate as Predicate;
+
+        match expression {
+            LogicalExpr::BinaryOp {
+                left,
+                op,
+                right,
+                ..
+            } => {
+                use parser::ast::expr::BinaryOp as Op;
+                match op {
+                    Op::And => Predicate::And(vec![
+                        Self::statistics_predicate(left),
+                        Self::statistics_predicate(right),
+                    ]),
+                    Op::Or => Predicate::Or(vec![
+                        Self::statistics_predicate(left),
+                        Self::statistics_predicate(right),
+                    ]),
+                    Op::Eq | Op::Neq | Op::Lt | Op::Leq | Op::Gt | Op::Geq => {
+                        let (column, comparison, literal) = match
+                            (left.as_ref(), right.as_ref())
+                        {
+                            (LogicalExpr::Column(column), LogicalExpr::Literal(literal)) => {
+                                (column, statistics_comparison(*op), literal)
+                            }
+                            (LogicalExpr::Literal(literal), LogicalExpr::Column(column)) => {
+                                (column, statistics_comparison(reverse_comparison(*op)), literal)
+                            }
+                            _ => return Predicate::Unknown,
+                        };
+                        Predicate::Comparison {
+                            column: column.name.clone(),
+                            comparison,
+                            literal: literal.clone(),
+                        }
+                    }
+                    _ => Predicate::Unknown,
+                }
+            }
+            LogicalExpr::IsNull { expr } => match expr.as_ref() {
+                LogicalExpr::Column(column) => Predicate::IsNull {
+                    column: column.name.clone(),
+                },
+                _ => Predicate::Unknown,
+            },
+            LogicalExpr::IsNotNull { expr } => match expr.as_ref() {
+                LogicalExpr::Column(column) => Predicate::IsNotNull {
+                    column: column.name.clone(),
+                },
+                _ => Predicate::Unknown,
+            },
+            LogicalExpr::InList {
+                expr,
+                list,
+                negated: false,
+            } => {
+                let LogicalExpr::Column(column) = expr.as_ref() else {
+                    return Predicate::Unknown;
+                };
+                if list.is_empty() {
+                    return Predicate::Unknown;
+                }
+                let equalities = list
+                    .iter()
+                    .map(|value| {
+                        let LogicalExpr::Literal(literal) = value else {
+                            return None;
+                        };
+                        Some(Predicate::Comparison {
+                            column: column.name.clone(),
+                            comparison: StatisticsComparison::Equal,
+                            literal: literal.clone(),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>();
+                equalities.map_or(Predicate::Unknown, Predicate::Or)
+            }
+            _ => Predicate::Unknown,
+        }
     }
 
     fn projected_scan_schema(
@@ -687,6 +797,30 @@ impl PipelineCompiler {
                 None,
             )),
         }
+    }
+}
+
+fn statistics_comparison(operator: parser::ast::expr::BinaryOp) -> StatisticsComparison {
+    use parser::ast::expr::BinaryOp as Op;
+    match operator {
+        Op::Eq => StatisticsComparison::Equal,
+        Op::Neq => StatisticsComparison::NotEqual,
+        Op::Lt => StatisticsComparison::Less,
+        Op::Leq => StatisticsComparison::LessOrEqual,
+        Op::Gt => StatisticsComparison::Greater,
+        Op::Geq => StatisticsComparison::GreaterOrEqual,
+        _ => unreachable!("only ordered comparison operators are lowered"),
+    }
+}
+
+fn reverse_comparison(operator: parser::ast::expr::BinaryOp) -> parser::ast::expr::BinaryOp {
+    use parser::ast::expr::BinaryOp as Op;
+    match operator {
+        Op::Lt => Op::Gt,
+        Op::Leq => Op::Geq,
+        Op::Gt => Op::Lt,
+        Op::Geq => Op::Leq,
+        other => other,
     }
 }
 
@@ -987,7 +1121,10 @@ fn estimate_single_key_groups(
 mod tests {
     use std::sync::Arc;
 
-    use catalog::{ColumnStatistics, TableMetadata, TableStatistics};
+    use catalog::{
+        ColumnStatistics, StatisticsComparison, StatisticsPredicate, TableMetadata,
+        TableStatistics,
+    };
     use common::protocol::{JoinOutput, MicroOp, SortKey as PhysicalSortKey, SortPlan};
     use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
     use plan::{LogicalExpr, LogicalLiteral, LogicalPlan, SortKey as LogicalSortKey};
@@ -1009,6 +1146,89 @@ mod tests {
             VeinDataType::Int64,
         ));
         (VeinSchema::new(vec![first, second.clone()]), second)
+    }
+
+    #[test]
+    fn compiled_scan_predicate_reports_filter_count_and_narrow_input_columns() {
+        let (schema, price) = schema();
+        let predicate = || LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(Arc::clone(&price))),
+            op: parser::ast::expr::BinaryOp::Gt,
+            right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(0))),
+            return_type: VeinDataType::Boolean,
+        };
+
+        let compiled = PipelineCompiler::scan_predicate(&[predicate(), predicate()], &schema)
+            .expect("compile scan predicate")
+            .expect("two scan filters produce a predicate");
+
+        assert_eq!(compiled.predicate_count, 2);
+        assert_eq!(compiled.input.fields.len(), 1);
+        assert_eq!(compiled.input.fields[0].name, "price");
+        assert!(!compiled.program.instructions.is_empty());
+    }
+
+    #[test]
+    fn scan_statistics_preserve_safe_ranges_and_fail_open_for_like() {
+        let date = Arc::new(ResolvedColumn::new(
+            ColumnId(3),
+            "shipdate",
+            None,
+            VeinDataType::Date32,
+        ));
+        let name = Arc::new(ResolvedColumn::new(
+            ColumnId(4),
+            "name",
+            None,
+            VeinDataType::Utf8,
+        ));
+        let schema = VeinSchema::new(vec![date.clone(), name.clone()]);
+        let lower = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(Arc::clone(&date))),
+            op: parser::ast::expr::BinaryOp::Geq,
+            right: Box::new(LogicalExpr::Literal(LogicalLiteral::Date(100))),
+            return_type: VeinDataType::Boolean,
+        };
+        let upper = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(Arc::clone(&date))),
+            op: parser::ast::expr::BinaryOp::Lt,
+            right: Box::new(LogicalExpr::Literal(LogicalLiteral::Date(200))),
+            return_type: VeinDataType::Boolean,
+        };
+        let like = LogicalExpr::Like {
+            expr: Box::new(LogicalExpr::Column(name)),
+            pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String("%urgent%".into()))),
+            negated: false,
+        };
+        let range = LogicalExpr::BinaryOp {
+            left: Box::new(lower),
+            op: parser::ast::expr::BinaryOp::And,
+            right: Box::new(upper),
+            return_type: VeinDataType::Boolean,
+        };
+
+        let compiled = PipelineCompiler::scan_predicate(&[range, like], &schema)
+            .expect("compile row predicate")
+            .expect("scan filters produce a predicate");
+
+        assert_eq!(
+            compiled.statistics,
+            vec![
+                StatisticsPredicate::And(vec![
+                    StatisticsPredicate::Comparison {
+                        column: "shipdate".into(),
+                        comparison: StatisticsComparison::GreaterOrEqual,
+                        literal: LogicalLiteral::Date(100),
+                    },
+                    StatisticsPredicate::Comparison {
+                        column: "shipdate".into(),
+                        comparison: StatisticsComparison::Less,
+                        literal: LogicalLiteral::Date(200),
+                    },
+                ]),
+                StatisticsPredicate::Unknown,
+            ]
+        );
     }
 
     fn unsupported_explain_plan() -> LogicalPlan {

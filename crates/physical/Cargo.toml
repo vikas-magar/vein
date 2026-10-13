@@ -8,6 +8,7 @@ missing_docs = "deny"
 
 [dependencies]
 arrow = { workspace = true }
+catalog = { path = "../catalog" }
 common = { path = "../common" }
 error = { path = "../error" }
 parser = { path = "../parser" }

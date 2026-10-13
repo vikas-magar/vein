@@ -180,6 +180,8 @@ pub enum JoinOrderOutcome {
     Reordered,
     /// Search completed and found no strict cost improvement.
     NoImprovement,
+    /// The safe join-order search currently requires at least three relations.
+    InsufficientRelations,
     /// The region exceeded its configured relation limit.
     RelationLimitExceeded,
     /// Search exceeded its configured candidate-split budget.
