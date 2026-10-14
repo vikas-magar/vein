@@ -9,6 +9,9 @@ pub mod expression_simplify;
 /// Filter predicate and plan-node normalization.
 pub mod filter_normalize;
 
+/// Propagation of implied ordered bounds through deterministic filter predicates.
+pub mod filter_transitivity;
+
 /// Top-down required-column analysis and scan projection pruning.
 pub mod column_pruning;
 
@@ -40,6 +43,7 @@ pub use column_pruning::ColumnPruningRule;
 pub use constant_fold::ConstantFoldingRule;
 pub use expression_simplify::ExpressionSimplificationRule;
 pub use filter_normalize::FilterNormalizationRule;
+pub use filter_transitivity::FilterTransitivityRule;
 pub use join_transitivity::JoinPredicateTransitivityRule;
 pub use predicate_pushdown::PredicatePushdownRule;
 pub use scan_filter_pushdown::ScanFilterPushdownRule;

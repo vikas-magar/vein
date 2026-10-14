@@ -63,6 +63,10 @@ pub struct BuildSink {
     /// Rows absorbed, and the time spent hashing and inserting them.
     rows: u64,
     insert_us: u64,
+    /// Worker-local tables skip spill backups and are merged before probing.
+    is_worker_local: bool,
+    /// Number of worker-local tables merged into this canonical sink.
+    combined_workers: u64,
 }
 
 impl BuildSink {
@@ -93,6 +97,8 @@ impl BuildSink {
             tracker,
             rows: 0,
             insert_us: 0,
+            is_worker_local: false,
+            combined_workers: 0,
         })
     }
 
@@ -125,12 +131,76 @@ impl BuildSink {
             tracker,
             rows: 0,
             insert_us: 0,
+            is_worker_local: false,
+            combined_workers: 0,
         })
+    }
+
+    /// Fork a private in-memory build table when the query has no memory cap.
+    ///
+    /// Bounded queries keep the canonical spill-capable sink: independent local
+    /// tables could collectively exceed the budget before they are combined.
+    pub(crate) fn fork_worker_local(&self) -> Result<Option<Self>> {
+        if !self.tracker.is_unlimited() || self.spill_writer.is_some() {
+            return Ok(None);
+        }
+        let Some(table) = self.table.as_ref() else {
+            return Ok(None);
+        };
+
+        Ok(Some(Self {
+            table: Some(table.fork_empty()?),
+            spill_writer: None,
+            spill_schema: None,
+            spill_backup: Vec::new(),
+            build_keys: self.build_keys.clone(),
+            tracker: self.tracker.clone(),
+            rows: 0,
+            insert_us: 0,
+            is_worker_local: true,
+            combined_workers: 0,
+        }))
+    }
+
+    /// Merge a finished local table into this canonical build sink.
+    pub(crate) fn combine_worker(&mut self, mut local: Self) -> Result<()> {
+        if !self.tracker.is_unlimited()
+            || !local.is_worker_local
+            || self.spill_writer.is_some()
+            || local.spill_writer.is_some()
+            || local.spill_schema.is_some()
+            || !self.spill_backup.is_empty()
+            || !local.spill_backup.is_empty()
+            || self.build_keys != local.build_keys
+            || self.tracker.identity() != local.tracker.identity()
+        {
+            return Err(VeinError::internal(
+                "cannot combine incompatible or spill-capable join build states",
+            ));
+        }
+
+        let local_table = local
+            .table
+            .take()
+            .ok_or_else(|| VeinError::internal("worker-local join build table is unavailable"))?;
+        self.table
+            .as_mut()
+            .ok_or_else(|| VeinError::internal("canonical join build table is unavailable"))?
+            .merge(local_table)?;
+        self.rows = self.rows.saturating_add(local.rows);
+        self.insert_us = self.insert_us.saturating_add(local.insert_us);
+        self.combined_workers = self.combined_workers.saturating_add(1);
+        Ok(())
     }
 
     /// How many build rows have been absorbed.
     pub fn rows(&self) -> usize {
         self.rows as usize
+    }
+
+    /// Number of worker-local build tables merged into this canonical sink.
+    pub fn combined_workers(&self) -> u64 {
+        self.combined_workers
     }
 
     /// The finished table, ready to probe.
@@ -175,7 +245,11 @@ impl PipelineNode<DataChunkView> for BuildSink {
                 .as_mut()
                 .ok_or_else(|| VeinError::internal("join build table is unavailable"))?;
             match table.insert_view(view.clone()) {
-                Ok(()) => self.spill_backup.push(view),
+                Ok(()) => {
+                    if self.spill_schema.is_some() {
+                        self.spill_backup.push(view);
+                    }
+                }
                 Err(VeinError::ResourceExhausted { .. }) if self.spill_schema.is_some() => {
                     let schema = self
                         .spill_schema
@@ -205,6 +279,22 @@ impl PipelineNode<DataChunkView> for BuildSink {
     }
 
     fn flush(&mut self) -> Result<()> {
+        if self.is_worker_local {
+            let table = self
+                .table
+                .as_ref()
+                .ok_or_else(|| VeinError::internal("worker-local join build table is unavailable at flush"))?;
+            tracing::debug!(
+                target: "vein.audit",
+                event = "join_build_worker_finished",
+                rows = self.rows,
+                table_rows = table.len(),
+                build_chunks = table.chunk_count(),
+                insert_us = self.insert_us,
+                "join build worker state finished"
+            );
+            return Ok(());
+        }
         if let Some(writer) = self.spill_writer.as_ref() {
             tracing::info!(
                 target: "vein.audit",
@@ -228,6 +318,7 @@ impl PipelineNode<DataChunkView> for BuildSink {
             table_rows = table.len(),
             build_chunks = table.chunk_count(),
             insert_us = self.insert_us,
+            combined_workers = self.combined_workers,
             key_shared_columns = keys.shared_columns,
             key_gathered_columns = keys.gathered_columns,
             key_empty_columns = keys.empty_columns,

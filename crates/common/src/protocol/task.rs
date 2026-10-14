@@ -20,26 +20,35 @@ pub enum FileFormat {
     Json,
 }
 
-/// A predicate a source evaluates before rows are materialized.
+/// A source predicate plan evaluated before projected rows are materialized.
 ///
-/// Held as compiled Micro-IR rather than a planner expression so an executor can
-/// evaluate it through the same VM that runs the residual pipeline — no planner
-/// and no logical plan are involved on the reading side.
+/// It is held as compiled Micro-IR so a source uses the same VM as the residual
+/// pipeline. Stages are applied in order, allowing a selective safe predicate to
+/// reduce the input to later stages without materializing conjunction arrays.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanPredicate {
-    /// Number of logical scan filters combined into this source predicate.
+    /// Number of logical conjuncts in the source predicate.
     pub predicate_count: usize,
-    /// The predicate's input columns, in register order: input column `i` is
-    /// mounted into VM register `i`.
-    pub input: VeinSchemaRef,
-    /// Program computing the predicate's boolean for one input batch.
-    pub program: Arc<MicroProgram>,
-    /// Register holding the boolean result.
-    pub result: RegId,
+    /// Ordered predicate stages. Each stage only reads its own required columns.
+    pub stages: Vec<ScanPredicateStage>,
     /// Format-neutral necessary conditions for skipping data units from exact
     /// source statistics. Unsupported logical expressions remain `Unknown`.
     #[serde(default)]
     pub statistics: Vec<StatisticsPredicate>,
+}
+
+/// One compiled conjunction evaluated as a source-level selection stage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanPredicateStage {
+    /// Number of logical conjuncts combined in this stage.
+    pub predicate_count: usize,
+    /// Stage input columns, in register order: input column `i` is mounted into
+    /// VM register `i`.
+    pub input: VeinSchemaRef,
+    /// Program computing this stage's boolean for one input batch.
+    pub program: Arc<MicroProgram>,
+    /// Register holding the boolean result.
+    pub result: RegId,
 }
 
 /// Self-contained file scan instruction for an Executor.

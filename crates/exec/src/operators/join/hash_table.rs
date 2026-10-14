@@ -815,6 +815,15 @@ impl HashTable {
         })
     }
 
+    /// Create an empty worker-local table with the same key layout and budget.
+    pub(crate) fn fork_empty(&self) -> Result<Self> {
+        Self::with_memory_tracker(
+            self.build_keys.clone(),
+            self.probe_keys.clone(),
+            self.tracker.clone(),
+        )
+    }
+
     /// Whether the build key is a single `Int64`, so [`Self::keys`] is usable.
     fn inline_keys(&self) -> bool {
         self.keys.len() == self.entries.len()

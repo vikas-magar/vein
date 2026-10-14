@@ -1,0 +1,291 @@
+[package]
+edition = "2024"
+rust-version = "1.88"
+name = "parquet"
+version = "60.0.0"
+authors = ["Apache Arrow <dev@arrow.apache.org>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Apache Parquet implementation in Rust"
+homepage = "https://github.com/apache/arrow-rs"
+keywords = [
+    "arrow",
+    "parquet",
+    "hadoop",
+]
+license = "Apache-2.0"
+repository = "https://github.com/apache/arrow-rs"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+arrow = [
+    "base64",
+    "arrow-array",
+    "arrow-buffer",
+    "arrow-data",
+    "arrow-schema",
+    "arrow-select",
+    "arrow-ipc",
+]
+arrow_canonical_extension_types = ["arrow-schema?/canonical_extension_types"]
+async = [
+    "futures",
+    "tokio",
+]
+cli = [
+    "json",
+    "base64",
+    "clap",
+    "arrow-csv",
+    "serde",
+]
+crc = ["dep:crc32fast"]
+default = [
+    "arrow",
+    "snap",
+    "brotli",
+    "flate2-zlib-rs",
+    "lz4",
+    "zstd",
+    "base64",
+    "simdutf8",
+]
+encryption = ["dep:ring"]
+experimental = ["variant_experimental"]
+flate2-rust_backend = ["flate2/rust_backend"]
+flate2-rust_backened = ["flate2-rust_backend"]
+flate2-zlib-rs = ["flate2/zlib-rs"]
+geospatial = ["parquet-geospatial"]
+json = [
+    "serde_json",
+    "base64",
+]
+lz4 = ["lz4_flex"]
+object_store = [
+    "dep:object_store",
+    "async",
+]
+simdutf8 = ["dep:simdutf8"]
+test_common = ["arrow/test_utils"]
+variant_experimental = [
+    "arrow",
+    "parquet-variant",
+    "parquet-variant-compute",
+]
+zstd = ["dep:zstd"]
+
+[lib]
+name = "parquet"
+path = "src/lib.rs"
+bench = false
+
+[dependencies.arrow-array]
+version = "60.0.0"
+optional = true
+
+[dependencies.arrow-buffer]
+version = "60.0.0"
+optional = true
+
+[dependencies.arrow-csv]
+version = "60.0.0"
+optional = true
+
+[dependencies.arrow-data]
+version = "60.0.0"
+optional = true
+
+[dependencies.arrow-ipc]
+version = "60.0.0"
+optional = true
+
+[dependencies.arrow-schema]
+version = "60.0.0"
+optional = true
+
+[dependencies.arrow-select]
+version = "60.0.0"
+optional = true
+
+[dependencies.base64]
+version = "0.23"
+features = ["std"]
+optional = true
+default-features = false
+
+[dependencies.brotli]
+version = "9.0"
+features = ["std"]
+optional = true
+default-features = false
+
+[dependencies.bytes]
+version = "1.1"
+features = ["std"]
+default-features = false
+
+[dependencies.chrono]
+version = "0.4.40"
+features = ["clock"]
+default-features = false
+
+[dependencies.clap]
+version = "4.1"
+features = [
+    "std",
+    "derive",
+    "env",
+    "help",
+    "error-context",
+    "usage",
+]
+optional = true
+default-features = false
+
+[dependencies.crc32fast]
+version = "1.4.2"
+optional = true
+default-features = false
+
+[dependencies.flate2]
+version = "1.1"
+optional = true
+default-features = false
+
+[dependencies.futures]
+version = "0.3"
+features = ["std"]
+optional = true
+default-features = false
+
+[dependencies.half]
+version = "2.1"
+features = ["num-traits"]
+default-features = false
+
+[dependencies.hashbrown]
+version = "0.17"
+default-features = false
+
+[dependencies.lz4_flex]
+version = "0.14"
+features = [
+    "std",
+    "frame",
+]
+optional = true
+default-features = false
+
+[dependencies.num-bigint]
+version = "0.5"
+default-features = false
+
+[dependencies.num-integer]
+version = "0.1.46"
+features = ["std"]
+default-features = false
+
+[dependencies.num-traits]
+version = "0.2.19"
+features = ["std"]
+default-features = false
+
+[dependencies.object_store]
+version = "0.14.1"
+features = ["tokio"]
+optional = true
+default-features = false
+
+[dependencies.parquet-geospatial]
+version = "60.0.0"
+optional = true
+
+[dependencies.parquet-variant]
+version = "60.0.0"
+optional = true
+
+[dependencies.parquet-variant-compute]
+version = "60.0.0"
+optional = true
+
+[dependencies.ring]
+version = "0.17"
+features = ["std"]
+optional = true
+default-features = false
+
+[dependencies.seq-macro]
+version = "0.3"
+default-features = false
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+optional = true
+default-features = false
+
+[dependencies.serde_json]
+version = "1.0"
+features = ["std"]
+optional = true
+default-features = false
+
+[dependencies.simdutf8]
+version = "0.1.5"
+optional = true
+default-features = false
+
+[dependencies.snap]
+version = "1.0"
+optional = true
+default-features = false
+
+[dependencies.tokio]
+version = "1.0"
+features = [
+    "macros",
+    "rt",
+    "io-util",
+]
+optional = true
+default-features = false
+
+[dependencies.twox-hash]
+version = "2.0"
+features = ["xxhash64"]
+default-features = false
+
+[dependencies.zstd]
+version = "0.14"
+optional = true
+default-features = false
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.ahash]
+version = "0.8"
+features = ["runtime-rng"]
+default-features = false
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.ahash]
+version = "0.8"
+features = ["compile-time-rng"]
+default-features = false
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.ring]
+version = "0.17"
+features = [
+    "wasm32_unknown_unknown_js",
+    "std",
+]
+optional = true
+default-features = false
+
+[dev-dependencies.arrow]
+version = "60.0.0"
+features = ["ipc", "test_utils", "prettyprint", "json"]
+default-features = false

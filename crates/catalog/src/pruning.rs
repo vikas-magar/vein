@@ -45,6 +45,19 @@ pub enum StatisticsPredicate {
         /// Scalar constant from the bound predicate.
         literal: LogicalLiteral,
     },
+    /// Comparison between two columns whose values are bounded by intervals.
+    ///
+    /// This is a necessary condition only: independent interval bounds do not
+    /// retain row-level correlation, so they can keep extra units but must never
+    /// discard a possible match.
+    ColumnComparison {
+        /// Name of the left column in the source schema.
+        left_column: String,
+        /// Comparison to apply to the two value intervals.
+        comparison: StatisticsComparison,
+        /// Name of the right column in the source schema.
+        right_column: String,
+    },
     /// A null test on one source column.
     IsNull {
         /// Name of the column in the source schema.
@@ -73,6 +86,14 @@ impl StatisticsPredicate {
             | Self::IsNull { column }
             | Self::IsNotNull { column } => {
                 columns.insert(column.as_str());
+            }
+            Self::ColumnComparison {
+                left_column,
+                right_column,
+                ..
+            } => {
+                columns.insert(left_column.as_str());
+                columns.insert(right_column.as_str());
             }
             Self::Unknown => {}
         }
@@ -105,10 +126,33 @@ pub fn may_match_data_unit(
             column,
             comparison,
             literal,
-        } => unit
-            .column_statistics
-            .get(column)
-            .is_none_or(|statistics| column_may_match(*comparison, literal, statistics)),
+        } => {
+            let Some(statistics) = unit.column_statistics.get(column) else {
+                return true;
+            };
+            if unit.num_rows.is_some_and(|rows| statistics.null_count == Some(rows)) {
+                return false;
+            }
+            column_may_match(*comparison, literal, statistics)
+        }
+        StatisticsPredicate::ColumnComparison {
+            left_column,
+            comparison,
+            right_column,
+        } => {
+            let (Some(left), Some(right)) = (
+                unit.column_statistics.get(left_column),
+                unit.column_statistics.get(right_column),
+            ) else {
+                return true;
+            };
+            if unit.num_rows.is_some_and(|rows| {
+                left.null_count == Some(rows) || right.null_count == Some(rows)
+            }) {
+                return false;
+            }
+            column_intervals_may_match(*comparison, left, right)
+        }
         StatisticsPredicate::IsNull { column } => unit
             .column_statistics
             .get(column)
@@ -177,6 +221,54 @@ fn column_may_match(
         return true;
     };
     comparison_may_match_bounds(comparison, literal, min, max)
+}
+
+fn column_intervals_may_match(
+    comparison: StatisticsComparison,
+    left: &ColumnStatistics,
+    right: &ColumnStatistics,
+) -> bool {
+    let (Some(left_min), Some(left_max), Some(right_min), Some(right_max)) = (
+        left.min_value.as_ref(),
+        left.max_value.as_ref(),
+        right.min_value.as_ref(),
+        right.max_value.as_ref(),
+    ) else {
+        return true;
+    };
+    if left.min_max_complete != Some(true) || right.min_max_complete != Some(true) {
+        return true;
+    }
+    if left.nan_count.is_some_and(|count| count > 0)
+        || right.nan_count.is_some_and(|count| count > 0)
+    {
+        return true;
+    }
+
+    let (Some(left_order), Some(right_order), Some(left_valid), Some(right_valid)) = (
+        left_min.try_cmp(right_max),
+        left_max.try_cmp(right_min),
+        left_min.try_cmp(left_max),
+        right_min.try_cmp(right_max),
+    ) else {
+        return true;
+    };
+    if left_valid.is_gt() || right_valid.is_gt() {
+        return true;
+    }
+
+    match comparison {
+        StatisticsComparison::Equal => {
+            left_order != Ordering::Greater && right_order != Ordering::Greater
+        }
+        StatisticsComparison::NotEqual => {
+            left_min != left_max || right_min != right_max || left_min != right_min
+        }
+        StatisticsComparison::Less => left_order == Ordering::Less,
+        StatisticsComparison::LessOrEqual => left_order != Ordering::Greater,
+        StatisticsComparison::Greater => right_order == Ordering::Greater,
+        StatisticsComparison::GreaterOrEqual => right_order != Ordering::Greater,
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +424,67 @@ mod tests {
             &LogicalLiteral::Date(20),
             &min,
             &max
+        ));
+    }
+
+    #[test]
+    fn column_comparisons_prune_only_when_intervals_prove_no_match() {
+        let mut unit = row_group(LogicalLiteral::Int64(1), LogicalLiteral::Int64(10));
+        unit.column_statistics.insert(
+            "right".into(),
+            ColumnStatistics {
+                null_count: Some(0),
+                min_value: Some(LogicalLiteral::Int64(11)),
+                max_value: Some(LogicalLiteral::Int64(20)),
+                min_max_complete: Some(true),
+                ..ColumnStatistics::default()
+            },
+        );
+        let predicate = StatisticsPredicate::ColumnComparison {
+            left_column: "value".into(),
+            comparison: StatisticsComparison::Greater,
+            right_column: "right".into(),
+        };
+        assert!(!may_match_data_unit(&predicate, &unit));
+
+        let inclusive = StatisticsPredicate::ColumnComparison {
+            left_column: "value".into(),
+            comparison: StatisticsComparison::LessOrEqual,
+            right_column: "right".into(),
+        };
+        assert!(may_match_data_unit(&inclusive, &unit));
+    }
+
+    #[test]
+    fn column_comparisons_fail_open_for_unknown_or_incompatible_bounds() {
+        let mut unit = row_group(LogicalLiteral::Int64(1), LogicalLiteral::Int64(10));
+        unit.column_statistics.insert(
+            "right".into(),
+            ColumnStatistics {
+                min_value: Some(LogicalLiteral::String("a".into())),
+                max_value: Some(LogicalLiteral::String("z".into())),
+                min_max_complete: Some(true),
+                ..ColumnStatistics::default()
+            },
+        );
+        let predicate = StatisticsPredicate::ColumnComparison {
+            left_column: "value".into(),
+            comparison: StatisticsComparison::Less,
+            right_column: "right".into(),
+        };
+        assert!(may_match_data_unit(&predicate, &unit));
+
+        unit.column_statistics.get_mut("right").unwrap().min_max_complete = Some(false);
+        assert!(may_match_data_unit(&predicate, &unit));
+    }
+
+    #[test]
+    fn ordinary_comparison_prunes_an_all_null_data_unit() {
+        let mut unit = row_group(LogicalLiteral::Int64(1), LogicalLiteral::Int64(10));
+        unit.column_statistics.get_mut("value").unwrap().null_count = Some(4);
+        assert!(!may_match_data_unit(
+            &comparison(StatisticsComparison::Greater, 5),
+            &unit
         ));
     }
 }

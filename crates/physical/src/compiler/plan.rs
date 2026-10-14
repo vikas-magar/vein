@@ -6,7 +6,8 @@ use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{
     AggOpCode, AggregatePlan, DataSource, FileFormat, FileScanTask, JoinOutput, JoinResidualPlan,
-    LimitSpec, MicroProgram, RegId, ScanPredicate, SortKey as PhysicalSortKey, SortPlan,
+    LimitSpec, MicroProgram, RegId, ScanPredicate, ScanPredicateStage,
+    SortKey as PhysicalSortKey, SortPlan,
 };
 use catalog::{StatisticsComparison, StatisticsPredicate};
 use error::VeinError;
@@ -519,53 +520,136 @@ impl PipelineCompiler {
         if filters.is_empty() {
             return Ok(None);
         }
-        let mut required = HashSet::new();
-        for filter in filters {
-            Self::collect_column_ids(filter, &mut required);
+        fn flatten_conjuncts(expression: &LogicalExpr, output: &mut Vec<LogicalExpr>) {
+            match expression {
+                LogicalExpr::BinaryOp {
+                    left,
+                    op: parser::ast::expr::BinaryOp::And,
+                    right,
+                    ..
+                } => {
+                    flatten_conjuncts(left, output);
+                    flatten_conjuncts(right, output);
+                }
+                _ => output.push(expression.clone()),
+            }
         }
-        let input = VeinSchema {
-            fields: schema
+
+        let mut conjuncts = Vec::new();
+        for filter in filters {
+            flatten_conjuncts(filter, &mut conjuncts);
+        }
+
+        let classes = conjuncts
+            .iter()
+            .map(|predicate| {
+                Self::scan_predicate_correlation_class(&Self::statistics_predicate(predicate))
+            })
+            .collect::<Option<Vec<_>>>();
+        let stage_filters = if let Some(classes) = classes {
+            let mut selective = Vec::new();
+            let mut correlated = Vec::new();
+            for (predicate, uses_column_comparison) in conjuncts.iter().cloned().zip(classes) {
+                if uses_column_comparison {
+                    correlated.push(predicate);
+                } else {
+                    selective.push(predicate);
+                }
+            }
+            let mut stages = Vec::with_capacity(2);
+            if !selective.is_empty() {
+                stages.push(selective);
+            }
+            if !correlated.is_empty() {
+                stages.push(correlated);
+            }
+            stages
+        } else {
+            // Unknown expressions stay in their original order; their semantics
+            // may make predicate reordering unsafe.
+            vec![conjuncts.clone()]
+        };
+
+        let mut stages = Vec::with_capacity(stage_filters.len());
+        for (stage_index, predicates) in stage_filters.into_iter().enumerate() {
+            let mut required = HashSet::new();
+            for predicate in &predicates {
+                Self::collect_column_ids(predicate, &mut required);
+            }
+            let input = VeinSchema {
+                fields: schema
+                    .fields
+                    .iter()
+                    .filter(|field| required.contains(&field.id))
+                    .cloned()
+                    .collect(),
+            };
+            if input.fields.len() != required.len() {
+                return Err(VeinError::planning(
+                    "scan predicate references a column that is absent from the scan schema",
+                    None,
+                ));
+            }
+            let register_count = input.fields.len() as RegId;
+            let mut compiler = BytecodeCompiler::new(register_count);
+            let result = compiler.compile_predicate(&predicates, &input)?;
+            let program = Arc::new(compiler.finish());
+            let input_columns = input
                 .fields
                 .iter()
-                .filter(|field| required.contains(&field.id))
-                .cloned()
-                .collect(),
-        };
-        if input.fields.len() != required.len() {
-            return Err(VeinError::planning(
-                "scan predicate references a column that is absent from the scan schema",
-                None,
-            ));
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>();
+            tracing::debug!(
+                target: "vein.optimizer",
+                event = "scan_predicate_stage_compiled",
+                stage_index,
+                predicate_count = predicates.len(),
+                input_columns = ?input_columns,
+                input_column_count = input.fields.len(),
+                register_count,
+                instruction_count = program.instructions.len(),
+                "scan_predicate_stage_compiled"
+            );
+            stages.push(ScanPredicateStage {
+                predicate_count: predicates.len(),
+                input: Arc::new(input),
+                program,
+                result,
+            });
         }
-        let register_count = input.fields.len() as RegId;
-        let mut compiler = BytecodeCompiler::new(register_count);
-        let result = compiler.compile_predicate(filters, &input)?;
-        let program = Arc::new(compiler.finish());
-        let input_columns = input
-            .fields
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>();
+
         tracing::debug!(
             target: "vein.optimizer",
             event = "scan_predicate_compiled",
-            predicate_count = filters.len(),
-            input_columns = ?input_columns,
-            input_column_count = input.fields.len(),
-            register_count,
-            instruction_count = program.instructions.len(),
+            predicate_count = conjuncts.len(),
+            stage_count = stages.len(),
+            stage_predicate_counts = ?stages.iter().map(|stage| stage.predicate_count).collect::<Vec<_>>(),
             "scan_predicate_compiled"
         );
         Ok(Some(Arc::new(ScanPredicate {
-            predicate_count: filters.len(),
-            input: Arc::new(input),
-            program,
-            result,
-            statistics: filters
+            predicate_count: conjuncts.len(),
+            stages,
+            statistics: conjuncts
                 .iter()
                 .map(Self::statistics_predicate)
                 .collect(),
         })))
+    }
+
+    fn scan_predicate_correlation_class(predicate: &StatisticsPredicate) -> Option<bool> {
+        match predicate {
+            StatisticsPredicate::Unknown => None,
+            StatisticsPredicate::ColumnComparison { .. } => Some(true),
+            StatisticsPredicate::And(children) | StatisticsPredicate::Or(children) => {
+                let mut contains_column_comparison = false;
+                for child in children {
+                    contains_column_comparison |=
+                        Self::scan_predicate_correlation_class(child)?;
+                }
+                Some(contains_column_comparison)
+            }
+            _ => Some(false),
+        }
     }
 
     /// Lowers the subset of a logical predicate whose truth can be bounded by
@@ -593,21 +677,29 @@ impl PipelineCompiler {
                         Self::statistics_predicate(right),
                     ]),
                     Op::Eq | Op::Neq | Op::Lt | Op::Leq | Op::Gt | Op::Geq => {
-                        let (column, comparison, literal) = match
-                            (left.as_ref(), right.as_ref())
-                        {
+                        match (left.as_ref(), right.as_ref()) {
                             (LogicalExpr::Column(column), LogicalExpr::Literal(literal)) => {
-                                (column, statistics_comparison(*op), literal)
+                                Predicate::Comparison {
+                                    column: column.name.clone(),
+                                    comparison: statistics_comparison(*op),
+                                    literal: literal.clone(),
+                                }
                             }
                             (LogicalExpr::Literal(literal), LogicalExpr::Column(column)) => {
-                                (column, statistics_comparison(reverse_comparison(*op)), literal)
+                                Predicate::Comparison {
+                                    column: column.name.clone(),
+                                    comparison: statistics_comparison(reverse_comparison(*op)),
+                                    literal: literal.clone(),
+                                }
                             }
-                            _ => return Predicate::Unknown,
-                        };
-                        Predicate::Comparison {
-                            column: column.name.clone(),
-                            comparison,
-                            literal: literal.clone(),
+                            (LogicalExpr::Column(left), LogicalExpr::Column(right)) => {
+                                Predicate::ColumnComparison {
+                                    left_column: left.name.clone(),
+                                    comparison: statistics_comparison(*op),
+                                    right_column: right.name.clone(),
+                                }
+                            }
+                            _ => Predicate::Unknown,
                         }
                     }
                     _ => Predicate::Unknown,
@@ -1149,6 +1241,37 @@ mod tests {
     }
 
     #[test]
+    fn statistics_lowering_preserves_column_to_column_comparisons() {
+        let left = Arc::new(ResolvedColumn::new(
+            ColumnId(10),
+            "l_shipdate",
+            None,
+            VeinDataType::Date32,
+        ));
+        let right = Arc::new(ResolvedColumn::new(
+            ColumnId(11),
+            "l_commitdate",
+            None,
+            VeinDataType::Date32,
+        ));
+        let expression = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(left)),
+            op: parser::ast::expr::BinaryOp::Lt,
+            right: Box::new(LogicalExpr::Column(right)),
+            return_type: VeinDataType::Boolean,
+        };
+
+        assert_eq!(
+            PipelineCompiler::statistics_predicate(&expression),
+            StatisticsPredicate::ColumnComparison {
+                left_column: "l_shipdate".into(),
+                comparison: StatisticsComparison::Less,
+                right_column: "l_commitdate".into(),
+            }
+        );
+    }
+
+    #[test]
     fn compiled_scan_predicate_reports_filter_count_and_narrow_input_columns() {
         let (schema, price) = schema();
         let predicate = || LogicalExpr::BinaryOp {
@@ -1163,9 +1286,80 @@ mod tests {
             .expect("two scan filters produce a predicate");
 
         assert_eq!(compiled.predicate_count, 2);
-        assert_eq!(compiled.input.fields.len(), 1);
-        assert_eq!(compiled.input.fields[0].name, "price");
-        assert!(!compiled.program.instructions.is_empty());
+        assert_eq!(compiled.stages.len(), 1);
+        assert_eq!(compiled.stages[0].predicate_count, 2);
+        assert_eq!(compiled.stages[0].input.fields.len(), 1);
+        assert_eq!(compiled.stages[0].input.fields[0].name, "price");
+        assert!(!compiled.stages[0].program.instructions.is_empty());
+    }
+
+    #[test]
+    fn scan_predicate_stages_literal_filters_before_column_correlations() {
+        let left = Arc::new(ResolvedColumn::new(
+            ColumnId(100),
+            "left_key",
+            None,
+            VeinDataType::Int64,
+        ));
+        let right = Arc::new(ResolvedColumn::new(
+            ColumnId(101),
+            "right_key",
+            None,
+            VeinDataType::Int64,
+        ));
+        let amount = Arc::new(ResolvedColumn::new(
+            ColumnId(102),
+            "amount",
+            None,
+            VeinDataType::Int64,
+        ));
+        let label = Arc::new(ResolvedColumn::new(
+            ColumnId(103),
+            "label",
+            None,
+            VeinDataType::Utf8,
+        ));
+        let schema = VeinSchema::new(vec![
+            Arc::clone(&left),
+            Arc::clone(&right),
+            Arc::clone(&amount),
+            Arc::clone(&label),
+        ]);
+        let correlated = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(Arc::clone(&left))),
+            op: parser::ast::expr::BinaryOp::Lt,
+            right: Box::new(LogicalExpr::Column(Arc::clone(&right))),
+            return_type: VeinDataType::Boolean,
+        };
+        let literal = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(Arc::clone(&amount))),
+            op: parser::ast::expr::BinaryOp::Gt,
+            right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(0))),
+            return_type: VeinDataType::Boolean,
+        };
+
+        let compiled = PipelineCompiler::scan_predicate(&[correlated.clone(), literal], &schema)
+            .expect("compile staged scan predicates")
+            .expect("scan predicates produce a plan");
+
+        assert_eq!(compiled.predicate_count, 2);
+        assert_eq!(compiled.stages.len(), 2);
+        assert_eq!(compiled.stages[0].input.fields.len(), 1);
+        assert_eq!(compiled.stages[0].input.fields[0].name, "amount");
+        assert_eq!(compiled.stages[1].input.fields.len(), 2);
+        assert_eq!(compiled.stages[1].input.fields[0].name, "left_key");
+        assert_eq!(compiled.stages[1].input.fields[1].name, "right_key");
+
+        let unknown = LogicalExpr::Like {
+            expr: Box::new(LogicalExpr::Column(label)),
+            pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String("%urgent%".into()))),
+            negated: false,
+        };
+        let conservative = PipelineCompiler::scan_predicate(&[correlated, unknown], &schema)
+            .expect("compile conservative predicate order")
+            .expect("scan predicates produce a plan");
+        assert_eq!(conservative.stages.len(), 1);
+        assert_eq!(conservative.stages[0].predicate_count, 2);
     }
 
     #[test]
@@ -1214,18 +1408,16 @@ mod tests {
         assert_eq!(
             compiled.statistics,
             vec![
-                StatisticsPredicate::And(vec![
-                    StatisticsPredicate::Comparison {
-                        column: "shipdate".into(),
-                        comparison: StatisticsComparison::GreaterOrEqual,
-                        literal: LogicalLiteral::Date(100),
-                    },
-                    StatisticsPredicate::Comparison {
-                        column: "shipdate".into(),
-                        comparison: StatisticsComparison::Less,
-                        literal: LogicalLiteral::Date(200),
-                    },
-                ]),
+                StatisticsPredicate::Comparison {
+                    column: "shipdate".into(),
+                    comparison: StatisticsComparison::GreaterOrEqual,
+                    literal: LogicalLiteral::Date(100),
+                },
+                StatisticsPredicate::Comparison {
+                    column: "shipdate".into(),
+                    comparison: StatisticsComparison::Less,
+                    literal: LogicalLiteral::Date(200),
+                },
                 StatisticsPredicate::Unknown,
             ]
         );

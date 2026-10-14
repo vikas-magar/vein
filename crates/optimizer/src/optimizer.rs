@@ -24,6 +24,7 @@ use crate::context::{CatalogStatisticsProvider, OptimizationDiagnostics, Optimiz
 use crate::rule::{OptimizerRule, RuleType};
 use crate::rules::{
     ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule, FilterNormalizationRule,
+    FilterTransitivityRule,
     JoinPredicateTransitivityRule, PredicatePushdownRule, ScanFilterPushdownRule,
     ScanStatisticsPruningRule, ScalarAggregateDecorrelationRule,
 };
@@ -87,6 +88,7 @@ impl OptimizerPipeline {
             Arc::new(ConstantFoldingRule),
             Arc::new(ExpressionSimplificationRule),
             Arc::new(FilterNormalizationRule),
+            Arc::new(FilterTransitivityRule),
             Arc::new(ScanStatisticsPruningRule),
             Arc::new(JoinPredicateTransitivityRule),
             Arc::new(ExistsDecorrelationRule),

@@ -22,7 +22,7 @@ use exec::parquet_statistics::{file_units, table_statistics};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use plan::{CatalogProvider, TableFormat, TableMetadata, VeinSchema};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -645,14 +645,24 @@ fn parquet_schema(
 
     let file = File::open(path)
         .map_err(|error| VeinError::io(format!("open Parquet file '{}'", path.display()), error))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+    let metadata = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Optional)
+        .parse_and_finish(&file)
+        .map_err(|error| {
         VeinError::internal(format!(
             "read Parquet metadata from '{}': {error}",
             path.display()
         ))
     })?;
+    let metadata = Arc::new(metadata);
+    let reader = ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::new())
+        .map_err(|error| {
+            VeinError::internal(format!(
+                "derive Arrow schema from '{}': {error}",
+                path.display()
+            ))
+        })?;
     let schema = reader.schema().clone();
-    let metadata = Arc::clone(reader.metadata());
     if let Some(key) = key {
         metadata_store.insert(key, Arc::clone(&metadata));
         tracing::debug!(

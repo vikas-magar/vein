@@ -169,6 +169,14 @@ impl QueryMemoryTracker {
         self.inner.limit
     }
 
+    /// Whether this tracker uses the platform maximum as its memory limit.
+    ///
+    /// Operators that support spilling can use worker-local state only when
+    /// their reservations cannot trigger the bounded-memory spill path.
+    pub fn is_unlimited(&self) -> bool {
+        self.inner.limit == usize::MAX
+    }
+
     /// Bytes currently reserved by live operator state.
     pub fn used(&self) -> usize {
         self.inner.used.load(Ordering::Acquire)
