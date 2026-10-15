@@ -4,15 +4,16 @@ use std::collections::HashMap;
 
 use plan::{LogicalExpr, LogicalPlan, PlanTraversal};
 use parser::ast::query::SetOpKind;
-use crate::context::{StatisticsFreshness, StatisticsProvider};
-use super::{Estimate, EstimateConfidence, EstimateSource, SelectivityEstimator};
-use super::columns::{ColumnEstimate, RelationEstimate};
+use crate::context::StatisticsProvider;
+use super::{Estimate, EstimateSource, SelectivityEstimator};
+use super::columns::RelationEstimate;
 
+mod table;
 fn scan<'a, P: StatisticsProvider + ?Sized>(
     node: &'a LogicalPlan, provider: &'a P, model: &impl SelectivityEstimator,
 ) -> RelationEstimate<'a> {
     let LogicalPlan::Scan { table, schema, filters, .. } = node else { unreachable!(); };
-    let mut input = table_estimate(table, schema, provider);
+    let mut input = table::table_estimate(table, schema, provider);
     // Evaluate all pushed predicates against the same pre-filter population.
     let mut fraction = super::PredicateEstimate::logical(1.0, 0.0);
     for (index, predicate) in filters.iter().enumerate() {
@@ -26,77 +27,10 @@ fn scan<'a, P: StatisticsProvider + ?Sized>(
     input
 }
 
-fn table_estimate<'a, P: StatisticsProvider + ?Sized>(
-    table: &'a plan::TableMetadata, schema: &plan::VeinSchema, provider: &'a P,
-) -> RelationEstimate<'a> {
-    let Some(snapshot) = provider.table_statistics(table) else {
-        return RelationEstimate::new(Estimate::unknown(EstimateSource::MissingStatistics));
-    };
-    tracing::debug!(target: "vein.optimizer", event = "optimizer_statistics_snapshot",
-        table = %table.name, freshness = ?snapshot.freshness,
-        rows = ?snapshot.statistics.num_rows,
-        column_statistics = snapshot.statistics.column_statistics.len(),
-        "optimizer_statistics_snapshot");
-    if snapshot.freshness == StatisticsFreshness::Stale {
-        return RelationEstimate::new(Estimate::unknown(EstimateSource::StaleStatistics));
-    }
-    let Some(rows) = snapshot.statistics.num_rows else {
-        return RelationEstimate::new(Estimate::unknown(EstimateSource::MissingStatistics));
-    };
-    let mut input = RelationEstimate::new(Estimate::known(rows as f64,
-                                                          EstimateSource::Statistics, EstimateConfidence::Statistics));
-    for column in &schema.fields {
-        if let Some(stats) = snapshot.statistics.column_statistics.get(&column.name) {
-            let Some(summary) = ColumnEstimate::from_statistics(stats, rows, column.nullable) else {
-                return RelationEstimate::new(Estimate::unknown(EstimateSource::InvalidStatistics));
-            };
-            input.columns.insert(column.id, summary);
-        }
-    }
-    for group in &snapshot.statistics.column_groups {
-        let Some(distinct) = group.distinct_count.filter(|count| {
-            *count <= rows && (*count > 0 || rows == 0)
-        }) else {
-            continue;
-        };
-        if group.columns.is_empty()
-            || group.distinct_count_relative_error.is_some_and(|error| {
-                !error.is_finite() || !(0.0..=1.0).contains(&error)
-            })
-        {
-            continue;
-        }
-        let mut ids = Vec::with_capacity(group.columns.len());
-        for name in &group.columns {
-            let Some(column) = schema.fields.iter().find(|column| column.name == *name) else {
-                ids.clear();
-                break;
-            };
-            ids.push(column.id);
-        }
-        if ids.len() != group.columns.len() {
-            continue;
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.len() != group.columns.len() {
-            continue;
-        }
-        input.joint_distinct.insert(
-            ids,
-            Estimate::known(
-                distinct as f64,
-                EstimateSource::Statistics,
-                EstimateConfidence::Statistics,
-            ),
-        );
-    }
-    input
-}
 
 fn remap_relation<'a>(
     input: &RelationEstimate<'a>,
-    mapping: impl IntoIterator<Item = (plan::ColumnId, plan::ColumnId)>,
+    mapping: impl IntoIterator<Item=(plan::ColumnId, plan::ColumnId)>,
     schema: &plan::VeinSchema,
 ) -> RelationEstimate<'a> {
     let mapping = mapping.into_iter().collect::<HashMap<_, _>>();
