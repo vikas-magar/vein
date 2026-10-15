@@ -2,6 +2,8 @@
 //!
 //! Maps task descriptions onto concrete sources, sinks, and Vector VM execution.
 
+mod scan_work;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -458,81 +460,29 @@ fn partition_parquet_scan(
         );
         candidate_units = candidate_units.saturating_add(candidates.selected.len());
         if !candidates.selected.is_empty() {
-            let weights = candidates
-                .selected
-                .iter()
-                .map(|index| {
-                    metadata.row_groups()[*index]
-                        .total_byte_size()
-                        .max(1) as u64
-                })
-                .collect::<Vec<_>>();
-            row_group_files.push(RowGroupFilePlan {
-                file,
-                groups: candidates.selected,
-                weights,
-            });
+            let weights = candidates.selected.iter().map(|index| {
+                let group = metadata.row_group(*index);
+                let bytes = group.columns().iter().filter(|column| {
+                    scan.projected.fields.is_empty() || scan.projected.fields.iter()
+                        .any(|field| column.column_path().parts().first() == Some(&field.name))
+                }).fold(0_u64, |sum, column| sum.saturating_add(column.compressed_size().max(1) as u64));
+                bytes.max(1)
+            }).collect::<Vec<_>>();
+            row_group_files.push((file, candidates.selected, weights));
         }
     }
 
-    // One reader per range avoids reopening a file for every row group. Allocate
-    // additional ranges to the files with the most estimated bytes, up to the
-    // executor's parallelism and the number of candidate row groups.
-    let fixed_units = whole_file_work.len()
-        + row_group_files
-            .iter()
-            .map(|file| contiguous_row_group_run_count(&file.groups))
-            .sum::<usize>();
-    let candidate_work_units = whole_file_work.len()
-        + row_group_files
-            .iter()
-            .map(|file| file.groups.len())
-            .sum::<usize>();
-    let target_work_units = max_parallelism
-        .max(fixed_units)
-        .min(candidate_work_units);
-    let mut range_counts = row_group_files
-        .iter()
-        .map(|file| contiguous_row_group_run_count(&file.groups))
-        .collect::<Vec<_>>();
-    let mut remaining_ranges = target_work_units.saturating_sub(fixed_units);
-    while remaining_ranges > 0 {
-        let mut best = None;
-        for (index, file) in row_group_files.iter().enumerate() {
-            if range_counts[index] >= file.groups.len() {
-                continue;
-            }
-            let Some(best_index) = best else {
-                best = Some(index);
-                continue;
-            };
-            let file_weight = file.weights.iter().copied().sum::<u64>() as u128;
-            let best_weight = row_group_files[best_index]
-                .weights
-                .iter()
-                .copied()
-                .sum::<u64>() as u128;
-            if file_weight * range_counts[best_index] as u128
-                > best_weight * range_counts[index] as u128
-            {
-                best = Some(index);
-            }
-        }
-        let Some(index) = best else {
-            break;
-        };
-        range_counts[index] += 1;
-        remaining_ranges -= 1;
-    }
-
+    // Keep one active and one ready morsel per worker. More work than workers
+    // permits stealing while amortizing reader setup over adjacent row groups.
+    // Compressed bytes cover only projected columns, including filter inputs.
+    let total_weight = row_group_files.iter().flat_map(|(_, _, weights)| weights)
+        .fold(0_u64, |sum, weight| sum.saturating_add(*weight));
+    let target_bytes = (max_parallelism > 1).then(|| total_weight
+        .div_ceil(max_parallelism.saturating_mul(2).max(1) as u64).max(1));
     let mut work = whole_file_work;
-    for (file, range_count) in row_group_files.into_iter().zip(range_counts) {
-        for range in weighted_row_group_ranges(
-            &file.groups,
-            &file.weights,
-            range_count,
-        ) {
-            work.push(file_scan_work_unit(scan, file.file, Some(range)));
+    for (file, groups, weights) in row_group_files {
+        for range in scan_work::row_group_ranges(groups.into_iter().zip(weights), target_bytes) {
+            work.push(file_scan_work_unit(scan, file, Some(range)));
         }
     }
 
@@ -556,116 +506,6 @@ fn partition_parquet_scan(
     Ok(work)
 }
 
-struct RowGroupFilePlan<'a> {
-    file: &'a str,
-    groups: Vec<usize>,
-    weights: Vec<u64>,
-}
-
-fn contiguous_row_group_run_count(groups: &[usize]) -> usize {
-    let Some((_, rest)) = groups.split_first() else {
-        return 0;
-    };
-    1 + rest
-        .iter()
-        .zip(groups.iter())
-        .filter(|(current, previous)| **current != previous.saturating_add(1))
-        .count()
-}
-
-fn weighted_row_group_ranges(
-    groups: &[usize],
-    weights: &[u64],
-    range_count: usize,
-) -> Vec<std::ops::Range<usize>> {
-    if groups.is_empty() || weights.len() != groups.len() || range_count == 0 {
-        return Vec::new();
-    }
-
-    // A reader range must never bridge a row group rejected by statistics.
-    // Split the candidate ordinals into contiguous runs first, then distribute
-    // any additional parallel ranges within those runs by estimated bytes.
-    let mut runs = Vec::new();
-    let mut run_start = 0usize;
-    for index in 1..groups.len() {
-        if groups[index] != groups[index - 1].saturating_add(1) {
-            runs.push(run_start..index);
-            run_start = index;
-        }
-    }
-    runs.push(run_start..groups.len());
-
-    let range_count = range_count.max(runs.len()).min(groups.len());
-    let mut run_range_counts = vec![1usize; runs.len()];
-    let mut remaining_ranges = range_count - runs.len();
-    while remaining_ranges > 0 {
-        let mut best_run = None;
-        for (index, run) in runs.iter().enumerate() {
-            if run_range_counts[index] >= run.len() {
-                continue;
-            }
-            let weight = weights[run.clone()]
-                .iter()
-                .copied()
-                .fold(0u64, u64::saturating_add) as u128;
-            let Some(best) = best_run else {
-                best_run = Some(index);
-                continue;
-            };
-            let best_weight = weights[runs[best].clone()]
-                .iter()
-                .copied()
-                .fold(0u64, u64::saturating_add) as u128;
-            if weight * run_range_counts[best] as u128
-                > best_weight * run_range_counts[index] as u128
-            {
-                best_run = Some(index);
-            }
-        }
-        let Some(index) = best_run else {
-            break;
-        };
-        run_range_counts[index] += 1;
-        remaining_ranges -= 1;
-    }
-
-    let mut ranges = Vec::with_capacity(range_count);
-    for (run, run_range_count) in runs.into_iter().zip(run_range_counts) {
-        let mut chunk_start = run.start;
-        let mut remaining_weight = weights[run.clone()]
-            .iter()
-            .copied()
-            .fold(0u64, u64::saturating_add);
-        for range_index in 0..run_range_count {
-            let ranges_left = run_range_count - range_index;
-            let mut chunk_end = chunk_start;
-            let mut chunk_weight = 0u64;
-            if ranges_left == 1 {
-                chunk_end = run.end;
-                chunk_weight = remaining_weight;
-            } else {
-                let target_weight = remaining_weight.div_ceil(ranges_left as u64);
-                // Keep at least one candidate for every range that follows.
-                // A skewed final row group can make the byte target unreachable
-                // before this limit; stop there rather than consuming the run.
-                let max_chunk_end = run.end - (ranges_left - 1);
-                while chunk_end < max_chunk_end {
-                    chunk_weight = chunk_weight.saturating_add(weights[chunk_end]);
-                    chunk_end += 1;
-                    if chunk_weight >= target_weight {
-                        break;
-                    }
-                }
-            }
-            let first_group = groups[chunk_start];
-            let last_group = groups[chunk_end - 1];
-            ranges.push(first_group..last_group.saturating_add(1));
-            remaining_weight = remaining_weight.saturating_sub(chunk_weight);
-            chunk_start = chunk_end;
-        }
-    }
-    ranges
-}
 
 fn file_scan_work_unit(
     scan: &FileScanTask,
@@ -745,55 +585,6 @@ mod tests {
         reader.metadata().as_ref().clone()
     }
 
-    #[test]
-    fn weighted_row_group_ranges_cover_file_once_and_keep_each_candidate() {
-        let selected = [1, 4, 8];
-        let weights = [2, 4, 2];
-        let ranges = weighted_row_group_ranges(&selected, &weights, 2);
-
-        assert_eq!(ranges, vec![1..2, 4..5, 8..9]);
-        assert!(ranges.iter().all(|range| range.start < range.end));
-        for group in selected {
-            assert_eq!(
-                ranges.iter().filter(|range| range.contains(&group)).count(),
-                1,
-                "candidate row group {group} must be assigned exactly once"
-            );
-        }
-        for group in [0, 2, 3, 5, 6, 7, 9] {
-            assert!(
-                ranges.iter().all(|range| !range.contains(&group)),
-                "rejected row group {group} must not be included in scheduled ranges"
-            );
-        }
-    }
-
-    #[test]
-    fn weighted_row_group_ranges_assign_all_candidates_to_last_range() {
-        let groups = (0..17).collect::<Vec<_>>();
-        let weights = vec![1; groups.len()];
-
-        let ranges = weighted_row_group_ranges(&groups, &weights, 2);
-
-        assert_eq!(ranges, vec![0..9, 9..17]);
-    }
-
-    #[test]
-    fn weighted_row_group_ranges_reserve_candidates_when_byte_target_is_unreachable() {
-        let groups = [0, 1, 2];
-        let weights = [1, 1, 100];
-
-        let ranges = weighted_row_group_ranges(&groups, &weights, 3);
-
-        assert_eq!(ranges, vec![0..1, 1..2, 2..3]);
-        for group in groups {
-            assert_eq!(
-                ranges.iter().filter(|range| range.contains(&group)).count(),
-                1,
-                "candidate row group {group} must be assigned exactly once"
-            );
-        }
-    }
 
     #[test]
     fn parquet_scan_partitions_cached_footer_by_available_parallelism() {
@@ -828,7 +619,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges.len(), 5);
         assert_eq!(ranges.first().map(|range| range.start), Some(0));
         assert_eq!(ranges.last().map(|range| range.end), Some(5));
         assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
@@ -893,5 +684,36 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ranges, vec![1..2], "only the row group spanning build bounds remains scheduled");
+    }
+
+    #[test]
+    fn parallel_parquet_work_covers_every_group_across_files_once() {
+        for (file_count, groups_per_file, workers) in [(2, 5, 3), (5, 17, 8), (7, 3, 4)] {
+            let dir = tempfile::tempdir().expect("temporary directory");
+            let metadata_store = MetadataStore::new();
+            let files = (0..file_count).map(|index| {
+                let path = dir.path().join(format!("part-{index}.parquet"));
+                let metadata = Arc::new(write_row_groups(&path, groups_per_file));
+                let key = MetadataKey::for_file(PARQUET_FOOTER, &path).unwrap();
+                metadata_store.insert(key, metadata);
+                path.to_string_lossy().into_owned()
+            }).collect::<Vec<_>>();
+            let scan = FileScanTask {
+                files: files.clone(), format: FileFormat::Parquet, byte_range: None,
+                scan_unit_range: None, projected: Arc::new(types::VeinSchema::empty()),
+                dictionary_columns: Vec::new(), pushdown: None, task_id: TaskId::new(),
+                catalog_snapshot: None,
+            };
+            let work = partition_parquet_scan(&scan, &metadata_store, workers, None).unwrap();
+            assert!(work.len() > workers);
+            for file in files {
+                let mut groups = work.iter().filter_map(|source| {
+                    let DataSource::File(task) = source else { panic!("expected file work") };
+                    (task.files == [file.clone()]).then(|| task.scan_unit_range.clone().unwrap())
+                }).flatten().collect::<Vec<_>>();
+                groups.sort_unstable();
+                assert_eq!(groups, (0..groups_per_file).collect::<Vec<_>>());
+            }
+        }
     }
 }

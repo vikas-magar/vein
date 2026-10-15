@@ -4,130 +4,13 @@ use error::{Result, VeinError};
 
 use crate::LogicalLiteral;
 
-/// A supported temporal field used by temporal functions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TemporalUnit {
-    /// Calendar year.
-    Year,
-    /// Three-month calendar quarter.
-    Quarter,
-    /// Calendar month.
-    Month,
-    /// ISO-style week beginning on Monday.
-    Week,
-    /// Calendar day.
-    Day,
-    /// Hour.
-    Hour,
-    /// Minute.
-    Minute,
-    /// Second.
-    Second,
-    /// Millisecond.
-    Millisecond,
-    /// Microsecond.
-    Microsecond,
-    /// Nanosecond.
-    Nanosecond,
-}
-
-impl TemporalUnit {
-    /// Every unit supported by `SHIFT` and `TRUNCATE`.
-    pub const ALL: [Self; 11] = [
-        Self::Year,
-        Self::Quarter,
-        Self::Month,
-        Self::Week,
-        Self::Day,
-        Self::Hour,
-        Self::Minute,
-        Self::Second,
-        Self::Millisecond,
-        Self::Microsecond,
-        Self::Nanosecond,
-    ];
-
-    /// Parses a case-insensitive singular or plural unit name.
-    pub fn parse(unit: &str) -> Result<Self> {
-        match unit.trim().to_ascii_lowercase().as_str() {
-            "year" | "years" => Ok(Self::Year),
-            "quarter" | "quarters" => Ok(Self::Quarter),
-            "month" | "months" => Ok(Self::Month),
-            "week" | "weeks" => Ok(Self::Week),
-            "day" | "days" => Ok(Self::Day),
-            "hour" | "hours" => Ok(Self::Hour),
-            "minute" | "minutes" => Ok(Self::Minute),
-            "second" | "seconds" => Ok(Self::Second),
-            "millisecond" | "milliseconds" => Ok(Self::Millisecond),
-            "microsecond" | "microseconds" => Ok(Self::Microsecond),
-            "nanosecond" | "nanoseconds" => Ok(Self::Nanosecond),
-            _ => Err(VeinError::semantic(format!("unknown temporal unit '{unit}'"), None)),
-        }
-    }
-
-    /// Returns the canonical singular unit name used for runtime dispatch.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Year => "year",
-            Self::Quarter => "quarter",
-            Self::Month => "month",
-            Self::Week => "week",
-            Self::Day => "day",
-            Self::Hour => "hour",
-            Self::Minute => "minute",
-            Self::Second => "second",
-            Self::Millisecond => "millisecond",
-            Self::Microsecond => "microsecond",
-            Self::Nanosecond => "nanosecond",
-        }
-    }
-
-    /// Canonical runtime function registered for this truncation unit.
-    pub const fn truncate_function_name(self) -> &'static str {
-        match self {
-            Self::Year => "TRUNCATE_YEAR",
-            Self::Quarter => "TRUNCATE_QUARTER",
-            Self::Month => "TRUNCATE_MONTH",
-            Self::Week => "TRUNCATE_WEEK",
-            Self::Day => "TRUNCATE_DAY",
-            Self::Hour => "TRUNCATE_HOUR",
-            Self::Minute => "TRUNCATE_MINUTE",
-            Self::Second => "TRUNCATE_SECOND",
-            Self::Millisecond => "TRUNCATE_MILLISECOND",
-            Self::Microsecond => "TRUNCATE_MICROSECOND",
-            Self::Nanosecond => "TRUNCATE_NANOSECOND",
-        }
-    }
-
-    /// Whether this unit can truncate the given Vein temporal type.
-    pub fn supports(self, data_type: &crate::VeinDataType) -> bool {
-        use crate::VeinDataType;
-        match data_type {
-            VeinDataType::Date32 | VeinDataType::Date64 => matches!(
-                self,
-                Self::Year | Self::Quarter | Self::Month | Self::Week | Self::Day
-            ),
-            VeinDataType::Timestamp(_, None) => true,
-            VeinDataType::Time32(_) | VeinDataType::Time64(_) => matches!(
-                self,
-                Self::Day
-                    | Self::Hour
-                    | Self::Minute
-                    | Self::Second
-                    | Self::Millisecond
-                    | Self::Microsecond
-                    | Self::Nanosecond
-            ),
-            _ => false,
-        }
-    }
-}
+mod unit;
+pub use unit::TemporalUnit;
 
 /// Converts an integer amount and temporal unit into an interval literal.
 ///
 /// Years and months use the interval month field, days use the day field, and
-/// sub-day units use nanoseconds.
-/// Conversion is checked so out-of-range values fail during binding.
+/// sub-day units use nanoseconds. Conversion is checked so out-of-range values fail during binding.
 pub fn interval_from_unit(amount: i64, unit: &str) -> Result<LogicalLiteral> {
     let parsed = TemporalUnit::parse(unit)?;
     let (months, days, nanos) = match parsed {
@@ -204,7 +87,6 @@ pub fn truncate_epoch_value(
         .checked_mul(units_per_day)
         .ok_or_else(|| VeinError::semantic("truncated temporal value is out of range", None))
 }
-
 fn truncate_subday(value: i64, unit: TemporalUnit, units_per_second: Option<i64>) -> Result<i64> {
     let units_per_second = units_per_second
         .ok_or_else(|| VeinError::internal("sub-day truncation requires a time scale"))?;
@@ -269,88 +151,4 @@ fn checked_nanos(amount: i64, nanos_per_unit: i64, unit: &str) -> Result<i64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn converts_calendar_and_subday_units() {
-        let cases = [
-            (2, "YEAR", (24, 0, 0)),
-            (-3, "months", (-3, 0, 0)),
-            (4, "DAY", (0, 4, 0)),
-            (-5, "hours", (0, 0, -18_000_000_000_000)),
-            (6, "minute", (0, 0, 360_000_000_000)),
-            (7, "seconds", (0, 0, 7_000_000_000)),
-            (8, "milliseconds", (0, 0, 8_000_000)),
-            (9, "microsecond", (0, 0, 9_000)),
-            (10, "nanoseconds", (0, 0, 10)),
-        ];
-
-        for (amount, unit, expected) in cases {
-            assert_eq!(
-                interval_from_unit(amount, unit).unwrap(),
-                LogicalLiteral::Interval {
-                    months: expected.0,
-                    days: expected.1,
-                    nanos: expected.2,
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_and_out_of_range_units() {
-        assert!(interval_from_unit(1, "fortnight").is_err());
-        assert!(interval_from_unit(i64::MAX, "year").is_err());
-        assert!(interval_from_unit(i64::MAX, "day").is_err());
-        assert!(interval_from_unit(i64::MAX, "second").is_err());
-    }
-
-    #[test]
-    fn truncates_calendar_units_with_epoch_and_leap_year_edges() {
-        let march_31 = days_from_civil(2024, 3, 31);
-        assert_eq!(
-            truncate_epoch_value(march_31, TemporalUnit::Quarter, None, 1, true, false).unwrap(),
-            days_from_civil(2024, 1, 1)
-        );
-        assert_eq!(
-            truncate_epoch_value(march_31, TemporalUnit::Month, None, 1, true, false).unwrap(),
-            days_from_civil(2024, 3, 1)
-        );
-        assert_eq!(
-            truncate_epoch_value(0, TemporalUnit::Week, None, 1, true, false).unwrap(),
-            -3
-        );
-        assert_eq!(
-            truncate_epoch_value(-1, TemporalUnit::Week, None, 1, true, false).unwrap(),
-            -3
-        );
-        assert_eq!(
-            truncate_epoch_value(march_31, TemporalUnit::Year, None, 1, true, false).unwrap(),
-            days_from_civil(2024, 1, 1)
-        );
-    }
-
-    #[test]
-    fn truncates_subday_values_using_physical_scale_and_euclidean_floor() {
-        assert_eq!(
-            truncate_epoch_value(
-                -1_000_000_001,
-                TemporalUnit::Second,
-                Some(1_000_000_000),
-                86_400_000_000_000,
-                false,
-                false,
-            )
-                .unwrap(),
-            -2_000_000_000
-        );
-        assert_eq!(
-            truncate_epoch_value(45_123_456, TemporalUnit::Minute, Some(1_000_000), 86_400_000_000, false, true)
-                .unwrap(),
-            0
-        );
-        assert!(truncate_epoch_value(1, TemporalUnit::Hour, None, 1, true, false).is_err());
-        assert!(truncate_epoch_value(1, TemporalUnit::Month, None, 86_400_000_000, false, true).is_err());
-    }
-}
+mod tests;

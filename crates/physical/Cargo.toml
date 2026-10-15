@@ -11,6 +11,7 @@ arrow = { workspace = true }
 catalog = { path = "../catalog" }
 common = { path = "../common" }
 error = { path = "../error" }
+optimizer = { path = "../optimizer" }
 parser = { path = "../parser" }
 plan = { path = "../plan" }
 tracing = { workspace = true }

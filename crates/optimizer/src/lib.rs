@@ -9,6 +9,7 @@
 pub mod context;
 
 /// Borrowed metadata estimates and extensible cardinality/selectivity strategies.
+/// Includes validated scan-schema bindings shared with physical predicate staging.
 pub mod estimation;
 
 mod statistics;

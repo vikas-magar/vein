@@ -1,7 +1,9 @@
 use crate::ast::data_type::DataType;
 use crate::ast::query::Query;
 use crate::token::Span;
-use ordered_float::OrderedFloat;
+mod literal;
+pub use literal::Literal;
+
 
 /// An expression node together with the source span it covers.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -175,94 +177,5 @@ pub enum Expr<'a> {
     },
 }
 
-/// A binary operator.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum BinaryOp {
-    /// `+`
-    Plus,
-    /// `-`
-    Minus,
-    /// `*`
-    Multiply,
-    /// `/`
-    Divide,
-    /// `%`
-    Modulo,
-    /// `||`
-    Concat,
-    /// `=`
-    Eq,
-    /// `<>`
-    Neq,
-    /// `<`
-    Lt,
-    /// `>`
-    Gt,
-    /// `<=`
-    Leq,
-    /// `>=`
-    Geq,
-    /// `AND`
-    And,
-    /// `OR`
-    Or,
-}
-
-/// A unary operator.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum UnaryOp {
-    /// `NOT`
-    Not,
-    /// unary `-`
-    Negate,
-    /// unary `+`
-    Plus,
-    /// `IS NULL`
-    IsNull,
-    /// `IS NOT NULL`
-    IsNotNull,
-}
-
-/// A literal value.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum Literal {
-    /// `NULL`
-    Null,
-    /// `TRUE` / `FALSE`
-    Boolean(bool),
-    /// An integer literal.
-    Int(i64),
-    /// An exact decimal literal: unscaled value, precision, and scale.
-    Decimal(i128, u8, i8),
-    /// A floating-point literal.
-    Float(OrderedFloat<f64>),
-    /// A string literal, with escapes already resolved.
-    String(String),
-}
-
-impl PartialEq for Literal {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Literal::Null, Literal::Null) => true,
-            (Literal::Boolean(a), Literal::Boolean(b)) => a == b,
-            (Literal::Int(a), Literal::Int(b)) => a == b,
-            (Literal::Decimal(a, ap, as_), Literal::Decimal(b, bp, bs)) => {
-                a == b && ap == bp && as_ == bs
-            }
-            (Literal::Float(a), Literal::Float(b)) => a.0 == b.0,
-            (Literal::String(a), Literal::String(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_literal_nan_is_not_equal_to_itself() {
-        let nan = Literal::Float(OrderedFloat::from(f64::NAN));
-        assert!(nan != nan.clone());
-    }
-}
+mod operator;
+pub use operator::{BinaryOp, UnaryOp};
