@@ -1868,6 +1868,7 @@ dependencies = [
  "catalog",
  "common",
  "error",
+ "optimizer",
  "parser",
  "plan",
  "tracing",

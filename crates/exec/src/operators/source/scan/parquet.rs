@@ -16,6 +16,7 @@ use opendal::Operator;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowFilter};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
@@ -835,7 +836,7 @@ pub async fn execute_parquet_scan(
             })
             .unwrap_or_default();
         let runtime_filter_names = runtime_filters.names();
-        tracing::info!(
+        tracing::debug!(
             target: "vein.audit",
             event = "scan_started",
             path = %path,
@@ -924,6 +925,12 @@ pub async fn execute_parquet_scan(
             })?;
         let mut builder =
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_metadata);
+        let reader_metrics = if detailed_metrics_enabled {
+            ArrowReaderMetrics::enabled()
+        } else {
+            ArrowReaderMetrics::disabled()
+        };
+        builder = builder.with_metrics(reader_metrics.clone());
 
         // Rows per scanned batch, overridable with `VEIN_SCAN_BATCH_ROWS` so the
         // value can be measured rather than argued about.
@@ -1377,6 +1384,7 @@ pub async fn execute_parquet_scan(
         // VM programs process fewer rows and only decode their own input columns.
         let mut predicates: Vec<Box<dyn ArrowPredicate>> =
             Vec::with_capacity(pushdown.map_or(0, |predicate| predicate.stages.len()) + 1);
+        let mut stage_metrics = Vec::new();
         if let Some(pushdown) = pushdown {
             for (stage_index, stage) in pushdown.stages.iter().enumerate() {
                 let mask = ProjectionMask::roots(
@@ -1390,6 +1398,10 @@ pub async fn execute_parquet_scan(
                 let result = stage.result;
                 let stage_predicate_count = stage.predicate_count;
                 let predicate_metrics = Arc::clone(&predicate_metrics);
+                let metrics = Arc::new(ScanPredicateMetrics::default());
+                stage_metrics.push((stage_index, stage_predicate_count,
+                    stage.input.fields.iter().map(|field| field.name.clone()).collect::<Vec<_>>(),
+                    Arc::clone(&metrics)));
                 let predicate = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
                     let rows_in = batch.num_rows();
                     let input_array_bytes = if detailed_metrics_enabled {
@@ -1423,6 +1435,7 @@ pub async fn execute_parquet_scan(
                             eval_wall,
                             input_array_bytes,
                         );
+                        metrics.record_batch(rows_in, rows_kept, eval_wall, input_array_bytes);
                         tracing::trace!(
                             target: "vein.audit",
                             event = "scan_filter_batch",
@@ -1679,7 +1692,24 @@ pub async fn execute_parquet_scan(
         let io_avg_bytes = bytes_read_total.checked_div(io_ranges).unwrap_or(0);
         let first_poll_offcpu = first_poll_time.saturating_sub(first_poll_thread_cpu);
         let predicate_metrics = predicate_metrics.snapshot();
-        tracing::info!(
+        if detailed_metrics_enabled {
+            for (stage_index, predicate_count, input_columns, metrics) in stage_metrics {
+                let metrics = metrics.snapshot();
+                tracing::debug!(target: "vein.audit", event = "scan_predicate_stage_completed",
+                    path = %path, stage_index, predicate_count, input_columns = ?input_columns,
+                    batches = metrics.batches, rows_in = metrics.rows_in, rows_kept = metrics.rows_kept,
+                    eval_wall_us = metrics.eval_wall_us,
+                    input_array_bytes_seen = metrics.input_array_bytes,
+                    "scan predicate stage completed");
+            }
+            tracing::debug!(target: "vein.audit", event = "parquet_column_decode_metrics",
+                path = %path, columns = ?reader_metrics.column_metrics(),
+                records_decoded = ?reader_metrics.records_read_from_inner(),
+                records_reused = ?reader_metrics.records_read_from_cache(),
+                timing_scope = "sum_of_leaf_reader_call_elapsed_times;decompression_is_nested",
+                "Parquet column decoding completed");
+        }
+        tracing::debug!(
             target: "vein.audit",
             event = "scan_completed",
             path = %path,
@@ -1771,6 +1801,7 @@ pub async fn execute_parquet_scan(
             first_poll_offcpu_us = first_poll_offcpu.as_micros() as u64,
             rest_poll_us = rest_poll_time.as_micros() as u64,
             poll_thread_cpu_us = poll_thread_cpu.as_micros() as u64,
+            poll_offcpu_us = parquet_read_time.saturating_sub(poll_thread_cpu).as_micros() as u64,
             poll_count,
             first_poll_polls,
             io_calls,
@@ -1793,6 +1824,10 @@ pub async fn execute_parquet_scan(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "reader_metrics_tests.rs"]
+mod reader_metrics_tests;
 
 #[cfg(test)]
 mod tests {

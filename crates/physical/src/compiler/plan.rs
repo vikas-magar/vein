@@ -417,7 +417,11 @@ impl PipelineCompiler {
                 };
                 let scan_schema =
                     Self::projected_scan_schema(schema, projection.as_deref(), filters)?;
-                let pushdown = Self::scan_predicate(filters, schema)?;
+                let statistics = optimizer::estimation::ScanStatistics::new(schema, table.statistics.as_ref());
+                let pushdown = Self::scan_predicate_with_estimator(filters, schema, |predicate| {
+                    use optimizer::estimation::{SelectivityEstimator, StatisticsSelectivity};
+                    StatisticsSelectivity.estimate(predicate, &statistics).true_fraction.value()
+                })?;
                 Self::file_source(files, scan_schema, pushdown)
             }
             LogicalPlan::ExternalScan {
@@ -513,9 +517,18 @@ impl PipelineCompiler {
     /// The predicate is compiled against its own narrow input schema — input
     /// column `i` lands in VM register `i` — so the reader mounts a batch of just
     /// those columns and never touches the wider projected schema.
+    #[cfg(test)]
     fn scan_predicate(
         filters: &[LogicalExpr],
         schema: &VeinSchema,
+    ) -> Result<Option<Arc<ScanPredicate>>> {
+        Self::scan_predicate_with_estimator(filters, schema, |_| None)
+    }
+
+    fn scan_predicate_with_estimator(
+        filters: &[LogicalExpr],
+        schema: &VeinSchema,
+        estimate: impl Fn(&LogicalExpr) -> Option<f64>,
     ) -> Result<Option<Arc<ScanPredicate>>> {
         if filters.is_empty() {
             return Ok(None);
@@ -540,35 +553,7 @@ impl PipelineCompiler {
             flatten_conjuncts(filter, &mut conjuncts);
         }
 
-        let classes = conjuncts
-            .iter()
-            .map(|predicate| {
-                Self::scan_predicate_correlation_class(&Self::statistics_predicate(predicate))
-            })
-            .collect::<Option<Vec<_>>>();
-        let stage_filters = if let Some(classes) = classes {
-            let mut selective = Vec::new();
-            let mut correlated = Vec::new();
-            for (predicate, uses_column_comparison) in conjuncts.iter().cloned().zip(classes) {
-                if uses_column_comparison {
-                    correlated.push(predicate);
-                } else {
-                    selective.push(predicate);
-                }
-            }
-            let mut stages = Vec::with_capacity(2);
-            if !selective.is_empty() {
-                stages.push(selective);
-            }
-            if !correlated.is_empty() {
-                stages.push(correlated);
-            }
-            stages
-        } else {
-            // Unknown expressions stay in their original order; their semantics
-            // may make predicate reordering unsafe.
-            vec![conjuncts.clone()]
-        };
+        let stage_filters = super::scan_stages::group_predicates(&conjuncts, estimate);
 
         let mut stages = Vec::with_capacity(stage_filters.len());
         for (stage_index, predicates) in stage_filters.into_iter().enumerate() {
@@ -636,7 +621,7 @@ impl PipelineCompiler {
         })))
     }
 
-    fn scan_predicate_correlation_class(predicate: &StatisticsPredicate) -> Option<bool> {
+    pub(super) fn scan_predicate_correlation_class(predicate: &StatisticsPredicate) -> Option<bool> {
         match predicate {
             StatisticsPredicate::Unknown => None,
             StatisticsPredicate::ColumnComparison { .. } => Some(true),
@@ -656,7 +641,7 @@ impl PipelineCompiler {
     /// exact per-column statistics. Unknown expressions are retained as an
     /// explicit fail-open node, so combining them with safe conjuncts remains
     /// correct while still allowing independent bounds to prune.
-    fn statistics_predicate(expression: &LogicalExpr) -> StatisticsPredicate {
+    pub(super) fn statistics_predicate(expression: &LogicalExpr) -> StatisticsPredicate {
         use StatisticsPredicate as Predicate;
 
         match expression {
@@ -781,7 +766,7 @@ impl PipelineCompiler {
         Ok(VeinSchema { fields })
     }
 
-    fn collect_column_ids(expression: &LogicalExpr, output: &mut HashSet<plan::schema::ColumnId>) {
+    pub(super) fn collect_column_ids(expression: &LogicalExpr, output: &mut HashSet<plan::schema::ColumnId>) {
         match expression {
             LogicalExpr::Column(column) | LogicalExpr::OuterColumn(column) => {
                 output.insert(column.id);

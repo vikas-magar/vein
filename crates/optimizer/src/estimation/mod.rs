@@ -12,10 +12,12 @@ mod derive;
 mod estimate;
 mod join;
 mod selectivity;
+mod scan_statistics;
 
 pub use estimate::{Estimate, EstimateConfidence, EstimateSource};
 pub(crate) use join::inner_join;
 pub use selectivity::{ColumnStatisticsLookup, PredicateEstimate, SelectivityEstimator, StatisticsSelectivity};
+pub use scan_statistics::ScanStatistics;
 
 use plan::{LogicalPlan, PlanTraversal};
 use crate::context::StatisticsProvider;

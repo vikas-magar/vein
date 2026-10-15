@@ -1494,7 +1494,10 @@ impl DefaultTaskExecutor {
                                     let runtime = runtime.clone();
                                     let runtime_filters = runtime_filters.clone();
                                     workers.spawn_blocking(move || {
+                                        let worker_started = std::time::Instant::now();
                                         let mut bytes = 0u64;
+                                        let mut work_units = 0u64;
+                                        let mut source_elapsed = std::time::Duration::ZERO;
                                         let worker_tail: Box<dyn PipelineNode<DataChunkView>> =
                                             Box::new(SuppressFlush::new(local));
                                         let mut pipeline: Box<dyn PipelineNode<DataChunkView>> =
@@ -1534,6 +1537,7 @@ impl DefaultTaskExecutor {
                                                     attempt,
                                                 )?,
                                             };
+                                            let source_started = std::time::Instant::now();
                                             runtime.block_on(async {
                                                 tokio::select! {
                                                     biased;
@@ -1541,8 +1545,16 @@ impl DefaultTaskExecutor {
                                                     result = source.execute(pipeline.as_mut()).instrument(span.clone()) => result,
                                                 }
                                             })?;
+                                            source_elapsed += source_started.elapsed();
+                                            work_units += 1;
                                             bytes = bytes.saturating_add(source.bytes_read());
                                         }
+                                        tracing::info!(target: "vein.audit",
+                                            event = "scan_worker_completed",
+                                            task_id = %task_id, node_id, work_units, bytes_read = bytes,
+                                            source_elapsed_us = source_elapsed.as_micros() as u64,
+                                            elapsed_us = worker_started.elapsed().as_micros() as u64,
+                                            "scan worker completed");
                                         Ok((bytes, pipeline))
                                     });
                                 }

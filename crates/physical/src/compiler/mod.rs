@@ -6,6 +6,7 @@
 pub mod allocator;
 pub mod expr;
 pub mod plan;
+mod scan_stages;
 
 pub use allocator::RegisterAllocator;
 pub use expr::BytecodeCompiler;
