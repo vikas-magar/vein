@@ -259,7 +259,8 @@ fn column_intervals_may_match(
 
     match comparison {
         StatisticsComparison::Equal => {
-            left_order != Ordering::Greater && right_order != Ordering::Greater
+            // Intervals overlap when left_min <= right_max and left_max >= right_min.
+            left_order != Ordering::Greater && right_order != Ordering::Less
         }
         StatisticsComparison::NotEqual => {
             left_min != left_max || right_min != right_max || left_min != right_min
@@ -267,7 +268,7 @@ fn column_intervals_may_match(
         StatisticsComparison::Less => left_order == Ordering::Less,
         StatisticsComparison::LessOrEqual => left_order != Ordering::Greater,
         StatisticsComparison::Greater => right_order == Ordering::Greater,
-        StatisticsComparison::GreaterOrEqual => right_order != Ordering::Greater,
+        StatisticsComparison::GreaterOrEqual => right_order != Ordering::Less,
     }
 }
 
@@ -453,6 +454,61 @@ mod tests {
             right_column: "right".into(),
         };
         assert!(may_match_data_unit(&inclusive, &unit));
+    }
+
+    #[test]
+    fn column_comparison_interval_proofs_match_exhaustive_integer_values() {
+        let intervals = (-2_i64..=2)
+            .flat_map(|min| (min..=2).map(move |max| (min, max)))
+            .collect::<Vec<_>>();
+        let comparisons = [
+            StatisticsComparison::Equal,
+            StatisticsComparison::NotEqual,
+            StatisticsComparison::Less,
+            StatisticsComparison::LessOrEqual,
+            StatisticsComparison::Greater,
+            StatisticsComparison::GreaterOrEqual,
+        ];
+
+        for &(left_min, left_max) in &intervals {
+            for &(right_min, right_max) in &intervals {
+                let mut unit = row_group(
+                    LogicalLiteral::Int64(left_min),
+                    LogicalLiteral::Int64(left_max),
+                );
+                unit.column_statistics.insert(
+                    "right".into(),
+                    ColumnStatistics {
+                        min_value: Some(LogicalLiteral::Int64(right_min)),
+                        max_value: Some(LogicalLiteral::Int64(right_max)),
+                        min_max_complete: Some(true),
+                        ..ColumnStatistics::default()
+                    },
+                );
+                for comparison in comparisons {
+                    let predicate = StatisticsPredicate::ColumnComparison {
+                        left_column: "value".into(),
+                        comparison,
+                        right_column: "right".into(),
+                    };
+                    let any_match = (left_min..=left_max).any(|left| {
+                        (right_min..=right_max).any(|right| match comparison {
+                            StatisticsComparison::Equal => left == right,
+                            StatisticsComparison::NotEqual => left != right,
+                            StatisticsComparison::Less => left < right,
+                            StatisticsComparison::LessOrEqual => left <= right,
+                            StatisticsComparison::Greater => left > right,
+                            StatisticsComparison::GreaterOrEqual => left >= right,
+                        })
+                    });
+                    assert_eq!(
+                        may_match_data_unit(&predicate, &unit),
+                        any_match,
+                        "{comparison:?}: left=[{left_min}, {left_max}], right=[{right_min}, {right_max}]"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

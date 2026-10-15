@@ -459,6 +459,7 @@ fn bound_expression(bound: LiteralBound) -> LogicalExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Optimizer;
     use plan::{ResolvedColumn, TableMetadata, VeinSchema};
 
     fn field(id: usize, name: &str, data_type: VeinDataType) -> ResolvedColumnRef {
@@ -506,7 +507,7 @@ mod tests {
 
     fn scan_filters(plan: &LogicalPlan) -> &[LogicalExpr] {
         let LogicalPlan::Scan { filters, .. } = plan else {
-            panic!("expected scan, got {}", plan.node_name());
+            panic!("expected scan, got {}", plan.operator_name());
         };
         filters
     }

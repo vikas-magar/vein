@@ -353,12 +353,15 @@ pub struct HashJoin {
     /// The build rows this task consumed, for the flavours that owe unmatched
     /// ones. Kept here, not in the table, because the table is shared.
     matched_build: HashSet<(u32, u32)>,
-    /// The join's own accounting: rows in, matches found, and the time split
-    /// between finding them and assembling the output.
+    /// The join's accounting: rows in, matches found, and cumulative worker
+    /// elapsed times. Worker times are not additive query wall-clock times.
     probed_rows: u64,
     matched_rows: u64,
     probe_us: u64,
+    /// Output grouping and view construction, excluding downstream execution.
     view_compose_us: u64,
+    /// Time inside downstream push calls, including calls that return an error.
+    downstream_push_us: u64,
     residual_us: u64,
     /// Probe key conversions; residual expressions have their own VM reports.
     probe_key_materialization: MaterializationReport,
@@ -413,6 +416,7 @@ impl HashJoin {
             matched_rows: 0,
             probe_us: 0,
             view_compose_us: 0,
+            downstream_push_us: 0,
             residual_us: 0,
             probe_key_materialization: MaterializationReport::default(),
             probe_key_materialize_us: 0,
@@ -473,7 +477,6 @@ impl HashJoin {
         self.probed_rows += u64::from(probe_row_count);
         self.matched_rows += matches.len() as u64;
 
-        let started = Instant::now();
         if matches!(self.join_type, JoinType::Inner | JoinType::Cross) {
             self.forward_rows(
                 Some(&chunk),
@@ -486,7 +489,6 @@ impl HashJoin {
             let rows = output_rows(self.join_type, 0..probe_row_count, &matches, &[]);
             self.forward_rows(Some(&chunk), rows)?;
         }
-        self.view_compose_us += started.elapsed().as_micros() as u64;
         Ok(())
     }
 
@@ -597,6 +599,7 @@ impl HashJoin {
         probe: Option<&DataChunkView>,
         rows: impl IntoIterator<Item = super::rows::OutputRow>,
     ) -> Result<()> {
+        let grouping_started = Instant::now();
         for row in rows {
             let key = row.build.map(|(chunk, _)| chunk);
             let group = self.rows_by_build_chunk.entry(key).or_default();
@@ -605,9 +608,13 @@ impl HashJoin {
             }
             group.push(row);
         }
+        self.view_compose_us = self
+            .view_compose_us
+            .saturating_add(grouping_started.elapsed().as_micros() as u64);
 
         let mut build_chunk_order = std::mem::take(&mut self.build_chunk_order);
         for build_chunk in build_chunk_order.drain(..) {
+            let compose_started = Instant::now();
             let mut group = self
                 .rows_by_build_chunk
                 .remove(&build_chunk)
@@ -625,9 +632,17 @@ impl HashJoin {
             );
             group.clear();
             self.rows_by_build_chunk.insert(build_chunk, group);
+            self.view_compose_us = self
+                .view_compose_us
+                .saturating_add(compose_started.elapsed().as_micros() as u64);
             let view = composed?;
             if !view.is_empty() {
-                self.next.push(view)?;
+                let downstream_started = Instant::now();
+                let pushed = self.next.push(view);
+                self.downstream_push_us = self
+                    .downstream_push_us
+                    .saturating_add(downstream_started.elapsed().as_micros() as u64);
+                pushed?;
             }
         }
         self.build_chunk_order = build_chunk_order;
@@ -652,9 +667,7 @@ impl PipelineNode<DataChunkView> for HashJoin {
                 .collect();
             if !unmatched.is_empty() {
                 let rows = output_rows(self.join_type, 0..0, &[], &unmatched);
-                let started = Instant::now();
                 self.forward_rows(None, rows)?;
-                self.view_compose_us += started.elapsed().as_micros() as u64;
             }
         }
         tracing::info!(
@@ -664,6 +677,8 @@ impl PipelineNode<DataChunkView> for HashJoin {
             matched_rows = self.matched_rows,
             probe_us = self.probe_us,
             view_compose_us = self.view_compose_us,
+            downstream_push_us = self.downstream_push_us,
+            timing_scope = "sum_of_worker_elapsed_times",
             residual_us = self.residual_us,
             key_shared_columns = self.probe_key_materialization.shared_columns,
             key_gathered_columns = self.probe_key_materialization.gathered_columns,
@@ -743,6 +758,9 @@ impl PipelineNode<DataChunkView> for HashJoin {
         target.view_compose_us = target
             .view_compose_us
             .saturating_add(self.view_compose_us);
+        target.downstream_push_us = target
+            .downstream_push_us
+            .saturating_add(self.downstream_push_us);
         target.residual_us = target.residual_us.saturating_add(self.residual_us);
         target
             .probe_key_materialization
@@ -960,6 +978,75 @@ mod tests {
 
         fn flush(&mut self) -> Result<()> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn output_timing_excludes_downstream_on_probe_flush_and_error() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        struct ObservingSink {
+            fail: bool,
+            elapsed_us: Arc<AtomicU64>,
+        }
+
+        impl PipelineNode<DataChunkView> for ObservingSink {
+            fn push(&mut self, _view: DataChunkView) -> Result<()> {
+                let started = Instant::now();
+                // Make double-counting observable without asserting an upper
+                // latency limit, which would depend on machine load.
+                std::thread::sleep(Duration::from_millis(5));
+                self.elapsed_us
+                    .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if self.fail {
+                    Err(VeinError::internal("test sink failure"))
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        for join_type in [JoinType::Inner, JoinType::Right] {
+            for fail in [false, true] {
+                let downstream_elapsed = Arc::new(AtomicU64::new(0));
+                let mut join = HashJoin::new(
+                    Arc::new(build(&[7])),
+                    join_type,
+                    vec![OutputColumn::Probe(0), OutputColumn::Build(0)],
+                    vec![DataType::Int64],
+                    vec![DataType::Int64],
+                    Box::new(ObservingSink {
+                        fail,
+                        elapsed_us: Arc::clone(&downstream_elapsed),
+                    }),
+                );
+                let probe = DataChunk::from_vectors(vec![ints(&[7])]);
+                let started = Instant::now();
+                let outcome = if join_type == JoinType::Right {
+                    join.flush()
+                } else {
+                    join.push(probe)
+                };
+                let total_us = started.elapsed().as_micros() as u64;
+                let sink_us = downstream_elapsed.load(Ordering::Relaxed);
+                assert_eq!(outcome.is_err(), fail);
+                assert!(sink_us > 0, "the output must reach the observing sink");
+                assert!(
+                    join.downstream_push_us >= sink_us,
+                    "downstream time must include the sink even on errors"
+                );
+                assert!(join.view_compose_us.saturating_add(join.downstream_push_us) <= total_us);
+                assert!(
+                    join.view_compose_us.saturating_add(sink_us) <= total_us,
+                    "{join_type:?}, fail={fail}: composition {} us plus downstream {sink_us} us exceeds total {total_us} us",
+                    join.view_compose_us
+                );
+            }
         }
     }
 
@@ -1606,6 +1693,14 @@ mod tests {
             )
             .expect("probe second worker batch");
 
+        for (local, compose_us, downstream_us) in [(&mut first, 13, 17), (&mut second, 19, 23)] {
+            let local = local.as_mut()
+                .as_any_mut()
+                .downcast_mut::<HashJoin>()
+                .expect("worker-local hash join");
+            local.view_compose_us = compose_us;
+            local.downstream_push_us = downstream_us;
+        }
         first
             .combine_local(&mut canonical)
             .expect("combine first worker state");
@@ -1632,5 +1727,7 @@ mod tests {
         );
         assert_eq!(canonical.probed_rows, 3);
         assert_eq!(canonical.matched_rows, 5);
+        assert_eq!(canonical.view_compose_us, 32);
+        assert_eq!(canonical.downstream_push_us, 40);
     }
 }
