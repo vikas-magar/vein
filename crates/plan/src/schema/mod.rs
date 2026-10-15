@@ -1,12 +1,8 @@
-//! Data types and schema definitions for the planner
+//! Data types and schema definitions for the planner.
+//!
+//! Re-exports the unified types from the [`types`] crate to ensure a single,
+//! consistent source of truth across the engine while preserving backward compatibility.
 
-/// Module defining column identities and resolved columns
-pub mod column;
-/// Module defining supported data types
-pub mod data_type;
-/// Module defining query schemas
-pub mod schema_def;
-
-pub use column::{ColumnId, ResolvedColumn};
-pub use data_type::VeinDataType;
-pub use schema_def::{VeinSchema, VeinSchemaRef};
+pub use types::column::{self, ColumnId, ResolvedColumn, ResolvedColumnRef};
+pub use types::data_type::{self, VeinDataType};
+pub use types::schema::{self, VeinSchema, VeinSchemaRef};

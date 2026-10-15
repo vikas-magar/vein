@@ -15,11 +15,7 @@ macro_rules! id_newtype {
             Ord,
             Serialize,
             Deserialize,
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
         )]
-        #[rkyv(derive(Debug, PartialEq, Eq))]
         #[doc = concat!("A newtype identifier for `", stringify!($name), "`.")]
         $vis struct $name($vis $inner);
 
@@ -55,41 +51,12 @@ macro_rules! id_newtype {
     };
 }
 
+id_newtype!(RequestId, u128, pub);
 id_newtype!(QueryId, u128, pub);
 id_newtype!(TaskId, u128, pub);
 id_newtype!(StageId, u64, pub);
 id_newtype!(PartitionId, u16, pub);
 id_newtype!(NodeId, u128, pub);
-
-impl fmt::Display for ArchivedQueryId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:x}", self.0.to_native())
-    }
-}
-
-impl fmt::Display for ArchivedTaskId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:x}", self.0.to_native())
-    }
-}
-
-impl fmt::Display for ArchivedStageId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:x}", self.0.to_native())
-    }
-}
-
-impl fmt::Display for ArchivedPartitionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:x}", self.0.to_native())
-    }
-}
-
-impl fmt::Display for ArchivedNodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:x}", self.0.to_native())
-    }
-}
 
 #[cfg(test)]
 #[allow(missing_docs)]
@@ -142,14 +109,5 @@ mod tests {
     fn test_stage_id_default() {
         let default = StageId::default();
         assert_ne!(default.into_raw(), 0);
-    }
-
-    #[test]
-    fn test_archived_display_and_debug() {
-        let id = QueryId::from_raw(0xdeadbeef);
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&id).unwrap();
-        let archived = rkyv::access::<ArchivedQueryId, rkyv::rancor::Error>(&bytes).unwrap();
-        assert_eq!(archived.to_string(), "deadbeef");
-        assert_eq!(format!("{archived:?}"), "ArchivedQueryId(3735928559)");
     }
 }

@@ -72,6 +72,8 @@ pub fn keyword(text: &str) -> Option<TokenKind> {
         "rows" => Some(TokenKind::Rows),
         "range" => Some(TokenKind::Range),
         "groups" => Some(TokenKind::Groups),
+        "grouping" => Some(TokenKind::Grouping),
+        "sets" => Some(TokenKind::Sets),
         "unbounded" => Some(TokenKind::Unbounded),
         "preceding" => Some(TokenKind::Preceding),
         "following" => Some(TokenKind::Following),

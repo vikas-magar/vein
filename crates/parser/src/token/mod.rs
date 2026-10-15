@@ -153,6 +153,10 @@ pub enum TokenKind {
     Range,
     /// `GROUPS`
     Groups,
+    /// `GROUPING`
+    Grouping,
+    /// `SETS`
+    Sets,
     /// `UNBOUNDED`
     Unbounded,
     /// `PRECEDING`

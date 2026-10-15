@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use error::Result;
 use parser::ast::query::QueryNode;
-use plan::{LogicalPlan, VeinDataType, Volatility};
+use plan::{CatalogRevision, CatalogProvider, LogicalPlan, VeinDataType, Volatility};
 
 /// Supported runtimes for User-Defined Functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +19,12 @@ pub enum RuntimeKind {
 pub enum FunctionKind {
     /// Standard SQL scalar function
     Scalar,
+    /// Temporal date/time part extractor with a polymorphic temporal argument.
+    TemporalExtract,
+    /// Temporal shift lowered to the existing interval arithmetic expression.
+    TemporalShift,
+    /// Temporal truncation with a compile-time-selected field.
+    TemporalTruncate,
     /// Standard SQL aggregate function
     Aggregate,
     /// First-Class AI Operator (requires cost estimation)
@@ -48,6 +54,15 @@ pub trait FunctionRegistry: Send + Sync {
     fn resolve(&self, name: &str) -> Result<FunctionSignature>;
 }
 
+/// A logical plan together with the catalog revision used to bind it.
+#[derive(Debug)]
+pub struct BoundQuery {
+    /// Bound logical plan.
+    pub plan: LogicalPlan,
+    /// Catalog revision pinned for all source resolution.
+    pub catalog_revision: CatalogRevision,
+}
+
 /// The core logical binder trait.
 ///
 /// Binds an AST [`QueryNode`] into a validated, type-coerced [`LogicalPlan`].
@@ -59,4 +74,17 @@ pub trait LogicalBinder: Send + Sync {
     /// `EXPLAIN` statements yield a [`LogicalPlan::Explain`] wrapper over the
     /// bound inner query.
     async fn bind<'a>(&self, node: &'a QueryNode<'a>) -> Result<LogicalPlan>;
+
+    /// Binds a query and returns the catalog revision used for source resolution.
+    async fn bind_with_catalog_revision<'a>(&self, node: &'a QueryNode<'a>) -> Result<BoundQuery> {
+        Ok(BoundQuery {
+            plan: self.bind(node).await?,
+            catalog_revision: CatalogRevision::default(),
+        })
+    }
+
+    /// Returns the underlying catalog, if available.
+    fn catalog(&self) -> Option<&std::sync::Arc<dyn CatalogProvider>> {
+        None
+    }
 }

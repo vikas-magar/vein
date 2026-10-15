@@ -14,6 +14,12 @@ pub enum JoinType {
     Full,
     /// CROSS JOIN
     Cross,
+    /// Internal optimizer join that emits each matching left row once.
+    Semi,
+    /// Internal optimizer join that emits left rows with no match.
+    Anti,
+    /// Internal optimizer join that emits at most one build row per left row.
+    Single,
 }
 
 /// A single pipe operator (`|>`) in a query pipeline.
@@ -42,10 +48,11 @@ pub enum PipeOperator<'a> {
     },
     /// `|> AGGREGATE BY ... [SUM(...)]`
     Aggregate {
-        /// The `GROUP BY`-style grouping expressions.
+        /// Grouping sets. A normal `GROUP BY a, b` is represented as `[[a, b]]`;
+        /// an aggregate without `GROUP BY` is represented as `[[]]`.
 
         #[serde(borrow)]
-        group_by: Vec<OrderByExpr<'a>>,
+        grouping_sets: Vec<Vec<OrderByExpr<'a>>>,
         /// The aggregate expressions.
 
         #[serde(borrow)]

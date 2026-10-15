@@ -6,7 +6,7 @@ use crate::window::{expr_contains_window_call, split_window_items, wrap_window};
 use plan::LogicalExpr;
 use plan::LogicalPlan;
 use plan::PlanTraversal;
-use plan::{ResolvedColumn, VeinSchema};
+use plan::{ResolvedColumn, ResolvedColumnRef, VeinSchema};
 use error::{Result, VeinError};
 use parser::ast::expr::SpannedExpr;
 use parser::ast::pipe_op::SelectItem;
@@ -44,22 +44,16 @@ pub async fn bind_extend<'a>(
         // resets the qualifier, matching projection semantics.
         let field = match &expr {
             LogicalExpr::Column(col) => match name {
-                Some(alias) => ResolvedColumn {
-                    id: col.id,
-                    name: alias.to_string(),
-                    qualifier: None,
-                    data_type: col.data_type.clone(),
-                    is_factorized: col.is_factorized,
-                    nullable: col.nullable,
-                },
+                Some(alias) => col.derived(col.id, alias.to_string(), None),
                 None => col.clone(),
             },
-            _ => ResolvedColumn::new(
+            _ => std::sync::Arc::new(ResolvedColumn::new(
                 context.next_id(),
                 name.unwrap_or_else(|| "_col".to_string()),
                 None,
                 expr.data_type(),
-            ),
+            )
+                .with_nullable(expr.nullable())),
         };
         new_fields.push(field);
         bound_exprs.push(expr);
@@ -101,14 +95,14 @@ pub async fn bind_set<'a>(
                 ));
             }
 
-            let new_col = ResolvedColumn {
+            let new_col = std::sync::Arc::new(ResolvedColumn {
                 id: context.next_id(),
                 name: col.name.clone(),
                 qualifier: col.qualifier.clone(),
                 data_type: bound_expr.data_type(),
                 is_factorized: false,
-                nullable: col.nullable,
-            };
+                nullable: bound_expr.nullable(),
+            });
 
             if let Some(pos) = new_fields.iter().position(|f| f.name == col.name) {
                 new_fields[pos] = new_col;
@@ -188,12 +182,19 @@ pub fn bind_rename(
     scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
     let mut bound_exprs = Vec::new();
-    let mut new_fields = input.schema().fields.clone();
+    let new_fields: Vec<ResolvedColumnRef> = input
+        .schema()
+        .fields
+        .iter()
+        .map(|col| match renames.iter().find(|(old, _)| *old == col.name.as_str()) {
+            Some((_, new_name)) => {
+                col.derived(col.id, (*new_name).to_string(), col.qualifier.clone())
+            }
+            None => col.clone(),
+        })
+        .collect();
 
-    for col in &mut new_fields {
-        if let Some((_, new_name)) = renames.iter().find(|(old, _)| *old == col.name.as_str()) {
-            col.name = (*new_name).to_string();
-        }
+    for col in &new_fields {
         bound_exprs.push(LogicalExpr::Column(col.clone()));
     }
 

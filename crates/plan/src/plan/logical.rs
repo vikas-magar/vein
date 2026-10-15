@@ -1,27 +1,27 @@
 use super::types::SortKey;
 use crate::expr::logical::LogicalExpr;
-use crate::schema::{ColumnId, ResolvedColumn, VeinSchema};
+use crate::schema::{ColumnId, ResolvedColumnRef, VeinSchema};
 use parser::ast::pipe_op::JoinType;
 use parser::ast::query::SetOpKind;
 
 /// A computed window expression: the resolved call together with the output
 /// column the surrounding projection references (via a placeholder `Column`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WindowExpr {
     /// The bound window function call (`fn(args) OVER (...)`).
     pub call: LogicalExpr,
     /// The output column holding this window expression's result.
-    pub output_column: ResolvedColumn,
+    pub output_column: ResolvedColumnRef,
 }
 
 /// A node in the logical query plan tree
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LogicalPlan {
     // ── Sources ─────────────────────────────────────────────
     /// A table scan
     Scan {
-        /// The name of the table
-        table_name: String,
+        /// The authoritative table metadata from the catalog.
+        table: std::sync::Arc<catalog::TableMetadata>,
         /// The projection of column IDs to read
         projection: Option<Vec<ColumnId>>,
         /// The filters to push down
@@ -35,6 +35,8 @@ pub enum LogicalPlan {
         url: String,
         /// Inline options (e.g. format).
         options: Vec<(String, String)>,
+        /// Physical files to scan from the catalog.
+        files: Vec<String>,
         /// The resulting schema.
         schema: Box<VeinSchema>,
     },
@@ -101,7 +103,7 @@ pub enum LogicalPlan {
         /// The join predicate (`None` for a CROSS join).
         on: Option<LogicalExpr>,
         /// The `USING` columns, kept for schema de-duplication and display.
-        using: Vec<ResolvedColumn>,
+        using: Vec<ResolvedColumnRef>,
         /// The resulting schema (left ++ right; `USING` merges the join column).
         schema: Box<VeinSchema>,
     },
@@ -197,7 +199,7 @@ pub enum LogicalPlan {
         /// The optional output alias for the pivoted column(s).
         alias: Option<String>,
         /// The column whose distinct values become new columns.
-        value_column: ResolvedColumn,
+        value_column: ResolvedColumnRef,
         /// The explicit pivot values.
         values: Vec<LogicalExpr>,
         /// The resulting schema.
@@ -212,7 +214,7 @@ pub enum LogicalPlan {
         /// The generated name column name.
         name_name: String,
         /// The columns to unpivot.
-        columns: Vec<ResolvedColumn>,
+        columns: Vec<ResolvedColumnRef>,
         /// Whether nulls are retained (`ALL`).
         include_nulls: bool,
         /// The resulting schema.
@@ -241,7 +243,7 @@ pub enum LogicalPlan {
         /// The natural language predicate
         predicate: String,
         /// The target features passed to the LLM
-        targets: Vec<ResolvedColumn>,
+        targets: Vec<ResolvedColumnRef>,
         /// The conformal prediction confidence bound
         alpha: f64,
         /// The resulting schema
@@ -256,9 +258,9 @@ pub enum LogicalPlan {
         /// The natural language join condition
         condition: String,
         /// The bounding equi-join condition to prevent Cartesian explosion
-        bounding_equi: Vec<(ResolvedColumn, ResolvedColumn)>,
+        bounding_equi: Vec<(ResolvedColumnRef, ResolvedColumnRef)>,
         /// The dependent columns passed to the LLM
-        depends_on: (Vec<ResolvedColumn>, Vec<ResolvedColumn>),
+        depends_on: (Vec<ResolvedColumnRef>, Vec<ResolvedColumnRef>),
         /// The conformal prediction confidence bound
         alpha: f64,
         /// The resulting schema
@@ -269,9 +271,9 @@ pub enum LogicalPlan {
         /// The input plan containing features and ground truth labels
         input: Box<LogicalPlan>,
         /// The target features used by the reference model
-        target_features: Vec<ResolvedColumn>,
+        target_features: Vec<ResolvedColumnRef>,
         /// The ground truth label column
-        ground_truth_label: ResolvedColumn,
+        ground_truth_label: ResolvedColumnRef,
         /// The target alpha level
         alpha: f64,
         /// The resulting schema
@@ -301,4 +303,74 @@ pub enum LogicalPlan {
         /// The resulting schema (mirrors the input)
         schema: Box<VeinSchema>,
     },
+}
+
+impl LogicalPlan {
+    /// Returns the stable name of this logical operator without formatting its
+    /// inputs, schemas, or other potentially large plan metadata.
+    pub fn operator_name(&self) -> &'static str {
+        match self {
+            LogicalPlan::Scan { .. } => "Scan",
+            LogicalPlan::ExternalScan { .. } => "ExternalScan",
+            LogicalPlan::Filter { .. } => "Filter",
+            LogicalPlan::Project { .. } => "Project",
+            LogicalPlan::Aggregate { .. } => "Aggregate",
+            LogicalPlan::Window { .. } => "Window",
+            LogicalPlan::Join { .. } => "Join",
+            LogicalPlan::Sort { .. } => "Sort",
+            LogicalPlan::Limit { .. } => "Limit",
+            LogicalPlan::Distinct { .. } => "Distinct",
+            LogicalPlan::SubqueryAlias { .. } => "SubqueryAlias",
+            LogicalPlan::Explain { .. } => "Explain",
+            LogicalPlan::SetOp { .. } => "SetOp",
+            LogicalPlan::Sample { .. } => "Sample",
+            LogicalPlan::Assert { .. } => "Assert",
+            LogicalPlan::Pivot { .. } => "Pivot",
+            LogicalPlan::Unpivot { .. } => "Unpivot",
+            LogicalPlan::Fork { .. } => "Fork",
+            LogicalPlan::Tee { .. } => "Tee",
+            LogicalPlan::SemanticFilter { .. } => "SemanticFilter",
+            LogicalPlan::SemanticJoin { .. } => "SemanticJoin",
+            LogicalPlan::SemanticCalibrate { .. } => "SemanticCalibrate",
+            LogicalPlan::Write { .. } => "Write",
+            LogicalPlan::Call { .. } => "Call",
+        }
+    }
+
+    /// Returns the table name if this plan node is a table `Scan`.
+    pub fn table_name(&self) -> Option<&str> {
+        match self {
+            LogicalPlan::Scan { table, .. } => Some(&table.name),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LogicalPlan;
+    use crate::schema::VeinSchema;
+
+    #[test]
+    fn operator_name_is_stable_and_does_not_format_plan_contents() {
+        let plan = LogicalPlan::Explain {
+            input: Box::new(LogicalPlan::Call {
+                input: Box::new(LogicalPlan::Scan {
+                    table: std::sync::Arc::new(catalog::TableMetadata::new(
+                        "sensitive_table_name",
+                        std::sync::Arc::new(VeinSchema::empty()),
+                    )),
+                    projection: None,
+                    filters: Vec::new(),
+                    schema: Box::new(VeinSchema::empty()),
+                }),
+                name: "custom_function".to_string(),
+                args: Vec::new(),
+                schema: Box::new(VeinSchema::empty()),
+            }),
+            schema: Box::new(VeinSchema::empty()),
+        };
+
+        assert_eq!(plan.operator_name(), "Explain");
+    }
 }

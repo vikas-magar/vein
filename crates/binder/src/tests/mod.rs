@@ -5,9 +5,8 @@
 //! the in-memory catalog and mock registry, so tests read like executable
 //! specs: `bind(sql).await` then shape/schema assertions.
 
-use plan::{LogicalPlan, PlanTraversal};
-use plan::ResolvedColumn;
 use crate::testing;
+use plan::{LogicalExpr, LogicalPlan, PlanTraversal};
 
 /// Binds `sql` and unwraps the plan (tests assume the query is valid).
 pub async fn bind(sql: &str) -> LogicalPlan {
@@ -111,16 +110,6 @@ pub fn assert_schema(plan: &LogicalPlan, expected: &[(&str, Option<&str>, bool)]
     }
 }
 
-/// True when the plan's schema contains a column with exactly this identity.
-pub fn has_column(plan: &LogicalPlan, name: &str) -> bool {
-    plan.schema().fields.iter().any(|f| f.name == name)
-}
-
-/// The output column of the topmost projection for `index`.
-pub fn output_column(plan: &LogicalPlan, index: usize) -> &ResolvedColumn {
-    &plan.schema().fields[index]
-}
-
 #[cfg(test)]
 mod smoke {
     use super::*;
@@ -187,14 +176,14 @@ mod window {
     async fn select_lifts_window_below_projection() {
         let plan = bind("FROM users |> SELECT id, SUM(age) OVER () AS total_age").await;
         assert_chain(&plan, &["Project", "Window", "Scan"]);
-        assert_schema(&plan, &[("id", None, false), ("total_age", None, false)]);
+        assert_schema(&plan, &[("id", None, false), ("total_age", None, true)]);
     }
 
     #[tokio::test]
     async fn select_window_without_alias_uses_fn_name() {
         let plan = bind("FROM users |> SELECT SUM(age) OVER ()").await;
         assert_chain(&plan, &["Project", "Window", "Scan"]);
-        assert_schema(&plan, &[("sum", None, false)]);
+        assert_schema(&plan, &[("sum", None, true)]);
     }
 
     /// EXTEND keeps the input columns and appends the window output.
@@ -209,7 +198,7 @@ mod window {
                 ("id", Some("users"), false),
                 ("name", Some("users"), false),
                 ("age", Some("users"), false),
-                ("total_age", None, false),
+                ("total_age", None, true),
             ],
         );
     }
@@ -270,7 +259,7 @@ mod window {
         let plan =
             bind("FROM users |> SELECT SUM(age) OVER () AS total_age, COUNT(*) OVER () AS n").await;
         assert_chain(&plan, &["Project", "Window", "Scan"]);
-        assert_schema(&plan, &[("total_age", None, false), ("n", None, false)]);
+        assert_schema(&plan, &[("total_age", None, true), ("n", None, true)]);
     }
 
     /// Conflicting OVER clauses in one operator are a semantic error.
@@ -279,7 +268,7 @@ mod window {
         let err = bind_err(
             "FROM users |> SELECT SUM(age) OVER () AS a, SUM(age) OVER (PARTITION BY id) AS b",
         )
-        .await;
+            .await;
         assert!(err.to_string().contains("same PARTITION BY"), "got {err}");
     }
 }
@@ -319,7 +308,7 @@ mod subquery {
         let plan = bind(
             "FROM users |> WHERE EXISTS (FROM orders |> WHERE orders.user_id = users.id |> SELECT user_id)",
         )
-        .await;
+            .await;
         // Binding succeeded => `users.id` resolved via the correlation snapshot.
         assert_chain(&plan, &["Filter", "Scan"]);
     }
@@ -338,8 +327,11 @@ mod subquery {
         let err = bind_err(
             "FROM users |> WHERE EXISTS (FROM orders |> WHERE orders.user_id = users.id |> SELECT nope)",
         )
-        .await;
-        assert!(matches!(err, error::VeinError::Semantic { .. }), "got {err}");
+            .await;
+        assert!(
+            matches!(err, error::VeinError::Semantic { .. }),
+            "got {err}"
+        );
     }
 
     /// Guard against accidental identifier capture: an unqualified column in a
@@ -350,13 +342,16 @@ mod subquery {
         // `users` has `age`, but `orders` does NOT have `age`.
         // In legacy SQL, `age > 18` inside the subquery would silently capture `users.age`.
         // In Vein, this is rejected with a helpful diagnostic hint.
-        let err = bind_err(
-            "FROM users |> WHERE EXISTS (FROM orders |> WHERE age > 18 |> SELECT id)",
-        )
-        .await;
-        assert!(matches!(err, error::VeinError::Semantic { .. }), "got {err}");
+        let err =
+            bind_err("FROM users |> WHERE EXISTS (FROM orders |> WHERE age > 18 |> SELECT id)")
+                .await;
         assert!(
-            err.to_string().contains("Hint: 'age' exists in outer scope 'users'"),
+            matches!(err, error::VeinError::Semantic { .. }),
+            "got {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("Hint: 'age' exists in outer scope 'users'"),
             "expected diagnostic hint, got: {err}"
         );
     }
@@ -365,10 +360,9 @@ mod subquery {
     /// cleanly to `OuterColumn`.
     #[tokio::test]
     async fn qualified_outer_column_resolves_successfully() {
-        let plan = bind(
-            "FROM users |> WHERE EXISTS (FROM orders |> WHERE users.age > 18 |> SELECT id)",
-        )
-        .await;
+        let plan =
+            bind("FROM users |> WHERE EXISTS (FROM orders |> WHERE users.age > 18 |> SELECT id)")
+                .await;
         assert_chain(&plan, &["Filter", "Scan"]);
     }
 }
@@ -382,7 +376,10 @@ mod projection_mutations {
     async fn drop_removes_columns() {
         let plan = bind("FROM users |> DROP name").await;
         assert_chain(&plan, &["Project", "Scan"]);
-        assert_schema(&plan, &[("id", Some("users"), false), ("age", Some("users"), false)]);
+        assert_schema(
+            &plan,
+            &[("id", Some("users"), false), ("age", Some("users"), false)],
+        );
     }
 
     /// DROP of an unknown column is a semantic error (mirrors SET), not a
@@ -394,10 +391,7 @@ mod projection_mutations {
             matches!(err, error::VeinError::Semantic { .. }),
             "got {err}"
         );
-        assert!(
-            err.to_string().contains("cannot find column"),
-            "got {err}"
-        );
+        assert!(err.to_string().contains("cannot find column"), "got {err}");
     }
 
     /// SET overwrites a column's value; the other columns pass through.
@@ -405,7 +399,29 @@ mod projection_mutations {
     async fn set_overwrites_column() {
         let plan = bind("FROM users |> SET age = age + 1").await;
         assert_chain(&plan, &["Project", "Scan"]);
-        assert_schema(&plan, &[("id", Some("users"), false), ("name", Some("users"), false), ("age", Some("users"), false)]);
+        assert_schema(
+            &plan,
+            &[
+                ("id", Some("users"), false),
+                ("name", Some("users"), false),
+                ("age", Some("users"), false),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn computed_projection_mutations_preserve_expression_nullability() {
+        let select = bind("FROM users |> SELECT id + 1 AS next_id, LOWER(name) AS lowered").await;
+        assert_schema(
+            &select,
+            &[("next_id", None, false), ("lowered", None, true)],
+        );
+
+        let extend = bind("FROM users |> EXTEND LOWER(name) AS lowered").await;
+        assert!(extend.schema().fields.last().unwrap().nullable);
+
+        let set = bind("FROM users |> SET name = LOWER(name)").await;
+        assert!(set.schema().fields[1].nullable);
     }
 
     /// SET of an unknown column is a semantic error.
@@ -444,6 +460,73 @@ mod join_and_sources {
         } else {
             panic!("expected a Join plan, got {:?}", node_kind(&plan));
         }
+    }
+
+    #[tokio::test]
+    async fn join_output_nullability_follows_join_flavor() {
+        for (flavor, left_nullable, right_nullable) in [
+            ("JOIN", false, false),
+            ("LEFT JOIN", false, true),
+            ("RIGHT JOIN", true, false),
+            ("FULL JOIN", true, true),
+        ] {
+            let query = format!(
+                "FROM users |> {flavor} orders ON users.id = orders.user_id"
+            );
+            let plan = bind(&query).await;
+            let LogicalPlan::Join { schema, .. } = plan else {
+                panic!("expected a Join plan for {flavor}");
+            };
+
+            assert_eq!(schema.fields.len(), 6, "{flavor}");
+            assert!(
+                schema.fields[..3]
+                    .iter()
+                    .all(|field| field.nullable == left_nullable),
+                "left-side nullability mismatch for {flavor}: {:?}",
+                &schema.fields[..3]
+            );
+            assert!(
+                schema.fields[3..]
+                    .iter()
+                    .all(|field| field.nullable == right_nullable),
+                "right-side nullability mismatch for {flavor}: {:?}",
+                &schema.fields[3..]
+            );
+        }
+
+        let projected = bind(
+            "FROM users |> LEFT JOIN orders ON users.id = orders.user_id |> SELECT orders.amount",
+        )
+            .await;
+        let LogicalPlan::Project { schema, .. } = projected else {
+            panic!("expected a Project above the left join");
+        };
+        assert!(
+            schema.fields[0].nullable,
+            "projecting a null-extended input column must retain nullable metadata"
+        );
+    }
+
+    /// Qualified self-join references must resolve to their respective input scopes.
+    #[tokio::test]
+    async fn qualified_self_join_columns_resolve_to_each_side() {
+        let plan = bind("FROM users AS a |> JOIN users AS b ON a.id = b.id").await;
+        let LogicalPlan::Join {
+            on: Some(LogicalExpr::BinaryOp { left, right, .. }),
+            ..
+        } = plan
+        else {
+            panic!("expected an equality predicate on the self-join");
+        };
+
+        let (LogicalExpr::Column(left), LogicalExpr::Column(right)) = (*left, *right) else {
+            panic!("expected column references in the self-join predicate");
+        };
+
+        assert_eq!(left.qualifier.as_deref(), Some("a"));
+        assert_eq!(right.qualifier.as_deref(), Some("b"));
+        assert_ne!(left.id, right.id);
     }
 
     /// `USING (col)` synthesizes an equality predicate and de-duplicates the
@@ -509,7 +592,11 @@ mod join_and_sources {
         let plan =
             bind("FROM users |> JOIN (FROM orders |> SELECT user_id AS uid) o ON users.id = o.uid")
                 .await;
-        assert!(matches!(&plan, LogicalPlan::Join { .. }), "got {:?}", node_kind(&plan));
+        assert!(
+            matches!(&plan, LogicalPlan::Join { .. }),
+            "got {:?}",
+            node_kind(&plan)
+        );
     }
 }
 
@@ -522,7 +609,10 @@ mod call_and_external {
     #[tokio::test]
     async fn call_binds_call_node() {
         let plan = bind("FROM users |> CALL my_udf(users.id, 1)").await;
-        if let LogicalPlan::Call { name, args, schema, .. } = &plan {
+        if let LogicalPlan::Call {
+            name, args, schema, ..
+        } = &plan
+        {
             assert_eq!(name, "my_udf");
             assert_eq!(args.len(), 2);
             assert_eq!(schema.fields.len(), 3, "Call mirrors the input schema");
@@ -547,10 +637,7 @@ mod pivot_unpivot {
     /// column per pivot value.
     #[tokio::test]
     async fn pivot_binds_pivot_node() {
-        let plan = bind(
-            "FROM orders |> PIVOT SUM(amount) AS total BY user_id IN (1, 2)",
-        )
-        .await;
+        let plan = bind("FROM orders |> PIVOT SUM(amount) AS total BY user_id IN (1, 2)").await;
         let LogicalPlan::Pivot {
             alias,
             value_column,
@@ -573,8 +660,7 @@ mod pivot_unpivot {
     /// columns and appends `name` and `value` columns.
     #[tokio::test]
     async fn unpivot_binds_unpivot_node() {
-        let plan = bind("FROM orders |> UNPIVOT ALL amount BY category IN (user_id, amount)")
-            .await;
+        let plan = bind("FROM orders |> UNPIVOT ALL amount BY category IN (user_id, amount)").await;
         let LogicalPlan::Unpivot {
             value_name,
             name_name,
@@ -604,14 +690,22 @@ mod cte_binding {
     #[tokio::test]
     async fn with_registers_cte_for_later_source() {
         let plan = bind("FROM users |> WITH cte AS (FROM orders |> SELECT user_id, amount) |> JOIN cte c ON users.id = c.user_id").await;
-        assert!(matches!(&plan, LogicalPlan::Join { .. }), "got {:?}", node_kind(&plan));
+        assert!(
+            matches!(&plan, LogicalPlan::Join { .. }),
+            "got {:?}",
+            node_kind(&plan)
+        );
     }
 
     /// A CTE used as the sole source substitutes for a catalog table.
     #[tokio::test]
     async fn cte_as_source() {
         let plan = bind("FROM users |> WITH big AS (FROM users |> WHERE age > 18) |> JOIN big b ON users.id = b.id").await;
-        assert!(matches!(&plan, LogicalPlan::Join { .. }), "got {:?}", node_kind(&plan));
+        assert!(
+            matches!(&plan, LogicalPlan::Join { .. }),
+            "got {:?}",
+            node_kind(&plan)
+        );
     }
 }
 
@@ -629,17 +723,249 @@ mod extended_features {
         }
     }
 
-    /// `DISTINCT` aggregate is preserved on the lifted `FunctionCall`.
-    #[tokio::test]
-    async fn distinct_aggregate_is_carried_on_call() {
-        let plan = bind("FROM users |> AGGREGATE SUM(DISTINCT age) GROUP BY name").await;
-        assert_chain(&plan, &["Aggregate", "Scan"]);
-        let LogicalPlan::Aggregate { aggs, .. } = &plan else {
-            panic!("expected aggregate");
+    fn between_bounds(
+        expr: &LogicalExpr,
+    ) -> (&LogicalExpr, &LogicalExpr, &LogicalExpr, &LogicalExpr) {
+        let LogicalExpr::BinaryOp {
+            left,
+            op: parser::ast::expr::BinaryOp::And,
+            right,
+            ..
+        } = expr
+        else {
+            panic!("BETWEEN should lower to an AND of its inclusive bounds: {expr:?}");
         };
-        match &aggs[0] {
-            LogicalExpr::FunctionCall { distinct, .. } => assert!(*distinct),
-            other => panic!("unexpected agg expr: {other:?}"),
+        let LogicalExpr::BinaryOp {
+            left: lower_value,
+            op: parser::ast::expr::BinaryOp::Geq,
+            right: lower,
+            ..
+        } = left.as_ref()
+        else {
+            panic!("BETWEEN lower bound should use >=: {left:?}");
+        };
+        let LogicalExpr::BinaryOp {
+            left: upper_value,
+            op: parser::ast::expr::BinaryOp::Leq,
+            right: upper,
+            ..
+        } = right.as_ref()
+        else {
+            panic!("BETWEEN upper bound should use <=: {right:?}");
+        };
+        (lower_value, lower, upper_value, upper)
+    }
+
+    #[tokio::test]
+    async fn between_binds_both_inclusive_bounds_and_not_between_negates_them() {
+        for (query, negated) in [
+            ("FROM users |> SELECT age BETWEEN 18 AND 30", false),
+            ("FROM users |> SELECT age NOT BETWEEN 18 AND 30", true),
+        ] {
+            let plan = bind(query).await;
+            let expr = expr_of(&plan);
+            let range = match (negated, expr) {
+                (false, expr) => expr,
+                (true, LogicalExpr::Not { expr }) => expr.as_ref(),
+                (true, other) => panic!("NOT BETWEEN should negate the range: {other:?}"),
+            };
+            let (lower_value, lower, upper_value, upper) = between_bounds(range);
+
+            assert_eq!(lower_value, upper_value, "both bounds must compare the input value");
+            assert!(matches!(lower_value, LogicalExpr::Column(column) if column.name == "age"));
+            assert!(matches!(lower, LogicalExpr::Literal(LogicalLiteral::Int64(18))));
+            assert!(matches!(upper, LogicalExpr::Literal(LogicalLiteral::Int64(30))));
+        }
+    }
+
+    #[tokio::test]
+    async fn between_preserves_null_input_for_three_valued_logic() {
+        let plan = bind("FROM users |> SELECT NULL BETWEEN 1 AND 2").await;
+        let expr = expr_of(&plan);
+        let (lower_value, _, upper_value, _) = between_bounds(expr);
+
+        assert!(matches!(lower_value, LogicalExpr::Literal(LogicalLiteral::Null(_))));
+        assert!(matches!(upper_value, LogicalExpr::Literal(LogicalLiteral::Null(_))));
+        assert!(expr.nullable(), "a NULL input must remain nullable through BETWEEN");
+    }
+
+    #[tokio::test]
+    async fn between_coerces_each_decimal_bound_to_the_input_type() {
+        let plan = bind("FROM decimal_values |> SELECT amount BETWEEN 0.05 AND 0.07").await;
+        let (lower_value, lower, upper_value, upper) = between_bounds(expr_of(&plan));
+        let decimal_type = plan::VeinDataType::Decimal128(15, 2);
+
+        assert!(matches!(lower_value, LogicalExpr::Column(column) if column.name == "amount"));
+        assert_eq!(lower_value.data_type(), decimal_type);
+        assert_eq!(upper_value.data_type(), decimal_type);
+        assert_eq!(lower.data_type(), decimal_type);
+        assert_eq!(upper.data_type(), decimal_type);
+        assert!(matches!(
+            lower,
+            LogicalExpr::Cast { expr, target_type }
+                if *target_type == decimal_type
+                    && matches!(expr.as_ref(), LogicalExpr::Literal(LogicalLiteral::Decimal(5, 2, 2)))
+        ));
+        assert!(matches!(
+            upper,
+            LogicalExpr::Cast { expr, target_type }
+                if *target_type == decimal_type
+                    && matches!(expr.as_ref(), LogicalExpr::Literal(LogicalLiteral::Decimal(7, 2, 2)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn decimal_literal_binds_exactly_and_compares_with_decimal_column() {
+        let projection = bind("FROM decimal_values |> SELECT 0.05 AS threshold").await;
+        assert!(matches!(
+            expr_of(&projection),
+            LogicalExpr::Literal(LogicalLiteral::Decimal(5, 2, 2))
+        ));
+
+        let filter = bind("FROM decimal_values |> WHERE amount >= 0.05").await;
+        assert_eq!(expr_of(&filter).data_type(), plan::VeinDataType::Boolean);
+    }
+
+    #[tokio::test]
+    async fn scalar_function_arguments_follow_registered_signatures() {
+        let plan = bind("FROM users |> SELECT LOWER(name)").await;
+        let LogicalExpr::FunctionCall { args, .. } = expr_of(&plan) else {
+            panic!("expected scalar function call");
+        };
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].data_type(), plan::VeinDataType::Utf8);
+
+        for query in [
+            "FROM users |> SELECT LOWER(age)",
+            "FROM users |> SELECT LOWER(name, name)",
+        ] {
+            let error = bind_err(query).await;
+            assert!(
+                matches!(error, error::VeinError::Semantic { .. }),
+                "got {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_and_year_accept_temporal_inputs_and_return_int32() {
+        let plan = bind(
+            "FROM dates |> SELECT EXTRACT(YEAR FROM order_date), EXTRACT(MONTH FROM date64), EXTRACT(HOUR FROM time_of_day), EXTRACT(MINUTE FROM timestamp), YEAR(order_date)",
+        )
+            .await;
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project plan");
+        };
+        assert_eq!(exprs.len(), 5);
+        for expr in exprs {
+            let LogicalExpr::FunctionCall { return_type, .. } = expr else {
+                panic!("expected temporal function call");
+            };
+            assert_eq!(return_type, plan::VeinDataType::Int32);
+        }
+
+        for query in [
+            "FROM dates |> SELECT EXTRACT(FROM order_date)",
+            "FROM dates |> SELECT EXTRACT(YEAR order_date)",
+            "FROM dates |> SELECT EXTRACT(YEAR FROM 1)",
+            "FROM dates |> SELECT EXTRACT(YEAR FROM order_date, date64)",
+        ] {
+            let error = bind_err(query).await;
+            assert!(
+                matches!(error, error::VeinError::Semantic { .. }),
+                "got {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scalar_function_arguments_coerce_null_and_widening_to_signature_type() {
+        let null_plan = bind("FROM users |> SELECT LOWER(NULL)").await;
+        let LogicalExpr::FunctionCall { args, .. } = expr_of(&null_plan) else {
+            panic!("expected scalar function call");
+        };
+        assert!(matches!(
+            args.as_slice(),
+            [LogicalExpr::Cast {
+                target_type: plan::VeinDataType::Utf8,
+                ..
+            }]
+        ));
+
+        let numeric_plan = bind("FROM users |> SELECT ROUND(age)").await;
+        let LogicalExpr::FunctionCall { args, .. } = expr_of(&numeric_plan) else {
+            panic!("expected scalar function call");
+        };
+        assert!(matches!(
+            args.as_slice(),
+            [LogicalExpr::Cast {
+                target_type: plan::VeinDataType::Float64,
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn vector_dimension_wildcard_matches_registered_scalar_signature() {
+        let plan =
+            bind("FROM vector_values |> SELECT VECTOR_DISTANCE(left_vector, right_vector)").await;
+        assert!(matches!(
+            expr_of(&plan),
+            LogicalExpr::FunctionCall { name, .. }
+                if name.eq_ignore_ascii_case("VECTOR_DISTANCE")
+        ));
+    }
+
+    /// `COUNT(*)` is lowered to a non-null literal for ordinary aggregates.
+    #[tokio::test]
+    async fn aggregate_count_star_binds_as_one() {
+        for query in [
+            "FROM users |> AGGREGATE COUNT(*) AS n",
+            "FROM users |> AGGREGATE COUNT(*) AS n GROUP BY name",
+        ] {
+            let plan = bind(query).await;
+            let LogicalPlan::Aggregate { aggs, .. } = plan else {
+                panic!("expected aggregate plan");
+            };
+            assert!(matches!(
+                &aggs[0],
+                LogicalExpr::FunctionCall { name, args, .. }
+                    if name.eq_ignore_ascii_case("count")
+                        && matches!(args.as_slice(), [LogicalExpr::Literal(LogicalLiteral::Int64(1))])
+            ));
+        }
+    }
+
+    /// Until distinct state is carried to execution, reject it instead of
+    /// silently executing a regular aggregate.
+    #[tokio::test]
+    async fn aggregate_distinct_is_rejected() {
+        for query in [
+            "FROM users |> AGGREGATE COUNT(DISTINCT age)",
+            "FROM users |> AGGREGATE SUM(DISTINCT age)",
+            "FROM users |> AGGREGATE COUNT(DISTINCT *)",
+        ] {
+            let error = bind_err(query).await;
+            assert!(
+                error
+                    .to_string()
+                    .contains("DISTINCT inside aggregate function"),
+                "got {error} for {query}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_argument_count_is_validated_during_binding() {
+        for query in [
+            "FROM users |> AGGREGATE COUNT()",
+            "FROM users |> AGGREGATE SUM(age, id)",
+        ] {
+            let error = bind_err(query).await;
+            assert!(
+                error.to_string().contains("expects exactly one argument"),
+                "got {error} for {query}"
+            );
         }
     }
 
@@ -657,11 +983,24 @@ mod extended_features {
     #[tokio::test]
     async fn typed_interval_literal_binds() {
         let plan = bind("FROM users |> SELECT INTERVAL '1 year 6 months' AS d").await;
-        let LogicalExpr::Literal(LogicalLiteral::Interval { months, .. }) = expr_of(&plan)
-        else {
+        let LogicalExpr::Literal(LogicalLiteral::Interval { months, .. }) = expr_of(&plan) else {
             panic!("expected Interval literal");
         };
         assert_eq!(*months, 18);
+    }
+
+    #[tokio::test]
+    async fn typed_interval_unit_qualifier_binds() {
+        let plan = bind("FROM users |> SELECT INTERVAL '90' DAY AS d").await;
+        let LogicalExpr::Literal(LogicalLiteral::Interval {
+                                     months,
+                                     days,
+                                     nanos,
+                                 }) = expr_of(&plan)
+        else {
+            panic!("expected Interval literal");
+        };
+        assert_eq!((*months, *days, *nanos), (0, 90, 0));
     }
 
     /// `QUALIFY` lowers to `Filter → Window → Scan`.
@@ -680,5 +1019,266 @@ mod extended_features {
                 .contains("QUALIFY predicate must contain a window function"),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod aggregate_types {
+    use super::*;
+    use plan::VeinDataType;
+
+    #[tokio::test]
+    async fn grouping_sets_bind_all_keys_once_in_the_output_schema() {
+        let plan = bind(
+            "FROM users |> AGGREGATE COUNT(*) AS n GROUP BY GROUPING SETS ((name, age), (name), ())",
+        )
+            .await;
+        let LogicalPlan::Aggregate {
+            grouping_sets,
+            schema,
+            ..
+        } = plan
+        else {
+            panic!("expected Aggregate plan");
+        };
+
+        assert_eq!(grouping_sets.len(), 3);
+        assert_eq!(
+            grouping_sets.iter().map(Vec::len).collect::<Vec<_>>(),
+            [2, 1, 0]
+        );
+        assert_eq!(schema.fields.len(), 3);
+        assert_eq!(schema.fields[0].name, "name");
+        assert_eq!(schema.fields[1].name, "age");
+        assert_eq!(schema.fields[2].name, "n");
+    }
+
+    #[tokio::test]
+    async fn aggregate_output_types_follow_numeric_input_types() {
+        let plan = bind(
+            "FROM users |> AGGREGATE SUM(id) AS total, MIN(age) AS youngest, AVG(age) AS mean_age",
+        )
+            .await;
+        let LogicalPlan::Aggregate { schema, .. } = plan else {
+            panic!("expected Aggregate plan");
+        };
+
+        assert_eq!(schema.fields[0].data_type, VeinDataType::Int64);
+        assert_eq!(schema.fields[1].data_type, VeinDataType::Int64);
+        assert_eq!(schema.fields[2].data_type, VeinDataType::Float64);
+    }
+
+    #[tokio::test]
+    async fn aggregate_result_nullability_is_conservative_and_grouping_is_inferred() {
+        let plan = bind(
+            "FROM users |> AGGREGATE SUM(age) AS total, COUNT(*) AS n GROUP BY age + 1",
+        )
+            .await;
+        let LogicalPlan::Aggregate { schema, .. } = plan else {
+            panic!("expected Aggregate plan");
+        };
+
+        assert_eq!(schema.fields.len(), 3);
+        assert!(schema.fields[1].nullable, "SUM can return NULL on empty input");
+        assert!(schema.fields[2].nullable, "function nullability is conservative");
+        assert!(!schema.fields[0].nullable, "non-null grouping inputs stay non-null");
+    }
+
+    #[tokio::test]
+    async fn decimal_aggregate_types_preserve_scale_and_widen_sum_precision() {
+        let plan = bind(
+            "FROM decimal_values |> AGGREGATE SUM(amount) AS total, MIN(amount) AS smallest, AVG(amount) AS mean",
+        )
+            .await;
+        let LogicalPlan::Aggregate { schema, .. } = plan else {
+            panic!("expected Aggregate plan");
+        };
+
+        assert_eq!(schema.fields[0].data_type, VeinDataType::Decimal128(38, 2));
+        assert_eq!(schema.fields[1].data_type, VeinDataType::Decimal128(15, 2));
+        assert_eq!(schema.fields[2].data_type, VeinDataType::Float64);
+    }
+
+    #[tokio::test]
+    async fn sum_result_types_cover_numeric_layouts() {
+        let plan = bind(
+            "FROM numeric_values |> AGGREGATE SUM(i8_value), SUM(i16_value), SUM(i32_value), SUM(u8_value), SUM(u16_value), SUM(u32_value), SUM(u64_value), SUM(f16_value), SUM(f32_value), SUM(decimal256_value)",
+        )
+            .await;
+        let LogicalPlan::Aggregate { schema, .. } = plan else {
+            panic!("expected Aggregate plan");
+        };
+
+        let expected = [
+            VeinDataType::Int64,
+            VeinDataType::Int64,
+            VeinDataType::Int64,
+            VeinDataType::UInt64,
+            VeinDataType::UInt64,
+            VeinDataType::UInt64,
+            VeinDataType::UInt64,
+            VeinDataType::Float64,
+            VeinDataType::Float64,
+            VeinDataType::Decimal256(76, 3),
+        ];
+        assert_eq!(
+            schema
+                .fields
+                .iter()
+                .map(|field| field.data_type.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn decimal_comparison_binds_both_sides_to_a_common_type() {
+        let plan = bind("FROM decimal_values |> WHERE amount > amount * 0.0001").await;
+        let LogicalPlan::Filter { predicate, .. } = plan else {
+            panic!("expected Filter plan");
+        };
+        let LogicalExpr::BinaryOp { left, right, .. } = predicate else {
+            panic!("expected a comparison predicate");
+        };
+        let common_type = left.data_type();
+        assert_eq!(right.data_type(), common_type);
+        assert_eq!(common_type, VeinDataType::Decimal128(35, 8));
+        assert!(
+            matches!(left.as_ref(), LogicalExpr::Cast { target_type, .. } if *target_type == common_type),
+            "the narrower decimal operand must be cast to the comparison type: {left:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod temporal_functions {
+    use super::*;
+    use parser::ast::expr::BinaryOp;
+    use plan::{LogicalExpr, LogicalLiteral, VeinDataType};
+
+    #[tokio::test]
+    async fn shift_lowers_to_temporal_interval_arithmetic() {
+        let plan =
+            bind("FROM users |> SELECT SHIFT(DATE '1998-12-01', -90, 'DAY') AS shifted").await;
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            &exprs[0],
+            LogicalExpr::BinaryOp {
+                op: BinaryOp::Plus,
+                return_type: VeinDataType::Date32,
+                right,
+                ..
+            } if matches!(right.as_ref(), LogicalExpr::Literal(LogicalLiteral::Interval {
+                months: 0, days: -90, nanos: 0
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn shift_supports_calendar_and_subday_units() {
+        for (unit, expected) in [
+            (
+                "MONTH",
+                LogicalLiteral::Interval {
+                    months: 1,
+                    days: 0,
+                    nanos: 0,
+                },
+            ),
+            (
+                "HOUR",
+                LogicalLiteral::Interval {
+                    months: 0,
+                    days: 0,
+                    nanos: 3_600_000_000_000,
+                },
+            ),
+            (
+                "MICROSECOND",
+                LogicalLiteral::Interval {
+                    months: 0,
+                    days: 0,
+                    nanos: 1_000,
+                },
+            ),
+        ] {
+            let sql = format!("FROM users |> SELECT SHIFT(DATE '2024-01-01', 1, '{unit}')");
+            let plan = bind(&sql).await;
+            let LogicalPlan::Project { exprs, .. } = plan else {
+                panic!("expected projection");
+            };
+            let LogicalExpr::BinaryOp { right, .. } = &exprs[0] else {
+                panic!("SHIFT should lower to binary arithmetic");
+            };
+            assert!(matches!(right.as_ref(), LogicalExpr::Literal(actual) if actual == &expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn shift_rejects_nonconstant_amount_invalid_units_and_non_temporal_values() {
+        for (query, message) in [
+            (
+                "FROM users |> SELECT SHIFT(DATE '2024-01-01', age, 'DAY')",
+                "constant integer",
+            ),
+            (
+                "FROM users |> SELECT SHIFT(DATE '2024-01-01', 1, age)",
+                "constant string",
+            ),
+            (
+                "FROM users |> SELECT SHIFT(DATE '2024-01-01', 1, 'FORTNIGHT')",
+                "unknown temporal unit",
+            ),
+            (
+                "FROM users |> SELECT SHIFT(age, 1, 'DAY')",
+                "no implicit coercion",
+            ),
+        ] {
+            let error = bind_err(query).await;
+            assert!(error.to_string().contains(message), "{error} for {query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn truncate_binds_to_the_unit_specific_vectorized_function() {
+        let plan = bind("FROM users |> SELECT TRUNCATE(DATE '2024-03-31', 'QUARTER') AS bucket").await;
+        let LogicalPlan::Project { exprs, schema, .. } = plan else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            &exprs[0],
+            LogicalExpr::FunctionCall { name, args, return_type, .. }
+                if name == "TRUNCATE_QUARTER"
+                    && args.len() == 1
+                    && *return_type == VeinDataType::Date32
+        ));
+        assert_eq!(schema.fields[0].data_type, VeinDataType::Date32);
+    }
+
+    #[tokio::test]
+    async fn truncate_validates_constant_unit_and_temporal_compatibility() {
+        for (query, message) in [
+            (
+                "FROM users |> SELECT TRUNCATE(DATE '2024-01-01', age)",
+                "constant string",
+            ),
+            (
+                "FROM users |> SELECT TRUNCATE(DATE '2024-01-01', 'FORTNIGHT')",
+                "unknown temporal unit",
+            ),
+            (
+                "FROM users |> SELECT TRUNCATE(TIME '12:30:00', 'MONTH')",
+                "does not support temporal type",
+            ),
+            (
+                "FROM users |> SELECT TRUNCATE(age, 'DAY')",
+                "does not support temporal type",
+            ),
+        ] {
+            let error = bind_err(query).await;
+            assert!(error.to_string().contains(message), "{error} for {query}");
+        }
     }
 }

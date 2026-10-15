@@ -5,7 +5,7 @@ use crate::scope::{Scope, ScopeStack};
 use crate::window::expr_contains_window_call;
 use plan::LogicalPlan;
 use plan::PlanTraversal;
-use plan::{ResolvedColumn, VeinDataType, VeinSchema};
+use plan::{ResolvedColumn, ResolvedColumnRef, VeinDataType, VeinSchema};
 use error::{Result, VeinError};
 use parser::ast::expr::SpannedExpr;
 use parser::ast::pipe_op::{CommonTableExpr, WriteTarget};
@@ -30,12 +30,13 @@ pub async fn bind_pivot<'a>(
     let pivot_type = aggregate_expr.data_type();
     let mut fields = input.schema().fields.clone();
     for (i, _) in values.iter().enumerate() {
-        fields.push(ResolvedColumn::new(
+        fields.push(std::sync::Arc::new(ResolvedColumn::new(
             context.next_id(),
             format!("{}_{}", alias.unwrap_or("pivot"), i),
             None,
             pivot_type.clone(),
-        ));
+        )
+            .with_nullable(aggregate_expr.nullable())));
     }
     scopes.push(Scope::unqualified(fields.clone()));
     Ok(LogicalPlan::Pivot {
@@ -66,25 +67,25 @@ pub async fn bind_unpivot<'a>(
         .first()
         .map(|c| c.data_type.clone())
         .unwrap_or(VeinDataType::Utf8);
-    let mut fields: Vec<ResolvedColumn> = input
+    let mut fields: Vec<ResolvedColumnRef> = input
         .schema()
         .fields
         .iter()
         .filter(|f| !columns.contains(&f.name.as_str()))
         .cloned()
         .collect();
-    fields.push(ResolvedColumn::new(
+    fields.push(std::sync::Arc::new(ResolvedColumn::new(
         context.next_id(),
         name_name.to_string(),
         None,
         VeinDataType::Utf8,
-    ));
-    fields.push(ResolvedColumn::new(
+    )));
+    fields.push(std::sync::Arc::new(ResolvedColumn::new(
         context.next_id(),
         value_name.to_string(),
         None,
         value_type,
-    ));
+    )));
     scopes.push(Scope::unqualified(fields.clone()));
     Ok(LogicalPlan::Unpivot {
         input: Box::new(input),
@@ -189,11 +190,11 @@ pub async fn bind_with<'a>(
                     None,
                 ));
             }
-            let mut new_fields = fields;
-            for (field, name) in new_fields.iter_mut().zip(cols.iter()) {
-                field.name = (*name).to_string();
-                field.qualifier = Some(cte.alias.to_string());
-            }
+            let new_fields: Vec<ResolvedColumnRef> = fields
+                .iter()
+                .zip(cols.iter())
+                .map(|(field, name)| field.derived(field.id, *name, Some(cte.alias.to_string())))
+                .collect();
             plan = LogicalPlan::SubqueryAlias {
                 input: Box::new(plan),
                 alias: cte.alias.to_string(),

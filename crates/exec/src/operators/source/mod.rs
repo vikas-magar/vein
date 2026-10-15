@@ -4,7 +4,5 @@
 pub mod memory;
 /// Generic scan source for files via OpenDAL
 pub mod scan;
-
 pub use memory::MemorySource;
 pub use scan::ScanSource;
-

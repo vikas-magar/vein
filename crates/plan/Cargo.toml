@@ -7,6 +7,10 @@ edition = "2024"
 missing_docs = "deny"
 
 [dependencies]
+catalog = { path = "../catalog" }
 error = { path = "../error" }
 parser = { path = "../parser" }
 arrow = { workspace = true }
+types = { path = "../types" }
+serde = { workspace = true }
+async-trait = { workspace = true }

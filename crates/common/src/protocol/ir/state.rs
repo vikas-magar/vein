@@ -3,9 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The mode of state materialization for pipeline breakers.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum StateMode {
     /// In-memory Hash Table for Hash Join probe.
     HashJoinTable,
@@ -28,9 +26,7 @@ pub enum StateMode {
 }
 
 /// Join flavors supported across distributed state probe stages.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum JoinKind {
     /// Inner join.
     Inner,
@@ -44,12 +40,14 @@ pub enum JoinKind {
     Semi,
     /// Left anti join.
     Anti,
+    /// Single join that errors when one probe row has multiple matches.
+    Single,
+    /// Cartesian product: every probe row paired with every build row.
+    Cross,
 }
 
 /// Aggregate accumulation opcodes.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum AggOpCode {
     /// COUNT(input).
     Count,
@@ -61,4 +59,6 @@ pub enum AggOpCode {
     Max,
     /// AVG(input).
     Avg,
+    /// Enforce scalar-subquery cardinality and return its only input value.
+    SingleValue,
 }

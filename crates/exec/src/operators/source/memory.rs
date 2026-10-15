@@ -1,9 +1,8 @@
-use crate::pipeline::{DataChunk, PipelineNode, Source};
+use crate::pipeline::{DataChunkView, PipelineNode, Source};
 use arrow::record_batch::RecordBatch;
-use common::arrow::SelectionVector;
 use common::Result;
 
-/// An in-memory data source for testing.
+/// An in-memory data source over a single [`RecordBatch`].
 pub struct MemorySource {
     batch: Option<RecordBatch>,
 }
@@ -13,32 +12,15 @@ impl MemorySource {
     pub fn new(batch: RecordBatch) -> Self {
         Self { batch: Some(batch) }
     }
-
-    /// Create a dummy [`MemorySource`] for quick testing.
-    pub fn dummy() -> Self {
-        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("dummy", arrow::datatypes::DataType::Int64, false),
-        ]));
-        let array = std::sync::Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3, 4, 5]));
-        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Self::new(batch)
-    }
 }
 
-#[async_trait::async_trait(?Send)]
-impl Source<DataChunk> for MemorySource {
-    async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunk>) -> Result<()> {
+#[async_trait::async_trait]
+impl Source<DataChunkView> for MemorySource {
+    async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunkView>) -> Result<()> {
         if let Some(batch) = self.batch.take() {
-            let num_rows = batch.num_rows();
-            let vectors = batch.columns().to_vec();
-            let chunk = DataChunk {
-                vectors,
-                selection: SelectionVector::new_dense(num_rows),
-            };
-            next.push(chunk)?;
+            next.push(DataChunkView::from_record_batch(batch)?)?;
         }
         next.flush()?;
         Ok(())
     }
 }
-

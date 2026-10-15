@@ -6,7 +6,7 @@ use crate::star::expand_projection_items;
 use crate::window::{expr_contains_window_call, split_window_items, wrap_window};
 use plan::LogicalPlan;
 use plan::PlanTraversal;
-use plan::{LogicalExpr, ResolvedColumn, VeinDataType, VeinSchema};
+use plan::{LogicalExpr, ResolvedColumn, ResolvedColumnRef, VeinDataType, VeinSchema};
 use error::{Result, VeinError};
 use parser::ast::expr::{BinaryOp, SpannedExpr};
 use parser::ast::pipe_op::{AggregateExpr, JoinClause, SelectItem};
@@ -92,11 +92,15 @@ pub async fn bind_select<'a>(
     let mut bound_exprs = Vec::with_capacity(plain_items.len());
     let mut new_fields = Vec::with_capacity(plain_items.len());
     for (expr, name) in plain_items {
-        new_fields.push(ResolvedColumn::new(
-            context.next_id(),
-            name.unwrap_or_else(|| "_col".to_string()),
-            None,
-            expr.data_type(),
+        let nullable = expr.nullable();
+        new_fields.push(std::sync::Arc::new(
+            ResolvedColumn::new(
+                context.next_id(),
+                name.unwrap_or_else(|| "_col".to_string()),
+                None,
+                expr.data_type(),
+            )
+                .with_nullable(nullable),
         ));
         bound_exprs.push(expr);
     }
@@ -114,32 +118,44 @@ pub async fn bind_select<'a>(
 /// Binds a PipeOperator::Aggregate into a LogicalPlan::Aggregate
 pub async fn bind_aggregate<'a>(
     input: LogicalPlan,
-    group_by: &[parser::ast::pipe_op::OrderByExpr<'_>],
+    grouping_sets: &[Vec<parser::ast::pipe_op::OrderByExpr<'_>>],
     aggregates: &[AggregateExpr<'_>],
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
-    let mut bound_group_by = Vec::new();
-    let mut new_fields = Vec::new();
+    let mut bound_grouping_sets = Vec::with_capacity(grouping_sets.len());
+    let mut new_fields: Vec<ResolvedColumnRef> = Vec::new();
 
-    for gb in group_by {
-        let bound_expr = ExprBinder::new(context, scopes).bind(&gb.expr).await?;
-        // Window functions are only allowed inside projection operators
-        // (Google: use EXTEND before AGGREGATE instead).
-        if expr_contains_window_call(&bound_expr) {
-            return Err(VeinError::semantic(
-                "window functions are not allowed inside AGGREGATE; use EXTEND before AGGREGATE",
-                Some(gb.expr.span),
-            ));
+    for grouping_set in grouping_sets {
+        let mut bound_grouping_set = Vec::with_capacity(grouping_set.len());
+        for grouping_expr in grouping_set {
+            let bound_expr = ExprBinder::new(context, scopes).bind(&grouping_expr.expr).await?;
+            // Window functions are only allowed inside projection operators
+            // (Google: use EXTEND before AGGREGATE instead).
+            if expr_contains_window_call(&bound_expr) {
+                return Err(VeinError::semantic(
+                    "window functions are not allowed inside AGGREGATE; use EXTEND before AGGREGATE",
+                    Some(grouping_expr.expr.span),
+                ));
+            }
+            if !bound_grouping_sets
+                .iter()
+                .flatten()
+                .chain(bound_grouping_set.iter())
+                .any(|expr| expr == &bound_expr)
+            {
+                let name = derive_column_name(&grouping_expr.expr.node);
+                new_fields.push(std::sync::Arc::new(ResolvedColumn::new(
+                    context.next_id(),
+                    name,
+                    None,
+                    bound_expr.data_type(),
+                )
+                    .with_nullable(bound_expr.nullable())));
+            }
+            bound_grouping_set.push(bound_expr);
         }
-        let name = derive_column_name(&gb.expr.node);
-        new_fields.push(ResolvedColumn::new(
-            context.next_id(),
-            name,
-            None,
-            bound_expr.data_type(),
-        ));
-        bound_group_by.push(bound_expr);
+        bound_grouping_sets.push(bound_grouping_set);
     }
 
     let mut bound_aggs = Vec::new();
@@ -156,12 +172,13 @@ pub async fn bind_aggregate<'a>(
             .map(|a| a.to_string())
             .unwrap_or_else(|| derive_column_name(&agg.expr.node));
 
-        new_fields.push(ResolvedColumn::new(
+        new_fields.push(std::sync::Arc::new(ResolvedColumn::new(
             context.next_id(),
             col_name,
             None,
             bound_expr.data_type(),
-        ));
+        )
+            .with_nullable(bound_expr.nullable())));
         bound_aggs.push(bound_expr);
     }
 
@@ -170,7 +187,7 @@ pub async fn bind_aggregate<'a>(
 
     Ok(LogicalPlan::Aggregate {
         input: Box::new(input),
-        grouping_sets: vec![bound_group_by],
+        grouping_sets: bound_grouping_sets,
         aggs: bound_aggs,
         schema: Box::new(VeinSchema { fields: new_fields }),
     })
@@ -285,9 +302,35 @@ pub async fn bind_join<'a>(
     };
 
     // 4. Output schema: left ++ right (USING de-duplicates the join columns).
-    let output_fields = merged.columns.clone();
+    // Outer joins make columns from the non-preserved side nullable. The ON
+    // predicate was bound against the original input fields above; downstream
+    // pipes must see the null-extended output fields.
+    let left_field_count = left_fields.len();
+    let output_fields: Vec<ResolvedColumnRef> = merged
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let null_extended = match &join.join_type {
+                parser::ast::pipe_op::JoinType::Left
+                | parser::ast::pipe_op::JoinType::Single => index >= left_field_count,
+                parser::ast::pipe_op::JoinType::Right => index < left_field_count,
+                parser::ast::pipe_op::JoinType::Full => true,
+                parser::ast::pipe_op::JoinType::Inner
+                | parser::ast::pipe_op::JoinType::Cross
+                | parser::ast::pipe_op::JoinType::Semi
+                | parser::ast::pipe_op::JoinType::Anti => false,
+            };
+            if null_extended && !field.nullable {
+                std::sync::Arc::new(field.as_ref().clone().with_nullable(true))
+            } else {
+                std::sync::Arc::clone(field)
+            }
+        })
+        .collect();
 
-    // 5. Push the merged scope so downstream pipes see both sides.
+    // 5. Push the output scope so downstream pipes see outer-join nullability.
+    merged.columns = output_fields.clone();
     scopes.push(merged);
 
     Ok(LogicalPlan::Join {

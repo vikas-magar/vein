@@ -1,23 +1,22 @@
 //! Vectorized micro-instruction definitions for Micro-IR.
 
 use serde::{Deserialize, Serialize};
+use types::VeinDataType;
 
-use super::constant::ScalarConstant;
 use super::program::RegId;
 use super::state::{AggOpCode, JoinKind, StateMode};
+use types::LogicalLiteral;
 
 /// A compact, zero-copy instruction operating on columnar vector registers.
-#[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MicroOp {
     // ── Scalar & Register Constants ──────────────────────────────
-    /// Load a scalar constant into a register across all active rows.
+    /// Load a constant into a register across all active rows.
     LoadConstant {
         /// Destination register.
         dst: RegId,
-        /// Scalar constant value.
-        value: ScalarConstant,
+        /// The constant, in the engine's own literal vocabulary.
+        value: LogicalLiteral,
     },
     /// Copy reference from one register to another.
     CopyRegister {
@@ -25,6 +24,21 @@ pub enum MicroOp {
         dst: RegId,
         /// Source register.
         src: RegId,
+    },
+
+    // ── Type Conversion ──────────────────────────────────────────
+    /// Convert a register to another logical type: `dst = cast(src AS target)`.
+    ///
+    /// The conversion is checked: values that cannot be represented in `target`
+    /// (an out-of-range integer, an unparsable string) fail the task rather than
+    /// wrapping or truncating silently.
+    Cast {
+        /// Destination register.
+        dst: RegId,
+        /// Source register.
+        src: RegId,
+        /// Logical type to convert the source array to.
+        target: VeinDataType,
     },
 
     // ── Arithmetic Operations (SIMD Vectorized) ──────────────────
@@ -99,6 +113,41 @@ pub enum MicroOp {
         src1: RegId,
         /// Right operand register.
         src2: RegId,
+    },
+    /// SQL string pattern comparison: dst = src LIKE pattern.
+    Like {
+        /// Destination register.
+        dst: RegId,
+        /// String value register.
+        src: RegId,
+        /// SQL pattern register.
+        pattern: RegId,
+        /// Whether to negate the match (NOT LIKE).
+        negated: bool,
+    },
+    /// SQL membership test over candidate registers: `dst = value [NOT] IN (...)`.
+    InList {
+        /// Destination boolean register.
+        dst: RegId,
+        /// Register containing the value being tested.
+        value: RegId,
+        /// Registers containing the candidate values.
+        candidates: Vec<RegId>,
+        /// Whether to negate the membership result.
+        negated: bool,
+    },
+    /// SQL searched CASE expression. WHEN arms are evaluated eagerly and in source order.
+    Case {
+        /// Destination register.
+        dst: RegId,
+        /// Boolean WHEN-condition registers.
+        when_regs: Vec<RegId>,
+        /// THEN-value registers corresponding to `when_regs`.
+        then_regs: Vec<RegId>,
+        /// ELSE-value register, or None for a typed NULL result.
+        else_reg: Option<RegId>,
+        /// Common result type selected by binding.
+        return_type: VeinDataType,
     },
     /// Vector comparison: `dst = src1 < src2`
     CmpLt {

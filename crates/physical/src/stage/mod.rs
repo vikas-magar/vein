@@ -1,20 +1,18 @@
-//! A group of parallel tasks between shuffle barriers.
+//! Parallel file tasks belonging to one local query plan.
 
 use crate::task::Task;
 use common::identifiers::StageId;
+use crate::pipeline_graph::DerivedPipelineGraph;
 
-/// A set of [`Task`]s that execute together, separated from other stages by a
-/// shuffle barrier.
-///
-/// Every task in a stage is independent of its siblings and can run in
-/// parallel on different executors; a stage completes only when all of its
-/// tasks have finished.
+/// A set of independent tasks that together produce one query result.
 #[derive(Debug, Clone)]
 pub struct Stage {
     /// The unique identifier of this stage.
     pub stage_id: StageId,
     /// The parallel tasks belonging to this stage.
     pub tasks: Vec<Task>,
+    /// Scheduling graph derived from the canonical input plan before task splitting.
+    pipeline_graph: DerivedPipelineGraph,
 }
 
 impl Stage {
@@ -23,7 +21,19 @@ impl Stage {
         Self {
             stage_id,
             tasks: Vec::new(),
+            pipeline_graph: DerivedPipelineGraph::default(),
         }
+    }
+
+    /// Attach the graph derived from this stage's canonical physical plan.
+    pub fn with_pipeline_graph(mut self, pipeline_graph: DerivedPipelineGraph) -> Self {
+        self.pipeline_graph = pipeline_graph;
+        self
+    }
+
+    /// Return pipeline boundaries and dependencies for inspection and scheduling.
+    pub fn pipeline_graph(&self) -> &DerivedPipelineGraph {
+        &self.pipeline_graph
     }
 
     /// Add a task to this stage.

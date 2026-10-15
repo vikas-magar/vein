@@ -14,15 +14,22 @@ pub mod udf;
 /// Operators for physical execution.
 pub mod operators;
 
-/// Executor daemon entrypoints and runtime environment.
-pub mod daemon;
-/// Execution seam: stage-factory, task-executor, and expression traits.
-pub mod runtime;
 /// Default stage factory mapping the wire protocol onto executor stages.
 pub mod factory;
+/// Execution seam: stage-factory, task-executor, and expression traits.
+pub mod runtime;
+/// Query-scoped reservation accounting for blocking operator state.
+pub mod memory;
+/// Query-local runtime filters shared by joins and capable scan adapters.
+pub mod runtime_filter;
+/// Typed Parquet footer statistics shared by catalog discovery and scan pruning.
+pub mod parquet_statistics;
+/// Query-scoped spill storage, accounting, and Arrow IPC run lifecycle.
+pub mod spill;
 /// Vector VM execution engine interpreting Micro-IR programs.
 pub mod vm;
 
-pub use daemon::{ExecutorDaemon, ExecutorDaemonBuilder};
-pub use pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
+/// Structured execution tracing for canonical plans and batch flow.
+mod trace;
 
+pub use pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};

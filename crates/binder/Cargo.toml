@@ -8,10 +8,11 @@ missing_docs = "deny"
 
 [dependencies]
 plan = { path = "../plan" }
-vcs = { path = "../vcs" }
 error = { path = "../error" }
 parser = { path = "../parser" }
+types = { path = "../types" }
 async-trait = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

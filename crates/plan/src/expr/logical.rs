@@ -1,18 +1,18 @@
-use crate::expr::literal::LogicalLiteral;
+use crate::expr::LogicalLiteral;
 use crate::plan::LogicalPlan;
 use crate::plan::types::SortKey;
-use crate::schema::{ResolvedColumn, VeinDataType};
+use crate::schema::{ResolvedColumnRef, VeinDataType};
 use parser::ast::expr::BinaryOp;
 use parser::ast::pipe_op::WindowFrame;
 
 /// A node in the logical expression tree
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LogicalExpr {
     // ── Atoms ─────────────────────────────────────────────
     /// A reference to a column in the current scope
-    Column(ResolvedColumn),
+    Column(ResolvedColumnRef),
     /// A reference to a column in an outer scope (Correlated subquery)
-    OuterColumn(ResolvedColumn),
+    OuterColumn(ResolvedColumnRef),
     /// A literal value
     Literal(LogicalLiteral),
 
@@ -166,11 +166,11 @@ pub enum LogicalExpr {
     /// A lambda expression for higher-order functions
     Lambda {
         /// The parameters bound by the lambda
-        params: Vec<ResolvedColumn>,
+        params: Vec<ResolvedColumnRef>,
         /// The body of the lambda
         body: Box<LogicalExpr>,
         /// The variables captured from the outer scope
-        captures: Vec<ResolvedColumn>,
+        captures: Vec<ResolvedColumnRef>,
     },
 
     // ── Subqueries ────────────────────────────────────────
@@ -205,6 +205,89 @@ fn is_volatile_builtin(name: &str) -> bool {
 }
 
 impl LogicalExpr {
+    /// Returns the stable kind name without formatting nested expression or plan data.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            LogicalExpr::Column(_) => "Column",
+            LogicalExpr::OuterColumn(_) => "OuterColumn",
+            LogicalExpr::Literal(_) => "Literal",
+            LogicalExpr::BinaryOp { .. } => "BinaryOp",
+            LogicalExpr::Cast { .. } => "Cast",
+            LogicalExpr::Not { .. } => "Not",
+            LogicalExpr::Negate { .. } => "Negate",
+            LogicalExpr::IsNull { .. } => "IsNull",
+            LogicalExpr::IsNotNull { .. } => "IsNotNull",
+            LogicalExpr::InList { .. } => "InList",
+            LogicalExpr::Like { .. } => "Like",
+            LogicalExpr::Case { .. } => "Case",
+            LogicalExpr::FunctionCall { .. } => "FunctionCall",
+            LogicalExpr::WindowCall { .. } => "WindowCall",
+            LogicalExpr::AiOperator { .. } => "AiOperator",
+            LogicalExpr::WasmUdf { .. } => "WasmUdf",
+            LogicalExpr::EbpfUdf { .. } => "EbpfUdf",
+            LogicalExpr::PythonUdf { .. } => "PythonUdf",
+            LogicalExpr::Lambda { .. } => "Lambda",
+            LogicalExpr::ScalarSubquery(_) => "ScalarSubquery",
+            LogicalExpr::Exists { .. } => "Exists",
+        }
+    }
+
+    /// Returns whether this expression can produce NULL.
+    ///
+    /// Column references and literals have exact nullability. Operators whose
+    /// result nullability depends on their operands propagate that information;
+    /// function calls and subqueries remain conservatively nullable because
+    /// their signatures do not yet describe NULL behavior.
+    pub fn nullable(&self) -> bool {
+        Self::nullable_at_depth(self, 0)
+    }
+
+    fn nullable_at_depth(expr: &LogicalExpr, depth: usize) -> bool {
+        if depth >= MAX_VOLATILITY_DEPTH {
+            // A deeply nested expression cannot be proven non-null cheaply or
+            // safely, so choose the schema that permits NULL values.
+            return true;
+        }
+
+        let child_nullable = |child: &LogicalExpr| Self::nullable_at_depth(child, depth + 1);
+        match expr {
+            LogicalExpr::Column(column) | LogicalExpr::OuterColumn(column) => column.nullable,
+            LogicalExpr::Literal(LogicalLiteral::Null(_)) => true,
+            LogicalExpr::Literal(_) => false,
+            LogicalExpr::BinaryOp { left, right, .. } => {
+                child_nullable(left) || child_nullable(right)
+            }
+            LogicalExpr::Cast { expr, .. }
+            | LogicalExpr::Not { expr }
+            | LogicalExpr::Negate { expr } => child_nullable(expr),
+            LogicalExpr::IsNull { .. }
+            | LogicalExpr::IsNotNull { .. }
+            | LogicalExpr::Exists { .. } => false,
+            LogicalExpr::InList { expr, list, .. } => {
+                child_nullable(expr) || list.iter().any(child_nullable)
+            }
+            LogicalExpr::Like { expr, pattern, .. } => {
+                child_nullable(expr) || child_nullable(pattern)
+            }
+            LogicalExpr::Case { then, else_, .. } => {
+                else_.is_none()
+                    || then.iter().any(child_nullable)
+                    || else_.as_deref().is_some_and(child_nullable)
+            }
+            // These nodes have independent NULL behavior that is not captured
+            // in the logical expression yet. In particular, scalar subqueries
+            // can return no rows and therefore yield NULL.
+            LogicalExpr::FunctionCall { .. }
+            | LogicalExpr::WindowCall { .. }
+            | LogicalExpr::AiOperator { .. }
+            | LogicalExpr::WasmUdf { .. }
+            | LogicalExpr::EbpfUdf { .. }
+            | LogicalExpr::PythonUdf { .. }
+            | LogicalExpr::Lambda { .. }
+            | LogicalExpr::ScalarSubquery(_) => true,
+        }
+    }
+
     /// Returns a list of child expressions for traversal
     pub fn children(&self) -> Vec<&LogicalExpr> {
         match self {
@@ -258,17 +341,21 @@ impl LogicalExpr {
         }
     }
 
-    /// Maps children using a mutable function
-    pub fn map_children<F>(&self, f: &mut F) -> Result<LogicalExpr, error::VeinError>
+    /// Maps children using a mutable function, consuming the expression.
+    ///
+    /// Taking `self` by value is what keeps recursion clone-free: a rewriter
+    /// that owns each node moves it into the mapper instead of deep-cloning the
+    /// whole subtree at every level.
+    pub fn map_children<F>(self, f: &mut F) -> Result<LogicalExpr, error::VeinError>
     where
         F: FnMut(LogicalExpr) -> Result<LogicalExpr, error::VeinError>,
     {
-        match self.clone() {
-            LogicalExpr::Column(_)
-            | LogicalExpr::OuterColumn(_)
-            | LogicalExpr::Literal(_)
-            | LogicalExpr::ScalarSubquery(_)
-            | LogicalExpr::Exists { .. } => Ok(self.clone()),
+        match self {
+            other @ LogicalExpr::Column(_)
+            | other @ LogicalExpr::OuterColumn(_)
+            | other @ LogicalExpr::Literal(_)
+            | other @ LogicalExpr::ScalarSubquery(_)
+            | other @ LogicalExpr::Exists { .. } => Ok(other),
             LogicalExpr::BinaryOp {
                 left,
                 op,
@@ -566,7 +653,7 @@ impl LogicalExpr {
 mod tests {
     use super::*;
     use crate::expr::LogicalLiteral;
-    use crate::schema::VeinDataType;
+    use crate::schema::{ColumnId, ResolvedColumn, VeinDataType};
 
     fn func(name: &str) -> LogicalExpr {
         LogicalExpr::FunctionCall {
@@ -576,6 +663,13 @@ mod tests {
             distinct: false,
             return_type: VeinDataType::Float64,
         }
+    }
+
+    #[test]
+    fn kind_name_returns_stable_expression_label() {
+        let expr = LogicalExpr::Literal(LogicalLiteral::Int64(42));
+
+        assert_eq!(expr.kind_name(), "Literal");
     }
 
     #[test]
@@ -607,6 +701,53 @@ mod tests {
     }
 
     #[test]
+    fn nullability_tracks_known_inputs_and_is_conservative_for_calls() {
+        let nullable_column = LogicalExpr::Column(std::sync::Arc::new(
+            ResolvedColumn::new(
+                ColumnId(1),
+                "nullable_value",
+                None,
+                VeinDataType::Utf8,
+            )
+                .with_nullable(true),
+        ));
+        let non_nullable_literal = LogicalExpr::Literal(LogicalLiteral::Int64(1));
+        let nullable_arithmetic = LogicalExpr::BinaryOp {
+            left: Box::new(nullable_column.clone()),
+            op: BinaryOp::Plus,
+            right: Box::new(non_nullable_literal.clone()),
+            return_type: VeinDataType::Int64,
+        };
+        let null_check = LogicalExpr::IsNull {
+            expr: Box::new(nullable_column.clone()),
+        };
+
+        assert!(nullable_column.nullable());
+        assert!(!non_nullable_literal.nullable());
+        assert!(nullable_arithmetic.nullable());
+        assert!(!null_check.nullable());
+        assert!(func("any_registered_function").nullable());
+    }
+
+    #[test]
+    fn deeply_nested_nullability_defaults_to_nullable_without_unbounded_recursion() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let mut expr = LogicalExpr::Literal(LogicalLiteral::Int64(1));
+                for _ in 0..200_000 {
+                    expr = LogicalExpr::Not {
+                        expr: Box::new(expr),
+                    };
+                }
+                assert!(expr.nullable());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn udfs_window_and_ai_ops_are_conservatively_volatile() {
         assert!(LogicalExpr::WindowCall {
             name: "row_number".to_string(),
@@ -618,19 +759,19 @@ mod tests {
             frame: None,
             return_type: VeinDataType::Int64,
         }
-        .is_volatile());
+            .is_volatile());
         assert!(LogicalExpr::AiOperator {
             name: "llm_classify".to_string(),
             args: vec![],
             return_type: VeinDataType::Utf8,
         }
-        .is_volatile());
+            .is_volatile());
         assert!(LogicalExpr::WasmUdf {
             bytecode_ref: None,
             args: vec![],
             return_type: VeinDataType::Int64,
         }
-        .is_volatile());
+            .is_volatile());
     }
 
     /// A pathologically deep expression must not overflow the stack while

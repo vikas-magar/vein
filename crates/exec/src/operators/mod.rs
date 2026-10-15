@@ -5,6 +5,10 @@
 //! - [`transform`]: Processes data chunks ([`LimitTransform`](transform::LimitTransform), [`VectorVmExecutor`](crate::vm::VectorVmExecutor)).
 //! - [`sink`]: Terminates data streams ([`CollectSink`](sink::CollectSink), [`DiscardSink`](sink::DiscardSink)).
 
+/// Aggregate operators that consume their whole input before emitting
+pub mod aggregate;
+/// Join operators that consume a second input before emitting
+pub mod join;
 /// Sink operators that consume data batches
 pub mod sink;
 /// Source operators that generate data batches
@@ -15,3 +19,4 @@ pub mod transform;
 pub use sink::{CollectSink, DiscardSink};
 pub use source::{MemorySource, ScanSource};
 pub use transform::LimitTransform;
+pub use transform::SortTransform;

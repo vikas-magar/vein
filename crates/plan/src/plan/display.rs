@@ -7,7 +7,7 @@
 use crate::expr::LogicalExpr;
 use crate::plan::logical::{LogicalPlan, WindowExpr};
 use crate::plan::traversal::PlanTraversal;
-use crate::schema::{ResolvedColumn, VeinDataType};
+use crate::schema::{ResolvedColumn, ResolvedColumnRef, VeinDataType};
 use parser::ast::expr::BinaryOp;
 use parser::ast::pipe_op::{WindowFrame, WindowFrameBound, WindowFrameKind};
 use std::cell::Cell;
@@ -186,7 +186,7 @@ fn format_expr_inner(expr: &LogicalExpr) -> String {
 }
 
 /// Renders a schema as `[name:Type, ...]`.
-pub fn format_schema(fields: &[ResolvedColumn]) -> String {
+pub fn format_schema(fields: &[ResolvedColumnRef]) -> String {
     let cols = fields
         .iter()
         .map(|f| format!("{}:{}", f.name, type_str(&f.data_type)))
@@ -251,11 +251,12 @@ fn build_lines(plan: &LogicalPlan, prefix: &str, child_prefix: &str, out: &mut S
 fn node_line(plan: &LogicalPlan) -> String {
     let (kind, details, show_schema) = match plan {
         LogicalPlan::Scan {
-            table_name,
+            table,
             projection,
             filters,
             ..
         } => {
+            let table_name = &table.name;
             let proj = match projection {
                 Some(cols) => cols
                     .iter()
@@ -463,6 +464,7 @@ fn format_literal(lit: &crate::LogicalLiteral) -> String {
         crate::LogicalLiteral::Null(_) => "NULL".to_string(),
         crate::LogicalLiteral::Boolean(b) => b.to_string(),
         crate::LogicalLiteral::Int64(v) => v.to_string(),
+        crate::LogicalLiteral::UInt64(v) => v.to_string(),
         crate::LogicalLiteral::Float64(v) => v.to_string(),
         crate::LogicalLiteral::String(s) => format!("\"{}\"", s.escape_default()),
         crate::LogicalLiteral::Date(d) => format!("DATE {d}"),
@@ -529,7 +531,8 @@ fn op_symbol(op: BinaryOp) -> &'static str {
 fn type_str(ty: &VeinDataType) -> String {
     match ty {
         VeinDataType::Decimal128(p, s) => format!("Decimal128({p}, {s})"),
-        VeinDataType::Timestamp(Some(tz)) => format!("Timestamp(\"{tz}\")"),
+        VeinDataType::Interval(unit) => format!("Interval({unit:?})"),
+        VeinDataType::Timestamp(unit, Some(tz)) => format!("Timestamp({unit:?}, \"{tz}\")"),
         _ => format!("{ty:?}"),
     }
 }
@@ -602,25 +605,26 @@ mod tests {
     use crate::{ColumnId, ResolvedColumn};
     use crate::VeinDataType;
 
-    fn col(id: u64, name: &str) -> ResolvedColumn {
-        ResolvedColumn {
+    fn col(id: u64, name: &str) -> ResolvedColumnRef {
+        std::sync::Arc::new(ResolvedColumn {
             id: ColumnId(id as usize),
             name: name.to_string(),
             qualifier: Some("users".to_string()),
             data_type: VeinDataType::Int64,
             is_factorized: false,
             nullable: false,
-        }
+        })
     }
 
     fn scan_plan() -> LogicalPlan {
+        let schema = std::sync::Arc::new(crate::VeinSchema {
+            fields: vec![col(0, "id"), col(1, "name")],
+        });
         LogicalPlan::Scan {
-            table_name: "users".to_string(),
+            table: std::sync::Arc::new(crate::TableMetadata::new("users", schema.clone())),
             projection: None,
             filters: vec![],
-            schema: Box::new(crate::VeinSchema {
-                fields: vec![col(0, "id"), col(1, "name")],
-            }),
+            schema: Box::new((*schema).clone()),
         }
     }
 
@@ -728,15 +732,15 @@ mod coverage {
     use parser::ast::pipe_op::JoinType;
     use parser::ast::query::SetOpKind;
 
-    fn col(id: u64, name: &str) -> ResolvedColumn {
-        ResolvedColumn {
+    fn col(id: u64, name: &str) -> ResolvedColumnRef {
+        std::sync::Arc::new(ResolvedColumn {
             id: ColumnId(id as usize),
             name: name.to_string(),
             qualifier: Some("users".to_string()),
             data_type: VeinDataType::Int64,
             is_factorized: false,
             nullable: false,
-        }
+        })
     }
 
     fn lit(v: i64) -> LogicalExpr {
@@ -744,17 +748,18 @@ mod coverage {
     }
 
     fn scan_plan() -> LogicalPlan {
+        let schema = std::sync::Arc::new(crate::VeinSchema {
+            fields: vec![col(0, "id"), col(1, "name")],
+        });
         LogicalPlan::Scan {
-            table_name: "users".to_string(),
+            table: std::sync::Arc::new(crate::TableMetadata::new("users", schema.clone())),
             projection: None,
             filters: vec![],
-            schema: Box::new(crate::VeinSchema {
-                fields: vec![col(0, "id"), col(1, "name")],
-            }),
+            schema: Box::new((*schema).clone()),
         }
     }
 
-    fn schema(cols: Vec<ResolvedColumn>) -> Box<crate::VeinSchema> {
+    fn schema(cols: Vec<ResolvedColumnRef>) -> Box<crate::VeinSchema> {
         Box::new(crate::VeinSchema { fields: cols })
     }
 
@@ -787,7 +792,10 @@ mod coverage {
         vec![
             (
                 LogicalPlan::Scan {
-                    table_name: "users".to_string(),
+                    table: std::sync::Arc::new(crate::TableMetadata::new(
+                        "users",
+                        std::sync::Arc::new(*base_schema.clone()),
+                    )),
                     projection: None,
                     filters: vec![],
                     schema: base_schema.clone(),
@@ -985,6 +993,7 @@ mod coverage {
                 LogicalPlan::ExternalScan {
                     url: "s3://bucket/data".to_string(),
                     options: vec![],
+                    files: vec![],
                     schema: schema(vec![]),
                 },
                 "ExternalScan".to_string(),
@@ -1088,7 +1097,7 @@ mod coverage {
         bind(LogicalExpr::Literal(LogicalLiteral::Boolean(true)), "true");
         bind(LogicalExpr::Literal(LogicalLiteral::Float64(1.5)), "1.5");
         bind(LogicalExpr::Literal(LogicalLiteral::String("a\\b".into())), "\"a\\\\b\"");
-                bind(LogicalExpr::Literal(LogicalLiteral::Date(19000)), "DATE 19000");
+        bind(LogicalExpr::Literal(LogicalLiteral::Date(19000)), "DATE 19000");
         bind(LogicalExpr::Literal(LogicalLiteral::Timestamp(123)), "TIMESTAMP 123");
         bind(LogicalExpr::Literal(LogicalLiteral::Time(9_000_000)), "TIME 9000000");
         bind(

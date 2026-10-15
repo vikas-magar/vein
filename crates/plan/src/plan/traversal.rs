@@ -1,4 +1,5 @@
 use super::logical::LogicalPlan;
+use crate::expr::LogicalExpr;
 use crate::schema::VeinSchema;
 use error::VeinError;
 
@@ -6,10 +7,21 @@ use error::VeinError;
 pub trait PlanTraversal {
     /// Returns the schema of the plan node
     fn schema(&self) -> &VeinSchema;
+    /// Visits every expression stored directly on this node and identifies
+    /// the field that owns it. Keep the implementation exhaustive so new
+    /// expression-bearing operators join the optimizer's support inventory.
+    fn for_each_expression<'a>(
+        &'a self,
+        visitor: &mut dyn FnMut(&'static str, &'a LogicalExpr),
+    );
     /// Returns a list of child plans for traversal
     fn children(&self) -> Vec<&LogicalPlan>;
-    /// Maps children using a mutable function
-    fn map_children<F>(&self, f: &mut F) -> Result<LogicalPlan, VeinError>
+    /// Maps children using a mutable function, consuming the node.
+    ///
+    /// Taking `self` by value is what keeps recursion clone-free: a rewriter
+    /// that owns each node moves it into the mapper instead of deep-cloning the
+    /// whole subtree at every level.
+    fn map_children<F>(self, f: &mut F) -> Result<LogicalPlan, VeinError>
     where
         F: FnMut(Box<LogicalPlan>) -> Result<Box<LogicalPlan>, VeinError>;
     /// Checks if the plan contains semantic nodes (which blocks relational sharing rules)
@@ -24,6 +36,75 @@ pub trait PlanTraversal {
 }
 
 impl PlanTraversal for LogicalPlan {
+    fn for_each_expression<'a>(
+        &'a self,
+        visitor: &mut dyn FnMut(&'static str, &'a LogicalExpr),
+    ) {
+        use crate::plan::types::SortKey;
+
+        fn expressions<'a>(
+            exprs: &'a [LogicalExpr],
+            owner: &'static str,
+            visitor: &mut dyn FnMut(&'static str, &'a LogicalExpr),
+        ) {
+            for expr in exprs {
+                visitor(owner, expr);
+            }
+        }
+
+        fn sort_keys<'a>(
+            keys: &'a [SortKey],
+            owner: &'static str,
+            visitor: &mut dyn FnMut(&'static str, &'a LogicalExpr),
+        ) {
+            for key in keys {
+                visitor(owner, &key.expr);
+            }
+        }
+
+        match self {
+            LogicalPlan::Scan { filters, .. } => expressions(filters, "Scan.filters", visitor),
+            LogicalPlan::Filter { predicate, .. } => visitor("Filter.predicate", predicate),
+            LogicalPlan::Project { exprs, .. } => expressions(exprs, "Project.exprs", visitor),
+            LogicalPlan::Aggregate { grouping_sets, aggs, .. } => {
+                for grouping_set in grouping_sets {
+                    expressions(grouping_set, "Aggregate.grouping_sets", visitor);
+                }
+                expressions(aggs, "Aggregate.aggs", visitor);
+            }
+            LogicalPlan::Window { partition_by, order_by, exprs, .. } => {
+                expressions(partition_by, "Window.partition_by", visitor);
+                sort_keys(order_by, "Window.order_by", visitor);
+                for expr in exprs {
+                    visitor("Window.exprs.call", &expr.call);
+                }
+            }
+            LogicalPlan::Join { on: Some(on), .. } => visitor("Join.on", on),
+            LogicalPlan::Sort { sort_keys: keys, .. } => sort_keys(keys, "Sort.sort_keys", visitor),
+            LogicalPlan::Assert { condition, .. } => visitor("Assert.condition", condition),
+            LogicalPlan::Pivot { aggregate, values, .. } => {
+                visitor("Pivot.aggregate", aggregate);
+                expressions(values, "Pivot.values", visitor);
+            }
+            LogicalPlan::Call { args, .. } => expressions(args, "Call.args", visitor),
+            LogicalPlan::ExternalScan { .. }
+            | LogicalPlan::Join { on: None, .. }
+            | LogicalPlan::Limit { .. }
+            | LogicalPlan::Distinct { .. }
+            | LogicalPlan::SubqueryAlias { .. }
+            | LogicalPlan::Explain { .. }
+            | LogicalPlan::SetOp { .. }
+            | LogicalPlan::Sample { .. }
+            | LogicalPlan::Unpivot { .. }
+            | LogicalPlan::Fork { .. }
+            | LogicalPlan::Tee { .. }
+            | LogicalPlan::SemanticFilter { .. }
+            | LogicalPlan::SemanticJoin { .. }
+            | LogicalPlan::SemanticCalibrate { .. }
+            | LogicalPlan::Write { .. } => {}
+        }
+    }
+
     fn schema(&self) -> &VeinSchema {
         match self {
             LogicalPlan::Scan { schema, .. }
@@ -83,12 +164,12 @@ impl PlanTraversal for LogicalPlan {
         }
     }
 
-    fn map_children<F>(&self, f: &mut F) -> Result<LogicalPlan, VeinError>
+    fn map_children<F>(self, f: &mut F) -> Result<LogicalPlan, VeinError>
     where
         F: FnMut(Box<LogicalPlan>) -> Result<Box<LogicalPlan>, VeinError>,
     {
-        match self.clone() {
-            LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. } => Ok(self.clone()),
+        match self {
+            node @ (LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. }) => Ok(node),
             LogicalPlan::Filter { input, predicate } => Ok(LogicalPlan::Filter {
                 input: f(input)?,
                 predicate,
@@ -343,66 +424,19 @@ impl PlanTraversal for LogicalPlan {
             _ => {
                 self.children().iter().any(|c| c.contains_semantic())
                     || self
-                        .subquery_plans()
-                        .iter()
-                        .any(|p| p.contains_semantic())
+                    .subquery_plans()
+                    .iter()
+                    .any(|p| p.contains_semantic())
             }
         }
     }
 
     fn subquery_plans(&self) -> Vec<&LogicalPlan> {
-        use crate::expr::LogicalExpr;
-        use crate::plan::types::SortKey;
-
-        fn from_sort_keys(keys: &[SortKey]) -> Vec<&LogicalPlan> {
-            keys.iter()
-                .flat_map(|k| k.expr.subquery_plans())
-                .collect()
-        }
-
-        fn from_exprs(exprs: &[LogicalExpr]) -> Vec<&LogicalPlan> {
-            exprs.iter().flat_map(|e| e.subquery_plans()).collect()
-        }
-
-        match self {
-            LogicalPlan::Scan { filters, .. } => from_exprs(filters),
-            LogicalPlan::Filter { predicate, .. } => predicate.subquery_plans(),
-            LogicalPlan::Project { exprs, .. } => from_exprs(exprs),
-            LogicalPlan::Aggregate {
-                grouping_sets,
-                aggs,
-                ..
-            } => grouping_sets
-                .iter()
-                .flat_map(|g| from_exprs(g))
-                .chain(from_exprs(aggs))
-                .collect(),
-            LogicalPlan::Window {
-                partition_by,
-                order_by,
-                exprs,
-                ..
-            } => from_exprs(partition_by)
-                .into_iter()
-                .chain(from_sort_keys(order_by))
-                .chain(exprs.iter().flat_map(|w| w.call.subquery_plans()))
-                .collect(),
-            LogicalPlan::Sort { sort_keys, .. } => from_sort_keys(sort_keys),
-            LogicalPlan::Join { on: Some(on), .. } => on.subquery_plans(),
-            LogicalPlan::Join { on: None, .. } => vec![],
-            LogicalPlan::Assert { condition, .. } => condition.subquery_plans(),
-            LogicalPlan::Pivot {
-                aggregate,
-                values,
-                ..
-            } => aggregate
-                .subquery_plans()
-                .into_iter()
-                .chain(from_exprs(values))
-                .collect(),
-            LogicalPlan::Call { args, .. } => from_exprs(args),
-            _ => vec![],
-        }
+        let mut subqueries = Vec::new();
+        self.for_each_expression(&mut |_, expression| {
+            subqueries.extend(expression.subquery_plans());
+        });
+        subqueries
     }
 }
 
@@ -411,29 +445,30 @@ mod tests {
     use super::*;
     use crate::expr::logical::LogicalExpr;
     use crate::expr::LogicalLiteral;
-    use crate::schema::{ColumnId, ResolvedColumn, VeinSchema};
+    use crate::schema::{ColumnId, ResolvedColumn, ResolvedColumnRef, VeinSchema};
     use crate::VeinDataType;
     use parser::ast::expr::BinaryOp;
 
-    fn col(id: u64, name: &str) -> ResolvedColumn {
-        ResolvedColumn {
+    fn col(id: u64, name: &str) -> ResolvedColumnRef {
+        std::sync::Arc::new(ResolvedColumn {
             id: ColumnId(id as usize),
             name: name.to_string(),
             qualifier: Some("users".to_string()),
             data_type: VeinDataType::Int64,
             is_factorized: false,
             nullable: false,
-        }
+        })
     }
 
     fn scan_plan() -> LogicalPlan {
+        let schema = std::sync::Arc::new(VeinSchema {
+            fields: vec![col(0, "id"), col(1, "name")],
+        });
         LogicalPlan::Scan {
-            table_name: "users".to_string(),
+            table: std::sync::Arc::new(crate::TableMetadata::new("users", schema.clone())),
             projection: None,
             filters: vec![],
-            schema: Box::new(VeinSchema {
-                fields: vec![col(0, "id"), col(1, "name")],
-            }),
+            schema: Box::new((*schema).clone()),
         }
     }
 
@@ -493,6 +528,126 @@ mod tests {
             filter.subquery_plans()[0],
             LogicalPlan::SemanticFilter { .. }
         ));
+    }
+
+    #[test]
+    fn expression_inventory_covers_every_expression_owner() {
+        use crate::plan::logical::WindowExpr;
+        use crate::plan::types::SortKey;
+
+        let scalar = || scalar_subquery(scan_plan());
+        let base = scan_plan();
+        let schema = Box::new(base.schema().clone());
+        let LogicalPlan::Scan { table, .. } = base else {
+            unreachable!();
+        };
+
+        let scan = LogicalPlan::Scan {
+            table: table.clone(),
+            projection: None,
+            filters: vec![scalar()],
+            schema: schema.clone(),
+        };
+        let input = || Box::new(scan_plan());
+        let plans = [
+            scan,
+            LogicalPlan::Filter {
+                input: input(),
+                predicate: scalar(),
+            },
+            LogicalPlan::Project {
+                input: input(),
+                exprs: vec![scalar()],
+                schema: schema.clone(),
+            },
+            LogicalPlan::Aggregate {
+                input: input(),
+                grouping_sets: vec![vec![scalar()]],
+                aggs: vec![scalar()],
+                schema: schema.clone(),
+            },
+            LogicalPlan::Window {
+                input: input(),
+                partition_by: vec![scalar()],
+                order_by: vec![SortKey {
+                    expr: scalar(),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                frame: None,
+                exprs: vec![WindowExpr {
+                    call: scalar(),
+                    output_column: col(2, "window_value"),
+                }],
+                schema: schema.clone(),
+            },
+            LogicalPlan::Join {
+                join_type: parser::ast::pipe_op::JoinType::Inner,
+                left: input(),
+                right: input(),
+                on: Some(scalar()),
+                using: vec![],
+                schema: schema.clone(),
+            },
+            LogicalPlan::Sort {
+                input: input(),
+                sort_keys: vec![SortKey {
+                    expr: scalar(),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                schema: schema.clone(),
+            },
+            LogicalPlan::Assert {
+                input: input(),
+                condition: scalar(),
+                message: None,
+                schema: schema.clone(),
+            },
+            LogicalPlan::Pivot {
+                input: input(),
+                aggregate: scalar(),
+                alias: None,
+                value_column: col(1, "value"),
+                values: vec![scalar()],
+                schema: schema.clone(),
+            },
+            LogicalPlan::Call {
+                input: input(),
+                name: "fixture".to_string(),
+                args: vec![scalar()],
+                schema,
+            },
+        ];
+
+        let mut owners = Vec::new();
+        for plan in &plans {
+            plan.for_each_expression(&mut |owner, expression| {
+                if !expression.subquery_plans().is_empty() {
+                    owners.push(owner);
+                }
+            });
+        }
+
+        assert_eq!(
+            owners,
+            [
+                "Scan.filters",
+                "Filter.predicate",
+                "Project.exprs",
+                "Aggregate.grouping_sets",
+                "Aggregate.aggs",
+                "Window.partition_by",
+                "Window.order_by",
+                "Window.exprs.call",
+                "Join.on",
+                "Sort.sort_keys",
+                "Assert.condition",
+                "Pivot.aggregate",
+                "Pivot.values",
+                "Call.args",
+            ]
+        );
     }
 
     #[test]

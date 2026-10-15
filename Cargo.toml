@@ -1,42 +1,25 @@
-[package]
-name = "vein"
-version = "0.1.0"
-edition = "2024"
-
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/vcs", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/orchestrator", "crates/cli", "crates/vfs", "crates/ebpf", "crates/plan", "crates/physical", "crates/optimizer"]
+members = ["crates/common", "crates/types", "crates/catalog", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/cli", "crates/plan", "crates/optimizer", "crates/physical"]
+exclude = ["vendor/parquet"]
+default-members = ["crates/cli"]
 
 [workspace.dependencies]
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["full"] }
-arrow = "59.1.0"
-parquet = { version = "59.1.0", features = ["async", "arrow"] }
-opendal = "0.45"
-s2n-quic = { version = "1.83.0", features = ["provider-tls-rustls"] }
+arrow = "60.0.0"
+arrow-row = "60.0.0"
+parquet = { version = "60.0.0", features = ["async", "arrow"] }
+opendal = { version = "0.59.3", features = ["services-fs"] }
 bytes = "1.0"
-libc = "0.2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2.0.19"
-serde = { version = "1.0", features = ["derive"] }
-rkyv = { version = "=0.8.17", features = ["alloc", "bytecheck"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 futures = "0.3"
 rand = "0.8"
-moka = { version = "0.12", features = ["future"] }
-iceberg = "0.10.0"
-iceberg-storage-opendal = { version = "0.10.0", features = ["opendal-fs", "opendal-s3"] }
-strum = { version = "0.28.0", features = ["derive"] }
 ordered-float = "5.3.0"
-
-[dependencies]
-common = { path = "crates/common" }
-tokio = { workspace = true, features = ["full"] }
-s2n-quic = { workspace = true }
-bytes = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rkyv = { workspace = true }
-arrow = { workspace = true, features = ["prettyprint"] }
+strum = { version = "0.28.0", features = ["derive"] }
 
 [profile.release]
 opt-level = 3
@@ -47,3 +30,18 @@ strip = true
 
 [profile.dev]
 opt-level = 1
+
+# Benchmarking and profiling profile.
+#
+# `08-performance-engineering.md` §5 requires benchmark hygiene on an optimized
+# build. This derives from `release` but is invoked as `--profile perf`, so no
+# `--release` build is ever needed. `debug = 1` keeps line tables for `perf` and
+# flamegraphs; `lto = "thin"` trades a little peak throughput for build time.
+[profile.perf]
+inherits = "release"
+lto = "thin"
+debug = 1
+strip = false
+
+[patch.crates-io]
+parquet = { path = "vendor/parquet" }

@@ -1,0 +1,15 @@
+[package]
+name = "types"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+missing_docs = "deny"
+
+[dependencies]
+error = { path = "../error" }
+arrow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"

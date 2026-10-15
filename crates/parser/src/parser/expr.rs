@@ -1,8 +1,43 @@
-use crate::ast::data_type::DataType;
+use crate::ast::data_type::{DataType, IntervalField};
 use crate::ast::expr::{BinaryOp, Expr, Literal, SpannedExpr, UnaryOp};
 use crate::ast::pipe_op::OrderByExpr;
 use crate::parser::{ParseError, Parser, TokenKind};
 use crate::token::Span;
+
+/// Parses a decimal-form numeric token without passing through binary floating
+/// point. The returned tuple is the unscaled value, precision, and scale.
+fn parse_exact_decimal(text: &str) -> Result<(i128, u8, i8), String> {
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(index) => {
+            let exponent = text[index + 1..]
+                .parse::<i32>()
+                .map_err(|_| format!("invalid decimal exponent: {text}"))?;
+            (&text[..index], exponent)
+        }
+        None => (text, 0),
+    };
+    let fractional_digits = mantissa
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
+    let significant = digits.trim_start_matches('0');
+    let significant = if significant.is_empty() { "0" } else { significant };
+    let scale = i32::try_from(fractional_digits)
+        .map_err(|_| format!("decimal scale is out of range: {text}"))?
+        - exponent;
+    let precision = significant
+        .len()
+        .saturating_add(usize::try_from((-scale).max(0)).unwrap_or(0))
+        .max(usize::try_from(scale.max(0)).unwrap_or(0))
+        .max(1);
+    if precision > 38 || scale < -38 || scale > 38 {
+        return Err(format!("decimal literal exceeds Decimal128 precision: {text}"));
+    }
+    let unscaled = significant
+        .parse::<i128>()
+        .map_err(|_| format!("decimal literal exceeds Decimal128 range: {text}"))?;
+    Ok((unscaled, precision as u8, scale as i8))
+}
 
 /// Resolves the escapes inside a string literal body (the text between the
 /// surrounding quotes): a doubled quote `''` becomes `'`, and a backslash
@@ -192,7 +227,14 @@ impl<'a> Parser<'a> {
                 })
             }
             TokenKind::Like => {
-                let pattern = self.parse_expr()?;
+                // Parse only the pattern's tighter-binding expression. Parsing
+                // a full expression here would absorb a following AND/OR into
+                // the pattern (for example, `name LIKE 'A%' AND active`).
+                let pattern_min_prec = infix_prec(&TokenKind::Like)
+                    .expect("LIKE always has a precedence")
+                    .0
+                    + 1;
+                let pattern = self.parse_binary(pattern_min_prec)?;
                 Ok(SpannedExpr {
                     span,
                     node: Expr::Like {
@@ -274,10 +316,10 @@ impl<'a> Parser<'a> {
                 TokenKind::Not => match expr {
                     SpannedExpr {
                         node:
-                            Expr::Exists {
-                                subquery,
-                                negated: false,
-                            },
+                        Expr::Exists {
+                            subquery,
+                            negated: false,
+                        },
                         span: _,
                     } => SpannedExpr {
                         span,
@@ -426,19 +468,13 @@ impl<'a> Parser<'a> {
                         node: Expr::Literal(Literal::Int(val)),
                     })
                 } else if text.contains('.') || text.contains('e') || text.contains('E') {
-                    let val: f64 = text.parse().map_err(|_| ParseError::NumberParse {
-                        message: format!("invalid float literal: {text}"),
+                    let (unscaled, precision, scale) = parse_exact_decimal(text).map_err(|message| ParseError::NumberParse {
+                        message,
                         span,
                     })?;
-                    if !val.is_finite() {
-                        return Err(ParseError::NumberParse {
-                            message: format!("float literal overflows f64: {text}"),
-                            span,
-                        });
-                    }
                     Ok(SpannedExpr {
                         span,
-                        node: Expr::Literal(Literal::Float(val.into())),
+                        node: Expr::Literal(Literal::Decimal(unscaled, precision, scale)),
                     })
                 } else {
                     let val: i64 = text.parse().map_err(|_| ParseError::NumberParse {
@@ -569,7 +605,7 @@ impl<'a> Parser<'a> {
         let mut operands = Vec::new();
         let mut results = Vec::new();
         let mut else_result = None;
-        let end_span ;
+        let end_span;
 
         // Simple CASE: CASE expr WHEN ... THEN ... ELSE ... END
         // Searched CASE: CASE WHEN ... THEN ... ELSE ... END
@@ -637,6 +673,21 @@ impl<'a> Parser<'a> {
         span: crate::token::Span,
     ) -> Result<SpannedExpr<'a>, ParseError> {
         self.next_token()?; // consume LParen
+        if name.eq_ignore_ascii_case("extract") {
+            let part = self.expect(TokenKind::Ident)?;
+            self.expect(TokenKind::From)?;
+            let value = self.parse_expr()?;
+            self.expect(TokenKind::RParen)?;
+            return Ok(SpannedExpr {
+                span,
+                node: Expr::Function {
+                    name: part.text,
+                    args: vec![value],
+                    distinct: false,
+                },
+            });
+        }
+
         let distinct = if let Ok(TokenKind::Distinct) = self.peek().map(|t| &t.kind) {
             self.next_token()?;
             true
@@ -818,11 +869,47 @@ impl<'a> Parser<'a> {
         match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::String) => {
                 let parsed: Result<DataType<'_>, _> = type_name.parse();
-                if let Ok(dt) = parsed {
+                if let Ok(mut dt) = parsed {
                     let str_token = self.next_token()?;
                     let value = &str_token.text[1..str_token.text.len() - 1];
+                    let mut span = ident_span.union(str_token.span);
+
+                    if let DataType::Interval { fields } = &mut dt
+                        && let Ok(token) = self.peek()
+                        && token.kind == TokenKind::Ident
+                        && interval_field(token.text, None).is_some()
+                    {
+                        let leading = self.next_token()?;
+                        let mut end_field = None;
+                        span = span.union(leading.span);
+                        if let Ok(token) = self.peek()
+                            && token.kind == TokenKind::Ident
+                            && token.text.eq_ignore_ascii_case("to")
+                        {
+                            self.next_token()?;
+                            let trailing = self.next_token()?;
+                            if trailing.kind != TokenKind::Ident {
+                                return Err(ParseError::Expected {
+                                    expected: "INTERVAL trailing field".into(),
+                                    found: format!("{:?}", trailing.kind),
+                                    span: trailing.span,
+                                });
+                            }
+                            end_field = Some(trailing.text);
+                            span = span.union(trailing.span);
+                        }
+                        let Some(field) = interval_field(leading.text, end_field) else {
+                            return Err(ParseError::Expected {
+                                expected: "valid INTERVAL field qualifier".into(),
+                                found: format!("{} TO {}", leading.text, end_field.unwrap_or("")),
+                                span: leading.span,
+                            });
+                        };
+                        *fields = field;
+                    }
+
                     return Ok(Some(SpannedExpr {
-                        span: ident_span.union(str_token.span),
+                        span,
                         node: Expr::TypedString {
                             data_type: dt,
                             value,
@@ -925,6 +1012,42 @@ impl<'a> Parser<'a> {
             self.peeked = Some(saved_val);
         }
         result
+    }
+}
+
+fn interval_field(leading: &str, trailing: Option<&str>) -> Option<IntervalField> {
+    let leading = normalize_interval_unit(leading)?;
+    let trailing = match trailing {
+        Some(unit) => Some(normalize_interval_unit(unit)?),
+        None => None,
+    };
+    Some(match (leading.as_str(), trailing.as_deref()) {
+        ("year", None) => IntervalField::Year,
+        ("month", None) => IntervalField::Month,
+        ("day", None) => IntervalField::Day,
+        ("hour", None) => IntervalField::Hour,
+        ("minute", None) => IntervalField::Minute,
+        ("second", None) => IntervalField::Second,
+        ("year", Some("month")) => IntervalField::YearToMonth,
+        ("day", Some("hour")) => IntervalField::DayToHour,
+        ("day", Some("minute")) => IntervalField::DayToMinute,
+        ("day", Some("second")) => IntervalField::DayToSecond,
+        ("hour", Some("minute")) => IntervalField::HourToMinute,
+        ("hour", Some("second")) => IntervalField::HourToSecond,
+        ("minute", Some("second")) => IntervalField::MinuteToSecond,
+        _ => return None,
+    })
+}
+
+fn normalize_interval_unit(name: &str) -> Option<String> {
+    match name.to_ascii_lowercase().as_str() {
+        "year" | "years" => Some("year".into()),
+        "month" | "months" => Some("month".into()),
+        "day" | "days" => Some("day".into()),
+        "hour" | "hours" => Some("hour".into()),
+        "minute" | "minutes" => Some("minute".into()),
+        "second" | "seconds" => Some("second".into()),
+        _ => None,
     }
 }
 
@@ -1054,6 +1177,30 @@ mod tests {
     fn test_overflowing_float_literal_is_error() {
         let err = parse_expr("1e999").expect_err("test should fail");
         assert!(matches!(err, ParseError::NumberParse { .. }));
+    }
+
+    #[test]
+    fn decimal_literals_preserve_unscaled_value_precision_and_scale() {
+        for (sql, expected) in [
+            ("0.05", (5, 2, 2)),
+            ("1.2300", (12300, 5, 4)),
+            ("1.25e-2", (125, 4, 4)),
+            ("1e2", (1, 3, -2)),
+        ] {
+            let expr = parse_expr(sql).expect("valid Decimal128 literal");
+            assert!(matches!(
+                expr.node,
+                Expr::Literal(Literal::Decimal(value, precision, scale))
+                    if (value, precision, scale) == expected
+            ), "wrong decimal representation for {sql}");
+        }
+    }
+
+    #[test]
+    fn decimal_literals_outside_decimal128_range_are_rejected() {
+        for sql in ["1e39", "1e-39"] {
+            assert!(parse_expr(sql).is_err(), "accepted out-of-range {sql}");
+        }
     }
 
     #[test]
@@ -1262,6 +1409,56 @@ mod tests {
         let expr =
             parse_expr("CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END").expect("test should succeed");
         assert!(matches!(expr.node, Expr::Case { .. }));
+    }
+
+    #[test]
+    fn extract_part_from_value_parses_as_part_function_call() {
+        let expr = parse_expr("EXTRACT(YEAR FROM order_date)").expect("valid EXTRACT");
+        assert!(matches!(
+            expr.node,
+            Expr::Function { name: "YEAR", args, distinct: false }
+                if matches!(args.as_slice(), [SpannedExpr { node: Expr::Column { column: "order_date", .. }, .. }])
+        ));
+    }
+
+    #[test]
+    fn extract_requires_part_from_value_syntax() {
+        for sql in ["EXTRACT(FROM order_date)", "EXTRACT(YEAR order_date)"] {
+            assert!(parse_expr(sql).is_err(), "accepted {sql}");
+        }
+    }
+
+    #[test]
+    fn interval_literal_preserves_sql_unit_qualifier() {
+        let fields = [
+            ("YEAR", IntervalField::Year),
+            ("MONTH", IntervalField::Month),
+            ("DAY", IntervalField::Day),
+            ("HOUR", IntervalField::Hour),
+            ("MINUTE", IntervalField::Minute),
+            ("SECOND", IntervalField::Second),
+            ("YEAR TO MONTH", IntervalField::YearToMonth),
+            ("DAY TO HOUR", IntervalField::DayToHour),
+            ("DAY TO MINUTE", IntervalField::DayToMinute),
+            ("DAY TO SECOND", IntervalField::DayToSecond),
+            ("HOUR TO MINUTE", IntervalField::HourToMinute),
+            ("HOUR TO SECOND", IntervalField::HourToSecond),
+            ("MINUTE TO SECOND", IntervalField::MinuteToSecond),
+        ];
+
+        for (qualifier, expected_field) in fields {
+            let sql = format!("INTERVAL '1' {qualifier}");
+            let expr = parse_expr(&sql).expect("qualified interval");
+            assert!(matches!(
+                expr.node,
+                Expr::TypedString {
+                    data_type: DataType::Interval { fields },
+                    value: "1"
+                } if fields == expected_field
+            ), "wrong field for {qualifier}");
+        }
+
+        assert!(parse_expr("INTERVAL '1' YEAR TO DAY").is_err());
     }
 
     #[test]

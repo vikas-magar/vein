@@ -14,18 +14,21 @@
 
 use std::cell::Cell;
 use std::sync::Arc;
+use std::time::Instant;
 
-use error::Result;
+use error::{Result, VeinError};
 use plan::{LogicalPlan, PlanTraversal};
 
+use crate::context::{CatalogStatisticsProvider, OptimizationDiagnostics, OptimizerConfig,
+                     OptimizerContext, RuleExecution, StatisticsProvider};
 use crate::rule::{OptimizerRule, RuleType};
-use crate::rules::ConstantFoldingRule;
-
-/// Hard cap on the number of full rule sweeps before giving up.
-///
-/// Correct rules converge in one sweep (once a node is folded, re-folding it
-/// is a no-op); the cap exists to bound misbehaving or interacting rules.
-const MAX_SWEEPS: usize = 8;
+use crate::rules::{
+    ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule, FilterNormalizationRule,
+    FilterTransitivityRule,
+    JoinPredicateTransitivityRule, PredicatePushdownRule, ScanFilterPushdownRule,
+    ScanStatisticsPruningRule, ScalarAggregateDecorrelationRule,
+};
+use crate::rules::join_order::JoinOrderRule;
 
 /// The engine-facing optimizer seam.
 ///
@@ -41,12 +44,30 @@ pub trait Optimizer: Send + Sync {
 /// An ordered, extensible collection of rules driven to a fixpoint.
 pub struct OptimizerPipeline {
     rules: Vec<Arc<dyn OptimizerRule>>,
+    config: OptimizerConfig,
+    statistics: Arc<dyn StatisticsProvider>,
 }
 
 impl OptimizerPipeline {
     /// Creates a pipeline from the given rules.
     pub fn new(rules: Vec<Arc<dyn OptimizerRule>>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            config: OptimizerConfig::default(),
+            statistics: Arc::new(CatalogStatisticsProvider),
+        }
+    }
+
+    /// Sets the optimizer configuration.
+    pub fn with_config(mut self, config: OptimizerConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Installs a statistics source shared by all planning estimates.
+    pub fn with_statistics_provider(mut self, provider: Arc<dyn StatisticsProvider>) -> Self {
+        self.statistics = provider;
+        self
     }
 
     /// Appends a rule to the pipeline.
@@ -58,12 +79,25 @@ impl OptimizerPipeline {
         self
     }
 
-    /// The default production pipeline: heuristic rules only.
+    /// The default production pipeline: heuristic rewrites followed by
+    /// bounded statistics-driven join-order selection.
     ///
-    /// Currently installs [`ConstantFoldingRule`]; new universally-beneficial
-    /// rules are added here as they land.
+    /// Installs constant folding followed by expression simplification.
     pub fn production() -> Self {
-        Self::new(vec![Arc::new(ConstantFoldingRule)])
+        Self::new(vec![
+            Arc::new(ConstantFoldingRule),
+            Arc::new(ExpressionSimplificationRule),
+            Arc::new(FilterNormalizationRule),
+            Arc::new(FilterTransitivityRule),
+            Arc::new(ScanStatisticsPruningRule),
+            Arc::new(JoinPredicateTransitivityRule),
+            Arc::new(ExistsDecorrelationRule),
+            Arc::new(ScalarAggregateDecorrelationRule),
+            Arc::new(PredicatePushdownRule),
+            Arc::new(ScanFilterPushdownRule),
+            Arc::new(ColumnPruningRule),
+            Arc::new(JoinOrderRule::default()),
+        ])
     }
 }
 
@@ -74,39 +108,219 @@ impl Default for OptimizerPipeline {
     }
 }
 
-impl Optimizer for OptimizerPipeline {
-    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        let heuristic_rules: Vec<_> = self
+impl OptimizerPipeline {
+    /// Optimizes a plan and returns rule execution diagnostics.
+    pub fn optimize_with_diagnostics(
+        &self,
+        plan: LogicalPlan,
+    ) -> Result<(LogicalPlan, OptimizationDiagnostics)> {
+        let context = OptimizerContext::with_statistics_provider(
+            self.config.clone(), Arc::clone(&self.statistics));
+        let rules: Vec<_> = self
             .rules
             .iter()
             .filter(|rule| rule.rule_type() == RuleType::Heuristic)
             .collect();
+        let cost_rules: Vec<_> = self
+            .rules
+            .iter()
+            .filter(|rule| rule.rule_type() == RuleType::CostBased)
+            .collect();
 
+        let mut diagnostics = OptimizationDiagnostics::default();
         let mut current = plan;
-        for _ in 0..MAX_SWEEPS {
+        tracing::info!(
+            target: "vein.audit",
+            event = "optimizer_started",
+            rule_count = rules.len(),
+            cost_rule_count = cost_rules.len(),
+            max_sweeps = context.config().max_sweeps,
+            "optimizer_started"
+        );
+
+        for sweep in 1..=context.config().max_sweeps {
             let mut next = current;
             let mut changed = false;
-            for rule in &heuristic_rules {
-                let (result, any_changed) = apply_rule(rule.as_ref(), next)?;
+
+            for rule in &rules {
+                let started = Instant::now();
+                let (result, any_changed, _) = apply_rule(rule.as_ref(), next, &context)?;
                 next = result;
                 changed |= any_changed;
+                let elapsed = started.elapsed();
+                tracing::debug!(
+                    target: "vein.optimizer",
+                    event = "optimizer_rule_applied",
+                    rule = rule.name(),
+                    phase = ?rule.phase(),
+                    sweep,
+                    changed = any_changed,
+                    duration_us = elapsed.as_micros() as u64,
+                    "optimizer_rule_applied"
+                );
+                diagnostics.rule_executions.push(RuleExecution {
+                    rule_name: rule.name().to_string(),
+                    phase: rule.phase(),
+                    sweep,
+                    changed: any_changed,
+                    elapsed,
+                });
+                if any_changed {
+                    tracing::trace!(
+                        target: "vein.optimizer",
+                        event = "optimizer_plan_after_rule",
+                        rule = rule.name(),
+                        phase = ?rule.phase(),
+                        sweep,
+                        plan = %plan::display::format_plan(&next),
+                        "optimizer_plan_after_rule"
+                    );
+                }
             }
+
+            diagnostics.sweeps = sweep;
             if !changed {
-                return Ok(next);
+                let mut optimized = next;
+                for rule in &cost_rules {
+                    let started = Instant::now();
+                    let (result, any_changed, join_decisions) =
+                        apply_rule(rule.as_ref(), optimized, &context)?;
+                    optimized = result;
+                    diagnostics.join_order_decisions.extend(join_decisions);
+                    let elapsed = started.elapsed();
+                    tracing::debug!(
+                        target: "vein.optimizer",
+                        event = "optimizer_rule_applied",
+                        rule = rule.name(),
+                        phase = ?rule.phase(),
+                        sweep,
+                        changed = any_changed,
+                        duration_us = elapsed.as_micros() as u64,
+                        "optimizer_rule_applied"
+                    );
+                    diagnostics.rule_executions.push(RuleExecution {
+                        rule_name: rule.name().to_string(),
+                        phase: rule.phase(),
+                        sweep,
+                        changed: any_changed,
+                        elapsed,
+                    });
+                }
+                validate_lowered_subqueries(&optimized)?;
+                diagnostics.cardinalities = context.estimate_plan(&optimized);
+                let filter_visibility = FilterPlacementVisibility::from_plan(&optimized);
+                tracing::info!(
+                    target: "vein.audit",
+                    event = "optimizer_filter_placement",
+                    scan_count = filter_visibility.scan_count,
+                    scan_filter_count = filter_visibility.scan_filter_count,
+                    residual_filter_count = filter_visibility.residual_filter_count,
+                    "optimizer_filter_placement"
+                );
+                tracing::info!(
+                    target: "vein.audit",
+                    event = "optimizer_converged",
+                    sweeps = sweep,
+                    rule_executions = diagnostics.rule_executions.len(),
+                    "optimizer_converged"
+                );
+                return Ok((optimized, diagnostics));
             }
             current = next;
         }
-        Ok(current)
+
+        Err(VeinError::planning(
+            format!(
+                "optimizer did not converge within {} sweeps",
+                context.config().max_sweeps
+            ),
+            None,
+        ))
+    }
+}
+
+/// Prevents unsupported subqueries from reaching physical expression
+/// compilation, where the resulting error lacks the owning operator context.
+/// Supported scalar and EXISTS rewrites remove their subquery expressions
+/// before this final invariant check.
+fn validate_lowered_subqueries(plan: &LogicalPlan) -> Result<()> {
+    let mut unsupported_owner = None;
+    plan.for_each_expression(&mut |owner, expression| {
+        if unsupported_owner.is_none() && !expression.subquery_plans().is_empty() {
+            unsupported_owner = Some(owner);
+        }
+    });
+
+    if let Some(owner) = unsupported_owner {
+        return Err(VeinError::planning(
+            format!("subquery expression in {owner} was not lowered by the optimizer"),
+            None,
+        ));
+    }
+
+    for child in plan.children() {
+        validate_lowered_subqueries(child)?;
+    }
+    Ok(())
+}
+
+impl Optimizer for OptimizerPipeline {
+    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        self.optimize_with_diagnostics(plan)
+            .map(|(optimized, _)| optimized)
+    }
+}
+
+/// Counts filters attached to scans and filters that remain above relational
+/// operators after optimization. The latter are usually residual filters whose
+/// semantics do not permit moving them into a source.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FilterPlacementVisibility {
+    scan_count: usize,
+    scan_filter_count: usize,
+    residual_filter_count: usize,
+}
+
+impl FilterPlacementVisibility {
+    fn from_plan(plan: &LogicalPlan) -> Self {
+        fn visit(plan: &LogicalPlan, summary: &mut FilterPlacementVisibility) {
+            match plan {
+                LogicalPlan::Scan { filters, .. } => {
+                    summary.scan_count += 1;
+                    summary.scan_filter_count += filters.len();
+                }
+                LogicalPlan::Filter { .. } => summary.residual_filter_count += 1,
+                _ => {}
+            }
+            for child in plan.children() {
+                visit(child, summary);
+            }
+            for subquery in plan.subquery_plans() {
+                visit(subquery, summary);
+            }
+        }
+
+        let mut summary = Self::default();
+        visit(plan, &mut summary);
+        summary
     }
 }
 
 /// Applies a single rule bottom-up to the whole plan.
 ///
 /// Returns the rewritten plan and whether the rule changed anything.
-fn apply_rule(rule: &dyn OptimizerRule, plan: LogicalPlan) -> Result<(LogicalPlan, bool)> {
+fn apply_rule(
+    rule: &dyn OptimizerRule,
+    plan: LogicalPlan,
+    context: &OptimizerContext,
+) -> Result<(LogicalPlan, bool, Vec<crate::context::JoinOrderDecision>)> {
+    if rule.is_plan_rule() {
+        return rule.apply_owned_plan(plan, context);
+    }
+
     let changed = Cell::new(false);
     let result = rewrite_bottom_up(plan, &mut |node| {
-        Ok(match rule.apply(&node)? {
+        Ok(match rule.apply(&node, context)? {
             Some(rewritten) => {
                 changed.set(true);
                 rewritten
@@ -114,7 +328,7 @@ fn apply_rule(rule: &dyn OptimizerRule, plan: LogicalPlan) -> Result<(LogicalPla
             None => node,
         })
     })?;
-    Ok((result, changed.get()))
+    Ok((result, changed.get(), Vec::new()))
 }
 
 /// Rewrites every node of the plan with `f`, children before parents.
@@ -136,15 +350,20 @@ mod tests {
     }
 
     fn project(exprs: Vec<LogicalExpr>) -> LogicalPlan {
+        let schema = Box::new(plan::VeinSchema { fields: vec![] });
+        let table = std::sync::Arc::new(plan::TableMetadata::new(
+            "t",
+            std::sync::Arc::new(*schema.clone()),
+        ));
         LogicalPlan::Project {
             input: Box::new(LogicalPlan::Scan {
-                table_name: "t".to_string(),
+                table,
                 projection: None,
                 filters: vec![],
-                schema: Box::new(plan::VeinSchema { fields: vec![] }),
+                schema: schema.clone(),
             }),
             exprs,
-            schema: Box::new(plan::VeinSchema { fields: vec![] }),
+            schema,
         }
     }
 
@@ -182,6 +401,34 @@ mod tests {
     }
 
     #[test]
+    fn filter_visibility_counts_scan_filters_and_residual_filters() {
+        let LogicalPlan::Project { input, .. } = project(vec![]) else {
+            unreachable!();
+        };
+        let LogicalPlan::Scan { table, schema, .. } = *input else {
+            unreachable!();
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                table,
+                projection: None,
+                filters: vec![lit(1)],
+                schema,
+            }),
+            predicate: lit(2),
+        };
+
+        assert_eq!(
+            FilterPlacementVisibility::from_plan(&plan),
+            FilterPlacementVisibility {
+                scan_count: 1,
+                scan_filter_count: 1,
+                residual_filter_count: 1,
+            }
+        );
+    }
+
+    #[test]
     fn custom_pipeline_appends_rules_in_order() {
         let pipeline = OptimizerPipeline::new(vec![]).with_rule(Arc::new(ConstantFoldingRule));
         let plan = project(vec![plus(plus(lit(1), lit(2)), lit(3))]);
@@ -191,5 +438,36 @@ mod tests {
             panic!("expected a Project node");
         };
         assert_eq!(exprs, vec![lit(6)]);
+    }
+
+    #[test]
+    fn optimizer_reports_owner_for_unlowered_scan_filter_subquery() {
+        let base = project(vec![lit(1)]);
+        let LogicalPlan::Project { input, .. } = base else {
+            unreachable!();
+        };
+        let LogicalPlan::Scan { table, schema, .. } = *input else {
+            unreachable!();
+        };
+        let plan = LogicalPlan::Scan {
+            table,
+            projection: None,
+            filters: vec![LogicalExpr::ScalarSubquery(Box::new(LogicalPlan::Scan {
+                table: std::sync::Arc::new(plan::TableMetadata::new(
+                    "inner",
+                    std::sync::Arc::new(*schema.clone()),
+                )),
+                projection: None,
+                filters: vec![],
+                schema: schema.clone(),
+            }))],
+            schema,
+        };
+
+        let error = OptimizerPipeline::default()
+            .optimize(plan)
+            .expect_err("unsupported scan-filter subquery should fail in planning");
+        assert!(error.to_string().contains("Scan.filters"), "{error}");
+        assert!(error.to_string().contains("not lowered by the optimizer"), "{error}");
     }
 }

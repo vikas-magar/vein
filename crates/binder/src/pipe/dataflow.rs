@@ -3,7 +3,7 @@ use plan::PlanTraversal;
 use error::{Result, VeinError};
 use parser::ast::query::{Query, SetOpKind};
 
-use crate::coerce::unify_types;
+use types::unify_types;
 use crate::context::BinderContext;
 use crate::pipe::query::{bind_pipeline, bind_query_internal};
 use crate::scope::ScopeStack;
@@ -44,9 +44,9 @@ pub async fn bind_set_op<'a>(
     for (lf, rf) in left_fields.iter().zip(right_fields.iter()) {
         match unify_types(&lf.data_type, &rf.data_type) {
             Ok(common) => {
-                let mut col = lf.clone();
+                let mut col = lf.as_ref().clone();
                 col.data_type = common;
-                fields.push(col);
+                fields.push(std::sync::Arc::new(col));
             }
             Err(e) => {
                 return Err(VeinError::semantic(
@@ -88,7 +88,7 @@ async fn bind_branches<'a>(
             context,
             &mut branch_scopes,
         ))
-        .await?;
+            .await?;
         branches.push(Box::new(branch_plan));
     }
     Ok(branches)

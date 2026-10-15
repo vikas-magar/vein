@@ -1,17 +1,22 @@
 //! In-flight columnar data chunk representation.
 
-use arrow::array::ArrayRef;
-use arrow::record_batch::RecordBatch;
+use arrow::array::{ArrayRef, UInt32Array};
+use arrow::compute::take;
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use common::arrow::SelectionVector;
 use common::Result;
 use error::VeinError;
 
-/// A horizontal slice of data processed in a pipeline.
+/// A materialized Arrow batch used by operators that need ordinary arrays.
 ///
-/// The single in-flight unit flowing through a pipeline: a set of Arrow
-/// columns plus a [`SelectionVector`] selecting the active rows. Columns are
-/// shared by `Arc` (zero-copy) — no data is copied as the chunk moves through
-/// operators.
+/// It stores Arrow columns plus a [`SelectionVector`] selecting the active
+/// rows. Passing columns through or changing only the selection can retain
+/// their Arrow buffers by reference. Pipelines that preserve arbitrary row
+/// references across source batches use [`super::DataChunkView`].
+/// Operators that compute values or gather rows may allocate new arrays;
+/// [`DataChunk::materialize`] slices contiguous selections and uses `take` for
+/// sparse selections.
 #[derive(Debug, Clone)]
 pub struct DataChunk {
     /// The columns in this chunk, each an Arc'd Arrow array.
@@ -23,7 +28,10 @@ pub struct DataChunk {
 impl DataChunk {
     /// Creates a new [`DataChunk`] from column arrays and an explicit selection vector.
     pub fn new(vectors: Vec<ArrayRef>, selection: SelectionVector) -> Self {
-        Self { vectors, selection }
+        Self {
+            vectors,
+            selection,
+        }
     }
 
     /// Creates a [`DataChunk`] from column arrays with an all-valid (dense) selection vector.
@@ -36,29 +44,54 @@ impl DataChunk {
     }
 
     /// Creates a [`DataChunk`] from an Arrow [`RecordBatch`] with an initially dense selection.
+    ///
+    /// Takes ownership of the batch's columns rather than copying them: the
+    /// [`RecordBatch`] is decomposed with [`RecordBatch::into_parts`], so the
+    /// vector of column references moves into the chunk for free.
     pub fn from_record_batch(batch: RecordBatch) -> Self {
-        let num_rows = batch.num_rows();
-        let vectors = batch.columns().to_vec();
+        let (_, vectors, num_rows) = batch.into_parts();
         Self {
             vectors,
             selection: SelectionVector::new_dense(num_rows),
         }
     }
 
-    /// Constructs an ephemeral Arrow [`RecordBatch`] from chunk vectors.
-    /// Used for interoperability with Arrow compute kernels that require schema metadata.
-    pub fn to_record_batch(&self) -> Result<RecordBatch> {
-        let fields: Vec<arrow::datatypes::Field> = self
-            .vectors
-            .iter()
-            .enumerate()
-            .map(|(i, vec)| {
-                arrow::datatypes::Field::new(format!("col_{i}"), vec.data_type().clone(), true)
-            })
-            .collect();
-        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-        RecordBatch::try_new(schema, self.vectors.clone())
-            .map_err(|e| VeinError::internal(format!("Failed to create RecordBatch from DataChunk: {e}")))
+    /// Materializes the selected rows into an Arrow [`RecordBatch`] under `schema`.
+    ///
+    /// The selection vector is honoured: a contiguous physical range is
+    /// `slice`d zero-copy, and only a sparse selection falls back to
+    /// [`take`]. `schema` is supplied by the caller so it can be built once per
+    /// query rather than once per batch.
+    pub fn materialize(&self, schema: SchemaRef) -> Result<RecordBatch> {
+        let selected = self.selection.size();
+        let range = self.selection.contiguous_range();
+        let indices = range.is_none().then(|| {
+            let mut indices = UInt32Array::builder(selected);
+            for row in 0..selected {
+                indices.append_value(self.selection.get_index(row) as u32);
+            }
+            indices.finish()
+        });
+
+        let mut columns = Vec::with_capacity(self.vectors.len());
+        for array in &self.vectors {
+            let materialized = match (&range, &indices) {
+                (Some(range), _) => array.slice(range.start, range.len()),
+                (None, Some(indices)) => take(array.as_ref(), indices, None).map_err(|error| {
+                    VeinError::internal(format!("materialize selection failed: {error}"))
+                })?,
+                (None, None) => {
+                    return Err(VeinError::internal(
+                        "materialize requires indices for a sparse selection",
+                    ));
+                }
+            };
+            columns.push(materialized);
+        }
+
+        let options = RecordBatchOptions::new().with_row_count(Some(selected));
+        RecordBatch::try_new_with_options(schema, columns, &options)
+            .map_err(|error| VeinError::internal(format!("materialize record batch failed: {error}")))
     }
 
     /// Total surviving rows in this chunk.
@@ -84,5 +117,108 @@ impl DataChunk {
     /// Borrow the column array at `index`.
     pub fn column(&self, index: usize) -> &ArrayRef {
         &self.vectors[index]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataChunk;
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::Schema;
+    use common::arrow::SelectionVector;
+    use std::sync::Arc;
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]))
+    }
+
+    #[test]
+    fn taking_record_batch_columns_into_a_chunk_shares_the_array() {
+        let input: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema(),
+            vec![Arc::clone(&input)],
+        )
+            .expect("valid input batch");
+
+        let chunk = DataChunk::from_record_batch(batch);
+
+        assert!(Arc::ptr_eq(&input, chunk.column(0)));
+    }
+
+    #[test]
+    fn materializing_a_contiguous_selection_slices_the_existing_values() {
+        let input: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let input_values = input
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 input")
+            .values()
+            .as_ptr();
+        let chunk = DataChunk::new(
+            vec![input],
+            SelectionVector::new_sparse(vec![0, 1]),
+        );
+
+        let batch = chunk.materialize(schema()).expect("materialize selection");
+        let output = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 output");
+
+        assert_eq!(output.values().as_ptr(), input_values);
+        assert_eq!(output.values().as_ref(), &[1, 2]);
+    }
+
+    #[test]
+    fn materializing_a_sparse_selection_gathers_values_into_a_new_buffer() {
+        let input: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let input_values = input
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 input")
+            .values()
+            .as_ptr();
+        let chunk = DataChunk::new(
+            vec![input],
+            SelectionVector::new_sparse(vec![0, 2]),
+        );
+
+        let batch = chunk.materialize(schema()).expect("materialize selection");
+        let output = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 output");
+
+        assert_ne!(output.values().as_ptr(), input_values);
+        assert_eq!(output.values().as_ref(), &[1, 3]);
+    }
+
+    #[test]
+    fn materializes_zero_column_chunks_with_their_row_count() {
+        let chunk = DataChunk::new(Vec::new(), SelectionVector::new_dense(3));
+        let batch = chunk
+            .materialize(Arc::new(Schema::empty()))
+            .expect("zero-column batch should materialize");
+
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[test]
+    fn materializes_empty_zero_column_chunks_as_zero_rows() {
+        let chunk = DataChunk::new(Vec::new(), SelectionVector::new_dense(0));
+        let batch = chunk
+            .materialize(Arc::new(Schema::empty()))
+            .expect("empty zero-column batch should materialize");
+
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), 0);
     }
 }

@@ -6,8 +6,7 @@ edition = "2024"
 [dependencies]
 thiserror = { workspace = true }
 arrow = { workspace = true }
-iceberg = { workspace = true }
-parser = { path = "../parser" }
+serde = { workspace = true }
 
 [dev-dependencies]
 serde_json = "1.0"

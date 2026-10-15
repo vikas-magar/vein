@@ -7,6 +7,9 @@ edition = "2024"
 missing_docs = "deny"
 
 [dependencies]
+catalog = { path = "../catalog" }
 plan = { path = "../plan" }
 parser = { path = "../parser" }
 error = { path = "../error" }
+types = { path = "../types" }
+tracing = { workspace = true }

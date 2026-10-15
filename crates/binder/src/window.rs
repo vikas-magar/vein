@@ -140,7 +140,9 @@ fn lift_window_calls(
                 alias_hint.unwrap_or(name.as_str()).to_string(),
                 None,
                 return_type.clone(),
-            );
+            )
+                .with_nullable(mapped.nullable());
+            let output_column = std::sync::Arc::new(output_column);
             window_exprs.push(WindowExpr {
                 call: mapped.clone(),
                 output_column: output_column.clone(),
@@ -216,18 +218,18 @@ mod tests {
     }
 
     fn col(id: usize) -> LogicalExpr {
-        LogicalExpr::Column(ResolvedColumn::new(
+        LogicalExpr::Column(std::sync::Arc::new(ResolvedColumn::new(
             ColumnId(id),
             format!("c{id}"),
             None,
             VeinDataType::Int64,
-        ))
+        )))
     }
 
     #[test]
     fn lifts_and_replaces() {
-        let catalog = vcs::InMemoryCatalog::new();
-        let registry = crate::testing::MockFunctionRegistry::new();
+        let catalog = crate::testing::TestCatalog::default();
+        let registry = crate::BuiltinFunctionRegistry::new();
         let mut ctx = crate::context::BinderContext::new(&catalog, &registry);
         let mut scopes = ScopeStack::new();
         let items = vec![(call(), Some("total".to_string()))];
@@ -243,8 +245,8 @@ mod tests {
 
     #[test]
     fn keeps_plain_items_untouched() {
-        let catalog = vcs::InMemoryCatalog::new();
-        let registry = crate::testing::MockFunctionRegistry::new();
+        let catalog = crate::testing::TestCatalog::default();
+        let registry = crate::BuiltinFunctionRegistry::new();
         let mut ctx = crate::context::BinderContext::new(&catalog, &registry);
         let mut scopes = ScopeStack::new();
         let items = vec![(col(7), None), (call(), None), (col(8), None)];

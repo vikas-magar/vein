@@ -4,7 +4,7 @@ use crate::context::BinderContext;
 use crate::expr::ExprBinder;
 use crate::scope::ScopeStack;
 use plan::LogicalExpr;
-use plan::ResolvedColumn;
+use plan::ResolvedColumnRef;
 use error::{Result, VeinError};
 use parser::ast::expr::Expr;
 use parser::ast::pipe_op::SelectItem;
@@ -19,7 +19,7 @@ use parser::ast::pipe_op::SelectItem;
 pub fn expand_wildcard(
     scopes: &ScopeStack,
     table: Option<&str>,
-) -> Result<Vec<ResolvedColumn>> {
+) -> Result<Vec<ResolvedColumnRef>> {
     let Some(scope) = scopes.scopes_top() else {
         return Err(VeinError::semantic(
             "no tables in scope for '*' expansion",
@@ -37,7 +37,7 @@ pub fn expand_wildcard(
             }
             // Only the columns belonging to `t` (its columns carry the table
             // name or alias as their qualifier), not every visible column.
-            let matched: Vec<ResolvedColumn> = scope
+            let matched: Vec<ResolvedColumnRef> = scope
                 .columns
                 .iter()
                 .filter(|c| c.qualifier.as_deref() == Some(t))
@@ -80,7 +80,10 @@ pub async fn expand_projection_items<'a>(
         match &item.expr.node {
             Expr::Wildcard { table } => {
                 for column in expand_wildcard(scopes, table.as_deref())? {
-                    bound.push((LogicalExpr::Column(column.clone()), Some(column.name)));
+                    bound.push((
+                        LogicalExpr::Column(column.clone()),
+                        Some(column.name.clone()),
+                    ));
                 }
             }
             _ => {

@@ -1,13 +1,13 @@
 use crate::context::BinderContext;
 use crate::scope::ScopeStack;
-use plan::{LogicalPlan, PlanTraversal};
 use error::Result;
 use parser::ast::query::{Query, QueryNode};
+use plan::{CatalogProvider, LogicalPlan, PlanTraversal};
 
 use crate::scope::Scope;
-use plan::VeinSchema;
 use parser::ast::pipe_op::PipeOperator;
 use parser::ast::query::TableSource;
+use plan::VeinSchema;
 
 use crate::pipe::advanced::{
     bind_assert, bind_call, bind_pivot, bind_table_sample, bind_unpivot, bind_with, bind_write,
@@ -19,47 +19,83 @@ use crate::pipe::relational::{
     bind_aggregate, bind_distinct, bind_join, bind_qualify, bind_select, bind_where,
 };
 
-use crate::traits::{FunctionRegistry, LogicalBinder};
+use crate::traits::{BoundQuery, FunctionRegistry, LogicalBinder};
 use async_trait::async_trait;
 use std::sync::Arc;
 
 /// Binds SQL query clauses into LogicalPlans
 pub struct QueryBinder {
-    catalog: Arc<dyn vcs::TableCatalog>,
+    catalog: Arc<dyn CatalogProvider>,
     functions: Arc<dyn FunctionRegistry>,
 }
 
 impl QueryBinder {
     /// Creates a new QueryBinder with the required dependencies
-    pub fn new(catalog: Arc<dyn vcs::TableCatalog>, functions: Arc<dyn FunctionRegistry>) -> Self {
+    pub fn new(catalog: Arc<dyn CatalogProvider>, functions: Arc<dyn FunctionRegistry>) -> Self {
         Self { catalog, functions }
+    }
+
+    /// Access the underlying table catalog.
+    pub fn catalog(&self) -> &Arc<dyn CatalogProvider> {
+        &self.catalog
     }
 }
 
 #[async_trait]
 impl LogicalBinder for QueryBinder {
+    fn catalog(&self) -> Option<&Arc<dyn CatalogProvider>> {
+        Some(&self.catalog)
+    }
+
     /// Recursively binds a parsed SQL statement into a LogicalPlan tree.
     /// `EXPLAIN` statements bind the inner query and wrap it in a
     /// [`LogicalPlan::Explain`] node so downstream stages can render the
     /// plan instead of executing it.
     async fn bind<'a>(&self, node: &'a QueryNode<'a>) -> Result<LogicalPlan> {
+        Ok(self.bind_with_catalog_revision(node).await?.plan)
+    }
+
+    async fn bind_with_catalog_revision<'a>(&self, node: &'a QueryNode<'a>) -> Result<BoundQuery> {
         let catalog_ref = self.catalog.as_ref();
         let functions_ref = self.functions.as_ref();
-
-        let mut context = BinderContext::new(catalog_ref, functions_ref);
+        // Opening a planning session is a catalog call, and it happens before a
+        // single operator is bound. For a two-table query `bind` measured 12x the
+        // optimizer and 24x the planner combined, so which half that is decides
+        // whether the cost is metadata or binding.
+        let session_started = std::time::Instant::now();
+        let planning_session = self.catalog.begin_planning_session().await?;
+        let session_us = session_started.elapsed().as_micros() as u64;
+        let binding_started = std::time::Instant::now();
+        let mut context =
+            BinderContext::with_planning_session(catalog_ref, functions_ref, planning_session);
         let mut scopes = ScopeStack::new();
 
-        match node {
-            QueryNode::Plain { query } => bind_query_internal(query, &mut context, &mut scopes).await,
+        let plan = match node {
+            QueryNode::Plain { query } => {
+                bind_query_internal(query, &mut context, &mut scopes).await?
+            }
             QueryNode::Explain { query } => {
                 let inner = bind_query_internal(query, &mut context, &mut scopes).await?;
                 let schema = inner.schema().clone();
-                Ok(LogicalPlan::Explain {
+                LogicalPlan::Explain {
                     input: Box::new(inner),
                     schema: Box::new(schema),
-                })
+                }
             }
-        }
+        };
+
+        tracing::info!(
+            target: "vein.audit",
+            event = "bind_phases",
+            session_us,
+            bind_us = binding_started.elapsed().as_micros() as u64,
+            "bind_phases"
+        );
+
+        Ok(BoundQuery {
+            plan,
+            catalog_revision: context.planning_session.revision,
+        })
     }
 }
 
@@ -91,21 +127,21 @@ pub async fn bind_source<'a>(
         TableSource::Table { name, alias } => {
             // A registered CTE takes precedence over a catalog table lookup.
             if let Some(cte) = context.ctes.get(name.as_ref()) {
-                let qualifier = alias.map(|a| a.to_string()).unwrap_or_else(|| name.to_string());
+                let qualifier = alias
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| name.to_string());
                 let fields = cte
                     .schema()
                     .fields
                     .iter()
-                    .map(|f| {
-                        let mut b = f.clone();
-                        b.qualifier = alias.map(|a| a.to_string());
-                        b
-                    })
+                    .map(|f| f.derived(f.id, f.name.as_str(), alias.map(|a| a.to_string())))
                     .collect::<Vec<_>>();
                 let plan = LogicalPlan::SubqueryAlias {
                     input: cte.clone(),
                     alias: name.to_string(),
-                    schema: Box::new(VeinSchema { fields: fields.clone() }),
+                    schema: Box::new(VeinSchema {
+                        fields: fields.clone(),
+                    }),
                 };
                 scopes.push(Scope {
                     columns: fields,
@@ -114,16 +150,17 @@ pub async fn bind_source<'a>(
                 return Ok(plan);
             }
 
-            let schema = context.catalog.get_table_schema(name).await?;
+            let table = context.resolve_table(name).await?;
 
             let mut columns = Vec::new();
-            for field in &schema.fields {
-                let mut bound_field = field.clone();
-                bound_field.id = context.next_id();
-                bound_field.qualifier = alias
-                    .map(|a| a.to_string())
-                    .or_else(|| Some(name.to_string()));
-                columns.push(bound_field);
+            for field in &table.schema.fields {
+                columns.push(field.derived(
+                    context.next_id(),
+                    field.name.as_str(),
+                    alias
+                        .map(|a| a.to_string())
+                        .or_else(|| Some(name.to_string())),
+                ));
             }
 
             let qualifier = alias
@@ -135,7 +172,7 @@ pub async fn bind_source<'a>(
             });
 
             Ok(LogicalPlan::Scan {
-                table_name: name.to_string(),
+                table: table.clone(),
                 projection: None,
                 filters: vec![],
                 schema: Box::new(VeinSchema { fields: columns }),
@@ -149,10 +186,11 @@ pub async fn bind_source<'a>(
             // then expose them under the subquery's alias.
             let mut fields = Vec::with_capacity(inner.schema().fields.len());
             for field in &inner.schema().fields {
-                let mut bound = field.clone();
-                bound.id = context.next_id();
-                bound.qualifier = alias.map(|a| a.to_string());
-                fields.push(bound);
+                fields.push(field.derived(
+                    context.next_id(),
+                    field.name.as_str(),
+                    alias.map(|a| a.to_string()),
+                ));
             }
 
             let qualifier = alias.map(|a| a.to_string()).unwrap_or_default();
@@ -172,18 +210,64 @@ pub async fn bind_source<'a>(
             inline_options,
             alias,
         } => {
-            let qualifier = alias.map(|a| a.to_string());
+            let mut options: Vec<(String, String)> = inline_options
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let table = context.resolve_table(url).await;
+
+            let (schema, files, detected_format) = match table {
+                Ok(tbl) => (
+                    tbl.schema.clone(),
+                    tbl.files.clone(),
+                    tbl.format.as_ref().map(|f| f.to_string()),
+                ),
+                Err(_error)
+                if options
+                    .iter()
+                    .any(|(key, _)| key.eq_ignore_ascii_case("format")) =>
+                    {
+                        (
+                            Arc::new(VeinSchema { fields: vec![] }),
+                            vec![url.to_string()],
+                            None,
+                        )
+                    }
+                Err(error) => return Err(error),
+            };
+
+            let mut columns = Vec::with_capacity(schema.fields.len());
+            for field in &schema.fields {
+                let mut bound_field = field.as_ref().clone();
+                bound_field.id = context.next_id();
+                bound_field.qualifier = alias
+                    .map(|a| a.to_string())
+                    .or_else(|| Some(url.to_string()));
+                columns.push(std::sync::Arc::new(bound_field));
+            }
+
+            let qualifier = alias
+                .map(|a| a.to_string())
+                .or_else(|| Some(url.to_string()));
             scopes.push(Scope {
-                columns: vec![],
+                columns: columns.clone(),
                 aliases: vec![qualifier.clone().unwrap_or_default()],
             });
+
+            if let Some(fmt) = detected_format {
+                if !options
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("format"))
+                {
+                    options.push(("format".to_string(), fmt));
+                }
+            }
+
             Ok(LogicalPlan::ExternalScan {
                 url: url.to_string(),
-                options: inline_options
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-                schema: Box::new(VeinSchema { fields: vec![] }),
+                options,
+                files,
+                schema: Box::new(VeinSchema { fields: columns }),
             })
         }
     }
@@ -196,7 +280,20 @@ pub async fn bind_pipeline<'a>(
     context: &mut BinderContext<'a>,
     scopes: &mut ScopeStack,
 ) -> Result<LogicalPlan> {
-    for pipe in pipes {
+    tracing::info!(
+        target: "vein.audit",
+        event = "binding_started",
+        operator_count = pipes.len(),
+        "binding_started"
+    );
+    for (operator_index, pipe) in pipes.iter().enumerate() {
+        tracing::debug!(
+            target: "vein.audit",
+            event = "binding_operator",
+            operator_index,
+            operator = ?pipe,
+            "binding_operator"
+        );
         plan = match pipe {
             // Relational Core
             PipeOperator::Where { predicate } => {
@@ -209,9 +306,9 @@ pub async fn bind_pipeline<'a>(
                 bind_select(plan, items, &mut *context, &mut *scopes).await?
             }
             PipeOperator::Aggregate {
-                group_by,
+                grouping_sets,
                 aggregates,
-            } => bind_aggregate(plan, group_by, aggregates, &mut *context, &mut *scopes).await?,
+            } => bind_aggregate(plan, grouping_sets, aggregates, &mut *context, &mut *scopes).await?,
             PipeOperator::Join { join } => {
                 bind_join(plan, join, &mut *context, &mut *scopes).await?
             }
@@ -251,31 +348,35 @@ pub async fn bind_pipeline<'a>(
                 alias,
                 value_column,
                 values,
-            } => bind_pivot(
-                plan,
-                aggregate,
-                alias.as_deref(),
-                value_column,
-                values,
-                &mut *context,
-                &mut *scopes,
-            )
-            .await?,
+            } => {
+                bind_pivot(
+                    plan,
+                    aggregate,
+                    alias.as_deref(),
+                    value_column,
+                    values,
+                    &mut *context,
+                    &mut *scopes,
+                )
+                    .await?
+            }
             PipeOperator::Unpivot {
                 value_name,
                 name_name,
                 columns,
                 include_nulls,
-            } => bind_unpivot(
-                plan,
-                value_name,
-                name_name,
-                columns,
-                *include_nulls,
-                &mut *context,
-                &mut *scopes,
-            )
-            .await?,
+            } => {
+                bind_unpivot(
+                    plan,
+                    value_name,
+                    name_name,
+                    columns,
+                    *include_nulls,
+                    &mut *context,
+                    &mut *scopes,
+                )
+                    .await?
+            }
             PipeOperator::TableSample { method, percent } => {
                 bind_table_sample(plan, method, *percent)?
             }
@@ -292,5 +393,11 @@ pub async fn bind_pipeline<'a>(
         };
     }
 
+    tracing::info!(
+        target: "vein.audit",
+        event = "binding_completed",
+        operator_count = pipes.len(),
+        "binding_completed"
+    );
     Ok(plan)
 }

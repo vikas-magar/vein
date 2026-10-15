@@ -8,9 +8,10 @@
 use error::Result;
 use parser::ast::expr::BinaryOp;
 use plan::{
-    LogicalExpr, LogicalLiteral, LogicalPlan, SortKey, WindowExpr,
+    LogicalExpr, LogicalLiteral, LogicalPlan, SortKey, VeinDataType, WindowExpr,
 };
 
+use crate::context::OptimizerContext;
 use crate::rule::{OptimizerRule, RuleType};
 
 /// A heuristic rule that folds constant sub-expressions into literals.
@@ -25,7 +26,11 @@ impl OptimizerRule for ConstantFoldingRule {
         RuleType::Heuristic
     }
 
-    fn apply(&self, plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    fn apply(
+        &self,
+        plan: &LogicalPlan,
+        _context: &OptimizerContext,
+    ) -> Result<Option<LogicalPlan>> {
         let rewritten = rewrite_node(plan);
         Ok((rewritten != *plan).then_some(rewritten))
     }
@@ -35,12 +40,12 @@ impl OptimizerRule for ConstantFoldingRule {
 fn rewrite_node(plan: &LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Scan {
-            table_name,
+            table,
             projection,
             filters,
             schema,
         } => LogicalPlan::Scan {
-            table_name: table_name.clone(),
+            table: table.clone(),
             projection: projection.clone(),
             filters: fold_exprs(filters),
             schema: schema.clone(),
@@ -194,40 +199,342 @@ fn fold_sort_keys(keys: &[SortKey]) -> Vec<SortKey> {
 
 /// Recursively folds constant sub-expressions inside `expr`.
 fn fold_expr(expr: &LogicalExpr) -> LogicalExpr {
-    match expr {
+    fold_expr_owned(expr.clone())
+}
+
+/// Owned recursion for [`fold_expr`]. Consuming each node keeps the traversal
+/// clone-free; the by-reference entry point above clones once per call.
+fn fold_expr_owned(expr: LogicalExpr) -> LogicalExpr {
+    // The logical expression owns one canonical child-mapping API. Using it
+    // here keeps folding aligned with every expression variant emitted by the
+    // pipe binder, including CASE, lists, windows, lambdas, and function args.
+    let rewritten = expr
+        .map_children(&mut |child| Ok(fold_expr_owned(child)))
+        .expect("constant folding child traversal is infallible");
+
+    match rewritten {
         LogicalExpr::BinaryOp {
             left,
             op,
             right,
             return_type,
         } => {
-            let folded_left = fold_expr(left);
-            let folded_right = fold_expr(right);
-
-            if let (LogicalExpr::Literal(l), LogicalExpr::Literal(r)) =
-                (&folded_left, &folded_right)
-                && let Some(folded) = fold_literals(*op, l, r)
+            if let (LogicalExpr::Literal(left), LogicalExpr::Literal(right)) = (&*left, &*right)
+                && let Some(folded) = fold_literals(op, left, right, &return_type)
             {
                 return LogicalExpr::Literal(folded);
             }
 
             LogicalExpr::BinaryOp {
-                left: Box::new(folded_left),
-                op: *op,
-                right: Box::new(folded_right),
-                return_type: return_type.clone(),
+                left,
+                op,
+                right,
+                return_type,
             }
         }
-        other => other.clone(),
+        LogicalExpr::Cast { expr, target_type } => fold_cast(expr, target_type),
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => fold_like(expr, pattern, negated),
+        LogicalExpr::Not { expr } => fold_unary(expr, UnaryKind::Not),
+        LogicalExpr::Negate { expr } => fold_unary(expr, UnaryKind::Negate),
+        LogicalExpr::IsNull { expr } => fold_null_check(expr, false),
+        LogicalExpr::IsNotNull { expr } => fold_null_check(expr, true),
+        LogicalExpr::InList {
+            expr,
+            list,
+            negated,
+        } => fold_in_list(expr, list, negated),
+        LogicalExpr::Case {
+            when,
+            then,
+            else_,
+            return_type,
+        } => fold_case(when, then, else_, return_type),
+        other => other,
     }
+}
+
+/// Folds a literal cast only when the representation and conversion are safe.
+fn fold_cast(expr: Box<LogicalExpr>, target_type: VeinDataType) -> LogicalExpr {
+    let LogicalExpr::Literal(literal) = &*expr else {
+        return LogicalExpr::Cast {
+            expr,
+            target_type,
+        };
+    };
+
+    let source_type = plan::expr::inference::literal_type(literal);
+    let converted = if matches!(literal, LogicalLiteral::Null(_)) {
+        Some(LogicalLiteral::Null(target_type.clone()))
+    } else if source_type == target_type {
+        Some(literal.clone())
+    } else {
+        match (literal, &target_type) {
+            (LogicalLiteral::Int64(value), VeinDataType::Float64) => {
+                Some(LogicalLiteral::Float64(*value as f64))
+            }
+            (LogicalLiteral::Float64(value), VeinDataType::Int64)
+            if value.is_finite()
+                && *value >= i64::MIN as f64
+                && *value < (i64::MAX as f64) + 1.0 =>
+                {
+                    Some(LogicalLiteral::Int64(value.trunc() as i64))
+                }
+            (LogicalLiteral::String(value), VeinDataType::Int64) => {
+                value.parse().ok().map(LogicalLiteral::Int64)
+            }
+            (LogicalLiteral::String(value), VeinDataType::Float64) => {
+                value.parse().ok().map(LogicalLiteral::Float64)
+            }
+            (LogicalLiteral::String(value), VeinDataType::Boolean) => match value.to_ascii_lowercase().as_str() {
+                "true" => Some(LogicalLiteral::Boolean(true)),
+                "false" => Some(LogicalLiteral::Boolean(false)),
+                _ => None,
+            },
+            (LogicalLiteral::Boolean(value), VeinDataType::Utf8) => {
+                Some(LogicalLiteral::String(value.to_string()))
+            }
+            _ => None,
+        }
+    };
+
+    converted
+        .map(LogicalExpr::Literal)
+        .unwrap_or(LogicalExpr::Cast {
+            expr,
+            target_type,
+        })
+}
+
+/// Folds literal LIKE patterns, including %, _, and backslash escapes.
+fn fold_like(expr: Box<LogicalExpr>, pattern: Box<LogicalExpr>, negated: bool) -> LogicalExpr {
+    let (LogicalExpr::Literal(LogicalLiteral::String(value)),
+        LogicalExpr::Literal(LogicalLiteral::String(pattern))) = (&*expr, &*pattern)
+    else {
+        return LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        };
+    };
+
+    let matches = like_matches(value, pattern);
+    LogicalExpr::Literal(LogicalLiteral::Boolean(if negated { !matches } else { matches }))
+}
+
+/// Matches a SQL LIKE pattern without allocating a transformed string.
+fn like_matches(value: &str, pattern: &str) -> bool {
+    let value: Vec<char> = value.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut memo = std::collections::HashMap::new();
+
+    fn visit(
+        value: &[char],
+        pattern: &[char],
+        value_index: usize,
+        pattern_index: usize,
+        memo: &mut std::collections::HashMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&(value_index, pattern_index)) {
+            return *result;
+        }
+        let result = if pattern_index == pattern.len() {
+            value_index == value.len()
+        } else {
+            match pattern[pattern_index] {
+                '%' => {
+                    visit(value, pattern, value_index, pattern_index + 1, memo)
+                        || (value_index < value.len()
+                        && visit(value, pattern, value_index + 1, pattern_index, memo))
+                }
+                '_' => {
+                    value_index < value.len()
+                        && visit(value, pattern, value_index + 1, pattern_index + 1, memo)
+                }
+                '\\' if pattern_index + 1 < pattern.len() => {
+                    value_index < value.len()
+                        && value[value_index] == pattern[pattern_index + 1]
+                        && visit(value, pattern, value_index + 1, pattern_index + 2, memo)
+                }
+                literal => {
+                    value_index < value.len()
+                        && value[value_index] == literal
+                        && visit(value, pattern, value_index + 1, pattern_index + 1, memo)
+                }
+            }
+        };
+        memo.insert((value_index, pattern_index), result);
+        result
+    }
+
+    visit(&value, &pattern, 0, 0, &mut memo)
+}
+
+/// Unary operators supported by the pipe expression language.
+#[derive(Debug, Clone, Copy)]
+enum UnaryKind {
+    /// Logical NOT.
+    Not,
+    /// Numeric negation.
+    Negate,
+}
+
+/// Folds a literal unary expression when its semantics are unambiguous.
+fn fold_unary(expr: Box<LogicalExpr>, kind: UnaryKind) -> LogicalExpr {
+    let LogicalExpr::Literal(literal) = &*expr else {
+        return match kind {
+            UnaryKind::Not => LogicalExpr::Not { expr },
+            UnaryKind::Negate => LogicalExpr::Negate { expr },
+        };
+    };
+
+    let folded = match (kind, literal) {
+        (UnaryKind::Not, LogicalLiteral::Boolean(value)) => {
+            Some(LogicalLiteral::Boolean(!value))
+        }
+        (UnaryKind::Negate, LogicalLiteral::Int64(value)) => {
+            value.checked_neg().map(LogicalLiteral::Int64)
+        }
+        (UnaryKind::Negate, LogicalLiteral::Float64(value)) => {
+            Some(LogicalLiteral::Float64(-value))
+        }
+        _ => None,
+    };
+
+    folded
+        .map(LogicalExpr::Literal)
+        .unwrap_or_else(|| match kind {
+            UnaryKind::Not => LogicalExpr::Not { expr },
+            UnaryKind::Negate => LogicalExpr::Negate { expr },
+        })
+}
+
+/// Folds IS NULL and IS NOT NULL for literal operands.
+fn fold_null_check(expr: Box<LogicalExpr>, negated: bool) -> LogicalExpr {
+    let LogicalExpr::Literal(literal) = &*expr else {
+        return if negated {
+            LogicalExpr::IsNotNull { expr }
+        } else {
+            LogicalExpr::IsNull { expr }
+        };
+    };
+
+    let is_null = matches!(literal, LogicalLiteral::Null(_));
+    LogicalExpr::Literal(LogicalLiteral::Boolean(if negated {
+        !is_null
+    } else {
+        is_null
+    }))
+}
+
+/// Folds an IN/NOT IN expression when all operands are literals.
+fn fold_in_list(expr: Box<LogicalExpr>, list: Vec<LogicalExpr>, negated: bool) -> LogicalExpr {
+    let LogicalExpr::Literal(value) = &*expr else {
+        return LogicalExpr::InList {
+            expr,
+            list,
+            negated,
+        };
+    };
+    let literals: Option<Vec<&LogicalLiteral>> = list
+        .iter()
+        .map(|item| match item {
+            LogicalExpr::Literal(literal) => Some(literal),
+            _ => None,
+        })
+        .collect();
+    let Some(literals) = literals else {
+        return LogicalExpr::InList {
+            expr,
+            list,
+            negated,
+        };
+    };
+
+    let mut has_null = false;
+    for candidate in literals {
+        match fold_literals(
+            BinaryOp::Eq,
+            value,
+            candidate,
+            &VeinDataType::Boolean,
+        ) {
+            Some(LogicalLiteral::Boolean(true)) => {
+                return LogicalExpr::Literal(LogicalLiteral::Boolean(!negated));
+            }
+            Some(LogicalLiteral::Null(_)) => has_null = true,
+            _ => {}
+        }
+    }
+
+    if has_null {
+        LogicalExpr::Literal(LogicalLiteral::Null(VeinDataType::Boolean))
+    } else {
+        LogicalExpr::Literal(LogicalLiteral::Boolean(negated))
+    }
+}
+
+/// Folds a CASE expression when a literal WHEN condition selects a branch.
+fn fold_case(
+    when: Vec<LogicalExpr>,
+    then: Vec<LogicalExpr>,
+    else_: Option<Box<LogicalExpr>>,
+    return_type: VeinDataType,
+) -> LogicalExpr {
+    for (condition, result) in when.iter().zip(&then) {
+        match condition {
+            LogicalExpr::Literal(LogicalLiteral::Boolean(true)) => return result.clone(),
+            LogicalExpr::Literal(LogicalLiteral::Boolean(false))
+            | LogicalExpr::Literal(LogicalLiteral::Null(_)) => continue,
+            _ => {
+                return LogicalExpr::Case {
+                    when,
+                    then,
+                    else_,
+                    return_type,
+                };
+            }
+        }
+    }
+
+    else_
+        .map(|expr| *expr)
+        .unwrap_or(LogicalExpr::Literal(LogicalLiteral::Null(return_type)))
 }
 
 /// Performs a constant binary operation on two literals.
 ///
-/// Returns `None` for operations that are not foldable: mismatched types,
-/// division by zero, integer overflow, or operators outside the supported
-/// subset.
-fn fold_literals(op: BinaryOp, left: &LogicalLiteral, right: &LogicalLiteral) -> Option<LogicalLiteral> {
+/// Returns `None` for mismatched types, invalid arithmetic, or operators
+/// outside the pipe language's supported foldable subset.
+fn fold_literals(
+    op: BinaryOp,
+    left: &LogicalLiteral,
+    right: &LogicalLiteral,
+    return_type: &VeinDataType,
+) -> Option<LogicalLiteral> {
+    if matches!(op, BinaryOp::And | BinaryOp::Or)
+        && let Some(result) = fold_nullable_boolean(op, left, right)
+    {
+        return Some(result);
+    }
+
+    if matches!(left, LogicalLiteral::Null(_)) || matches!(right, LogicalLiteral::Null(_)) {
+        return Some(LogicalLiteral::Null(match op {
+            BinaryOp::Eq
+            | BinaryOp::Neq
+            | BinaryOp::Lt
+            | BinaryOp::Gt
+            | BinaryOp::Leq
+            | BinaryOp::Geq
+            | BinaryOp::And
+            | BinaryOp::Or => VeinDataType::Boolean,
+            _ => return_type.clone(),
+        }));
+    }
+
     match (left, right) {
         (LogicalLiteral::Int64(l), LogicalLiteral::Int64(r)) => fold_int64(op, *l, *r),
         (LogicalLiteral::Float64(l), LogicalLiteral::Float64(r)) => fold_float64(op, *l, *r),
@@ -236,10 +543,67 @@ fn fold_literals(op: BinaryOp, left: &LogicalLiteral, right: &LogicalLiteral) ->
             BinaryOp::Concat => Some(LogicalLiteral::String(format!("{l}{r}"))),
             BinaryOp::Eq => Some(LogicalLiteral::Boolean(l == r)),
             BinaryOp::Neq => Some(LogicalLiteral::Boolean(l != r)),
+            BinaryOp::Lt => Some(LogicalLiteral::Boolean(l < r)),
+            BinaryOp::Gt => Some(LogicalLiteral::Boolean(l > r)),
+            BinaryOp::Leq => Some(LogicalLiteral::Boolean(l <= r)),
+            BinaryOp::Geq => Some(LogicalLiteral::Boolean(l >= r)),
             _ => None,
         },
+        (LogicalLiteral::Date(l), LogicalLiteral::Date(r)) => {
+            fold_ordered_scalars(op, *l, *r)
+        }
+        (LogicalLiteral::Timestamp(l), LogicalLiteral::Timestamp(r))
+        | (LogicalLiteral::Time(l), LogicalLiteral::Time(r)) => {
+            fold_ordered_scalars(op, *l, *r)
+        }
+        (LogicalLiteral::Decimal(l, lp, ls), LogicalLiteral::Decimal(r, rp, rs))
+        if lp == rp && ls == rs =>
+            {
+                fold_ordered_scalars(op, *l, *r)
+            }
         _ => None,
     }
+}
+
+/// Folds SQL three-valued boolean combinations involving NULL.
+fn fold_nullable_boolean(
+    op: BinaryOp,
+    left: &LogicalLiteral,
+    right: &LogicalLiteral,
+) -> Option<LogicalLiteral> {
+    let left_null = matches!(left, LogicalLiteral::Null(_));
+    let right_null = matches!(right, LogicalLiteral::Null(_));
+
+    match (op, left, right) {
+        (BinaryOp::And, LogicalLiteral::Boolean(false), _)
+        | (BinaryOp::And, _, LogicalLiteral::Boolean(false)) => {
+            Some(LogicalLiteral::Boolean(false))
+        }
+        (BinaryOp::Or, LogicalLiteral::Boolean(true), _)
+        | (BinaryOp::Or, _, LogicalLiteral::Boolean(true)) => {
+            Some(LogicalLiteral::Boolean(true))
+        }
+        (BinaryOp::And | BinaryOp::Or, _, _)
+        if left_null || right_null =>
+            {
+                Some(LogicalLiteral::Null(VeinDataType::Boolean))
+            }
+        _ => None,
+    }
+}
+
+/// Folds equality and ordering for scalar values with a shared representation.
+fn fold_ordered_scalars<T: PartialOrd + PartialEq>(op: BinaryOp, left: T, right: T) -> Option<LogicalLiteral> {
+    let result = match op {
+        BinaryOp::Eq => left == right,
+        BinaryOp::Neq => left != right,
+        BinaryOp::Lt => left < right,
+        BinaryOp::Gt => left > right,
+        BinaryOp::Leq => left <= right,
+        BinaryOp::Geq => left >= right,
+        _ => return None,
+    };
+    Some(LogicalLiteral::Boolean(result))
 }
 
 /// Folds integer operations, guarding against overflow and division by zero.
@@ -318,11 +682,16 @@ mod tests {
     }
 
     fn scan() -> LogicalPlan {
+        let schema = Box::new(plan::VeinSchema { fields: vec![] });
+        let table = std::sync::Arc::new(plan::TableMetadata::new(
+            "t",
+            std::sync::Arc::new(*schema.clone()),
+        ));
         LogicalPlan::Scan {
-            table_name: "t".to_string(),
+            table,
             projection: None,
             filters: vec![],
-            schema: Box::new(plan::VeinSchema { fields: vec![] }),
+            schema,
         }
     }
 
@@ -400,7 +769,7 @@ mod tests {
             schema: Box::new(plan::VeinSchema { fields: vec![] }),
         };
 
-        let optimized = rule.apply(&plan).unwrap().expect("plan must change");
+        let optimized = rule.apply(&plan, &OptimizerContext::default()).unwrap().expect("plan must change");
         let LogicalPlan::Aggregate {
             grouping_sets,
             aggs,
@@ -417,14 +786,14 @@ mod tests {
     fn unchanged_plan_returns_none() {
         let rule = ConstantFoldingRule;
         let plan = project(vec![lit(17)]);
-        assert!(rule.apply(&plan).unwrap().is_none());
+        assert!(rule.apply(&plan, &OptimizerContext::default()).unwrap().is_none());
     }
 
     #[test]
     fn project_exprs_are_folded() {
         let plan = project(vec![bin(BinaryOp::Multiply, lit(3), lit(4))]);
         let optimized = ConstantFoldingRule
-            .apply(&plan)
+            .apply(&plan, &OptimizerContext::default())
             .unwrap()
             .expect("plan must change");
         let LogicalPlan::Project { exprs, .. } = optimized else {
@@ -442,12 +811,179 @@ mod tests {
         };
 
         let optimized = ConstantFoldingRule
-            .apply(&plan)
+            .apply(&plan, &OptimizerContext::default())
             .unwrap()
             .expect("plan must change");
         let LogicalPlan::Filter { predicate, .. } = optimized else {
             panic!("expected a Filter node");
         };
         assert_eq!(predicate, LogicalExpr::Literal(LogicalLiteral::Boolean(false)));
+    }
+
+    #[test]
+    fn folds_unary_and_null_checks() {
+        assert_eq!(
+            fold_expr(&LogicalExpr::Not {
+                expr: Box::new(LogicalExpr::Literal(LogicalLiteral::Boolean(true))),
+            }),
+            LogicalExpr::Literal(LogicalLiteral::Boolean(false))
+        );
+        assert_eq!(
+            fold_expr(&LogicalExpr::Negate {
+                expr: Box::new(lit(7)),
+            }),
+            lit(-7)
+        );
+        assert_eq!(
+            fold_expr(&LogicalExpr::IsNull {
+                expr: Box::new(LogicalExpr::Literal(LogicalLiteral::Null(
+                    VeinDataType::Int64,
+                ))),
+            }),
+            LogicalExpr::Literal(LogicalLiteral::Boolean(true))
+        );
+        assert_eq!(
+            fold_expr(&LogicalExpr::IsNotNull {
+                expr: Box::new(lit(7)),
+            }),
+            LogicalExpr::Literal(LogicalLiteral::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn folds_in_list_and_case() {
+        let in_list = LogicalExpr::InList {
+            expr: Box::new(lit(2)),
+            list: vec![lit(1), lit(2), lit(3)],
+            negated: false,
+        };
+        assert_eq!(
+            fold_expr(&in_list),
+            LogicalExpr::Literal(LogicalLiteral::Boolean(true))
+        );
+
+        let case = LogicalExpr::Case {
+            when: vec![LogicalExpr::Literal(LogicalLiteral::Boolean(false))],
+            then: vec![lit(1)],
+            else_: Some(Box::new(lit(2))),
+            return_type: VeinDataType::Int64,
+        };
+        assert_eq!(fold_expr(&case), lit(2));
+    }
+
+    #[test]
+    fn folds_children_inside_function_and_preserves_call() {
+        let call = LogicalExpr::FunctionCall {
+            name: "abs".to_string(),
+            args: vec![bin(BinaryOp::Plus, lit(2), lit(3))],
+            is_aggregate: false,
+            distinct: false,
+            return_type: VeinDataType::Int64,
+        };
+        let folded = fold_expr(&call);
+        assert!(matches!(
+            folded,
+            LogicalExpr::FunctionCall { ref args, .. } if args == &vec![lit(5)]
+        ));
+    }
+
+    #[test]
+    fn folds_safe_literal_casts() {
+        assert_eq!(
+            fold_expr(&LogicalExpr::Cast {
+                expr: Box::new(LogicalExpr::Literal(LogicalLiteral::String("42".into()))),
+                target_type: VeinDataType::Int64,
+            }),
+            lit(42)
+        );
+        assert_eq!(
+            fold_expr(&LogicalExpr::Cast {
+                expr: Box::new(lit(7)),
+                target_type: VeinDataType::Float64,
+            }),
+            float(7.0)
+        );
+        assert_eq!(
+            fold_expr(&LogicalExpr::Cast {
+                expr: Box::new(LogicalExpr::Literal(LogicalLiteral::Null(
+                    VeinDataType::Int64,
+                ))),
+                target_type: VeinDataType::Float64,
+            }),
+            LogicalExpr::Literal(LogicalLiteral::Null(VeinDataType::Float64))
+        );
+    }
+
+    #[test]
+    fn preserves_unsafe_or_unsupported_casts() {
+        let expr = LogicalExpr::Cast {
+            expr: Box::new(LogicalExpr::Literal(LogicalLiteral::String("not-a-number".into()))),
+            target_type: VeinDataType::Int64,
+        };
+        assert_eq!(fold_expr(&expr), expr);
+    }
+
+    #[test]
+    fn folds_like_temporal_and_decimal_literals() {
+        let like = LogicalExpr::Like {
+            expr: Box::new(LogicalExpr::Literal(LogicalLiteral::String(
+                "vein optimizer".into(),
+            ))),
+            pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String(
+                "vein%".into(),
+            ))),
+            negated: false,
+        };
+        assert_eq!(
+            fold_expr(&like),
+            LogicalExpr::Literal(LogicalLiteral::Boolean(true))
+        );
+
+        assert_eq!(
+            fold_expr(&bin(
+                BinaryOp::Geq,
+                LogicalExpr::Literal(LogicalLiteral::Date(10)),
+                LogicalExpr::Literal(LogicalLiteral::Date(9)),
+            )),
+            LogicalExpr::Literal(LogicalLiteral::Boolean(true))
+        );
+        assert_eq!(
+            fold_expr(&bin(
+                BinaryOp::Eq,
+                LogicalExpr::Literal(LogicalLiteral::Decimal(1234, 10, 2)),
+                LogicalExpr::Literal(LogicalLiteral::Decimal(1234, 10, 2)),
+            )),
+            LogicalExpr::Literal(LogicalLiteral::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn preserves_sql_null_comparison() {
+        let expr = bin(
+            BinaryOp::Eq,
+            LogicalExpr::Literal(LogicalLiteral::Null(VeinDataType::Int64)),
+            lit(1),
+        );
+        assert_eq!(
+            fold_expr(&expr),
+            LogicalExpr::Literal(LogicalLiteral::Null(VeinDataType::Boolean))
+        );
+
+        assert_eq!(
+            fold_expr(&bin(
+                BinaryOp::And,
+                LogicalExpr::Literal(LogicalLiteral::Boolean(false)),
+                LogicalExpr::Literal(LogicalLiteral::Null(VeinDataType::Boolean)),
+            )),
+            LogicalExpr::Literal(LogicalLiteral::Boolean(false))
+        );
+        assert_eq!(
+            fold_expr(&bin(
+                BinaryOp::Or,
+                LogicalExpr::Literal(LogicalLiteral::Boolean(true)),
+                LogicalExpr::Literal(LogicalLiteral::Null(VeinDataType::Boolean)),
+            )),
+            LogicalExpr::Literal(LogicalLiteral::Boolean(true))
+        );
     }
 }

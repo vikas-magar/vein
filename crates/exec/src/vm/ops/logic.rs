@@ -11,33 +11,39 @@ use error::VeinError;
 
 /// Performs element-wise logical AND between two boolean registers.
 pub fn eval_and(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef> {
-    let b_lhs = lhs
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| VeinError::internal("Logical AND requires BooleanArray for LHS"))?;
-    let b_rhs = rhs
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| VeinError::internal("Logical AND requires BooleanArray for RHS"))?;
-
-    let res = boolean::and(b_lhs, b_rhs)
-        .map_err(|e| VeinError::internal(format!("Vector VM And error: {e}")))?;
-    Ok(Arc::new(res))
+    eval_binary_boolean(lhs, rhs, "AND", "And", boolean::and)
 }
 
 /// Performs element-wise logical OR between two boolean registers.
 pub fn eval_or(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef> {
+    eval_binary_boolean(lhs, rhs, "OR", "Or", boolean::or)
+}
+
+fn eval_binary_boolean(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+    operator: &str,
+    kernel_name: &str,
+    kernel: impl FnOnce(
+        &BooleanArray,
+        &BooleanArray,
+    ) -> std::result::Result<BooleanArray, arrow::error::ArrowError>,
+) -> Result<ArrayRef> {
     let b_lhs = lhs
         .as_any()
         .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| VeinError::internal("Logical OR requires BooleanArray for LHS"))?;
+        .ok_or_else(|| {
+            VeinError::internal(format!("Logical {operator} requires BooleanArray for LHS"))
+        })?;
     let b_rhs = rhs
         .as_any()
         .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| VeinError::internal("Logical OR requires BooleanArray for RHS"))?;
+        .ok_or_else(|| {
+            VeinError::internal(format!("Logical {operator} requires BooleanArray for RHS"))
+        })?;
 
-    let res = boolean::or(b_lhs, b_rhs)
-        .map_err(|e| VeinError::internal(format!("Vector VM Or error: {e}")))?;
+    let res = kernel(b_lhs, b_rhs)
+        .map_err(|e| VeinError::internal(format!("Vector VM {kernel_name} error: {e}")))?;
     Ok(Arc::new(res))
 }
 
@@ -96,5 +102,20 @@ mod tests {
         assert_eq!(not_bool.value(1), false);
         assert_eq!(not_bool.value(2), true);
         assert_eq!(not_bool.value(3), true);
+    }
+
+    #[test]
+    fn binary_boolean_kernels_preserve_operator_error_context() {
+        let lhs: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
+        let rhs: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+
+        assert!(eval_and(&lhs, &rhs)
+            .unwrap_err()
+            .to_string()
+            .contains("Vector VM And error"));
+        assert!(eval_or(&lhs, &rhs)
+            .unwrap_err()
+            .to_string()
+            .contains("Vector VM Or error"));
     }
 }
