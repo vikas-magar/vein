@@ -7,7 +7,8 @@ use crate::runtime_filter::RuntimeFilterSet;
 use crate::udf::FunctionRegistry;
 use catalog::MetadataStore;
 use common::protocol::FileFormat;
-use common::protocol::ScanPredicate;
+use common::protocol::{RuntimeStatisticsScan, ScanPredicate};
+use common::statistics::{QueryStatisticsContext, RuntimeStatisticsStore};
 use common::Result;
 use error::VeinError;
 use opendal::Operator;
@@ -51,6 +52,9 @@ pub struct ScanSource {
     metadata_store: MetadataStore,
     /// Function registry the compiled predicate program runs against.
     registry: Arc<FunctionRegistry>,
+    runtime_statistics: RuntimeStatisticsStore,
+    statistics_scan: Option<RuntimeStatisticsScan>,
+    query_statistics: Option<Arc<QueryStatisticsContext>>,
     /// Bytes this scan has read from storage, shared with the Parquet reader so
     /// the runtime can report real I/O volume in execution metrics.
     bytes_read: Arc<AtomicU64>,
@@ -94,6 +98,35 @@ impl ScanSource {
         registry: Arc<FunctionRegistry>,
         runtime_filters: RuntimeFilterSet,
     ) -> Self {
+        Self::new_with_runtime_statistics(
+            operator,
+            files,
+            format,
+            projected,
+            dictionary_columns,
+            pushdown,
+            metadata_store,
+            registry,
+            runtime_filters,
+            RuntimeStatisticsStore::default(),
+            None,
+        )
+    }
+
+    /// Creates a scan that collects bounded synopses while emitting source batches.
+    pub fn new_with_runtime_statistics(
+        operator: Operator,
+        files: Vec<ScanFile>,
+        format: FileFormat,
+        projected: VeinSchemaRef,
+        dictionary_columns: Vec<u32>,
+        pushdown: Option<Arc<ScanPredicate>>,
+        metadata_store: MetadataStore,
+        registry: Arc<FunctionRegistry>,
+        runtime_filters: RuntimeFilterSet,
+        runtime_statistics: RuntimeStatisticsStore,
+        statistics_scan: Option<RuntimeStatisticsScan>,
+    ) -> Self {
         Self {
             operator,
             files,
@@ -104,8 +137,20 @@ impl ScanSource {
             runtime_filters,
             metadata_store,
             registry,
+            runtime_statistics,
+            statistics_scan,
+            query_statistics: None,
             bytes_read: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Attaches the owning query's shared statistics context.
+    pub fn with_query_statistics_context(
+        mut self,
+        context: Arc<QueryStatisticsContext>,
+    ) -> Self {
+        self.query_statistics = Some(context);
+        self
     }
 }
 
@@ -124,6 +169,9 @@ impl Source<DataChunkView> for ScanSource {
                     &self.registry,
                     &self.bytes_read,
                     &self.runtime_filters,
+                    &self.runtime_statistics,
+                    self.statistics_scan.as_ref(),
+                    self.query_statistics.as_ref(),
                     next,
                 )
                     .await?

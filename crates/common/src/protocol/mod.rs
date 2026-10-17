@@ -19,7 +19,7 @@ pub use task::{
     KeyValue, JoinOutput, JoinPlan, JoinResidualPlan, LimitSpec, PhysicalPlan,
     InputMaterialization, OperatorDataFlow, OutputRepresentation,
     PhysicalPlanNode, PhysicalPlanOperator, ScanPredicate, ScanPredicateStage, SortKey, SortPlan,
-    StorageTarget, StreamSource,
+    RuntimeStatisticsScan, StorageTarget, StreamSource,
 };
 
 // Derived scheduling metadata references nodes in the canonical physical plan.

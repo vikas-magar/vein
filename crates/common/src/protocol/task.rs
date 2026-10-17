@@ -8,6 +8,7 @@ use types::VeinSchemaRef;
 
 use super::ir::{MicroProgram, RegId};
 use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
+use crate::statistics::QueryStatisticsContext;
 
 /// Supported file formats for storage scans.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +88,27 @@ pub struct FileScanTask {
     pub task_id: TaskId,
     /// Catalog snapshot pinned by the planning session.
     pub catalog_snapshot: Option<CatalogSnapshotToken>,
+    /// Runtime synopsis collection context, when the planner identified a table scan.
+    #[serde(default)]
+    pub runtime_statistics: Option<RuntimeStatisticsScan>,
+}
+
+/// Stable identity and coverage information for lazy runtime statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeStatisticsScan {
+    /// Identity shared by all independently scheduled pieces of this scan.
+    pub scan_id: u128,
+    /// Source revision key used to prevent cross-snapshot statistics reuse.
+    pub table_key: String,
+    /// Exact row count from the catalog, when available.
+    pub expected_rows: Option<u64>,
+    /// Whether the plan can prove complete source-row coverage. Column
+    /// coverage is independent: projected-column synopses may still be useful.
+    pub row_coverage_candidate: bool,
+    /// Ordinal of this independently scheduled work unit.
+    pub partition_index: usize,
+    /// Number of work units that must finish before the synopsis is finalized.
+    pub partition_count: usize,
 }
 
 /// Read from an infinite stream.
@@ -262,13 +284,21 @@ impl PhysicalPlanOperator {
             Self::Limit { .. } => ("limit", None, References),
             Self::Aggregate { .. } => ("aggregate", WholeBatch, ResultArrays),
             Self::Distinct { .. } => ("distinct", WholeBatch, ResultArrays),
-            Self::Sink { sink, .. } => ("sink", match sink.as_ref() {
-                DataSink::Client { .. } => ConsumerBoundary,
-                DataSink::Storage(_) => WholeBatch,
-                DataSink::Discard => None,
-            }, Sink),
+            Self::Sink { sink, .. } => (
+                "sink",
+                match sink.as_ref() {
+                    DataSink::Client { .. } => ConsumerBoundary,
+                    DataSink::Storage(_) => WholeBatch,
+                    DataSink::Discard => None,
+                },
+                Sink,
+            ),
         };
-        OperatorDataFlow { operator, input_materialization, output }
+        OperatorDataFlow {
+            operator,
+            input_materialization,
+            output,
+        }
     }
 }
 
@@ -389,6 +419,13 @@ pub struct ExecuteTask {
     pub stage_id: StageId,
     /// The authoritative physical operator tree for this task.
     pub plan: PhysicalPlan,
+    /// In-process query statistics shared by planning and local execution.
+    ///
+    /// This is deliberately excluded from the serialized task payload. A local
+    /// coordinator attaches the context after planning; remote executors receive
+    /// the self-contained plan and can provide their own local context.
+    #[serde(skip)]
+    pub statistics_context: Option<Arc<QueryStatisticsContext>>,
 }
 
 use super::{AggOpCode, JoinKind};
@@ -513,9 +550,9 @@ fn default_emit_empty_group() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AggOpCode, AggregatePlan, DataSink, DataSource, JoinKind, JoinOutput, JoinPlan, LimitSpec,
-        MicroProgram, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator, SortKey, SortPlan,
-        InputMaterialization, OutputRepresentation,
+        AggOpCode, AggregatePlan, DataSink, DataSource, InputMaterialization, JoinKind, JoinOutput,
+        JoinPlan, LimitSpec, MicroProgram, OutputRepresentation, PhysicalPlan, PhysicalPlanNode,
+        PhysicalPlanOperator, SortKey, SortPlan,
     };
     use std::sync::Arc;
     use types::VeinSchema;
@@ -587,13 +624,25 @@ mod tests {
         });
         for (sink, expected) in [
             (DataSink::Discard, InputMaterialization::None),
-            (DataSink::Client { schema: Arc::new(VeinSchema::empty()) },
-                InputMaterialization::ConsumerBoundary),
-            (DataSink::Storage(super::StorageTarget::new(
-                "test", Vec::new(), Arc::new(VeinSchema::empty()),
-            )), InputMaterialization::WholeBatch),
+            (
+                DataSink::Client {
+                    schema: Arc::new(VeinSchema::empty()),
+                },
+                InputMaterialization::ConsumerBoundary,
+            ),
+            (
+                DataSink::Storage(super::StorageTarget::new(
+                    "test",
+                    Vec::new(),
+                    Arc::new(VeinSchema::empty()),
+                )),
+                InputMaterialization::WholeBatch,
+            ),
         ] {
-            let operator = PhysicalPlanOperator::Sink { input: Arc::clone(&input), sink: Arc::new(sink) };
+            let operator = PhysicalPlanOperator::Sink {
+                input: Arc::clone(&input),
+                sink: Arc::new(sink),
+            };
             let contract = operator.data_flow();
             assert_eq!(contract.input_materialization, expected);
             assert_eq!(contract.output, OutputRepresentation::Sink);
@@ -605,20 +654,29 @@ mod tests {
         // Exhaustive against the operator enum: a new variant requires both a
         // production contract and regression expectations, without a wildcard.
         let (input, output) = match &node.operator {
-            PhysicalPlanOperator::Pipeline { .. } | PhysicalPlanOperator::Transform { .. } =>
-                (InputMaterialization::KernelColumns, OutputRepresentation::ReferencesAndComputed),
-            PhysicalPlanOperator::Join { .. } | PhysicalPlanOperator::Sort { .. } =>
-                (InputMaterialization::KernelColumns, OutputRepresentation::References),
-            PhysicalPlanOperator::Limit { .. } =>
-                (InputMaterialization::None, OutputRepresentation::References),
-            PhysicalPlanOperator::Aggregate { .. } | PhysicalPlanOperator::Distinct { .. } =>
-                (InputMaterialization::WholeBatch, OutputRepresentation::ResultArrays),
-            PhysicalPlanOperator::Sink { sink, .. } =>
-                (match sink.as_ref() {
+            PhysicalPlanOperator::Pipeline { .. } | PhysicalPlanOperator::Transform { .. } => (
+                InputMaterialization::KernelColumns,
+                OutputRepresentation::ReferencesAndComputed,
+            ),
+            PhysicalPlanOperator::Join { .. } | PhysicalPlanOperator::Sort { .. } => (
+                InputMaterialization::KernelColumns,
+                OutputRepresentation::References,
+            ),
+            PhysicalPlanOperator::Limit { .. } => {
+                (InputMaterialization::None, OutputRepresentation::References)
+            }
+            PhysicalPlanOperator::Aggregate { .. } | PhysicalPlanOperator::Distinct { .. } => (
+                InputMaterialization::WholeBatch,
+                OutputRepresentation::ResultArrays,
+            ),
+            PhysicalPlanOperator::Sink { sink, .. } => (
+                match sink.as_ref() {
                     DataSink::Client { .. } => InputMaterialization::ConsumerBoundary,
                     DataSink::Storage(_) => InputMaterialization::WholeBatch,
                     DataSink::Discard => InputMaterialization::None,
-                }, OutputRepresentation::Sink),
+                },
+                OutputRepresentation::Sink,
+            ),
         };
         assert_eq!(contract.input_materialization, input);
         assert_eq!(contract.output, output);
@@ -777,8 +835,13 @@ mod tests {
         let cloned = plan.clone();
 
         assert!(Arc::ptr_eq(&plan.root, &cloned.root));
-        let (PhysicalPlanOperator::Limit { input, .. }, PhysicalPlanOperator::Limit { input: cloned_input, .. }) =
-            (&plan.root.operator, &cloned.root.operator)
+        let (
+            PhysicalPlanOperator::Limit { input, .. },
+            PhysicalPlanOperator::Limit {
+                input: cloned_input,
+                ..
+            },
+        ) = (&plan.root.operator, &cloned.root.operator)
         else {
             panic!("cloned plan should retain its root node");
         };

@@ -181,15 +181,6 @@ impl<C: JoinCostModel> JoinOrderRule<C> {
             }
         };
 
-        if graph.leaves.len() < 3 {
-            return Some(SearchAttempt::Fallback(graph.decision(
-                0,
-                None,
-                None,
-                JoinOrderOutcome::InsufficientRelations,
-            )));
-        }
-
         let config = &context.config().join_order;
         if graph.leaves.len() > config.max_relations
             || graph.leaves.len() >= usize::BITS as usize
@@ -1279,26 +1270,29 @@ mod tests {
     }
 
     #[test]
-    fn binary_join_reports_that_cost_based_order_search_was_not_run() {
+    fn binary_join_runs_cost_search_and_reports_its_candidate() {
         let plan = join(
             scan("orders", 100, &[(1, "order_key", 100)]),
             scan("lineitem", 400, &[(2, "order_key", 200)]),
             equality(1, "order_key", 2, "order_key"),
             JoinType::Inner,
         );
+        let original = plan.clone();
 
-        let (_, diagnostics) = optimizer(JoinOrderConfig::default())
+        let (optimized, diagnostics) = optimizer(JoinOrderConfig::default())
             .optimize_with_diagnostics(plan)
             .expect("binary join should be retained");
 
+        assert_eq!(optimized, original);
         let decision = diagnostics
             .join_order_decisions
             .first()
             .expect("binary join decision should be visible");
-        assert_eq!(decision.outcome, JoinOrderOutcome::InsufficientRelations);
+        assert_eq!(decision.outcome, JoinOrderOutcome::NoImprovement);
         assert_eq!(decision.relation_labels, vec!["orders", "lineitem"]);
-        assert!(decision.original_cost.is_none());
-        assert!(decision.selected_cost.is_none());
+        assert_eq!(decision.candidate_splits, 1);
+        assert!(decision.original_cost.is_some());
+        assert!(decision.selected_cost.is_some());
         assert_eq!(
             relation_order_labels(&decision.original_order, &decision.relation_labels),
             vec!["orders", "lineitem"]
@@ -1498,7 +1492,7 @@ mod tests {
         assert_eq!(diagnostics.join_order_decisions.len(), 1);
         let decision = &diagnostics.join_order_decisions[0];
         assert_eq!(decision.relation_count, 2);
-        assert_eq!(decision.outcome, JoinOrderOutcome::InsufficientRelations);
+        assert_eq!(decision.outcome, JoinOrderOutcome::InsufficientStatistics);
         assert_eq!(decision.original_order, decision.selected_order);
     }
 }

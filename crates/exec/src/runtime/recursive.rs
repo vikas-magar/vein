@@ -156,6 +156,7 @@ impl DefaultTaskExecutor {
                                 let pending = Arc::new(Mutex::new(VecDeque::from(sources)));
                                 let runtime = tokio::runtime::Handle::current();
                                 let mut workers = tokio::task::JoinSet::new();
+                                let query_statistics = trace.query_statistics_context();
                                 for local in local_nodes {
                                     let builder = Arc::clone(&self.builder);
                                     let pending = Arc::clone(&pending);
@@ -166,6 +167,7 @@ impl DefaultTaskExecutor {
                                     let span = span.clone();
                                     let runtime = runtime.clone();
                                     let runtime_filters = runtime_filters.clone();
+                                    let query_statistics = Arc::clone(&query_statistics);
                                     workers.spawn_blocking(move || {
                                         let worker_started = std::time::Instant::now();
                                         let mut bytes = 0u64;
@@ -196,20 +198,13 @@ impl DefaultTaskExecutor {
                                             let Some(source_spec) = source_spec else {
                                                 break;
                                             };
-                                            let mut source = match runtime_filters.as_deref() {
-                                                Some(filters) if !filters.is_empty() => builder
-                                                    .build_source_with_runtime_filters(
-                                                        &source_spec,
-                                                        task_id,
-                                                        attempt,
-                                                        filters,
-                                                    )?,
-                                                _ => builder.build_source(
-                                                    &source_spec,
-                                                    task_id,
-                                                    attempt,
-                                                )?,
-                                            };
+                                            let mut source = builder.build_source_with_query_context(
+                                                &source_spec,
+                                                task_id,
+                                                attempt,
+                                                runtime_filters.as_deref(),
+                                                Some(Arc::clone(&query_statistics)),
+                                            )?;
                                             let source_started = std::time::Instant::now();
                                             runtime.block_on(async {
                                                 tokio::select! {
@@ -437,19 +432,13 @@ impl DefaultTaskExecutor {
                             return Ok(bytes);
                         }
                         let source_spec = &sources[0];
-                        let mut source = match runtime_filters.as_deref() {
-                            Some(filters) if !filters.is_empty() => self
-                                .builder
-                                .build_source_with_runtime_filters(
-                                    source_spec,
-                                    task.task_id,
-                                    task.attempt,
-                                    filters,
-                                )?,
-                            _ => self
-                                .builder
-                                .build_source(source_spec, task.task_id, task.attempt)?,
-                        };
+                        let mut source = self.builder.build_source_with_query_context(
+                            source_spec,
+                            task.task_id,
+                            task.attempt,
+                            runtime_filters.as_deref(),
+                            Some(trace.query_statistics_context()),
+                        )?;
                         let bytes_read = if program.instructions.is_empty() {
                             let mut source_next = next;
                             tokio::select! {
@@ -678,6 +667,7 @@ impl DefaultTaskExecutor {
                             plan,
                             &build_result,
                             &operator_memory,
+                            trace,
                             node_id,
                         )?;
                         let probe_rows = Arc::new(AtomicU64::new(0));
@@ -741,7 +731,7 @@ impl DefaultTaskExecutor {
                             let rows_seen = filters.rows_seen();
                             let rows_kept = filters.rows_kept();
                             tracing::info!(
-                                target: "vein.audit",
+                                target: "vein.statistics",
                                 event = "join_runtime_filter_completed",
                                 node_id,
                                 filter_names = ?filters.names(),

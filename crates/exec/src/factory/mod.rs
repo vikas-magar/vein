@@ -17,7 +17,10 @@ use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};
 use crate::operators::source::scan::{PARQUET_FOOTER, ScanFile};
 use crate::operators::source::ScanSource;
 use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Sink, Source, Transform};
-use crate::runtime_filter::{RuntimeFilterFactory, RuntimeFilterSet};
+use crate::runtime_filter::{
+    ConservativeRuntimeFilterPolicy, RuntimeFilterDecisionPolicy, RuntimeFilterFactory,
+    RuntimeFilterSet,
+};
 use crate::runtime::{ExecutorBuilder, MaterializeViewNode, split_scan_by_file};
 use crate::udf::FunctionRegistry;
 use crate::vm::VectorVmExecutor;
@@ -25,6 +28,7 @@ use catalog::{MetadataKey, MetadataStore};
 use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, FileFormat, FileScanTask, MicroProgram};
+use common::statistics::{QueryStatisticsContext, RuntimeStatisticsStore};
 use error::VeinError;
 use opendal::Operator;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -44,6 +48,8 @@ pub struct TaskExecutorBuilder {
     resource_limits: ExecutionResourceLimits,
     spill_storage_factory: Arc<dyn SpillStorageFactory>,
     runtime_filter_factory: Arc<dyn RuntimeFilterFactory>,
+    runtime_filter_policy: Arc<dyn RuntimeFilterDecisionPolicy>,
+    runtime_statistics: RuntimeStatisticsStore,
 }
 
 impl TaskExecutorBuilder {
@@ -58,6 +64,8 @@ impl TaskExecutorBuilder {
             resource_limits: ExecutionResourceLimits::default(),
             spill_storage_factory: Arc::new(LocalSpillStorageFactory),
             runtime_filter_factory: Arc::new(JoinBloomFilterFactory::default()),
+            runtime_filter_policy: Arc::new(ConservativeRuntimeFilterPolicy),
+            runtime_statistics: RuntimeStatisticsStore::default(),
         }
     }
 
@@ -68,6 +76,13 @@ impl TaskExecutorBuilder {
     /// instead of reading the same files again.
     pub fn with_metadata_store(mut self, metadata_store: MetadataStore) -> Self {
         self.metadata_store = metadata_store;
+        self.rebuild_default();
+        self
+    }
+
+    /// Share the catalog's runtime statistics store with executing scan sources.
+    pub fn with_runtime_statistics_store(mut self, store: RuntimeStatisticsStore) -> Self {
+        self.runtime_statistics = store;
         self.rebuild_default();
         self
     }
@@ -97,6 +112,16 @@ impl TaskExecutorBuilder {
         self
     }
 
+    /// Configure the current-query policy for selecting join runtime filters.
+    pub fn with_runtime_filter_decision_policy(
+        mut self,
+        policy: Arc<dyn RuntimeFilterDecisionPolicy>,
+    ) -> Self {
+        self.runtime_filter_policy = policy;
+        self.rebuild_default();
+        self
+    }
+
     /// Override the UDF function registry used by the Vector VM.
     pub fn with_registry(mut self, registry: Arc<FunctionRegistry>) -> Self {
         self.registry = registry;
@@ -117,7 +142,9 @@ impl TaskExecutorBuilder {
             builder = builder.with_write_storage(storage.clone());
         }
         builder = builder.with_metadata_store(self.metadata_store.clone());
+        builder = builder.with_runtime_statistics_store(self.runtime_statistics.clone());
         builder = builder.with_runtime_filter_factory(Arc::clone(&self.runtime_filter_factory));
+        builder = builder.with_runtime_filter_decision_policy(Arc::clone(&self.runtime_filter_policy));
         self.builder = Arc::new(builder);
     }
 
@@ -154,6 +181,8 @@ pub struct DefaultExecutorBuilder {
     storage: Option<Arc<dyn WriteStorage>>,
     metadata_store: MetadataStore,
     runtime_filter_factory: Arc<dyn RuntimeFilterFactory>,
+    runtime_filter_policy: Arc<dyn RuntimeFilterDecisionPolicy>,
+    runtime_statistics: RuntimeStatisticsStore,
     /// Storage handles, keyed by the root they were opened on.
     ///
     /// Opening a handle resolves the root and wires up the service behind it,
@@ -172,6 +201,8 @@ impl DefaultExecutorBuilder {
             storage: None,
             metadata_store: MetadataStore::new(),
             runtime_filter_factory: Arc::new(JoinBloomFilterFactory::default()),
+            runtime_filter_policy: Arc::new(ConservativeRuntimeFilterPolicy),
+            runtime_statistics: RuntimeStatisticsStore::default(),
             operators: Mutex::new(HashMap::new()),
         }
     }
@@ -188,6 +219,12 @@ impl DefaultExecutorBuilder {
         self
     }
 
+    /// Share runtime scan observations with the local catalog and optimizer.
+    pub fn with_runtime_statistics_store(mut self, store: RuntimeStatisticsStore) -> Self {
+        self.runtime_statistics = store;
+        self
+    }
+
     /// Configure the strategy used to create query-local join filters.
     pub fn with_runtime_filter_factory(
         mut self,
@@ -197,10 +234,20 @@ impl DefaultExecutorBuilder {
         self
     }
 
+    /// Attach the runtime policy that selects safe join filter candidates.
+    pub fn with_runtime_filter_decision_policy(
+        mut self,
+        policy: Arc<dyn RuntimeFilterDecisionPolicy>,
+    ) -> Self {
+        self.runtime_filter_policy = policy;
+        self
+    }
+
     fn build_source_inner(
         &self,
         source: &DataSource,
         runtime_filters: &RuntimeFilterSet,
+        query_statistics: Option<Arc<QueryStatisticsContext>>,
     ) -> Result<Box<dyn Source<DataChunkView>>> {
         match source {
             DataSource::Memory => Err(VeinError::internal(
@@ -223,7 +270,7 @@ impl DefaultExecutorBuilder {
                     })
                     .collect();
                 let op = self.local_operator(&root)?;
-                Ok(Box::new(ScanSource::new_with_runtime_filters(
+                let source = ScanSource::new_with_runtime_statistics(
                     op,
                     files,
                     scan.format.clone(),
@@ -233,7 +280,14 @@ impl DefaultExecutorBuilder {
                     self.metadata_store.clone(),
                     self.registry.clone(),
                     runtime_filters.clone(),
-                )))
+                    self.runtime_statistics.clone(),
+                    scan.runtime_statistics.clone(),
+                );
+                let source = match query_statistics {
+                    Some(context) => source.with_query_statistics_context(context),
+                    None => source,
+                };
+                Ok(Box::new(source))
             }
             DataSource::Stream(_) => Err(
                 VeinError::internal("this local executor supports only memory and Parquet sources"),
@@ -291,7 +345,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         _task_id: TaskId,
         _attempt: u32,
     ) -> Result<Box<dyn Source<DataChunkView>>> {
-        self.build_source_inner(source, &RuntimeFilterSet::empty())
+        self.build_source_inner(source, &RuntimeFilterSet::empty(), None)
     }
 
     fn build_source_with_runtime_filters(
@@ -301,7 +355,22 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         _attempt: u32,
         filters: &RuntimeFilterSet,
     ) -> Result<Box<dyn Source<DataChunkView>>> {
-        self.build_source_inner(source, filters)
+        self.build_source_inner(source, filters, None)
+    }
+
+    fn build_source_with_query_context(
+        &self,
+        source: &DataSource,
+        _task_id: TaskId,
+        _attempt: u32,
+        runtime_filters: Option<&RuntimeFilterSet>,
+        query_statistics: Option<Arc<QueryStatisticsContext>>,
+    ) -> Result<Box<dyn Source<DataChunkView>>> {
+        self.build_source_inner(
+            source,
+            runtime_filters.unwrap_or(&RuntimeFilterSet::empty()),
+            query_statistics,
+        )
     }
 
     fn supports_runtime_filter_pushdown(
@@ -319,6 +388,10 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
 
     fn runtime_filter_factory(&self) -> Option<Arc<dyn RuntimeFilterFactory>> {
         Some(Arc::clone(&self.runtime_filter_factory))
+    }
+
+    fn runtime_filter_decision_policy(&self) -> Arc<dyn RuntimeFilterDecisionPolicy> {
+        Arc::clone(&self.runtime_filter_policy)
     }
 
     fn build_vm(
@@ -389,12 +462,12 @@ fn partition_source(
     max_parallelism: usize,
     runtime_filters: Option<&RuntimeFilterSet>,
 ) -> Result<Vec<DataSource>> {
-    match source {
+    let mut partitions = match source {
         DataSource::File(scan)
-            if scan.format == FileFormat::Parquet && scan.scan_unit_range.is_none() =>
-        {
-            partition_parquet_scan(scan, metadata_store, max_parallelism, runtime_filters)
-        }
+        if scan.format == FileFormat::Parquet && scan.scan_unit_range.is_none() =>
+            {
+                partition_parquet_scan(scan, metadata_store, max_parallelism, runtime_filters)
+            }
         DataSource::File(scan) if scan.scan_unit_range.is_some() => {
             if scan.files.len() != 1 {
                 return Err(VeinError::planning(
@@ -405,7 +478,18 @@ fn partition_source(
             Ok(vec![source.clone()])
         }
         _ => Ok(split_scan_by_file(source)),
+    }?;
+    let partition_count = partitions.len();
+    for (partition_index, partition) in partitions.iter_mut().enumerate() {
+        let DataSource::File(scan) = partition else {
+            continue;
+        };
+        if let Some(statistics) = &mut scan.runtime_statistics {
+            statistics.partition_index = partition_index;
+            statistics.partition_count = partition_count;
+        }
     }
+    Ok(partitions)
 }
 
 fn partition_parquet_scan(
@@ -450,9 +534,9 @@ fn partition_parquet_scan(
             Arc::clone(&metadata),
             ArrowReaderOptions::new(),
         )
-        .map_err(|error| {
-            VeinError::internal(format!("Failed to derive Parquet scan schema: {error}"))
-        })?;
+            .map_err(|error| {
+                VeinError::internal(format!("Failed to derive Parquet scan schema: {error}"))
+            })?;
         let candidates = crate::parquet_statistics::prune_row_groups(
             arrow_metadata.schema().as_ref(),
             &metadata,
@@ -572,7 +656,7 @@ mod tests {
                 Arc::clone(&schema),
                 vec![Arc::new(Int64Array::from(vec![first, first + 1]))],
             )
-            .expect("valid row-group batch");
+                .expect("valid row-group batch");
             writer.write(&batch).expect("write row group");
             writer.flush().expect("finish row group");
         }
@@ -581,7 +665,7 @@ mod tests {
         let reader = ParquetRecordBatchReaderBuilder::try_new(
             std::fs::File::open(path).expect("open Parquet footer"),
         )
-        .expect("read Parquet footer");
+            .expect("read Parquet footer");
         reader.metadata().as_ref().clone()
     }
 
@@ -604,6 +688,7 @@ mod tests {
             pushdown: None,
             task_id: TaskId::new(),
             catalog_snapshot: None,
+            runtime_statistics: None,
         };
 
         let work = partition_parquet_scan(&scan, &metadata_store, 3, None)
@@ -653,6 +738,7 @@ mod tests {
             pushdown: None,
             task_id: TaskId::new(),
             catalog_snapshot: None,
+            runtime_statistics: None,
         };
         let tracker = QueryMemoryTracker::new(1 << 20, CancellationToken::new());
         let build_hashes = [123_u64];
@@ -699,10 +785,16 @@ mod tests {
                 path.to_string_lossy().into_owned()
             }).collect::<Vec<_>>();
             let scan = FileScanTask {
-                files: files.clone(), format: FileFormat::Parquet, byte_range: None,
-                scan_unit_range: None, projected: Arc::new(types::VeinSchema::empty()),
-                dictionary_columns: Vec::new(), pushdown: None, task_id: TaskId::new(),
+                files: files.clone(),
+                format: FileFormat::Parquet,
+                byte_range: None,
+                scan_unit_range: None,
+                projected: Arc::new(types::VeinSchema::empty()),
+                dictionary_columns: Vec::new(),
+                pushdown: None,
+                task_id: TaskId::new(),
                 catalog_snapshot: None,
+                runtime_statistics: None,
             };
             let work = partition_parquet_scan(&scan, &metadata_store, workers, None).unwrap();
             assert!(work.len() > workers);

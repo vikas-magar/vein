@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -9,7 +10,10 @@ use common::cancellation::CancellationToken;
 use common::identifiers::RequestId;
 use common::protocol::{DataSink, ExecuteTask, PhysicalPlanOperator};
 use common::{Result, VeinError};
-use common::statistics::StatisticsConfig;
+use common::statistics::{
+    QuerySourceStatistics, QueryStatisticsContext, RuntimeStatisticsStore, StatisticsConfig,
+    TableStatisticsLog,
+};
 use common::statistics::analysis::{
     StatisticsAnalysisProvider, analyze_table as analyze_statistics_table,
 };
@@ -18,9 +22,8 @@ use exec::operators::sink::{WriteReceipt, WriteStorage};
 use exec::runtime::TaskExecutor;
 use exec::udf::{FunctionRegistry, register_builtin_scalars};
 use futures::Stream;
-use optimizer::Optimizer;
 use physical::PhysicalPlanner;
-use plan::{CatalogProvider, LogicalPlan};
+use plan::{CatalogProvider, LogicalPlan, PlanTraversal};
 
 use super::parquet_catalog::ParquetCatalog;
 use super::parquet_storage::ParquetStorage;
@@ -35,13 +38,18 @@ pub struct LocalQueryEngine {
     executor: Arc<dyn TaskExecutor>,
     write_storage: Arc<dyn WriteStorage>,
     statistics_provider: Arc<dyn StatisticsAnalysisProvider>,
+    runtime_statistics: RuntimeStatisticsStore,
 }
 
 impl LocalQueryEngine {
     /// Creates an engine whose table names resolve beneath `data_root`.
     pub fn new(data_root: impl Into<std::path::PathBuf>) -> Self {
         let data_root = data_root.into();
-        let catalog = Arc::new(ParquetCatalog::new(data_root.clone()));
+        let runtime_statistics = RuntimeStatisticsStore::default();
+        let catalog = Arc::new(
+            ParquetCatalog::new(data_root.clone())
+                .with_runtime_statistics_store(runtime_statistics.clone()),
+        );
         let metadata_store = catalog.metadata_store();
         let statistics_provider: Arc<dyn StatisticsAnalysisProvider> = catalog.clone();
         let catalog: Arc<dyn CatalogProvider> = catalog;
@@ -53,6 +61,7 @@ impl LocalQueryEngine {
         let executor = Arc::new(
             exec::factory::TaskExecutorBuilder::new()
                 .with_metadata_store(metadata_store)
+                .with_runtime_statistics_store(runtime_statistics.clone())
                 .with_registry(Arc::new(runtime_functions))
                 .with_write_storage(Arc::clone(&storage))
                 .build(),
@@ -65,6 +74,7 @@ impl LocalQueryEngine {
             executor,
             write_storage: storage,
             statistics_provider,
+            runtime_statistics,
         }
     }
 
@@ -83,6 +93,11 @@ impl LocalQueryEngine {
         analyze_statistics_table(self.statistics_provider.as_ref(), table_name, config).await
     }
 
+    /// Returns the shared runtime statistics populated by completed scans.
+    pub fn runtime_statistics(&self) -> &RuntimeStatisticsStore {
+        &self.runtime_statistics
+    }
+
     /// Parses, binds, optimizes, and plans a Pipe query for local execution.
     pub async fn prepare(&self, query: &str) -> Result<LocalQuery> {
         let prepare_started = Instant::now();
@@ -98,8 +113,34 @@ impl LocalQueryEngine {
         let bound = self.binder.bind_with_catalog_revision(&statement).await?;
         let bind_us = bind_started.elapsed().as_micros() as u64;
 
+        let statistics_context = Arc::new(query_statistics_context(&bound.plan));
+        for source in statistics_context.sources() {
+            let statistics = source.statistics.as_deref();
+            tracing::info!(
+                target: "vein.statistics",
+                event = "query_source_statistics",
+                source_key = %source.source_key,
+                table = %source.table_name,
+                statistics_available = statistics.is_some(),
+                rows = ?statistics.and_then(|value| value.num_rows),
+                total_bytes = ?statistics.and_then(|value| value.total_bytes),
+                file_count = ?statistics.and_then(|value| value.file_count),
+                row_group_count = ?statistics.and_then(|value| value.row_group_count),
+                compressed_bytes = ?statistics.and_then(|value| value.compressed_bytes),
+                uncompressed_bytes = ?statistics.and_then(|value| value.uncompressed_bytes),
+                statistics_summary = %statistics.map_or_else(
+                    || "unavailable".to_owned(),
+                    |value| TableStatisticsLog::new(value).to_string(),
+                ),
+                "query source statistics snapshot"
+            );
+        }
+
         let optimize_started = Instant::now();
-        let optimized = self.optimizer.optimize(bound.plan)?;
+        let optimized = self
+            .optimizer
+            .optimize_with_statistics_context(bound.plan, Arc::clone(&statistics_context))?
+            .0;
         let optimize_us = optimize_started.elapsed().as_micros() as u64;
 
         if let LogicalPlan::Write { target, options, .. } = &optimized {
@@ -142,7 +183,9 @@ impl LocalQueryEngine {
                     ));
                 }
             }
-            tasks.push(task.into_execute_task(request_id, query_id, stage_id, mode));
+            let mut task = task.into_execute_task(request_id, query_id, stage_id, mode);
+            task.statistics_context = Some(Arc::clone(&statistics_context));
+            tasks.push(task);
         }
         let task_build_us = task_started.elapsed().as_micros() as u64;
 
@@ -163,6 +206,7 @@ impl LocalQueryEngine {
         Ok(LocalQuery {
             tasks,
             executor: self.executor.clone(),
+            statistics_context,
             is_write,
         })
     }
@@ -172,10 +216,16 @@ impl LocalQueryEngine {
 pub struct LocalQuery {
     tasks: Vec<ExecuteTask>,
     executor: Arc<dyn TaskExecutor>,
+    statistics_context: Arc<QueryStatisticsContext>,
     is_write: bool,
 }
 
 impl LocalQuery {
+    /// Returns the shared query statistics context used by planning and execution.
+    pub fn statistics_context(&self) -> &Arc<QueryStatisticsContext> {
+        &self.statistics_context
+    }
+
     /// Whether this prepared query commits data to a storage target.
     pub fn is_write(&self) -> bool {
         self.is_write
@@ -306,6 +356,39 @@ impl LocalQuery {
     }
 }
 
+fn query_statistics_context(plan: &LogicalPlan) -> QueryStatisticsContext {
+    fn collect(
+        plan: &LogicalPlan,
+        sources: &mut Vec<QuerySourceStatistics>,
+        seen: &mut HashSet<String>,
+    ) {
+        if let LogicalPlan::Scan { table, .. } = plan {
+            let source_key = table
+                .catalog_snapshot
+                .as_ref()
+                .map(common::statistics::runtime::table_statistics_key)
+                .unwrap_or_else(|| table.name.clone());
+            if seen.insert(source_key.clone()) {
+                sources.push(QuerySourceStatistics {
+                    source_key,
+                    table_name: table.name.clone(),
+                    statistics: table.statistics.clone().map(Arc::new),
+                });
+            }
+        }
+        for child in plan.children() {
+            collect(child, sources, seen);
+        }
+        for subquery in plan.subquery_plans() {
+            collect(subquery, sources, seen);
+        }
+    }
+
+    let mut sources = Vec::new();
+    collect(plan, &mut sources, &mut HashSet::new());
+    QueryStatisticsContext::new(sources)
+}
+
 /// Executes one task into its own channel and records the outcome.
 ///
 /// The channel's last sender is dropped only after the outcome is recorded, so
@@ -416,6 +499,13 @@ mod tests {
             "a global sort must read all files in one task"
         );
         assert!(contains_sort(&query.tasks[0].plan.root));
+        let statistics_context = Arc::clone(query.statistics_context());
+        assert_eq!(statistics_context.sources().len(), 1);
+        assert_eq!(statistics_context.sources()[0].table_name, "flights");
+        assert!(Arc::ptr_eq(
+            &statistics_context,
+            query.tasks[0].statistics_context.as_ref().expect("task shares query context"),
+        ));
         let mut stream = query.into_stream();
         let mut rows = Vec::new();
         while let Some(batch) = stream.next().await {
@@ -429,6 +519,60 @@ mod tests {
         }
 
         assert_eq!(rows, vec![5, 4, 3, 2]);
+        assert!(statistics_context
+            .operator_statistics()
+            .iter()
+            .any(|operator| operator.output_rows > 0));
+
+        let catalog = ParquetCatalog::new(root.path())
+            .with_runtime_statistics_store(engine.runtime_statistics.clone());
+        let table = CatalogProvider::get_table(&catalog, "flights")
+            .await
+            .expect("read scan table metadata");
+        let runtime_key = common::statistics::runtime::table_statistics_key(
+            table
+                .catalog_snapshot
+                .as_ref()
+                .expect("catalog pins source revision"),
+        );
+        assert!(
+            engine
+                .runtime_statistics
+                .complete_table_statistics(&runtime_key)
+                .is_none(),
+            "filtered scans must not become full-table optimizer statistics"
+        );
+
+        let query = engine
+            .prepare("FROM flights |> SELECT id")
+            .await
+            .expect("prepare complete table scan");
+        let mut stream = query.into_stream();
+        let mut scanned_rows = 0;
+        while let Some(batch) = stream.next().await {
+            scanned_rows += batch.expect("full scan batch").num_rows();
+        }
+        assert_eq!(scanned_rows, 5);
+
+        let runtime = engine
+            .runtime_statistics
+            .complete_table_statistics(&runtime_key)
+            .expect("complete scan publishes runtime synopsis");
+        assert_eq!(runtime.num_rows, Some(5));
+        assert_eq!(runtime.column_statistics["id"].distinct_count, Some(5));
+
+        let replanned_table = CatalogProvider::get_table(&catalog, "flights")
+            .await
+            .expect("read table metadata after runtime collection");
+        let planner_statistics = replanned_table
+            .statistics
+            .as_ref()
+            .expect("runtime synopsis is visible to binder and optimizer");
+        assert_eq!(planner_statistics.num_rows, Some(5));
+        assert_eq!(
+            planner_statistics.column_statistics["id"].distinct_count,
+            Some(5)
+        );
 
         let query = engine
             .prepare("FROM flights |> SELECT id |> ORDER id + 1 DESC")
@@ -467,6 +611,49 @@ mod tests {
         }
 
         assert_eq!(grouped_ids, vec![5, 4, 3, 2, 1]);
+
+        // Replacing a source in place must invalidate the reusable runtime
+        // synopsis even when its table path and total row count stay unchanged.
+        let replaced_path = table_dir.join("part-1.parquet");
+        std::fs::remove_file(&replaced_path).expect("remove old source file");
+        let replacement = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![7, 7]))],
+        )
+            .expect("valid replacement batch");
+        let file = File::create(&replaced_path).expect("recreate source file at same path");
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .expect("create replacement writer");
+        writer.write(&replacement).expect("write replacement batch");
+        writer.close().expect("close replacement writer");
+
+        let changed_table = CatalogProvider::get_table(&catalog, "flights")
+            .await
+            .expect("read table after same-path replacement");
+        let changed_snapshot = changed_table
+            .catalog_snapshot
+            .as_ref()
+            .expect("catalog pins replacement source revision");
+        assert_ne!(
+            table.catalog_snapshot.as_ref(),
+            Some(changed_snapshot),
+            "source replacement must create a new runtime-statistics identity"
+        );
+        let changed_runtime_key =
+            common::statistics::runtime::table_statistics_key(changed_snapshot);
+        assert!(
+            engine
+                .runtime_statistics
+                .complete_table_statistics(&changed_runtime_key)
+                .is_none(),
+            "a complete synopsis for the old source revision must not be reused"
+        );
+        assert_eq!(changed_table.statistics.as_ref().unwrap().num_rows, Some(5));
+        assert_eq!(
+            changed_table.statistics.as_ref().unwrap().column_statistics["id"].distinct_count,
+            None,
+            "the old five-distinct-value synopsis must not leak into the replacement"
+        );
     }
 
     #[tokio::test]
@@ -537,6 +724,52 @@ mod tests {
             .expect("read projected output metadata");
         assert_eq!(metadata.schema.fields.len(), 1);
         assert_eq!(metadata.schema.fields[0].name, "value");
+    }
+
+    #[tokio::test]
+    async fn runtime_synopsis_uses_complete_rows_with_projected_column_coverage() {
+        let root = tempfile::tempdir().expect("temporary data root");
+        let table_dir = root.path().join("events");
+        std::fs::create_dir_all(&table_dir).expect("create table directory");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            ],
+        )
+            .expect("valid input batch");
+        let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
+        writer.write(&input).expect("write input batch");
+        writer.close().expect("close writer");
+
+        let engine = LocalQueryEngine::new(root.path());
+        let query = engine.prepare("FROM events |> SELECT key").await.expect("prepare query");
+        let scan = find_file_scan(&query.tasks[0].plan.root).expect("find file scan");
+        let statistics_scan = scan.runtime_statistics.as_ref().expect("statistics context");
+        assert!(statistics_scan.row_coverage_candidate);
+        let table_key = statistics_scan.table_key.clone();
+        assert_eq!(scan.projected.fields.len(), 1, "only the selected column is scanned");
+
+        let mut stream = query.into_stream();
+        let mut row_count = 0;
+        while let Some(batch) = stream.next().await {
+            row_count += batch.expect("query batch").num_rows();
+        }
+        assert_eq!(row_count, 4);
+
+        let statistics = engine
+            .runtime_statistics
+            .complete_table_statistics(&table_key)
+            .expect("background synopsis is visible to the next plan");
+        assert_eq!(statistics.num_rows, Some(4));
+        assert_eq!(statistics.column_statistics.len(), 1);
+        assert_eq!(statistics.column_statistics["key"].distinct_count, Some(4));
     }
 
     #[tokio::test]
@@ -786,7 +1019,7 @@ mod tests {
                 ])),
             ],
         )
-        .expect("valid external batch");
+            .expect("valid external batch");
         let file = File::create(&path).expect("create external Parquet file");
         let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
             .expect("create external Parquet writer");
@@ -828,7 +1061,7 @@ mod tests {
                 ])),
             ],
         )
-        .expect("valid replacement batch");
+            .expect("valid replacement batch");
         let file = File::create(&path).expect("recreate external Parquet file");
         let mut writer = ArrowWriter::try_new(file, schema, None)
             .expect("create replacement Parquet writer");

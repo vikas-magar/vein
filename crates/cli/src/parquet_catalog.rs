@@ -8,8 +8,12 @@ use std::time::Instant;
 
 use crate::parquet_storage::{ParquetStorage, resolve_manifest_file};
 use async_trait::async_trait;
-use catalog::{MetadataKey, MetadataStore};
+use catalog::{CatalogSnapshotToken, MetadataKey, MetadataStore};
 use common::statistics::analysis::revision_from_identities;
+use common::statistics::{
+    RuntimeStatisticsStore, runtime::table_statistics_key, schema_fingerprint,
+    stable_identifier_hash,
+};
 use error::{Result, VeinError};
 use exec::operators::source::scan::PARQUET_FOOTER;
 use exec::parquet_statistics::{file_units, table_statistics};
@@ -28,6 +32,7 @@ pub struct ParquetCatalog {
     root: Arc<PathBuf>,
     storage: ParquetStorage,
     metadata_store: MetadataStore,
+    runtime_statistics: RuntimeStatisticsStore,
 }
 
 impl ParquetCatalog {
@@ -38,7 +43,14 @@ impl ParquetCatalog {
             storage: ParquetStorage::new(root.clone()),
             root: Arc::new(root),
             metadata_store: MetadataStore::new(),
+            runtime_statistics: RuntimeStatisticsStore::default(),
         }
+    }
+
+    /// Shares lazily collected runtime statistics with future catalog lookups.
+    pub fn with_runtime_statistics_store(mut self, store: RuntimeStatisticsStore) -> Self {
+        self.runtime_statistics = store;
+        self
     }
 
     fn resolve_path(&self, name: &str) -> PathBuf {
@@ -59,8 +71,9 @@ impl CatalogProvider for ParquetCatalog {
         let storage = self.storage.clone();
         let root = self.root.clone();
         let metadata_store = self.metadata_store.clone();
+        let runtime_statistics = self.runtime_statistics.clone();
         tokio::task::spawn_blocking(move || {
-            if let Some(manifest) = storage.read_manifest(&name)? {
+            let mut metadata = if let Some(manifest) = storage.read_manifest(&name)? {
                 let discover_started = Instant::now();
                 let files = manifest
                     .files
@@ -86,7 +99,7 @@ impl CatalogProvider for ParquetCatalog {
                         &identities,
                     );
                 }
-                Ok(metadata)
+                metadata
             } else {
                 let mut metadata = inspect_table(&name, &path, &metadata_store)?;
                 if let Some(analyzed) = storage.read_external_statistics(&name)? {
@@ -94,8 +107,55 @@ impl CatalogProvider for ParquetCatalog {
                     let revision = revision_from_identities(&identities);
                     statistics::apply_analyzed_statistics(&mut metadata, revision, &analyzed, &identities);
                 }
-                Ok(metadata)
+                metadata
+            };
+            // Pin runtime synopses to the source object versions and logical schema
+            // observed by this catalog lookup. Paths alone are not a revision:
+            // an external file can be replaced in place without changing its path.
+            let identities = storage.source_identities_from_paths(&metadata.files)?;
+            let source_revision = revision_from_identities(&identities);
+            let schema_version = stable_identifier_hash(&schema_fingerprint(&metadata.schema));
+            metadata.catalog_snapshot = Some(CatalogSnapshotToken::new(
+                metadata.name.clone(),
+                format!("source:{source_revision:016x}"),
+                format!("{source_revision:016x}"),
+                schema_version,
+            ));
+            let runtime_key = metadata
+                .catalog_snapshot
+                .as_ref()
+                .map(table_statistics_key)
+                .ok_or_else(|| VeinError::internal("catalog source snapshot was not assigned"))?;
+            if let Some(runtime) = runtime_statistics.complete_table_statistics(&runtime_key) {
+                let statistics = metadata.statistics.get_or_insert_with(Default::default);
+                statistics.num_rows = runtime.num_rows;
+                for (column, synopsis) in &runtime.column_statistics {
+                    statistics.column_statistics.insert(column.clone(), synopsis.clone());
+                }
+                if !runtime.column_groups.is_empty() {
+                    statistics.column_groups = runtime.column_groups.clone();
+                }
+                tracing::info!(
+                    target: "vein.audit",
+                    event = "catalog_runtime_statistics_applied",
+                    table = %metadata.name,
+                    column_count = runtime.column_statistics.len(),
+                    column_group_count = runtime.column_groups.len(),
+                    rows = ?runtime.num_rows,
+                    source_revision = %source_revision,
+                    "catalog_runtime_statistics_applied"
+                );
+            } else {
+                tracing::debug!(
+                    target: "vein.audit",
+                    event = "catalog_runtime_statistics_unavailable",
+                    table = %metadata.name,
+                    source_revision = %source_revision,
+                    reason = "no_complete_snapshot_for_current_source_revision",
+                    "catalog runtime statistics unavailable"
+                );
             }
+            Ok(metadata)
         })
             .await
             .map_err(|error| VeinError::internal(format!("Parquet metadata worker failed: {error}")))?

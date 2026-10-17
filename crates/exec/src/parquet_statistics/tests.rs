@@ -854,6 +854,29 @@ fn bloom_boolean_logic_is_conservative_for_and_or_and_unknown_terms() {
 }
 
 #[test]
+fn bloom_candidates_require_equality_predicates_and_report_distinct_columns() {
+    let range_predicates = [StatisticsPredicate::And(vec![
+        StatisticsPredicate::Comparison {
+            column: "key".into(),
+            comparison: StatisticsComparison::GreaterOrEqual,
+            literal: LogicalLiteral::Int64(10),
+        },
+        StatisticsPredicate::Comparison {
+            column: "key".into(),
+            comparison: StatisticsComparison::LessOrEqual,
+            literal: LogicalLiteral::Int64(20),
+        },
+    ])];
+    assert!(equality_predicate_columns(&range_predicates).is_empty());
+
+    let equality_predicates = [equality("z_key", 1), equality("a_key", 2), equality("z_key", 3)];
+    assert_eq!(
+        equality_predicate_columns(&equality_predicates),
+        vec!["a_key", "z_key"]
+    );
+}
+
+#[test]
 fn parquet_bloom_filter_prunes_row_group_without_losing_matching_rows() {
     let root = tempfile::tempdir().expect("temporary root");
     let path = root.path().join("bloom_filter.parquet");

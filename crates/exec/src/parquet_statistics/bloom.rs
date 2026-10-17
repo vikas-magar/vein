@@ -143,12 +143,7 @@ pub fn bloom_filter_columns(
     metadata: &ParquetMetaData,
     predicates: &[StatisticsPredicate],
 ) -> Vec<BloomFilterColumn> {
-    let mut names = HashSet::new();
-    for predicate in predicates {
-        collect_equality_columns(predicate, &mut names);
-    }
-    let mut names = names.into_iter().collect::<Vec<_>>();
-    names.sort_unstable();
+    let names = equality_predicate_columns(predicates);
 
     let parquet_schema = metadata.file_metadata().schema_descr();
     names
@@ -167,6 +162,19 @@ pub fn bloom_filter_columns(
             })
         })
         .collect()
+}
+
+/// Returns the distinct columns with equality predicates in stable order.
+/// Parquet column-chunk Bloom filters answer point-membership queries; range
+/// predicates and row-level runtime Bloom filters are not equality candidates.
+pub fn equality_predicate_columns(predicates: &[StatisticsPredicate]) -> Vec<String> {
+    let mut names = HashSet::new();
+    for predicate in predicates {
+        collect_equality_columns(predicate, &mut names);
+    }
+    let mut names = names.into_iter().collect::<Vec<_>>();
+    names.sort_unstable();
+    names
 }
 
 /// Applies row-group column-chunk Bloom filters after exact footer and page

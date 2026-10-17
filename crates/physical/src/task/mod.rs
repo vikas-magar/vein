@@ -46,6 +46,7 @@ impl Task {
             query_id,
             stage_id,
             plan,
+            statistics_context: None,
         }
     }
 }

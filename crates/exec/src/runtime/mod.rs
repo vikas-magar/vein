@@ -31,12 +31,16 @@ use crate::operators::join::{
 use crate::operators::sink::{ClientOutput, CollectSink, ViewResultBatch};
 use crate::operators::{LimitTransform, SortTransform};
 use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Sink, Source, Transform};
-use crate::runtime_filter::{RuntimeFilterBuildInput, RuntimeFilterFactory, RuntimeFilterSet};
+use crate::runtime_filter::{
+    ConservativeRuntimeFilterPolicy, RuntimeFilterBuildInput, RuntimeFilterDecisionContext,
+    RuntimeFilterDecisionPolicy, RuntimeFilterFactory, RuntimeFilterSet,
+};
 use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};
 use crate::trace::ExecutionTrace;
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::TaskId;
+use common::statistics::QueryStatisticsContext;
 use common::protocol::{
     DataSink, DataSource, ExecuteTask, JoinKind, JoinPlan, MicroProgram,
     PhysicalPlanNode,
@@ -135,6 +139,26 @@ pub trait ExecutorBuilder: Send + Sync {
         self.build_source(source, task_id, attempt)
     }
 
+    /// Build a source with this query's shared statistics context.
+    ///
+    /// Adapters that collect source feedback can override this method. Other
+    /// adapters retain their existing source behavior through the default.
+    fn build_source_with_query_context(
+        &self,
+        source: &DataSource,
+        task_id: TaskId,
+        attempt: u32,
+        runtime_filters: Option<&RuntimeFilterSet>,
+        _query_statistics: Option<Arc<QueryStatisticsContext>>,
+    ) -> Result<Box<dyn Source<DataChunkView>>> {
+        match runtime_filters {
+            Some(filters) if !filters.is_empty() => {
+                self.build_source_with_runtime_filters(source, task_id, attempt, filters)
+            }
+            _ => self.build_source(source, task_id, attempt),
+        }
+    }
+
     /// Whether this builder's source adapter can apply filters to this source.
     ///
     /// The default declines pushdown. Builders should opt in only when their
@@ -153,6 +177,15 @@ pub trait ExecutorBuilder: Send + Sync {
     /// Optional strategy for creating execution-local filters after a join build.
     fn runtime_filter_factory(&self) -> Option<Arc<dyn RuntimeFilterFactory>> {
         None
+    }
+
+    /// Policy for choosing whether to build and apply join runtime filters.
+    ///
+    /// The default skips filter setup only when the direct probe scan is known
+    /// to contain no rows, and otherwise applies every safe candidate. Engines
+    /// can inject a different policy using the same runtime measurements.
+    fn runtime_filter_decision_policy(&self) -> Arc<dyn RuntimeFilterDecisionPolicy> {
+        Arc::new(ConservativeRuntimeFilterPolicy)
     }
 
     /// Build a Vector VM transform interpreting the task's [`MicroProgram`].
@@ -288,6 +321,7 @@ impl DefaultTaskExecutor {
         plan: &JoinPlan,
         build: &BuildResult,
         memory: &QueryMemoryTracker,
+        trace: &ExecutionTrace,
         node_id: u32,
     ) -> Result<Option<Arc<RuntimeFilterSet>>> {
         if !matches!(plan.join_type, JoinKind::Inner | JoinKind::Semi) {
@@ -337,11 +371,84 @@ impl DefaultTaskExecutor {
             return Ok(None);
         };
 
+        let build_hashes = table.runtime_filter_hashes();
+        let probe_rows_estimate = match source {
+            DataSource::File(scan) => scan
+                .runtime_statistics
+                .as_ref()
+                .and_then(|statistics| statistics.expected_rows),
+            _ => None,
+        };
+        let probe_source_key = match source {
+            DataSource::File(scan) => scan
+                .catalog_snapshot
+                .as_ref()
+                .map(common::statistics::runtime::table_statistics_key),
+            _ => None,
+        };
+        let query_statistics = trace.query_statistics_context().snapshot();
+        let source_statistics_count = query_statistics.sources.len();
+        let runtime_scan_observation_count = query_statistics.scans.values().map(Vec::len).sum::<usize>();
+        let runtime_operators_with_output = query_statistics
+            .operators
+            .iter()
+            .filter(|operator| operator.output_batches > 0)
+            .count();
+        let runtime_operator_output_rows = query_statistics
+            .operators
+            .iter()
+            .map(|operator| operator.output_rows)
+            .sum::<u64>();
+        let runtime_operator_output_batches = query_statistics
+            .operators
+            .iter()
+            .map(|operator| operator.output_batches)
+            .sum::<u64>();
+        let runtime_source_bytes_observed = query_statistics
+            .operators
+            .iter()
+            .map(|operator| operator.source_bytes_read)
+            .sum::<u64>();
+        let context = RuntimeFilterDecisionContext {
+            build_rows: table.len() as u64,
+            build_keys: build_hashes.len(),
+            probe_rows_estimate,
+            probe_source_key,
+            available_memory_bytes: memory.limit().saturating_sub(memory.used()),
+            query_statistics,
+        };
+        let (effective_probe_rows, probe_rows_source) = context.probe_rows();
+        let policy = self.builder.runtime_filter_decision_policy();
+        if !policy.should_build_candidates(&context) {
+            tracing::info!(
+                target: "vein.statistics",
+                event = "join_runtime_filter_decision",
+                node_id,
+                build_rows = context.build_rows,
+                build_keys = context.build_keys,
+                probe_rows_estimate = ?context.probe_rows_estimate,
+                effective_probe_rows,
+                probe_rows_source,
+                available_memory_bytes = context.available_memory_bytes,
+                source_statistics_count,
+                runtime_scan_observation_count,
+                runtime_operators_with_output,
+                runtime_operator_output_rows,
+                runtime_operator_output_batches,
+                runtime_source_bytes_observed,
+                candidate_construction = "skipped",
+                selected_filters = 0usize,
+                reason = "policy_declined_setup",
+                "join runtime filter decision"
+            );
+            return Ok(None);
+        }
+
         let build_key_bounds = table.runtime_key_bounds()?;
         let bounded_key_columns = build_key_bounds.iter().filter(|bounds| bounds.is_some()).count();
         let filters = factory.build_filters(RuntimeFilterBuildInput {
             probe_columns: &columns,
-            build_hashes: table.runtime_filter_hashes(),
+            build_hashes: &build_hashes,
             build_key_bounds,
             memory,
         })?;
@@ -351,24 +458,75 @@ impl DefaultTaskExecutor {
                 event = "join_runtime_filter_skipped",
                 node_id,
                 reason = "factory_declined",
-                build_hashes = table.runtime_filter_hashes().len(),
+                build_hashes = build_hashes.len(),
                 "join runtime filter skipped"
             );
             return Ok(None);
         }
 
-        let filters = Arc::new(RuntimeFilterSet::new(filters));
+        let candidate_names = filters.iter().map(|filter| filter.name()).collect::<Vec<_>>();
+        let selected_indices = policy.select_filters(&context, &filters)?;
+        let statistics = trace
+            .operator_statistics_handle(node_id)
+            .ok_or_else(|| VeinError::internal("join node is missing query statistics"))?;
+        let selected_filters = RuntimeFilterSet::from_selection_with_statistics(
+            &filters,
+            &selected_indices,
+            statistics,
+        )?;
+        if selected_filters.is_empty() {
+            tracing::info!(
+                target: "vein.statistics",
+                event = "join_runtime_filter_decision",
+                node_id,
+                build_rows = context.build_rows,
+                build_keys = context.build_keys,
+                probe_rows_estimate = ?context.probe_rows_estimate,
+                effective_probe_rows,
+                probe_rows_source,
+                available_memory_bytes = context.available_memory_bytes,
+                source_statistics_count,
+                runtime_scan_observation_count,
+                runtime_operators_with_output,
+                runtime_operator_output_rows,
+                runtime_operator_output_batches,
+                runtime_source_bytes_observed,
+                candidate_construction = "completed",
+                candidate_filters = ?candidate_names,
+                selected_filters = 0usize,
+                reason = "policy_selected_no_filters",
+                "join runtime filter decision"
+            );
+            return Ok(None);
+        }
+
+        let filters = Arc::new(selected_filters);
         tracing::info!(
-            target: "vein.audit",
-            event = "join_runtime_filter_built",
+            target: "vein.statistics",
+            event = "join_runtime_filter_decision",
             node_id,
+            build_rows = context.build_rows,
+            build_keys = context.build_keys,
+            probe_rows_estimate = ?context.probe_rows_estimate,
+            effective_probe_rows,
+            probe_rows_source,
+            available_memory_bytes = context.available_memory_bytes,
+            source_statistics_count,
+            runtime_scan_observation_count,
+            runtime_operators_with_output,
+            runtime_operator_output_rows,
+            runtime_operator_output_batches,
+            runtime_source_bytes_observed,
+            candidate_construction = "completed",
+            candidate_filters = ?candidate_names,
             filter_names = ?filters.names(),
+            selected_filters = filters.len(),
             key_columns = columns.len(),
-            build_rows = table.len(),
-            indexed_build_keys = table.runtime_filter_hashes().len(),
+            indexed_build_keys = build_hashes.len(),
             bounded_key_columns,
             filter_bytes = filters.memory_bytes(),
-            "join runtime filter built"
+            reason = "policy_selected_candidates",
+            "join runtime filter decision"
         );
         Ok(Some(filters))
     }
@@ -448,7 +606,15 @@ impl DefaultTaskExecutor {
         }
         let query_id = task.query_id.to_string();
         let task_id = task.task_id.to_string();
-        let mut trace = ExecutionTrace::new(&task.plan.root, query_id.clone(), task_id.clone());
+        let statistics_context = task.statistics_context.clone()
+            .unwrap_or_else(|| Arc::new(QueryStatisticsContext::new([])));
+        let mut trace = ExecutionTrace::new_with_query_context(
+            &task.plan.root,
+            query_id.clone(),
+            task_id.clone(),
+            task.task_id.into_raw(),
+            statistics_context,
+        );
         // Emit the compact plan before validation so malformed plans still have
         // node IDs, schemas, mappings, and flow contracts in the debug trace.
         trace.log_plan();

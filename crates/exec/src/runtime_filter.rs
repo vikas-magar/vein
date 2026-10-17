@@ -6,16 +6,21 @@
 
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::{Array, BooleanArray, builder::BooleanBuilder};
 use arrow::record_batch::RecordBatch;
 use catalog::StatisticsPredicate;
 use common::Result;
+use common::statistics::{
+    OperatorCounter, OperatorStatisticsHandle, QueryStatisticsSnapshot,
+};
 use error::VeinError;
 use types::{ColumnId, LogicalLiteral, ResolvedColumnRef, VeinSchema};
 
 use crate::memory::QueryMemoryTracker;
+
+const FILTER_ROWS_SEEN: &str = "runtime_filter_rows_seen";
+const FILTER_ROWS_KEPT: &str = "runtime_filter_rows_kept";
 
 /// A necessary-condition filter over one or more columns.
 ///
@@ -83,11 +88,110 @@ pub trait RuntimeFilterFactory: Debug + Send + Sync {
     ) -> Result<Vec<Arc<dyn RuntimeFilter>>>;
 }
 
+/// Query-wide statistics and runtime measurements available at a join
+/// build/probe checkpoint.
+///
+/// These values are execution-local: build cardinalities come from the completed
+/// hash table, while the probe estimate is supplied by the scan's pinned plan
+/// metadata when available. `query_statistics` is the shared live context; its
+/// scan observations retain their own coverage so policies can distinguish
+/// partial feedback from complete source statistics.
+#[derive(Debug, Clone)]
+pub struct RuntimeFilterDecisionContext {
+    /// Rows retained by the completed in-memory build table.
+    pub build_rows: u64,
+    /// Number of non-null build keys represented in the filter input.
+    pub build_keys: usize,
+    /// Probe rows known from the direct scan's execution metadata.
+    pub probe_rows_estimate: Option<u64>,
+    /// Revision-pinned identity of the direct probe scan, when available.
+    pub probe_source_key: Option<String>,
+    /// Query memory available after build completion.
+    pub available_memory_bytes: usize,
+    /// Consistent point-in-time view of this query's source metadata and runtime feedback.
+    pub query_statistics: QueryStatisticsSnapshot,
+}
+
+impl RuntimeFilterDecisionContext {
+    /// Returns the best authoritative probe cardinality available at this
+    /// checkpoint. A complete query-local scan observation supersedes the
+    /// planning estimate; incomplete observations never do.
+    pub fn probe_rows(&self) -> (Option<u64>, &'static str) {
+        self.probe_source_key
+            .as_deref()
+            .and_then(|key| self.query_statistics.complete_scan_row_count(key))
+            .map(|rows| (Some(rows), "complete_runtime_scan"))
+            .unwrap_or((self.probe_rows_estimate, "plan_estimate"))
+    }
+}
+
+/// Chooses which safe runtime-filter candidates to apply to the remaining probe.
+///
+/// Returned indices address `candidates`. Returning no indices preserves exact
+/// join execution without a scan prefilter. Implementations must only choose
+/// among the supplied candidates; the executor validates indices and rejects a
+/// malformed decision before starting the probe.
+pub trait RuntimeFilterDecisionPolicy: std::fmt::Debug + Send + Sync {
+    /// Whether it is worth constructing candidates for this checkpoint.
+    ///
+    /// The default keeps existing behavior. Policies can avoid even transient
+    /// candidate allocations when current-query evidence proves there is no
+    /// remaining probe work.
+    fn should_build_candidates(&self, _context: &RuntimeFilterDecisionContext) -> bool {
+        true
+    }
+
+    /// Select candidate filters from current-query measurements.
+    fn select_filters(
+        &self,
+        context: &RuntimeFilterDecisionContext,
+        candidates: &[Arc<dyn RuntimeFilter>],
+    ) -> Result<Vec<usize>>;
+}
+
+/// Per-filter capabilities exposed to scan diagnostics without revealing data values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFilterPruningDiagnostic {
+    /// Stable implementation name.
+    pub name: &'static str,
+    /// Whether the source adapter can apply this filter to decoded rows.
+    pub row_evaluation: bool,
+    /// Number of safe metadata predicates available for this scan schema.
+    pub metadata_predicate_count: usize,
+}
+
+/// Safe default policy: skip filter setup for a provably empty probe; otherwise
+/// apply every filter the source adapter can safely evaluate.
+#[derive(Debug, Default)]
+pub struct ConservativeRuntimeFilterPolicy;
+
+impl RuntimeFilterDecisionPolicy for ConservativeRuntimeFilterPolicy {
+    fn should_build_candidates(&self, context: &RuntimeFilterDecisionContext) -> bool {
+        context.build_rows > 0
+            && context.build_keys > 0
+            && context.probe_rows().0 != Some(0)
+    }
+
+    fn select_filters(
+        &self,
+        context: &RuntimeFilterDecisionContext,
+        candidates: &[Arc<dyn RuntimeFilter>],
+    ) -> Result<Vec<usize>> {
+        if context.build_rows == 0
+            || context.build_keys == 0
+            || context.probe_rows().0 == Some(0)
+        {
+            return Ok(Vec::new());
+        }
+        Ok((0..candidates.len()).collect())
+    }
+}
+
 /// Immutable, shareable set of filters for one operator's probe input.
 #[derive(Clone)]
 pub struct RuntimeFilterSet {
     filters: Arc<[Arc<dyn RuntimeFilter>]>,
-    metrics: Arc<RuntimeFilterMetrics>,
+    statistics: Option<RuntimeFilterCounters>,
 }
 
 impl Debug for RuntimeFilterSet {
@@ -102,10 +206,70 @@ impl Debug for RuntimeFilterSet {
 impl RuntimeFilterSet {
     /// Create a shareable set from filters built for the same probe input.
     pub fn new(filters: Vec<Arc<dyn RuntimeFilter>>) -> Self {
+        Self::with_optional_statistics(filters, None)
+    }
+
+    /// Creates a set whose runtime feedback is recorded by the query's shared
+    /// operator statistics handle.
+    pub fn with_statistics(
+        filters: Vec<Arc<dyn RuntimeFilter>>,
+        statistics: Arc<OperatorStatisticsHandle>,
+    ) -> Self {
+        Self::with_optional_statistics(filters, Some(statistics))
+    }
+
+    fn with_optional_statistics(
+        filters: Vec<Arc<dyn RuntimeFilter>>,
+        statistics: Option<Arc<OperatorStatisticsHandle>>,
+    ) -> Self {
         Self {
             filters: Arc::from(filters),
-            metrics: Arc::new(RuntimeFilterMetrics::default()),
+            statistics: statistics.map(|statistics| RuntimeFilterCounters {
+                rows_seen: statistics.register_counter(FILTER_ROWS_SEEN),
+                rows_kept: statistics.register_counter(FILTER_ROWS_KEPT),
+            }),
         }
+    }
+
+    /// Build a set from policy-selected candidate indices without cloning filter
+    /// state. Candidate handles are shared; duplicate or out-of-range indices
+    /// are rejected as a policy contract violation.
+    pub fn from_selection(
+        candidates: &[Arc<dyn RuntimeFilter>],
+        selected_indices: &[usize],
+    ) -> Result<Self> {
+        Self::from_selection_with_optional_statistics(candidates, selected_indices, None)
+    }
+
+    /// Selects candidate handles and records feedback through shared query stats.
+    pub fn from_selection_with_statistics(
+        candidates: &[Arc<dyn RuntimeFilter>],
+        selected_indices: &[usize],
+        statistics: Arc<OperatorStatisticsHandle>,
+    ) -> Result<Self> {
+        Self::from_selection_with_optional_statistics(
+            candidates,
+            selected_indices,
+            Some(statistics),
+        )
+    }
+
+    fn from_selection_with_optional_statistics(
+        candidates: &[Arc<dyn RuntimeFilter>],
+        selected_indices: &[usize],
+        statistics: Option<Arc<OperatorStatisticsHandle>>,
+    ) -> Result<Self> {
+        let mut selected = Vec::with_capacity(selected_indices.len());
+        let mut seen = std::collections::HashSet::with_capacity(selected_indices.len());
+        for &index in selected_indices {
+            if index >= candidates.len() || !seen.insert(index) {
+                return Err(VeinError::internal(format!(
+                    "runtime filter policy returned invalid candidate index {index}"
+                )));
+            }
+            selected.push(Arc::clone(&candidates[index]));
+        }
+        Ok(Self::with_optional_statistics(selected, statistics))
     }
 
     /// An empty set, used when a source or plan cannot support pushdown.
@@ -159,9 +323,47 @@ impl RuntimeFilterSet {
     /// pruning. These predicates are additional necessary conditions and are
     /// conjoined by the storage adapter with any static scan predicates.
     pub fn statistics_predicates(&self, schema: &VeinSchema) -> Vec<StatisticsPredicate> {
+        self.collect_statistics_predicates(schema, |_| {})
+    }
+
+    /// Collect metadata predicates and a bounded per-filter capability summary
+    /// in one pass, so adapters can explain which filters reach metadata pruning.
+    pub fn statistics_predicates_with_diagnostics(
+        &self,
+        schema: &VeinSchema,
+    ) -> (Vec<StatisticsPredicate>, Vec<RuntimeFilterPruningDiagnostic>) {
+        let mut diagnostics = Vec::with_capacity(self.filters.len());
+        let predicates = self.collect_statistics_predicates(schema, |diagnostic| {
+            diagnostics.push(diagnostic);
+        });
+        (predicates, diagnostics)
+    }
+
+    fn collect_statistics_predicates(
+        &self,
+        schema: &VeinSchema,
+        mut observe: impl FnMut(RuntimeFilterPruningDiagnostic),
+    ) -> Vec<StatisticsPredicate> {
+        let mut predicates = Vec::new();
+        for filter in self.filters.iter() {
+            let filter_predicates = filter.statistics_predicates(schema);
+            observe(RuntimeFilterPruningDiagnostic {
+                name: filter.name(),
+                row_evaluation: filter.supports_row_evaluation(),
+                metadata_predicate_count: filter_predicates.len(),
+            });
+            predicates.extend(filter_predicates);
+        }
+        predicates
+    }
+
+    /// Names of filters that can reject rows after decoding their required
+    /// columns. Metadata-only filters are intentionally omitted.
+    pub fn row_filter_names(&self) -> Vec<&'static str> {
         self.filters
             .iter()
-            .flat_map(|filter| filter.statistics_predicates(schema))
+            .filter(|filter| filter.supports_row_evaluation())
+            .map(|filter| filter.name())
             .collect()
     }
 
@@ -216,18 +418,22 @@ impl RuntimeFilterSet {
         Some(RuntimeFilterBinding {
             columns,
             filters,
-            metrics: Arc::clone(&self.metrics),
+            statistics: self.statistics.clone(),
         })
     }
 
     /// Number of source-filter rows presented to the runtime filters.
     pub fn rows_seen(&self) -> u64 {
-        self.metrics.rows_seen.load(Ordering::Relaxed)
+        self.statistics
+            .as_ref()
+            .map_or(0, |statistics| statistics.rows_seen.value())
     }
 
     /// Number of rows retained by all filters in the bound predicate.
     pub fn rows_kept(&self) -> u64 {
-        self.metrics.rows_kept.load(Ordering::Relaxed)
+        self.statistics
+            .as_ref()
+            .map_or(0, |statistics| statistics.rows_kept.value())
     }
 }
 
@@ -241,7 +447,7 @@ impl Default for RuntimeFilterSet {
 pub struct RuntimeFilterBinding {
     columns: Vec<ResolvedColumnRef>,
     filters: Vec<BoundRuntimeFilter>,
-    metrics: Arc<RuntimeFilterMetrics>,
+    statistics: Option<RuntimeFilterCounters>,
 }
 
 impl RuntimeFilterBinding {
@@ -275,10 +481,10 @@ impl RuntimeFilterBinding {
             output.append_value(keep);
             rows_kept += u64::from(keep);
         }
-        self.metrics
-            .rows_seen
-            .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-        self.metrics.rows_kept.fetch_add(rows_kept, Ordering::Relaxed);
+        if let Some(statistics) = &self.statistics {
+            statistics.rows_seen.add(batch.num_rows() as u64);
+            statistics.rows_kept.add(rows_kept);
+        }
         Ok(output.finish())
     }
 }
@@ -288,10 +494,10 @@ struct BoundRuntimeFilter {
     positions: Vec<usize>,
 }
 
-#[derive(Default)]
-struct RuntimeFilterMetrics {
-    rows_seen: AtomicU64,
-    rows_kept: AtomicU64,
+#[derive(Clone)]
+struct RuntimeFilterCounters {
+    rows_seen: OperatorCounter,
+    rows_kept: OperatorCounter,
 }
 
 #[cfg(test)]

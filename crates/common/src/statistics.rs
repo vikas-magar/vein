@@ -7,6 +7,12 @@
 
 /// Generic streaming analysis orchestration and source/publisher contracts.
 pub mod analysis;
+/// Shared, query-time statistics observations collected from borrowed batches.
+pub mod runtime;
+/// One query-scoped view of source metadata and lazily collected runtime feedback.
+pub mod context;
+/// Compact, payload-safe formatting for query statistics diagnostics.
+pub mod logging;
 
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
@@ -33,6 +39,12 @@ use crate::Result;
 
 mod accumulators;
 pub use accumulators::StatisticsCollector;
+pub use runtime::{RuntimeStatisticsObservation, RuntimeStatisticsStore};
+pub use context::{
+    OperatorCounter, OperatorStatisticsHandle, OperatorStatisticsIdentity, OperatorStatisticsSnapshot,
+    QuerySourceStatistics, QueryStatisticsContext, QueryStatisticsSnapshot,
+};
+pub use logging::TableStatisticsLog;
 #[cfg(test)]
 mod tests;
 

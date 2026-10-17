@@ -148,13 +148,15 @@ pub(super) fn build_scan_predicates(
                 .evaluate(&batch)
                 .map_err(|error| ArrowError::ComputeError(error.to_string()))
         });
-        tracing::debug!(
-            target: "vein.audit",
+        tracing::info!(
+            target: "vein.parquet_runtime_filter",
             event = "scan_runtime_filter_bound",
             path = %path,
-            filter_names = ?runtime_filters.names(),
+            filter_names = ?runtime_filters.row_filter_names(),
             key_columns = key_column_count,
             filter_bytes = runtime_filters.memory_bytes(),
+            execution_stage = "arrow_row_filter_after_metadata_pruning",
+            participates_in_parquet_page_pruning = false,
             "scan runtime filter bound"
         );
         predicates.push(Box::new(predicate));

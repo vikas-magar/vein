@@ -18,9 +18,10 @@ use std::time::Instant;
 
 use error::{Result, VeinError};
 use plan::{LogicalPlan, PlanTraversal};
+use common::statistics::QueryStatisticsContext;
 
 use crate::context::{CatalogStatisticsProvider, OptimizationDiagnostics, OptimizerConfig,
-                     OptimizerContext, RuleExecution, StatisticsProvider};
+                     OptimizerContext, QueryStatisticsProvider, RuleExecution, StatisticsProvider};
 use crate::rule::{OptimizerRule, RuleType};
 use crate::rules::{
     ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule, FilterNormalizationRule,
@@ -114,8 +115,28 @@ impl OptimizerPipeline {
         &self,
         plan: LogicalPlan,
     ) -> Result<(LogicalPlan, OptimizationDiagnostics)> {
+        self.optimize_with_statistics_provider(plan, Arc::clone(&self.statistics))
+    }
+
+    /// Optimizes using the query-scoped metadata and runtime statistics context.
+    pub fn optimize_with_statistics_context(
+        &self,
+        plan: LogicalPlan,
+        statistics: Arc<QueryStatisticsContext>,
+    ) -> Result<(LogicalPlan, OptimizationDiagnostics)> {
+        self.optimize_with_statistics_provider(
+            plan,
+            Arc::new(QueryStatisticsProvider::new(statistics)),
+        )
+    }
+
+    fn optimize_with_statistics_provider(
+        &self,
+        plan: LogicalPlan,
+        statistics: Arc<dyn StatisticsProvider>,
+    ) -> Result<(LogicalPlan, OptimizationDiagnostics)> {
         let context = OptimizerContext::with_statistics_provider(
-            self.config.clone(), Arc::clone(&self.statistics));
+            self.config.clone(), statistics);
         let rules: Vec<_> = self
             .rules
             .iter()

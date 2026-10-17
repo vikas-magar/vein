@@ -2,14 +2,18 @@ use crate::pipeline::{DataChunkView, PipelineNode};
 use crate::runtime_filter::RuntimeFilterSet;
 use crate::udf::FunctionRegistry;
 use common::Result;
+use common::protocol::RuntimeStatisticsScan;
 use common::protocol::ScanPredicate;
+use common::statistics::RuntimeStatisticsStore;
+#[cfg(test)]
+use common::statistics::runtime::{runtime_metric_availability, RUNTIME_STATISTIC_METRICS};
 use error::VeinError;
 use futures::Stream;
 use opendal::Operator;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::RowFilter;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use std::collections::HashMap;
@@ -31,15 +35,15 @@ mod predicate;
 mod projection;
 mod reader;
 
-use metrics::ScanPredicateMetrics;
 use file::prepare_parquet_file;
-use page_header_reader::{read_page_header_statistics, PageHeaderReadResult};
+use metrics::ScanPredicateMetrics;
+use page_header_reader::{PageHeaderReadResult, read_page_header_statistics};
 use page_pruning::{
     attach_header_page_locations, page_header_audit_enabled, page_payload_pruning_metrics,
 };
-use predicate::{build_scan_predicates, ScanPredicateContext};
+use predicate::{ScanPredicateContext, build_scan_predicates};
 use projection::{dictionary_schema_hint, root_indices};
-use reader::{thread_cpu_time, IoStats, OpendalParquetReader};
+use reader::{IoStats, OpendalParquetReader, thread_cpu_time};
 
 /// Metadata kind under which this format publishes parsed Parquet footers.
 ///
@@ -58,6 +62,9 @@ pub async fn execute_parquet_scan(
     registry: &Arc<FunctionRegistry>,
     bytes_read: &Arc<AtomicU64>,
     runtime_filters: &RuntimeFilterSet,
+    runtime_statistics: &RuntimeStatisticsStore,
+    statistics_scan: Option<&RuntimeStatisticsScan>,
+    query_statistics: Option<&Arc<common::statistics::QueryStatisticsContext>>,
     next: &mut dyn PipelineNode<DataChunkView>,
 ) -> Result<()> {
     'files: for file in files {
@@ -97,14 +104,9 @@ pub async fn execute_parquet_scan(
         let bytes_before_file = bytes_read.load(Ordering::Relaxed);
         let io = Arc::new(IoStats::default());
 
-        let prepared_file = prepare_parquet_file(
-            operator,
-            file,
-            bytes_read,
-            Arc::clone(&io),
-            metadata_store,
-        )
-            .await?;
+        let prepared_file =
+            prepare_parquet_file(operator, file, bytes_read, Arc::clone(&io), metadata_store)
+                .await?;
         let reader = prepared_file.reader;
         let parquet_metadata = prepared_file.metadata;
         let file_size_bytes = prepared_file.file_size_bytes;
@@ -175,12 +177,26 @@ pub async fn execute_parquet_scan(
             .end
             .min(row_groups_total)
             .saturating_sub(assigned_range.start.min(row_groups_total));
-        let mut statistics_predicates =
-            pushdown.map_or_else(Vec::new, |predicate| predicate.statistics.clone());
-        let static_statistics_predicates = statistics_predicates.len();
-        let runtime_statistics = runtime_filters.statistics_predicates(projected);
-        let runtime_statistics_predicates = runtime_statistics.len();
-        statistics_predicates.extend(runtime_statistics);
+        let static_predicates = pushdown.map_or(&[][..], |predicate| predicate.statistics.as_slice());
+        let mut statistics_predicates = static_predicates.to_vec();
+        let static_statistics_predicate_count = static_predicates.len();
+        let (runtime_filter_predicates, runtime_filter_diagnostics) =
+            runtime_filters.statistics_predicates_with_diagnostics(projected);
+        let runtime_statistics_predicates = runtime_filter_predicates.len();
+        if !runtime_filter_diagnostics.is_empty() {
+            tracing::info!(
+                target: "vein.parquet_runtime_filter",
+                event = "parquet_runtime_filter_pruning_path",
+                path = %path,
+                filters = ?runtime_filter_diagnostics,
+                metadata_predicate_count = runtime_statistics_predicates,
+                row_filter_names = ?runtime_filters.row_filter_names(),
+                metadata_stage = "footer_and_page_index",
+                row_filter_stage = "arrow_row_filter_after_metadata_pruning",
+                "runtime filter capabilities at the Parquet scan boundary"
+            );
+        }
+        statistics_predicates.extend(runtime_filter_predicates);
         let row_group_pruning = crate::parquet_statistics::prune_row_groups_in_range(
             builder.schema().as_ref(),
             builder.metadata(),
@@ -337,10 +353,20 @@ pub async fn execute_parquet_scan(
             builder.metadata(),
             &statistics_predicates,
         );
+        let static_bloom_equality_columns =
+            crate::parquet_statistics::equality_predicate_columns(static_predicates);
+        let runtime_bloom_equality_columns =
+            crate::parquet_statistics::equality_predicate_columns(
+                &statistics_predicates[static_statistics_predicate_count..],
+            );
+        let bloom_row_groups_considered = page_pruning.selections.len() as u64;
         let bloom_filter_columns = bloom_columns.len();
         let mut bloom_filters_available = 0_u64;
         let mut bloom_filters_loaded = 0_u64;
         let mut bloom_filter_read_errors = 0_u64;
+        let mut bloom_filter_chunks_checked = 0_u64;
+        let mut bloom_filter_chunks_without_metadata = 0_u64;
+        let mut bloom_filter_column_metadata_missing = 0_u64;
         let mut bloom_filter_bytes = 0_u64;
         let bloom_filter_load_started = Instant::now();
         let mut row_group_bloom_filters = HashMap::new();
@@ -348,20 +374,19 @@ pub async fn execute_parquet_scan(
             let row_group_index = selection.row_group_index();
             let mut filters = HashMap::with_capacity(bloom_columns.len());
             for column in &bloom_columns {
-                let Some((has_bloom_filter, bloom_filter_length)) = (|| {
-                    let row_group = builder.metadata().row_group(row_group_index);
-                    row_group.columns().get(column.parquet_column_index).map(|metadata| {
-                        (
-                            metadata.bloom_filter_offset().is_some(),
-                            metadata
-                                .bloom_filter_length()
-                                .and_then(|length| u64::try_from(length).ok()),
-                        )
-                    })
-                })() else {
+                let row_group = builder.metadata().row_group(row_group_index);
+                let Some(metadata) = row_group.columns().get(column.parquet_column_index) else {
+                    bloom_filter_column_metadata_missing =
+                        bloom_filter_column_metadata_missing.saturating_add(1);
                     continue;
                 };
-                if !has_bloom_filter {
+                bloom_filter_chunks_checked = bloom_filter_chunks_checked.saturating_add(1);
+                let bloom_filter_length = metadata
+                    .bloom_filter_length()
+                    .and_then(|length| u64::try_from(length).ok());
+                if metadata.bloom_filter_offset().is_none() {
+                    bloom_filter_chunks_without_metadata =
+                        bloom_filter_chunks_without_metadata.saturating_add(1);
                     continue;
                 }
                 bloom_filters_available = bloom_filters_available.saturating_add(1);
@@ -404,6 +429,36 @@ pub async fn execute_parquet_scan(
             }
         }
         let bloom_filter_load_us = bloom_filter_load_started.elapsed().as_micros() as u64;
+        let bloom_filter_eligibility_reason = if static_bloom_equality_columns.is_empty()
+            && runtime_bloom_equality_columns.is_empty()
+        {
+            "no_equality_predicate_columns"
+        } else if bloom_filter_columns == 0 {
+            "equality_columns_not_mappable_to_parquet_schema"
+        } else if bloom_filters_available == 0 {
+            "no_column_chunk_bloom_metadata"
+        } else if bloom_filters_loaded == 0 {
+            "column_chunk_bloom_filters_unavailable_or_unreadable"
+        } else {
+            "column_chunk_bloom_filters_loaded"
+        };
+        tracing::info!(
+            target: "vein.parquet_bloom",
+            event = "parquet_bloom_filter_eligibility",
+            path = %path,
+            static_equality_columns = ?static_bloom_equality_columns,
+            runtime_equality_columns = ?runtime_bloom_equality_columns,
+            mapped_columns = bloom_filter_columns,
+            row_groups_considered = bloom_row_groups_considered,
+            chunks_checked = bloom_filter_chunks_checked,
+            chunks_without_bloom_metadata = bloom_filter_chunks_without_metadata,
+            column_metadata_missing = bloom_filter_column_metadata_missing,
+            filters_available = bloom_filters_available,
+            filters_loaded = bloom_filters_loaded,
+            read_errors = bloom_filter_read_errors,
+            eligibility_reason = bloom_filter_eligibility_reason,
+            "why Parquet column-chunk Bloom pruning is or is not available"
+        );
         let bloom_pruning_started = Instant::now();
         let mut bloom_pruning = crate::parquet_statistics::prune_row_groups_with_bloom(
             builder.metadata(),
@@ -462,24 +517,20 @@ pub async fn execute_parquet_scan(
                 }
                 dictionary_chunks_considered = dictionary_chunks_considered.saturating_add(1);
                 let Some(chunk) = row_group.columns().get(column.parquet_column_index) else {
-                    dictionary_unsupported_chunks =
-                        dictionary_unsupported_chunks.saturating_add(1);
+                    dictionary_unsupported_chunks = dictionary_unsupported_chunks.saturating_add(1);
                     continue;
                 };
-                let Some(range) = crate::parquet_statistics::dictionary_page_range(
-                    chunk,
-                    file_size_bytes,
-                ) else {
-                    dictionary_unsupported_chunks =
-                        dictionary_unsupported_chunks.saturating_add(1);
+                let Some(range) =
+                    crate::parquet_statistics::dictionary_page_range(chunk, file_size_bytes)
+                else {
+                    dictionary_unsupported_chunks = dictionary_unsupported_chunks.saturating_add(1);
                     continue;
                 };
                 dictionary_chunks_eligible = dictionary_chunks_eligible.saturating_add(1);
                 let page_bytes = match dictionary_reader.get_bytes(range.clone()).await {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        dictionary_page_read_errors =
-                            dictionary_page_read_errors.saturating_add(1);
+                        dictionary_page_read_errors = dictionary_page_read_errors.saturating_add(1);
                         tracing::debug!(
                             target: "vein.audit",
                             event = "parquet_dictionary_page_unavailable",
@@ -629,7 +680,7 @@ pub async fn execute_parquet_scan(
             row_groups_selected,
             row_groups_skipped,
             row_groups_skipped_rows,
-            static_statistics_predicates,
+            static_statistics_predicates = static_statistics_predicate_count,
             runtime_statistics_predicates,
             estimated_compressed_bytes_skipped,
             page_index_available,
@@ -705,6 +756,11 @@ pub async fn execute_parquet_scan(
         let mut first_poll_io_us = 0u64;
         let mut first_poll_thread_cpu = Duration::ZERO;
         let mut first_poll_polls = 0u64;
+        let mut statistics_enqueue_us = 0u64;
+        let mut statistics_batches_queued = 0u64;
+        let mut statistics_batches_queue_full = 0u64;
+        let mut statistics_batches_too_large = 0u64;
+        let mut statistics_batches_worker_unavailable = 0u64;
         let io_wall_before_first_poll = io.fetch_wall_us.load(Ordering::Relaxed);
         let mut last_progress = Instant::now();
         loop {
@@ -748,6 +804,34 @@ pub async fn execute_parquet_scan(
             }
             total_rows += batch.num_rows();
             batches += 1;
+
+            if let Some(scan) = statistics_scan {
+                let statistics_started = Instant::now();
+                let outcome = runtime_statistics.enqueue_batch(
+                    scan.scan_id,
+                    &scan.table_key,
+                    scan.expected_rows,
+                    scan.partition_count,
+                    scan.row_coverage_candidate,
+                    &batch,
+                );
+                match outcome {
+                    common::statistics::runtime::RuntimeStatisticsEnqueue::Queued => {
+                        statistics_batches_queued += 1;
+                    }
+                    common::statistics::runtime::RuntimeStatisticsEnqueue::QueueFull => {
+                        statistics_batches_queue_full += 1;
+                    }
+                    common::statistics::runtime::RuntimeStatisticsEnqueue::BatchTooLarge => {
+                        statistics_batches_too_large += 1;
+                    }
+                    common::statistics::runtime::RuntimeStatisticsEnqueue::WorkerUnavailable => {
+                        statistics_batches_worker_unavailable += 1;
+                    }
+                }
+                statistics_enqueue_us = statistics_enqueue_us
+                    .saturating_add(statistics_started.elapsed().as_micros() as u64);
+            }
 
             tracing::trace!(rows = batch.num_rows(), "Pushing batch down pipeline");
             let chunk = DataChunkView::from_record_batch(batch)?;
@@ -830,7 +914,7 @@ pub async fn execute_parquet_scan(
                 "Parquet column decoding completed");
         }
         tracing::debug!(
-            target: "vein.audit",
+            target: "vein.statistics",
             event = "scan_completed",
             path = %path,
             format = "parquet",
@@ -908,6 +992,12 @@ pub async fn execute_parquet_scan(
             predicate_input_array_bytes = predicate_metrics.input_array_bytes,
             output_source_array_count,
             output_source_array_bytes,
+            runtime_statistics_enabled = statistics_scan.is_some(),
+            runtime_statistics_enqueue_us = statistics_enqueue_us,
+            runtime_statistics_batches_queued = statistics_batches_queued,
+            runtime_statistics_batches_queue_full = statistics_batches_queue_full,
+            runtime_statistics_batches_too_large = statistics_batches_too_large,
+            runtime_statistics_batches_worker_unavailable = statistics_batches_worker_unavailable,
             bytes_read = bytes_read_total,
             file_size_bytes,
             stat_us,
@@ -942,6 +1032,26 @@ pub async fn execute_parquet_scan(
         }
     }
 
+    if let Some(scan) = statistics_scan {
+        let queued = runtime_statistics.enqueue_partition_completion(
+            scan.scan_id,
+            &scan.table_key,
+            scan.expected_rows,
+            scan.partition_count,
+            scan.row_coverage_candidate,
+            scan.partition_index,
+            query_statistics.cloned(),
+        );
+        if !queued {
+            tracing::debug!(
+                target: "vein.audit",
+                event = "runtime_statistics_completion_unavailable",
+                scan_id = scan.scan_id,
+                "runtime statistics completion notification was unavailable"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -952,3 +1062,7 @@ mod reader_metrics_tests;
 #[cfg(test)]
 #[path = "parquet/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "parquet/runtime_statistics_tests.rs"]
+mod runtime_statistics_tests;

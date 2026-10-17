@@ -270,8 +270,8 @@ fn retained_statistics_reason(
 
 /// Predicate diagnostics for files/row groups and Parquet metadata pruning paths.
 pub use bloom::{
-    bloom_filter_columns, prune_row_groups_with_bloom, BloomFilterColumn, BloomPruning,
-    ParquetBloomFilter,
+    bloom_filter_columns, equality_predicate_columns, prune_row_groups_with_bloom,
+    BloomFilterColumn, BloomPruning, ParquetBloomFilter,
 };
 pub use dictionary::{
     dictionary_page_predicate_matches, dictionary_page_range, dictionary_predicates,

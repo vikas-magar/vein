@@ -2,14 +2,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use catalog::{StatisticsComparison, StatisticsPredicate};
 use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{
     AggOpCode, AggregatePlan, DataSource, FileFormat, FileScanTask, JoinOutput, JoinResidualPlan,
-    LimitSpec, MicroProgram, RegId, ScanPredicate, ScanPredicateStage,
-    SortKey as PhysicalSortKey, SortPlan,
+    LimitSpec, MicroProgram, RegId, ScanPredicate, ScanPredicateStage, SortKey as PhysicalSortKey,
+    SortPlan,
 };
-use catalog::{StatisticsComparison, StatisticsPredicate};
 use error::VeinError;
 use plan::schema::VeinSchema;
 use plan::{LogicalExpr, LogicalPlan, SortKey as LogicalSortKey};
@@ -269,7 +269,11 @@ impl PipelineCompiler {
             // physical node. Compile only each operator against its immediate
             // input schema; walking its logical child again can lose columns
             // that a preceding operator has intentionally narrowed.
-            output_schema = Self::compile_recursive_transform_node(plan, &output_schema, &mut compiler)
+            output_schema = Self::compile_recursive_transform_node(
+                plan,
+                &output_schema,
+                &mut compiler,
+            )
                 .map_err(|error| {
                     let operator = match *plan {
                         LogicalPlan::Filter { .. } => "filter",
@@ -417,12 +421,48 @@ impl PipelineCompiler {
                 };
                 let scan_schema =
                     Self::projected_scan_schema(schema, projection.as_deref(), filters)?;
-                let statistics = optimizer::estimation::ScanStatistics::new(schema, table.statistics.as_ref());
+                let statistics =
+                    optimizer::estimation::ScanStatistics::new(schema, table.statistics.as_ref());
                 let pushdown = Self::scan_predicate_with_estimator(filters, schema, |predicate| {
                     use optimizer::estimation::{SelectivityEstimator, StatisticsSelectivity};
-                    StatisticsSelectivity.estimate(predicate, &statistics).true_fraction.value()
+                    let estimate = StatisticsSelectivity
+                        .estimate(predicate, &statistics)
+                        .true_fraction
+                        .value();
+                    tracing::debug!(
+                        target: "vein.optimizer",
+                        event = "scan_filter_selectivity_estimate",
+                        table = %table.name,
+                        predicate_kind = predicate.kind_name(),
+                        estimated_pass_fraction = ?estimate,
+                        estimate_used_for_ordering = estimate.is_some(),
+                        table_rows = ?table.statistics.as_ref().and_then(|statistics| statistics.num_rows),
+                        statistics_column_count = table.statistics
+                            .as_ref()
+                            .map_or(0, |statistics| statistics.column_statistics.len()),
+                        source_snapshot_pinned = table.catalog_snapshot.is_some(),
+                        "scan filter selectivity estimated"
+                    );
+                    estimate
                 })?;
-                Self::file_source(files, scan_schema, pushdown)
+                // Full row coverage does not require reading every table
+                // column. The synopsis records only columns it observed, while
+                // the pinned row count validates complete source-row coverage.
+                let row_coverage_candidate = pushdown.is_none();
+                let runtime_statistics = table.catalog_snapshot.as_ref().map(|snapshot| {
+                    common::protocol::RuntimeStatisticsScan {
+                        scan_id: TaskId::new().into_raw(),
+                        table_key: common::statistics::runtime::table_statistics_key(snapshot),
+                        expected_rows: table
+                            .statistics
+                            .as_ref()
+                            .and_then(|statistics| statistics.num_rows),
+                        row_coverage_candidate,
+                        partition_index: 0,
+                        partition_count: 1,
+                    }
+                });
+                Self::file_source(files, scan_schema, pushdown, runtime_statistics)
             }
             LogicalPlan::ExternalScan {
                 url,
@@ -443,7 +483,7 @@ impl PipelineCompiler {
                 } else {
                     files.clone()
                 };
-                Self::file_source(paths, (**schema).clone(), None)
+                Self::file_source(paths, (**schema).clone(), None, None)
             }
             LogicalPlan::Aggregate {
                 input,
@@ -488,6 +528,7 @@ impl PipelineCompiler {
         files: Vec<String>,
         schema: VeinSchema,
         pushdown: Option<Arc<ScanPredicate>>,
+        runtime_statistics: Option<common::protocol::RuntimeStatisticsScan>,
     ) -> Result<(DataSource, VeinSchema)> {
         if files.is_empty() {
             return Err(VeinError::planning("Parquet scan has no input files", None));
@@ -506,6 +547,7 @@ impl PipelineCompiler {
                 pushdown,
                 task_id: TaskId::new(),
                 catalog_snapshot: None,
+                runtime_statistics,
             }),
             schema,
         ))
@@ -614,22 +656,20 @@ impl PipelineCompiler {
         Ok(Some(Arc::new(ScanPredicate {
             predicate_count: conjuncts.len(),
             stages,
-            statistics: conjuncts
-                .iter()
-                .map(Self::statistics_predicate)
-                .collect(),
+            statistics: conjuncts.iter().map(Self::statistics_predicate).collect(),
         })))
     }
 
-    pub(super) fn scan_predicate_correlation_class(predicate: &StatisticsPredicate) -> Option<bool> {
+    pub(super) fn scan_predicate_correlation_class(
+        predicate: &StatisticsPredicate,
+    ) -> Option<bool> {
         match predicate {
             StatisticsPredicate::Unknown => None,
             StatisticsPredicate::ColumnComparison { .. } => Some(true),
             StatisticsPredicate::And(children) | StatisticsPredicate::Or(children) => {
                 let mut contains_column_comparison = false;
                 for child in children {
-                    contains_column_comparison |=
-                        Self::scan_predicate_correlation_class(child)?;
+                    contains_column_comparison |= Self::scan_predicate_correlation_class(child)?;
                 }
                 Some(contains_column_comparison)
             }
@@ -646,10 +686,7 @@ impl PipelineCompiler {
 
         match expression {
             LogicalExpr::BinaryOp {
-                left,
-                op,
-                right,
-                ..
+                left, op, right, ..
             } => {
                 use parser::ast::expr::BinaryOp as Op;
                 match op {
@@ -766,7 +803,10 @@ impl PipelineCompiler {
         Ok(VeinSchema { fields })
     }
 
-    pub(super) fn collect_column_ids(expression: &LogicalExpr, output: &mut HashSet<plan::schema::ColumnId>) {
+    pub(super) fn collect_column_ids(
+        expression: &LogicalExpr,
+        output: &mut HashSet<plan::schema::ColumnId>,
+    ) {
         match expression {
             LogicalExpr::Column(column) | LogicalExpr::OuterColumn(column) => {
                 output.insert(column.id);

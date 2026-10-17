@@ -55,6 +55,7 @@ pub(in crate::runtime::tests) fn task() -> ExecuteTask {
         attempt: 0,
         query_id: QueryId::new(),
         stage_id: StageId::new(),
+        statistics_context: None,
 
         plan: PhysicalPlan {
             root: plan_node(
@@ -123,7 +124,6 @@ pub(in crate::runtime::tests) fn aggregate_task_with_post_filter(threshold: i64)
     task.plan = plan_with_input(&task, filtered);
     task
 }
-
 
 
 
