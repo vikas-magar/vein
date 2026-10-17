@@ -208,7 +208,7 @@ impl Write for SpillWriteHandle {
         let position = self.stream.stream_position()?;
         let proposed_end = position
             .checked_add(buffer.len() as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "spill run size overflow"))?;
+            .ok_or_else(|| io::Error::other("spill run size overflow"))?;
         let current_size = self.state.bytes.load(Ordering::Acquire);
         let reserved = proposed_end.saturating_sub(current_size);
         if reserved > 0 && !self.state.manager.reserve_disk(reserved) {

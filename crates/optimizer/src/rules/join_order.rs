@@ -8,9 +8,7 @@ use std::collections::HashMap;
 
 use error::{Result, VeinError};
 use parser::ast::{expr::BinaryOp, pipe_op::JoinType};
-use plan::{
-    ColumnId, LogicalExpr, LogicalPlan, PlanTraversal, VeinDataType, VeinSchema,
-};
+use plan::{LogicalExpr, LogicalPlan, PlanTraversal, VeinDataType, VeinSchema};
 
 use crate::context::{
     JoinCardinalityAssumption, JoinCostBreakdown, JoinOrderAlternative, JoinOrderConfig,
@@ -174,7 +172,7 @@ impl<C: JoinCostModel> JoinOrderRule<C> {
                     original_cost: None,
                     selected_cost: None,
                     cardinality_assumption:
-                        JoinCardinalityAssumption::UniformDistinctValueOverlap,
+                    JoinCardinalityAssumption::UniformDistinctValueOverlap,
                     alternatives: Vec::new(),
                     outcome: failure.outcome,
                 }));
@@ -331,19 +329,56 @@ impl JoinGraph<'_> {
     }
 
     fn build(root: &'_ LogicalPlan) -> std::result::Result<JoinGraph<'_>, GraphFailure> {
-        let mut pending = vec![root];
+        let mut pending = vec![(root, false)];
         let mut leaves = Vec::new();
         let mut joins = Vec::new();
-        while let Some(node) = pending.pop() {
+        let mut original_splits = HashMap::new();
+        let mut subtree_masks = Vec::new();
+        while let Some((node, visited)) = pending.pop() {
             if is_reorderable_join(node) {
                 let LogicalPlan::Join { left, right, .. } = node else {
                     unreachable!("join eligibility checked the plan variant");
                 };
-                joins.push(node);
-                pending.push(right);
-                pending.push(left);
+                if !visited {
+                    pending.push((node, true));
+                    pending.push((right, false));
+                    pending.push((left, false));
+                } else {
+                    let right_mask = subtree_masks
+                        .pop()
+                        .expect("right child mask is produced before its parent");
+                    let left_mask = subtree_masks
+                        .pop()
+                        .expect("left child mask is produced before its parent");
+                    let parent_mask = left_mask | right_mask;
+                    original_splits.insert(parent_mask, (left_mask, right_mask));
+                    joins.push((node, left_mask, right_mask));
+                    subtree_masks.push(parent_mask);
+                }
             } else {
+                let relation_index = leaves.len();
+                if relation_index >= usize::BITS as usize {
+                    let mut relation_labels = leaves
+                        .iter()
+                        .map(|leaf: &&LogicalPlan| {
+                            leaf.table_name()
+                                .unwrap_or_else(|| leaf.operator_name())
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>();
+                    relation_labels.push(
+                        node.table_name()
+                            .unwrap_or_else(|| node.operator_name())
+                            .to_string(),
+                    );
+                    return Err(GraphFailure {
+                        relation_count: relation_index + 1,
+                        relation_labels,
+                        outcome: JoinOrderOutcome::RelationLimitExceeded,
+                    });
+                }
                 leaves.push(node);
+                subtree_masks.push(1usize << relation_index);
             }
         }
 
@@ -364,6 +399,8 @@ impl JoinGraph<'_> {
             });
         }
 
+        debug_assert_eq!(subtree_masks, vec![(1usize << relation_count) - 1]);
+
         let mut column_relations = HashMap::new();
         let mut all_fields = Vec::new();
         for (relation, leaf) in leaves.iter().enumerate() {
@@ -380,46 +417,15 @@ impl JoinGraph<'_> {
         }
 
         let mut graph_predicates = Vec::new();
-        let mut original_splits = HashMap::new();
         let mut adjacency = vec![0usize; relation_count];
-        for node in joins {
-            let LogicalPlan::Join {
-                left, right, on, ..
-            } = node
+        for (node, left_mask, right_mask) in joins {
+            let LogicalPlan::Join { on, .. } = node
             else {
                 unreachable!("join eligibility checked the plan variant");
             };
             let Some(on) = on.as_ref() else {
                 unreachable!("join eligibility requires a predicate");
             };
-            let (Some(left_mask), Some(right_mask)) = (
-                schema_mask(left.schema(), &column_relations),
-                schema_mask(right.schema(), &column_relations),
-            ) else {
-                return Err(GraphFailure {
-                    relation_count,
-                    relation_labels: labels,
-                    outcome: JoinOrderOutcome::UnsupportedShape,
-                });
-            };
-            if left_mask == 0 || right_mask == 0 || left_mask & right_mask != 0 {
-                return Err(GraphFailure {
-                    relation_count,
-                    relation_labels: labels,
-                    outcome: JoinOrderOutcome::UnsupportedShape,
-                });
-            }
-            let parent_mask = left_mask | right_mask;
-            if original_splits
-                .insert(parent_mask, (left_mask, right_mask))
-                .is_some()
-            {
-                return Err(GraphFailure {
-                    relation_count,
-                    relation_labels: labels,
-                    outcome: JoinOrderOutcome::UnsupportedShape,
-                });
-            }
             let Some(atoms) = equi_atoms(on) else {
                 return Err(GraphFailure {
                     relation_count,
@@ -568,8 +574,18 @@ fn enumerate<C: JoinCostModel>(
     for (relation_index, leaf) in graph.leaves.iter().enumerate() {
         let relation = context.estimate_relation(leaf);
         if relation.rows.value().is_none() {
+            let outcome = match relation.rows.source {
+                crate::estimation::EstimateSource::MissingStatistics
+                | crate::estimation::EstimateSource::StaleStatistics =>
+                    JoinOrderOutcome::InsufficientStatistics,
+                _ => JoinOrderOutcome::UnsupportedShape,
+            };
+            tracing::warn!(target: "vein.optimizer", event = "optimizer_join_order_missing_relation_rows",
+                relation_index, relation = %graph.labels[relation_index],
+                estimate_source = ?relation.rows.source, confidence = ?relation.rows.confidence,
+                "join-order search cannot start because this input has no population estimate");
             return SearchResult::Fallback {
-                outcome: JoinOrderOutcome::InsufficientStatistics,
+                outcome,
                 candidate_splits: 0,
                 original_cost: None,
                 alternatives,
@@ -626,8 +642,20 @@ fn enumerate<C: JoinCostModel>(
                         &graph.analysis_schema,
                     );
                     if estimate.rows.value().is_none() {
+                        let outcome = match estimate.rows.source {
+                            crate::estimation::EstimateSource::MissingStatistics
+                            | crate::estimation::EstimateSource::StaleStatistics =>
+                                JoinOrderOutcome::InsufficientStatistics,
+                            _ => JoinOrderOutcome::UnsupportedShape,
+                        };
+                        tracing::warn!(target: "vein.optimizer", event = "optimizer_join_order_missing_candidate_rows",
+                            left_mask, right_mask, left_rows = ?left.relation.rows.value(),
+                            right_rows = ?right.relation.rows.value(),
+                            estimate_source = ?estimate.rows.source,
+                            confidence = ?estimate.rows.confidence,
+                            "join-order candidate has no output cardinality estimate");
                         return SearchResult::Fallback {
-                            outcome: JoinOrderOutcome::InsufficientStatistics,
+                            outcome,
                             candidate_splits,
                             original_cost: None,
                             alternatives,
@@ -734,14 +762,19 @@ fn enumerate<C: JoinCostModel>(
         }
     }
 
-    let Some(original_cost) = original_tree_cost(graph.full_mask, graph, &states, cost_model)
-    else {
-        return SearchResult::Fallback {
-            outcome: JoinOrderOutcome::InsufficientStatistics,
-            candidate_splits,
-            original_cost: None,
-            alternatives,
-        };
+    let original_cost = match original_tree_cost(graph.full_mask, graph, &states, cost_model) {
+        Ok(cost) => cost,
+        Err(reason) => {
+            tracing::warn!(target: "vein.optimizer", event = "optimizer_join_order_original_cost_unavailable",
+            relation_count = graph.leaves.len(), candidate_splits, reason = ?reason,
+            "could not reconstruct the original join tree cost from enumerated relation states");
+            return SearchResult::Fallback {
+                outcome: JoinOrderOutcome::InvalidCost,
+                candidate_splits,
+                original_cost: None,
+                alternatives,
+            };
+        }
     };
     let selected = states.get(&graph.full_mask).expect("full connected state exists");
     let selected_cost = selected.cumulative_cost;
@@ -779,21 +812,39 @@ fn checked_cost<C: JoinCostModel>(
     (cost.is_finite() && cost >= 0.0).then_some(cost)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginalTreeCostFailure {
+    MissingOriginalSplit { relation_mask: usize },
+    MissingSubplanState { relation_mask: usize },
+    MissingCardinality { relation_mask: usize },
+    InvalidCost { relation_mask: usize },
+}
+
 fn original_tree_cost<C: JoinCostModel>(
     mask: usize,
     graph: &JoinGraph<'_>,
     states: &HashMap<usize, SubplanState<'_>>,
     cost_model: &C,
-) -> Option<f64> {
+) -> std::result::Result<f64, OriginalTreeCostFailure> {
     if mask.count_ones() == 1 {
-        return Some(0.0);
+        return Ok(0.0);
     }
-    let (left_mask, right_mask) = *graph.original_splits.get(&mask)?;
+    let (left_mask, right_mask) = *graph.original_splits.get(&mask)
+        .ok_or(OriginalTreeCostFailure::MissingOriginalSplit { relation_mask: mask })?;
     let left_cost = original_tree_cost(left_mask, graph, states, cost_model)?;
     let right_cost = original_tree_cost(right_mask, graph, states, cost_model)?;
-    let left_rows = states.get(&left_mask)?.relation.rows.value()?;
-    let right_rows = states.get(&right_mask)?.relation.rows.value()?;
-    let output_rows = states.get(&mask)?.relation.rows.value()?;
+    let left_state = states.get(&left_mask)
+        .ok_or(OriginalTreeCostFailure::MissingSubplanState { relation_mask: left_mask })?;
+    let right_state = states.get(&right_mask)
+        .ok_or(OriginalTreeCostFailure::MissingSubplanState { relation_mask: right_mask })?;
+    let output_state = states.get(&mask)
+        .ok_or(OriginalTreeCostFailure::MissingSubplanState { relation_mask: mask })?;
+    let left_rows = left_state.relation.rows.value()
+        .ok_or(OriginalTreeCostFailure::MissingCardinality { relation_mask: left_mask })?;
+    let right_rows = right_state.relation.rows.value()
+        .ok_or(OriginalTreeCostFailure::MissingCardinality { relation_mask: right_mask })?;
+    let output_rows = output_state.relation.rows.value()
+        .ok_or(OriginalTreeCostFailure::MissingCardinality { relation_mask: mask })?;
     checked_cost(
         cost_model,
         JoinCostInput {
@@ -806,6 +857,7 @@ fn original_tree_cost<C: JoinCostModel>(
         },
         output_rows,
     )
+        .ok_or(OriginalTreeCostFailure::InvalidCost { relation_mask: mask })
 }
 
 fn same_tree(
@@ -863,14 +915,6 @@ fn is_connected(mask: usize, adjacency: &[usize]) -> bool {
         }
     }
     visited == mask
-}
-
-fn schema_mask(schema: &VeinSchema, columns: &HashMap<ColumnId, usize>) -> Option<usize> {
-    let mut mask = 0usize;
-    for column in &schema.fields {
-        mask |= 1usize.checked_shl(*columns.get(&column.id)? as u32)?;
-    }
-    Some(mask)
 }
 
 fn is_reorderable_join(plan: &LogicalPlan) -> bool {
@@ -1115,6 +1159,7 @@ mod tests {
     use std::sync::Arc;
 
     use parser::ast::{expr::BinaryOp, pipe_op::JoinType};
+    use catalog::{DataUnitStatistics, StatisticsUnitKind};
     use plan::{
         ColumnId, ColumnStatistics, LogicalExpr, LogicalPlan, ResolvedColumn,
         TableMetadata, TableStatistics, VeinDataType, VeinSchema,
@@ -1122,6 +1167,68 @@ mod tests {
 
     use super::*;
     use crate::{OptimizerConfig, OptimizerPipeline};
+
+    #[test]
+    fn checkpoint_distribution_reorders_the_remaining_joins_without_changing_population() {
+        use common::statistics::QueryStatisticsContext;
+        let a = scan("a", 1000, &[(1, "a_key", 1)]);
+        let b = scan("b", 1000, &[(2, "b_a", 1), (3, "b_c", 1000)]);
+        let c = scan("c", 10000, &[(4, "c_key", 100)]);
+        let bc = join(b, c, equality(3, "b_c", 4, "c_key"), JoinType::Inner);
+        let original = join(a.clone(), bc.clone(), equality(1, "a_key", 2, "b_a"), JoinType::Inner);
+        let context = Arc::new(QueryStatisticsContext::new([]));
+        let (_, before) = OptimizerPipeline::default()
+            .optimize_with_statistics_context(original, Arc::clone(&context)).unwrap();
+        assert!(!before.join_order_decisions.iter().any(|decision| decision.outcome == JoinOrderOutcome::Reordered));
+
+        // Same row count, different observed key distribution. The synopsis
+        // belongs only to this materialized population and uses column IDs.
+        context.record_intermediate(17, Arc::new(TableStatistics {
+            num_rows: Some(1000),
+            column_statistics: std::collections::HashMap::from([("1".into(), ColumnStatistics {
+                distinct_count: Some(200),
+                null_count: Some(0),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        })).unwrap();
+        let observed = LogicalPlan::Intermediate {
+            source_id: 17,
+            row_count: 1000,
+            schema: Box::new(a.schema().clone()),
+        };
+        let provider = Arc::new(crate::QueryStatisticsProvider::new(Arc::clone(&context)));
+        let estimates = OptimizerContext::with_statistics_provider(OptimizerConfig::default(), provider);
+        assert_eq!(estimates.estimate_relation(&observed).columns[&ColumnId(1)].distinct, Some(200.0));
+        let remaining = join(observed, bc, equality(1, "a_key", 2, "b_a"), JoinType::Inner);
+        let expected_schema = remaining.schema().clone();
+        let (optimized, after) = OptimizerPipeline::default()
+            .optimize_with_statistics_context(remaining, context).unwrap();
+        let decision = after.join_order_decisions.iter()
+            .find(|decision| decision.outcome == JoinOrderOutcome::Reordered)
+            .expect("observed key distribution must change the remaining join order");
+        assert!(decision.selected_cost < decision.original_cost);
+        assert_eq!(optimized.schema(), &expected_schema);
+    }
+
+    #[test]
+    fn mismatched_checkpoint_population_does_not_reuse_its_column_synopses() {
+        let source = scan("a", 100, &[(1, "key", 10)]);
+        let context = Arc::new(common::statistics::QueryStatisticsContext::new([]));
+        context.record_intermediate(17, Arc::new(TableStatistics {
+            num_rows: Some(8),
+            column_statistics: std::collections::HashMap::from([
+                ("1".into(), ColumnStatistics { distinct_count: Some(2), null_count: Some(0), ..Default::default() }),
+            ]),
+            ..Default::default()
+        })).unwrap();
+        let provider = Arc::new(crate::QueryStatisticsProvider::new(context));
+        let context = OptimizerContext::with_statistics_provider(OptimizerConfig::default(), provider);
+        let input = LogicalPlan::Intermediate { source_id: 17, row_count: 9, schema: Box::new(source.schema().clone()) };
+        let estimate = context.estimate_relation(&input);
+        assert_eq!(estimate.rows.value(), Some(9.0));
+        assert_ne!(estimate.columns[&ColumnId(1)].distinct, Some(2.0));
+    }
 
     fn scan(name: &str, rows: u64, columns: &[(usize, &str, u64)]) -> LogicalPlan {
         let fields = columns
@@ -1263,8 +1370,10 @@ mod tests {
     }
 
     fn optimizer(config: JoinOrderConfig) -> OptimizerPipeline {
-        let mut optimizer_config = OptimizerConfig::default();
-        optimizer_config.join_order = config;
+        let optimizer_config = OptimizerConfig {
+            join_order: config,
+            ..OptimizerConfig::default()
+        };
         OptimizerPipeline::new(vec![Arc::new(JoinOrderRule::default())])
             .with_config(optimizer_config)
     }
@@ -1297,6 +1406,41 @@ mod tests {
             relation_order_labels(&decision.original_order, &decision.relation_labels),
             vec!["orders", "lineitem"]
         );
+    }
+
+    #[test]
+    fn pruned_join_output_schema_preserves_original_relation_lineage_for_costing() {
+        let a = scan("a", 100, &[(1, "a_key", 10)]);
+        let b = scan("b", 100, &[(2, "b_key", 10), (3, "b_c", 10)]);
+        let c = scan("c", 100, &[(4, "c_key", 10)]);
+        let mut ab = join(
+            a,
+            b,
+            equality(1, "a_key", 2, "b_key"),
+            JoinType::Inner,
+        );
+        let LogicalPlan::Join { schema, .. } = &mut ab else {
+            unreachable!("helper creates a join");
+        };
+        schema.fields.retain(|column| column.id == ColumnId(3));
+
+        let plan = join(
+            ab,
+            c,
+            equality(3, "b_c", 4, "c_key"),
+            JoinType::Inner,
+        );
+        let (_, diagnostics) = optimizer(JoinOrderConfig::default())
+            .optimize_with_diagnostics(plan)
+            .expect("column pruning must not hide an original relation from costing");
+
+        let decision = diagnostics
+            .join_order_decisions
+            .first()
+            .expect("the three-relation inner join is eligible for costing");
+        assert_eq!(decision.relation_count, 3);
+        assert!(decision.original_cost.is_some());
+        assert_ne!(decision.outcome, JoinOrderOutcome::InvalidCost);
     }
 
     #[test]
@@ -1342,9 +1486,9 @@ mod tests {
         assert!(decision.alternatives.iter().any(|alternative| {
             alternative.cost.local_cost == Some(alternative.output_rows)
                 && (alternative.cost.left_subtree_cost
-                    + alternative.cost.right_subtree_cost
-                    + alternative.cost.local_cost.unwrap()
-                    == alternative.cost.cumulative_cost)
+                + alternative.cost.right_subtree_cost
+                + alternative.cost.local_cost.unwrap()
+                == alternative.cost.cumulative_cost)
         }));
     }
 
@@ -1391,6 +1535,46 @@ mod tests {
             diagnostics.join_order_decisions[0].outcome,
             JoinOrderOutcome::InsufficientStatistics
         );
+    }
+
+    #[test]
+    fn complete_row_group_population_supports_join_order_costing() {
+        let mut a = scan("a", 100, &[(1, "a_key", 10)]);
+        let LogicalPlan::Scan { table, .. } = &mut a else {
+            unreachable!("scan fixture must produce a scan");
+        };
+        let statistics = Arc::make_mut(table)
+            .statistics
+            .as_mut()
+            .expect("scan fixture has statistics");
+        statistics.num_rows = None;
+        statistics.row_group_count = Some(2);
+        statistics.data_units = [40, 60]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, num_rows)| {
+                let mut unit = DataUnitStatistics::new(StatisticsUnitKind::RowGroup, ordinal);
+                unit.num_rows = Some(num_rows);
+                unit
+            })
+            .collect();
+
+        let b = scan("b", 200, &[(2, "b_key", 20)]);
+        let plan = join(a, b, equality(1, "a_key", 2, "b_key"), JoinType::Inner);
+        let original = plan.clone();
+
+        let (optimized, diagnostics) = optimizer(JoinOrderConfig::default())
+            .optimize_with_diagnostics(plan)
+            .expect("complete row-group counts provide a population estimate");
+
+        assert_eq!(optimized, original);
+        let decision = diagnostics
+            .join_order_decisions
+            .first()
+            .expect("the two-relation join must be costed");
+        assert_eq!(decision.outcome, JoinOrderOutcome::NoImprovement);
+        assert_eq!(decision.original_cost, decision.selected_cost);
+        assert_eq!(decision.candidate_splits, 1);
     }
 
     #[test]
@@ -1492,7 +1676,45 @@ mod tests {
         assert_eq!(diagnostics.join_order_decisions.len(), 1);
         let decision = &diagnostics.join_order_decisions[0];
         assert_eq!(decision.relation_count, 2);
-        assert_eq!(decision.outcome, JoinOrderOutcome::InsufficientStatistics);
+        assert_eq!(decision.outcome, JoinOrderOutcome::NoImprovement);
+        assert!(decision.original_cost.is_some());
         assert_eq!(decision.original_order, decision.selected_order);
+    }
+
+    #[test]
+    fn catalog_resolved_external_join_has_a_costed_join_order_decision() {
+        let LogicalPlan::Scan {
+            table,
+            schema,
+            ..
+        } = scan("external", 100, &[(1, "external_key", 10)])
+        else {
+            unreachable!();
+        };
+        let external = LogicalPlan::ExternalScan {
+            url: "file:///external".into(),
+            options: vec![],
+            files: vec![],
+            source_metadata: Some(table),
+            schema,
+        };
+        let right = scan("right", 100, &[(2, "right_key", 10)]);
+        let plan = join(
+            external,
+            right,
+            equality(1, "external_key", 2, "right_key"),
+            JoinType::Inner,
+        );
+
+        let (_, diagnostics) = optimizer(JoinOrderConfig::default())
+            .optimize_with_diagnostics(plan)
+            .expect("resolved external source statistics should support join costing");
+        let decision = diagnostics
+            .join_order_decisions
+            .first()
+            .expect("two relations produce a join-order decision");
+        assert_ne!(decision.outcome, JoinOrderOutcome::InsufficientStatistics);
+        assert!(decision.original_cost.is_some());
+        assert_eq!(decision.candidate_splits, 1);
     }
 }

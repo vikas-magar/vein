@@ -165,9 +165,9 @@ pub(crate) fn partition_runs(
 
     for run in runs {
         tracker.check_cancelled()?;
-        let mut reader = open_reader(run)
+        let reader = open_reader(run)
             .map_err(|error| spill_error("read join IPC run", error))?;
-        while let Some(batch) = reader.next() {
+        for batch in reader {
             tracker.check_cancelled()?;
             let batch = batch.map_err(|error| spill_error("decode join IPC batch", error))?;
             let hashes = batch
@@ -294,9 +294,9 @@ mod tests {
     }
 
     fn hashes(run: &JoinSpillRun, schema: &JoinSpillSchema) -> Vec<u64> {
-        let mut reader = open_reader(run).expect("open run");
+        let reader = open_reader(run).expect("open run");
         let mut values = Vec::new();
-        while let Some(batch) = reader.next() {
+        for batch in reader {
             let batch = batch.expect("read batch");
             let hashes = batch
                 .column(schema.payload_columns())

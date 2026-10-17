@@ -11,17 +11,19 @@ fn null_comparison_is_logically_unknown_even_without_statistics() {
 }
 
 #[test]
-fn unknown_null_fraction_is_not_assumed_to_be_zero() {
+fn missing_null_fraction_uses_a_visible_model_prior() {
     let plan = scan(1, Some(100), Some(10), None);
     let c = plan.schema().fields[0].clone();
-    assert_eq!(rows(&filter(plan, predicate(&c, BinaryOp::Eq, LogicalLiteral::Int64(1)))), None);
+    let estimate = root(&filter(plan, predicate(&c, BinaryOp::Eq, LogicalLiteral::Int64(1)))).rows;
+    assert_eq!(estimate.value(), Some(10.0));
+    assert_eq!(estimate.confidence, EstimateConfidence::Model);
 }
 
 #[test]
-fn degenerate_bounds_with_multiple_distinct_values_are_contradictory() {
+fn invalid_degenerate_bounds_fall_back_without_losing_rows() {
     let mut plan = scan(1, Some(100), Some(10), Some(0));
     bounds(&mut plan, LogicalLiteral::Int64(3), LogicalLiteral::Int64(3));
-    assert_eq!(root(&plan).rows.source, EstimateSource::InvalidStatistics);
+    assert_eq!(root(&plan).rows.value(), Some(100.0));
 }
 
 #[test]
@@ -59,7 +61,9 @@ fn computed_projection_has_unknown_distribution_but_preserves_rows() {
         schema: Box::new(VeinSchema { fields: vec![output.clone()] }),
     };
     assert_eq!(rows(&projected), Some(100.0));
-    assert_eq!(rows(&filter(projected, predicate(&output, BinaryOp::Eq, LogicalLiteral::Int64(1)))), None);
+    let estimate = root(&filter(projected, predicate(&output, BinaryOp::Eq, LogicalLiteral::Int64(1)))).rows;
+    assert_eq!(estimate.value(), Some(100.0));
+    assert_eq!(estimate.source, EstimateSource::SelectivityFallback);
 }
 
 #[test]
@@ -68,7 +72,9 @@ fn deeply_nested_predicates_fall_back_without_exhausting_the_stack() {
     let c = plan.schema().fields[0].clone();
     let mut expr = predicate(&c, BinaryOp::Eq, LogicalLiteral::Int64(1));
     for _ in 0..256 { expr = LogicalExpr::Not { expr: Box::new(expr) }; }
-    assert_eq!(root(&filter(plan, expr)).rows.source, EstimateSource::UnsupportedExpression);
+    let estimate = root(&filter(plan, expr)).rows;
+    assert_eq!(estimate.value(), Some(100.0));
+    assert_eq!(estimate.source, EstimateSource::SelectivityFallback);
 }
 
 struct InvalidSelectivity;
@@ -88,8 +94,9 @@ fn an_extension_cannot_publish_a_selectivity_above_one() {
     let result = StatisticsEstimator::with_selectivity(&CatalogStatisticsProvider, InvalidSelectivity)
         .estimate_plan(&plan);
     let estimate = result.last().unwrap();
-    assert_eq!(estimate.rows.value(), None);
-    assert_eq!(estimate.selectivity.unwrap().source, EstimateSource::InvalidStatistics);
+    assert_eq!(estimate.rows.value(), Some(100.0));
+    assert_eq!(estimate.rows.source, EstimateSource::SelectivityFallback);
+    assert_eq!(estimate.selectivity.unwrap().source, EstimateSource::SelectivityFallback);
 }
 
 #[test]

@@ -1,5 +1,9 @@
 use super::*;
 
+type SharedAggregateSink = Arc<Mutex<AggregateSink>>;
+type AggregatePipelineNode = Box<dyn PipelineNode<DataChunk>>;
+type SharedAggregate = (SharedAggregateSink, AggregatePipelineNode);
+
 /// Forwards pushes into the shared accumulator so the runtime can take the
 /// groups once the source has been drained.
 struct AggregateHandle(Arc<Mutex<AggregateSink>>);
@@ -61,9 +65,7 @@ impl PipelineNode<DataChunk> for AggregateHandle {
 }
 
 /// Builds the accumulator and the node that feeds it.
-pub fn shared(
-    plan: AggregatePlan,
-) -> Result<(Arc<Mutex<AggregateSink>>, Box<dyn PipelineNode<DataChunk>>)> {
+pub fn shared(plan: AggregatePlan) -> Result<SharedAggregate> {
     shared_with_memory_tracker(
         plan,
         QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new()),
@@ -74,7 +76,7 @@ pub fn shared(
 pub fn shared_with_memory_tracker(
     plan: AggregatePlan,
     tracker: QueryMemoryTracker,
-) -> Result<(Arc<Mutex<AggregateSink>>, Box<dyn PipelineNode<DataChunk>>)> {
+) -> Result<SharedAggregate> {
     let sink = Arc::new(Mutex::new(AggregateSink::with_memory_tracker(
         plan, tracker,
     )?));

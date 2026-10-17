@@ -79,9 +79,9 @@ impl AggregateSink {
                 .filter_map(|(set_id, grouping_set)| grouping_set.is_empty().then_some(set_id))
                 .collect();
             for set_id in empty_sets {
-                let mut hasher = self.hash_builder.build_hasher();
-                set_id.hash(&mut hasher);
-                let hash = hasher.finish();
+                
+                
+                let hash = self.hash_builder.hash_one(set_id);
                 let exists = self.index.find(hash, |entry| {
                     self.groups[entry.slot].grouping_set_id == set_id
                 });

@@ -446,13 +446,12 @@ fn summarize_column(
             continue;
         }
         saw_non_null_values = true;
-        if let (Some(min), Some(max)) = (&statistics.min_value, &statistics.max_value) {
-            if min.try_cmp(max).is_none_or(|order| order.is_gt()) {
+        if let (Some(min), Some(max)) = (&statistics.min_value, &statistics.max_value)
+            && min.try_cmp(max).is_none_or(|order| order.is_gt()) {
                 min_complete = false;
                 max_complete = false;
                 continue;
             }
-        }
         match &statistics.min_value {
             Some(value) => match &min_value {
                 Some(current) => match value.try_cmp(current) {

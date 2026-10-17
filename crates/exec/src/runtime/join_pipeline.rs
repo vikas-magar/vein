@@ -168,8 +168,8 @@ impl SpilledJoinProbe {
         )?;
         let mut overflow = false;
         'build_runs: for run in &build_runs {
-            let mut reader = open_reader(run)?;
-            while let Some(batch) = reader.next() {
+            let reader = open_reader(run)?;
+            for batch in reader {
                 self.tracker.check_cancelled()?;
                 let batch = batch.map_err(|error| {
                     VeinError::internal(format!("decode spilled join build batch: {error}"))
@@ -203,8 +203,8 @@ impl SpilledJoinProbe {
         if !overflow {
             let working_set = self.tracker.used();
             'probe_runs: for run in &probe_runs {
-                let mut reader = open_reader(run)?;
-                while let Some(batch) = reader.next() {
+                let reader = open_reader(run)?;
+                for batch in reader {
                     self.tracker.check_cancelled()?;
                     let batch = batch.map_err(|error| {
                         VeinError::internal(format!("decode spilled join probe batch: {error}"))
@@ -288,8 +288,8 @@ impl SpilledJoinProbe {
         let join = install_join_residual(self.builder.as_ref(), &self.plan, join)?;
         let mut join: Box<dyn PipelineNode<DataChunkView>> = Box::new(join);
         for run in &probe_runs {
-            let mut reader = open_reader(run)?;
-            while let Some(batch) = reader.next() {
+            let reader = open_reader(run)?;
+            for batch in reader {
                 self.tracker.check_cancelled()?;
                 let batch = batch.map_err(|error| {
                     VeinError::internal(format!("decode spilled join probe batch: {error}"))

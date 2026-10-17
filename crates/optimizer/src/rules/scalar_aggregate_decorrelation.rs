@@ -407,7 +407,7 @@ fn decorrelate_scalar_aggregate(
         aggs: grouped_aggs,
         schema: Box::new(VeinSchema::new(aggregate_fields)),
     };
-    let (right, projected_value) = if &rewritten_value == &LogicalExpr::Column(Arc::clone(&aggregate_value)) {
+    let (right, projected_value) = if rewritten_value == LogicalExpr::Column(Arc::clone(&aggregate_value)) {
         (aggregate, aggregate_value)
     } else {
         let mut exprs = Vec::with_capacity(2);
@@ -497,14 +497,13 @@ fn decorrelate_correlated_scalar_row(
     if correlations.is_empty() {
         return None;
     }
-    if let LogicalExpr::Column(source_value) = value_expression {
-        if let Some((_, key)) = correlations.iter().find(|(_, key)| key.id == source_value.id) {
+    if let LogicalExpr::Column(source_value) = value_expression
+        && let Some((_, key)) = correlations.iter().find(|(_, key)| key.id == source_value.id) {
             // The joined relation already carries this array as its key column.
             // Reuse that column ID for the scalar reference instead of emitting a
             // duplicate schema field for an aliased projection.
             value = nullable_column(key);
         }
-    }
 
     // Reapply deterministic local filters once above the scan, while removing
     // correlation predicates that cannot be evaluated in the shared build.

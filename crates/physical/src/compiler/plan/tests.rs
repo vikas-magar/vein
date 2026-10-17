@@ -244,6 +244,7 @@ fn external_scan(schema: &VeinSchema) -> LogicalPlan {
         url: "memory://sort-test".to_owned(),
         options: Vec::new(),
         files: Vec::new(),
+        source_metadata: None,
         schema: Box::new(schema.clone()),
     }
 }

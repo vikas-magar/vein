@@ -7,7 +7,7 @@ use std::sync::Arc;
 use types::VeinSchemaRef;
 
 use super::ir::{MicroProgram, RegId};
-use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
+use crate::identifiers::{IntermediateSourceId, QueryId, RequestId, StageId, TaskId};
 use crate::statistics::QueryStatisticsContext;
 
 /// Supported file formats for storage scans.
@@ -120,6 +120,9 @@ pub struct StreamSource {
 
 /// Source of data for a stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Physical plan nodes retain this enum behind an Arc. Keeping the file task
+// inline avoids a second allocation for its already heap-backed metadata.
+#[allow(clippy::large_enum_variant)]
 pub enum DataSource {
     /// Read from static storage (e.g., Parquet).
     File(FileScanTask),
@@ -127,6 +130,11 @@ pub enum DataSource {
     Stream(StreamSource),
     /// A source that generates data directly (e.g. VALUES).
     Memory,
+    /// A query-local relation produced by an earlier adaptive stage.
+    ///
+    /// The identifier is resolved by the in-process executor registry. The
+    /// relation payload itself is deliberately not serialized into the plan.
+    Intermediate(IntermediateSourceId),
 }
 
 /// Immutable, schema-aware physical plan tree shared by planning and execution.
@@ -140,6 +148,173 @@ pub enum DataSource {
 pub struct PhysicalPlan {
     /// The root operator of the query plan.
     pub root: Arc<PhysicalPlanNode>,
+}
+
+/// The two physical fragments produced by cutting a plan at a checkpoint.
+pub struct CheckpointPlanFragments {
+    /// Upstream subtree that materializes the checkpoint relation.
+    pub producer: PhysicalPlan,
+    /// Remaining downstream operators reading the registered relation.
+    pub continuation: PhysicalPlan,
+}
+
+impl PhysicalPlan {
+    /// Split this canonical plan at one node for adaptive execution.
+    ///
+    /// The producer retains the selected subtree and writes its output through a
+    /// client-shaped sink, which can be replaced by the checkpoint sink by the
+    /// coordinator. The continuation preserves the surrounding immutable
+    /// operator tree and replaces the selected subtree with an intermediate
+    /// source. It returns `None` if the node is absent, is the output sink, or is
+    /// referenced more than once in the plan.
+    pub fn split_at_checkpoint(
+        &self,
+        target: &Arc<PhysicalPlanNode>,
+        source_id: IntermediateSourceId,
+    ) -> Option<CheckpointPlanFragments> {
+        if Arc::ptr_eq(&self.root, target)
+            || matches!(target.operator, PhysicalPlanOperator::Sink { .. })
+        {
+            return None;
+        }
+
+        let source = Arc::new(PhysicalPlanNode {
+            output_schema: Arc::clone(&target.output_schema),
+            operator: PhysicalPlanOperator::Pipeline {
+                source: Arc::new(DataSource::Intermediate(source_id)),
+                input_schema: Arc::clone(&target.output_schema),
+                program: Arc::new(MicroProgram::empty()),
+            },
+        });
+        let (continuation_root, replacements) = replace_plan_node(&self.root, target, &source);
+        if replacements != 1 {
+            return None;
+        }
+
+        let producer = PhysicalPlan {
+            root: Arc::new(PhysicalPlanNode {
+                output_schema: Arc::clone(&target.output_schema),
+                operator: PhysicalPlanOperator::Sink {
+                    input: Arc::clone(target),
+                    sink: Arc::new(DataSink::Client {
+                        schema: Arc::clone(&target.output_schema),
+                    }),
+                },
+            }),
+        };
+        Some(CheckpointPlanFragments {
+            producer,
+            continuation: PhysicalPlan {
+                root: continuation_root,
+            },
+        })
+    }
+}
+
+fn replace_plan_node(
+    current: &Arc<PhysicalPlanNode>,
+    target: &Arc<PhysicalPlanNode>,
+    replacement: &Arc<PhysicalPlanNode>,
+) -> (Arc<PhysicalPlanNode>, usize) {
+    if Arc::ptr_eq(current, target) {
+        return (Arc::clone(replacement), 1);
+    }
+
+    let (operator, replacements) = match &current.operator {
+        PhysicalPlanOperator::Pipeline {
+            source,
+            input_schema,
+            program,
+        } => (
+            PhysicalPlanOperator::Pipeline {
+                source: Arc::clone(source),
+                input_schema: Arc::clone(input_schema),
+                program: Arc::clone(program),
+            },
+            0,
+        ),
+        PhysicalPlanOperator::Transform { input, program } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (
+                PhysicalPlanOperator::Transform {
+                    input,
+                    program: Arc::clone(program),
+                },
+                count,
+            )
+        }
+        PhysicalPlanOperator::Join { probe, build, plan } => {
+            let (probe, probe_count) = replace_plan_node(probe, target, replacement);
+            let (build, build_count) = replace_plan_node(build, target, replacement);
+            (
+                PhysicalPlanOperator::Join {
+                    probe,
+                    build,
+                    plan: plan.clone(),
+                },
+                probe_count + build_count,
+            )
+        }
+        PhysicalPlanOperator::Aggregate { input, plan } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (
+                PhysicalPlanOperator::Aggregate {
+                    input,
+                    plan: plan.clone(),
+                },
+                count,
+            )
+        }
+        PhysicalPlanOperator::Distinct { input, plan } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (
+                PhysicalPlanOperator::Distinct {
+                    input,
+                    plan: plan.clone(),
+                },
+                count,
+            )
+        }
+        PhysicalPlanOperator::Sort {
+            input,
+            plan,
+            key_program,
+            output_columns,
+        } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (
+                PhysicalPlanOperator::Sort {
+                    input,
+                    plan: plan.clone(),
+                    key_program: key_program.clone(),
+                    output_columns: *output_columns,
+                },
+                count,
+            )
+        }
+        PhysicalPlanOperator::Limit { input, spec } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (PhysicalPlanOperator::Limit { input, spec: *spec }, count)
+        }
+        PhysicalPlanOperator::Sink { input, sink } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (
+                PhysicalPlanOperator::Sink {
+                    input,
+                    sink: Arc::clone(sink),
+                },
+                count,
+            )
+        }
+    };
+
+    (
+        Arc::new(PhysicalPlanNode {
+            output_schema: Arc::clone(&current.output_schema),
+            operator,
+        }),
+        replacements,
+    )
 }
 
 /// One immutable operator node in a [`PhysicalPlan`].
@@ -554,6 +729,7 @@ mod tests {
         JoinPlan, LimitSpec, MicroProgram, OutputRepresentation, PhysicalPlan, PhysicalPlanNode,
         PhysicalPlanOperator, SortKey, SortPlan,
     };
+    use crate::identifiers::IntermediateSourceId;
     use std::sync::Arc;
     use types::VeinSchema;
 
@@ -846,5 +1022,69 @@ mod tests {
             panic!("cloned plan should retain its root node");
         };
         assert!(Arc::ptr_eq(input, cloned_input));
+    }
+
+    #[test]
+    fn checkpoint_split_preserves_producer_and_replaces_only_the_continuation_input() {
+        let schema = Arc::new(VeinSchema::empty());
+        let source = node(PhysicalPlanOperator::Pipeline {
+            source: Arc::new(DataSource::Memory),
+            input_schema: Arc::clone(&schema),
+            program: Arc::new(MicroProgram::empty()),
+        });
+        let boundary = Arc::new(PhysicalPlanNode {
+            output_schema: Arc::clone(&schema),
+            operator: PhysicalPlanOperator::Transform {
+                input: source,
+                program: Arc::new(MicroProgram::empty()),
+            },
+        });
+        let plan = PhysicalPlan {
+            root: Arc::new(PhysicalPlanNode {
+                output_schema: Arc::clone(&schema),
+                operator: PhysicalPlanOperator::Sink {
+                    input: Arc::clone(&boundary),
+                    sink: Arc::new(DataSink::Client {
+                        schema: Arc::clone(&schema),
+                    }),
+                },
+            }),
+        };
+        let source_id = IntermediateSourceId::new();
+
+        let fragments = plan
+            .split_at_checkpoint(&boundary, source_id)
+            .expect("selected subplan should split into two fragments");
+        let PhysicalPlanOperator::Sink {
+            input: producer_input,
+            ..
+        } = &fragments.producer.root.operator
+        else {
+            panic!("producer fragment must end at a checkpoint sink");
+        };
+        assert!(Arc::ptr_eq(producer_input, &boundary));
+
+        let PhysicalPlanOperator::Sink {
+            input: continuation_input,
+            ..
+        } = &fragments.continuation.root.operator
+        else {
+            panic!("continuation must preserve the original output sink");
+        };
+        // The selected transform runs in the producer. Its entire subtree is
+        // replaced in the continuation so it cannot be executed a second time.
+        let PhysicalPlanOperator::Pipeline { source, .. } = &continuation_input.operator
+        else {
+            panic!("boundary should be replaced by an intermediate source");
+        };
+        let DataSource::Intermediate(actual) = source.as_ref() else {
+            panic!("continuation must read the checkpoint relation");
+        };
+        assert_eq!(*actual, source_id);
+
+        assert!(
+            plan.split_at_checkpoint(&plan.root, source_id).is_none(),
+            "the terminal sink cannot be used as a checkpoint boundary"
+        );
     }
 }

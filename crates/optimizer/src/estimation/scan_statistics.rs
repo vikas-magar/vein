@@ -21,7 +21,7 @@ impl<'a> ScanStatistics<'a> {
         let table = self.statistics?;
         ColumnEstimate::from_statistics(
             table.column_statistics.get(&field.name)?, table.num_rows?, field.nullable,
-        )
+        ).ok()
     }
 }
 

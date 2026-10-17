@@ -52,6 +52,19 @@ impl std::fmt::Debug for DefaultPhysicalPlanner {
 
 impl PhysicalPlanner for DefaultPhysicalPlanner {
     fn create_physical_plan(&self, request_id: RequestId, logical_plan: LogicalPlan) -> Result<Job> {
+        self.create_plan(request_id, logical_plan, None)
+    }
+
+    fn create_physical_plan_with_statistics(&self, request_id: RequestId, logical_plan: LogicalPlan,
+                                            statistics: Arc<common::statistics::QueryStatisticsContext>) -> Result<Job> {
+        self.create_plan(request_id, logical_plan, Some(statistics))
+    }
+}
+
+impl DefaultPhysicalPlanner {
+    fn create_plan(&self, request_id: RequestId, logical_plan: LogicalPlan,
+                   statistics: Option<Arc<common::statistics::QueryStatisticsContext>>) -> Result<Job> {
+        let logical_plan = Arc::new(logical_plan);
         let query_id = QueryId::new();
         tracing::info!(
             target: "vein.audit",
@@ -63,9 +76,10 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
         // Keep every fallible lowering and validation step inside this closure
         // so the single failure path below records all planner errors.
         let result = (|| -> Result<Job> {
-            match &logical_plan {
+            match logical_plan.as_ref() {
                 LogicalPlan::Scan { .. }
                 | LogicalPlan::ExternalScan { .. }
+                | LogicalPlan::Intermediate { .. }
                 | LogicalPlan::Filter { .. }
                 | LogicalPlan::Project { .. }
                 | LogicalPlan::Join { .. }
@@ -75,7 +89,10 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 | LogicalPlan::Aggregate { .. }
                 | LogicalPlan::Distinct { .. }
                 | LogicalPlan::Write { .. } => {
-                    let stage = self.pipeline_builder.build(&logical_plan)?;
+                    let stage = match statistics {
+                        Some(statistics) => self.pipeline_builder.build_with_statistics(&logical_plan, statistics)?,
+                        None => self.pipeline_builder.build(&logical_plan)?,
+                    };
                     let graph = stage.pipeline_graph();
                     tracing::info!(
                     target: "vein.audit",
@@ -92,7 +109,13 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                     for task in stage.tasks() {
                         task.plan.validate()?;
                     }
-                    Ok(Job::new(request_id, query_id, stage, ExecutionMode::Batch))
+                    Ok(Job::new(
+                        request_id,
+                        query_id,
+                        Arc::clone(&logical_plan),
+                        stage,
+                        ExecutionMode::Batch,
+                    ))
                 }
                 other => Err(VeinError::unsupported(
                     format!(
@@ -235,9 +258,11 @@ mod tests {
     fn test_create_physical_plan_for_linear_scan() {
         let planner = DefaultPhysicalPlanner::new();
         let plan = mock_scan_plan();
+        let expected_logical_plan = plan.clone();
         let job = planner
             .create_physical_plan(RequestId::new(), plan)
             .expect("plan should succeed");
+        assert_eq!(job.logical_plan().as_ref(), &expected_logical_plan);
 
         let stage = job.stage();
         assert_eq!(stage.tasks().len(), 1);

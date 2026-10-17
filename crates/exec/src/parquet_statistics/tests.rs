@@ -366,7 +366,7 @@ fn exact_footer_bounds_skip_row_groups_and_reader_returns_same_matching_rows() {
         .build()
         .expect("build reader over selected groups");
     let selected_rows = reader
-        .map(|batch| {
+        .flat_map(|batch| {
             let batch = batch.expect("read selected row group");
             let values = batch
                 .column(0)
@@ -375,7 +375,6 @@ fn exact_footer_bounds_skip_row_groups_and_reader_returns_same_matching_rows() {
                 .expect("int64 output");
             (0..values.len()).map(|row| values.value(row)).collect::<Vec<_>>()
         })
-        .flatten()
         .collect::<Vec<_>>();
     assert_eq!(selected_rows, vec![10, 11]);
 }
@@ -442,7 +441,7 @@ fn page_indexes_select_only_possible_rows_and_missing_indexes_fail_open() {
         .build()
         .expect("apply page-derived row selection");
     let selected_rows = reader
-        .map(|batch| {
+        .flat_map(|batch| {
             let batch = batch.expect("read selected page ranges");
             let values = batch
                 .column(0)
@@ -454,7 +453,6 @@ fn page_indexes_select_only_possible_rows_and_missing_indexes_fail_open() {
                 .filter(|value| (900..1000).contains(value))
                 .collect::<Vec<_>>()
         })
-        .flatten()
         .collect::<Vec<_>>();
     assert_eq!(selected_rows, (900..1000).collect::<Vec<_>>());
 
@@ -972,7 +970,7 @@ fn parquet_bloom_filter_prunes_row_group_without_losing_matching_rows() {
         .build()
         .expect("build reader for Bloom-selected row groups");
     let values = reader
-        .map(|batch| {
+        .flat_map(|batch| {
             let batch = batch.expect("read selected row group");
             let values = batch
                 .column(0)
@@ -981,7 +979,6 @@ fn parquet_bloom_filter_prunes_row_group_without_losing_matching_rows() {
                 .expect("int64 output");
             (0..values.len()).map(|row| values.value(row)).collect::<Vec<_>>()
         })
-        .flatten()
         .filter(|value| *value == matching_value)
         .collect::<Vec<_>>();
     assert_eq!(values, vec![matching_value]);

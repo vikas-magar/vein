@@ -18,6 +18,7 @@ fn builds_recursive_sort_and_limit_nodes_without_duplicate_task_windows() {
         url: url.to_owned(),
         options: Vec::new(),
         files: Vec::new(),
+        source_metadata: None,
         schema: Box::new(schema.clone()),
     };
     let join = LogicalPlan::Join {
@@ -79,6 +80,7 @@ fn recursive_lowering_fuses_adjacent_transforms_above_join() {
         url: name.to_owned(),
         options: Vec::new(),
         files: Vec::new(),
+        source_metadata: None,
         schema: Box::new(schema.clone()),
     };
     let join = LogicalPlan::Join {
@@ -137,6 +139,7 @@ fn recursive_lowering_fuses_source_filter_and_projection_into_pipeline() {
         url: "memory://source".to_owned(),
         options: Vec::new(),
         files: Vec::new(),
+        source_metadata: None,
         schema: Box::new(input_schema.clone()),
     };
     let filter = LogicalPlan::Filter {
@@ -182,6 +185,7 @@ fn recursive_lowering_names_unsupported_logical_operators() {
             url: "memory://source".to_owned(),
             options: Vec::new(),
             files: Vec::new(),
+            source_metadata: None,
             schema: Box::new(schema.clone()),
         }),
         name: "custom_call".to_owned(),

@@ -1,4 +1,5 @@
 use std::time::Instant;
+use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
@@ -169,7 +170,7 @@ impl BuildSink {
     /// Finish either the retained hash table or its spill run.
     pub(crate) fn finish_with_spill(mut self) -> Result<BuildResult> {
         if let Some(table) = self.table.take() {
-            return Ok(BuildResult::InMemory(table));
+            return Ok(BuildResult::InMemory(Arc::new(table)));
         }
         let run = self
             .spill_writer
@@ -187,7 +188,7 @@ impl BuildSink {
 }
 
 pub(crate) enum BuildResult {
-    InMemory(HashTable),
+    InMemory(Arc<HashTable>),
     Spilled { run: JoinSpillRun, schema: JoinSpillSchema },
 }
 

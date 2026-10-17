@@ -36,6 +36,32 @@ pub struct ScanFile {
     pub scan_unit_range: Option<std::ops::Range<usize>>,
 }
 
+/// Inputs required to construct one source scan.
+pub struct ScanSourceConfig {
+    /// Storage operator used to read the source files.
+    pub operator: Operator,
+    /// Source files and their reader-defined unit ranges.
+    pub files: Vec<ScanFile>,
+    /// Encoding format of the files.
+    pub format: FileFormat,
+    /// Columns emitted by the scan.
+    pub projected: VeinSchemaRef,
+    /// Projected columns whose Parquet dictionary encoding should be retained.
+    pub dictionary_columns: Vec<u32>,
+    /// Predicate evaluated by the source reader before materializing rows.
+    pub pushdown: Option<Arc<ScanPredicate>>,
+    /// Query-local necessary-condition filters for source adapters.
+    pub runtime_filters: RuntimeFilterSet,
+    /// Shared metadata cache used by format readers.
+    pub metadata_store: MetadataStore,
+    /// Functions available to compiled scan predicates.
+    pub registry: Arc<FunctionRegistry>,
+    /// Background collector for lazily computed source statistics.
+    pub runtime_statistics: RuntimeStatisticsStore,
+    /// Scan identity and coverage information for synopsis completion.
+    pub statistics_scan: Option<RuntimeStatisticsScan>,
+}
+
 /// Reads local Parquet files into the execution pipeline.
 pub struct ScanSource {
     operator: Operator,
@@ -61,84 +87,20 @@ pub struct ScanSource {
 }
 
 impl ScanSource {
-    /// Creates a scan over the provided files.
-    pub fn new(
-        operator: Operator,
-        files: Vec<ScanFile>,
-        format: FileFormat,
-        projected: VeinSchemaRef,
-        dictionary_columns: Vec<u32>,
-        pushdown: Option<Arc<ScanPredicate>>,
-        metadata_store: MetadataStore,
-        registry: Arc<FunctionRegistry>,
-    ) -> Self {
-        Self::new_with_runtime_filters(
-            operator,
-            files,
-            format,
-            projected,
-            dictionary_columns,
-            pushdown,
-            metadata_store,
-            registry,
-            RuntimeFilterSet::empty(),
-        )
-    }
-
-    /// Creates a scan that may apply query-local runtime filters before reading
-    /// the projected payload columns.
-    pub fn new_with_runtime_filters(
-        operator: Operator,
-        files: Vec<ScanFile>,
-        format: FileFormat,
-        projected: VeinSchemaRef,
-        dictionary_columns: Vec<u32>,
-        pushdown: Option<Arc<ScanPredicate>>,
-        metadata_store: MetadataStore,
-        registry: Arc<FunctionRegistry>,
-        runtime_filters: RuntimeFilterSet,
-    ) -> Self {
-        Self::new_with_runtime_statistics(
-            operator,
-            files,
-            format,
-            projected,
-            dictionary_columns,
-            pushdown,
-            metadata_store,
-            registry,
-            runtime_filters,
-            RuntimeStatisticsStore::default(),
-            None,
-        )
-    }
-
-    /// Creates a scan that collects bounded synopses while emitting source batches.
-    pub fn new_with_runtime_statistics(
-        operator: Operator,
-        files: Vec<ScanFile>,
-        format: FileFormat,
-        projected: VeinSchemaRef,
-        dictionary_columns: Vec<u32>,
-        pushdown: Option<Arc<ScanPredicate>>,
-        metadata_store: MetadataStore,
-        registry: Arc<FunctionRegistry>,
-        runtime_filters: RuntimeFilterSet,
-        runtime_statistics: RuntimeStatisticsStore,
-        statistics_scan: Option<RuntimeStatisticsScan>,
-    ) -> Self {
+    /// Creates a scan from its source and runtime options.
+    pub fn new(config: ScanSourceConfig) -> Self {
         Self {
-            operator,
-            files,
-            format,
-            projected,
-            dictionary_columns,
-            pushdown,
-            runtime_filters,
-            metadata_store,
-            registry,
-            runtime_statistics,
-            statistics_scan,
+            operator: config.operator,
+            files: config.files,
+            format: config.format,
+            projected: config.projected,
+            dictionary_columns: config.dictionary_columns,
+            pushdown: config.pushdown,
+            runtime_filters: config.runtime_filters,
+            metadata_store: config.metadata_store,
+            registry: config.registry,
+            runtime_statistics: config.runtime_statistics,
+            statistics_scan: config.statistics_scan,
             query_statistics: None,
             bytes_read: Arc::new(AtomicU64::new(0)),
         }
@@ -160,18 +122,20 @@ impl Source<DataChunkView> for ScanSource {
         match self.format {
             FileFormat::Parquet => {
                 parquet::execute_parquet_scan(
-                    &self.operator,
-                    &self.files,
-                    &self.projected,
-                    &self.dictionary_columns,
-                    self.pushdown.as_deref(),
-                    &self.metadata_store,
-                    &self.registry,
-                    &self.bytes_read,
-                    &self.runtime_filters,
-                    &self.runtime_statistics,
-                    self.statistics_scan.as_ref(),
-                    self.query_statistics.as_ref(),
+                    parquet::ParquetScanRequest {
+                        operator: &self.operator,
+                        files: &self.files,
+                        projected: &self.projected,
+                        dictionary_columns: &self.dictionary_columns,
+                        pushdown: self.pushdown.as_deref(),
+                        metadata_store: &self.metadata_store,
+                        registry: &self.registry,
+                        bytes_read: &self.bytes_read,
+                        runtime_filters: &self.runtime_filters,
+                        runtime_statistics: &self.runtime_statistics,
+                        statistics_scan: self.statistics_scan.as_ref(),
+                        query_statistics: self.query_statistics.as_ref(),
+                    },
                     next,
                 )
                     .await?

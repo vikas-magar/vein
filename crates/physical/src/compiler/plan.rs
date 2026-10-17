@@ -221,8 +221,8 @@ impl PipelineCompiler {
     ) -> Result<(DataSource, MicroProgram, VeinSchema, VeinSchema)> {
         let mut dictionary_group_ids = Vec::new();
         let (mut source, scan_schema) = Self::collect_leaf_source(plan, &mut dictionary_group_ids)?;
-        if let DataSource::File(scan) = &mut source {
-            if scan.pushdown.is_none() {
+        if let DataSource::File(scan) = &mut source
+            && scan.pushdown.is_none() {
                 scan.dictionary_columns = scan_schema
                     .fields
                     .iter()
@@ -234,7 +234,6 @@ impl PipelineCompiler {
                     .filter_map(|(index, _)| u32::try_from(index).ok())
                     .collect();
             }
-        }
         // `RegId` is wide enough for any schema, so the scan no longer has a
         // column-count ceiling (`02-execution-and-vir-lld.md` §2).
         let register_count = scan_schema.fields.len() as RegId;
@@ -396,6 +395,10 @@ impl PipelineCompiler {
         dictionary_group_ids: &mut Vec<plan::schema::ColumnId>,
     ) -> Result<(DataSource, VeinSchema)> {
         match plan {
+            LogicalPlan::Intermediate { source_id, schema, .. } => Ok((
+                DataSource::Intermediate(common::identifiers::IntermediateSourceId::from_raw(*source_id)),
+                (**schema).clone(),
+            )),
             LogicalPlan::Scan {
                 table,
                 projection,
@@ -469,6 +472,7 @@ impl PipelineCompiler {
                 options,
                 files,
                 schema,
+                ..
             } => {
                 if options.iter().any(|(key, value)| {
                     key.eq_ignore_ascii_case("format") && !value.eq_ignore_ascii_case("parquet")
@@ -492,11 +496,10 @@ impl PipelineCompiler {
             } => {
                 let (keys, _) = grouping_layout(grouping_sets)?;
                 for key in keys {
-                    if let LogicalExpr::Column(column) = key {
-                        if !dictionary_group_ids.contains(&column.id) {
+                    if let LogicalExpr::Column(column) = key
+                        && !dictionary_group_ids.contains(&column.id) {
                             dictionary_group_ids.push(column.id);
                         }
-                    }
                 }
                 Self::collect_leaf_source(input, dictionary_group_ids)
             }
@@ -836,6 +839,7 @@ impl PipelineCompiler {
                 Ok(input_schema)
             }
             LogicalPlan::ExternalScan { .. } => Ok(input_schema),
+            LogicalPlan::Intermediate { .. } => Ok(input_schema),
             LogicalPlan::Write { input, .. } => Self::compile_node(input, input_schema, compiler),
             // A limit changes no column, only how many rows come out: the window
             // is applied by the executor, so the program sees straight through.

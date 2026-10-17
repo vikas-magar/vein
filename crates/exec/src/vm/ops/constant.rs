@@ -37,7 +37,7 @@ pub fn literal_to_array(literal: &LogicalLiteral, row_count: usize) -> Result<Ar
         LogicalLiteral::Int64(v) => Arc::new(Int64Array::from(vec![*v; row_count])),
         LogicalLiteral::Float64(v) => Arc::new(Float64Array::from(vec![*v; row_count])),
         LogicalLiteral::String(v) => {
-            let iter = std::iter::repeat(v.as_str()).take(row_count);
+            let iter = std::iter::repeat_n(v.as_str(), row_count);
             Arc::new(StringArray::from_iter_values(iter))
         }
         // `Date32` is a day count and `Time64`/`Timestamp` are microsecond
@@ -48,11 +48,11 @@ pub fn literal_to_array(literal: &LogicalLiteral, row_count: usize) -> Result<Ar
         LogicalLiteral::Interval { months, days, nanos } => {
             let value = IntervalMonthDayNano::new(*months, *days, *nanos);
             Arc::new(IntervalMonthDayNanoArray::from_iter_values(
-                std::iter::repeat(value).take(row_count),
+                std::iter::repeat_n(value, row_count),
             ))
         }
         LogicalLiteral::Decimal(v, precision, scale) => {
-            let values = std::iter::repeat(*v).take(row_count);
+            let values = std::iter::repeat_n(*v, row_count);
             Arc::new(
                 Decimal128Array::from_iter_values(values)
                     .with_precision_and_scale(*precision, *scale)

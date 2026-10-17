@@ -117,10 +117,7 @@ pub fn existence_probe_rows(
     let matched: std::collections::HashSet<u32> =
         matches.iter().map(|(probe, _)| *probe).collect();
     probe_rows
-        .filter_map(|probe| {
-            let has_match = matched.contains(&probe);
-            (has_match == (join_type == JoinType::Semi)).then_some(probe)
-        })
+        .filter(|probe| matched.contains(probe) == (join_type == JoinType::Semi))
         .collect()
 }
 

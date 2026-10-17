@@ -213,10 +213,10 @@ fn interval_magnitude(value: &str) -> (bool, &str) {
     }
 }
 
-fn split_interval_fields<'a>(
-    value: &'a str,
+fn split_interval_fields(
+    value: &str,
     separator: char,
-) -> Result<(&'a str, &'a str)> {
+) -> Result<(&str, &str)> {
     let mut fields = value.split(separator);
     let first = fields.next().unwrap_or_default();
     let second = fields.next().unwrap_or_default();

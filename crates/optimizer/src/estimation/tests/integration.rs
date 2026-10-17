@@ -32,6 +32,40 @@ fn pipeline_uses_injected_provider_once_per_scan_and_preserves_the_plan() {
     assert_eq!(diagnostics.cardinalities[0].rows.value(), Some(321.0));
 }
 
+#[test]
+fn resolved_external_scan_uses_the_shared_table_statistics_provider() {
+    let provider = CountingProvider {
+        calls: AtomicUsize::new(0),
+        statistics: TableStatistics { num_rows: Some(321), ..Default::default() },
+    };
+    let LogicalPlan::Scan { table, schema, .. } = scan(42, Some(100), Some(10), Some(0)) else {
+        unreachable!();
+    };
+    let external = LogicalPlan::ExternalScan {
+        url: "file:///source".into(),
+        options: vec![],
+        files: vec![],
+        source_metadata: Some(table),
+        schema,
+    };
+
+    let estimate = StatisticsEstimator::new(&provider).estimate_plan(&external);
+    assert_eq!(estimate.last().unwrap().rows.value(), Some(321.0));
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+
+    let LogicalPlan::ExternalScan { schema, .. } = external else { unreachable!(); };
+    let unresolved = LogicalPlan::ExternalScan {
+        url: "s3://unresolved/source".into(),
+        options: vec![],
+        files: vec![],
+        source_metadata: None,
+        schema,
+    };
+    let estimate = StatisticsEstimator::new(&CatalogStatisticsProvider).estimate_plan(&unresolved);
+    assert_eq!(estimate.last().unwrap().rows.value(), None);
+    assert_eq!(estimate.last().unwrap().rows.source, EstimateSource::MissingStatistics);
+}
+
 struct CustomSelectivity;
 impl SelectivityEstimator for CustomSelectivity {
     fn estimate(&self, _: &LogicalExpr, _: &dyn ColumnStatisticsLookup) -> PredicateEstimate {

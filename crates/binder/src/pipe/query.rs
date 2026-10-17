@@ -216,11 +216,12 @@ pub async fn bind_source<'a>(
                 .collect();
             let table = context.resolve_table(url).await;
 
-            let (schema, files, detected_format) = match table {
+            let (schema, files, detected_format, source_metadata) = match table {
                 Ok(tbl) => (
                     tbl.schema.clone(),
                     tbl.files.clone(),
                     tbl.format.as_ref().map(|f| f.to_string()),
+                    Some(tbl),
                 ),
                 Err(_error)
                 if options
@@ -230,6 +231,7 @@ pub async fn bind_source<'a>(
                         (
                             Arc::new(VeinSchema { fields: vec![] }),
                             vec![url.to_string()],
+                            None,
                             None,
                         )
                     }
@@ -254,19 +256,19 @@ pub async fn bind_source<'a>(
                 aliases: vec![qualifier.clone().unwrap_or_default()],
             });
 
-            if let Some(fmt) = detected_format {
-                if !options
+            if let Some(fmt) = detected_format
+                && !options
                     .iter()
                     .any(|(k, _)| k.eq_ignore_ascii_case("format"))
                 {
                     options.push(("format".to_string(), fmt));
                 }
-            }
 
             Ok(LogicalPlan::ExternalScan {
                 url: url.to_string(),
                 options,
                 files,
+                source_metadata,
                 schema: Box::new(VeinSchema { fields: columns }),
             })
         }

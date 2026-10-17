@@ -1,4 +1,6 @@
+use super::super::projection::dictionary_schema_hint;
 use super::*;
+use types::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
 
 #[test]
 fn dictionary_schema_hint_changes_only_requested_utf8_fields() {

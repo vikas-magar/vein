@@ -37,7 +37,9 @@ mod reader;
 
 use file::prepare_parquet_file;
 use metrics::ScanPredicateMetrics;
-use page_header_reader::{PageHeaderReadResult, read_page_header_statistics};
+use page_header_reader::{
+    PageHeaderReadRequest, PageHeaderReadResult, read_page_header_statistics,
+};
 use page_pruning::{
     attach_header_page_locations, page_header_audit_enabled, page_payload_pruning_metrics,
 };
@@ -51,22 +53,42 @@ use reader::{IoStats, OpendalParquetReader, thread_cpu_time};
 /// constant, so a footer parsed once is found by the other side. It moves to a
 /// dedicated Parquet catalog crate together with the rest of this format.
 pub const PARQUET_FOOTER: MetadataKind = MetadataKind::new("parquet.footer");
+
+/// Borrowed inputs for one Parquet scan invocation.
+pub(super) struct ParquetScanRequest<'a> {
+    pub(super) operator: &'a Operator,
+    pub(super) files: &'a [ScanFile],
+    pub(super) projected: &'a VeinSchema,
+    pub(super) dictionary_columns: &'a [u32],
+    pub(super) pushdown: Option<&'a ScanPredicate>,
+    pub(super) metadata_store: &'a MetadataStore,
+    pub(super) registry: &'a Arc<FunctionRegistry>,
+    pub(super) bytes_read: &'a Arc<AtomicU64>,
+    pub(super) runtime_filters: &'a RuntimeFilterSet,
+    pub(super) runtime_statistics: &'a RuntimeStatisticsStore,
+    pub(super) statistics_scan: Option<&'a RuntimeStatisticsScan>,
+    pub(super) query_statistics: Option<&'a Arc<common::statistics::QueryStatisticsContext>>,
+}
+
 /// Executes a scan over a list of Parquet files
-pub async fn execute_parquet_scan(
-    operator: &Operator,
-    files: &[ScanFile],
-    projected: &VeinSchema,
-    dictionary_columns: &[u32],
-    pushdown: Option<&ScanPredicate>,
-    metadata_store: &MetadataStore,
-    registry: &Arc<FunctionRegistry>,
-    bytes_read: &Arc<AtomicU64>,
-    runtime_filters: &RuntimeFilterSet,
-    runtime_statistics: &RuntimeStatisticsStore,
-    statistics_scan: Option<&RuntimeStatisticsScan>,
-    query_statistics: Option<&Arc<common::statistics::QueryStatisticsContext>>,
+pub(super) async fn execute_parquet_scan(
+    request: ParquetScanRequest<'_>,
     next: &mut dyn PipelineNode<DataChunkView>,
 ) -> Result<()> {
+    let ParquetScanRequest {
+        operator,
+        files,
+        projected,
+        dictionary_columns,
+        pushdown,
+        metadata_store,
+        registry,
+        bytes_read,
+        runtime_filters,
+        runtime_statistics,
+        statistics_scan,
+        query_statistics,
+    } = request;
     'files: for file in files {
         let path = file.relative.as_str();
         let scan_started = Instant::now();
@@ -259,17 +281,17 @@ pub async fn execute_parquet_scan(
         let page_header_result = if page_header_columns.is_empty() {
             PageHeaderReadResult::default()
         } else {
-            read_page_header_statistics(
+            read_page_header_statistics(PageHeaderReadRequest {
                 operator,
                 path,
                 file_size_bytes,
-                bytes_read.clone(),
-                Arc::clone(&io),
-                builder.schema().as_ref(),
-                builder.metadata(),
-                &page_header_columns,
-                &header_row_groups,
-            )
+                bytes_read,
+                io: &io,
+                arrow_schema: builder.schema().as_ref(),
+                metadata: builder.metadata(),
+                needed_columns: &page_header_columns,
+                row_groups: &header_row_groups,
+            })
                 .await
         };
         let header_pages_loaded = page_header_result.metrics.pages_scanned;
@@ -1034,13 +1056,15 @@ pub async fn execute_parquet_scan(
 
     if let Some(scan) = statistics_scan {
         let queued = runtime_statistics.enqueue_partition_completion(
-            scan.scan_id,
-            &scan.table_key,
-            scan.expected_rows,
-            scan.partition_count,
-            scan.row_coverage_candidate,
-            scan.partition_index,
-            query_statistics.cloned(),
+            common::statistics::runtime::RuntimeStatisticsPartitionCompletion {
+                scan_id: scan.scan_id,
+                table_key: &scan.table_key,
+                expected_rows: scan.expected_rows,
+                expected_partitions: scan.partition_count,
+                table_scan_candidate: scan.row_coverage_candidate,
+                partition_index: scan.partition_index,
+                query_context: query_statistics.cloned(),
+            },
         );
         if !queued {
             tracing::debug!(

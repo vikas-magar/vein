@@ -207,8 +207,10 @@ pub fn prune_data_pages_with_headers(
         return full_row_group_selections(row_groups);
     }
 
-    let mut pruning = PagePruning::default();
-    pruning.predicate_diagnostics = PredicatePruningDiagnostics::for_predicates(predicates);
+    let mut pruning = PagePruning {
+        predicate_diagnostics: PredicatePruningDiagnostics::for_predicates(predicates),
+        ..PagePruning::default()
+    };
     let row_group_metadata = metadata.row_groups();
     for row_group_index in row_groups {
         let Some(row_group) = row_group_metadata.get(*row_group_index) else {

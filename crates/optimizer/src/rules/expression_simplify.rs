@@ -236,11 +236,10 @@ fn simplify_binary(
         }
     }
 
-    if return_type == VeinDataType::Int64 {
-        if let Some(result) = simplify_integer_identity(&left, op, &right) {
+    if return_type == VeinDataType::Int64
+        && let Some(result) = simplify_integer_identity(&left, op, &right) {
             return result;
         }
-    }
 
     LogicalExpr::BinaryOp {
         left: Box::new(left),

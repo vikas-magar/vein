@@ -23,6 +23,11 @@ use parquet::arrow::arrow_reader::{
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use plan::{CatalogProvider, TableFormat, TableMetadata, VeinSchema};
 
+type ParquetSchema = Arc<arrow::datatypes::Schema>;
+type ParsedParquetFooter = (ParquetSchema, Arc<ParquetMetaData>, bool);
+type ParsedParquetFooterResult = Result<ParsedParquetFooter>;
+type ParsedParquetFooterSlots = Mutex<Vec<Option<ParsedParquetFooterResult>>>;
+
 mod analysis;
 mod statistics;
 
@@ -318,10 +323,8 @@ fn inspect_table_files(
 fn parquet_schemas(
     files: &[PathBuf],
     metadata_store: &MetadataStore,
-) -> Result<Vec<(Arc<arrow::datatypes::Schema>, Arc<ParquetMetaData>, bool)>> {
-    let slots: Mutex<
-        Vec<Option<Result<(Arc<arrow::datatypes::Schema>, Arc<ParquetMetaData>, bool)>>>,
-    > =
+) -> Result<Vec<ParsedParquetFooter>> {
+    let slots: ParsedParquetFooterSlots =
         Mutex::new((0..files.len()).map(|_| None).collect());
     let next = AtomicUsize::new(0);
     let workers = std::thread::available_parallelism()
@@ -374,17 +377,16 @@ fn parquet_schema(
     metadata_store: &MetadataStore,
 ) -> Result<(Arc<arrow::datatypes::Schema>, Arc<ParquetMetaData>, bool)> {
     let key = MetadataKey::for_file(PARQUET_FOOTER, path);
-    if let Some(key) = &key {
-        if let Some(metadata) = metadata_store.get::<ParquetMetaData>(key) {
-            let reader = ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::new())
-                .map_err(|error| {
-                    VeinError::internal(format!(
-                        "derive Arrow schema from '{}': {error}",
-                        path.display()
-                    ))
-                })?;
-            return Ok((reader.schema().clone(), metadata, true));
-        }
+    if let Some(key) = &key
+        && let Some(metadata) = metadata_store.get::<ParquetMetaData>(key) {
+        let reader = ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::new())
+            .map_err(|error| {
+                VeinError::internal(format!(
+                    "derive Arrow schema from '{}': {error}",
+                    path.display()
+                ))
+            })?;
+        return Ok((reader.schema().clone(), metadata, true));
     }
 
     let file = File::open(path)

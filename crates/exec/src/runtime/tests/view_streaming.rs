@@ -77,21 +77,22 @@ async fn view_and_arrow_results_share_execution_for_join_sort_limit() {
         .unwrap();
     assert_eq!(views.row_count, 2);
     let mut actual = Vec::new();
-    let source_arrays = builder.source_arrays.lock().unwrap();
-    for batch in &views.output {
-        for row in 0..batch.num_rows() {
-            let (array, source_row) = batch.view().resolve(0, row).unwrap().unwrap();
-            let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            assert!(
-                source_arrays
-                    .iter()
-                    .any(|source| std::ptr::eq(source.as_ref(), values))
-            );
-            actual.push(values.value(source_row));
+    {
+        let source_arrays = builder.source_arrays.lock().unwrap();
+        for batch in &views.output {
+            for row in 0..batch.num_rows() {
+                let (array, source_row) = batch.view().resolve(0, row).unwrap().unwrap();
+                let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                assert!(
+                    source_arrays
+                        .iter()
+                        .any(|source| std::ptr::eq(source.as_ref(), values))
+                );
+                actual.push(values.value(source_row));
+            }
         }
     }
     assert_eq!(actual, vec![2, 3]);
-    drop(source_arrays);
     let arrow = runner
         .execute(&task, CancellationToken::new())
         .await

@@ -75,7 +75,7 @@ impl ParquetStorage {
         identifier: String,
         path: &Path,
     ) -> Result<StatisticsSourceIdentity> {
-        let metadata = fs::metadata(&path)
+        let metadata = fs::metadata(path)
             .map_err(|error| VeinError::io(format!("read source identity for '{}'", path.display()), error))?;
         let modified_nanos = metadata
             .modified()
@@ -508,7 +508,12 @@ fn table_commit_lock(root: &Path, table: &str) -> Result<File> {
     let lock_dir = root.join(".vein").join("locks");
     fs::create_dir_all(&lock_dir).map_err(|error| VeinError::io("create table lock directory", error))?;
     let lock_path = lock_dir.join(format!("{}.lock", safe_table_name(table)?));
-    let lock = OpenOptions::new().read(true).write(true).create(true).open(&lock_path)
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
         .map_err(|error| VeinError::io(format!("open table lock '{}'", lock_path.display()), error))?;
     lock.lock().map_err(|error| VeinError::io(format!("lock table '{}' for commit", table), error))?;
     Ok(lock)
@@ -629,7 +634,7 @@ mod tests {
             ("events", vec![("mode".into(), "append".into()), ("MODE".into(), "create".into())], "duplicate WRITE option"),
             ("events", vec![("partition_id".into(), "0".into())], "reserved for the execution engine"),
         ] {
-            let error = storage.validate_target(destination, &options).err().expect("invalid target should fail preflight");
+            let error = storage.validate_target(destination, &options).expect_err("invalid target should fail preflight");
             assert!(error.to_string().contains(expected), "unexpected error: {error}");
         }
     }

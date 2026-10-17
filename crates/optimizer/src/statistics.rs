@@ -37,19 +37,69 @@ pub(super) fn distance(a: &LogicalLiteral, b: &LogicalLiteral) -> Option<f64> {
     distance.is_finite().then_some(distance)
 }
 
+/// Why an individual column synopsis cannot be used for estimation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColumnStatisticsValidationError {
+    NullCountExceedsRows,
+    NullsInNonNullableColumn,
+    DistinctCountExceedsNonNullRows,
+    ZeroDistinctForNonEmptyPopulation,
+    NullBound,
+    NonFiniteBound,
+    IncomparableBounds,
+    ReversedBounds,
+    ConstantBoundsWithMultipleDistinctValues,
+    BoundsForAllNullPopulation,
+}
+
 /// Validates population and supported bound invariants before any statistics
 /// consumer uses them. NDV is a non-null count and is never a uniqueness proof.
-pub(crate) fn valid_column(stats: &plan::ColumnStatistics, rows: u64, nullable: bool) -> bool {
+pub(crate) fn validate_column(
+    stats: &plan::ColumnStatistics,
+    rows: u64,
+    nullable: bool,
+) -> Result<(), ColumnStatisticsValidationError> {
     let nulls = stats.null_count;
-    if nulls.is_some_and(|n| n > rows || (!nullable && n != 0))
-        || stats.distinct_count.is_some_and(|d| d > rows - nulls.unwrap_or(0))
-        || (rows > nulls.unwrap_or(0) && stats.distinct_count == Some(0))
-    { return false; }
+    if nulls.is_some_and(|n| n > rows) {
+        return Err(ColumnStatisticsValidationError::NullCountExceedsRows);
+    }
+    if nulls.is_some_and(|n| !nullable && n != 0) {
+        return Err(ColumnStatisticsValidationError::NullsInNonNullableColumn);
+    }
+    let non_null_rows = rows - nulls.unwrap_or(0);
+    if stats.distinct_count.is_some_and(|distinct| distinct > non_null_rows) {
+        return Err(ColumnStatisticsValidationError::DistinctCountExceedsNonNullRows);
+    }
+    if non_null_rows > 0 && stats.distinct_count == Some(0) {
+        return Err(ColumnStatisticsValidationError::ZeroDistinctForNonEmptyPopulation);
+    }
     let min = stats.min_value.as_ref();
     let max = stats.max_value.as_ref();
-    !(min.into_iter().chain(max).any(|v| matches!(v, LogicalLiteral::Null(_))
-        || matches!(v, LogicalLiteral::Float64(v) if !v.is_finite()))
-        || min.zip(max).is_some_and(|(a, b)| compare(a, b).is_none_or(|o| o.is_gt()
-        || (o.is_eq() && stats.distinct_count.is_some_and(|d| d > 1))))
-        || (nulls == Some(rows) && (min.is_some() || max.is_some())))
+    if min.into_iter().chain(max).any(|value| matches!(value, LogicalLiteral::Null(_))) {
+        return Err(ColumnStatisticsValidationError::NullBound);
+    }
+    if min.into_iter().chain(max).any(|value| {
+        matches!(value, LogicalLiteral::Float64(value) if !value.is_finite())
+    }) {
+        return Err(ColumnStatisticsValidationError::NonFiniteBound);
+    }
+    if let Some((minimum, maximum)) = min.zip(max) {
+        let Some(order) = compare(minimum, maximum) else {
+            return Err(ColumnStatisticsValidationError::IncomparableBounds);
+        };
+        if order.is_gt() {
+            return Err(ColumnStatisticsValidationError::ReversedBounds);
+        }
+        if order.is_eq() && stats.distinct_count.is_some_and(|distinct| distinct > 1) {
+            return Err(ColumnStatisticsValidationError::ConstantBoundsWithMultipleDistinctValues);
+        }
+    }
+    if nulls == Some(rows) && (min.is_some() || max.is_some()) {
+        return Err(ColumnStatisticsValidationError::BoundsForAllNullPopulation);
+    }
+    Ok(())
+}
+
+pub(crate) fn valid_column(stats: &plan::ColumnStatistics, rows: u64, nullable: bool) -> bool {
+    validate_column(stats, rows, nullable).is_ok()
 }

@@ -30,6 +30,7 @@ use crate::rules::{
     ScanStatisticsPruningRule, ScalarAggregateDecorrelationRule,
 };
 use crate::rules::join_order::JoinOrderRule;
+use crate::rules::CheckpointJoinFilterRule;
 
 /// The engine-facing optimizer seam.
 ///
@@ -92,6 +93,7 @@ impl OptimizerPipeline {
             Arc::new(FilterTransitivityRule),
             Arc::new(ScanStatisticsPruningRule),
             Arc::new(JoinPredicateTransitivityRule),
+            Arc::new(CheckpointJoinFilterRule),
             Arc::new(ExistsDecorrelationRule),
             Arc::new(ScalarAggregateDecorrelationRule),
             Arc::new(PredicatePushdownRule),

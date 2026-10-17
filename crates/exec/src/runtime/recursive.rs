@@ -1,21 +1,24 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct RecursiveExecutionContext<'a> {
+    pub(super) task: &'a ExecuteTask,
+    pub(super) cancel: &'a CancellationToken,
+    pub(super) memory: &'a QueryMemoryTracker,
+    pub(super) span: &'a tracing::Span,
+    pub(super) schedule: &'a PipelineExecutionSchedule,
+    pub(super) trace: &'a ExecutionTrace,
+}
+
 impl DefaultTaskExecutor {
     pub(super) fn execute_input<'a>(
         &'a self,
         input: &'a Arc<PhysicalPlanNode>,
         next: Box<dyn PipelineNode<DataChunkView>>,
-        task: &'a ExecuteTask,
-        cancel: &'a CancellationToken,
-        memory: &'a QueryMemoryTracker,
-        span: &'a tracing::Span,
-        schedule: &'a PipelineExecutionSchedule,
-        trace: &'a ExecutionTrace,
+        context: &'a RecursiveExecutionContext<'a>,
         depth: usize,
     ) -> Pin<Box<dyn Future<Output=Result<u64>> + Send + 'a>> {
-        self.execute_input_with_runtime_filters(
-            input, next, task, cancel, memory, span, schedule, trace, None, depth,
-        )
+        self.execute_input_with_runtime_filters(input, next, context, None, depth)
     }
 
     /// Execute one input node with filters scoped to its direct source.
@@ -25,15 +28,18 @@ impl DefaultTaskExecutor {
         &'a self,
         input: &'a Arc<PhysicalPlanNode>,
         next: Box<dyn PipelineNode<DataChunkView>>,
-        task: &'a ExecuteTask,
-        cancel: &'a CancellationToken,
-        memory: &'a QueryMemoryTracker,
-        span: &'a tracing::Span,
-        schedule: &'a PipelineExecutionSchedule,
-        trace: &'a ExecutionTrace,
+        context: &'a RecursiveExecutionContext<'a>,
         runtime_filters: Option<Arc<RuntimeFilterSet>>,
         depth: usize,
     ) -> Pin<Box<dyn Future<Output=Result<u64>> + Send + 'a>> {
+        let RecursiveExecutionContext {
+            task,
+            cancel,
+            memory,
+            span,
+            schedule,
+            trace,
+        } = *context;
         let node_id = trace.node_id(input);
         let operator = input.operator.data_flow().operator;
         let node_span = tracing::debug_span!(
@@ -75,6 +81,27 @@ impl DefaultTaskExecutor {
                         program,
                         ..
                     } => {
+                        if let DataSource::Intermediate(source_id) = data_source.as_ref() {
+                            let mut source = self
+                                .intermediate_sources
+                                .source(task.query_id, *source_id)?;
+                            let mut pipeline = if program.instructions.is_empty() {
+                                next
+                            } else {
+                                self.builder.build_view_vm(program, next)?
+                            };
+                            tracing::info!(
+                                target: "vein.audit",
+                                event = "intermediate_source_started",
+                                query_id = %task.query_id,
+                                source_id = %source_id,
+                                task_id = %task.task_id,
+                                "replaying query-local checkpoint"
+                            );
+                            source.execute(pipeline.as_mut()).await?;
+                            trace.record_source_bytes(node_id, 0);
+                            return Ok(0);
+                        }
                         let max_parallelism = self.builder.max_parallelism().max(1);
                         let sources = self
                             .builder
@@ -472,12 +499,7 @@ impl DefaultTaskExecutor {
                             .execute_input(
                                 input,
                                 Box::new(TransformHandle(transform)),
-                                task,
-                                cancel,
-                                memory,
-                                span,
-                                schedule,
-                                trace,
+                                context,
                                 depth + 1,
                             )
                             .await?;
@@ -501,12 +523,7 @@ impl DefaultTaskExecutor {
                             .execute_input(
                                 child,
                                 handle,
-                                task,
-                                cancel,
-                                memory,
-                                span,
-                                schedule,
-                                trace,
+                                context,
                                 depth + 1,
                             )
                             .await?;
@@ -589,7 +606,7 @@ impl DefaultTaskExecutor {
                             None => sort,
                         };
                         let bytes = self
-                            .execute_input(child, next, task, cancel, memory, span, schedule, trace, depth + 1)
+                            .execute_input(child, next, context, depth + 1)
                             .await?;
                         schedule.complete_boundary(input, PipelineBoundaryKind::SortInput)?;
                         Ok(bytes)
@@ -599,12 +616,7 @@ impl DefaultTaskExecutor {
                         self.execute_input(
                             input,
                             Box::new(limit),
-                            task,
-                            cancel,
-                            memory,
-                            span,
-                            schedule,
-                            trace,
+                            context,
                             depth + 1,
                         )
                             .await
@@ -626,12 +638,7 @@ impl DefaultTaskExecutor {
                             .execute_input(
                                 build,
                                 Box::new(SharedBuildSink(Arc::clone(&build_sink))),
-                                task,
-                                cancel,
-                                memory,
-                                span,
-                                schedule,
-                                trace,
+                                context,
                                 depth + 1,
                             )
                             .await?;
@@ -677,7 +684,7 @@ impl DefaultTaskExecutor {
                         let join: Box<dyn PipelineNode<DataChunkView>> = match build_result {
                             BuildResult::InMemory(table) => {
                                 let join = HashJoin::new(
-                                    Arc::new(table),
+                                    table,
                                     join_type(plan.join_type)?,
                                     join_outputs(&plan.outputs),
                                     join_types(&plan.probe_types),
@@ -716,12 +723,7 @@ impl DefaultTaskExecutor {
                                     rows: Arc::clone(&probe_rows),
                                     batches: Arc::clone(&probe_batches),
                                 }),
-                                task,
-                                cancel,
-                                memory,
-                                span,
-                                schedule,
-                                trace,
+                                context,
                                 runtime_filters.clone(),
                                 depth + 1,
                             )

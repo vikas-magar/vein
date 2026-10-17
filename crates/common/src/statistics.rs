@@ -38,6 +38,8 @@ use std::collections::BinaryHeap;
 use crate::Result;
 
 mod accumulators;
+mod input;
+pub use input::StatisticsInput;
 pub use accumulators::StatisticsCollector;
 pub use runtime::{RuntimeStatisticsObservation, RuntimeStatisticsStore};
 pub use context::{
@@ -45,6 +47,10 @@ pub use context::{
     QuerySourceStatistics, QueryStatisticsContext, QueryStatisticsSnapshot,
 };
 pub use logging::TableStatisticsLog;
+
+/// Unambiguous synopsis key for a column in a query-local intermediate relation.
+/// Display names can repeat after joins; bound identities cannot alias inputs.
+pub fn intermediate_column_key(id: types::ColumnId) -> String { id.0.to_string() }
 #[cfg(test)]
 mod tests;
 

@@ -30,8 +30,8 @@ fn validate_node(node: &PhysicalPlanNode, path: &str, root: bool) -> Result<()> 
             input_schema,
             program,
         } => {
-            if let DataSource::File(scan) = source.as_ref() {
-                if scan.projected.as_ref() != input_schema.as_ref() {
+            if let DataSource::File(scan) = source.as_ref()
+                && scan.projected.as_ref() != input_schema.as_ref() {
                     return Err(invalid(
                         path,
                         format!(
@@ -40,7 +40,6 @@ fn validate_node(node: &PhysicalPlanNode, path: &str, root: bool) -> Result<()> 
                         ),
                     ));
                 }
-            }
             validate_program(
                 program,
                 input_schema,
@@ -520,14 +519,13 @@ fn validate_program(
     }
 
     let output_width = projected_width.unwrap_or(input_schema.fields.len());
-    if let Some(expected) = expected_output_width {
-        if output_width != expected {
+    if let Some(expected) = expected_output_width
+        && output_width != expected {
             return Err(invalid(
                 path,
                 format!("program emits {output_width} columns but node schema has {expected}"),
             ));
         }
-    }
     Ok(projected_width)
 }
 

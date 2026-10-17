@@ -92,9 +92,9 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
 
     for predicate in &filters {
         let mut terms = Vec::new();
-        split_conjunction(&predicate, &mut terms);
+        split_conjunction(predicate, &mut terms);
         for term in terms {
-            if let Some((inner, outer)) = equality_correlation(&term) {
+            if let Some((inner, outer)) = equality_correlation(term) {
                 if inner_base.schema().position_of_id(inner.id).is_none()
                     || input.schema().position_of_id(outer.id).is_none()
                 {
@@ -104,7 +104,7 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
                     ));
                 }
                 keys.push((inner, outer));
-            } else if contains_outer_column(&term) {
+            } else if contains_outer_column(term) {
                 return Err(VeinError::planning(
                     "correlated EXISTS currently requires outer references to be direct equality keys between inner and outer columns",
                     None,

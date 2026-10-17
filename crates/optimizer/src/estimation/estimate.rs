@@ -7,10 +7,16 @@ pub enum EstimateSource {
     Logical,
     /// Catalog or injected table statistics.
     Statistics,
+    /// Exact row count observed at a query-local adaptive checkpoint.
+    RuntimeFeedback,
     /// Predicate selectivity.
     Filter,
+    /// Low-confidence selectivity prior used when predicate statistics are unavailable.
+    SelectivityFallback,
     /// Join key distributions.
     Join,
+    /// Conservative join estimate used when join-key statistics are unavailable.
+    JoinSelectivityFallback,
     /// Grouping key distributions.
     Aggregate,
     /// A row-preserving or bounded operator.

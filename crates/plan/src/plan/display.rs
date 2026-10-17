@@ -278,6 +278,11 @@ fn node_line(plan: &LogicalPlan) -> String {
                 false,
             )
         }
+        LogicalPlan::Intermediate { source_id, row_count, .. } => (
+            "Intermediate".to_string(),
+            format!("source: {source_id:x}, observed_rows: {row_count}"),
+            false,
+        ),
         LogicalPlan::Filter { predicate, .. } => {
             ("Filter".to_string(), format!("predicate: {}", format_expr(predicate)), false)
         }
@@ -994,6 +999,7 @@ mod coverage {
                     url: "s3://bucket/data".to_string(),
                     options: vec![],
                     files: vec![],
+                    source_metadata: None,
                     schema: schema(vec![]),
                 },
                 "ExternalScan".to_string(),

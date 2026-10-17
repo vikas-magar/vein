@@ -518,11 +518,9 @@ mod tests {
         let commit = field(2, "commitdate", VeinDataType::Date32);
         let receipt = field(3, "receiptdate", VeinDataType::Date32);
         let cutoff = literal(LogicalLiteral::Date(9_131));
-        let original = vec![
-            comparison(column(&ship), BinaryOp::Lt, column(&commit)),
+        let original = [comparison(column(&ship), BinaryOp::Lt, column(&commit)),
             comparison(column(&commit), BinaryOp::Lt, column(&receipt)),
-            comparison(column(&receipt), BinaryOp::Lt, cutoff.clone()),
-        ];
+            comparison(column(&receipt), BinaryOp::Lt, cutoff.clone())];
         let plan = filter(
             filter(
                 filter(

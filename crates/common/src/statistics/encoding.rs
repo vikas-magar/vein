@@ -233,9 +233,7 @@ impl ArrowValueEncoder for ArrowScalarEncoder {
                 .map(LogicalLiteral::Timestamp),
             DataType::Decimal128(precision, scale) => array.as_any()
                 .downcast_ref::<Decimal128Array>()
-                .and_then(|values| u8::try_from(*precision).ok().map(|precision| {
-                    LogicalLiteral::Decimal(values.value(index), precision, *scale)
-                })),
+                .map(|values| LogicalLiteral::Decimal(values.value(index), *precision, *scale)),
             _ => None,
         }
     }

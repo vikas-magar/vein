@@ -595,11 +595,9 @@ mod tests {
         )
             .expect("create typed aggregate spill schema");
         let key: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(17)]));
-        let groups = vec![
-            sample_group(0, Some((Arc::clone(&key), 0)), 2),
+        let groups = [sample_group(0, Some((Arc::clone(&key), 0)), 2),
             sample_group(0, Some((Arc::clone(&key), 1)), 5),
-            sample_group(1, None, 7),
-        ];
+            sample_group(1, None, 7)];
         let mut bytes = Cursor::new(Vec::new());
         layout
             .write_run(&mut bytes, groups.iter().cloned())
@@ -687,7 +685,7 @@ mod tests {
         )
             .expect("dictionary source key");
         let key: ArrayRef = Arc::new(dict);
-        let groups = vec![sample_group(0, Some((key, 1)), 1)];
+        let groups = [sample_group(0, Some((key, 1)), 1)];
         let mut bytes = Cursor::new(Vec::new());
         layout
             .write_run(&mut bytes, groups.iter().cloned())
@@ -799,7 +797,7 @@ mod tests {
         let hashes = children
             .into_iter()
             .enumerate()
-            .map(|(partition, path)| {
+            .flat_map(|(partition, path)| {
                 let Some(path) = path else {
                     return Vec::new();
                 };
@@ -815,7 +813,6 @@ mod tests {
                 }
                 hashes
             })
-            .flatten()
             .collect::<Vec<_>>();
         let mut sorted_hashes = hashes;
         sorted_hashes.sort_unstable();

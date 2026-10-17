@@ -30,21 +30,36 @@ fn join_selectivity<'e>(
 ) -> Estimate
 {
     // For composite keys, use the most selective supported key rather than
-    // multiplying correlated key estimates. Residual predicates stay unknown.
+    // multiplying correlated key estimates. An unestimated conjunct uses the
+    // identity selectivity (1.0), a conservative upper bound that preserves
+    // estimates from the supported predicates.
     let mut pending = Vec::with_capacity(additional.len() + usize::from(on.is_some()));
     pending.extend(additional.iter().copied());
     pending.extend(on);
     let mut fraction = 1.0_f64;
+    let mut used_fallback = false;
     while let Some(expr) = pending.pop() {
         if let LogicalExpr::BinaryOp { left, op: BinaryOp::And, right, .. } = expr {
             pending.extend([left.as_ref(), right.as_ref()]);
+        } else if matches!(expr, LogicalExpr::Literal(plan::LogicalLiteral::Boolean(true))) {
+            continue;
+        } else if matches!(expr, LogicalExpr::Literal(plan::LogicalLiteral::Boolean(false)
+            | plan::LogicalLiteral::Null(_))) {
+            return Estimate::model(0.0, EstimateSource::Join);
         } else if let Some(value) = equality(left, right, expr) {
             fraction = fraction.min(value);
         } else {
-            return Estimate::unknown(EstimateSource::UnsupportedExpression);
+            used_fallback = true;
         }
     }
-    Estimate::model(fraction, EstimateSource::Join)
+    Estimate::model(
+        fraction,
+        if used_fallback {
+            EstimateSource::JoinSelectivityFallback
+        } else {
+            EstimateSource::Join
+        },
+    )
 }
 
 pub(super) fn join<'a>(
@@ -85,11 +100,8 @@ fn join_with_predicates<'a>(
     let matches = if *kind == Cross || no_predicates || product.value() == Some(0.0) {
         product
     } else {
-        product.combine(
-            join_selectivity(&left, &right, on, additional),
-            EstimateSource::Join,
-            |p, s| p * s,
-        )
+        let selectivity = join_selectivity(&left, &right, on, additional);
+        product.combine(selectivity, selectivity.source, |p, s| p * s)
     };
     let rows = match kind {
         Inner | Cross => matches,

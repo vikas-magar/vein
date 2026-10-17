@@ -74,3 +74,24 @@ fn ndv_model_exposes_its_uniformity_limit_under_skew() {
     assert_eq!(skewed_actual, 8_290);
     assert_eq!(selectivity.confidence, EstimateConfidence::Model);
 }
+
+#[test]
+fn cardinality_priors_keep_join_estimation_available_without_column_synopses() {
+    let mut left = RelationEstimate::new(Estimate::known(
+        100.0,
+        EstimateSource::RuntimeFeedback,
+        EstimateConfidence::Statistics,
+    ));
+    let mut right = RelationEstimate::new(Estimate::known(
+        25.0,
+        EstimateSource::Statistics,
+        EstimateConfidence::Statistics,
+    ));
+    left.add_cardinality_prior(ColumnId(1), 100);
+    right.add_cardinality_prior(ColumnId(2), 25);
+
+    let predicate = key_equality();
+    let selectivity = join_selectivity(&left, &right, None, &[&predicate]);
+    assert_eq!(selectivity.value(), Some(0.01));
+    assert_eq!(selectivity.confidence, EstimateConfidence::Model);
+}

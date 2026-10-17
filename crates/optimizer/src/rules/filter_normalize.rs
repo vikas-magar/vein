@@ -59,14 +59,11 @@ fn normalize_filter(input: &LogicalPlan, predicate: &LogicalExpr) -> LogicalPlan
     // Consecutive filters are equivalent to one conjunction. Pull them into
     // one canonical chain only when all predicates are deterministic.
     let mut nested = Vec::new();
-    loop {
-        let LogicalPlan::Filter {
+    while let LogicalPlan::Filter {
             input: nested_input,
             predicate: nested_predicate,
         } = &base
-        else {
-            break;
-        };
+    {
         if nested_predicate.is_volatile() {
             return LogicalPlan::Filter {
                 input: Box::new(base),

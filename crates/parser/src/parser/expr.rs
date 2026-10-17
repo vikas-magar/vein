@@ -30,13 +30,16 @@ fn parse_exact_decimal(text: &str) -> Result<(i128, u8, i8), String> {
         .saturating_add(usize::try_from((-scale).max(0)).unwrap_or(0))
         .max(usize::try_from(scale.max(0)).unwrap_or(0))
         .max(1);
-    if precision > 38 || scale < -38 || scale > 38 {
+    if precision > 38 || !(-38..=38).contains(&scale) {
         return Err(format!("decimal literal exceeds Decimal128 precision: {text}"));
     }
     let unscaled = significant
         .parse::<i128>()
         .map_err(|_| format!("decimal literal exceeds Decimal128 range: {text}"))?;
-    Ok((unscaled, precision as u8, scale as i8))
+    let precision = u8::try_from(precision)
+        .map_err(|_| format!("decimal precision is out of range: {text}"))?;
+    let scale = i8::try_from(scale).map_err(|_| format!("decimal scale is out of range: {text}"))?;
+    Ok((unscaled, precision, scale))
 }
 
 /// Resolves the escapes inside a string literal body (the text between the
@@ -66,7 +69,7 @@ fn unescape_string(body: &str) -> String {
 }
 
 /// Precedence table. Higher = tighter binding.
-fn infix_prec(kind: &TokenKind) -> Option<(u32, bool)> {
+fn infix_prec(kind: TokenKind) -> Option<(u32, bool)> {
     match kind {
         TokenKind::Or => Some((0, true)),
         TokenKind::And => Some((1, true)),
@@ -84,7 +87,7 @@ fn infix_prec(kind: &TokenKind) -> Option<(u32, bool)> {
     }
 }
 
-fn prefix_prec(kind: &TokenKind) -> Option<(u32, bool)> {
+fn prefix_prec(kind: TokenKind) -> Option<(u32, bool)> {
     match kind {
         TokenKind::Not => Some((2, true)),
         TokenKind::Minus | TokenKind::Plus => Some((8, true)),
@@ -100,6 +103,11 @@ type WindowSpec<'a> = (
 
 impl<'a> Parser<'a> {
     /// Parses a single (possibly parenthesized or operator-chained) expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the input is not a valid expression or lexing
+    /// encounters invalid input.
     pub fn parse_expr(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
         self.enter_recursive()?;
         let result = self.parse_binary(0);
@@ -114,9 +122,8 @@ impl<'a> Parser<'a> {
             // Handle NOT as special prefix within infix operators
             let mut postfix_op = None;
             if peek_kind == TokenKind::Not {
-                let next = match self.peek_next_token_kind() {
-                    Ok(k) => k,
-                    Err(_) => break,
+                let Ok(next) = self.peek_next_token_kind() else {
+                    break;
                 };
                 if next == TokenKind::In || next == TokenKind::Between || next == TokenKind::Like {
                     postfix_op = Some((next, true));
@@ -134,7 +141,7 @@ impl<'a> Parser<'a> {
                 // this recursion level when their precedence allows it. Otherwise
                 // they are left for an enclosing loop, e.g. `x = 1 IN (2)` parses
                 // as `(x = 1) IN (2)` (IN binds like `=` in GoogleSQL).
-                let prec = infix_prec(&op)
+                let prec = infix_prec(op)
                     .expect("IN, BETWEEN, LIKE, IS always have a precedence")
                     .0;
                 if prec < min_prec {
@@ -152,12 +159,12 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            match infix_prec(&peek_kind) {
+            match infix_prec(peek_kind) {
                 Some((prec, left_assoc)) if prec >= min_prec => {
                     self.next_token()?;
                     let right_prec = if left_assoc { prec + 1 } else { prec };
                     let right = self.parse_binary(right_prec)?;
-                    let op = token_to_binary_op(&peek_kind)?;
+                    let op = token_to_binary_op(peek_kind)?;
                     let span = left.span.union(right.span);
                     left = SpannedExpr {
                         span,
@@ -230,7 +237,7 @@ impl<'a> Parser<'a> {
                 // Parse only the pattern's tighter-binding expression. Parsing
                 // a full expression here would absorb a following AND/OR into
                 // the pattern (for example, `name LIKE 'A%' AND active`).
-                let pattern_min_prec = infix_prec(&TokenKind::Like)
+                let pattern_min_prec = infix_prec(TokenKind::Like)
                     .expect("LIKE always has a precedence")
                     .0
                     + 1;
@@ -274,12 +281,8 @@ impl<'a> Parser<'a> {
 
     fn parse_unary(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
         let mut ops: Vec<(TokenKind, Span)> = Vec::new();
-        loop {
-            let peek_kind = match self.peek() {
-                Ok(t) => t.kind,
-                Err(_) => break,
-            };
-            if prefix_prec(&peek_kind).is_some() {
+        while let Ok(peek_kind) = self.peek().map(|token| token.kind) {
+            if prefix_prec(peek_kind).is_some() {
                 let op_token = self.next_token()?;
                 self.enter_recursive()?;
                 ops.push((peek_kind, op_token.span));
@@ -290,7 +293,7 @@ impl<'a> Parser<'a> {
 
         let operand_prec = match ops.last() {
             Some((op, _)) => {
-                prefix_prec(op)
+                prefix_prec(*op)
                     .expect("prefix op always has a precedence")
                     .0
             }
@@ -386,107 +389,8 @@ impl<'a> Parser<'a> {
                 let token = self.next_token()?;
                 self.parse_case_expr(token.span)
             }
-            TokenKind::Ident => {
-                let token = self.next_token()?;
-                let name = token.text;
-                let span = token.span;
-
-                // Function call: IDENT(
-                if let Ok(TokenKind::LParen) = self.peek().map(|t| &t.kind) {
-                    self.parse_function_call(name, span)
-                } else {
-                    if let Some(typed) = self.parse_typed_string(name, span)? {
-                        return Ok(typed);
-                    }
-
-                    // Simple column reference (possibly table.column)
-                    if let Ok(TokenKind::Dot) = self.peek().map(|t| &t.kind) {
-                        self.next_token()?;
-                        let col_token = self.next_token()?;
-                        let column = match col_token.kind {
-                            TokenKind::Ident => col_token.text,
-                            TokenKind::DoubleQuotedIdent => {
-                                &col_token.text[1..col_token.text.len() - 1]
-                            }
-                            TokenKind::Star => {
-                                return Ok(SpannedExpr {
-                                    span: span.union(col_token.span),
-                                    node: Expr::Wildcard { table: Some(name) },
-                                });
-                            }
-                            _ => {
-                                return Err(ParseError::Expected {
-                                    expected: "identifier after '.'".into(),
-                                    found: format!("{:?}", col_token.kind),
-                                    span: col_token.span,
-                                });
-                            }
-                        };
-                        Ok(SpannedExpr {
-                            span: span.union(col_token.span),
-                            node: Expr::Column {
-                                table: Some(name),
-                                column,
-                            },
-                        })
-                    } else {
-                        Ok(SpannedExpr {
-                            span,
-                            node: Expr::Column {
-                                table: None,
-                                column: name,
-                            },
-                        })
-                    }
-                }
-            }
-            TokenKind::Number => {
-                let token = self.next_token()?;
-                let text = &token.text;
-                let span = token.span;
-
-                if text.starts_with("0x") || text.starts_with("0X") {
-                    let val = i64::from_str_radix(&text[2..], 16).map_err(|_| {
-                        ParseError::NumberParse {
-                            message: format!("invalid hex literal: {text}"),
-                            span,
-                        }
-                    })?;
-                    Ok(SpannedExpr {
-                        span,
-                        node: Expr::Literal(Literal::Int(val)),
-                    })
-                } else if text.starts_with("0b") || text.starts_with("0B") {
-                    let val = i64::from_str_radix(&text[2..], 2).map_err(|_| {
-                        ParseError::NumberParse {
-                            message: format!("invalid binary literal: {text}"),
-                            span,
-                        }
-                    })?;
-                    Ok(SpannedExpr {
-                        span,
-                        node: Expr::Literal(Literal::Int(val)),
-                    })
-                } else if text.contains('.') || text.contains('e') || text.contains('E') {
-                    let (unscaled, precision, scale) = parse_exact_decimal(text).map_err(|message| ParseError::NumberParse {
-                        message,
-                        span,
-                    })?;
-                    Ok(SpannedExpr {
-                        span,
-                        node: Expr::Literal(Literal::Decimal(unscaled, precision, scale)),
-                    })
-                } else {
-                    let val: i64 = text.parse().map_err(|_| ParseError::NumberParse {
-                        message: format!("invalid integer literal: {text}"),
-                        span,
-                    })?;
-                    Ok(SpannedExpr {
-                        span,
-                        node: Expr::Literal(Literal::Int(val)),
-                    })
-                }
-            }
+            TokenKind::Ident => self.parse_identifier_primary(),
+            TokenKind::Number => self.parse_numeric_primary(),
             TokenKind::String => {
                 let token = self.next_token()?;
                 // Strip the surrounding quotes and resolve escapes (`''` → `'`,
@@ -541,6 +445,93 @@ impl<'a> Parser<'a> {
                 })
             }
         }
+    }
+
+    fn parse_identifier_primary(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
+        let token = self.next_token()?;
+        let name = token.text;
+        let span = token.span;
+
+        if let Ok(TokenKind::LParen) = self.peek().map(|token| &token.kind) {
+            return self.parse_function_call(name, span);
+        }
+        if let Some(typed) = self.parse_typed_string(name, span)? {
+            return Ok(typed);
+        }
+        if let Ok(TokenKind::Dot) = self.peek().map(|token| &token.kind) {
+            self.next_token()?;
+            let column_token = self.next_token()?;
+            let column = match column_token.kind {
+                TokenKind::Ident => column_token.text,
+                TokenKind::DoubleQuotedIdent => {
+                    &column_token.text[1..column_token.text.len() - 1]
+                }
+                TokenKind::Star => {
+                    return Ok(SpannedExpr {
+                        span: span.union(column_token.span),
+                        node: Expr::Wildcard { table: Some(name) },
+                    });
+                }
+                _ => {
+                    return Err(ParseError::Expected {
+                        expected: "identifier after '.'".into(),
+                        found: format!("{:?}", column_token.kind),
+                        span: column_token.span,
+                    });
+                }
+            };
+            return Ok(SpannedExpr {
+                span: span.union(column_token.span),
+                node: Expr::Column {
+                    table: Some(name),
+                    column,
+                },
+            });
+        }
+        Ok(SpannedExpr {
+            span,
+            node: Expr::Column {
+                table: None,
+                column: name,
+            },
+        })
+    }
+
+    fn parse_numeric_primary(&mut self) -> Result<SpannedExpr<'a>, ParseError> {
+        let token = self.next_token()?;
+        let text = &token.text;
+        let span = token.span;
+        let literal = if text.starts_with("0x") || text.starts_with("0X") {
+            Literal::Int(i64::from_str_radix(&text[2..], 16).map_err(|_| {
+                ParseError::NumberParse {
+                    message: format!("invalid hex literal: {text}"),
+                    span,
+                }
+            })?)
+        } else if text.starts_with("0b") || text.starts_with("0B") {
+            Literal::Int(i64::from_str_radix(&text[2..], 2).map_err(|_| {
+                ParseError::NumberParse {
+                    message: format!("invalid binary literal: {text}"),
+                    span,
+                }
+            })?)
+        } else if text.contains('.') || text.contains('e') || text.contains('E') {
+            let (unscaled, precision, scale) =
+                parse_exact_decimal(text).map_err(|message| ParseError::NumberParse {
+                    message,
+                    span,
+                })?;
+            Literal::Decimal(unscaled, precision, scale)
+        } else {
+            Literal::Int(text.parse().map_err(|_| ParseError::NumberParse {
+                message: format!("invalid integer literal: {text}"),
+                span,
+            })?)
+        };
+        Ok(SpannedExpr {
+            span,
+            node: Expr::Literal(literal),
+        })
     }
 
     fn parse_subquery_in_parens(
@@ -701,7 +692,7 @@ impl<'a> Parser<'a> {
             if name.eq_ignore_ascii_case("count") {
                 self.next_token()?;
                 args.push(SpannedExpr {
-                    span: Default::default(),
+                    span: Span::default(),
                     node: Expr::Wildcard { table: None },
                 });
             } else {
@@ -1051,7 +1042,7 @@ fn normalize_interval_unit(name: &str) -> Option<String> {
     }
 }
 
-fn token_to_binary_op(kind: &TokenKind) -> Result<BinaryOp, ParseError> {
+fn token_to_binary_op(kind: TokenKind) -> Result<BinaryOp, ParseError> {
     match kind {
         TokenKind::Plus => Ok(BinaryOp::Plus),
         TokenKind::Minus => Ok(BinaryOp::Minus),
@@ -1245,10 +1236,12 @@ mod tests {
     fn test_deep_between_chain_hits_recursion_limit() {
         let mut input = String::from("1");
         for i in 2..=600 {
-            input.push_str(&format!(" BETWEEN {i}"));
+            std::fmt::Write::write_fmt(&mut input, format_args!(" BETWEEN {i}"))
+                .expect("writing to String cannot fail");
         }
         for i in 2..=600 {
-            input.push_str(&format!(" AND {i}"));
+            std::fmt::Write::write_fmt(&mut input, format_args!(" AND {i}"))
+                .expect("writing to String cannot fail");
         }
         let err = parse_expr(&input).expect_err("test should fail");
         assert!(matches!(err, ParseError::RecursionLimitExceeded { .. }));

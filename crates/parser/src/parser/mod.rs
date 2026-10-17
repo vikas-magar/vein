@@ -173,6 +173,10 @@ impl<'a> Parser<'a> {
     /// Supports `EXPLAIN <query>` (returning [`QueryNode::Explain`]) and
     /// plain pipe queries (returning [`QueryNode::Plain`]). An `EXPLAIN`
     /// query is planned but must not be executed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the statement or its query is malformed.
     pub fn parse_statement(&mut self) -> Result<QueryNode<'a>, ParseError> {
         match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::Explain) => {
@@ -189,10 +193,18 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a full query, failing if any input remains after the pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error when the query is malformed or trailing input
+    /// remains after the query.
     pub fn parse_query(&mut self) -> Result<Query<'a>, ParseError> {
         let result = match self.peek().map(|t| &t.kind) {
             Ok(TokenKind::From) => self.parse_pipe_query(),
-            Err(_) => Err(self.take_peek_error().expect("peeked error")),
+            Err(error) => {
+                let error = error.clone();
+                Err(self.take_peek_error().unwrap_or(error))
+            }
             _ => {
                 let span = self.peek_span().unwrap_or_default();
                 let found = self
@@ -219,7 +231,10 @@ impl<'a> Parser<'a> {
                 found: format!("{other:?}"),
                 span: self.peek_span().unwrap_or_default(),
             }),
-            Err(_) => Err(self.take_peek_error().expect("peeked error")),
+            Err(error) => {
+                let error = error.clone();
+                Err(self.take_peek_error().unwrap_or(error))
+            }
         }
     }
 
@@ -278,49 +293,7 @@ impl<'a> Parser<'a> {
                     alias: None,
                 }
             }
-            TokenKind::String => {
-                let token = self.next_token()?;
-                let url = if token.text.starts_with('\'') || token.text.starts_with('"') {
-                    &token.text[1..token.text.len() - 1]
-                } else {
-                    token.text
-                };
-                let mut inline_options = Vec::new();
-                if let Ok(TokenKind::With) = self.peek().map(|t| &t.kind) {
-                    self.next_token()?; // consume WITH
-                    self.expect(TokenKind::LParen)?;
-                    loop {
-                        let key = self.expect_ident()?;
-                        self.expect(TokenKind::Eq)?;
-                        let val_tok = self.next_token()?;
-                        let val = match val_tok.kind {
-                            TokenKind::String | TokenKind::DoubleQuotedIdent => {
-                                &val_tok.text[1..val_tok.text.len() - 1]
-                            }
-                            TokenKind::Ident | TokenKind::Number => val_tok.text,
-                            _ => {
-                                return Err(ParseError::Unexpected {
-                                    token: format!("{:?}", val_tok.kind),
-                                    span: val_tok.span,
-                                });
-                            }
-                        };
-                        inline_options.push((key, val));
-                        match self.peek().map(|t| &t.kind) {
-                            Ok(TokenKind::Comma) => {
-                                self.next_token()?;
-                            }
-                            _ => break,
-                        }
-                    }
-                    self.expect(TokenKind::RParen)?;
-                }
-                crate::ast::query::TableSource::ObjectStore {
-                    url,
-                    inline_options,
-                    alias: None,
-                }
-            }
+            TokenKind::String => self.parse_object_store_source()?,
             _ => {
                 let first = self.expect_ident()?;
                 if let Ok(TokenKind::Dot) = self.peek().map(|t| &t.kind) {
@@ -360,22 +333,66 @@ impl<'a> Parser<'a> {
         if has_as {
             let alias = self.expect_ident()?;
             match &mut source {
-                crate::ast::query::TableSource::Table { alias: a, .. } => *a = Some(alias),
-                crate::ast::query::TableSource::ObjectStore { alias: a, .. } => *a = Some(alias),
-                crate::ast::query::TableSource::Subquery { alias: a, .. } => *a = Some(alias),
+                crate::ast::query::TableSource::Table { alias: a, .. }
+                | crate::ast::query::TableSource::ObjectStore { alias: a, .. }
+                | crate::ast::query::TableSource::Subquery { alias: a, .. } => *a = Some(alias),
             }
         } else if let Ok(TokenKind::Ident | TokenKind::DoubleQuotedIdent) =
             self.peek().map(|t| &t.kind)
         {
             let alias = self.expect_ident()?;
             match &mut source {
-                crate::ast::query::TableSource::Table { alias: a, .. } => *a = Some(alias),
-                crate::ast::query::TableSource::ObjectStore { alias: a, .. } => *a = Some(alias),
-                crate::ast::query::TableSource::Subquery { alias: a, .. } => *a = Some(alias),
+                crate::ast::query::TableSource::Table { alias: a, .. }
+                | crate::ast::query::TableSource::ObjectStore { alias: a, .. }
+                | crate::ast::query::TableSource::Subquery { alias: a, .. } => *a = Some(alias),
             }
         }
 
         Ok(source)
+    }
+
+    fn parse_object_store_source(
+        &mut self,
+    ) -> Result<crate::ast::query::TableSource<'a>, ParseError> {
+        let token = self.next_token()?;
+        let url = if token.text.starts_with('\'') || token.text.starts_with('"') {
+            &token.text[1..token.text.len() - 1]
+        } else {
+            token.text
+        };
+        let mut inline_options = Vec::new();
+        if let Ok(TokenKind::With) = self.peek().map(|token| &token.kind) {
+            self.next_token()?;
+            self.expect(TokenKind::LParen)?;
+            loop {
+                let key = self.expect_ident()?;
+                self.expect(TokenKind::Eq)?;
+                let option_token = self.next_token()?;
+                let value = match option_token.kind {
+                    TokenKind::String | TokenKind::DoubleQuotedIdent => {
+                        &option_token.text[1..option_token.text.len() - 1]
+                    }
+                    TokenKind::Ident | TokenKind::Number => option_token.text,
+                    _ => {
+                        return Err(ParseError::Unexpected {
+                            token: format!("{:?}", option_token.kind),
+                            span: option_token.span,
+                        });
+                    }
+                };
+                inline_options.push((key, value));
+                if !matches!(self.peek().map(|token| &token.kind), Ok(TokenKind::Comma)) {
+                    break;
+                }
+                self.next_token()?;
+            }
+            self.expect(TokenKind::RParen)?;
+        }
+        Ok(crate::ast::query::TableSource::ObjectStore {
+            url,
+            inline_options,
+            alias: None,
+        })
     }
 }
 

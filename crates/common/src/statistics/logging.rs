@@ -35,7 +35,7 @@ impl Display for TableStatisticsLog<'_> {
         )?;
 
         let mut columns = statistics.column_statistics.iter().collect::<Vec<_>>();
-        columns.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        columns.sort_unstable_by_key(|(left, _)| *left);
         write!(f, " columns={{")?;
         for (index, (name, column)) in columns.into_iter().enumerate() {
             if index > 0 {

@@ -43,17 +43,20 @@ async fn page_header_statistics_prune_flat_data_pages_without_dropping_matches()
     let operator = Operator::new(opendal::services::Fs::default().root(&root_path))
         .expect("create local filesystem operator");
     let bytes_read = Arc::new(AtomicU64::new(0));
-    let page_headers = read_page_header_statistics(
-        &operator,
-        relative_path,
-        file_size,
-        Arc::clone(&bytes_read),
-        Arc::new(IoStats::default()),
-        schema.as_ref(),
-        &metadata,
-        &["value".to_string()],
-        &[0],
-    )
+    let io = Arc::new(IoStats::default());
+    let needed_columns = ["value".to_string()];
+    let row_groups = [0];
+    let page_headers = read_page_header_statistics(PageHeaderReadRequest {
+        operator: &operator,
+        path: relative_path,
+        file_size_bytes: file_size,
+        bytes_read: &bytes_read,
+        io: &io,
+        arrow_schema: schema.as_ref(),
+        metadata: &metadata,
+        needed_columns: &needed_columns,
+        row_groups: &row_groups,
+    })
         .await;
 
     assert_eq!(page_headers.metrics.failed_chunks, 0);
@@ -235,7 +238,7 @@ async fn page_header_statistics_prune_flat_data_pages_without_dropping_matches()
         .build()
         .expect("apply page-derived row selection");
     let matches = reader
-        .map(|batch| {
+        .flat_map(|batch| {
             let batch = batch.expect("read selected rows");
             let values = batch
                 .column(0)
@@ -247,7 +250,6 @@ async fn page_header_statistics_prune_flat_data_pages_without_dropping_matches()
                 .filter(|value| *value == target)
                 .collect::<Vec<_>>()
         })
-        .flatten()
         .collect::<Vec<_>>();
     assert_eq!(matches, vec![target]);
 }

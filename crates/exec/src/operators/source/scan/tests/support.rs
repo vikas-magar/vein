@@ -63,16 +63,19 @@ pub(super) fn scan_over(dir: &std::path::Path, files: &[(&str, PathBuf)]) -> Sca
             scan_unit_range: None,
         })
         .collect();
-    ScanSource::new(
+    ScanSource::new(ScanSourceConfig {
         operator,
         files,
-        FileFormat::Parquet,
-        Arc::new(types::VeinSchema::empty()),
-        Vec::new(),
-        None,
-        MetadataStore::new(),
-        Arc::new(FunctionRegistry::new()),
-    )
+        format: FileFormat::Parquet,
+        projected: Arc::new(types::VeinSchema::empty()),
+        dictionary_columns: Vec::new(),
+        pushdown: None,
+        runtime_filters: RuntimeFilterSet::empty(),
+        metadata_store: MetadataStore::new(),
+        registry: Arc::new(FunctionRegistry::new()),
+        runtime_statistics: RuntimeStatisticsStore::default(),
+        statistics_scan: None,
+    })
 }
 
 #[derive(Debug)]

@@ -9,7 +9,9 @@ use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use std::sync::Arc;
 
+#[path = "tests/metrics.rs"]
 mod metrics;
 #[path = "tests/page_header.rs"]
 mod page_header;
+#[path = "tests/projection.rs"]
 mod projection;

@@ -105,6 +105,24 @@ pub enum RuntimeStatisticsEnqueue {
     WorkerUnavailable,
 }
 
+/// Work-unit completion data needed to publish scan feedback asynchronously.
+pub struct RuntimeStatisticsPartitionCompletion<'a> {
+    /// Stable identity for the scan across all its work units.
+    pub scan_id: u128,
+    /// Snapshot-scoped source identity used to publish the synopsis.
+    pub table_key: &'a str,
+    /// Exact row count from catalog metadata, when available.
+    pub expected_rows: Option<u64>,
+    /// Number of work units participating in completion.
+    pub expected_partitions: usize,
+    /// Whether this scan proves complete source-row coverage.
+    pub table_scan_candidate: bool,
+    /// Ordinal of this completed work unit.
+    pub partition_index: usize,
+    /// Shared query context receiving completed feedback, when available.
+    pub query_context: Option<Arc<QueryStatisticsContext>>,
+}
+
 struct RuntimeStatisticsWorker {
     batches: SyncSender<StatisticsWork>,
     controls: mpsc::Sender<StatisticsControl>,
@@ -325,14 +343,17 @@ impl RuntimeStatisticsStore {
     /// Queue partition completion without waiting for synopsis work.
     pub fn enqueue_partition_completion(
         &self,
-        scan_id: u128,
-        table_key: &str,
-        expected_rows: Option<u64>,
-        expected_partitions: usize,
-        table_scan_candidate: bool,
-        partition_index: usize,
-        query_context: Option<Arc<QueryStatisticsContext>>,
+        completion: RuntimeStatisticsPartitionCompletion<'_>,
     ) -> bool {
+        let RuntimeStatisticsPartitionCompletion {
+            scan_id,
+            table_key,
+            expected_rows,
+            expected_partitions,
+            table_scan_candidate,
+            partition_index,
+            query_context,
+        } = completion;
         self.worker.as_ref().is_some_and(|worker| {
             worker.controls.send(StatisticsControl::Complete {
                 scan_id,
@@ -543,7 +564,7 @@ fn handle_statistics_control(store: &RuntimeStatisticsStore, control: Statistics
                     metric_column_counts = ?metric_column_counts,
                     missing_metrics = ?missing,
                     complete_table_snapshot = observation.complete_table_snapshot,
-                    computed_statistics = %TableStatisticsLog::new(&stats),
+                    computed_statistics = %TableStatisticsLog::new(stats),
                     "runtime scan statistics completed asynchronously"
                 );
             }
@@ -631,15 +652,15 @@ mod tests {
             store.enqueue_batch(17, "table@revision", Some(4), 1, true, &input),
             RuntimeStatisticsEnqueue::Queued,
         );
-        assert!(store.enqueue_partition_completion(
-            17,
-            "table@revision",
-            Some(4),
-            1,
-            true,
-            0,
-            Some(Arc::clone(&query_context)),
-        ));
+        assert!(store.enqueue_partition_completion(RuntimeStatisticsPartitionCompletion {
+            scan_id: 17,
+            table_key: "table@revision",
+            expected_rows: Some(4),
+            expected_partitions: 1,
+            table_scan_candidate: true,
+            partition_index: 0,
+            query_context: Some(Arc::clone(&query_context)),
+        }));
 
         // Reading the synopsis is a planning-time barrier. The producing scan
         // itself never waits for the background collector.
@@ -668,7 +689,15 @@ mod tests {
             store.enqueue_batch(18, "table@revision", Some(4), 1, true, &input),
             RuntimeStatisticsEnqueue::BatchTooLarge,
         );
-        assert!(store.enqueue_partition_completion(18, "table@revision", Some(4), 1, true, 0, None));
+        assert!(store.enqueue_partition_completion(RuntimeStatisticsPartitionCompletion {
+            scan_id: 18,
+            table_key: "table@revision",
+            expected_rows: Some(4),
+            expected_partitions: 1,
+            table_scan_candidate: true,
+            partition_index: 0,
+            query_context: None,
+        }));
         assert!(store.complete_table_statistics("table@revision").is_none());
     }
 

@@ -45,20 +45,36 @@ pub(super) type HeaderPageLocations = HashMap<
     HashMap<usize, Vec<parquet::file::page_index::offset_index::PageLocation>>,
 >;
 
+/// Inputs needed to inspect data-page headers for selected predicate columns.
+pub(super) struct PageHeaderReadRequest<'a> {
+    pub(super) operator: &'a Operator,
+    pub(super) path: &'a str,
+    pub(super) file_size_bytes: u64,
+    pub(super) bytes_read: &'a Arc<AtomicU64>,
+    pub(super) io: &'a Arc<IoStats>,
+    pub(super) arrow_schema: &'a Schema,
+    pub(super) metadata: &'a ParquetMetaData,
+    pub(super) needed_columns: &'a [String],
+    pub(super) row_groups: &'a [usize],
+}
+
 /// Reads data-page headers for predicate columns when page-index coverage is
 /// missing or incomplete. Unsupported mappings or malformed chunks remain
 /// conservative and are left for Arrow's normal row filter.
 pub(super) async fn read_page_header_statistics(
-    operator: &Operator,
-    path: &str,
-    file_size_bytes: u64,
-    bytes_read: Arc<AtomicU64>,
-    io: Arc<IoStats>,
-    arrow_schema: &Schema,
-    metadata: &ParquetMetaData,
-    needed_columns: &[String],
-    row_groups: &[usize],
+    request: PageHeaderReadRequest<'_>,
 ) -> PageHeaderReadResult {
+    let PageHeaderReadRequest {
+        operator,
+        path,
+        file_size_bytes,
+        bytes_read,
+        io,
+        arrow_schema,
+        metadata,
+        needed_columns,
+        row_groups,
+    } = request;
     let started = Instant::now();
     let mut result = PageHeaderReadResult::default();
     let parquet_schema = metadata.file_metadata().schema_descr();
@@ -89,8 +105,8 @@ pub(super) async fn read_page_header_statistics(
         operator,
         path,
         file_size_bytes,
-        bytes_read,
-        io,
+        Arc::clone(bytes_read),
+        Arc::clone(io),
     );
 
     for row_group_index in row_groups {

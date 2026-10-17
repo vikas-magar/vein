@@ -152,7 +152,7 @@ impl RowMapping {
     /// Creates a mapping from output rows to physical source rows.
     pub fn new(
         source_lengths: Arc<[usize]>,
-        rows: impl IntoIterator<Item = Option<SourceRow>>,
+        rows: impl IntoIterator<Item=Option<SourceRow>>,
     ) -> Result<Self> {
         if source_lengths.len() >= u32::MAX as usize {
             return Err(VeinError::internal(
@@ -362,6 +362,17 @@ pub struct DataChunkView {
     row_count: usize,
     columns: Vec<ViewColumn>,
     selection: SelectionVector,
+}
+
+impl common::statistics::StatisticsInput for DataChunkView {
+    fn num_rows(&self) -> usize { DataChunkView::num_rows(self) }
+    fn num_columns(&self) -> usize { DataChunkView::num_columns(self) }
+    fn column_type(&self, column: usize) -> Result<&DataType> {
+        self.column_data_type(column)
+    }
+    fn value(&self, column: usize, row: usize) -> Result<Option<(&dyn Array, usize)>> {
+        Ok(self.resolve(column, row)?.map(|(array, index)| (array.as_ref(), index)))
+    }
 }
 
 /// Maps output rows from one input view to its logical selected rows.
@@ -751,8 +762,8 @@ impl DataChunkView {
         }
 
         for (identity, bytes) in sizes {
-            if !leases_by_array.contains_key(&identity) {
-                leases_by_array.insert(identity, acquire(identity, bytes)?);
+            if let std::collections::hash_map::Entry::Vacant(e) = leases_by_array.entry(identity) {
+                e.insert(acquire(identity, bytes)?);
             }
         }
 
@@ -877,10 +888,10 @@ impl DataChunkView {
                     match contiguous {
                         None => contiguous = Some((array, row, 1)),
                         Some((first, start, len))
-                            if Arc::ptr_eq(first, array) && row == start + len =>
-                        {
-                            contiguous = Some((first, start, len + 1));
-                        }
+                        if Arc::ptr_eq(first, array) && row == start + len =>
+                            {
+                                contiguous = Some((first, start, len + 1));
+                            }
                         _ => can_slice = false,
                     }
                 }
@@ -891,11 +902,10 @@ impl DataChunkView {
             }
         }
 
-        if can_slice {
-            if let Some((array, start, len)) = contiguous {
+        if can_slice
+            && let Some((array, start, len)) = contiguous {
                 return Ok((array.slice(start, len), ColumnMaterialization::Shared));
             }
-        }
 
         let null_array = new_null_array(&column.data_type, 1);
         source_arrays.push(null_array.as_ref());
@@ -936,11 +946,9 @@ impl DataChunkView {
                 let column = &self.columns[index];
                 if let Some((source, _, _)) =
                     column.mapping.contiguous_source_range(&self.selection)
-                {
-                    if column.arrays[source].null_count() == 0 {
+                    && column.arrays[source].null_count() == 0 {
                         continue;
                     }
-                }
                 for row in 0..self.num_rows() {
                     let null = match self.resolve(index, row)? {
                         Some((array, source_row)) => array.is_null(source_row),

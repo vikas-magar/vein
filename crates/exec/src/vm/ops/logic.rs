@@ -84,24 +84,24 @@ mod tests {
 
         let and_res = eval_and(&b1, &b2).unwrap();
         let and_bool = and_res.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(and_bool.value(0), true);
-        assert_eq!(and_bool.value(1), false);
-        assert_eq!(and_bool.value(2), false);
-        assert_eq!(and_bool.value(3), false);
+        assert!(and_bool.value(0));
+        assert!(!and_bool.value(1));
+        assert!(!and_bool.value(2));
+        assert!(!and_bool.value(3));
 
         let or_res = eval_or(&b1, &b2).unwrap();
         let or_bool = or_res.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(or_bool.value(0), true);
-        assert_eq!(or_bool.value(1), true);
-        assert_eq!(or_bool.value(2), true);
-        assert_eq!(or_bool.value(3), false);
+        assert!(or_bool.value(0));
+        assert!(or_bool.value(1));
+        assert!(or_bool.value(2));
+        assert!(!or_bool.value(3));
 
         let not_res = eval_not(&b1).unwrap();
         let not_bool = not_res.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(not_bool.value(0), false);
-        assert_eq!(not_bool.value(1), false);
-        assert_eq!(not_bool.value(2), true);
-        assert_eq!(not_bool.value(3), true);
+        assert!(!not_bool.value(0));
+        assert!(!not_bool.value(1));
+        assert!(not_bool.value(2));
+        assert!(not_bool.value(3));
     }
 
     #[test]

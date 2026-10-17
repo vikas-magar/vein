@@ -155,7 +155,7 @@ where
 ///
 /// The source identities are sorted and encoded with length prefixes, so
 /// different identifier/version boundaries cannot produce the same byte stream.
-pub fn revision_from_identities(identities: &[StatisticsSourceIdentity]) -> u64 {
+    pub fn revision_from_identities(identities: &[StatisticsSourceIdentity]) -> u64 {
     let mut ordered = identities.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.identifier.cmp(&right.identifier));
     let mut bytes = Vec::new();
@@ -168,7 +168,7 @@ pub fn revision_from_identities(identities: &[StatisticsSourceIdentity]) -> u64 
     stable_hash(0xfd, &bytes)
 }
 
-fn canonicalize_identities(identities: &mut Vec<StatisticsSourceIdentity>) -> Result<()> {
+fn canonicalize_identities(identities: &mut [StatisticsSourceIdentity]) -> Result<()> {
     identities.sort_by(|left, right| left.identifier.cmp(&right.identifier));
     if identities.iter().any(|identity| identity.identifier.is_empty())
         || identities.windows(2).any(|pair| pair[0].identifier == pair[1].identifier)

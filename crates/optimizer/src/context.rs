@@ -73,6 +73,9 @@ pub struct StatisticsSnapshot<'a> {
 pub trait StatisticsProvider: Send + Sync {
     /// Returns statistics for a table when available.
     fn table_statistics<'a>(&'a self, table: &'a TableMetadata) -> Option<StatisticsSnapshot<'a>>;
+    /// Complete statistics for a query-local checkpoint. Column keys are
+    /// query-local ColumnIds rather than potentially ambiguous display names.
+    fn intermediate_statistics(&self, _source_id: u128) -> Option<&TableStatistics> { None }
 }
 
 /// Reads statistics directly from catalog table metadata.
@@ -97,6 +100,7 @@ impl StatisticsProvider for CatalogStatisticsProvider {
 pub struct QueryStatisticsProvider {
     context: Arc<QueryStatisticsContext>,
     runtime_statistics: HashMap<String, Arc<TableStatistics>>,
+    intermediates: HashMap<u128, Arc<TableStatistics>>,
 }
 
 impl QueryStatisticsProvider {
@@ -117,7 +121,7 @@ impl QueryStatisticsProvider {
                     runtime.as_ref(),
                 ))
             });
-            let used_statistics = merged.as_deref();
+            let used_statistics = merged.as_deref().or(source.statistics.as_deref());
 
             tracing::info!(
                 target: "vein.statistics",
@@ -129,6 +133,7 @@ impl QueryStatisticsProvider {
                 runtime_scan_observations = observations.len(),
                 complete_runtime_observations = complete_observations,
                 runtime_snapshot_accepted = runtime.is_some(),
+                optimizer_statistics_origin = if merged.is_some() { "runtime_merged" } else { "pinned_source" },
                 runtime_rows = ?runtime.as_deref().and_then(|statistics| statistics.num_rows),
                 optimizer_rows = ?used_statistics.and_then(|statistics| statistics.num_rows),
                 optimizer_synopsis_columns = used_statistics.map_or(0, |statistics| statistics.column_statistics.len()),
@@ -151,11 +156,15 @@ impl QueryStatisticsProvider {
         Self {
             context,
             runtime_statistics,
+            intermediates: snapshot.intermediates,
         }
     }
 }
 
 impl StatisticsProvider for QueryStatisticsProvider {
+    fn intermediate_statistics(&self, source_id: u128) -> Option<&TableStatistics> {
+        self.intermediates.get(&source_id).map(Arc::as_ref)
+    }
     fn table_statistics<'a>(&'a self, table: &'a TableMetadata) -> Option<StatisticsSnapshot<'a>> {
         let source_key = match table.catalog_snapshot.as_ref() {
             Some(snapshot) => {
@@ -230,6 +239,10 @@ pub struct OptimizerContext {
 }
 
 impl OptimizerContext {
+    /// Borrows the complete population measured for a query-local checkpoint.
+    pub fn intermediate_statistics(&self, source_id: u128) -> Option<&TableStatistics> {
+        self.statistics.intermediate_statistics(source_id)
+    }
     /// Creates a context using catalog-provided table statistics.
     pub fn new(config: OptimizerConfig) -> Self {
         Self::with_statistics_provider(config, Arc::new(CatalogStatisticsProvider))

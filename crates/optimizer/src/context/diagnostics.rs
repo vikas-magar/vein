@@ -56,7 +56,7 @@ pub enum JoinOrderOutcome {
     RelationLimitExceeded,
     /// Search exceeded its configured candidate-split budget.
     SearchBudgetExceeded,
-    /// Required row or join-key estimates were unavailable.
+    /// A base input has no population estimate, so join-order cardinalities cannot be formed.
     InsufficientStatistics,
     /// Legal decompositions produced different relation summaries.
     AmbiguousEstimates,
@@ -73,7 +73,10 @@ pub enum JoinOrderOutcome {
 pub enum JoinCardinalityAssumption {
     /// Non-null values are treated as uniform, with the smaller NDV domain
     /// assumed to overlap the larger one unless exact bounds prove disjoint.
-    /// Frequency skew cannot be detected from the current catalog statistics.
+    /// When a column synopsis is absent, row count is used as a maximum-NDV
+    /// prior and null fraction defaults to zero. These are model inputs, not
+    /// observed statistics or correctness proofs. Frequency skew cannot be
+    /// detected from the current catalog statistics.
     UniformDistinctValueOverlap,
 }
 
@@ -137,4 +140,3 @@ pub struct JoinOrderDecision {
     /// Result of the attempt.
     pub outcome: JoinOrderOutcome,
 }
-

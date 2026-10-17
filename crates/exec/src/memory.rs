@@ -226,7 +226,7 @@ impl QueryMemoryTracker {
             .retained_array_requests
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        if request % 256 == 0 {
+        if request.is_multiple_of(256) {
             retained.retain(|_, lease| lease.strong_count() != 0);
         }
         Ok(lease)

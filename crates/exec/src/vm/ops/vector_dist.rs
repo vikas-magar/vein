@@ -9,7 +9,7 @@ use common::Result;
 use error::VeinError;
 
 /// Helper function to extract a float slice for row `idx` from a list or fixed-size list array.
-fn get_vector_slice<'a>(array: &'a ArrayRef, idx: usize) -> Result<&'a [f32]> {
+fn get_vector_slice(array: &ArrayRef, idx: usize) -> Result<&[f32]> {
     if let Some(fixed) = array.as_any().downcast_ref::<FixedSizeListArray>() {
         let values = fixed
             .values()

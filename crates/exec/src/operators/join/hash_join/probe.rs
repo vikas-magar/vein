@@ -13,6 +13,9 @@ use super::super::rows::{JoinType, OutputRow, output_rows};
 use super::super::spec::OutputColumn;
 use super::JoinFilterCollector;
 
+type JoinMatch = (u32, (u32, u32));
+type BuildChunkMatchGroups = Vec<(u32, Vec<JoinMatch>)>;
+
 /// Probes a shared build table and forwards matching rows as chunk views.
 pub struct HashJoin {
     /// Shared rather than owned, so a probe fan-out can give every task the same
@@ -181,15 +184,15 @@ impl HashJoin {
     fn filter_residual_matches(
         &mut self,
         probe: &DataChunkView,
-        matches: &[(u32, (u32, u32))],
-    ) -> Result<(Vec<(u32, (u32, u32))>, u64)> {
+        matches: &[JoinMatch],
+    ) -> Result<(Vec<JoinMatch>, u64)> {
         if self.residual_vm.is_none() {
             return Ok((matches.to_vec(), 0));
         }
-        let output = self.residual_output.as_ref().ok_or_else(|| {
+        let output = self.residual_output.as_ref().cloned().ok_or_else(|| {
             VeinError::internal("join residual transform has no output collector")
         })?;
-        let mut groups: Vec<(u32, Vec<(u32, (u32, u32))>)> = Vec::new();
+        let mut groups = BuildChunkMatchGroups::new();
         let mut positions = HashMap::with_capacity(matches.len());
         for pair in matches.iter().copied() {
             let key = pair.1.0;
@@ -206,13 +209,7 @@ impl HashJoin {
                 probe: Some(*probe),
                 build: Some(*build),
             }).collect::<Vec<_>>();
-            let candidate = Self::compose_group(
-                &self.table,
-                &self.probe_types,
-                &self.build_types,
-                &mut self.probe_rows,
-                &mut self.build_rows,
-                &self.residual_view_columns,
+            let candidate = self.compose_group(
                 Some(probe),
                 Some(build_chunk),
                 &candidates,
@@ -227,7 +224,7 @@ impl HashJoin {
             let filtered = output.take()?;
             if let Some(filtered) = filtered {
                 for position in 0..filtered.selection().size() {
-                    let candidate_row = filtered.selection().get_index(position) as usize;
+                    let candidate_row = filtered.selection().get_index(position);
                     if let Some(pair) = pairs.get(candidate_row) {
                         accepted.push(*pair);
                     }
@@ -239,48 +236,45 @@ impl HashJoin {
 
     /// Composes a batch from one build chunk (or a null-extended build side).
     fn compose_group(
-        table: &HashTable,
-        probe_types: &[DataType],
-        build_types: &[DataType],
-        probe_rows: &mut Vec<Option<usize>>,
-        build_rows: &mut Vec<Option<usize>>,
-        output_columns: &[ViewColumnRef],
+        &mut self,
         probe: Option<&DataChunkView>,
         build_chunk: Option<u32>,
         rows: &[OutputRow],
     ) -> Result<DataChunkView> {
         let row_count = rows.len();
         let null_probe = if probe.is_none() {
-            Some(DataChunkView::nulls(probe_types, row_count)?)
+            Some(DataChunkView::nulls(&self.probe_types, row_count)?)
         } else {
             None
         };
         let null_build = if build_chunk.is_none() {
-            Some(DataChunkView::nulls(build_types, row_count)?)
+            Some(DataChunkView::nulls(&self.build_types, row_count)?)
         } else {
             None
         };
         let probe_view = probe.or(null_probe.as_ref()).expect("probe view or null extension");
         let build_view = build_chunk
-            .map(|chunk| table.build_chunk(chunk))
+            .map(|chunk| self.table.build_chunk(chunk))
             .or(null_build.as_ref())
             .expect("build view or null extension");
-        probe_rows.clear();
-        probe_rows.extend(rows.iter().map(|row| row.probe.map(|row| row as usize)));
-        build_rows.clear();
-        build_rows.extend(rows.iter().map(|row| row.build.map(|(_, row)| row as usize)));
+        self.probe_rows.clear();
+        self.probe_rows
+            .extend(rows.iter().map(|row| row.probe.map(|row| row as usize)));
+        self.build_rows.clear();
+        self.build_rows
+            .extend(rows.iter().map(|row| row.build.map(|(_, row)| row as usize)));
         let inputs = [
-            ViewInputRows { view: probe_view, rows: probe_rows },
-            ViewInputRows { view: build_view, rows: build_rows },
+            ViewInputRows { view: probe_view, rows: &self.probe_rows },
+            ViewInputRows { view: build_view, rows: &self.build_rows },
         ];
-        DataChunkView::combine(&inputs, output_columns)
+        DataChunkView::combine(&inputs, &self.output_columns)
     }
 
     /// Preserves output row order while splitting only at build-batch changes.
     fn forward_rows(
         &mut self,
         probe: Option<&DataChunkView>,
-        rows: impl IntoIterator<Item = OutputRow>,
+        rows: impl IntoIterator<Item=OutputRow>,
     ) -> Result<()> {
         let grouping_started = Instant::now();
         for row in rows {
@@ -302,13 +296,7 @@ impl HashJoin {
                 .rows_by_build_chunk
                 .remove(&build_chunk)
                 .ok_or_else(|| VeinError::internal("join output row bucket disappeared"))?;
-            let composed = Self::compose_group(
-                &self.table,
-                &self.probe_types,
-                &self.build_types,
-                &mut self.probe_rows,
-                &mut self.build_rows,
-                &self.output_columns,
+            let composed = self.compose_group(
                 probe,
                 build_chunk,
                 &group,

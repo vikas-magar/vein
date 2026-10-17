@@ -4,19 +4,31 @@ use crate::parser::ParseError;
 /// A visitor that walks every node of an [`Expr`] tree.
 pub trait ExprVisitor<'a>: Sized {
     /// Visits the expression itself.
+    ///
+    /// # Errors
+    /// Returns an error when visiting this node cannot continue.
     fn visit_expr(&mut self, expr: &Expr<'a>) -> Result<(), ParseError>;
     /// Visits the expression itself, with mutable access.
+    ///
+    /// # Errors
+    /// Returns an error when visiting this node cannot continue.
     fn visit_expr_mut(&mut self, expr: &mut Expr<'a>) -> Result<(), ParseError>;
 }
 
 impl<'a> Expr<'a> {
     /// Visits this expression and then its children.
+    ///
+    /// # Errors
+    /// Propagates errors returned by the visitor or by visiting a child.
     pub fn accept<V: ExprVisitor<'a>>(&self, visitor: &mut V) -> Result<(), ParseError> {
         visitor.visit_expr(self)?;
         self.accept_children(visitor)
     }
 
     /// Visits this expression and then its children, with mutable access.
+    ///
+    /// # Errors
+    /// Propagates errors returned by the visitor or by visiting a child.
     pub fn accept_mut<V: ExprVisitor<'a>>(&mut self, visitor: &mut V) -> Result<(), ParseError> {
         visitor.visit_expr_mut(self)?;
         self.accept_children_mut(visitor)
@@ -28,7 +40,9 @@ impl<'a> Expr<'a> {
                 left.node.accept(visitor)?;
                 right.node.accept(visitor)
             }
-            Expr::UnaryOp { expr, .. } => expr.node.accept(visitor),
+            Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::Alias { expr, .. } => {
+                expr.node.accept(visitor)
+            }
             Expr::Function { args, .. } => {
                 for arg in args {
                     arg.node.accept(visitor)?;
@@ -69,8 +83,6 @@ impl<'a> Expr<'a> {
                 }
                 Ok(())
             }
-            Expr::Cast { expr, .. } => expr.node.accept(visitor),
-            Expr::Alias { expr, .. } => expr.node.accept(visitor),
             Expr::Between {
                 expr, low, high, ..
             } => {
@@ -102,7 +114,9 @@ impl<'a> Expr<'a> {
                 left.node.accept_mut(visitor)?;
                 right.node.accept_mut(visitor)
             }
-            Expr::UnaryOp { expr, .. } => expr.node.accept_mut(visitor),
+            Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::Alias { expr, .. } => {
+                expr.node.accept_mut(visitor)
+            }
             Expr::Function { args, .. } => {
                 for arg in args {
                     arg.node.accept_mut(visitor)?;
@@ -143,8 +157,6 @@ impl<'a> Expr<'a> {
                 }
                 Ok(())
             }
-            Expr::Cast { expr, .. } => expr.node.accept_mut(visitor),
-            Expr::Alias { expr, .. } => expr.node.accept_mut(visitor),
             Expr::Between {
                 expr, low, high, ..
             } => {
@@ -169,12 +181,13 @@ impl<'a> Expr<'a> {
 }
 
 /// A test visitor that collects every column reference it walks.
-
+#[cfg(test)]
 pub struct ColumnCollector<'a> {
     /// The collected `(table, column)` references.
     pub columns: Vec<(Option<&'a str>, &'a str)>,
 }
 
+#[cfg(test)]
 impl<'a> ExprVisitor<'a> for ColumnCollector<'a> {
     fn visit_expr(&mut self, expr: &Expr<'a>) -> Result<(), ParseError> {
         if let Expr::Column { table, column, .. } = expr {

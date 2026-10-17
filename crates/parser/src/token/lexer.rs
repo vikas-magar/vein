@@ -62,15 +62,14 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn skip_line_comment(&mut self) -> Result<(), LexicalError> {
+    fn skip_line_comment(&mut self) {
         while let Some(ch) = self.peek() {
             if ch == '\n' {
                 self.advance();
-                return Ok(());
+                return;
             }
             self.advance();
         }
-        Ok(())
     }
 
     fn skip_block_comment(&mut self) -> Result<(), LexicalError> {
@@ -270,9 +269,6 @@ impl<'a> Iterator for Lexer<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.pos >= self.input.len() {
-                return None;
-            }
             self.skip_whitespace();
             if self.pos >= self.input.len() {
                 return None;
@@ -285,171 +281,155 @@ impl<'a> Iterator for Lexer<'a> {
             self.start_line = self.line;
             self.start_column = self.column;
 
-            return Some(match ch {
-                '/' if self.peek_next() == Some('/') => {
-                    self.advance();
-                    self.advance();
-                    match self.skip_line_comment() {
-                        Ok(()) => continue,
-                        Err(e) => Err(e),
-                    }
+            if let Some(token) = self.scan_token(ch, start) {
+                return Some(token);
+            }
+        }
+    }
+}
+
+impl<'a> Lexer<'a> {
+    /// Scan a token beginning at the current cursor. Comments return `None`
+    /// after advancing to the next token; lexical errors are yielded normally.
+    fn scan_token(
+        &mut self,
+        ch: char,
+        start: usize,
+    ) -> Option<Result<SpannedToken<'a>, LexicalError>> {
+        let token = match ch {
+            '/' if self.peek_next() == Some('/') => {
+                self.advance();
+                self.advance();
+                self.skip_line_comment();
+                return None;
+            }
+            '/' if self.peek_next() == Some('*') => {
+                self.advance();
+                self.advance();
+                match self.skip_block_comment() {
+                    Ok(()) => return None,
+                    Err(e) => Err(e),
                 }
-                '/' if self.peek_next() == Some('*') => {
-                    self.advance();
-                    self.advance();
-                    match self.skip_block_comment() {
-                        Ok(()) => continue,
-                        Err(e) => Err(e),
-                    }
+            }
+            '/' => {
+                self.advance();
+                Ok(self.make_token(start, TokenKind::Slash))
+            }
+            '\'' => {
+                self.advance();
+                match self.scan_string() {
+                    Ok(kind) => Ok(self.make_token(start, kind)),
+                    Err(e) => Err(e),
                 }
-                '/' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::Slash))
+            }
+            '"' => {
+                self.advance();
+                match self.scan_double_quoted_ident() {
+                    Ok(kind) => Ok(self.make_token(start, kind)),
+                    Err(e) => Err(e),
                 }
-                '\'' => {
-                    self.advance();
-                    match self.scan_string() {
-                        Ok(kind) => Ok(self.make_token(start, kind)),
-                        Err(e) => Err(e),
-                    }
-                }
-                '"' => {
-                    self.advance();
-                    match self.scan_double_quoted_ident() {
-                        Ok(kind) => Ok(self.make_token(start, kind)),
-                        Err(e) => Err(e),
-                    }
-                }
-                ch if ch.is_ascii_digit()
-                    || (ch == '.' && self.peek_next().is_some_and(|c| c.is_ascii_digit())) =>
+            }
+            ch if ch.is_ascii_digit()
+                || (ch == '.' && self.peek_next().is_some_and(|c| c.is_ascii_digit())) =>
                 {
                     match self.scan_number() {
                         Ok(kind) => Ok(self.make_token(start, kind)),
                         Err(e) => Err(e),
                     }
                 }
-                ch if ch.is_ascii_alphabetic() || ch == '_' => {
-                    self.scan_ident();
-                    let text = self.current_text(start);
-                    let kind = keyword(text).unwrap_or(TokenKind::Ident);
-                    Ok(self.make_token(start, kind))
+            ch if ch.is_ascii_alphabetic() || ch == '_' => {
+                self.scan_ident();
+                let text = self.current_text(start);
+                let kind = keyword(text).unwrap_or(TokenKind::Ident);
+                Ok(self.make_token(start, kind))
+            }
+            '-' if self.peek_next() == Some('-') => {
+                self.advance();
+                self.advance();
+                self.skip_line_comment();
+                return None;
+            }
+            '|' if self.peek_next() == Some('|') => {
+                self.advance();
+                self.advance();
+                Ok(self.make_token(start, TokenKind::Concat))
+            }
+            '|' => {
+                self.advance();
+                if self.peek() == Some('>') {
+                    self.advance();
+                    Ok(self.make_token(start, TokenKind::Pipe))
+                } else {
+                    Err(self.make_error(start, "unexpected '|'".into()))
                 }
-                '-' if self.peek_next() == Some('-') => {
+            }
+            '-' => {
+                self.advance();
+                let kind = if self.peek() == Some('>') {
                     self.advance();
-                    self.advance();
-                    match self.skip_line_comment() {
-                        Ok(()) => continue,
-                        Err(e) => Err(e),
-                    }
-                }
-                '|' if self.peek_next() == Some('|') => {
-                    self.advance();
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::Concat))
-                }
-                '|' => {
-                    self.advance();
-                    if self.peek() == Some('>') {
-                        self.advance();
-                        Ok(self.make_token(start, TokenKind::Pipe))
-                    } else {
-                        Err(self.make_error(start, "unexpected '|'".into()))
-                    }
-                }
-                '-' => {
-                    self.advance();
-                    let kind = if self.peek() == Some('>') {
-                        self.advance();
-                        TokenKind::Arrow
-                    } else {
-                        TokenKind::Minus
-                    };
-                    Ok(self.make_token(start, kind))
-                }
-                '=' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::Eq))
-                }
-                '+' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::Plus))
-                }
-                '*' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::Star))
-                }
-                '%' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::Percent))
-                }
-                ',' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::Comma))
-                }
-                '.' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::Dot))
-                }
-                ';' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::Semicolon))
-                }
-                ':' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::Colon))
-                }
-                '(' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::LParen))
-                }
-                ')' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::RParen))
-                }
-                '[' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::LBracket))
-                }
-                ']' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::RBracket))
-                }
-                '{' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::LBrace))
-                }
-                '}' => {
-                    self.advance();
-                    Ok(self.make_token(start, TokenKind::RBrace))
-                }
-                '<' => {
-                    self.advance();
-                    let kind = if self.peek() == Some('=') {
+                    TokenKind::Arrow
+                } else {
+                    TokenKind::Minus
+                };
+                Ok(self.make_token(start, kind))
+            }
+            _ => return Some(self.scan_punctuation(ch, start)),
+        };
+        Some(token)
+    }
+
+    /// Scan single-character punctuation and the two-character comparisons.
+    fn scan_punctuation(
+        &mut self,
+        ch: char,
+        start: usize,
+    ) -> Result<SpannedToken<'a>, LexicalError> {
+        let kind = match ch {
+            '=' => TokenKind::Eq,
+            '+' => TokenKind::Plus,
+            '*' => TokenKind::Star,
+            '%' => TokenKind::Percent,
+            ',' => TokenKind::Comma,
+            '.' => TokenKind::Dot,
+            ';' => TokenKind::Semicolon,
+            ':' => TokenKind::Colon,
+            '(' => TokenKind::LParen,
+            ')' => TokenKind::RParen,
+            '[' => TokenKind::LBracket,
+            ']' => TokenKind::RBracket,
+            '{' => TokenKind::LBrace,
+            '}' => TokenKind::RBrace,
+            '<' => {
+                self.advance();
+                let kind = match self.peek() {
+                    Some('=') => {
                         self.advance();
                         TokenKind::Leq
-                    } else if self.peek() == Some('>') {
+                    }
+                    Some('>') => {
                         self.advance();
                         TokenKind::Neq
-                    } else {
-                        TokenKind::Lt
-                    };
-                    Ok(self.make_token(start, kind))
-                }
-                '>' => {
+                    }
+                    _ => TokenKind::Lt,
+                };
+                return Ok(self.make_token(start, kind));
+            }
+            '>' => {
+                self.advance();
+                let kind = if self.peek() == Some('=') {
                     self.advance();
-                    let kind = if self.peek() == Some('=') {
-                        self.advance();
-                        TokenKind::Geq
-                    } else {
-                        TokenKind::Gt
-                    };
-                    Ok(self.make_token(start, kind))
-                }
-                _ => {
-                    self.advance();
-                    Err(self.make_error(start, format!("unexpected character '{ch}'")))
-                }
-            });
-        }
+                    TokenKind::Geq
+                } else {
+                    TokenKind::Gt
+                };
+                return Ok(self.make_token(start, kind));
+            }
+            _ => {
+                self.advance();
+                return Err(self.make_error(start, format!("unexpected character '{ch}'")));
+            }
+        };
+        self.advance();
+        Ok(self.make_token(start, kind))
     }
 }

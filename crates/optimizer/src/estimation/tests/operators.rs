@@ -14,13 +14,16 @@ fn grouping_ndv_is_bounded_by_rows_and_includes_a_null_group() {
 }
 
 #[test]
-fn grouping_sets_sum_cardinalities_and_unknown_keys_stay_unknown() {
+fn grouping_sets_sum_cardinalities_and_missing_ndv_uses_a_model_upper_bound() {
     let plan = scan(1, Some(100), Some(10), Some(0));
     let key = LogicalExpr::Column(plan.schema().fields[0].clone());
     assert_eq!(rows(&aggregate(plan, vec![vec![key], vec![]])), Some(11.0));
     let plan = scan(1, Some(100), None, Some(0));
     let key = LogicalExpr::Column(plan.schema().fields[0].clone());
-    assert_eq!(rows(&aggregate(plan, vec![vec![key]])), None);
+    let estimate = root(&aggregate(plan, vec![vec![key]])).rows;
+    assert_eq!(estimate.value(), Some(100.0));
+    assert_eq!(estimate.source, EstimateSource::Aggregate);
+    assert_eq!(estimate.confidence, EstimateConfidence::Model);
 }
 
 #[test]
@@ -124,10 +127,16 @@ fn scan_with_joint_statistics() -> LogicalPlan {
         num_rows: Some(100),
         column_statistics: [
             ("left_key".into(), ColumnStatistics {
-                distinct_count: Some(10), null_count: Some(0), nan_count: Some(0), ..Default::default()
+                distinct_count: Some(10),
+                null_count: Some(0),
+                nan_count: Some(0),
+                ..Default::default()
             }),
             ("right_key".into(), ColumnStatistics {
-                distinct_count: Some(10), null_count: Some(0), nan_count: Some(0), ..Default::default()
+                distinct_count: Some(10),
+                null_count: Some(0),
+                nan_count: Some(0),
+                ..Default::default()
             }),
         ].into(),
         column_groups: vec![ColumnGroupStatistics {

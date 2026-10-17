@@ -35,10 +35,7 @@ fn view(chunk: DataChunk) -> DataChunkView {
 }
 
 fn int_at(view: &DataChunkView, column: usize, row: usize) -> Option<i64> {
-    let Some((array, physical_row)) = view.resolve(column, row).expect("resolve view cell")
-    else {
-        return None;
-    };
+    let (array, physical_row) = view.resolve(column, row).ok()??;
     let values = array
         .as_any()
         .downcast_ref::<Int64Array>()
@@ -49,10 +46,7 @@ fn int_at(view: &DataChunkView, column: usize, row: usize) -> Option<i64> {
 }
 
 fn string_at(view: &DataChunkView, column: usize, row: usize) -> Option<String> {
-    let Some((array, physical_row)) = view.resolve(column, row).expect("resolve view cell")
-    else {
-        return None;
-    };
+    let (array, physical_row) = view.resolve(column, row).ok()??;
     let values = array
         .as_any()
         .downcast_ref::<StringArray>()

@@ -44,7 +44,6 @@ impl AggregateStateColumn {
     }
 
     #[allow(dead_code)] // Used when restoring aggregate spill state.
-
     pub(in crate::operators::aggregate) fn merge_intermediate_state(
         &mut self,
         slot: usize,

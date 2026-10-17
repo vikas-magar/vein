@@ -205,9 +205,8 @@ fn retained_statistics_reason(
                 return RetainedStatisticsReason::Missing;
             };
             if statistics.min_max_complete != Some(true)
-                && !unit
-                .num_rows
-                .is_some_and(|rows| statistics.null_count == Some(rows))
+                && unit
+                .num_rows.is_none_or(|rows| statistics.null_count != Some(rows))
             {
                 return RetainedStatisticsReason::Incomplete;
             }

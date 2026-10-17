@@ -18,8 +18,12 @@ pub(crate) struct ColumnEstimate<'a> {
 }
 
 impl<'a> ColumnEstimate<'a> {
-    pub fn from_statistics(stats: &'a ColumnStatistics, rows: u64, nullable: bool) -> Option<Self> {
-        if !crate::statistics::valid_column(stats, rows, nullable) { return None; }
+    pub fn from_statistics(
+        stats: &'a ColumnStatistics,
+        rows: u64,
+        nullable: bool,
+    ) -> Result<Self, crate::statistics::ColumnStatisticsValidationError> {
+        crate::statistics::validate_column(stats, rows, nullable)?;
         let nulls = stats.null_count;
         let min = stats.min_value.as_ref();
         let max = stats.max_value.as_ref();
@@ -28,14 +32,17 @@ impl<'a> ColumnEstimate<'a> {
             && stats.is_consistent_with_rows(rows)
             && stats.nan_count == Some(0)
         {
-            rows.checked_sub(nulls?)
+            nulls.and_then(|nulls| rows.checked_sub(nulls))
         } else {
             None
         };
-        Some(Self {
-            distinct: stats.distinct_count.map(|d| d as f64),
-            null_fraction: nulls.map(|n| if rows == 0 { 0.0 } else { n as f64 / rows as f64 })
-                .or((!nullable).then_some(0.0)),
+        Ok(Self {
+            // Missing per-column values use explicit model priors while retaining
+            // every independently validated field from the supplied synopsis.
+            distinct: Some(stats.distinct_count.unwrap_or(rows - nulls.unwrap_or(0)) as f64),
+            null_fraction: Some(nulls.map_or(0.0, |n| {
+                if rows == 0 { 0.0 } else { n as f64 / rows as f64 }
+            })),
             min,
             max,
             synopsis: synopsis_population.map(|_| stats),
@@ -47,9 +54,8 @@ impl<'a> ColumnEstimate<'a> {
         self.distinct = self.distinct.zip(rows.value()).map(|(d, r)| d.min(r));
         self.synopsis = None;
         self.synopsis_population = None;
-        if self.null_fraction != Some(0.0) {
-            self.null_fraction = None;
-        }
+        // Filtering can change the conditional null rate. Retaining the observed
+        // rate is the model's independence prior; it is not a semantic guarantee.
     }
 }
 
@@ -83,6 +89,21 @@ impl<'a> RelationEstimate<'a> {
         self.columns.retain(|id, _| schema.fields.iter().any(|c| c.id == *id));
         self.joint_distinct.retain(|columns, _| {
             columns.iter().all(|id| schema.fields.iter().any(|column| column.id == *id))
+        });
+    }
+
+    /// Add a model-only distribution prior when row cardinality is known but a
+    /// column synopsis is absent. The maximum possible NDV is the non-null row
+    /// count; using it is deliberately conservative for equality selectivity.
+    /// This prior is never used as a semantic pruning proof.
+    pub fn add_cardinality_prior(&mut self, id: ColumnId, rows: u64) {
+        self.columns.entry(id).or_insert(ColumnEstimate {
+            distinct: Some(rows as f64),
+            null_fraction: Some(0.0),
+            min: None,
+            max: None,
+            synopsis: None,
+            synopsis_population: None,
         });
     }
 
@@ -121,8 +142,8 @@ impl<'a> RelationEstimate<'a> {
                         | (LogicalExpr::Literal(v), LogicalExpr::Column(c)) => (c, v),
                         _ => continue,
                     };
-                    if !matches!(value, LogicalLiteral::Null(_)) {
-                        if let Some(stats) = self.columns.get_mut(&column.id) {
+                    if !matches!(value, LogicalLiteral::Null(_))
+                        && let Some(stats) = self.columns.get_mut(&column.id) {
                             stats.distinct = Some(self.rows.value().unwrap_or(1.0).min(1.0));
                             stats.null_fraction = Some(0.0);
                             stats.min = Some(value);
@@ -130,11 +151,10 @@ impl<'a> RelationEstimate<'a> {
                             stats.synopsis = None;
                             stats.synopsis_population = None;
                         }
-                    }
                 }
                 LogicalExpr::IsNull { expr: operand } | LogicalExpr::IsNotNull { expr: operand } => {
-                    if let LogicalExpr::Column(column) = operand.as_ref() {
-                        if let Some(stats) = self.columns.get_mut(&column.id) {
+                    if let LogicalExpr::Column(column) = operand.as_ref()
+                        && let Some(stats) = self.columns.get_mut(&column.id) {
                             let is_null = matches!(expr, LogicalExpr::IsNull { .. });
                             stats.null_fraction = Some(if is_null { 1.0 } else { 0.0 });
                             if is_null {
@@ -145,7 +165,6 @@ impl<'a> RelationEstimate<'a> {
                                 stats.synopsis_population = None;
                             }
                         }
-                    }
                 }
                 _ => {}
             }

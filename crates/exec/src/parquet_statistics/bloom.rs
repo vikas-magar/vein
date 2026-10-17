@@ -101,8 +101,7 @@ impl ParquetBloomFilter {
                 DataType::Decimal128(precision, scale),
                 physical,
                 LogicalLiteral::Decimal(value, literal_precision, literal_scale),
-            ) if u8::try_from(*precision).ok() == Some(*literal_precision)
-                && i8::try_from(*scale).ok() == Some(*literal_scale) =>
+            ) if *precision == *literal_precision && *scale == *literal_scale =>
                 {
                     decimal_may_contain(
                         filter,
@@ -245,7 +244,7 @@ pub(super) fn predicate_may_match_bloom(
         } => filters
             .get(column)
             .and_then(|filter| filter.may_contain(literal))
-            .map_or(true, |may_contain| {
+            .is_none_or(|may_contain| {
                 *probes = probes.saturating_add(1);
                 may_contain
             }),

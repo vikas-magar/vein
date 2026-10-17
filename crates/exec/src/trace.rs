@@ -417,7 +417,7 @@ impl NodeExecutionGuard {
     pub(crate) fn finish(&mut self, result: &common::Result<u64>) {
         self.outcome = match result {
             Ok(_) => 1,
-            Err(error) if matches!(error, error::VeinError::Cancelled) => 2,
+            Err(error::VeinError::Cancelled) => 2,
             Err(_) => 3,
         };
     }
@@ -589,6 +589,7 @@ fn operator_config(operator: &PhysicalPlanOperator) -> String {
                 common::protocol::DataSource::File(_) => "file",
                 common::protocol::DataSource::Stream(_) => "stream",
                 common::protocol::DataSource::Memory => "memory",
+                common::protocol::DataSource::Intermediate(_) => "intermediate",
             };
             format!("source={source_kind}, program_instructions={}", program.instructions.len())
         }

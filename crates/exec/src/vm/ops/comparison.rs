@@ -77,21 +77,21 @@ mod tests {
 
         let eq_res = eval_cmp_eq(&a, &b).unwrap();
         let eq_bool = eq_res.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(eq_bool.value(0), false);
-        assert_eq!(eq_bool.value(1), true);
-        assert_eq!(eq_bool.value(2), false);
+        assert!(!eq_bool.value(0));
+        assert!(eq_bool.value(1));
+        assert!(!eq_bool.value(2));
 
         let gt_res = eval_cmp_gt(&a, &b).unwrap();
         let gt_bool = gt_res.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(gt_bool.value(0), false);
-        assert_eq!(gt_bool.value(1), false);
-        assert_eq!(gt_bool.value(2), true);
+        assert!(!gt_bool.value(0));
+        assert!(!gt_bool.value(1));
+        assert!(gt_bool.value(2));
 
         let lte_res = eval_cmp_lte(&a, &b).unwrap();
         let lte_bool = lte_res.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(lte_bool.value(0), true);
-        assert_eq!(lte_bool.value(1), true);
-        assert_eq!(lte_bool.value(2), false);
+        assert!(lte_bool.value(0));
+        assert!(lte_bool.value(1));
+        assert!(!lte_bool.value(2));
     }
 
     #[test]
@@ -105,8 +105,8 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("LIKE returns booleans");
-        assert_eq!(matched.value(0), true);
-        assert_eq!(matched.value(1), true);
+        assert!(matched.value(0));
+        assert!(matched.value(1));
         assert!(matched.is_null(2));
 
         let values = StringArray::from(vec![Some("POLISHED BRASS"), Some("BRASS"), None]);
@@ -116,8 +116,8 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("NOT LIKE returns booleans");
-        assert_eq!(unmatched.value(0), false);
-        assert_eq!(unmatched.value(1), false);
+        assert!(!unmatched.value(0));
+        assert!(!unmatched.value(1));
         assert!(unmatched.is_null(2));
     }
 }

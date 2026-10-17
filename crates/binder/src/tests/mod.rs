@@ -51,6 +51,7 @@ pub fn node_kind(plan: &LogicalPlan) -> &'static str {
     match plan {
         LogicalPlan::Scan { .. } => "Scan",
         LogicalPlan::ExternalScan { .. } => "ExternalScan",
+        LogicalPlan::Intermediate { .. } => "Intermediate",
         LogicalPlan::Filter { .. } => "Filter",
         LogicalPlan::Project { .. } => "Project",
         LogicalPlan::Aggregate { .. } => "Aggregate",
@@ -626,6 +627,22 @@ mod call_and_external {
     async fn object_store_source_binds_external_scan() {
         let plan = bind("FROM 's3://bucket/data' WITH (format = 'parquet') |> SELECT 1").await;
         assert_chain(&plan, &["Project", "ExternalScan"]);
+    }
+
+    #[tokio::test]
+    async fn catalog_resolved_external_source_retains_shared_metadata() {
+        let plan = bind("FROM 'users' |> SELECT 1").await;
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected project over external scan");
+        };
+        let LogicalPlan::ExternalScan {
+            source_metadata: Some(metadata),
+            ..
+        } = *input
+        else {
+            panic!("resolved external source must retain its catalog metadata");
+        };
+        assert_eq!(metadata.name, "users");
     }
 }
 

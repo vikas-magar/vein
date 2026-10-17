@@ -39,6 +39,10 @@ pub mod join_transitivity;
 /// Bounded cost-based enumeration for safe inner equijoins.
 pub mod join_order;
 
+/// Exact checkpoint key bounds propagated to unread inner-join inputs.
+pub mod checkpoint_filters;
+pub use checkpoint_filters::CheckpointJoinFilterRule;
+
 pub use column_pruning::ColumnPruningRule;
 pub use constant_fold::ConstantFoldingRule;
 pub use expression_simplify::ExpressionSimplificationRule;

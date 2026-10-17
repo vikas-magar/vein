@@ -1,4 +1,6 @@
-use super::*;
+use super::super::metrics::{count_true_rows, ScanPredicateMetrics};
+use arrow::array::BooleanArray;
+use std::time::Duration;
 
 #[test]
 fn scan_predicate_metrics_count_only_true_rows_and_accumulate_batches() {

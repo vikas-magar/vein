@@ -30,11 +30,9 @@ pub(super) fn available_join_outputs(
     let mut outputs = Vec::with_capacity(schema.fields.len());
     let mut fields = Vec::with_capacity(schema.fields.len());
     for field in &schema.fields {
-        let probe_index = probe.position_of_id(field.id).or_else(|| {
-            probe.fields.iter().position(|candidate| {
-                candidate.name == field.name && candidate.qualifier == field.qualifier
-            })
-        });
+        // Bound identities are authoritative. Name fallback can select a
+        // same-named column from the opposite side of a join.
+        let probe_index = probe.position_of_id(field.id);
         if let Some(index) = probe_index {
             let index = u32::try_from(index)
                 .map_err(|_| VeinError::planning("join probe input has too many columns", None))?;
@@ -42,11 +40,7 @@ pub(super) fn available_join_outputs(
             fields.push(Arc::clone(field));
             continue;
         }
-        let build_index = build.position_of_id(field.id).or_else(|| {
-            build.fields.iter().position(|candidate| {
-                candidate.name == field.name && candidate.qualifier == field.qualifier
-            })
-        });
+        let build_index = build.position_of_id(field.id);
         if let Some(index) = build_index {
             let index = u32::try_from(index)
                 .map_err(|_| VeinError::planning("join build input has too many columns", None))?;

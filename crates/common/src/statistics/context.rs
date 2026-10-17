@@ -183,6 +183,10 @@ pub struct QueryStatisticsSnapshot {
     pub scans: HashMap<String, Vec<Arc<RuntimeStatisticsObservation>>>,
     /// Operator feedback observed when this snapshot was taken.
     pub operators: Vec<OperatorStatisticsSnapshot>,
+    /// Complete checkpoint populations, keyed by query-local relation identity.
+    /// Column synopsis keys are the decimal query-local ColumnId, avoiding
+    /// ambiguity when joined inputs have identical column names.
+    pub intermediates: HashMap<u128, Arc<TableStatistics>>,
 }
 
 impl QueryStatisticsSnapshot {
@@ -286,6 +290,7 @@ impl QueryStatisticsSnapshot {
 struct RuntimeState {
     operators: HashMap<OperatorStatisticsIdentity, Arc<OperatorStatisticsHandle>>,
     scans: HashMap<String, Vec<Arc<RuntimeStatisticsObservation>>>,
+    intermediates: HashMap<u128, Arc<TableStatistics>>,
 }
 
 /// The shared statistics context for one prepared query.
@@ -314,6 +319,20 @@ impl std::fmt::Debug for QueryStatisticsContext {
 }
 
 impl QueryStatisticsContext {
+    /// Publish a sealed checkpoint's complete synopsis. This population is
+    /// never merged into a base table, even if it originated from one scan.
+    pub fn record_intermediate(&self, source_id: u128, statistics: Arc<TableStatistics>) -> crate::Result<()> {
+        if statistics.num_rows.is_none() {
+            return Err(crate::VeinError::internal("checkpoint statistics require an observed row count"));
+        }
+        let mut runtime = self.runtime.lock().unwrap_or_else(|poison| poison.into_inner());
+        if runtime.intermediates.contains_key(&source_id) {
+            return Err(crate::VeinError::internal("checkpoint statistics were already published"));
+        }
+        runtime.intermediates.insert(source_id, statistics);
+        Ok(())
+    }
+
     /// Creates a query context from source snapshots bound during planning.
     pub fn new(sources: impl IntoIterator<Item=QuerySourceStatistics>) -> Self {
         Self {
@@ -408,6 +427,7 @@ impl QueryStatisticsContext {
         QueryStatisticsSnapshot {
             sources: Arc::clone(&self.sources),
             scans: runtime.scans.clone(),
+            intermediates: runtime.intermediates.clone(),
             operators: runtime
                 .operators
                 .iter()
@@ -420,6 +440,23 @@ impl QueryStatisticsContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_populations_are_query_scoped_immutable_and_separate_from_sources() {
+        let first = QueryStatisticsContext::new([]);
+        let other = QueryStatisticsContext::new([]);
+        let statistics = Arc::new(TableStatistics { num_rows: Some(3), ..Default::default() });
+        first.record_intermediate(17, Arc::clone(&statistics)).unwrap();
+        assert!(Arc::ptr_eq(&first.snapshot().intermediates[&17], &statistics));
+        assert!(first.snapshot().scans.is_empty());
+        assert!(other.snapshot().intermediates.is_empty());
+        assert!(first.record_intermediate(17, Arc::new(TableStatistics {
+            num_rows: Some(4),
+            ..Default::default()
+        })).is_err());
+        assert!(first.record_intermediate(18, Arc::new(TableStatistics::default())).is_err());
+        assert_eq!(first.snapshot().intermediates[&17].num_rows, Some(3));
+    }
 
     #[test]
     fn cloned_contexts_share_runtime_feedback_and_keep_source_snapshots() {

@@ -405,6 +405,7 @@ mod tests {
             url: "private_source_marker".to_string(),
             options: Vec::new(),
             files: Vec::new(),
+            source_metadata: None,
             schema: Box::new(VeinSchema::empty()),
         }));
         let mut compiler = BytecodeCompiler::new(0);

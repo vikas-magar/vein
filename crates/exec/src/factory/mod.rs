@@ -14,7 +14,7 @@ use crate::operators::join::JoinBloomFilterFactory;
 use crate::operators::sink::{CollectSink, DiscardSink, WriteSink, WriteStorage};
 use crate::memory::ExecutionResourceLimits;
 use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};
-use crate::operators::source::scan::{PARQUET_FOOTER, ScanFile};
+use crate::operators::source::scan::{PARQUET_FOOTER, ScanFile, ScanSourceConfig};
 use crate::operators::source::ScanSource;
 use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Sink, Source, Transform};
 use crate::runtime_filter::{
@@ -253,6 +253,9 @@ impl DefaultExecutorBuilder {
             DataSource::Memory => Err(VeinError::internal(
                 "a DataSource::Memory task carries no payload to materialize",
             )),
+            DataSource::Intermediate(_) => Err(VeinError::internal(
+                "intermediate sources must be resolved by the query task executor",
+            )),
             DataSource::File(scan) => {
                 if scan.scan_unit_range.is_some() && scan.files.len() != 1 {
                     return Err(VeinError::planning(
@@ -270,19 +273,19 @@ impl DefaultExecutorBuilder {
                     })
                     .collect();
                 let op = self.local_operator(&root)?;
-                let source = ScanSource::new_with_runtime_statistics(
-                    op,
+                let source = ScanSource::new(ScanSourceConfig {
+                    operator: op,
                     files,
-                    scan.format.clone(),
-                    scan.projected.clone(),
-                    scan.dictionary_columns.clone(),
-                    scan.pushdown.clone(),
-                    self.metadata_store.clone(),
-                    self.registry.clone(),
-                    runtime_filters.clone(),
-                    self.runtime_statistics.clone(),
-                    scan.runtime_statistics.clone(),
-                );
+                    format: scan.format.clone(),
+                    projected: scan.projected.clone(),
+                    dictionary_columns: scan.dictionary_columns.clone(),
+                    pushdown: scan.pushdown.clone(),
+                    runtime_filters: runtime_filters.clone(),
+                    metadata_store: self.metadata_store.clone(),
+                    registry: self.registry.clone(),
+                    runtime_statistics: self.runtime_statistics.clone(),
+                    statistics_scan: scan.runtime_statistics.clone(),
+                });
                 let source = match query_statistics {
                     Some(context) => source.with_query_statistics_context(context),
                     None => source,

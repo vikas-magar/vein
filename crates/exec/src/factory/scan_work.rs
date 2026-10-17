@@ -13,13 +13,12 @@ pub(super) fn row_group_ranges(
     let mut ranges: Vec<Range<usize>> = Vec::new();
     let mut weight = 0_u64;
     for (group, bytes) in groups {
-        if let Some(last) = ranges.last_mut() {
-            if last.end == group && target_bytes.is_none_or(|target| weight.saturating_add(bytes.max(1)) <= target.max(1)) {
+        if let Some(last) = ranges.last_mut()
+            && last.end == group && target_bytes.is_none_or(|target| weight.saturating_add(bytes.max(1)) <= target.max(1)) {
                 last.end = group + 1;
                 weight = weight.saturating_add(bytes.max(1));
                 continue;
             }
-        }
         ranges.push(group..group + 1);
         weight = bytes.max(1);
     }
