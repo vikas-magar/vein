@@ -184,7 +184,8 @@ fn validate_node(node: &PhysicalPlanNode, path: &str, root: bool) -> Result<()> 
                     crate::protocol::JoinKind::Inner
                     | crate::protocol::JoinKind::Cross
                     | crate::protocol::JoinKind::Semi
-                    | crate::protocol::JoinKind::Anti => false,
+                    | crate::protocol::JoinKind::Anti
+                    | crate::protocol::JoinKind::NullAwareAnti => false,
                 };
                 let expected_nullable = source_field.nullable || output_is_null_extended;
                 if node.output_schema.fields[output_index].nullable != expected_nullable {

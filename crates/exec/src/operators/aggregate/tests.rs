@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Decimal256Array, DictionaryArray, Float16Array, Float32Array, Float64Array, Int32Array,
+    Date32Array, Decimal256Array, DictionaryArray, Float16Array, Float32Array, Float64Array, Int32Array,
     Int64Array, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{Int32Type, i256};
@@ -19,3 +19,4 @@ mod grouping;
 mod memory;
 mod intermediate;
 mod spill;
+mod distinct;

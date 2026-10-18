@@ -1,4 +1,6 @@
 use super::*;
+use arrow::array::new_null_array;
+use arrow::compute::kernels::numeric;
 use arrow::datatypes::TimeUnit;
 
 #[test]
@@ -33,6 +35,19 @@ fn unifies_integer_and_decimal_without_losing_range_or_scale() {
 }
 
 #[test]
+fn mixed_decimal_and_float_unify_to_float64_symmetrically() {
+    for decimal in [
+        VeinDataType::Decimal128(1, 1),
+        VeinDataType::Decimal256(40, 12),
+    ] {
+        for float in [VeinDataType::Float16, VeinDataType::Float32, VeinDataType::Float64] {
+            assert_eq!(unify_types(&decimal, &float).unwrap(), VeinDataType::Float64);
+            assert_eq!(unify_types(&float, &decimal).unwrap(), VeinDataType::Float64);
+        }
+    }
+}
+
+#[test]
 fn decimal_unification_preserves_widest_scale_and_uses_decimal256_when_needed() {
     assert_eq!(
         unify_types(
@@ -49,24 +64,48 @@ fn decimal_unification_preserves_widest_scale_and_uses_decimal256_when_needed() 
 }
 
 #[test]
-fn decimal_multiplication_matches_arrow_precision_and_scale() {
+fn decimal_arithmetic_inference_matches_arrow_kernels() {
+    let operators = [
+        DecimalArithmeticOp::Add,
+        DecimalArithmeticOp::Subtract,
+        DecimalArithmeticOp::Multiply,
+        DecimalArithmeticOp::Divide,
+        DecimalArithmeticOp::Remainder,
+    ];
+    let operands = [
+        (VeinDataType::Decimal128(17, 4), VeinDataType::Decimal128(13, 2)),
+        (VeinDataType::Decimal256(42, 8), VeinDataType::Decimal256(42, 8)),
+    ];
+
+    for (left_type, right_type) in operands {
+        for op in operators {
+            let left = new_null_array(&left_type.to_arrow(), 1);
+            let right = new_null_array(&right_type.to_arrow(), 1);
+            let actual = match op {
+                DecimalArithmeticOp::Add => numeric::add(&left, &right),
+                DecimalArithmeticOp::Subtract => numeric::sub(&left, &right),
+                DecimalArithmeticOp::Multiply => numeric::mul(&left, &right),
+                DecimalArithmeticOp::Divide => numeric::div(&left, &right),
+                DecimalArithmeticOp::Remainder => numeric::rem(&left, &right),
+            }
+                .expect("Arrow decimal kernel should infer a result type");
+            let expected = decimal_arithmetic_result_type(op, &left_type, &right_type)
+                .unwrap()
+                .expect("decimal operands should produce a decimal result");
+            assert_eq!(actual.data_type(), &expected.to_arrow(), "{op:?}");
+        }
+    }
     assert_eq!(
-        decimal_multiply_result_type(
-            &VeinDataType::Decimal128(17, 4),
-            &VeinDataType::Decimal128(17, 4),
+        decimal_arithmetic_result_type(
+            DecimalArithmeticOp::Divide,
+            &VeinDataType::Decimal256(42, 8),
+            &VeinDataType::Decimal256(42, 8),
         )
             .unwrap(),
-        Some(VeinDataType::Decimal128(35, 8))
+        Some(VeinDataType::Decimal256(54, 12))
     );
-    assert_eq!(
-        decimal_multiply_result_type(
-            &VeinDataType::Decimal256(40, 4),
-            &VeinDataType::Decimal256(40, 4),
-        )
-            .unwrap(),
-        Some(VeinDataType::Decimal256(76, 8))
-    );
-    assert!(decimal_multiply_result_type(
+    assert!(decimal_arithmetic_result_type(
+        DecimalArithmeticOp::Multiply,
         &VeinDataType::Decimal128(38, 20),
         &VeinDataType::Decimal128(38, 20),
     )

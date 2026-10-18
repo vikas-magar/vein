@@ -4,6 +4,7 @@ use super::FunctionRegistry;
 
 mod lower;
 mod round;
+mod substring;
 mod vector_distance;
 mod extract;
 mod truncate;
@@ -12,6 +13,7 @@ mod truncate;
 pub fn register_builtin_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(Arc::new(lower::LowerFunction));
     registry.register_scalar(Arc::new(round::RoundFunction));
+    registry.register_scalar(Arc::new(substring::SubstringFunction));
     registry.register_scalar(Arc::new(vector_distance::VectorDistanceFunction));
     for (name, part) in [
         ("year", DatePart::Year),

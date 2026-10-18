@@ -11,10 +11,21 @@ fn builtin(
     arg_types: &[VeinDataType],
     kind: FunctionKind,
 ) -> FunctionSignature {
+    let min_arg_count = arg_types.len();
+    builtin_with_min_args(return_type, arg_types, kind, min_arg_count)
+}
+
+fn builtin_with_min_args(
+    return_type: VeinDataType,
+    arg_types: &[VeinDataType],
+    kind: FunctionKind,
+    min_arg_count: usize,
+) -> FunctionSignature {
     FunctionSignature {
         return_type,
         volatility: Volatility::Immutable,
         arg_types: arg_types.to_vec(),
+        min_arg_count,
         kind,
         bytecode_ref: None,
     }
@@ -73,6 +84,15 @@ impl MockFunctionRegistry {
                 ),
             ),
             (
+                "SUBSTRING".to_string(),
+                builtin_with_min_args(
+                    VeinDataType::Utf8,
+                    &[VeinDataType::Utf8, VeinDataType::Int64, VeinDataType::Int64],
+                    FunctionKind::Scalar,
+                    2,
+                ),
+            ),
+            (
                 "EMBED".to_string(),
                 builtin(
                     VeinDataType::Vector(1536),
@@ -128,4 +148,3 @@ impl FunctionRegistry for MockFunctionRegistry {
             .ok_or_else(|| VeinError::not_found(format!("Function '{name}' not found in registry")))
     }
 }
-

@@ -4,14 +4,16 @@ use error::{Result, VeinError};
 
 use crate::{TimeUnit, VeinDataType};
 
-mod decimal_multiply;
-pub use decimal_multiply::decimal_multiply_result_type;
+mod decimal_arithmetic;
+pub use decimal_arithmetic::{DecimalArithmeticOp, decimal_arithmetic_result_type};
 
 /// Resolves the common supertype of two data types, or errors if none exists.
 ///
 /// Identical types pass through, `Null` unifies with any type, numeric and
 /// string widening is symmetric, and `Date32` promotes to `Timestamp` while
 /// preserving timestamp timezone and selecting the finest common time unit.
+/// Mixed decimal/floating operations use `Float64`, because floating-point
+/// aggregate results must interoperate with exact decimal literals.
 pub fn unify_types(left: &VeinDataType, right: &VeinDataType) -> Result<VeinDataType> {
     if left == right {
         return Ok(left.clone());
@@ -96,6 +98,19 @@ fn common_string(left: &VeinDataType, right: &VeinDataType) -> VeinDataType {
 }
 
 fn common_numeric(left: &VeinDataType, right: &VeinDataType) -> Option<VeinDataType> {
+    let is_decimal = |data_type: &VeinDataType| {
+        matches!(data_type, VeinDataType::Decimal128(_, _) | VeinDataType::Decimal256(_, _))
+    };
+    let is_float = |data_type: &VeinDataType| {
+        matches!(
+            data_type,
+            VeinDataType::Float16 | VeinDataType::Float32 | VeinDataType::Float64
+        )
+    };
+    if (is_decimal(left) && is_float(right)) || (is_float(left) && is_decimal(right)) {
+        return Some(VeinDataType::Float64);
+    }
+
     if let Some(common) = common_decimal(left, right) {
         return Some(common);
     }

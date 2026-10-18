@@ -1,6 +1,6 @@
 use super::support::{equality, join_key_schemas, test_column};
 use super::super::{available_join_outputs, equality_keys, join_kind};
-use common::protocol::JoinKind;
+use common::protocol::{JoinKind, JoinOutput};
 use parser::ast::pipe_op::JoinType;
 use plan::schema::VeinSchema;
 use std::sync::Arc;
@@ -108,4 +108,26 @@ fn join_output_mapping_preserves_only_declared_pruned_outputs() {
         vec![probe_value.id]
     );
     assert!(Arc::ptr_eq(&output_schema.fields[0], &probe_value));
+}
+
+#[test]
+fn join_output_mapping_uses_identity_for_duplicate_names_and_declared_order() {
+    let probe_column = test_column(31, "value");
+    let build_column = test_column(32, "value");
+    let probe = VeinSchema::new(vec![Arc::clone(&probe_column)]);
+    let build = VeinSchema::new(vec![Arc::clone(&build_column)]);
+    let declared_output = VeinSchema::new(vec![
+        Arc::clone(&build_column),
+        Arc::clone(&probe_column),
+    ]);
+
+    let (outputs, output_schema) = available_join_outputs(&declared_output, &probe, &build)
+        .expect("duplicate names must resolve through their stable identities");
+
+    assert!(matches!(outputs[0], JoinOutput::Build(0)));
+    assert!(matches!(outputs[1], JoinOutput::Probe(0)));
+    assert_eq!(output_schema.fields[0].id, build_column.id);
+    assert_eq!(output_schema.fields[1].id, probe_column.id);
+    assert!(Arc::ptr_eq(&output_schema.fields[0], &build_column));
+    assert!(Arc::ptr_eq(&output_schema.fields[1], &probe_column));
 }

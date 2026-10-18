@@ -94,7 +94,7 @@ impl AggregateSink {
             })
             .transpose()?
             .unwrap_or_default();
-        Ok(Self {
+        let mut sink = Self {
             plan,
             metrics: AggregateMetrics {
                 grouping_sets: grouping_sets.len() as u64,
@@ -121,6 +121,9 @@ impl AggregateSink {
             tracker,
             spill_schema,
             spill_runs: Vec::new(),
-        })
+            distinct_collectors: Vec::new(),
+        };
+        sink.initialize_distinct_collectors()?;
+        Ok(sink)
     }
 }

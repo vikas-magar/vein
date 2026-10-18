@@ -86,6 +86,7 @@ pub(super) fn join_kind(join_type: &JoinType) -> JoinKind {
         JoinType::Full => JoinKind::Full,
         JoinType::Semi => JoinKind::Semi,
         JoinType::Anti => JoinKind::Anti,
+        JoinType::NullAwareAnti => JoinKind::NullAwareAnti,
         JoinType::Single => JoinKind::Single,
         JoinType::Cross => JoinKind::Cross,
     }

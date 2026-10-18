@@ -740,6 +740,43 @@ fn compiles_project_above_aggregate_after_grouping_with_having_order_and_limit()
 }
 
 #[test]
+fn count_distinct_compiles_to_its_per_aggregate_opcode() {
+    let (input_schema, value) = schema();
+    let group = Arc::clone(&input_schema.fields[0]);
+    let output_schema = Box::new(VeinSchema::new(vec![
+        Arc::new(ResolvedColumn::new(
+            ColumnId(30),
+            "group_name",
+            None,
+            VeinDataType::Utf8,
+        )),
+        Arc::new(ResolvedColumn::new(
+            ColumnId(31),
+            "supplier_count",
+            None,
+            VeinDataType::Int64,
+        )),
+    ]));
+    let aggregate = LogicalPlan::Aggregate {
+        input: Box::new(external_scan(&input_schema)),
+        grouping_sets: vec![vec![LogicalExpr::Column(group)]],
+        aggs: vec![LogicalExpr::FunctionCall {
+            name: "count".to_owned(),
+            args: vec![LogicalExpr::Column(value)],
+            is_aggregate: true,
+            distinct: true,
+            return_type: VeinDataType::Int64,
+        }],
+        schema: output_schema,
+    };
+
+    let plan = PipelineCompiler::aggregate(&aggregate)
+        .expect("lower COUNT DISTINCT")
+        .expect("aggregate plan");
+    assert_eq!(plan.aggs, vec![common::protocol::AggOpCode::CountDistinct]);
+}
+
+#[test]
 fn compiles_join_residual_against_only_referenced_build_columns() {
     let probe_key = Arc::new(ResolvedColumn::new(
         ColumnId(1),

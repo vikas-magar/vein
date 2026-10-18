@@ -1,6 +1,7 @@
 use crate::context::BinderContext;
 use crate::expr::{ExprBinder, derive_column_name};
 use crate::pipe::query::bind_query_internal;
+use crate::pipe::aggregate_projection;
 use crate::scope::{Scope, ScopeStack};
 use crate::star::expand_projection_items;
 use crate::window::{expr_contains_window_call, split_window_items, wrap_window};
@@ -182,15 +183,39 @@ pub async fn bind_aggregate<'a>(
         bound_aggs.push(bound_expr);
     }
 
-    // Aggregate also replaces the current scope
-    scopes.push(crate::scope::Scope::unqualified(new_fields.clone()));
+    let visible_schema = VeinSchema {
+        fields: new_fields.clone(),
+    };
+    let normalized = aggregate_projection::normalize(
+        &bound_grouping_sets,
+        &bound_aggs,
+        &visible_schema,
+        || context.next_id(),
+    );
 
-    Ok(LogicalPlan::Aggregate {
-        input: Box::new(input),
-        grouping_sets: bound_grouping_sets,
-        aggs: bound_aggs,
-        schema: Box::new(VeinSchema { fields: new_fields }),
-    })
+    // Aggregate also replaces the current scope. A scalar projection above the
+    // aggregate restores the same visible schema after raw aggregate results.
+    scopes.push(crate::scope::Scope::unqualified(new_fields.clone()));
+    if let Some(normalized) = normalized {
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(input),
+            grouping_sets: bound_grouping_sets,
+            aggs: normalized.aggregates,
+            schema: Box::new(normalized.intermediate_schema),
+        };
+        Ok(LogicalPlan::Project {
+            input: Box::new(aggregate),
+            exprs: normalized.expressions,
+            schema: Box::new(visible_schema),
+        })
+    } else {
+        Ok(LogicalPlan::Aggregate {
+            input: Box::new(input),
+            grouping_sets: bound_grouping_sets,
+            aggs: bound_aggs,
+            schema: Box::new(visible_schema),
+        })
+    }
 }
 
 /// Binds a PipeOperator::Join into a LogicalPlan::Join
@@ -319,7 +344,8 @@ pub async fn bind_join<'a>(
                 parser::ast::pipe_op::JoinType::Inner
                 | parser::ast::pipe_op::JoinType::Cross
                 | parser::ast::pipe_op::JoinType::Semi
-                | parser::ast::pipe_op::JoinType::Anti => false,
+                | parser::ast::pipe_op::JoinType::Anti
+                | parser::ast::pipe_op::JoinType::NullAwareAnti => false,
             };
             if null_extended && !field.nullable {
                 std::sync::Arc::new(field.as_ref().clone().with_nullable(true))

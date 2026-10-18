@@ -700,6 +700,19 @@ mod pivot_unpivot {
 }
 
 #[cfg(test)]
+#[path = "subquery_projection.rs"]
+mod subquery_projection;
+mod substring;
+
+#[cfg(test)]
+#[path = "aggregate_projection.rs"]
+mod aggregate_projection;
+
+#[cfg(test)]
+#[path = "numeric_coercion.rs"]
+mod numeric_coercion;
+
+#[cfg(test)]
 mod cte_binding {
     use super::*;
 
@@ -953,22 +966,30 @@ mod extended_features {
         }
     }
 
-    /// Until distinct state is carried to execution, reject it instead of
-    /// silently executing a regular aggregate.
     #[tokio::test]
-    async fn aggregate_distinct_is_rejected() {
-        for query in [
-            "FROM users |> AGGREGATE COUNT(DISTINCT age)",
-            "FROM users |> AGGREGATE SUM(DISTINCT age)",
-            "FROM users |> AGGREGATE COUNT(DISTINCT *)",
+    async fn count_distinct_binds_its_distinct_metadata_and_rejects_unsupported_forms() {
+        let plan = bind("FROM users |> AGGREGATE COUNT(DISTINCT age) AS n GROUP BY name").await;
+        let LogicalPlan::Aggregate { aggs, .. } = plan else {
+            panic!("expected aggregate plan");
+        };
+        assert!(matches!(
+            &aggs[0],
+            LogicalExpr::FunctionCall { name, distinct: true, args, .. }
+                if name.eq_ignore_ascii_case("count") && args.len() == 1
+        ));
+
+        for (query, message) in [
+            (
+                "FROM users |> AGGREGATE SUM(DISTINCT age)",
+                "supported only for COUNT",
+            ),
+            (
+                "FROM users |> AGGREGATE COUNT(DISTINCT *)",
+                "COUNT(DISTINCT *) is not valid",
+            ),
         ] {
             let error = bind_err(query).await;
-            assert!(
-                error
-                    .to_string()
-                    .contains("DISTINCT inside aggregate function"),
-                "got {error} for {query}"
-            );
+            assert!(error.to_string().contains(message), "got {error} for {query}");
         }
     }
 

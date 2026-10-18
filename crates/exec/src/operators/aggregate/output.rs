@@ -50,6 +50,9 @@ impl AggregateSink {
         batch_rows: NonZeroUsize,
         mut emit: impl FnMut(DataChunk) -> Result<()>,
     ) -> Result<()> {
+        if !self.distinct_collectors.is_empty() {
+            self.finish_distinct_counts(batch_rows)?;
+        }
         if self.spill_runs.is_empty() {
             return self.finish_in_memory_with(batch_rows, &mut emit);
         }

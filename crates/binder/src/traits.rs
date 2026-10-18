@@ -42,6 +42,9 @@ pub struct FunctionSignature {
     pub volatility: Volatility,
     /// The expected argument types
     pub arg_types: Vec<VeinDataType>,
+    /// Minimum accepted argument count; `arg_types` defines the maximum.
+    /// Optional parameters are restricted to the trailing argument positions.
+    pub min_arg_count: usize,
     /// The execution kind and runtime of the function
     pub kind: FunctionKind,
     /// A reference string/path to the compiled bytecode (if it's a UDF)

@@ -9,12 +9,18 @@ use common::Result;
 use error::VeinError;
 
 use super::super::hash_table::HashTable;
-use super::super::rows::{JoinType, OutputRow, output_rows};
+use super::super::rows::{JoinType, OutputRow, null_aware_anti_rows, output_rows};
 use super::super::spec::OutputColumn;
 use super::JoinFilterCollector;
 
 type JoinMatch = (u32, (u32, u32));
 type BuildChunkMatchGroups = Vec<(u32, Vec<JoinMatch>)>;
+
+#[derive(Clone, Copy)]
+enum ComposedColumns {
+    ResidualPredicate,
+    JoinOutput,
+}
 
 /// Probes a shared build table and forwards matching rows as chunk views.
 pub struct HashJoin {
@@ -135,8 +141,13 @@ impl HashJoin {
             ))
         })?;
         let mut matches = Vec::new();
+        let mut null_probe_rows = Vec::new();
         let probe_started = Instant::now();
-        let (report, materialize_us) = self.table.probe_view(&chunk, &mut matches)?;
+        let (report, materialize_us) = if self.join_type == JoinType::NullAwareAnti {
+            self.table.probe_view_with_null_rows(&chunk, &mut matches, &mut null_probe_rows)?
+        } else {
+            self.table.probe_view(&chunk, &mut matches)?
+        };
         self.probe_key_materialization.accumulate(report);
         self.probe_key_materialize_us = self.probe_key_materialize_us.saturating_add(materialize_us);
         self.probe_us += probe_started.elapsed().as_micros() as u64;
@@ -172,7 +183,17 @@ impl HashJoin {
                 }),
             )?;
         } else {
-            let rows = output_rows(self.join_type, 0..probe_row_count, &matches, &[]);
+            let rows = if self.join_type == JoinType::NullAwareAnti {
+                null_aware_anti_rows(
+                    0..probe_row_count,
+                    &matches,
+                    &null_probe_rows,
+                    self.table.is_empty(),
+                    self.table.has_null_keys(),
+                )
+            } else {
+                output_rows(self.join_type, 0..probe_row_count, &matches, &[])
+            };
             self.forward_rows(Some(&chunk), rows)?;
         }
         Ok(())
@@ -213,6 +234,7 @@ impl HashJoin {
                 Some(probe),
                 Some(build_chunk),
                 &candidates,
+                ComposedColumns::ResidualPredicate,
             )?;
             output.clear()?;
             let started = Instant::now();
@@ -240,6 +262,7 @@ impl HashJoin {
         probe: Option<&DataChunkView>,
         build_chunk: Option<u32>,
         rows: &[OutputRow],
+        columns: ComposedColumns,
     ) -> Result<DataChunkView> {
         let row_count = rows.len();
         let null_probe = if probe.is_none() {
@@ -267,7 +290,11 @@ impl HashJoin {
             ViewInputRows { view: probe_view, rows: &self.probe_rows },
             ViewInputRows { view: build_view, rows: &self.build_rows },
         ];
-        DataChunkView::combine(&inputs, &self.output_columns)
+        let columns = match columns {
+            ComposedColumns::ResidualPredicate => &self.residual_view_columns,
+            ComposedColumns::JoinOutput => &self.output_columns,
+        };
+        DataChunkView::combine(&inputs, columns)
     }
 
     /// Preserves output row order while splitting only at build-batch changes.
@@ -300,6 +327,7 @@ impl HashJoin {
                 probe,
                 build_chunk,
                 &group,
+                ComposedColumns::JoinOutput,
             );
             group.clear();
             self.rows_by_build_chunk.insert(build_chunk, group);

@@ -25,6 +25,7 @@ use crate::context::{CatalogStatisticsProvider, OptimizationDiagnostics, Optimiz
 use crate::rule::{OptimizerRule, RuleType};
 use crate::rules::{
     ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule, FilterNormalizationRule,
+    InSubqueryJoinRule,
     FilterTransitivityRule,
     JoinPredicateTransitivityRule, PredicatePushdownRule, ScanFilterPushdownRule,
     ScanStatisticsPruningRule, ScalarAggregateDecorrelationRule,
@@ -94,6 +95,7 @@ impl OptimizerPipeline {
             Arc::new(ScanStatisticsPruningRule),
             Arc::new(JoinPredicateTransitivityRule),
             Arc::new(CheckpointJoinFilterRule),
+            Arc::new(InSubqueryJoinRule),
             Arc::new(ExistsDecorrelationRule),
             Arc::new(ScalarAggregateDecorrelationRule),
             Arc::new(PredicatePushdownRule),
@@ -204,11 +206,13 @@ impl OptimizerPipeline {
             diagnostics.sweeps = sweep;
             if !changed {
                 let mut optimized = next;
+                let mut cost_rewrite_changed_plan = false;
                 for rule in &cost_rules {
                     let started = Instant::now();
                     let (result, any_changed, join_decisions) =
                         apply_rule(rule.as_ref(), optimized, &context)?;
                     optimized = result;
+                    cost_rewrite_changed_plan |= any_changed;
                     diagnostics.join_order_decisions.extend(join_decisions);
                     let elapsed = started.elapsed();
                     tracing::debug!(
@@ -226,6 +230,28 @@ impl OptimizerPipeline {
                         phase: rule.phase(),
                         sweep,
                         changed: any_changed,
+                        elapsed,
+                    });
+                }
+                if cost_rewrite_changed_plan {
+                    let pruning_rule = ColumnPruningRule;
+                    let started = Instant::now();
+                    let (result, changed, _) =
+                        apply_rule(&pruning_rule, optimized, &context)?;
+                    optimized = result;
+                    let elapsed = started.elapsed();
+                    tracing::info!(
+                        target: "vein.audit",
+                        event = "optimizer_post_cost_column_pruning",
+                        changed,
+                        duration_us = elapsed.as_micros() as u64,
+                        "required columns refreshed after cost-based plan rewrite"
+                    );
+                    diagnostics.rule_executions.push(RuleExecution {
+                        rule_name: format!("{} (post-cost)", pruning_rule.name()),
+                        phase: pruning_rule.phase(),
+                        sweep,
+                        changed,
                         elapsed,
                     });
                 }

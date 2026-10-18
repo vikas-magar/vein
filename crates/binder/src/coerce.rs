@@ -6,10 +6,10 @@
 //! unifiable pair is handled here, every non-unifiable pair surfaces as a
 //! `Semantic` error instead of a silent type lie.
 
-use plan::LogicalExpr;
-use types::{unify_types, VeinDataType};
 use error::Result;
 use parser::ast::expr::BinaryOp;
+use plan::LogicalExpr;
+use types::{VeinDataType, unify_types};
 
 /// Resolves the common supertype of two expressions, injecting `Cast` nodes
 /// where implicit coercion is required.
@@ -82,14 +82,22 @@ pub fn coerce_arithmetic(
     }
 
     let (left, right, common_type) = coerce_types(left, right)?;
-    let result_type = if op == BinaryOp::Multiply {
-        types::coercion::decimal_multiply_result_type(
+    let decimal_op = match op {
+        BinaryOp::Plus => Some(types::coercion::DecimalArithmeticOp::Add),
+        BinaryOp::Minus => Some(types::coercion::DecimalArithmeticOp::Subtract),
+        BinaryOp::Multiply => Some(types::coercion::DecimalArithmeticOp::Multiply),
+        BinaryOp::Divide => Some(types::coercion::DecimalArithmeticOp::Divide),
+        BinaryOp::Modulo => Some(types::coercion::DecimalArithmeticOp::Remainder),
+        _ => None,
+    };
+    let result_type = match decimal_op {
+        Some(decimal_op) => types::coercion::decimal_arithmetic_result_type(
+            decimal_op,
             &left.data_type(),
             &right.data_type(),
         )?
-            .unwrap_or(common_type)
-    } else {
-        common_type
+            .unwrap_or(common_type),
+        None => common_type,
     };
 
     Ok((left, right, result_type))

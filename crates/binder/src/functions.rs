@@ -32,11 +32,20 @@ impl BuiltinFunctionRegistry {
                 scalar(VeinDataType::Float64, vec![VeinDataType::Float64]),
             ),
             (
+                "SUBSTRING",
+                scalar_with_min_args(
+                    VeinDataType::Utf8,
+                    vec![VeinDataType::Utf8, VeinDataType::Int64, VeinDataType::Int64],
+                    2,
+                ),
+            ),
+            (
                 "EMBED",
                 FunctionSignature {
                     return_type: VeinDataType::Vector(1536),
                     volatility: Volatility::Immutable,
                     arg_types: vec![VeinDataType::Utf8],
+                    min_arg_count: 1,
                     kind: FunctionKind::AiOperator,
                     bytecode_ref: None,
                 },
@@ -80,16 +89,27 @@ fn aggregate(return_type: VeinDataType) -> FunctionSignature {
         return_type,
         volatility: Volatility::Immutable,
         arg_types: Vec::new(),
+        min_arg_count: 0,
         kind: FunctionKind::Aggregate,
         bytecode_ref: None,
     }
 }
 
 fn scalar(return_type: VeinDataType, arg_types: Vec<VeinDataType>) -> FunctionSignature {
+    let min_arg_count = arg_types.len();
+    scalar_with_min_args(return_type, arg_types, min_arg_count)
+}
+
+fn scalar_with_min_args(
+    return_type: VeinDataType,
+    arg_types: Vec<VeinDataType>,
+    min_arg_count: usize,
+) -> FunctionSignature {
     FunctionSignature {
         return_type,
         volatility: Volatility::Immutable,
         arg_types,
+        min_arg_count,
         kind: FunctionKind::Scalar,
         bytecode_ref: None,
     }
@@ -100,6 +120,7 @@ fn temporal_extract() -> FunctionSignature {
         return_type: VeinDataType::Int32,
         volatility: Volatility::Immutable,
         arg_types: Vec::new(),
+        min_arg_count: 0,
         kind: FunctionKind::TemporalExtract,
         bytecode_ref: None,
     }
@@ -110,6 +131,7 @@ fn temporal_shift() -> FunctionSignature {
         return_type: VeinDataType::Null,
         volatility: Volatility::Immutable,
         arg_types: Vec::new(),
+        min_arg_count: 0,
         kind: FunctionKind::TemporalShift,
         bytecode_ref: None,
     }
@@ -120,6 +142,7 @@ fn temporal_truncate() -> FunctionSignature {
         return_type: VeinDataType::Null,
         volatility: Volatility::Immutable,
         arg_types: Vec::new(),
+        min_arg_count: 0,
         kind: FunctionKind::TemporalTruncate,
         bytecode_ref: None,
     }

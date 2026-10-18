@@ -22,6 +22,9 @@ impl AggregateSink {
 
     /// Folds one chunk into the groups.
     pub fn accumulate(&mut self, chunk: DataChunk) -> Result<()> {
+        if !self.distinct_collectors.is_empty() {
+            self.accumulate_distinct(&chunk)?;
+        }
         self.accumulate_with_spill(&chunk)
     }
 
@@ -501,6 +504,9 @@ impl AggregateSink {
         // batch, then fold the selected rows through the borrowed view.
         let state_update_started = Instant::now();
         for (offset, op) in self.plan.aggs.iter().enumerate() {
+            if *op == AggOpCode::CountDistinct {
+                continue;
+            }
             let input = AggregateInput::new(
                 *op,
                 &self.plan.aggregate_input_types[offset],

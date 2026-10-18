@@ -10,6 +10,18 @@ impl GroupKeyColumn {
                 array.data_type()
             ))
         };
+        if let Some(values) = array.as_any().downcast_ref::<Date32Array>() {
+            return Ok(Self::Date32(values.clone()));
+        }
+        if let Some(values) = array.as_any().downcast_ref::<Int8Array>() {
+            return Ok(Self::Int8(values.clone()));
+        }
+        if let Some(values) = array.as_any().downcast_ref::<Int16Array>() {
+            return Ok(Self::Int16(values.clone()));
+        }
+        if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
+            return Ok(Self::Int32(values.clone()));
+        }
         if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
             return Ok(Self::Int64(values.clone()));
         }
@@ -24,6 +36,12 @@ impl GroupKeyColumn {
         }
         if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
             return Ok(Self::UInt64(values.clone()));
+        }
+        if let Some(values) = array.as_any().downcast_ref::<Decimal128Array>() {
+            return Ok(Self::Decimal128(values.clone()));
+        }
+        if let Some(values) = array.as_any().downcast_ref::<Decimal256Array>() {
+            return Ok(Self::Decimal256(values.clone()));
         }
         if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
             return Ok(Self::Utf8(values.clone()));
@@ -49,11 +67,17 @@ impl GroupKeyColumn {
     /// Clone the typed Arrow wrapper while sharing its underlying buffers.
     pub(in crate::operators::aggregate) fn array_ref(&self) -> ArrayRef {
         match self {
+            Self::Date32(values) => Arc::new(values.clone()),
+            Self::Int8(values) => Arc::new(values.clone()),
+            Self::Int16(values) => Arc::new(values.clone()),
+            Self::Int32(values) => Arc::new(values.clone()),
             Self::Int64(values) => Arc::new(values.clone()),
             Self::UInt8(values) => Arc::new(values.clone()),
             Self::UInt16(values) => Arc::new(values.clone()),
             Self::UInt32(values) => Arc::new(values.clone()),
             Self::UInt64(values) => Arc::new(values.clone()),
+            Self::Decimal128(values) => Arc::new(values.clone()),
+            Self::Decimal256(values) => Arc::new(values.clone()),
             Self::Utf8(values) => Arc::new(values.clone()),
             Self::DictionaryUtf8(keys, _) => Arc::new(keys.clone()),
         }

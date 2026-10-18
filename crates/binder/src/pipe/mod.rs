@@ -6,6 +6,7 @@ pub mod dataflow;
 pub mod mutation;
 /// Sorting and Limiting operators
 pub mod order_limit;
+mod aggregate_projection;
 /// Query orchestrator logic
 pub mod query;
 /// Relational operators (Filter, Project, Aggregate, Join)

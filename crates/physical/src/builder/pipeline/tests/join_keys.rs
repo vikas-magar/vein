@@ -71,13 +71,13 @@ fn rejects_a_join_condition_without_a_supported_hash_key_type() {
         ColumnId(31),
         "probe_key",
         None,
-        VeinDataType::Int32,
+        VeinDataType::Boolean,
     ));
     let build_key = Arc::new(ResolvedColumn::new(
         ColumnId(41),
         "build_key",
         None,
-        VeinDataType::Int32,
+        VeinDataType::Boolean,
     ));
     let probe = VeinSchema::new(vec![Arc::clone(&probe_key)]);
     let build = VeinSchema::new(vec![Arc::clone(&build_key)]);
@@ -89,7 +89,7 @@ fn rejects_a_join_condition_without_a_supported_hash_key_type() {
     assert!(error.to_string().contains("matching supported hash-key type"));
 }
 #[test]
-fn unsupported_equality_remains_residual_when_a_supported_hash_key_exists() {
+fn int32_equality_is_extracted_as_hash_key_alongside_int64() {
     let probe_key = test_column(11, "probe_key");
     let build_key = test_column(21, "build_key");
     let probe_i32 = Arc::new(ResolvedColumn::new(
@@ -107,15 +107,15 @@ fn unsupported_equality_remains_residual_when_a_supported_hash_key_exists() {
     let probe = VeinSchema::new(vec![Arc::clone(&probe_key), Arc::clone(&probe_i32)]);
     let build = VeinSchema::new(vec![Arc::clone(&build_key), Arc::clone(&build_i32)]);
     let supported = equality(probe_key, build_key);
-    let residual = equality(probe_i32, build_i32);
+    let int32_equality = equality(probe_i32, build_i32);
 
     let ((probe_keys, build_keys), residuals) =
-        extract_equi_join_keys(&[&supported, &residual], &probe, &build)
-            .expect("the supported equality supplies the hash key");
+        extract_equi_join_keys(&[&supported, &int32_equality], &probe, &build)
+            .expect("both supported equalities should become hash keys");
 
-    assert_eq!(probe_keys, vec![0]);
-    assert_eq!(build_keys, vec![0]);
-    assert_eq!(residuals, vec![residual]);
+    assert_eq!(probe_keys, vec![0, 1]);
+    assert_eq!(build_keys, vec![0, 1]);
+    assert!(residuals.is_empty());
 }
 
 #[test]

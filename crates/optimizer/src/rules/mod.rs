@@ -33,6 +33,9 @@ pub mod scalar_aggregate_decorrelation;
 /// Decorrelation of correlated EXISTS predicates into semi/anti joins.
 pub mod exists_decorrelation;
 
+/// Rewrite filter-level IN/NOT IN subqueries to relational joins.
+pub mod in_subquery;
+
 /// Equality-based predicate propagation across inner joins.
 pub mod join_transitivity;
 
@@ -54,3 +57,4 @@ pub use scan_filter_pushdown::ScanFilterPushdownRule;
 pub use scan_statistics_pruning::ScanStatisticsPruningRule;
 pub use scalar_aggregate_decorrelation::ScalarAggregateDecorrelationRule;
 pub use exists_decorrelation::ExistsDecorrelationRule;
+pub use in_subquery::InSubqueryJoinRule;

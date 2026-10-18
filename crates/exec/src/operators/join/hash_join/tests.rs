@@ -958,3 +958,9 @@ fn inner_join_worker_local_probe_states_combine_duplicate_matches() {
     assert_eq!(canonical.view_compose_us, 32);
     assert_eq!(canonical.downstream_push_us, 40);
 }
+
+#[path = "tests/residual_projection.rs"]
+mod residual_projection;
+
+#[path = "tests/correlated_semi_anti.rs"]
+mod correlated_semi_anti;

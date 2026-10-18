@@ -44,7 +44,7 @@ impl AggregateStateColumn {
             };
         }
         Ok(match (self, op, data_type) {
-            (Self::Count(states), AggOpCode::Count, VeinDataType::Int64) => Arc::new(
+            (Self::Count(states), AggOpCode::Count | AggOpCode::CountDistinct, VeinDataType::Int64) => Arc::new(
                 Int64Array::from_iter_values(states[range.clone()].iter().copied()),
             ),
             (

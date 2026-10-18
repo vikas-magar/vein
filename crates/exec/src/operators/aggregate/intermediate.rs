@@ -252,6 +252,7 @@ fn decode_numeric<T: SpillValue>(cursor: &mut Cursor<&[u8]>) -> common::Result<N
 fn encode_op(op: AggOpCode) -> u8 {
     match op {
         AggOpCode::Count => 1,
+        AggOpCode::CountDistinct => 7,
         AggOpCode::Sum => 2,
         AggOpCode::Min => 3,
         AggOpCode::Max => 4,
@@ -263,6 +264,7 @@ fn encode_op(op: AggOpCode) -> u8 {
 fn decode_op(op: u8) -> common::Result<AggOpCode> {
     match op {
         1 => Ok(AggOpCode::Count),
+        7 => Ok(AggOpCode::CountDistinct),
         2 => Ok(AggOpCode::Sum),
         3 => Ok(AggOpCode::Min),
         4 => Ok(AggOpCode::Max),

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use crate::runtime_filter::RuntimeFilterSet;
 
 use super::*;
@@ -242,14 +242,14 @@ fn probe_finds_equal_keys() {
 #[test]
 fn insert_rejects_key_types_without_a_hash_join_representation() {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
-    let unsupported: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+    let unsupported: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
 
     let error = table
         .insert(chunk(unsupported))
         .expect_err("unsupported key representations must fail before probing");
 
     assert!(error.to_string().contains("not supported by hash join"));
-    assert!(error.to_string().contains("Int32"));
+    assert!(error.to_string().contains("Boolean"));
     assert_eq!(table.build_key_materialization(), (MaterializationReport::default(), 0));
 }
 

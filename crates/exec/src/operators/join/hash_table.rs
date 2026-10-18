@@ -8,7 +8,7 @@
 //! Matching produces row references. The join operator composes output views;
 //! ordinary Arrow payload arrays are requested only at an explicit boundary.
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray, builder::BooleanBuilder};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray, builder::BooleanBuilder};
 use arrow::record_batch::RecordBatch;
 use std::cmp::Ordering;
 use std::mem::size_of;
@@ -72,6 +72,7 @@ fn bucket_of(hash: u64, buckets: usize) -> usize {
 /// self-referential.
 #[derive(Debug, Clone)]
 enum KeyArray {
+    Int32(Int32Array),
     Int64(Int64Array),
     Utf8(StringArray),
 }
@@ -80,6 +81,7 @@ impl KeyArray {
     #[inline]
     fn is_null(&self, row: usize) -> bool {
         match self {
+            KeyArray::Int32(array) => array.is_null(row),
             KeyArray::Int64(array) => array.is_null(row),
             KeyArray::Utf8(array) => array.is_null(row),
         }
@@ -88,6 +90,7 @@ impl KeyArray {
     #[inline]
     fn hash_into(&self, row: usize, hash: u64) -> u64 {
         match self {
+            KeyArray::Int32(array) => fnv1a(&array.value(row).to_ne_bytes(), hash),
             KeyArray::Int64(array) => fnv1a(&array.value(row).to_ne_bytes(), hash),
             KeyArray::Utf8(array) => fnv1a(array.value(row).as_bytes(), hash),
         }
@@ -96,6 +99,9 @@ impl KeyArray {
     #[inline]
     fn value_eq(&self, row: usize, other: &KeyArray, other_row: usize) -> bool {
         match (self, other) {
+            (KeyArray::Int32(left), KeyArray::Int32(right)) => {
+                left.value(row) == right.value(other_row)
+            }
             (KeyArray::Int64(left), KeyArray::Int64(right)) => {
                 left.value(row) == right.value(other_row)
             }
@@ -109,6 +115,9 @@ impl KeyArray {
     #[inline]
     fn compare_values(&self, row: usize, other: &KeyArray, other_row: usize) -> Option<Ordering> {
         match (self, other) {
+            (KeyArray::Int32(left), KeyArray::Int32(right)) => {
+                Some(left.value(row).cmp(&right.value(other_row)))
+            }
             (KeyArray::Int64(left), KeyArray::Int64(right)) => {
                 Some(left.value(row).cmp(&right.value(other_row)))
             }
@@ -121,6 +130,7 @@ impl KeyArray {
 
     fn logical_literal(&self, row: usize) -> Result<LogicalLiteral> {
         match self {
+            KeyArray::Int32(array) => Ok(LogicalLiteral::Int64(i64::from(array.value(row)))),
             KeyArray::Int64(array) => Ok(LogicalLiteral::Int64(array.value(row))),
             KeyArray::Utf8(array) => Ok(LogicalLiteral::String(array.value(row).to_owned())),
         }
@@ -166,6 +176,14 @@ impl ChunkKeys {
             ))
         })?;
         match data_type.hash_join_key_type() {
+            Some(HashJoinKeyType::Int32) => {
+                let ints = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    VeinError::internal(format!(
+                        "join key column {index} does not match its declared Int32 type"
+                    ))
+                })?;
+                Ok(KeyArray::Int32(ints.clone()))
+            }
             Some(HashJoinKeyType::Int64) => {
                 let ints = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     VeinError::internal(format!(
@@ -245,7 +263,8 @@ impl ChunkKeys {
             .zip(&other.columns)
             .all(|(left, right)| matches!(
                     (left, right),
-                    (KeyArray::Int64(_), KeyArray::Int64(_))
+                    (KeyArray::Int32(_), KeyArray::Int32(_))
+                        | (KeyArray::Int64(_), KeyArray::Int64(_))
                         | (KeyArray::Utf8(_), KeyArray::Utf8(_))
                 ))
     }
@@ -1256,11 +1275,34 @@ impl HashTable {
     /// Returns the probe key conversion report and resolution time in microseconds.
     /// The report excludes hash/index allocations and never mutates build metrics.
     pub fn probe_view(&self, probe: &DataChunkView, matches: &mut Vec<(u32, (u32, u32))>) -> Result<(MaterializationReport, u64)> {
+        self.probe_view_inner(probe, matches, None)
+    }
+
+    /// Probes while recording NULL-keyed probe row positions for a
+    /// null-aware anti join. Ordinary joins avoid allocating this side vector.
+    pub fn probe_view_with_null_rows(
+        &self,
+        probe: &DataChunkView,
+        matches: &mut Vec<(u32, (u32, u32))>,
+        null_probe_rows: &mut Vec<u32>,
+    ) -> Result<(MaterializationReport, u64)> {
+        self.probe_view_inner(probe, matches, Some(null_probe_rows))
+    }
+
+    fn probe_view_inner(
+        &self,
+        probe: &DataChunkView,
+        matches: &mut Vec<(u32, (u32, u32))>,
+        mut null_probe_rows: Option<&mut Vec<u32>>,
+    ) -> Result<(MaterializationReport, u64)> {
         let (probe_keys, report, materialize_us) = ChunkKeys::resolve(&self.probe_keys, probe)?;
         let inline = self.inline_keys() && probe_keys.is_single_i64();
         for position in 0..probe.num_rows() {
             let row = position as u32;
             let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position) else {
+                if let Some(rows) = &mut null_probe_rows {
+                    rows.push(row);
+                }
                 continue;
             };
             let value = inline.then(|| inline_key.unwrap_or_default());
@@ -1283,6 +1325,11 @@ impl HashTable {
             }
         }
         Ok((report, materialize_us))
+    }
+
+    /// Whether a single-key membership build contains a NULL key.
+    pub fn has_null_keys(&self) -> bool {
+        !self.null_keyed.is_empty()
     }
 
     /// Accumulated build key conversion work, including merged build tables.
@@ -1325,3 +1372,7 @@ impl HashTable {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "hash_table/int32_tests.rs"]
+mod int32_tests;

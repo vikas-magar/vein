@@ -23,7 +23,7 @@ impl AggregateStateColumn {
         if op == AggOpCode::SingleValue {
             return Ok(Self::SingleValue(Vec::new()));
         }
-        if op == AggOpCode::Count {
+        if matches!(op, AggOpCode::Count | AggOpCode::CountDistinct) {
             return Ok(Self::Count(Vec::new()));
         }
         // Integer SUM/MIN/MAX use an Int64 state; integer AVG needs a wide

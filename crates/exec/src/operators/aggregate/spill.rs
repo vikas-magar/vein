@@ -29,6 +29,7 @@ const FORMAT_METADATA_VALUE: &str = "2";
 const GROUPING_SET_ID_FIELD: &str = "grouping_set_id";
 const HASH_FIELD: &str = "group_hash";
 const STATE_FIELD: &str = "aggregate_state";
+mod decimal_key_builder;
 /// Spill batches stay smaller than normal aggregate batches because decoded
 /// runs temporarily retain key, metadata, and state arrays during partitioning.
 const SPILL_RECORD_BATCH_SIZE: usize = super::AGGREGATE_BATCH_ROWS.get() / 16;
@@ -232,7 +233,7 @@ impl AggregateSpillSchema {
         columns.push(Arc::new(UInt64Array::from(grouping_set_ids)));
         columns.push(Arc::new(UInt64Array::from(hashes)));
         for builder in key_builders {
-            columns.push(builder.finish());
+            columns.push(builder.finish()?);
         }
         columns.push(Arc::new(states.finish()) as ArrayRef);
         RecordBatch::try_new(Arc::clone(&self.schema), columns)
@@ -414,7 +415,7 @@ impl<R: Read + Seek> AggregateSpillReader<R> {
 
 trait SpillKeyBuilder {
     fn append(&mut self, key: Option<&(ArrayRef, usize)>) -> Result<()>;
-    fn finish(self: Box<Self>) -> ArrayRef;
+    fn finish(self: Box<Self>) -> Result<ArrayRef>;
 }
 
 struct PrimitiveKeyColumnBuilder<T: ArrowPrimitiveType>(PrimitiveBuilder<T>);
@@ -437,8 +438,8 @@ impl<T: ArrowPrimitiveType> SpillKeyBuilder for PrimitiveKeyColumnBuilder<T> {
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>) -> ArrayRef {
-        Arc::new(self.0.finish())
+    fn finish(mut self: Box<Self>) -> Result<ArrayRef> {
+        Ok(Arc::new(self.0.finish()))
     }
 }
 
@@ -507,8 +508,8 @@ impl SpillKeyBuilder for Utf8KeyColumnBuilder {
         Err(key_type_error(array, &DataType::Utf8))
     }
 
-    fn finish(mut self: Box<Self>) -> ArrayRef {
-        Arc::new(self.values.finish())
+    fn finish(mut self: Box<Self>) -> Result<ArrayRef> {
+        Ok(Arc::new(self.values.finish()))
     }
 }
 
@@ -523,6 +524,10 @@ fn key_builder(data_type: &VeinDataType, capacity: usize) -> Result<Box<dyn Spil
     }
 
     Ok(match data_type {
+        VeinDataType::Date32 => primitive_builder!(arrow::datatypes::Date32Type),
+        VeinDataType::Int8 => primitive_builder!(arrow::datatypes::Int8Type),
+        VeinDataType::Int16 => primitive_builder!(arrow::datatypes::Int16Type),
+        VeinDataType::Int32 => primitive_builder!(arrow::datatypes::Int32Type),
         VeinDataType::Int64 => primitive_builder!(arrow::datatypes::Int64Type),
         VeinDataType::UInt8 => primitive_builder!(arrow::datatypes::UInt8Type),
         VeinDataType::UInt16 => primitive_builder!(arrow::datatypes::UInt16Type),
@@ -532,6 +537,12 @@ fn key_builder(data_type: &VeinDataType, capacity: usize) -> Result<Box<dyn Spil
             values: StringBuilder::with_capacity(capacity, 0),
             payload_bytes: 0,
         }),
+        VeinDataType::Decimal128(precision, scale) => {
+            return decimal_key_builder::decimal128(capacity, *precision, *scale);
+        }
+        VeinDataType::Decimal256(precision, scale) => {
+            return decimal_key_builder::decimal256(capacity, *precision, *scale);
+        }
         unsupported => {
             return Err(VeinError::internal(format!(
                 "aggregate spill does not support grouping key type {unsupported:?}"

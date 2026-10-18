@@ -19,11 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arrow::array::{
-    Array, ArrayRef, Decimal128Array, Decimal256Array, DictionaryArray, Float16Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+    Array, ArrayRef, Date32Array, Decimal128Array, Decimal256Array, DictionaryArray, Float16Array,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
     UInt16Array, UInt32Array, UInt64Array, UInt8Array, new_null_array,
 };
-use arrow::buffer::NullBuffer;
 use arrow::datatypes::{Int32Type, i256};
 use hashbrown::DefaultHashBuilder;
 
@@ -36,6 +35,7 @@ mod spill;
 mod metrics;
 mod init;
 mod input;
+mod distinct;
 mod intermediate_merge;
 mod output;
 mod pipeline;
@@ -71,8 +71,11 @@ pub(crate) const AGGREGATE_BATCH_ROWS: NonZeroUsize =
 #[derive(Clone, Copy, Hash, PartialEq)]
 enum KeyValueRef<'a> {
     Null,
+    Date32(i32),
     Int64(i64),
     UInt64(u64),
+    Decimal128(i128),
+    Decimal256(i256),
     Utf8(&'a str),
 }
 
@@ -145,6 +148,8 @@ pub struct AggregateSink {
     spill_schema: AggregateSpillSchema,
     spill_runs: Vec<SpillRun>,
     metrics: AggregateMetrics,
+    /// One spillable typed-key collector per distinct aggregate and grouping set.
+    distinct_collectors: Vec<distinct::DistinctCollector>,
 }
 
 

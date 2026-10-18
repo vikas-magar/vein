@@ -40,6 +40,8 @@ pub enum JoinKind {
     Semi,
     /// Left anti join.
     Anti,
+    /// Anti join with SQL `NOT IN` NULL semantics.
+    NullAwareAnti,
     /// Single join that errors when one probe row has multiple matches.
     Single,
     /// Cartesian product: every probe row paired with every build row.
@@ -51,6 +53,8 @@ pub enum JoinKind {
 pub enum AggOpCode {
     /// COUNT(input).
     Count,
+    /// COUNT(DISTINCT input); the executor deduplicates typed input keys before counting.
+    CountDistinct,
     /// SUM(input).
     Sum,
     /// MIN(input).

@@ -136,6 +136,8 @@ pub enum VeinDataType {
 /// the same mapping when resolving Arrow arrays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HashJoinKeyType {
+    /// Signed 32-bit integer key, retained in its native Arrow representation.
+    Int32,
     /// Signed 64-bit integer key.
     Int64,
     /// UTF-8 string key.
@@ -146,6 +148,7 @@ impl VeinDataType {
     /// Returns the physical hash-join key representation for this logical type.
     pub fn hash_join_key_type(&self) -> Option<HashJoinKeyType> {
         match self {
+            Self::Int32 => Some(HashJoinKeyType::Int32),
             Self::Int64 => Some(HashJoinKeyType::Int64),
             Self::Utf8 => Some(HashJoinKeyType::Utf8),
             _ => None,
@@ -634,12 +637,15 @@ mod tests {
             Some(HashJoinKeyType::Int64)
         );
         assert_eq!(
+            VeinDataType::Int32.hash_join_key_type(),
+            Some(HashJoinKeyType::Int32)
+        );
+        assert_eq!(
             VeinDataType::Utf8.hash_join_key_type(),
             Some(HashJoinKeyType::Utf8)
         );
 
         for unsupported in [
-            VeinDataType::Int32,
             VeinDataType::Decimal128(15, 2),
             VeinDataType::Date32,
             VeinDataType::Boolean,

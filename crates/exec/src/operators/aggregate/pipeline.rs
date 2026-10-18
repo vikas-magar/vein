@@ -59,7 +59,7 @@ impl PipelineNode<DataChunk> for AggregateHandle {
         )?;
         // Group hashes are stored in each local index and reused by the
         // canonical index during merge, so every worker must share its seed.
-        local.hash_builder = sink.hash_builder.clone();
+        local.inherit_hash_builders(&sink)?;
         Ok(Some(Box::new(LocalAggregateHandle(local))))
     }
 }

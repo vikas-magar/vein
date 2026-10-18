@@ -56,6 +56,11 @@ impl<T: AggregateValue> NumericAccumulator<T> {
             AggOpCode::Max => {
                 self.value = Some(self.value.map_or(value, |current| current.maximum(value)));
             }
+            AggOpCode::CountDistinct => {
+                return Err(VeinError::internal(
+                    "COUNT(DISTINCT) cannot use a numeric accumulator",
+                ));
+            }
             AggOpCode::SingleValue => unreachable!("single-value uses a retained Arrow value"),
         }
         Ok(())

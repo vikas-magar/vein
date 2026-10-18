@@ -112,7 +112,7 @@ fn join_with_predicates<'a>(
         Full => matches.combine(left.rows, EstimateSource::Join, f64::max)
             .combine(right.rows, EstimateSource::Join, f64::max),
         Semi => matches.combine(left.rows, EstimateSource::Join, f64::min),
-        Anti => matches.combine(left.rows, EstimateSource::Join, |m, l| (l - m.min(l)).max(0.0)),
+        Anti | NullAwareAnti => matches.combine(left.rows, EstimateSource::Join, |m, l| (l - m.min(l)).max(0.0)),
         Single => left.rows,
     };
     left.subset(rows);
@@ -123,7 +123,7 @@ fn join_with_predicates<'a>(
     if matches!(kind, Left | Full | Single) {
         for stats in right.columns.values_mut() { stats.null_fraction = None; }
     }
-    if !matches!(kind, Semi | Anti) {
+    if !matches!(kind, Semi | Anti | NullAwareAnti) {
         left.columns.extend(right.columns);
         left.joint_distinct.extend(right.joint_distinct);
     }

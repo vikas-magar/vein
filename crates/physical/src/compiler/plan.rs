@@ -141,8 +141,8 @@ impl PipelineCompiler {
                 let (aggs, aggregate_input_types): (Vec<_>, Vec<_>) = aggs
                     .iter()
                     .map(|agg| {
-                        let (name, argument) = aggregate_argument(agg)?;
-                        Ok((agg_op(name)?, argument.data_type()))
+                        let (name, argument, distinct) = aggregate_argument(agg)?;
+                        Ok((agg_op(name, distinct)?, argument.data_type()))
                     })
                     .collect::<Result<Vec<_>>>()?
                     .into_iter()
@@ -329,8 +329,8 @@ impl PipelineCompiler {
                 let (keys, _) = grouping_layout(grouping_sets)?;
                 let mut projected = keys;
                 for agg in aggs {
-                    let (name, argument) = aggregate_argument(agg)?;
-                    agg_op(name)?;
+                    let (name, argument, distinct) = aggregate_argument(agg)?;
+                    agg_op(name, distinct)?;
                     projected.push(argument.clone());
                 }
                 compiler.compile_projection_with_schema(&projected, input_schema, schema)?;
@@ -869,8 +869,8 @@ impl PipelineCompiler {
                 let (keys, _) = grouping_layout(grouping_sets)?;
                 let mut projected = keys;
                 for agg in aggs {
-                    let (name, argument) = aggregate_argument(agg)?;
-                    agg_op(name)?;
+                    let (name, argument, distinct) = aggregate_argument(agg)?;
+                    agg_op(name, distinct)?;
                     projected.push(argument.clone());
                 }
                 compiler.compile_projection_with_schema(&projected, &input_schema, schema)?;
@@ -1172,7 +1172,16 @@ fn grouping_layout(
 ///
 /// Refusing an unknown name here is what keeps the executor from having to
 /// interpret a function it was never told how to fold.
-fn agg_op(name: &str) -> Result<AggOpCode> {
+fn agg_op(name: &str, distinct: bool) -> Result<AggOpCode> {
+    if distinct {
+        if name.eq_ignore_ascii_case("COUNT") {
+            return Ok(AggOpCode::CountDistinct);
+        }
+        return Err(VeinError::unsupported(
+            format!("DISTINCT is currently supported only for COUNT, not {name}"),
+            None,
+        ));
+    }
     Ok(match name.to_ascii_uppercase().as_str() {
         "COUNT" => AggOpCode::Count,
         "SUM" => AggOpCode::Sum,
@@ -1190,8 +1199,8 @@ fn agg_op(name: &str) -> Result<AggOpCode> {
 }
 
 /// Returns the single input argument for an aggregate expression.
-fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr)> {
-    let LogicalExpr::FunctionCall { name, args, .. } = agg else {
+fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr, bool)> {
+    let LogicalExpr::FunctionCall { name, args, distinct, .. } = agg else {
         return Err(VeinError::planning(
             format!(
                 "aggregate expression must be a function call, found expression kind {}",
@@ -1206,7 +1215,7 @@ fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr)> {
             None,
         ));
     };
-    Ok((name, argument))
+    Ok((name, argument, *distinct))
 }
 
 /// Uses a catalog NDV only when it describes the unfiltered single-key input
