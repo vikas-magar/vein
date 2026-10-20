@@ -6,7 +6,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use common::{Result, VeinError};
 use common::protocol::StorageTarget;
 use common::statistics::{
@@ -14,6 +13,7 @@ use common::statistics::{
 };
 use catalog::{AnalyzedTableStatistics, StatisticsSourceIdentity};
 use exec::operators::sink::{WriteReceipt, WriteStorage, WriteTransaction};
+use exec::pipeline::{DataChunkView, MaterializationReport};
 use parquet::arrow::ArrowWriter;
 use plan::VeinSchema;
 use serde::{Deserialize, Serialize};
@@ -278,15 +278,17 @@ struct ParquetWriteTransaction {
 }
 
 impl WriteTransaction for ParquetWriteTransaction {
-    fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        if self.schema.as_ref() != batch.schema().as_ref() {
-            return Err(VeinError::planning("WRITE batch schema does not match the planned output schema", None));
-        }
-        let rows = self.rows.checked_add(batch.num_rows() as u64)
-            .ok_or_else(|| VeinError::internal("WRITE row count overflow"))?;
+    fn write_view(&mut self, view: &DataChunkView) -> Result<MaterializationReport> {
+        view.validate_schema(&self.schema)?;
         if let Some(statistics) = &mut self.statistics {
-            statistics.update(batch)?;
+            statistics.update_input(view)?;
         }
+        let (batch, report) = exec::pipeline::arrow_adapter::to_record_batch_with_report(
+            view,
+            Arc::clone(&self.schema),
+        )?;
+        let rows = self.rows.checked_add(view.num_rows() as u64)
+            .ok_or_else(|| VeinError::internal("WRITE row count overflow"))?;
         if self.writer.is_none() {
             let path = self.staging_dir.join("part.parquet");
             let file = OpenOptions::new().write(true).create_new(true).open(&path)
@@ -296,10 +298,10 @@ impl WriteTransaction for ParquetWriteTransaction {
         }
         self.writer.as_mut()
             .ok_or_else(|| VeinError::internal("Parquet writer was not initialized"))?
-            .write(batch)
+            .write(&batch)
             .map_err(|error| VeinError::internal(format!("write Parquet batch: {error}")))?;
         self.rows = rows;
-        Ok(())
+        Ok(report)
     }
 
     fn commit(mut self: Box<Self>) -> Result<WriteReceipt> {
@@ -653,10 +655,12 @@ mod tests {
         assert!(error.to_string().contains("does not support option 'compression'"));
     }
 
-    fn batch(values: Vec<i64>) -> RecordBatch {
+    fn chunk(values: Vec<i64>) -> DataChunkView {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
-            .expect("valid test batch")
+        DataChunkView::from_dense_arrays(vec![Arc::new(Int64Array::from(values))])
+            .expect("valid test chunk")
+            .with_schema(schema)
+            .expect("valid test schema")
     }
 
     #[tokio::test]
@@ -665,7 +669,7 @@ mod tests {
         let storage = ParquetStorage::new(root.path());
 
         let mut create = storage.begin_write(&target(None)).expect("begin create");
-        create.write_batch(&batch(vec![1, 2])).expect("write create batch");
+        create.write_view(&chunk(vec![1, 2])).expect("write create chunk");
         assert!(storage.read_manifest("events").expect("read catalog").is_none());
         let receipt = create.commit().expect("commit create");
         assert_eq!(receipt.row_count, 2);
@@ -687,7 +691,7 @@ mod tests {
 
         assert!(storage.begin_write(&target(None)).is_err());
         let mut append = storage.begin_write(&target(Some("append"))).expect("begin append");
-        append.write_batch(&batch(vec![3])).expect("write append batch");
+        append.write_view(&chunk(vec![3])).expect("write append chunk");
         append.commit().expect("commit append");
         let appended = storage.read_manifest("events").expect("read appended catalog").expect("appended manifest");
         assert_eq!(appended.revision, 2);
@@ -706,7 +710,7 @@ mod tests {
         assert_eq!(appended_table.statistics.as_ref().unwrap().column_statistics["id"].min_value, Some(plan::LogicalLiteral::Int64(1)));
 
         let mut overwrite = storage.begin_write(&target(Some("overwrite"))).expect("begin overwrite");
-        overwrite.write_batch(&batch(vec![9])).expect("write overwrite batch");
+        overwrite.write_view(&chunk(vec![9])).expect("write overwrite chunk");
         overwrite.commit().expect("commit overwrite");
         let replaced = storage.read_manifest("events").expect("read overwritten catalog").expect("overwritten manifest");
         assert_eq!(replaced.revision, 3);
@@ -728,7 +732,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary root");
         let storage = ParquetStorage::new(root.path());
         let mut create = storage.begin_write(&target(None)).expect("begin create");
-        create.write_batch(&batch(vec![1, 2])).expect("write create batch");
+        create.write_view(&chunk(vec![1, 2])).expect("write create chunk");
         create.commit().expect("commit create");
 
         let mut manifest = storage.read_manifest("events").expect("read manifest").expect("created table");
@@ -738,7 +742,7 @@ mod tests {
             .expect("persist stale test identity");
 
         let mut append = storage.begin_write(&target(Some("append"))).expect("begin append with stale stats");
-        append.write_batch(&batch(vec![3])).expect("write append batch");
+        append.write_view(&chunk(vec![3])).expect("write append chunk");
         append.commit().expect("commit append without stale stats");
 
         let manifest = storage.read_manifest("events").expect("read appended manifest").expect("appended table");
@@ -757,12 +761,13 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary root");
         let storage = ParquetStorage::new(root.path());
         let mut transaction = storage.begin_write(&target(None)).expect("begin create");
-        transaction.write_batch(&batch(vec![1])).expect("write first batch");
-        let incompatible = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("other", DataType::Int64, false)])),
-            vec![Arc::new(Int64Array::from(vec![2]))],
-        ).expect("valid incompatible batch");
-        assert!(transaction.write_batch(&incompatible).is_err());
+        transaction.write_view(&chunk(vec![1])).expect("write first chunk");
+        let incompatible_schema = Arc::new(Schema::new(vec![Field::new("other", DataType::Int64, false)]));
+        let incompatible = DataChunkView::from_dense_arrays(vec![Arc::new(Int64Array::from(vec![2]))])
+            .expect("valid incompatible chunk")
+            .with_schema(incompatible_schema)
+            .expect("valid incompatible schema");
+        assert!(transaction.write_view(&incompatible).is_err());
         drop(transaction);
         assert!(storage.read_manifest("events").expect("read catalog").is_none());
     }
@@ -787,8 +792,8 @@ mod tests {
         let second_storage = ParquetStorage::new(root.path());
         let mut first = first_storage.begin_write(&target(None)).expect("begin first");
         let mut second = second_storage.begin_write(&target(None)).expect("begin second");
-        first.write_batch(&batch(vec![1])).expect("write first");
-        second.write_batch(&batch(vec![2])).expect("write second");
+        first.write_view(&chunk(vec![1])).expect("write first");
+        second.write_view(&chunk(vec![2])).expect("write second");
         first.commit().expect("first commit wins");
         assert!(second.commit().is_err());
         let manifest = first_storage.read_manifest("events").expect("read manifest").expect("committed table");

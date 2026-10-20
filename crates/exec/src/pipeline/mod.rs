@@ -4,6 +4,7 @@
 //! execution node contracts ([`PipelineNode`], [`Source`], [`Transform`], [`Sink`]).
 
 pub mod node;
+pub mod arrow_adapter;
 pub mod view;
 
 pub use node::{PipelineNode, Sink, Source, Transform};

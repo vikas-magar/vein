@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn view_and_arrow_results_share_execution_for_join_sort_limit() {
+async fn client_result_stays_reference_backed_through_join_sort_limit() {
     use arrow::array::Int64Array;
 
     let builder = Arc::new(MultiFileFeedBuilder::new());
@@ -71,17 +71,17 @@ async fn view_and_arrow_results_share_execution_for_join_sort_limit() {
     );
     let mut task = task();
     task.plan = plan_with_input(&task, input);
-    let views = runner
-        .execute_views(&task, CancellationToken::new())
+    let result = runner
+        .execute(&task, CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(views.row_count, 2);
+    assert_eq!(result.row_count, 2);
     let mut actual = Vec::new();
     {
         let source_arrays = builder.source_arrays.lock().unwrap();
-        for batch in &views.output {
-            for row in 0..batch.num_rows() {
-                let (array, source_row) = batch.view().resolve(0, row).unwrap().unwrap();
+        for view in &result.output {
+            for row in 0..view.num_rows() {
+                let (array, source_row) = view.resolve(0, row).unwrap().unwrap();
                 let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
                 assert!(
                     source_arrays
@@ -93,27 +93,13 @@ async fn view_and_arrow_results_share_execution_for_join_sort_limit() {
         }
     }
     assert_eq!(actual, vec![2, 3]);
-    let arrow = runner
-        .execute(&task, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(arrow.row_count, views.row_count);
-    assert_eq!(arrow.output.len(), views.output.len());
-    for (batch, view) in arrow.output.iter().zip(&views.output) {
-        let (converted, report) = view.to_record_batch_with_report().unwrap();
-        assert_eq!(&converted, batch);
-        assert_eq!(
-            report.gathered_columns, 1,
-            "payloads gather only at the Arrow boundary"
-        );
-    }
 }
 
 #[tokio::test]
 async fn view_results_stream_without_retention_and_propagate_cancellation_and_channel_errors() {
     let (sender, receiver) = flume::bounded(1);
     let result = runner()
-        .execute_views_streaming(&task(), CancellationToken::new(), sender)
+        .execute_streaming(&task(), CancellationToken::new(), sender)
         .await
         .unwrap();
     let batch = receiver.recv().unwrap();
@@ -124,14 +110,14 @@ async fn view_results_stream_without_retention_and_propagate_cancellation_and_ch
     let (sender, receiver) = flume::bounded(1);
     drop(receiver);
     let error = runner()
-        .execute_views_streaming(&task(), CancellationToken::new(), sender)
+        .execute_streaming(&task(), CancellationToken::new(), sender)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("client result channel closed"));
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert!(matches!(
-            runner().execute_views(&task(), cancel).await,
+            runner().execute(&task(), cancel).await,
             Err(VeinError::Cancelled)
         ));
 }

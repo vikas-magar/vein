@@ -54,14 +54,9 @@ async fn fused_source_and_recursive_expression_pipeline_match() {
     assert_eq!(fused.output.len(), recursive.output.len());
     for (left, right) in fused.output.iter().zip(&recursive.output) {
         assert_eq!(left.schema(), right.schema());
-        assert_eq!(left.column(0).to_data(), right.column(0).to_data());
+        assert_eq!(view_nullable_int64_values(left, 0), view_nullable_int64_values(right, 0));
     }
-    let values = fused.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("projection returns Int64");
-    assert_eq!(values.values(), &[3, 4, 5]);
+    assert_eq!(view_int64_values(&fused.output[0], 0), vec![3, 4, 5]);
 }
 
 #[tokio::test]
@@ -94,12 +89,10 @@ async fn projection_expression_preserves_nulls() {
     .execute(&execution_task, CancellationToken::new())
     .await
     .expect("column expression should preserve NULLs");
-    let values = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("projection returns Int64");
-    assert_eq!(values, &arrow::array::Int64Array::from(vec![Some(1), None, Some(3)]));
+    assert_eq!(
+        view_nullable_int64_values(&result.output[0], 0),
+        vec![Some(1), None, Some(3)]
+    );
 }
 
 #[tokio::test]
@@ -119,5 +112,6 @@ async fn expression_pipeline_rejects_columns_outside_the_input_view() {
         .execute(&execution_task, CancellationToken::new())
         .await
         .expect_err("an invalid expression column ordinal must fail clearly");
-    assert!(error.to_string().contains("outside the 1-column input view"));
+    assert_eq!(error.category(), error::ErrorCategory::Planning);
+    assert!(error.to_string().contains("99"), "unexpected error: {error}");
 }

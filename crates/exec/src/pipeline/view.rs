@@ -13,7 +13,6 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, new_empty_array, new_null_array};
 use arrow::compute::interleave;
 use arrow::datatypes::{DataType, SchemaRef};
-use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use common::Result;
 use common::arrow::SelectionVector;
 use error::VeinError;
@@ -461,6 +460,7 @@ pub struct DataChunkView {
     row_count: usize,
     columns: Vec<ViewColumn>,
     selection: SelectionVector,
+    schema: Option<SchemaRef>,
 }
 
 impl common::statistics::StatisticsInput for DataChunkView {
@@ -520,16 +520,6 @@ impl DataChunkView {
         Self::new(row_count, columns, SelectionVector::new_dense(row_count))
     }
 
-    /// Wraps an Arrow batch without copying its Arrow arrays.
-    ///
-    /// The batch's column handles move into the view. This is the scan-source
-    /// constructor: readers can enter the reference-backed pipeline directly
-    /// without first creating a materialized `DataChunkView`.
-    pub fn from_record_batch(batch: RecordBatch) -> Result<Self> {
-        let (_, arrays, row_count) = batch.into_parts();
-        Self::from_arrays(arrays, row_count, SelectionVector::new_dense(row_count))
-    }
-
     /// Creates a view over owned Arrow array handles and an explicit active-row
     /// selection. Array payload buffers are retained by reference.
     pub fn from_arrays(
@@ -579,6 +569,7 @@ impl DataChunkView {
             row_count,
             columns,
             selection,
+            schema: None,
         })
     }
 
@@ -1093,24 +1084,9 @@ impl DataChunkView {
         Ok(())
     }
 
-    /// Converts active rows directly into a RecordBatch at the Arrow boundary.
-    ///
-    /// Uses the same conversion branches as kernel and chunk materialization:
-    /// contiguous mappings share buffers, arbitrary mappings gather once, and
-    /// zero-column results preserve their explicit selected row count.
-    pub fn to_record_batch_with_report(
+    pub(crate) fn materialize_columns_with_report(
         &self,
-        schema: SchemaRef,
-    ) -> Result<(RecordBatch, MaterializationReport)> {
-        self.validate_schema(&schema)?;
-        let (columns, report) = self.materialize_columns_with_report()?;
-        let options = RecordBatchOptions::new().with_row_count(Some(self.num_rows()));
-        let batch = RecordBatch::try_new_with_options(schema, columns, &options)
-            .map_err(|error| VeinError::internal(format!("view result batch failed: {error}")))?;
-        Ok((batch, report))
-    }
-
-    fn materialize_columns_with_report(&self) -> Result<(Vec<ArrayRef>, MaterializationReport)> {
+    ) -> Result<(Vec<ArrayRef>, MaterializationReport)> {
         let mut columns = Vec::with_capacity(self.num_columns());
         let mut report = MaterializationReport::default();
         for column in 0..self.num_columns() {
@@ -1279,4 +1255,14 @@ mod mapping_tests;
 mod derived;
 #[path = "view/constructors.rs"]
 mod constructors;
+#[path = "view/schema.rs"]
+mod schema;
+#[path = "view/selection.rs"]
+mod selection;
+#[cfg(test)]
+#[path = "view/schema_tests.rs"]
+mod schema_tests;
+#[cfg(test)]
+#[path = "view/selection_tests.rs"]
+mod selection_tests;
 pub(crate) use derived::{DerivedColumnBuilder, ViewSourceRow};

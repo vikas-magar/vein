@@ -3,7 +3,7 @@ use super::*;
 /// Shares a build sink with the join executor while a source owns its pipeline.
 pub(super) struct SharedBuildSink(pub(super) Arc<Mutex<Option<BuildSink>>>);
 
-impl PipelineNode<DataChunkView> for SharedBuildSink {
+impl PipelineNode for SharedBuildSink {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0
             .lock()
@@ -21,7 +21,7 @@ impl PipelineNode<DataChunkView> for SharedBuildSink {
             .flush()
     }
 
-    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
         let build_sink = self
             .0
             .lock()
@@ -31,14 +31,14 @@ impl PipelineNode<DataChunkView> for SharedBuildSink {
             .ok_or_else(|| VeinError::internal("join build sink already finished"))?;
         Ok(build_sink
             .fork_worker_local()?
-            .map(|local| Box::new(LocalBuildSink(local)) as Box<dyn PipelineNode<DataChunkView>>))
+            .map(|local| Box::new(LocalBuildSink(local)) as Box<dyn PipelineNode>))
     }
 }
 
 /// Worker-private adapter whose completed table is merged into `SharedBuildSink`.
 pub(super) struct LocalBuildSink(BuildSink);
 
-impl PipelineNode<DataChunkView> for LocalBuildSink {
+impl PipelineNode for LocalBuildSink {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0.push(view)
     }
@@ -49,7 +49,7 @@ impl PipelineNode<DataChunkView> for LocalBuildSink {
 
     fn combine_local(
         self: Box<Self>,
-        canonical: &mut dyn PipelineNode<DataChunkView>,
+        canonical: &mut dyn PipelineNode,
     ) -> Result<()> {
         let canonical = canonical
             .as_any_mut()
@@ -72,12 +72,12 @@ impl PipelineNode<DataChunkView> for LocalBuildSink {
 /// `finished` lets source readers stop after a downstream limit has completed.
 /// Counts active rows and chunks entering a join without inspecting or cloning columns.
 pub(super) struct JoinProbeCounter {
-    pub(super) inner: Box<dyn PipelineNode<DataChunkView>>,
+    pub(super) inner: Box<dyn PipelineNode>,
     pub(super) rows: Arc<AtomicU64>,
     pub(super) batches: Arc<AtomicU64>,
 }
 
-impl PipelineNode<DataChunkView> for JoinProbeCounter {
+impl PipelineNode for JoinProbeCounter {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.rows
             .fetch_add(view.num_rows() as u64, Ordering::Relaxed);
@@ -91,7 +91,7 @@ impl PipelineNode<DataChunkView> for JoinProbeCounter {
         self.inner.finished()
     }
 
-    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
         let Some(inner) = self.inner.fork_local()? else {
             return Ok(None);
         };
@@ -104,7 +104,7 @@ impl PipelineNode<DataChunkView> for JoinProbeCounter {
 
     fn combine_local(
         self: Box<Self>,
-        canonical: &mut dyn PipelineNode<DataChunkView>,
+        canonical: &mut dyn PipelineNode,
     ) -> Result<()> {
         let target = canonical
             .as_any_mut()
@@ -114,7 +114,7 @@ impl PipelineNode<DataChunkView> for JoinProbeCounter {
     }
 }
 
-pub(super) type SharedJoinOutput = Arc<Mutex<Box<dyn PipelineNode<DataChunkView>>>>;
+pub(super) type SharedJoinOutput = Arc<Mutex<Box<dyn PipelineNode>>>;
 
 /// Forwards partition results into the one downstream operator instance.
 /// HashJoin flushes once per partition; this adapter defers that flush until
@@ -122,7 +122,7 @@ pub(super) type SharedJoinOutput = Arc<Mutex<Box<dyn PipelineNode<DataChunkView>
 #[derive(Clone)]
 struct JoinPartitionOutput(SharedJoinOutput);
 
-impl PipelineNode<DataChunkView> for JoinPartitionOutput {
+impl PipelineNode for JoinPartitionOutput {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0
             .lock()
@@ -178,7 +178,9 @@ impl SpilledJoinProbe {
                 // into the hash table. It can exhaust the budget before
                 // insert_view gets a chance to reject the row references, so
                 // treat either failure as a signal to repartition.
-                let view = match payload_view(batch, &self.build_schema, &self.tracker) {
+                let view = match crate::pipeline::arrow_adapter::from_record_batch(batch)
+                    .and_then(|view| payload_view(view, &self.build_schema, &self.tracker))
+                {
                     Ok(view) => view,
                     Err(VeinError::ResourceExhausted { .. }) => {
                         overflow = true;
@@ -286,7 +288,7 @@ impl SpilledJoinProbe {
             next,
         );
         let join = install_join_residual(self.builder.as_ref(), &self.plan, join)?;
-        let mut join: Box<dyn PipelineNode<DataChunkView>> = Box::new(join);
+        let mut join: Box<dyn PipelineNode> = Box::new(join);
         for run in &probe_runs {
             let reader = open_reader(run)?;
             for batch in reader {
@@ -294,7 +296,8 @@ impl SpilledJoinProbe {
                 let batch = batch.map_err(|error| {
                     VeinError::internal(format!("decode spilled join probe batch: {error}"))
                 })?;
-                join.push(payload_view(batch, &self.probe_schema, &self.tracker)?)?;
+                let view = crate::pipeline::arrow_adapter::from_record_batch(batch)?;
+                join.push(payload_view(view, &self.probe_schema, &self.tracker)?)?;
             }
         }
         join.flush()?;
@@ -305,7 +308,7 @@ impl SpilledJoinProbe {
     }
 }
 
-impl PipelineNode<DataChunkView> for SpilledJoinProbe {
+impl PipelineNode for SpilledJoinProbe {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.probe_writer
             .as_mut()

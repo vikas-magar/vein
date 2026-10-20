@@ -60,17 +60,7 @@ async fn runs_a_join_task() {
     let rows: Vec<i64> = result
         .output
         .iter()
-        .flat_map(|batch| {
-            let column = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("int64 output")
-                .clone();
-            (0..column.len())
-                .map(|row| column.value(row))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|view| view_int64_values(view, 0))
         .collect();
     assert_eq!(rows, vec![5, 4, 3, 2, 1]);
 }

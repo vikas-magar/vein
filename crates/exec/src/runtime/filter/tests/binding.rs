@@ -29,13 +29,9 @@ fn independent_bindings_keep_each_filter_narrow_and_preserve_order() {
     assert_eq!(bindings[0].columns().len(), 1);
     assert_eq!(bindings[0].columns()[0].id, ColumnId(7));
 
-    let batch = RecordBatch::try_from_iter(vec![(
-        "id",
-        Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
-    )])
-        .expect("probe batch");
+    let view = int64_view(vec![vec![1, 2, 3]]);
     assert_eq!(
-        bindings[0].evaluate(&batch).expect("combined same-column stage"),
+        bindings[0].evaluate(&view).expect("combined same-column stage"),
         BooleanArray::from(vec![false, false, false])
     );
 }
@@ -93,18 +89,8 @@ fn binding_uses_scan_order_without_changing_filter_key_positions() {
         .collect::<Vec<_>>();
     assert_eq!(bound_ids, vec![ColumnId(7), ColumnId(8)]);
 
-    let batch = RecordBatch::try_from_iter(vec![
-        (
-            "id",
-            Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
-        ),
-        (
-            "label",
-            Arc::new(Int64Array::from(vec![10, 20, 30])) as Arc<dyn Array>,
-        ),
-    ])
-        .expect("test batch");
-    let mask = binding.evaluate(&batch).expect("evaluate bound filters");
+    let view = int64_view(vec![vec![1, 2, 3], vec![10, 20, 30]]);
+    let mask = binding.evaluate(&view).expect("evaluate bound filters");
 
     assert_eq!(mask, BooleanArray::from(vec![false, true, false]));
 }
@@ -142,13 +128,9 @@ fn combined_runtime_filters_return_a_selection_and_account_rows() {
         ],
         Arc::clone(&statistics),
     );
-    let batch = RecordBatch::try_from_iter(vec![(
-        "id",
-        Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
-    )])
-        .expect("test batch");
+    let view = int64_view(vec![vec![1, 2, 3]]);
     let binding = set.bind(&schema()).expect("filter columns bind");
-    let mask = binding.evaluate(&batch).expect("combine filters");
+    let mask = binding.evaluate(&view).expect("combine filters");
 
     assert_eq!(mask, BooleanArray::from(vec![false, true, false]));
     assert_eq!(set.rows_seen(), 3);

@@ -46,26 +46,15 @@ pub(in crate::runtime::tests) fn full_join_feed() -> Arc<MemoryFeedBuilder> {
     Arc::new(MemoryFeedBuilder::with_nullable_values(values))
 }
 
-pub(in crate::runtime::tests) fn join_result_pairs(output: &[RecordBatch]) -> Vec<(Option<i64>, Option<i64>)> {
+pub(in crate::runtime::tests) fn join_result_pairs(
+    output: &[DataChunkView],
+) -> Vec<(Option<i64>, Option<i64>)> {
     let mut pairs = output
         .iter()
-        .flat_map(|batch| {
-            let probe = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("probe output");
-            let build = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("build output");
-            (0..batch.num_rows()).map(|row| {
-                (
-                    probe.is_valid(row).then(|| probe.value(row)),
-                    build.is_valid(row).then(|| build.value(row)),
-                )
-            })
+        .flat_map(|view| {
+            view_nullable_int64_values(view, 0)
+                .into_iter()
+                .zip(view_nullable_int64_values(view, 1))
         })
         .collect::<Vec<_>>();
     pairs.sort_unstable();

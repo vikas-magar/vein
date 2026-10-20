@@ -6,7 +6,6 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::json::writer::{LineDelimitedWriter, WriterBuilder};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use common::{Result, VeinError};
-use exec::operators::sink::ViewResultBatch;
 use exec::pipeline::DataChunkView;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,11 +53,14 @@ impl<W: Write> JsonRowsWriter<W> {
         }
     }
 
-    pub(super) fn write_view_batch(&mut self, result: &ViewResultBatch) -> Result<()> {
-        let schema = self.ensure_schema(result.schema())?;
+    pub(super) fn write_view_batch(&mut self, result: &DataChunkView) -> Result<()> {
+        let input_schema = result
+            .schema()
+            .ok_or_else(|| VeinError::internal("result view is missing its schema"))?;
+        let schema = self.ensure_schema(input_schema)?;
         let mut start = 0;
         while start < result.num_rows() {
-            let (batch, run_len) = contiguous_run_batch(result.view(), Arc::clone(&schema), start)?;
+            let (batch, run_len) = contiguous_run_batch(result, Arc::clone(&schema), start)?;
             self.writer.write(&batch)?;
             start += run_len;
         }

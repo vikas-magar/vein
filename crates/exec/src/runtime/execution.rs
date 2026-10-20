@@ -26,7 +26,7 @@ impl DefaultTaskExecutor {
     }
 
     /// Execute a recursive input tree with bounded batches between operators.
-    pub(super) async fn execute_with_output<O: ClientOutput>(
+    pub(super) async fn execute_with_output(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
@@ -34,14 +34,14 @@ impl DefaultTaskExecutor {
             &dyn ExecutorBuilder,
             &DataSink,
             &QueryMemoryTracker,
-        ) -> Result<Box<dyn Sink<DataChunkView, O>>>
+        ) -> Result<Box<dyn Sink>>
         + Send,
-    ) -> Result<TaskResult<O>> {
+    ) -> Result<TaskResult> {
         self.execute_with_output_and_resources(task, cancel, None, make_sink)
             .await
     }
 
-    pub(super) async fn execute_with_output_and_resources<O: ClientOutput>(
+    pub(super) async fn execute_with_output_and_resources(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
@@ -50,9 +50,9 @@ impl DefaultTaskExecutor {
             &dyn ExecutorBuilder,
             &DataSink,
             &QueryMemoryTracker,
-        ) -> Result<Box<dyn Sink<DataChunkView, O>>>
+        ) -> Result<Box<dyn Sink>>
         + Send,
-    ) -> Result<TaskResult<O>> {
+    ) -> Result<TaskResult> {
         let start = Instant::now();
         if cancel.is_cancelled() {
             return Err(VeinError::cancelled());
@@ -101,7 +101,7 @@ impl DefaultTaskExecutor {
 
         let sink_started = Instant::now();
         let sink = make_sink(self.builder.as_ref(), sink_plan, &memory)?;
-        let sink: Arc<Mutex<Box<dyn Sink<DataChunkView, O>>>> = Arc::new(Mutex::new(sink));
+        let sink: Arc<Mutex<Box<dyn Sink>>> = Arc::new(Mutex::new(sink));
         let sink_build_us = sink_started.elapsed().as_micros() as u64;
         let task_span = tracing::info_span!(
             target: "vein.audit",
@@ -112,7 +112,7 @@ impl DefaultTaskExecutor {
             task_id = %task.task_id,
             attempt = task.attempt,
         );
-        let head: Box<dyn PipelineNode<DataChunkView>> = Box::new(CancelGuard::new(
+        let head: Box<dyn PipelineNode> = Box::new(CancelGuard::new(
             Box::new(SinkHandle(Arc::clone(&sink))),
             cancel.clone(),
         ));

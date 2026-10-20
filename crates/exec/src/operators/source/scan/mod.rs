@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::pipeline::{DataChunkView, PipelineNode, Source};
+use crate::pipeline::{PipelineNode, Source};
 use crate::expression::eval::ExpressionKernelProvider;
 use crate::runtime::filter::RuntimeFilterSet;
 use crate::udf::FunctionRegistry;
@@ -73,7 +73,7 @@ pub struct ScanSource {
     operator: Operator,
     files: Vec<ScanFile>,
     format: FileFormat,
-    parquet_reader: Arc<dyn ParquetScanReader<Batch=DataChunkView>>,
+    parquet_reader: Arc<dyn ParquetScanReader>,
     projected: VeinSchemaRef,
     /// Projected columns whose Parquet dictionary encoding should be retained.
     dictionary_columns: Vec<u32>,
@@ -131,7 +131,7 @@ impl ScanSource {
     /// selections in `DataChunkView` instead of compacting payload columns.
     pub fn with_parquet_reader(
         mut self,
-        reader: Arc<dyn ParquetScanReader<Batch=DataChunkView>>,
+        reader: Arc<dyn ParquetScanReader>,
     ) -> Self {
         self.parquet_reader = reader;
         self
@@ -139,8 +139,8 @@ impl ScanSource {
 }
 
 #[async_trait::async_trait]
-impl Source<DataChunkView> for ScanSource {
-    async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunkView>) -> Result<()> {
+impl Source for ScanSource {
+    async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()> {
         match self.format {
             FileFormat::Parquet => {
                 self.parquet_reader.execute(

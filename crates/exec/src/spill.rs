@@ -15,11 +15,13 @@ pub use storage::{
 use std::io::{Seek, Write};
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use common::Result;
 use error::{ErrorCategory, VeinError};
+
+use crate::pipeline::{DataChunkView, MaterializationReport};
 
 pub(crate) type SpillErrorResolver = Arc<dyn Fn() -> Option<VeinError> + Send + Sync>;
 
@@ -40,6 +42,7 @@ impl IpcRunOutput for SpillWriteHandle {
 /// Incrementally writes batches to one Arrow IPC file.
 pub(crate) struct IpcRunWriter<W: IpcRunOutput> {
     writer: FileWriter<W>,
+    schema: SchemaRef,
     error_resolver: Option<SpillErrorResolver>,
 }
 
@@ -49,11 +52,29 @@ impl<W: IpcRunOutput> IpcRunWriter<W> {
         let error_resolver = output.spill_error_resolver();
         let writer = FileWriter::try_new(output, schema)
             .map_err(|error| resolve_spill_error(&error_resolver, operation, error))?;
-        Ok(Self { writer, error_resolver })
+        Ok(Self {
+            writer,
+            schema: Arc::new(schema.clone()),
+            error_resolver,
+        })
     }
 
-    /// Writes one already encoded batch to the run.
-    pub(crate) fn write_batch(
+    /// Serializes one logical view, materializing selected rows only at this
+    /// Arrow IPC boundary and reporting any gathered output columns.
+    pub(crate) fn write_view(
+        &mut self,
+        view: &DataChunkView,
+        operation: &'static str,
+    ) -> Result<MaterializationReport> {
+        let (batch, report) = crate::pipeline::arrow_adapter::to_record_batch_with_report(
+            view,
+            Arc::clone(&self.schema),
+        )?;
+        self.write_encoded_batch(&batch, operation)?;
+        Ok(report)
+    }
+
+    fn write_encoded_batch(
         &mut self,
         batch: &RecordBatch,
         operation: &'static str,
@@ -132,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_ipc_run_writer_round_trips_multiple_batches() {
+    fn generic_ipc_run_writer_round_trips_multiple_views() {
         let schema = Schema::new(vec![Field::new("key", DataType::Int64, false)]);
         let first = RecordBatch::try_new(
             Arc::new(schema.clone()),
@@ -144,15 +165,19 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![3])) as ArrayRef],
         )
             .expect("create second batch");
+        let first_view = crate::pipeline::arrow_adapter::from_record_batch(first.clone())
+            .expect("create first view");
+        let second_view = crate::pipeline::arrow_adapter::from_record_batch(second.clone())
+            .expect("create second view");
 
         let mut writer = IpcRunWriter::new(Cursor::new(Vec::new()), &schema, "create test run")
             .expect("create generic IPC writer");
         writer
-            .write_batch(&first, "write first test batch")
-            .expect("write first batch");
+            .write_view(&first_view, "write first test view")
+            .expect("write first view");
         writer
-            .write_batch(&second, "write second test batch")
-            .expect("write second batch");
+            .write_view(&second_view, "write second test view")
+            .expect("write second view");
         let output = writer.finish("finish test run").expect("finish IPC run");
 
         let mut reader = FileReader::try_new(Cursor::new(output.into_inner()), None)

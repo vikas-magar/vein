@@ -41,7 +41,7 @@ pub(crate) struct ExpressionExecutor<K: ?Sized> {
     program: Arc<ExpressionProgram>,
     kernels: Arc<K>,
     functions: Arc<dyn ScalarFunctionProvider>,
-    next: Box<dyn PipelineNode<DataChunkView>>,
+    next: Box<dyn PipelineNode>,
     metrics: ExecutionMetrics,
 }
 
@@ -53,7 +53,7 @@ where
         program: Arc<ExpressionProgram>,
         kernels: Arc<K>,
         functions: Arc<dyn ScalarFunctionProvider>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
     ) -> Self {
         Self { program, kernels, functions, next, metrics: ExecutionMetrics::default() }
     }
@@ -86,7 +86,7 @@ where
         Ok(Some(Arc::try_unwrap(view).unwrap_or_else(|view| view.as_ref().clone())))
     }
 
-    fn fork_with_next(&self, next: Box<dyn PipelineNode<DataChunkView>>) -> Self {
+    fn fork_with_next(&self, next: Box<dyn PipelineNode>) -> Self {
         Self::new(
             Arc::clone(&self.program), Arc::clone(&self.kernels),
             Arc::clone(&self.functions), next,
@@ -94,7 +94,7 @@ where
     }
 }
 
-impl<K> PipelineNode<DataChunkView> for ExpressionExecutor<K>
+impl<K> PipelineNode for ExpressionExecutor<K>
 where
     K: ExpressionKernelProvider + ?Sized + 'static,
 {
@@ -125,30 +125,30 @@ where
         self.next.finished()
     }
 
-    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
         let Some(next) = self.next.fork_local()? else { return Ok(None) };
         Ok(Some(Box::new(self.fork_with_next(next))))
     }
 
-    fn combine_local(self: Box<Self>, canonical: &mut dyn PipelineNode<DataChunkView>) -> Result<()> {
+    fn combine_local(self: Box<Self>, canonical: &mut dyn PipelineNode) -> Result<()> {
         let target = canonical.as_any_mut().downcast_mut::<Self>()
             .ok_or_else(|| VeinError::internal("expression executor local state type mismatch"))?;
         combine_state(self, target)
     }
 }
 
-impl<K> Transform<DataChunkView> for ExpressionExecutor<K>
+impl<K> Transform for ExpressionExecutor<K>
 where
     K: ExpressionKernelProvider + ?Sized + 'static,
 {
-    fn fork_transform(&self) -> Result<Option<Box<dyn Transform<DataChunkView>>>> {
+    fn fork_transform(&self) -> Result<Option<Box<dyn Transform>>> {
         let Some(next) = self.next.fork_local()? else { return Ok(None) };
         Ok(Some(Box::new(self.fork_with_next(next))))
     }
 
     fn combine_transform(
         self: Box<Self>,
-        canonical: &mut dyn Transform<DataChunkView>,
+        canonical: &mut dyn Transform,
     ) -> Result<()> {
         let target = canonical.as_any_mut().downcast_mut::<Self>()
             .ok_or_else(|| VeinError::internal("expression executor transform type mismatch"))?;

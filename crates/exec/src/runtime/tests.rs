@@ -30,6 +30,46 @@ mod expression_pipeline;
 
 pub(in crate::runtime::tests) use fixtures::*;
 
+pub(in crate::runtime::tests) fn view_int64_values(
+    view: &DataChunkView,
+    column: usize,
+) -> Vec<i64> {
+    (0..view.num_rows())
+        .map(|row| {
+            let (array, physical_row) = view
+                .resolve(column, row)
+                .expect("resolve view column")
+                .expect("expected non-null view row");
+            array
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("Int64 view column")
+                .value(physical_row)
+        })
+        .collect()
+}
+
+pub(in crate::runtime::tests) fn view_nullable_int64_values(
+    view: &DataChunkView,
+    column: usize,
+) -> Vec<Option<i64>> {
+    (0..view.num_rows())
+        .map(|row| {
+            let Some((array, physical_row)) = view
+                .resolve(column, row)
+                .expect("resolve view column")
+            else {
+                return None;
+            };
+            let values = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("Int64 view column");
+            values.is_valid(physical_row).then(|| values.value(physical_row))
+        })
+        .collect()
+}
+
 pub(in crate::runtime::tests) fn column_expr(index: u32, return_type: VeinDataType) -> PhysicalExpr {
     PhysicalExpr { return_type, kind: ExprKind::Column { index } }
 }

@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use arrow::record_batch::RecordBatch;
-
 use crate::memory::ExecutionResourceLimits;
 use crate::expression::executor::ExpressionExecutor;
 use crate::expression::{ExpressionKernelProvider, ExpressionKernelRegistry, ScalarFunctionProvider};
@@ -274,7 +272,7 @@ impl DefaultExecutorBuilder {
         source: &DataSource,
         runtime_filters: &RuntimeFilterSet,
         query_statistics: Option<Arc<QueryStatisticsContext>>,
-    ) -> Result<Box<dyn Source<DataChunkView>>> {
+    ) -> Result<Box<dyn Source>> {
         match source {
             DataSource::Memory => Err(VeinError::internal(
                 "a DataSource::Memory task carries no payload to materialize",
@@ -379,7 +377,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         source: &DataSource,
         _task_id: TaskId,
         _attempt: u32,
-    ) -> Result<Box<dyn Source<DataChunkView>>> {
+    ) -> Result<Box<dyn Source>> {
         self.build_source_inner(source, &RuntimeFilterSet::empty(), None)
     }
 
@@ -389,7 +387,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         _task_id: TaskId,
         _attempt: u32,
         filters: &RuntimeFilterSet,
-    ) -> Result<Box<dyn Source<DataChunkView>>> {
+    ) -> Result<Box<dyn Source>> {
         self.build_source_inner(source, filters, None)
     }
 
@@ -400,7 +398,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         _attempt: u32,
         runtime_filters: Option<&RuntimeFilterSet>,
         query_statistics: Option<Arc<QueryStatisticsContext>>,
-    ) -> Result<Box<dyn Source<DataChunkView>>> {
+    ) -> Result<Box<dyn Source>> {
         self.build_source_inner(
             source,
             runtime_filters.unwrap_or(&RuntimeFilterSet::empty()),
@@ -432,8 +430,8 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
     fn build_expression_executor(
         &self,
         program: &Arc<ExpressionProgram>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
-    ) -> Result<Box<dyn Transform<DataChunkView>>> {
+        next: Box<dyn PipelineNode>,
+    ) -> Result<Box<dyn Transform>> {
         let functions: Arc<dyn ScalarFunctionProvider> = self.registry.clone();
         Ok(Box::new(ExpressionExecutor::new(
             Arc::clone(program),
@@ -443,7 +441,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         )))
     }
 
-    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunkView>>> {
+    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink>> {
         match sink {
             DataSink::Discard => Ok(Box::new(DiscardSink::new())),
             DataSink::Client { schema } => {
@@ -461,8 +459,8 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
     fn build_streaming_sink(
         &self,
         sink: &DataSink,
-        output: flume::Sender<RecordBatch>,
-    ) -> Result<Box<dyn Sink<DataChunkView>>> {
+        output: flume::Sender<DataChunkView>,
+    ) -> Result<Box<dyn Sink>> {
         match sink {
             DataSink::Client { schema } => Ok(Box::new(CollectSink::with_sender(
                 Arc::new(schema.to_arrow()),

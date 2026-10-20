@@ -49,15 +49,8 @@ async fn recursive_sort_and_limit_run_in_logical_order_over_join_output() {
         .expect("recursive sort then limit should execute");
 
     assert_eq!(result.row_count, 2);
-    let values = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("sorted output column");
     assert_eq!(
-        (0..values.len())
-            .map(|row| values.value(row))
-            .collect::<Vec<_>>(),
+        view_int64_values(&result.output[0], 0),
         vec![2, 3]
     );
 
@@ -77,15 +70,8 @@ async fn recursive_sort_and_limit_run_in_logical_order_over_join_output() {
         .execute(&task, CancellationToken::new())
         .await
         .expect("recursive limit then sort should execute");
-    let values = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("limited sorted output column");
     assert_eq!(
-        (0..values.len())
-            .map(|row| values.value(row))
-            .collect::<Vec<_>>(),
+        view_int64_values(&result.output[0], 0),
         vec![1, 4]
     );
 }
@@ -160,16 +146,6 @@ async fn recursive_aggregate_filter_sort_limit_execute_once_in_order() {
         .expect("recursive aggregate, filter, sort, and limit should execute");
 
     assert_eq!(result.row_count, 1);
-    let key = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("group key");
-    let count = result.output[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("group count");
-    assert_eq!(key.value(0), 1);
-    assert_eq!(count.value(0), 4);
+    assert_eq!(view_int64_values(&result.output[0], 0), vec![1]);
+    assert_eq!(view_int64_values(&result.output[0], 1), vec![4]);
 }

@@ -3,7 +3,7 @@ use std::time::Instant;
 use futures::StreamExt;
 use cli::local::LocalQueryEngine;
 use common::{Result, VeinError};
-use exec::operators::sink::ViewResultBatch;
+use exec::pipeline::DataChunkView;
 
 mod result_format;
 mod view_pretty;
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     let mut format_us = 0u64;
 
     // Keep the rendered prefix as row mappings into the original Arrow buffers.
-    let mut shown: Vec<ViewResultBatch> = Vec::new();
+    let mut shown: Vec<DataChunkView> = Vec::new();
     let mut shown_rows = 0usize;
 
     while let Some(batch) = batches.next().await {

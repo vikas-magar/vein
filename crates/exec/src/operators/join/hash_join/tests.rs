@@ -18,7 +18,7 @@ use residual_support::{
 #[derive(Clone, Default)]
 struct Collect(Arc<Mutex<Vec<DataChunkView>>>);
 
-impl PipelineNode<DataChunkView> for Collect {
+impl PipelineNode for Collect {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0.lock().expect("collect lock").push(view);
         Ok(())
@@ -28,14 +28,11 @@ impl PipelineNode<DataChunkView> for Collect {
         Ok(())
     }
 
-    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
         Ok(Some(Box::new(Self::default())))
     }
 
-    fn combine_local(
-        self: Box<Self>,
-        canonical: &mut dyn PipelineNode<DataChunkView>,
-    ) -> Result<()> {
+    fn combine_local(self: Box<Self>, canonical: &mut dyn PipelineNode) -> Result<()> {
         let target = canonical
             .as_any_mut()
             .downcast_mut::<Collect>()
@@ -60,11 +57,11 @@ impl PipelineNode<DataChunkView> for Collect {
 
 impl HashJoin {
     fn push(&mut self, chunk: DataChunkView) -> Result<()> {
-        PipelineNode::<DataChunkView>::push(self, chunk)
+        PipelineNode::push(self, chunk)
     }
 
     fn flush(&mut self) -> Result<()> {
-        PipelineNode::<DataChunkView>::flush(self)
+        PipelineNode::flush(self)
     }
 }
 
@@ -176,7 +173,7 @@ fn build(values: &[i64]) -> HashTable {
 #[derive(Clone, Default)]
 struct ViewCollect(Arc<Mutex<Vec<DataChunkView>>>);
 
-impl PipelineNode<DataChunkView> for ViewCollect {
+impl PipelineNode for ViewCollect {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0.lock().expect("view collector lock").push(view);
         Ok(())
@@ -197,7 +194,7 @@ fn output_timing_excludes_downstream_on_probe_flush_and_error() {
         elapsed_us: Arc<AtomicU64>,
     }
 
-    impl PipelineNode<DataChunkView> for ObservingSink {
+    impl PipelineNode for ObservingSink {
         fn push(&mut self, _view: DataChunkView) -> Result<()> {
             let started = Instant::now();
             // Make double-counting observable without asserting an upper
@@ -287,7 +284,7 @@ fn join_keeps_build_and_probe_payloads_as_views() {
         SelectionVector::new_dense(3),
         SelectionVector::new_sparse(vec![1, 0]),
     ] {
-        PipelineNode::<DataChunkView>::push(
+        PipelineNode::push(
             &mut join,
             crate::pipeline::test_support::selected_view(
                 vec![Arc::clone(&keys), Arc::clone(&probe_payload)],
@@ -350,12 +347,12 @@ fn join_output_view_references_original_probe_and_build_payloads() {
         vec![DataType::Int64, DataType::Int64],
         Box::new(sink.clone()),
     );
-    PipelineNode::<DataChunkView>::push(
+    PipelineNode::push(
         &mut join,
         crate::pipeline::test_support::dense_view(vec![probe_key, Arc::clone(&probe_payload)]),
     )
     .expect("probe join");
-    PipelineNode::<DataChunkView>::flush(&mut join).expect("flush join");
+    PipelineNode::flush(&mut join).expect("flush join");
 
     let outputs = sink.0.lock().expect("view collector lock");
     assert_eq!(outputs.len(), 1);
@@ -407,7 +404,7 @@ fn multiple_build_batches_preserve_duplicate_output_references() {
         vec![DataType::Int64; 2],
         Box::new(sink.clone()),
     );
-    PipelineNode::<DataChunkView>::push(
+    PipelineNode::push(
         &mut join,
         crate::pipeline::test_support::dense_view(vec![ints(&[7]), Arc::clone(&probe_payload)]),
     )
@@ -454,7 +451,7 @@ fn zero_column_join_views_retain_match_cardinality() {
         vec![DataType::Int64],
         Box::new(sink.clone()),
     );
-    PipelineNode::<DataChunkView>::push(
+    PipelineNode::push(
         &mut join,
         crate::pipeline::test_support::dense_view(vec![ints(&[7, 8, 7])]),
     )
@@ -467,9 +464,11 @@ fn zero_column_join_views_retain_match_cardinality() {
     );
     for view in outputs.iter() {
         assert_eq!(view.num_columns(), 0);
-        let (batch, report) = view
-            .to_record_batch_with_report(Arc::new(arrow::datatypes::Schema::empty()))
-            .unwrap();
+        let (batch, report) = crate::pipeline::arrow_adapter::to_record_batch_with_report(
+            view,
+            Arc::new(arrow::datatypes::Schema::empty()),
+        )
+        .unwrap();
         assert_eq!(batch.num_rows(), view.num_rows());
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(report, MaterializationReport::default());
@@ -503,7 +502,7 @@ fn outer_join_views_preserve_payloads_with_empty_opposite_sides() {
             } else {
                 ints(&[])
             };
-            PipelineNode::<DataChunkView>::push(
+            PipelineNode::push(
                 &mut join,
                 crate::pipeline::test_support::dense_view(vec![probe]),
             )
@@ -546,7 +545,7 @@ fn empty_build_null_extension_requires_declared_output_column() {
         vec![],
         Box::new(sink.clone()),
     );
-    let error = PipelineNode::<DataChunkView>::push(
+    let error = PipelineNode::push(
         &mut join,
         crate::pipeline::test_support::dense_view(vec![ints(&[10])]),
     )

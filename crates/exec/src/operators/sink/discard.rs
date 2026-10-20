@@ -23,7 +23,7 @@ impl Default for DiscardSink {
     }
 }
 
-impl PipelineNode<DataChunkView> for DiscardSink {
+impl PipelineNode for DiscardSink {
     fn push(&mut self, batch: DataChunkView) -> Result<()> {
         self.rows_seen += batch.num_rows();
         Ok(())
@@ -38,7 +38,7 @@ impl PipelineNode<DataChunkView> for DiscardSink {
     }
 }
 
-impl Sink<DataChunkView> for DiscardSink {
+impl Sink for DiscardSink {
     fn row_count(&self) -> u64 {
         self.rows_seen as u64
     }
@@ -63,8 +63,8 @@ mod tests {
             3,
             SelectionVector::new_dense(3),
         ).unwrap()).unwrap();
-        assert_eq!(Sink::<DataChunkView>::row_count(&sink), 5);
-        assert!(Sink::<DataChunkView>::collect(&mut sink).is_empty());
-        PipelineNode::<DataChunkView>::flush(&mut sink).unwrap();
+        assert_eq!(Sink::row_count(&sink), 5);
+        assert!(Sink::collect(&mut sink).is_empty());
+        PipelineNode::flush(&mut sink).unwrap();
     }
 }

@@ -1,14 +1,11 @@
 use super::*;
-use arrow::array::Int64Array;
 use catalog::TableStatistics;
 use common::statistics::{
     OperatorStatisticsIdentity, QuerySourceStatistics, QueryStatisticsContext,
     RuntimeStatisticsObservation,
 };
-use types::{ResolvedColumn, VeinDataType};
-
 mod support;
-use support::{KeepValues, MetadataOnlyRange, schema};
+use support::{KeepValues, MetadataOnlyRange, int64_view, int64_view_with_selection, schema};
 
 mod binding;
 mod policy_basics;

@@ -14,7 +14,7 @@ impl DefaultTaskExecutor {
     pub(super) fn execute_input<'a>(
         &'a self,
         input: &'a Arc<PhysicalPlanNode>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
         context: &'a RecursiveExecutionContext<'a>,
         depth: usize,
     ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
@@ -27,7 +27,7 @@ impl DefaultTaskExecutor {
     fn execute_input_with_runtime_filters<'a>(
         &'a self,
         input: &'a Arc<PhysicalPlanNode>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
         context: &'a RecursiveExecutionContext<'a>,
         runtime_filters: Option<Arc<RuntimeFilterSet>>,
         depth: usize,
@@ -164,7 +164,7 @@ impl DefaultTaskExecutor {
                                 }
                             }
                             if local_nodes.len() == worker_count && fan_in_fallback.is_none() {
-                                let mut canonical: Box<dyn PipelineNode<DataChunkView>> =
+                                let mut canonical: Box<dyn PipelineNode> =
                                     if program.is_empty() {
                                         next
                                     } else {
@@ -200,9 +200,9 @@ impl DefaultTaskExecutor {
                                         let mut bytes = 0u64;
                                         let mut work_units = 0u64;
                                         let mut source_elapsed = std::time::Duration::ZERO;
-                                        let worker_tail: Box<dyn PipelineNode<DataChunkView>> =
+                                        let worker_tail: Box<dyn PipelineNode> =
                                             Box::new(SuppressFlush::new(local));
-                                        let mut pipeline: Box<dyn PipelineNode<DataChunkView>> =
+                                        let mut pipeline: Box<dyn PipelineNode> =
                                             if program.is_empty() {
                                                 worker_tail
                                             } else {
@@ -363,7 +363,7 @@ impl DefaultTaskExecutor {
                                                 )?,
                                             _ => builder.build_source(&source_spec, task_id, attempt)?,
                                         };
-                                        let channel: Box<dyn PipelineNode<DataChunkView>> = Box::new(
+                                        let channel: Box<dyn PipelineNode> = Box::new(
                                             SuppressFlush::new(Box::new(ChannelPipelineNode {
                                                 sender: sender.clone(),
                                                 finished: Arc::clone(&finished),
@@ -591,14 +591,14 @@ impl DefaultTaskExecutor {
                         let output_columns = usize::try_from(*output_columns).map_err(|_| {
                             VeinError::planning("recursive sort output width is invalid", None)
                         })?;
-                        let sort: Box<dyn PipelineNode<DataChunkView>> =
+                        let sort: Box<dyn PipelineNode> =
                             Box::new(SortTransform::with_memory_tracker(
                                 plan.clone(),
                                 Some(output_columns),
                                 operator_memory,
                                 next,
                             )?);
-                        let next: Box<dyn PipelineNode<DataChunkView>> = match key_program {
+                        let next: Box<dyn PipelineNode> = match key_program {
                             Some(program) => {
                                 Box::new(TransformHandle(self.builder.build_expression_executor(program, sort)?))
                             }
@@ -680,7 +680,7 @@ impl DefaultTaskExecutor {
                         let probe_batches = Arc::new(AtomicU64::new(0));
                         let probe_started = Instant::now();
                         let dependencies = schedule.dependencies_for_operator(input)?;
-                        let join: Box<dyn PipelineNode<DataChunkView>> = match build_result {
+                        let join: Box<dyn PipelineNode> = match build_result {
                             BuildResult::InMemory(table) => {
                                 let join = HashJoin::new(
                                     table,

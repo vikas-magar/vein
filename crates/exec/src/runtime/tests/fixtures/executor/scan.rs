@@ -1,7 +1,7 @@
 use super::input::MemoryFeedBuilder;
 use super::*;
 
-/// Supplies one borrowed Arrow batch for each synthetic file in a scan.
+/// Supplies one array-backed view for each synthetic file in a scan.
 pub(in crate::runtime::tests) struct MultiFileFeedBuilder {
     inner: crate::factory::DefaultExecutorBuilder,
     pub(in crate::runtime::tests) source_arrays: Arc<Mutex<Vec<Arc<arrow::array::Int64Array>>>>,
@@ -31,23 +31,23 @@ impl Drop for ActiveSourceGuard {
 }
 
 pub(in crate::runtime::tests) struct TrackedFileSource {
-    batch: Option<RecordBatch>,
+    view: Option<DataChunkView>,
     active_sources: Arc<std::sync::atomic::AtomicUsize>,
     peak_sources: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[async_trait]
-impl Source<DataChunkView> for TrackedFileSource {
-    async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunkView>) -> Result<()> {
+impl Source for TrackedFileSource {
+    async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()> {
         let active = self.active_sources.fetch_add(1, Ordering::Relaxed) + 1;
         self.peak_sources.fetch_max(active, Ordering::Relaxed);
         let _active = ActiveSourceGuard(Arc::clone(&self.active_sources));
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let batch = self
-            .batch
+        let view = self
+            .view
             .take()
-            .ok_or_else(|| VeinError::internal("synthetic source batch already consumed"))?;
-        next.push(DataChunkView::from_record_batch(batch)?)
+            .ok_or_else(|| VeinError::internal("synthetic source view already consumed"))?;
+        next.push(view)
     }
 }
 
@@ -61,7 +61,7 @@ impl ExecutorBuilder for MultiFileFeedBuilder {
         source: &DataSource,
         task_id: TaskId,
         attempt: u32,
-    ) -> Result<Box<dyn Source<DataChunkView>>> {
+    ) -> Result<Box<dyn Source>> {
         let DataSource::File(scan) = source else {
             return self.inner.build_source(source, task_id, attempt);
         };
@@ -79,10 +79,9 @@ impl ExecutorBuilder for MultiFileFeedBuilder {
             .map_err(|_| VeinError::internal("test source array mutex poisoned"))?
             .push(Arc::clone(&values));
         let array: arrow::array::ArrayRef = values;
-        let batch = RecordBatch::try_new(Arc::new(int64_schema().to_arrow()), vec![array])
-            .map_err(|error| VeinError::internal(format!("build synthetic batch: {error}")))?;
+        let view = DataChunkView::from_dense_arrays(vec![array])?;
         Ok(Box::new(TrackedFileSource {
-            batch: Some(batch),
+            view: Some(view),
             active_sources: Arc::clone(&self.active_sources),
             peak_sources: Arc::clone(&self.peak_sources),
         }))
@@ -91,20 +90,20 @@ impl ExecutorBuilder for MultiFileFeedBuilder {
     fn build_expression_executor(
         &self,
         program: &Arc<ExpressionProgram>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
-    ) -> Result<Box<dyn Transform<DataChunkView>>> {
+        next: Box<dyn PipelineNode>,
+    ) -> Result<Box<dyn Transform>> {
         self.inner.build_expression_executor(program, next)
     }
 
-    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunkView>>> {
+    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink>> {
         self.inner.build_sink(sink)
     }
 
     fn build_streaming_sink(
         &self,
         sink: &DataSink,
-        output: flume::Sender<RecordBatch>,
-    ) -> Result<Box<dyn Sink<DataChunkView>>> {
+        output: flume::Sender<DataChunkView>,
+    ) -> Result<Box<dyn Sink>> {
         self.inner.build_streaming_sink(sink, output)
     }
 }

@@ -1,6 +1,7 @@
 use super::*;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{Field, Schema};
+use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
 fn batch() -> RecordBatch {
@@ -31,7 +32,7 @@ fn collects_mergeable_table_ndv_and_null_counts_from_borrowed_batches() {
         StatisticsConfig { distinct_precision: 10, ..StatisticsConfig::default() },
     )
         .expect("collector");
-    collector.update(&batch).expect("collect input batch");
+    collector.update_input(&batch).expect("collect input batch");
     let statistics = collector.finish();
 
     assert_eq!(statistics.num_rows, Some(4));
@@ -52,8 +53,8 @@ fn collector_merge_and_restore_preserve_table_wide_ndv() {
     let config = StatisticsConfig { distinct_precision: 10, ..StatisticsConfig::default() };
     let mut left = StatisticsCollector::new(Arc::clone(&schema), config.clone()).unwrap();
     let mut right = StatisticsCollector::new(Arc::clone(&schema), config.clone()).unwrap();
-    left.update(&batch.slice(0, 2)).unwrap();
-    right.update(&batch.slice(2, 2)).unwrap();
+    left.update_input(&batch.slice(0, 2)).unwrap();
+    right.update_input(&batch.slice(2, 2)).unwrap();
     left.merge(&right).unwrap();
 
     let merged = left.finish();
@@ -67,7 +68,7 @@ fn collector_merge_and_restore_preserve_table_wide_ndv() {
         &merged,
     )
         .expect("restore serialized mergeable state");
-    restored.update(&batch.slice(0, 1)).unwrap();
+    restored.update_input(&batch.slice(0, 1)).unwrap();
     let appended = restored.finish();
     assert_eq!(appended.num_rows, Some(5));
     assert_eq!(appended.column_statistics["key"].distinct_count, Some(2));
@@ -94,7 +95,7 @@ fn collects_exact_bounds_numeric_moments_and_utf8_lengths() {
         ],
     ).unwrap();
     let mut collector = StatisticsCollector::new(schema, StatisticsConfig::default()).unwrap();
-    collector.update(&batch).unwrap();
+    collector.update_input(&batch).unwrap();
     let stats = collector.finish();
 
     let measure = &stats.column_statistics["measure"];
@@ -131,7 +132,7 @@ fn uint64_bounds_preserve_values_above_signed_range() {
         vec![Arc::new(UInt64Array::from(vec![1, i64::MAX as u64 + 1, u64::MAX]))],
     ).unwrap();
     let mut collector = StatisticsCollector::new(schema, StatisticsConfig::default()).unwrap();
-    collector.update(&batch).unwrap();
+    collector.update_input(&batch).unwrap();
     let summary = collector.finish().column_statistics.remove("key").unwrap();
     assert_eq!(summary.min_value, Some(LogicalLiteral::UInt64(1)));
     assert_eq!(summary.max_value, Some(LogicalLiteral::UInt64(u64::MAX)));
@@ -147,7 +148,7 @@ fn oversized_string_bounds_become_unknown_without_losing_length_stats() {
     ).unwrap();
     let config = StatisticsConfig { max_bound_value_bytes: 3, ..StatisticsConfig::default() };
     let mut collector = StatisticsCollector::new(schema, config).unwrap();
-    collector.update(&batch).unwrap();
+    collector.update_input(&batch).unwrap();
     let summary = collector.finish().column_statistics.remove("label").unwrap();
     assert_eq!(summary.min_max_complete, Some(false));
     assert_eq!(summary.min_value, None);
@@ -168,14 +169,14 @@ fn empty_numeric_batches_keep_appendable_moments_and_empty_bounds() {
         vec![Arc::new(Int64Array::from(vec![Some(7)]))],
     ).unwrap();
     let mut collector = StatisticsCollector::new(schema.clone(), StatisticsConfig::default()).unwrap();
-    collector.update(&empty).unwrap();
+    collector.update_input(&empty).unwrap();
     let empty_stats = collector.finish();
     assert_eq!(empty_stats.column_statistics["measure"].min_max_complete, Some(true));
     assert_eq!(empty_stats.column_statistics["measure"].min_value, None);
     assert_eq!(empty_stats.column_statistics["measure"].numeric.as_ref().unwrap().mean, None);
 
     let mut restored = StatisticsCollector::restore(schema, StatisticsConfig::default(), &empty_stats).unwrap();
-    restored.update(&one).unwrap();
+    restored.update_input(&one).unwrap();
     let stats = restored.finish();
     assert_eq!(stats.column_statistics["measure"].numeric.as_ref().unwrap().mean, Some(7.0));
     assert_eq!(stats.column_statistics["measure"].min_value, Some(LogicalLiteral::Int64(7)));
@@ -207,7 +208,7 @@ fn unsupported_arrow_types_keep_counts_but_do_not_publish_a_false_ndv() {
     )]));
     let batch = RecordBatch::new_empty(schema.clone());
     let mut collector = StatisticsCollector::new(schema, StatisticsConfig::default()).unwrap();
-    collector.update(&batch).unwrap();
+    collector.update_input(&batch).unwrap();
     let stats = collector.finish();
     assert_eq!(stats.num_rows, Some(0));
     assert_eq!(stats.column_statistics["nested"].null_count, Some(0));
@@ -243,7 +244,7 @@ fn bounded_most_common_synopsis_tracks_heavy_hitters_and_nulls_are_excluded() {
         ..StatisticsConfig::default()
     };
     let mut collector = StatisticsCollector::new(schema, config).expect("collector");
-    collector.update(&batch).expect("collect values");
+    collector.update_input(&batch).expect("collect values");
     let summary = collector.finish().column_statistics.remove("key").unwrap();
     let most_common = summary.most_common_values.expect("frequency synopsis");
 
@@ -278,8 +279,8 @@ fn mcv_histogram_and_joint_ndv_merge_restore_and_serialize() {
     };
     let mut left = StatisticsCollector::new(Arc::clone(&schema), config.clone()).unwrap();
     let mut right = StatisticsCollector::new(Arc::clone(&schema), config.clone()).unwrap();
-    left.update(&batch.slice(0, 2)).unwrap();
-    right.update(&batch.slice(2, 2)).unwrap();
+    left.update_input(&batch.slice(0, 2)).unwrap();
+    right.update_input(&batch.slice(2, 2)).unwrap();
     left.merge(&right).unwrap();
 
     let merged = left.finish();
@@ -295,7 +296,7 @@ fn mcv_histogram_and_joint_ndv_merge_restore_and_serialize() {
 
     let mut restored = StatisticsCollector::restore(Arc::clone(&schema), config, &merged)
         .expect("restore mergeable statistics");
-    restored.update(&batch.slice(0, 1)).unwrap();
+    restored.update_input(&batch.slice(0, 1)).unwrap();
     let appended = restored.finish();
     assert_eq!(appended.column_statistics["key"].most_common_values.as_ref().unwrap().analyzed_count, 4);
     assert_eq!(appended.column_statistics["key"].histogram.as_ref().unwrap().population_count, 4);

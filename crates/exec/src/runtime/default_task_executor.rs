@@ -1,7 +1,6 @@
 //! Implementation of the runtime task-executor contract for the default engine.
 
 use async_trait::async_trait;
-use arrow::record_batch::RecordBatch;
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::{IntermediateSourceId, QueryId};
@@ -9,7 +8,7 @@ use common::protocol::{DataSink, ExecuteTask};
 use error::VeinError;
 use std::sync::{Arc, Mutex};
 
-use crate::operators::sink::ViewResultBatch;
+use crate::pipeline::DataChunkView;
 use crate::runtime::checkpoint::{CheckpointTaskResult, IntermediateRelation};
 
 use super::{DefaultTaskExecutor, QueryExecutionResources, TaskExecutor, TaskResult};
@@ -31,17 +30,6 @@ impl TaskExecutor for DefaultTaskExecutor {
 
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult> {
         self.execute_with_output(task, cancel, |builder, sink, _memory| builder.build_sink(sink))
-            .await
-    }
-
-    async fn execute_views(
-        &self,
-        task: &ExecuteTask,
-        cancel: CancellationToken,
-    ) -> Result<TaskResult<ViewResultBatch>> {
-        self.execute_with_output(task, cancel, |builder, sink, _memory| {
-            builder.build_view_result_sink(sink, None)
-        })
             .await
     }
 
@@ -106,39 +94,11 @@ impl TaskExecutor for DefaultTaskExecutor {
         self.intermediate_sources.register(query_id, source_id, relation)
     }
 
-    async fn execute_views_streaming(
-        &self,
-        task: &ExecuteTask,
-        cancel: CancellationToken,
-        output: flume::Sender<ViewResultBatch>,
-    ) -> Result<TaskResult<ViewResultBatch>> {
-        self.execute_with_output(task, cancel, move |builder, sink, _memory| {
-            builder.build_view_result_sink(sink, Some(output))
-        })
-            .await
-    }
-
-    async fn execute_views_streaming_with_resources(
-        &self,
-        task: &ExecuteTask,
-        cancel: CancellationToken,
-        output: flume::Sender<ViewResultBatch>,
-        resources: Arc<QueryExecutionResources>,
-    ) -> Result<TaskResult<ViewResultBatch>> {
-        self.execute_with_output_and_resources(
-            task,
-            cancel,
-            Some(resources),
-            move |builder, sink, _memory| builder.build_view_result_sink(sink, Some(output)),
-        )
-            .await
-    }
-
     async fn execute_streaming(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
-        output: flume::Sender<RecordBatch>,
+        output: flume::Sender<DataChunkView>,
     ) -> Result<TaskResult> {
         self.execute_with_output(task, cancel, move |builder, sink, _memory| {
             builder.build_streaming_sink(sink, output)
@@ -150,7 +110,7 @@ impl TaskExecutor for DefaultTaskExecutor {
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
-        output: flume::Sender<RecordBatch>,
+        output: flume::Sender<DataChunkView>,
         resources: Arc<QueryExecutionResources>,
     ) -> Result<TaskResult> {
         self.execute_with_output_and_resources(

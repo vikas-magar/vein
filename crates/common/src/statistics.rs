@@ -26,7 +26,6 @@ use arrow::array::{
     UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use arrow::record_batch::RecordBatch;
 use catalog::{
     ByteLengthStatistics, ColumnGroupStatistics, ColumnStatistics, HistogramBucket,
     HistogramSample, HistogramStatistics, MostCommonValue, MostCommonValuesStatistics,
@@ -41,7 +40,9 @@ use crate::Result;
 
 mod accumulators;
 mod input;
-pub use input::{SelectedRecordBatch, StatisticsInput};
+pub use input::StatisticsInput;
+#[cfg(test)]
+pub(crate) use input::OwnedSelectedRecordBatch;
 pub use accumulators::StatisticsCollector;
 pub use runtime::{RuntimeStatisticsObservation, RuntimeStatisticsStore};
 pub use context::{

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::runtime::filter::RuntimeFilterSet;
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
+use common::arrow::SelectionVector;
 
 use super::*;
 
@@ -10,15 +11,22 @@ fn ints(values: &[i64]) -> ArrayRef {
 }
 
 fn chunk(column: ArrayRef) -> DataChunkView {
-    crate::pipeline::test_support::dense_view(vec![column])
+    view(vec![column])
 }
 
-fn hashes_for_arrays(columns: &[ArrayRef]) -> Vec<u64> {
-    let keys = ChunkKeys::resolve_arrays(columns).expect("resolve key arrays");
+fn view(columns: Vec<ArrayRef>) -> DataChunkView {
     let rows = columns.first().map_or(0, |column| column.len());
-    (0..rows)
+    DataChunkView::from_arrays(columns, rows, SelectionVector::new_dense(rows))
+        .expect("valid test view")
+}
+
+fn hashes_for_view(view: &DataChunkView, columns: Vec<usize>) -> Vec<u64> {
+    let keys = ChunkKeys::resolve_view(&JoinKeys::new(columns), view)
+        .expect("resolve view join keys")
+        .0;
+    (0..view.num_rows())
         .filter_map(|row| {
-            keys.hash_and_single_i64(row, None)
+            keys.hash_and_single_i64(row, view)
                 .expect("hash key row")
                 .map(|(hash, _)| hash)
         })
@@ -35,7 +43,8 @@ fn bloom_runtime_filter_preserves_composite_join_keys_and_null_semantics() {
         Arc::new(Int64Array::from(vec![Some(5), Some(8), Some(5)])) as ArrayRef,
         Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("a")])) as ArrayRef,
     ];
-    let hashes = hashes_for_arrays(&build);
+    let build = view(build);
+    let hashes = hashes_for_view(&build, vec![0, 1]);
     let memory = query_memory(1 << 20);
     let columns = [ColumnId(11), ColumnId(12)];
     let filters = JoinBloomFilterFactory::default()
@@ -48,22 +57,15 @@ fn bloom_runtime_filter_preserves_composite_join_keys_and_null_semantics() {
         .expect("build runtime filter");
     assert_eq!(filters.len(), 1);
 
-    let probe = RecordBatch::try_from_iter(vec![
-        (
-            "id",
-            Arc::new(Int64Array::from(vec![Some(5), Some(5), Some(8), None])) as ArrayRef,
-        ),
-        (
-            "region",
-            Arc::new(StringArray::from(vec![
-                Some("a"),
-                Some("missing"),
-                Some("b"),
-                Some("a"),
-            ])) as ArrayRef,
-        ),
-    ])
-    .expect("probe key batch");
+    let probe = view(vec![
+        Arc::new(Int64Array::from(vec![Some(5), Some(5), Some(8), None])) as ArrayRef,
+        Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("missing"),
+            Some("b"),
+            Some("a"),
+        ])) as ArrayRef,
+    ]);
     let selection = filters[0]
         .evaluate(&probe, &[0, 1])
         .expect("evaluate composite runtime filter");
@@ -106,35 +108,38 @@ fn bloom_runtime_filter_declines_optional_allocation_when_budget_is_exhausted() 
 
 #[test]
 fn row_key_encoding_hashes_composite_values_and_skips_null_keys() {
-    let single_i64 =
-        ChunkKeys::resolve_arrays(&[Arc::new(Int64Array::from(vec![Some(3), None])) as ArrayRef])
-            .expect("resolve single Int64 key");
+    let single_i64_view = view(vec![Arc::new(Int64Array::from(vec![Some(3), None])) as ArrayRef]);
+    let single_i64 = ChunkKeys::resolve_view(&JoinKeys::new(vec![0]), &single_i64_view)
+        .expect("resolve single Int64 key")
+        .0;
     let expected_i64_hash = fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET);
     assert_eq!(
-        single_i64.hash_and_single_i64(0, None).unwrap(),
+        single_i64.hash_and_single_i64(0, &single_i64_view).unwrap(),
         Some((expected_i64_hash, Some(3))),
         "the Int64 scalar is read for hashing without retaining a duplicate"
     );
-    assert_eq!(single_i64.hash_and_single_i64(1, None).unwrap(), None);
+    assert_eq!(single_i64.hash_and_single_i64(1, &single_i64_view).unwrap(), None);
 
-    let composite = ChunkKeys::resolve_arrays(&[
+    let composite_view = view(vec![
         Arc::new(Int64Array::from(vec![Some(3), Some(3), None])) as ArrayRef,
         Arc::new(StringArray::from(vec![Some("north"), None, Some("north")])) as ArrayRef,
-    ])
-    .expect("resolve composite key");
+    ]);
+    let composite = ChunkKeys::resolve_view(&JoinKeys::new(vec![0, 1]), &composite_view)
+        .expect("resolve composite key")
+        .0;
     let expected_composite_hash = fnv1a(b"north", fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET));
     assert_eq!(
-        composite.hash_and_single_i64(0, None).unwrap(),
+        composite.hash_and_single_i64(0, &composite_view).unwrap(),
         Some((expected_composite_hash, None)),
         "composite keys preserve column order in the canonical hash"
     );
     assert_eq!(
-        composite.hash_and_single_i64(1, None).unwrap(),
+        composite.hash_and_single_i64(1, &composite_view).unwrap(),
         None,
         "a null in any key column skips the row"
     );
     assert_eq!(
-        composite.hash_and_single_i64(2, None).unwrap(),
+        composite.hash_and_single_i64(2, &composite_view).unwrap(),
         None,
         "null leading key columns skip the row"
     );

@@ -8,7 +8,6 @@ mod array;
 use std::mem::size_of;
 use std::time::Instant;
 
-use arrow::array::ArrayRef;
 use common::Result;
 use error::VeinError;
 use types::LogicalLiteral;
@@ -21,7 +20,7 @@ use array::KeyArray;
 #[derive(Debug, Clone)]
 pub(super) struct ChunkKeys {
     columns: Vec<KeyArray>,
-    source_columns: Option<Vec<usize>>,
+    source_columns: Vec<usize>,
 }
 
 impl ChunkKeys {
@@ -39,43 +38,27 @@ impl ChunkKeys {
         Ok((
             Self {
                 columns,
-                source_columns: Some(keys.columns.clone()),
+                source_columns: keys.columns.clone(),
             },
             elapsed,
         ))
     }
 
-    pub(super) fn resolve_arrays(arrays: &[ArrayRef]) -> Result<Self> {
-        let columns = arrays
-            .iter()
-            .enumerate()
-            .map(|(index, array)| KeyArray::resolve(index, std::slice::from_ref(array)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            columns,
-            source_columns: None,
-        })
-    }
-
     fn source_location(
         &self,
         key_index: usize,
-        view: Option<&DataChunkView>,
+        view: &DataChunkView,
         row: usize,
     ) -> Result<Option<(usize, usize)>> {
-        let Some(columns) = &self.source_columns else {
-            return Ok(Some((0, row)));
-        };
-        let column = *columns
+        let column = *self.source_columns
             .get(key_index)
             .ok_or_else(|| VeinError::internal("join key source mapping is incomplete"))?;
-        view.ok_or_else(|| VeinError::internal("join key source view is missing"))?
-            .source_row(column, row)
+        view.source_row(column, row)
     }
 
     pub(super) fn any_null(&self, view: &DataChunkView, row: usize) -> Result<bool> {
         for (key_index, column) in self.columns.iter().enumerate() {
-            let Some((source, source_row)) = self.source_location(key_index, Some(view), row)? else {
+            let Some((source, source_row)) = self.source_location(key_index, view, row)? else {
                 return Ok(true);
             };
             if column.is_null(source, source_row)? {
@@ -88,7 +71,7 @@ impl ChunkKeys {
     pub(super) fn hash_and_single_i64(
         &self,
         row: usize,
-        view: Option<&DataChunkView>,
+        view: &DataChunkView,
     ) -> Result<Option<(u64, Option<i64>)>> {
         if self.is_single_i64() {
             let Some((source, source_row)) = self.source_location(0, view, row)? else {
@@ -122,7 +105,7 @@ impl ChunkKeys {
         view: &DataChunkView,
         row: usize,
     ) -> Result<Option<i64>> {
-        let Some((source, source_row)) = self.source_location(0, Some(view), row)? else {
+        let Some((source, source_row)) = self.source_location(0, view, row)? else {
             return Ok(None);
         };
         self.columns[0].int64_value(source, source_row)
@@ -140,11 +123,11 @@ impl ChunkKeys {
             return Ok(false);
         }
         for (key_index, (left, right)) in self.columns.iter().zip(&other.columns).enumerate() {
-            let Some((left_source, left_row)) = self.source_location(key_index, Some(view), row)? else {
+            let Some((left_source, left_row)) = self.source_location(key_index, view, row)? else {
                 return Ok(false);
             };
             let Some((right_source, right_row)) =
-                other.source_location(key_index, Some(other_view), other_row)?
+                other.source_location(key_index, other_view, other_row)?
             else {
                 return Ok(false);
             };
@@ -164,11 +147,11 @@ impl ChunkKeys {
         other_row: usize,
         other_view: &DataChunkView,
     ) -> Result<Option<std::cmp::Ordering>> {
-        let Some((source, row)) = self.source_location(key_index, Some(view), row)? else {
+        let Some((source, row)) = self.source_location(key_index, view, row)? else {
             return Ok(None);
         };
         let Some((other_source, other_row)) =
-            other.source_location(key_index, Some(other_view), other_row)?
+            other.source_location(key_index, other_view, other_row)?
         else {
             return Ok(None);
         };
@@ -182,7 +165,7 @@ impl ChunkKeys {
         view: &DataChunkView,
     ) -> Result<LogicalLiteral> {
         let (source, row) = self
-            .source_location(key_index, Some(view), row)?
+            .source_location(key_index, view, row)?
             .ok_or_else(|| VeinError::internal("join key bound references a null-extended row"))?;
         self.columns[key_index].logical_literal(source, row)
     }
@@ -204,8 +187,8 @@ impl ChunkKeys {
             )
             .saturating_add(
                 self.source_columns
-                    .as_ref()
-                    .map_or(0, |columns| columns.capacity().saturating_mul(size_of::<usize>())),
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
             )
     }
 }

@@ -177,10 +177,10 @@ impl ExecutionTrace {
     pub(crate) fn observer(
         &self,
         node_id: u32,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
         query_id: String,
         task_id: String,
-    ) -> Box<dyn PipelineNode<DataChunkView>> {
+    ) -> Box<dyn PipelineNode> {
         let Some(metrics) = self.nodes.get(node_id as usize).cloned() else {
             return next;
         };
@@ -459,13 +459,13 @@ impl Drop for ExecutionTrace {
 }
 
 struct ObservedOutputNode {
-    next: Box<dyn PipelineNode<DataChunkView>>,
+    next: Box<dyn PipelineNode>,
     metrics: Arc<NodeMetrics>,
     query_id: String,
     task_id: String,
 }
 
-impl PipelineNode<DataChunkView> for ObservedOutputNode {
+impl PipelineNode for ObservedOutputNode {
     fn push(&mut self, view: DataChunkView) -> common::Result<()> {
         let rows = view.num_rows() as u64;
         self.metrics.statistics.record_output(rows);
@@ -505,7 +505,7 @@ impl PipelineNode<DataChunkView> for ObservedOutputNode {
         self.next.finished()
     }
 
-    fn fork_local(&self) -> common::Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+    fn fork_local(&self) -> common::Result<Option<Box<dyn PipelineNode>>> {
         let Some(next) = self.next.fork_local()? else {
             return Ok(None);
         };
@@ -519,7 +519,7 @@ impl PipelineNode<DataChunkView> for ObservedOutputNode {
 
     fn combine_local(
         self: Box<Self>,
-        canonical: &mut dyn PipelineNode<DataChunkView>,
+        canonical: &mut dyn PipelineNode,
     ) -> common::Result<()> {
         let target = canonical
             .as_any_mut()
@@ -646,7 +646,7 @@ mod tests {
         expected: ArrayRef,
     }
 
-    impl PipelineNode<DataChunkView> for Discard {
+    impl PipelineNode for Discard {
         fn push(&mut self, batch: DataChunkView) -> Result<()> {
             let (array, _) = batch.resolve(0, 0)?.expect("source row remains present");
             assert!(

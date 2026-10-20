@@ -40,16 +40,23 @@ fn write_table(root: &std::path::Path, name: &str, values: Vec<i64>) {
 async fn run(engine: &LocalQueryEngine, query: &str) -> (Vec<Vec<i64>>, Arc<QueryStatisticsContext>) {
     let prepared = engine.prepare(query).await.unwrap();
     let statistics = Arc::clone(prepared.statistics_context());
-    let mut stream = prepared.into_record_batch_stream();
+    let mut stream = prepared.into_stream();
     let mut output = Vec::new();
     while let Some(batch) = stream.next().await {
         let batch = batch.unwrap();
         for row in 0..batch.num_rows() {
-            output.push(batch.columns().iter().map(|array| {
-                let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                assert!(!array.is_null(row));
-                array.value(row)
-            }).collect());
+            let values = (0..batch.num_columns())
+                .map(|column| {
+                    let (array, physical_row) = batch
+                        .resolve(column, row)
+                        .unwrap()
+                        .expect("query result is not null-extended");
+                    let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                    assert!(!values.is_null(physical_row));
+                    values.value(physical_row)
+                })
+                .collect();
+            output.push(values);
         }
     }
     (output, statistics)
@@ -89,10 +96,6 @@ impl exec::runtime::TaskExecutor for FailsSecondCheckpoint {
     }
     async fn execute(&self, task: &common::protocol::ExecuteTask, cancel: common::cancellation::CancellationToken)
                      -> common::Result<exec::runtime::TaskResult> { self.inner.execute(task, cancel).await }
-    async fn execute_views(&self, task: &common::protocol::ExecuteTask, cancel: common::cancellation::CancellationToken)
-                           -> common::Result<exec::runtime::TaskResult<exec::operators::sink::ViewResultBatch>> {
-        self.inner.execute_views(task, cancel).await
-    }
     async fn execute_to_checkpoint(&self, task: &common::protocol::ExecuteTask, cancel: common::cancellation::CancellationToken)
                                    -> common::Result<exec::runtime::checkpoint::CheckpointTaskResult> {
         self.inner.execute_to_checkpoint(task, cancel).await
@@ -110,13 +113,9 @@ impl exec::runtime::TaskExecutor for FailsSecondCheckpoint {
                                     -> common::Result<exec::runtime::checkpoint::IntermediateSourceRegistration> {
         self.inner.register_intermediate_source(query, source, relation)
     }
-    async fn execute_views_streaming(&self, task: &common::protocol::ExecuteTask,
-                                     cancel: common::cancellation::CancellationToken, output: flume::Sender<exec::operators::sink::ViewResultBatch>)
-                                     -> common::Result<exec::runtime::TaskResult<exec::operators::sink::ViewResultBatch>> {
-        self.inner.execute_views_streaming(task, cancel, output).await
-    }
     async fn execute_streaming_with_resources(&self, task: &common::protocol::ExecuteTask,
-                                              cancel: common::cancellation::CancellationToken, output: flume::Sender<RecordBatch>,
+                                              cancel: common::cancellation::CancellationToken,
+                                              output: flume::Sender<exec::pipeline::DataChunkView>,
                                               resources: Arc<exec::runtime::QueryExecutionResources>) -> common::Result<exec::runtime::TaskResult> {
         self.inner.execute_streaming_with_resources(task, cancel, output, resources).await
     }
@@ -150,7 +149,7 @@ async fn dropping_an_adaptive_result_stream_cancels_its_shared_resource_scope() 
         cancel: Default::default(),
     });
     engine.executor = executor.clone();
-    let mut stream = engine.prepare(JOIN_QUERY).await.unwrap().into_record_batch_stream();
+    let mut stream = engine.prepare(JOIN_QUERY).await.unwrap().into_stream();
     assert!(stream.next().await.unwrap().is_ok());
     let cancel = executor.cancel.lock().unwrap().clone().unwrap();
     assert!(!cancel.is_cancelled());

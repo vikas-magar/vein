@@ -1,4 +1,4 @@
-use arrow::record_batch::RecordBatch;
+use crate::pipeline::DataChunkView;
 use crate::operators::sink::WriteReceipt;
 
 /// Per-task execution metrics, reported to the master on completion.
@@ -12,18 +12,18 @@ pub struct TaskMetrics {
 
 /// The outcome of running a single task to completion.
 #[derive(Debug, Clone)]
-pub struct TaskResult<O = RecordBatch> {
+pub struct TaskResult {
     /// Number of rows produced by the pipeline.
     pub row_count: u64,
     /// Captured output batches (populated by a [`Sink`] that retains results).
-    pub output: Vec<O>,
+    pub output: Vec<DataChunkView>,
     /// Execution metrics (bytes read, duration).
     pub metrics: TaskMetrics,
     /// Present only after a storage sink has committed successfully.
     pub write_receipt: Option<WriteReceipt>,
 }
 
-impl<O> Default for TaskResult<O> {
+impl Default for TaskResult {
     fn default() -> Self {
         Self {
             row_count: 0,

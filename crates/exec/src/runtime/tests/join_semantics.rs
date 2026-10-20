@@ -41,20 +41,8 @@ async fn recursive_left_join_applies_residual_before_preserving_unmatched_probe_
     let mut probe_rows = Vec::new();
     let mut build_rows = Vec::new();
     for batch in &result.output {
-        let probe = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("probe output");
-        let build = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("build output");
-        for row in 0..batch.num_rows() {
-            probe_rows.push(probe.value(row));
-            build_rows.push(build.is_valid(row).then(|| build.value(row)));
-        }
+        probe_rows.extend(view_int64_values(batch, 0));
+        build_rows.extend(view_nullable_int64_values(batch, 1));
     }
     assert_eq!(probe_rows, vec![1, 2, 3, 4, 5]);
     assert_eq!(build_rows, vec![Some(1), Some(2), None, None, None]);
@@ -101,28 +89,12 @@ async fn recursive_right_join_does_not_mark_residual_rejections_as_matches() {
     let probe_rows = result
         .output
         .iter()
-        .flat_map(|batch| {
-            let probe = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("probe output");
-            (0..probe.len())
-                .map(|i| probe.is_valid(i).then(|| probe.value(i)))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|view| view_nullable_int64_values(view, 0))
         .collect::<Vec<_>>();
     let build_rows = result
         .output
         .iter()
-        .flat_map(|batch| {
-            let build = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("build output");
-            (0..build.len()).map(|i| build.value(i)).collect::<Vec<_>>()
-        })
+        .flat_map(|view| view_int64_values(view, 1))
         .collect::<Vec<_>>();
     assert_eq!(probe_rows, vec![Some(1), Some(2), None, None, None]);
     assert_eq!(build_rows, vec![1, 2, 3, 4, 5]);

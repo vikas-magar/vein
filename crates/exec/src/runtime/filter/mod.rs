@@ -21,13 +21,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use common::Result;
 #[cfg(test)]
-use arrow::array::{Array, BooleanArray, builder::BooleanBuilder};
+use arrow::array::BooleanArray;
 #[cfg(test)]
-use arrow::record_batch::RecordBatch;
-#[cfg(test)]
-use error::VeinError;
-#[cfg(test)]
-use types::{ColumnId, VeinSchema};
+use types::ColumnId;
 
 #[cfg(test)]
 mod tests;

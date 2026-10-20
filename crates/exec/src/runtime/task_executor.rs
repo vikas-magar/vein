@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use common::Result;
 use common::cancellation::CancellationToken;
@@ -10,7 +9,7 @@ use common::identifiers::{IntermediateSourceId, QueryId};
 use common::protocol::ExecuteTask;
 use error::VeinError;
 
-use crate::operators::sink::ViewResultBatch;
+use crate::pipeline::DataChunkView;
 use super::checkpoint;
 use super::{QueryExecutionResources, TaskResult};
 
@@ -40,13 +39,6 @@ pub trait TaskExecutor: Send + Sync {
 
     /// Run one task, driving its source through the operator chain.
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult>;
-
-    /// Executes the same canonical plan while retaining client result views.
-    async fn execute_views(
-        &self,
-        task: &ExecuteTask,
-        cancel: CancellationToken,
-    ) -> Result<TaskResult<ViewResultBatch>>;
 
     /// Runs a client-result task into a query-accounted, replayable checkpoint.
     ///
@@ -86,37 +78,18 @@ pub trait TaskExecutor: Send + Sync {
         ))
     }
 
-    /// Streams reference-backed results through a bounded channel.
-    async fn execute_views_streaming(
-        &self,
-        task: &ExecuteTask,
-        cancel: CancellationToken,
-        output: flume::Sender<ViewResultBatch>,
-    ) -> Result<TaskResult<ViewResultBatch>>;
-
-    /// Stream a continuation using the same resource budget as earlier stages.
-    async fn execute_views_streaming_with_resources(
-        &self,
-        task: &ExecuteTask,
-        cancel: CancellationToken,
-        output: flume::Sender<ViewResultBatch>,
-        _resources: Arc<QueryExecutionResources>,
-    ) -> Result<TaskResult<ViewResultBatch>> {
-        self.execute_views_streaming(task, cancel, output).await
-    }
-
-    /// Stream client batches using the query-wide memory and spill budget.
+    /// Stream client views using the query-wide memory and spill budget.
     async fn execute_streaming_with_resources(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
-        output: flume::Sender<RecordBatch>,
+        output: flume::Sender<DataChunkView>,
         _resources: Arc<QueryExecutionResources>,
     ) -> Result<TaskResult> {
         self.execute_streaming(task, cancel, output).await
     }
 
-    /// Execute a task while forwarding client batches through a bounded channel.
+    /// Execute a task while forwarding canonical views through a bounded channel.
     ///
     /// The default adapter preserves compatibility for custom executors; the
     /// default executor overrides this to avoid retaining the complete output.
@@ -124,7 +97,7 @@ pub trait TaskExecutor: Send + Sync {
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
-        output: flume::Sender<RecordBatch>,
+        output: flume::Sender<DataChunkView>,
     ) -> Result<TaskResult> {
         let mut result = self.execute(task, cancel).await?;
         for batch in result.output.drain(..) {

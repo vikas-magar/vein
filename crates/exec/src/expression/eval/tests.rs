@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::protocol::{BinaryExprOp, ExprKind, PhysicalExpr};
 use types::{LogicalLiteral, VeinDataType};
 
 use crate::expression::eval::{
-    ExpressionEvaluationContext, ExpressionEvaluator, ExpressionKernelFn,
-    ExpressionKernelRegistry, ExpressionNodeKind,
+    ExpressionEvaluationContext, ExpressionEvaluator, ExpressionKernelFn, ExpressionKernelRegistry,
+    ExpressionNodeKind,
 };
+use crate::expression::value::ExpressionValue;
 use crate::pipeline::DataChunkView;
 use crate::udf::FunctionRegistry;
-use crate::expression::value::ExpressionValue;
 
 fn evaluate(
     expression: &PhysicalExpr,
@@ -32,13 +32,19 @@ fn input() -> Arc<DataChunkView> {
         Arc::new(Int64Array::from(vec![1, 2, 3])),
         Arc::new(StringArray::from(vec![Some("A"), None, Some("C")])),
     ];
-    Arc::new(DataChunkView::from_record_batch(
-        RecordBatch::try_new(schema, arrays).unwrap(),
-    ).unwrap())
+    Arc::new(
+        crate::pipeline::arrow_adapter::from_record_batch(
+            RecordBatch::try_new(schema, arrays).unwrap(),
+        )
+            .unwrap(),
+    )
 }
 
 fn column(index: u32, data_type: VeinDataType) -> PhysicalExpr {
-    PhysicalExpr { return_type: data_type, kind: ExprKind::Column { index } }
+    PhysicalExpr {
+        return_type: data_type,
+        kind: ExprKind::Column { index },
+    }
 }
 
 #[test]
@@ -56,7 +62,14 @@ fn typed_arithmetic_evaluates_columns_and_broadcast_literals() {
     };
     let value = evaluate(&expression, &input(), &FunctionRegistry::new()).unwrap();
     let result = value.materialized_array().unwrap();
-    assert_eq!(result.as_any().downcast_ref::<Int64Array>().unwrap().values(), &[6, 7, 8]);
+    assert_eq!(
+        result
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[6, 7, 8]
+    );
 }
 
 #[test]
@@ -74,12 +87,14 @@ fn typed_like_preserves_nulls_and_uses_arrow_vector_kernel() {
     };
     let value = evaluate(&expression, &input(), &FunctionRegistry::new()).unwrap();
     let result = value.materialized_array().unwrap();
-    assert_eq!(result.as_any().downcast_ref::<BooleanArray>().unwrap(),
-        &BooleanArray::from(vec![Some(true), None, Some(true)]));
+    assert_eq!(
+        result.as_any().downcast_ref::<BooleanArray>().unwrap(),
+        &BooleanArray::from(vec![Some(true), None, Some(true)])
+    );
 }
 
 #[test]
-fn typed_column_evaluation_retains_the_input_arrow_array() {
+fn typed_column_evaluation_materializes_a_zero_copy_source_slice() {
     let view = input();
     let source = view.source_arrays_for_column(0).unwrap()[0].clone();
     let expression = column(0, VeinDataType::Int64);
@@ -88,7 +103,12 @@ fn typed_column_evaluation_retains_the_input_arrow_array() {
         panic!("column expressions must preserve the source view")
     };
     let (materialized, report) = column.materialize_with_report().unwrap();
-    assert!(Arc::ptr_eq(&source, &materialized));
+    assert_eq!(
+        source.to_data().buffers()[0].as_ptr(),
+        materialized.to_data().buffers()[0].as_ptr(),
+        "a contiguous view may create an Arrow slice wrapper but must share its value buffer"
+    );
+    assert_eq!(report.shared_columns, 1);
     assert_eq!(report.gathered_columns, 0);
 }
 
@@ -96,7 +116,9 @@ fn replacement_literal(
     _expression: &PhysicalExpr,
     _context: &dyn ExpressionEvaluationContext,
 ) -> common::Result<ExpressionValue> {
-    Ok(ExpressionValue::Scalar(Arc::new(Int64Array::from(vec![42]))))
+    Ok(ExpressionValue::Scalar(Arc::new(Int64Array::from(vec![
+        42,
+    ]))))
 }
 
 #[test]
@@ -117,7 +139,14 @@ fn evaluator_uses_injected_kernel_for_a_typed_expression_node() {
         .expect("registered expression kernel should execute");
 
     let result = value.materialized_array().unwrap();
-    assert_eq!(result.as_any().downcast_ref::<Int64Array>().unwrap().value(0), 42);
+    assert_eq!(
+        result
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        42
+    );
 }
 
 #[test]

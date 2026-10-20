@@ -1,24 +1,23 @@
 use crate::pipeline::{DataChunkView, PipelineNode, Source};
-use arrow::record_batch::RecordBatch;
 use common::Result;
 
-/// An in-memory data source over a single [`RecordBatch`].
+/// An in-memory data source over a single reference-backed view.
 pub struct MemorySource {
-    batch: Option<RecordBatch>,
+    view: Option<DataChunkView>,
 }
 
 impl MemorySource {
-    /// Create a memory source from a single RecordBatch.
-    pub fn new(batch: RecordBatch) -> Self {
-        Self { batch: Some(batch) }
+    /// Create a memory source from a view without changing its row mapping.
+    pub fn new(view: DataChunkView) -> Self {
+        Self { view: Some(view) }
     }
 }
 
 #[async_trait::async_trait]
-impl Source<DataChunkView> for MemorySource {
-    async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunkView>) -> Result<()> {
-        if let Some(batch) = self.batch.take() {
-            next.push(DataChunkView::from_record_batch(batch)?)?;
+impl Source for MemorySource {
+    async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()> {
+        if let Some(view) = self.view.take() {
+            next.push(view)?;
         }
         next.flush()?;
         Ok(())

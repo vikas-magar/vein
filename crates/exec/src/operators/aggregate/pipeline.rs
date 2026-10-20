@@ -2,7 +2,7 @@ use super::*;
 use crate::pipeline::DataChunkView;
 
 type SharedAggregateSink = Arc<Mutex<AggregateSink>>;
-type AggregatePipelineNode = Box<dyn PipelineNode<DataChunkView>>;
+type AggregatePipelineNode = Box<dyn PipelineNode>;
 type SharedAggregate = (SharedAggregateSink, AggregatePipelineNode);
 
 /// Pushes aggregate inputs into the shared state used by the recursive runtime.
@@ -11,7 +11,7 @@ struct AggregateHandle(SharedAggregateSink);
 /// Worker-owned aggregate state, combined into its matching canonical handle.
 struct LocalAggregateHandle(AggregateSink);
 
-impl PipelineNode<DataChunkView> for LocalAggregateHandle {
+impl PipelineNode for LocalAggregateHandle {
     fn push(&mut self, batch: DataChunkView) -> Result<()> {
         self.0.accumulate(batch)
     }
@@ -20,7 +20,7 @@ impl PipelineNode<DataChunkView> for LocalAggregateHandle {
         Ok(())
     }
 
-    fn combine_local(self: Box<Self>, canonical: &mut dyn PipelineNode<DataChunkView>) -> Result<()> {
+    fn combine_local(self: Box<Self>, canonical: &mut dyn PipelineNode) -> Result<()> {
         let target = canonical
             .as_any_mut()
             .downcast_mut::<AggregateHandle>()
@@ -33,7 +33,7 @@ impl PipelineNode<DataChunkView> for LocalAggregateHandle {
     }
 }
 
-impl PipelineNode<DataChunkView> for AggregateHandle {
+impl PipelineNode for AggregateHandle {
     fn push(&mut self, batch: DataChunkView) -> Result<()> {
         let mut sink = self
             .0
@@ -46,7 +46,7 @@ impl PipelineNode<DataChunkView> for AggregateHandle {
         Ok(())
     }
 
-    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
         let sink = self
             .0
             .lock()

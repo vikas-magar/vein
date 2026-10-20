@@ -9,7 +9,6 @@
 //! ordinary Arrow payload arrays are requested only at an explicit boundary.
 
 use arrow::array::{BooleanArray, builder::BooleanBuilder};
-use arrow::record_batch::RecordBatch;
 use std::cmp::Ordering;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -325,25 +324,18 @@ impl RuntimeFilter for JoinBloomFilter {
         true
     }
 
-    fn evaluate(&self, batch: &RecordBatch, column_positions: &[usize]) -> Result<BooleanArray> {
+    fn evaluate(&self, view: &DataChunkView, column_positions: &[usize]) -> Result<BooleanArray> {
         if column_positions.len() != self.columns.len() {
             return Err(VeinError::internal(
                 "runtime filter key positions do not match its declared columns",
             ));
         }
-        let arrays = column_positions
-            .iter()
-            .map(|position| {
-                batch.columns().get(*position).cloned().ok_or_else(|| {
-                    VeinError::internal("runtime filter key position is out of range")
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let keys = ChunkKeys::resolve_arrays(&arrays)?;
-        let mut mask = BooleanBuilder::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
+        let join_keys = JoinKeys::new(column_positions.to_vec());
+        let (keys, _) = ChunkKeys::resolve_view(&join_keys, view)?;
+        let mut mask = BooleanBuilder::with_capacity(view.num_rows());
+        for row in 0..view.num_rows() {
             let may_match = keys
-                .hash_and_single_i64(row, None)?
+                .hash_and_single_i64(row, view)?
                 .is_some_and(|(hash, _)| self.may_contain(hash));
             mask.append_value(may_match);
         }
@@ -429,7 +421,7 @@ impl RuntimeFilter for JoinKeyRangeFilter {
         self.memory.bytes()
     }
 
-    fn evaluate(&self, _batch: &RecordBatch, _column_positions: &[usize]) -> Result<BooleanArray> {
+    fn evaluate(&self, _view: &DataChunkView, _column_positions: &[usize]) -> Result<BooleanArray> {
         Err(VeinError::internal(
             "statistics-only join key range filter cannot evaluate rows",
         ))
@@ -542,7 +534,7 @@ impl HashTable {
         for row in 0..view.num_rows() {
             hashes.push(
                 resolved
-                    .hash_and_single_i64(row, Some(view))?
+                    .hash_and_single_i64(row, view)?
                     .map_or(FNV_OFFSET, |(hash, _)| hash),
             );
         }
@@ -842,7 +834,7 @@ impl HashTable {
         for position in 0..row_count {
             let row = position as u32;
             let Some((hash, _)) = self.keys_by_chunk[chunk_index as usize]
-                .hash_and_single_i64(position as usize, Some(&self.chunks[chunk_index as usize]))?
+                .hash_and_single_i64(position as usize, &self.chunks[chunk_index as usize])?
             else {
                 self.null_keyed.push((chunk_index, row));
                 continue;
@@ -1082,7 +1074,7 @@ impl HashTable {
                 .is_some_and(ChunkKeys::is_single_i64);
         for position in 0..probe.num_rows() {
             let row = position as u32;
-            let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position, Some(probe))?
+            let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position, probe)?
             else {
                 if let Some(rows) = &mut null_probe_rows {
                     rows.push(row);

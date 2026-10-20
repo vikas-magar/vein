@@ -25,7 +25,7 @@ fn scan_leaf(schema: &Arc<types::VeinSchema>) -> Arc<PhysicalPlanNode> {
 }
 
 #[tokio::test]
-async fn scan_join_expression_aggregate_sort_preserve_passthrough_arrays_to_view_sink() {
+async fn scan_join_expression_aggregate_sort_preserve_arrays_to_client_sink() {
     let builder = Arc::new(MultiFileFeedBuilder::new());
     let runner = DefaultTaskExecutor::new(builder.clone());
     let scan_schema = int64_schema();
@@ -114,7 +114,7 @@ async fn scan_join_expression_aggregate_sort_preserve_passthrough_arrays_to_view
     task.plan = plan_with_input(&task, sorted);
 
     let result = runner
-        .execute_views(&task, CancellationToken::new())
+        .execute(&task, CancellationToken::new())
         .await
         .expect("view pipeline should finish");
     assert_eq!(result.row_count, 2);
@@ -122,7 +122,7 @@ async fn scan_join_expression_aggregate_sort_preserve_passthrough_arrays_to_view
     let mut rows = Vec::new();
     for batch in &result.output {
         for row in 0..batch.num_rows() {
-            let (key_array, key_row) = batch.view().resolve(0, row).unwrap().unwrap();
+            let (key_array, key_row) = batch.resolve(0, row).unwrap().unwrap();
             let key_values = key_array.as_any().downcast_ref::<Int64Array>().unwrap();
             assert!(
                 source_arrays
@@ -130,7 +130,7 @@ async fn scan_join_expression_aggregate_sort_preserve_passthrough_arrays_to_view
                     .any(|source| std::ptr::eq(source.as_ref(), key_values)),
                 "group key must still reference a scan array after join, expression, aggregate, and sort"
             );
-            let (sum_array, sum_row) = batch.view().resolve(1, row).unwrap().unwrap();
+            let (sum_array, sum_row) = batch.resolve(1, row).unwrap().unwrap();
             let sum_values = sum_array.as_any().downcast_ref::<Int64Array>().unwrap();
             rows.push((key_values.value(key_row), sum_values.value(sum_row)));
         }

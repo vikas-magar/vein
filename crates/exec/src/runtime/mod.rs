@@ -8,7 +8,6 @@
 //! task end-to-end (see `crate::pipeline`).
 
 use arrow::array::Array;
-use arrow::record_batch::RecordBatch;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -26,7 +25,6 @@ use crate::operators::join::spill::{
     remove_run,
 };
 use crate::operators::join::{BuildSink, HashJoin, HashTable, JoinFilterCollector};
-use crate::operators::sink::ClientOutput;
 use crate::operators::{LimitTransform, SortTransform};
 use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
 use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};

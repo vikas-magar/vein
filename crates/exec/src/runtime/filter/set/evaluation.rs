@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, builder::BooleanBuilder};
-use arrow::record_batch::RecordBatch;
 use common::Result;
 use common::statistics::OperatorCounter;
 use error::VeinError;
 use types::ResolvedColumnRef;
 
 use super::super::contract::RuntimeFilter;
+use crate::pipeline::DataChunkView;
 
 pub(super) const FILTER_ROWS_SEEN: &str = "runtime_filter_rows_seen";
 pub(super) const FILTER_ROWS_KEPT: &str = "runtime_filter_rows_kept";
@@ -41,12 +41,12 @@ impl RuntimeFilterBinding {
 
     /// Evaluate all filters and return one combined selection mask.
     ///
-    /// Only the boolean mask is newly allocated. The input payload arrays are
-    /// borrowed through Arrow's `RecordBatch` and are never gathered or copied.
-    pub fn evaluate(&self, batch: &RecordBatch) -> Result<BooleanArray> {
+    /// Only the boolean mask is newly allocated. The input payload arrays stay
+    /// borrowed through the view's source mappings.
+    pub fn evaluate(&self, view: &DataChunkView) -> Result<BooleanArray> {
         if let [bound] = self.filters.as_slice() {
-            let mask = bound.filter.evaluate(batch, &bound.positions)?;
-            if mask.len() != batch.num_rows() {
+            let mask = bound.filter.evaluate(view, &bound.positions)?;
+            if mask.len() != view.num_rows() {
                 return Err(VeinError::internal(
                     "runtime filter returned a mask with a different row count",
                 ));
@@ -57,7 +57,7 @@ impl RuntimeFilterBinding {
                         .filter(|&row| mask.is_valid(row) && mask.value(row))
                         .count() as u64
                 });
-                self.record_statistics(statistics, batch.num_rows(), rows_kept);
+                self.record_statistics(statistics, view.num_rows(), rows_kept);
             }
             return Ok(mask);
         }
@@ -65,17 +65,17 @@ impl RuntimeFilterBinding {
         let masks = self
             .filters
             .iter()
-            .map(|bound| bound.filter.evaluate(batch, &bound.positions))
+            .map(|bound| bound.filter.evaluate(view, &bound.positions))
             .collect::<Result<Vec<_>>>()?;
-        if masks.iter().any(|mask| mask.len() != batch.num_rows()) {
+        if masks.iter().any(|mask| mask.len() != view.num_rows()) {
             return Err(VeinError::internal(
                 "runtime filter returned a mask with a different row count",
             ));
         }
 
-        let mut output = BooleanBuilder::with_capacity(batch.num_rows());
+        let mut output = BooleanBuilder::with_capacity(view.num_rows());
         let mut rows_kept = 0u64;
-        for row in 0..batch.num_rows() {
+        for row in 0..view.num_rows() {
             let keep = masks
                 .iter()
                 .all(|mask| mask.is_valid(row) && mask.value(row));
@@ -83,7 +83,7 @@ impl RuntimeFilterBinding {
             rows_kept += u64::from(keep);
         }
         if let Some(statistics) = &self.statistics {
-            self.record_statistics(statistics, batch.num_rows(), Some(rows_kept));
+            self.record_statistics(statistics, view.num_rows(), Some(rows_kept));
         }
         Ok(output.finish())
     }

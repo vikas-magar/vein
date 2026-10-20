@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow::record_batch::RecordBatch;
 use common::arrow::SelectionVector;
 use common::protocol::{LimitSpec, SortKey, SortPlan};
 
@@ -11,7 +12,7 @@ use crate::pipeline::DataChunkView;
 #[derive(Clone)]
 struct Collect(Arc<Mutex<Vec<DataChunkView>>>);
 
-impl PipelineNode<DataChunkView> for Collect {
+impl PipelineNode for Collect {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0.lock().unwrap().push(view);
         Ok(())
@@ -1007,6 +1008,7 @@ fn spill_array_reservation_lives_until_the_last_composed_view_is_dropped() {
         false,
     )]));
     let batch = RecordBatch::try_new(schema, vec![source]).expect("spill batch");
+    let batch = crate::pipeline::arrow_adapter::from_record_batch(batch).expect("spill view");
     let input = view_from_spill_batch(batch, &tracker).expect("reference spill arrays");
     assert_eq!(tracker.used(), source_bytes);
 

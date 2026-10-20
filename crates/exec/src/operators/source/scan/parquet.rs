@@ -1,4 +1,4 @@
-use crate::pipeline::{DataChunkView, PipelineNode};
+use crate::pipeline::PipelineNode;
 use crate::expression::eval::ExpressionKernelProvider;
 use crate::runtime::filter::RuntimeFilterSet;
 use crate::udf::FunctionRegistry;
@@ -35,7 +35,6 @@ mod page_pruning;
 mod predicate;
 mod projection;
 mod reader;
-mod selection;
 
 use batch_size::{RowGroupBatchSizePolicy, ScanBatchSizePolicy};
 use file::prepare_parquet_file;
@@ -49,7 +48,6 @@ use page_pruning::{
 use predicate::{AdaptiveFilterOrder, ScanPredicateContext, build_scan_predicates};
 use projection::{dictionary_schema_hint, scan_projection};
 use reader::{IoStats, ParquetFileReader, ParquetIoBackend, thread_cpu_time};
-use selection::{handoff_view, project_batch};
 
 /// Metadata kind under which this format publishes parsed Parquet footers.
 ///
@@ -91,7 +89,7 @@ pub struct ParquetScanRequest<'a> {
 /// Executes a scan over a list of Parquet files
 pub(super) async fn execute_parquet_scan(
     request: ParquetScanRequest<'_>,
-    next: &mut dyn PipelineNode<DataChunkView>,
+    next: &mut dyn PipelineNode,
 ) -> Result<()> {
     let ParquetScanRequest {
         operator,
@@ -938,25 +936,40 @@ pub(super) async fn execute_parquet_scan(
             };
             let batch = batch_result
                 .map_err(|e| VeinError::internal(format!("Parquet read error: {}", e)))?;
+            let view = crate::pipeline::arrow_adapter::from_record_batch(batch)?;
             if batches == 0 {
                 first_batch_us = scan_started.elapsed().as_micros() as u64;
             }
-            total_rows = total_rows.saturating_add(batch.num_rows());
+            total_rows = total_rows.saturating_add(view.num_rows());
             if !has_row_filter {
-                physical_rows_read = physical_rows_read.saturating_add(batch.num_rows());
+                physical_rows_read = physical_rows_read.saturating_add(view.num_rows());
             }
             batches += 1;
 
             if let Some(scan) = statistics_scan {
                 let statistics_started = Instant::now();
-                let statistics_batch = project_batch(&batch, &scan_projection.output_positions)?;
-                let outcome = runtime_statistics.enqueue_batch(
+                let statistics_view = view.project(&scan_projection.output_positions)?;
+                let statistics_schema = statistics_view
+                    .schema()
+                    .cloned()
+                    .ok_or_else(|| VeinError::internal("Parquet statistics view is missing its schema"))?;
+                let retained_bytes = statistics_view
+                    .source_array_memory_sizes()?
+                    .into_iter()
+                    .try_fold(0usize, |total, (_, bytes)| {
+                        total.checked_add(bytes).ok_or_else(|| {
+                            VeinError::internal("runtime statistics retained-byte count overflow")
+                        })
+                    })?;
+                let outcome = runtime_statistics.enqueue_input(
                     scan.scan_id,
                     &scan.table_key,
                     scan.expected_rows,
                     scan.partition_count,
                     scan.row_coverage_candidate,
-                    &statistics_batch,
+                    statistics_schema,
+                    statistics_view,
+                    retained_bytes,
                 );
                 match outcome {
                     common::statistics::runtime::RuntimeStatisticsEnqueue::Queued => {
@@ -976,8 +989,8 @@ pub(super) async fn execute_parquet_scan(
                     .saturating_add(statistics_started.elapsed().as_micros() as u64);
             }
 
-            if batch.num_rows() != 0 {
-                let chunk = handoff_view(batch, &scan_projection.output_positions)?;
+            if view.num_rows() != 0 {
+                let chunk = view.project(&scan_projection.output_positions)?;
                 tracing::trace!(
                     rows = chunk.num_rows(),
                     "Pushing selected batch down pipeline"
@@ -1234,3 +1247,7 @@ mod tests;
 #[cfg(test)]
 #[path = "parquet/runtime_statistics_tests.rs"]
 mod runtime_statistics_tests;
+
+#[cfg(test)]
+#[path = "parquet/selection_tests.rs"]
+mod selection_tests;

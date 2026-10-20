@@ -6,7 +6,7 @@ use crate::pipeline::{DataChunkView, RowMapping, SourceRow, ViewColumn};
 use std::sync::{Arc, Mutex};
 
 struct TestCollector(Arc<Mutex<Vec<u32>>>);
-impl PipelineNode<DataChunkView> for TestCollector {
+impl PipelineNode for TestCollector {
     fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         let mut out = self.0.lock().unwrap();
         for i in 0..chunk.selection().size() {
@@ -76,7 +76,7 @@ fn test_limit_spanning_multiple_chunks() {
 
 struct ViewCollector(Arc<Mutex<Option<DataChunkView>>>, arrow::array::ArrayRef);
 
-impl PipelineNode<DataChunkView> for ViewCollector {
+impl PipelineNode for ViewCollector {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         assert_eq!(view.num_rows(), 1);
         let (array, physical_row) = view.resolve(0, 0)?.expect("selected value");

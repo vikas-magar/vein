@@ -25,7 +25,7 @@ async fn checkpoint_synopses_follow_mapped_rows_null_extensions_and_column_ident
         Arc::new(Int64Array::from(vec![1, 2, 3])),
         Arc::new(Int64Array::from(vec![10, 20, 30])),
     ];
-    let view = DataChunkView::from_record_batch(RecordBatch::try_new(Arc::clone(&arrow), arrays.clone()).unwrap()).unwrap();
+    let view = crate::pipeline::arrow_adapter::from_record_batch(RecordBatch::try_new(Arc::clone(&arrow), arrays.clone()).unwrap()).unwrap();
     let mapped = DataChunkView::combine(&[ViewInputRows {
         view: &view,
         rows: &[Some(2), None, Some(2), Some(0)],
@@ -65,7 +65,7 @@ async fn parallel_checkpoint_statistics_merge_batches_without_copying_arrays() {
     let relation = IntermediateRelation::new(Arc::clone(&arrow), tracker.clone());
     let mut sink = relation.sink();
     for _ in 0..8 {
-        sink.push(DataChunkView::from_record_batch(RecordBatch::try_new(
+        sink.push(crate::pipeline::arrow_adapter::from_record_batch(RecordBatch::try_new(
             Arc::clone(&arrow),
             vec![
                 Arc::new(Int64Array::from(vec![Some(1), Some(2), None, Some(2)])),
@@ -120,7 +120,7 @@ async fn spilled_checkpoint_synopses_cover_the_complete_population() {
     let relation = IntermediateRelation::new(Arc::clone(&arrow),
                                              QueryMemoryTracker::new(0, CancellationToken::new()));
     let mut sink = relation.sink();
-    sink.push(DataChunkView::from_record_batch(RecordBatch::try_new(arrow, vec![
+    sink.push(crate::pipeline::arrow_adapter::from_record_batch(RecordBatch::try_new(arrow, vec![
         Arc::new(Int64Array::from(vec![Some(5), None, Some(8)])),
         Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2)])),
     ]).unwrap()).unwrap()).unwrap();
@@ -139,7 +139,7 @@ async fn cancelled_checkpoint_statistics_stop_without_publishing_partial_results
     let relation = IntermediateRelation::new(Arc::clone(&arrow),
                                              QueryMemoryTracker::new(1 << 20, cancel.clone()));
     let mut sink = relation.sink();
-    sink.push(DataChunkView::from_record_batch(RecordBatch::try_new(arrow, vec![
+    sink.push(crate::pipeline::arrow_adapter::from_record_batch(RecordBatch::try_new(arrow, vec![
         Arc::new(Int64Array::from(vec![1])), Arc::new(Int64Array::from(vec![2])),
     ]).unwrap()).unwrap()).unwrap();
     sink.flush().unwrap();

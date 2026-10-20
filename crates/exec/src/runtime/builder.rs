@@ -2,13 +2,10 @@
 
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
 use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, ExpressionProgram};
 use common::statistics::QueryStatisticsContext;
-use error::VeinError;
-use crate::operators::sink::{CollectSink, ViewResultBatch};
 use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
 use crate::runtime::split_scan_by_file;
 use crate::runtime::filter::{
@@ -62,7 +59,7 @@ pub trait ExecutorBuilder: Send + Sync {
         source: &DataSource,
         task_id: TaskId,
         attempt: u32,
-    ) -> Result<Box<dyn Source<DataChunkView>>>;
+    ) -> Result<Box<dyn Source>>;
 
     /// Build a source with optional execution-local filters.
     ///
@@ -74,7 +71,7 @@ pub trait ExecutorBuilder: Send + Sync {
         task_id: TaskId,
         attempt: u32,
         filters: &RuntimeFilterSet,
-    ) -> Result<Box<dyn Source<DataChunkView>>> {
+    ) -> Result<Box<dyn Source>> {
         let _ = filters;
         self.build_source(source, task_id, attempt)
     }
@@ -90,7 +87,7 @@ pub trait ExecutorBuilder: Send + Sync {
         attempt: u32,
         runtime_filters: Option<&RuntimeFilterSet>,
         _query_statistics: Option<Arc<QueryStatisticsContext>>,
-    ) -> Result<Box<dyn Source<DataChunkView>>> {
+    ) -> Result<Box<dyn Source>> {
         match runtime_filters {
             Some(filters) if !filters.is_empty() => {
                 self.build_source_with_runtime_filters(source, task_id, attempt, filters)
@@ -132,13 +129,13 @@ pub trait ExecutorBuilder: Send + Sync {
     fn build_expression_executor(
         &self,
         program: &Arc<ExpressionProgram>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
-    ) -> Result<Box<dyn Transform<DataChunkView>>>;
+        next: Box<dyn PipelineNode>,
+    ) -> Result<Box<dyn Transform>>;
 
     /// Build a sink from the task's [`DataSink`]. The sink is the terminal
     /// stage; a sink that returns data (e.g. `DataSink::Client`) exposes it via
     /// [`Sink::collect`].
-    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunkView>>>;
+    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink>>;
 
     /// Build a sink that forwards client batches through a bounded output channel.
     ///
@@ -147,31 +144,9 @@ pub trait ExecutorBuilder: Send + Sync {
     fn build_streaming_sink(
         &self,
         sink: &DataSink,
-        output: flume::Sender<RecordBatch>,
-    ) -> Result<Box<dyn Sink<DataChunkView>>> {
+        output: flume::Sender<DataChunkView>,
+    ) -> Result<Box<dyn Sink>> {
         let _ = output;
         self.build_sink(sink)
-    }
-
-    /// Builds an internal client result sink which retains views without gathering.
-    ///
-    /// Storage/discard destinations are rejected because this API returns client
-    /// results. Both collected and streaming view results use the same sink.
-    fn build_view_result_sink(
-        &self,
-        sink: &DataSink,
-        output: Option<flume::Sender<ViewResultBatch>>,
-    ) -> Result<Box<dyn Sink<DataChunkView, ViewResultBatch>>> {
-        let DataSink::Client { schema } = sink else {
-            return Err(VeinError::planning(
-                "view results require a client sink",
-                None,
-            ));
-        };
-        let schema = Arc::new(schema.to_arrow());
-        Ok(Box::new(match output {
-            Some(sender) => CollectSink::with_sender(schema, sender),
-            None => CollectSink::new(schema),
-        }))
     }
 }

@@ -12,7 +12,6 @@ use std::collections::HashMap;
 
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::FileReader;
-use arrow::record_batch::RecordBatch;
 use common::Result;
 use common::identifiers::{IntermediateSourceId, QueryId};
 use error::VeinError;
@@ -276,13 +275,12 @@ impl IntermediateRelation {
         writer: &mut IpcRunWriter<SpillWriteHandle>,
         view: &DataChunkView,
     ) -> Result<()> {
-        let (batch, report) = view.to_record_batch_with_report(Arc::clone(&self.schema))?;
-        writer.write_batch(&batch, "write intermediate relation IPC batch")?;
+        let report = writer.write_view(view, "write intermediate relation IPC batch")?;
         tracing::debug!(
             target: "vein.audit",
             event = "intermediate_checkpoint_batch_spilled",
-            rows = batch.num_rows(),
-            columns = batch.num_columns(),
+            rows = view.num_rows(),
+            columns = view.num_columns(),
             shared_columns = report.shared_columns,
             gathered_columns = report.gathered_columns,
             gathered_output_buffer_bytes = report.gathered_output_buffer_bytes,
@@ -347,7 +345,7 @@ pub struct IntermediateRelationSink {
     rows: u64,
 }
 
-impl PipelineNode<DataChunkView> for IntermediateRelationSink {
+impl PipelineNode for IntermediateRelationSink {
     fn push(&mut self, batch: DataChunkView) -> Result<()> {
         let rows = u64::try_from(batch.num_rows())
             .map_err(|_| VeinError::internal("intermediate relation row count overflow"))?;
@@ -365,7 +363,7 @@ impl PipelineNode<DataChunkView> for IntermediateRelationSink {
     }
 }
 
-impl crate::pipeline::Sink<DataChunkView, RecordBatch> for IntermediateRelationSink {
+impl crate::pipeline::Sink for IntermediateRelationSink {
     fn row_count(&self) -> u64 {
         self.rows
     }
@@ -404,7 +402,7 @@ impl IntermediateRelationSource {
                     VeinError::internal(format!("open intermediate IPC relation: {error}"))
                 })?;
                 for batch in &mut reader {
-                    let batch: RecordBatch = batch.map_err(|error| {
+                    let batch = batch.map_err(|error| {
                         VeinError::internal(format!("read intermediate IPC relation: {error}"))
                     })?;
                     if batch.schema().as_ref() != self.schema.as_ref() {
@@ -412,7 +410,7 @@ impl IntermediateRelationSource {
                             "intermediate IPC relation schema changed while reading",
                         ));
                     }
-                    visit(DataChunkView::from_record_batch(batch)?)?;
+                    visit(crate::pipeline::arrow_adapter::from_record_batch(batch)?)?;
                 }
             }
         }
@@ -421,8 +419,8 @@ impl IntermediateRelationSource {
 }
 
 #[async_trait::async_trait]
-impl Source<DataChunkView> for IntermediateRelationSource {
-    async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunkView>) -> Result<()> {
+impl Source for IntermediateRelationSource {
+    async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()> {
         self.for_each_batch(|view| next.push(view))?;
         next.flush()
     }

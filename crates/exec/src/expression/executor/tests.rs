@@ -17,7 +17,7 @@ use crate::udf::FunctionRegistry;
 #[derive(Clone)]
 struct Capture(Arc<Mutex<Vec<DataChunkView>>>);
 
-impl PipelineNode<DataChunkView> for Capture {
+impl PipelineNode for Capture {
     fn push(&mut self, batch: DataChunkView) -> common::Result<()> {
         self.0.lock().unwrap().push(batch);
         Ok(())
@@ -43,7 +43,7 @@ fn input() -> (DataChunkView, ArrayRef) {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let source: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
     let batch = RecordBatch::try_new(schema, vec![Arc::clone(&source)]).unwrap();
-    (DataChunkView::from_record_batch(batch).unwrap(), source)
+    (crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap(), source)
 }
 
 fn run(program: ExpressionProgram, batch: DataChunkView) -> Vec<DataChunkView> {

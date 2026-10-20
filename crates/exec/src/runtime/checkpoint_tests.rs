@@ -16,7 +16,7 @@ struct ViewCollector {
     batches: Vec<DataChunkView>,
 }
 
-impl PipelineNode<DataChunkView> for ViewCollector {
+impl PipelineNode for ViewCollector {
     fn push(&mut self, batch: DataChunkView) -> common::Result<()> {
         self.batches.push(batch);
         Ok(())
@@ -45,12 +45,14 @@ async fn read_values(relation: &IntermediateRelation) -> Vec<i64> {
         .batches
         .into_iter()
         .flat_map(|view| {
-            let (batch, report) = view
-                .to_record_batch_with_report(Arc::new(Schema::new(vec![Field::new(
+            let (batch, report) = crate::pipeline::arrow_adapter::to_record_batch_with_report(
+                &view,
+                Arc::new(Schema::new(vec![Field::new(
                     "id",
                     DataType::Int64,
                     false,
-                )])))
+                )])),
+            )
                 .expect("materialize test output");
             assert_eq!(report.gathered_columns, 0);
             assert_eq!(report.shared_columns, 1);
@@ -70,7 +72,7 @@ async fn intermediate_source_registry_is_query_scoped_and_registration_owned() {
     let tracker = QueryMemoryTracker::new(1 << 20, CancellationToken::new());
     let relation = IntermediateRelation::new(Arc::clone(&schema), tracker);
     let mut sink = relation.sink();
-    sink.push(DataChunkView::from_record_batch(batch).unwrap())
+    sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap())
         .expect("retain checkpoint arrays");
     sink.flush().expect("seal relation before registering source");
 
@@ -107,7 +109,7 @@ async fn in_memory_checkpoint_retains_shared_arrays_and_replays_views() {
     let relation = IntermediateRelation::new(Arc::clone(&schema), tracker.clone());
     let mut sink = relation.sink();
 
-    sink.push(DataChunkView::from_record_batch(batch.clone()).unwrap())
+    sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch.clone()).unwrap())
         .expect("retain reference-backed batch");
     assert_eq!(
         tracker.used(),
@@ -127,9 +129,9 @@ fn checkpoint_sink_reports_rows_and_seals_as_a_task_sink() {
     let tracker = QueryMemoryTracker::new(1 << 20, CancellationToken::new());
     let relation = IntermediateRelation::new(schema, tracker);
     let mut sink = relation.sink();
-    let sink: &mut dyn Sink<DataChunkView, RecordBatch> = &mut sink;
+    let sink: &mut dyn Sink = &mut sink;
 
-    sink.push(DataChunkView::from_record_batch(batch).unwrap())
+    sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap())
         .expect("retain reference-backed batch");
     assert_eq!(sink.row_count(), 3);
     assert!(sink.collect().is_empty(), "checkpoints are not client batches");
@@ -147,7 +149,7 @@ async fn checkpoint_spills_when_array_retention_exceeds_budget_and_replays_rows(
     let relation = IntermediateRelation::new(Arc::clone(&schema), tracker.clone());
     let mut sink = relation.sink();
 
-    sink.push(DataChunkView::from_record_batch(batch).unwrap())
+    sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap())
         .expect("spill batch when memory budget is exhausted");
     sink.flush().expect("finish spill run");
 
@@ -167,7 +169,7 @@ fn unsealed_checkpoint_cannot_be_read_and_drop_discards_partial_state() {
     let tracker = QueryMemoryTracker::new(1 << 20, CancellationToken::new());
     let relation = IntermediateRelation::new(schema, tracker.clone());
     let mut sink = relation.sink();
-    sink.push(DataChunkView::from_record_batch(batch).unwrap())
+    sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap())
         .expect("retain batch");
 
     assert!(relation.source().is_err());

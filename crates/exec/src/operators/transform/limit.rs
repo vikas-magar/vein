@@ -9,7 +9,7 @@ pub struct LimitTransform {
     count: u64,
     rows_seen: u64,
     rows_emitted: u64,
-    next: Box<dyn PipelineNode<DataChunkView>>,
+    next: Box<dyn PipelineNode>,
 }
 
 impl LimitTransform {
@@ -17,7 +17,7 @@ impl LimitTransform {
     pub fn new(
         offset: u64,
         count: u64,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
     ) -> Self {
         Self {
             offset,
@@ -29,7 +29,7 @@ impl LimitTransform {
     }
 }
 
-impl PipelineNode<DataChunkView> for LimitTransform {
+impl PipelineNode for LimitTransform {
     fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         if self.rows_emitted >= self.count {
             // Maximum rows already reached; drop further pushes
@@ -80,7 +80,7 @@ impl PipelineNode<DataChunkView> for LimitTransform {
     }
 }
 
-impl Transform<DataChunkView> for LimitTransform {}
+impl Transform for LimitTransform {}
 
 #[cfg(test)]
 mod tests;

@@ -1,26 +1,21 @@
 //! Replaceable execution boundary for Parquet scan implementations.
 
-use crate::pipeline::{DataChunkView, PipelineNode};
+use crate::pipeline::PipelineNode;
 use common::Result;
 
 use super::parquet::ParquetScanRequest;
 
 /// Executes one Parquet scan into the engine's reference-backed pipeline.
 ///
-/// Implementations own format-specific decode and pruning. The associated
-/// batch type keeps the interface reusable, while `ScanSource` selects the
-/// `DataChunkView` implementation so readers can retain row selections and
-/// Arrow buffers across the scan boundary.
+/// Implementations own format-specific decode and pruning, and emit the
+/// canonical `DataChunkView` so row selections and Arrow buffers remain shared.
 #[async_trait::async_trait]
 pub trait ParquetScanReader: Send + Sync {
-    /// Batch representation delivered to the downstream pipeline.
-    type Batch: 'static;
-
-    /// Reads the scan request and pushes batches to the next pipeline node.
+    /// Reads the scan request and pushes views to the next pipeline node.
     async fn execute(
         &self,
         request: ParquetScanRequest<'_>,
-        next: &mut dyn PipelineNode<Self::Batch>,
+        next: &mut dyn PipelineNode,
     ) -> Result<()>;
 }
 
@@ -30,12 +25,10 @@ pub struct ArrowParquetScanReader;
 
 #[async_trait::async_trait]
 impl ParquetScanReader for ArrowParquetScanReader {
-    type Batch = DataChunkView;
-
     async fn execute(
         &self,
         request: ParquetScanRequest<'_>,
-        next: &mut dyn PipelineNode<Self::Batch>,
+        next: &mut dyn PipelineNode,
     ) -> Result<()> {
         super::parquet::execute_parquet_scan(request, next).await
     }

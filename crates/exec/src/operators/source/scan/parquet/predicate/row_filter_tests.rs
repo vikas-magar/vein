@@ -11,6 +11,7 @@ use types::{ColumnId, LogicalLiteral, ResolvedColumn, VeinDataType, VeinSchema};
 
 use crate::expression::eval::{ExpressionKernelProvider, ExpressionKernelRegistry};
 use crate::operators::source::scan::parquet::metrics::ScanPredicateMetrics;
+use crate::pipeline::DataChunkView;
 use crate::runtime::filter::{RuntimeFilter, RuntimeFilterSet};
 use crate::udf::FunctionRegistry;
 
@@ -37,20 +38,25 @@ impl RuntimeFilter for KeepColumnValue {
 
     fn evaluate(
         &self,
-        batch: &RecordBatch,
+        view: &DataChunkView,
         column_positions: &[usize],
     ) -> common::Result<BooleanArray> {
         let [position] = column_positions else {
             return Err(error::VeinError::internal("test filter expects one key"));
         };
-        let values = batch
-            .column(*position)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| error::VeinError::internal("test filter key must be Int64"))?;
-        let mut output = BooleanBuilder::with_capacity(batch.num_rows());
-        for value in values.iter() {
-            output.append_value(value == Some(self.expected));
+        let mut output = BooleanBuilder::with_capacity(view.num_rows());
+        for row in 0..view.num_rows() {
+            let matches = match view.resolve(*position, row)? {
+                Some((array, index)) => {
+                    let values = array
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| error::VeinError::internal("test filter key must be Int64"))?;
+                    values.is_valid(index) && values.value(index) == self.expected
+                }
+                None => false,
+            };
+            output.append_value(matches);
         }
         Ok(output.finish())
     }

@@ -3,7 +3,6 @@
 use std::sync::{Arc, Mutex};
 
 use arrow::ipc::reader::StreamReader;
-use arrow::record_batch::RecordBatch;
 use common::Result;
 use common::protocol::StorageTarget;
 use error::VeinError;
@@ -23,8 +22,9 @@ pub struct WriteReceipt {
 
 /// One staged, incremental table write.
 pub trait WriteTransaction: Send {
-    /// Append one selected Arrow batch to the staged write.
-    fn write_batch(&mut self, batch: &RecordBatch) -> Result<()>;
+    /// Append one selected view. The backend owns any conversion required by
+    /// its storage format and reports materialization performed at that edge.
+    fn write_view(&mut self, view: &DataChunkView) -> Result<MaterializationReport>;
     /// Atomically publish the staged write and return its committed receipt.
     fn commit(self: Box<Self>) -> Result<WriteReceipt>;
 }
@@ -46,7 +46,7 @@ pub struct WriteSink {
     transaction: Option<Mutex<Box<dyn WriteTransaction>>>,
     rows_written: u64,
     batches_written: u64,
-    conversion_us: u64,
+    write_us: u64,
     materialization: MaterializationReport,
     receipt: Option<WriteReceipt>,
 }
@@ -73,17 +73,13 @@ impl WriteSink {
             transaction: Some(Mutex::new(transaction)),
             rows_written: 0,
             batches_written: 0,
-            conversion_us: 0,
+            write_us: 0,
             materialization: MaterializationReport::default(),
             receipt: None,
         })
     }
 
-    fn materialize(&self, view: &DataChunkView) -> Result<Option<(RecordBatch, MaterializationReport)>> {
-        let selected = view.num_rows();
-        if selected == 0 {
-            return Ok(None);
-        }
+    fn validate_view(&self, view: &DataChunkView) -> Result<()> {
         if view.num_columns() != self.expected_schema.fields().len() {
             return Err(VeinError::internal(format!(
                 "WRITE received {} columns, expected {}",
@@ -91,28 +87,28 @@ impl WriteSink {
             )));
         }
         view.validate_schema(&self.expected_schema)?;
-        view.to_record_batch_with_report(self.expected_schema.clone())
-            .map(Some)
+        Ok(())
     }
 }
 
-impl PipelineNode<DataChunkView> for WriteSink {
+impl PipelineNode for WriteSink {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
-        let started = Instant::now();
-        let Some((batch, report)) = self.materialize(&view)? else {
+        if view.is_empty() {
             return Ok(());
-        };
-        let rows_written = self.rows_written.checked_add(batch.num_rows() as u64)
+        }
+        self.validate_view(&view)?;
+        let rows_written = self.rows_written.checked_add(view.num_rows() as u64)
             .ok_or_else(|| VeinError::internal("storage row count overflow"))?;
-        self.transaction.as_ref()
+        let started = Instant::now();
+        let report = self.transaction.as_ref()
             .ok_or_else(|| VeinError::internal("storage transaction already completed"))?
             .lock()
             .map_err(|_| VeinError::internal("storage transaction mutex poisoned"))?
-            .write_batch(&batch)?;
+            .write_view(&view)?;
         self.rows_written = rows_written;
         self.batches_written = self.batches_written.saturating_add(1);
-        self.conversion_us = self
-            .conversion_us
+        self.write_us = self
+            .write_us
             .saturating_add(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
         self.materialization.accumulate(report);
         Ok(())
@@ -135,14 +131,14 @@ impl PipelineNode<DataChunkView> for WriteSink {
             gathered_columns = self.materialization.gathered_columns,
             empty_columns = self.materialization.empty_columns,
             gathered_output_buffer_bytes = self.materialization.gathered_output_buffer_bytes,
-            conversion_us = self.conversion_us,
+            write_us = self.write_us,
             "storage_write_finished"
         );
         Ok(())
     }
 }
 
-impl Sink<DataChunkView> for WriteSink {
+impl Sink for WriteSink {
     fn row_count(&self) -> u64 {
         self.rows_written
     }

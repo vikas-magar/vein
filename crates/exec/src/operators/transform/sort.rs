@@ -2,7 +2,6 @@
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::ipc::reader::FileReader;
-use arrow::record_batch::RecordBatch;
 use common::Result;
 use common::protocol::{LimitSpec, SortPlan};
 use error::VeinError;
@@ -173,7 +172,7 @@ pub struct SortTransform {
     spill_runs: Vec<SpillRun>,
     spill_schema: Option<SchemaRef>,
     spilling: bool,
-    next: Box<dyn PipelineNode<DataChunkView>>,
+    next: Box<dyn PipelineNode>,
 }
 
 #[derive(Default)]
@@ -200,7 +199,7 @@ struct SortMetrics {
 
 impl SortTransform {
     /// Create a global sort boundary for one task's input stream.
-    pub fn new(plan: SortPlan, next: Box<dyn PipelineNode<DataChunkView>>) -> Self {
+    pub fn new(plan: SortPlan, next: Box<dyn PipelineNode>) -> Self {
         Self::with_output_columns(plan, None, next)
     }
 
@@ -208,7 +207,7 @@ impl SortTransform {
     pub fn with_output_columns(
         plan: SortPlan,
         output_columns: Option<usize>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
     ) -> Self {
         Self::with_limit(plan, output_columns, None, next)
     }
@@ -219,7 +218,7 @@ impl SortTransform {
         plan: SortPlan,
         output_columns: Option<usize>,
         limit: Option<LimitSpec>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
     ) -> Self {
         Self::with_limit_and_memory_tracker(
             plan,
@@ -236,7 +235,7 @@ impl SortTransform {
         plan: SortPlan,
         output_columns: Option<usize>,
         tracker: QueryMemoryTracker,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
     ) -> Result<Self> {
         Self::with_limit_and_memory_tracker(plan, output_columns, None, tracker, next)
     }
@@ -246,7 +245,7 @@ impl SortTransform {
         output_columns: Option<usize>,
         limit: Option<LimitSpec>,
         tracker: QueryMemoryTracker,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
     ) -> Result<Self> {
         let candidate_limit = limit.map(|limit| {
             if limit.count == 0 {
@@ -507,10 +506,8 @@ impl SortTransform {
                 let row_refs = rows.iter().map(|row| (0, *row)).collect::<Vec<_>>();
                 let sorted_view =
                     DataChunkView::compose_rows(&[view], &row_refs, view.num_columns())?;
-                let (batch, report) =
-                    sorted_view.to_record_batch_with_report(Arc::clone(&schema))?;
+                let report = writer.write_view(&sorted_view, "write sort spill batch")?;
                 self.metrics.key_materialization.accumulate(report);
-                writer.write_batch(&batch, "write sort spill batch")?;
             }
             let output = writer.finish("finish sort spill run")?;
             let run = pending.commit(output)?;
@@ -545,9 +542,9 @@ impl SortTransform {
             &self.tracker,
             &mut self.metrics,
             |view| {
-                let (batch, _) =
-                    view.to_record_batch_with_report(Arc::clone(&schema))?;
-                writer.write_batch(&batch, "write merged sort batch")
+                writer
+                    .write_view(&view, "write merged sort batch")
+                    .map(|_| ())
             },
         )?;
         let output = writer.finish("finish merged sort run")?;
@@ -777,10 +774,10 @@ struct SpillMergeCursor {
 }
 
 fn view_from_spill_batch(
-    batch: RecordBatch,
+    batch: DataChunkView,
     tracker: &QueryMemoryTracker,
 ) -> Result<DataChunkView> {
-    let mut view = DataChunkView::from_record_batch(batch)?;
+    let mut view = batch;
     let leases = view
         .source_array_memory_sizes()?
         .into_iter()
@@ -839,6 +836,8 @@ fn merge_spill_group(
             .transpose()
             .map_err(|error| VeinError::internal(format!("decode sort spill batch: {error}")))?;
         let view = batch
+            .map(crate::pipeline::arrow_adapter::from_record_batch)
+            .transpose()?
             .map(|batch| view_from_spill_batch(batch, tracker))
             .transpose()?;
         if first_view.is_none() {
@@ -919,6 +918,7 @@ fn merge_spill_group(
             })?;
             if let Some(batch) = batch {
                 ordering.clear_cache();
+                let batch = crate::pipeline::arrow_adapter::from_record_batch(batch)?;
                 cursor.view = view_from_spill_batch(batch, tracker)?;
                 cursor.row = 0;
                 cursor.snapshot = snapshots.len();
@@ -976,7 +976,7 @@ fn compare_spill_rows(
         .map(|ordering| ordering.then_with(|| left.chunk.cmp(&right.chunk)).then_with(|| left.row.cmp(&right.row)))
 }
 
-impl PipelineNode<DataChunkView> for SortTransform {
+impl PipelineNode for SortTransform {
     fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         if self.top_n.is_some() {
             self.push_top_n(chunk)
@@ -1078,7 +1078,7 @@ impl PipelineNode<DataChunkView> for SortTransform {
     }
 }
 
-impl Transform<DataChunkView> for SortTransform {}
+impl Transform for SortTransform {}
 
 #[cfg(test)]
 mod tests;

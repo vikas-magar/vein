@@ -195,7 +195,7 @@ pub(crate) enum BuildResult {
     },
 }
 
-impl PipelineNode<DataChunkView> for BuildSink {
+impl PipelineNode for BuildSink {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.rows += view.num_rows() as u64;
         let started = Instant::now();

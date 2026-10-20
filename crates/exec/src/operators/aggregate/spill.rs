@@ -15,14 +15,15 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use arrow::ipc::reader::FileReader;
-use arrow::record_batch::RecordBatch;
 use common::Result;
+use common::arrow::SelectionVector;
 use error::VeinError;
 use types::VeinDataType;
 
-use crate::memory::{MemoryReservation, QueryMemoryTracker};
-use crate::spill::{IpcRunOutput, IpcRunWriter, SpillRun};
 use super::intermediate::{AggregateGroupKeyRef, AggregateIntermediateGroup};
+use crate::memory::{MemoryReservation, QueryMemoryTracker};
+use crate::pipeline::DataChunkView;
+use crate::spill::{IpcRunOutput, IpcRunWriter, SpillRun};
 
 const FORMAT_METADATA_KEY: &str = "vein.aggregate.spill.format";
 const FORMAT_METADATA_VALUE: &str = "2";
@@ -64,9 +65,16 @@ impl AggregateSpillSchema {
         fields.push(Field::new(STATE_FIELD, DataType::Binary, false));
 
         let mut metadata = HashMap::new();
-        metadata.insert(FORMAT_METADATA_KEY.to_owned(), FORMAT_METADATA_VALUE.to_owned());
+        metadata.insert(
+            FORMAT_METADATA_KEY.to_owned(),
+            FORMAT_METADATA_VALUE.to_owned(),
+        );
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
-        Ok(Self { key_types, grouping_sets, schema })
+        Ok(Self {
+            key_types,
+            grouping_sets,
+            schema,
+        })
     }
 
     /// Writes groups incrementally as a versioned Arrow IPC run.
@@ -77,7 +85,7 @@ impl AggregateSpillSchema {
     pub(super) fn write_run<W, I>(&self, output: W, groups: I) -> Result<W>
     where
         W: IpcRunOutput,
-        I: IntoIterator<Item=AggregateIntermediateGroup>,
+        I: IntoIterator<Item = AggregateIntermediateGroup>,
     {
         let mut writer = AggregateSpillWriter::new(self, output)?;
         for group in groups {
@@ -116,7 +124,9 @@ impl AggregateSpillSchema {
         bit: u32,
     ) -> Result<[Option<SpillRun>; 2]> {
         if bit >= u64::BITS {
-            return Err(VeinError::internal("aggregate spill partition bit is out of range"));
+            return Err(VeinError::internal(
+                "aggregate spill partition bit is out of range",
+            ));
         }
         tracker.check_cancelled()?;
         let manager = tracker.spill_manager();
@@ -148,10 +158,7 @@ impl AggregateSpillSchema {
         let one_output = one.finish()?;
         let zero_run = zero_pending.commit(zero_output)?;
         let one_run = one_pending.commit(one_output)?;
-        Ok([
-            has_zero.then_some(zero_run),
-            has_one.then_some(one_run),
-        ])
+        Ok([has_zero.then_some(zero_run), has_one.then_some(one_run)])
     }
 
     /// Opens a run after validating its complete schema and format version.
@@ -163,10 +170,13 @@ impl AggregateSpillSchema {
                 "aggregate IPC run schema does not match the active aggregate plan",
             ));
         }
-        Ok(AggregateSpillReader { reader, layout: self.clone() })
+        Ok(AggregateSpillReader {
+            reader,
+            layout: self.clone(),
+        })
     }
 
-    fn encode_batch(&self, groups: &[AggregateIntermediateGroup]) -> Result<RecordBatch> {
+    fn encode_batch(&self, groups: &[AggregateIntermediateGroup]) -> Result<DataChunkView> {
         let mut grouping_set_ids = Vec::with_capacity(groups.len());
         let mut hashes = Vec::with_capacity(groups.len());
         let mut key_builders = self
@@ -178,9 +188,12 @@ impl AggregateSpillSchema {
         let mut state_bytes = 0_usize;
 
         for group in groups {
-            let grouping_set = self.grouping_sets.get(group.grouping_set_id).ok_or_else(|| {
-                VeinError::internal("aggregate spill group has an invalid grouping-set ID")
-            })?;
+            let grouping_set = self
+                .grouping_sets
+                .get(group.grouping_set_id)
+                .ok_or_else(|| {
+                    VeinError::internal("aggregate spill group has an invalid grouping-set ID")
+                })?;
             if group.keys.len() != self.key_types.len() {
                 return Err(VeinError::internal(
                     "aggregate spill group key count does not match its schema",
@@ -219,7 +232,9 @@ impl AggregateSpillSchema {
                 .checked_add(payload.len())
                 .filter(|&size| size <= i32::MAX as usize)
                 .ok_or_else(|| {
-                    VeinError::internal("aggregate spill batch exceeds Arrow Binary offset capacity")
+                    VeinError::internal(
+                        "aggregate spill batch exceeds Arrow Binary offset capacity",
+                    )
                 })?;
             states.append_value(payload);
         }
@@ -231,31 +246,41 @@ impl AggregateSpillSchema {
             columns.push(builder.finish()?);
         }
         columns.push(Arc::new(states.finish()) as ArrayRef);
-        RecordBatch::try_new(Arc::clone(&self.schema), columns)
-            .map_err(|error| spill_error("build aggregate spill batch", error))
+        DataChunkView::from_arrays(
+            columns,
+            groups.len(),
+            SelectionVector::new_dense(groups.len()),
+        )?
+        .with_schema(Arc::clone(&self.schema))
     }
 
-    fn decode_batch(&self, batch: RecordBatch) -> Result<Vec<AggregateIntermediateGroup>> {
-        if batch.schema().as_ref() != self.schema.as_ref() {
+    fn decode_batch(&self, batch: &DataChunkView) -> Result<Vec<AggregateIntermediateGroup>> {
+        if !batch
+            .schema()
+            .is_some_and(|schema| schema.as_ref() == self.schema.as_ref())
+        {
             return Err(VeinError::internal(
                 "aggregate IPC batch schema changed within a run",
             ));
         }
-        let grouping_set_ids = batch
-            .column(0)
+        let grouping_set_array = batch.materialize_column(0)?;
+        let grouping_set_ids = grouping_set_array
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| VeinError::internal("invalid aggregate spill grouping-set column"))?;
-        let hashes = batch
-            .column(1)
+        let hash_array = batch.materialize_column(1)?;
+        let hashes = hash_array
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| VeinError::internal("invalid aggregate spill hash column"))?;
-        let state_payloads = batch
-            .column(self.key_types.len() + 2)
+        let state_array = batch.materialize_column(self.key_types.len() + 2)?;
+        let state_payloads = state_array
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| VeinError::internal("invalid aggregate spill state column"))?;
+        let key_arrays = (0..self.key_types.len())
+            .map(|index| batch.materialize_column(index + 2))
+            .collect::<Result<Vec<_>>>()?;
 
         let mut groups = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
@@ -264,18 +289,16 @@ impl AggregateSpillSchema {
                     "aggregate spill metadata columns cannot contain NULL",
                 ));
             }
-            let grouping_set_id = usize::try_from(grouping_set_ids.value(row))
-                .map_err(|_| VeinError::internal("aggregate spill grouping-set ID overflows usize"))?;
+            let grouping_set_id = usize::try_from(grouping_set_ids.value(row)).map_err(|_| {
+                VeinError::internal("aggregate spill grouping-set ID overflows usize")
+            })?;
             let grouping_set = self.grouping_sets.get(grouping_set_id).ok_or_else(|| {
                 VeinError::internal("aggregate spill record has an invalid grouping-set ID")
             })?;
             let keys = (0..self.key_types.len())
                 .map(|key_index| {
                     if grouping_set.contains(&key_index) {
-                        AggregateGroupKeyRef::from_array(
-                            Arc::clone(batch.column(key_index + 2)),
-                            row,
-                        )
+                        AggregateGroupKeyRef::from_array(Arc::clone(&key_arrays[key_index]), row)
                             .map(Some)
                     } else {
                         Ok(None)
@@ -296,7 +319,7 @@ impl AggregateSpillSchema {
 
     fn reserve_decoded_batch(
         &self,
-        batch: &RecordBatch,
+        batch: &DataChunkView,
         tracker: &QueryMemoryTracker,
     ) -> Result<(MemoryReservation, Vec<Arc<MemoryReservation>>)> {
         let mut identities = HashSet::with_capacity(batch.num_columns());
@@ -304,20 +327,24 @@ impl AggregateSpillSchema {
         let mut workspace_bytes = 0_usize;
         let first_key = 2;
         let end_key = first_key + self.key_types.len();
-        for (column, array) in batch.columns().iter().enumerate() {
-            if (first_key..end_key).contains(&column) {
-                let identity = Arc::as_ptr(array) as *const () as usize;
-                if identities.insert(identity) {
-                    key_leases.push(tracker.lease_retained_array(
-                        identity,
-                        array.get_array_memory_size(),
-                        "aggregate retained spill keys",
-                    )?);
+        for column in 0..batch.num_columns() {
+            for array in batch.source_arrays_for_column(column)? {
+                if (first_key..end_key).contains(&column) {
+                    let identity = Arc::as_ptr(array) as *const () as usize;
+                    if identities.insert(identity) {
+                        key_leases.push(tracker.lease_retained_array(
+                            identity,
+                            array.get_array_memory_size(),
+                            "aggregate retained spill keys",
+                        )?);
+                    }
+                } else {
+                    workspace_bytes = workspace_bytes
+                        .checked_add(array.get_array_memory_size())
+                        .ok_or_else(|| {
+                            VeinError::internal("aggregate spill workspace size overflow")
+                        })?;
                 }
-            } else {
-                workspace_bytes = workspace_bytes
-                    .checked_add(array.get_array_memory_size())
-                    .ok_or_else(|| VeinError::internal("aggregate spill workspace size overflow"))?;
             }
         }
         let workspace = tracker.reserve(workspace_bytes, "aggregate spill decode workspace")?;
@@ -356,7 +383,7 @@ impl<'a, W: IpcRunOutput> AggregateSpillWriter<'a, W> {
         }
         let encoded = self.layout.encode_batch(&self.pending)?;
         self.writer
-            .write_batch(&encoded, "write aggregate IPC batch")?;
+            .write_view(&encoded, "write aggregate IPC batch")?;
         self.pending.clear();
         Ok(())
     }
@@ -385,7 +412,10 @@ impl<R: Read + Seek> AggregateSpillReader<R> {
     #[cfg(test)]
     pub(super) fn next_batch(&mut self) -> Result<Option<Vec<AggregateIntermediateGroup>>> {
         match self.reader.next() {
-            Some(Ok(batch)) => self.layout.decode_batch(batch).map(Some),
+            Some(Ok(batch)) => {
+                let view = crate::pipeline::arrow_adapter::from_record_batch(batch)?;
+                self.layout.decode_batch(&view).map(Some)
+            }
             Some(Err(error)) => Err(spill_error("read aggregate IPC batch", error)),
             None => Ok(None),
         }
@@ -397,9 +427,9 @@ impl<R: Read + Seek> AggregateSpillReader<R> {
     ) -> Result<Option<AggregateSpillBatch>> {
         match self.reader.next() {
             Some(Ok(batch)) => {
-                let (workspace, key_leases) =
-                    self.layout.reserve_decoded_batch(&batch, tracker)?;
-                let groups = self.layout.decode_batch(batch)?;
+                let batch = crate::pipeline::arrow_adapter::from_record_batch(batch)?;
+                let (workspace, key_leases) = self.layout.reserve_decoded_batch(&batch, tracker)?;
+                let groups = self.layout.decode_batch(&batch)?;
                 drop(workspace);
                 Ok(Some(AggregateSpillBatch {
                     groups,
@@ -527,8 +557,7 @@ fn key_builder(data_type: &VeinDataType, capacity: usize) -> Result<Box<dyn Spil
         ($native:ty) => {
             Box::new(PrimitiveKeyColumnBuilder::<$native>(
                 PrimitiveBuilder::with_capacity(capacity),
-            ))
-                as Box<dyn SpillKeyBuilder>
+            )) as Box<dyn SpillKeyBuilder>
         };
     }
 
@@ -600,9 +629,12 @@ mod tests {
     fn managed_run(
         layout: &AggregateSpillSchema,
         tracker: &QueryMemoryTracker,
-        groups: impl IntoIterator<Item=AggregateIntermediateGroup>,
+        groups: impl IntoIterator<Item = AggregateIntermediateGroup>,
     ) -> SpillRun {
-        let mut pending = tracker.spill_manager().create_run().expect("create managed run");
+        let mut pending = tracker
+            .spill_manager()
+            .create_run()
+            .expect("create managed run");
         let output = layout
             .write_run(pending.writer().expect("managed run writer"), groups)
             .expect("write managed run");
@@ -611,15 +643,15 @@ mod tests {
 
     #[test]
     fn aggregate_ipc_run_round_trips_typed_keys_nulls_grouping_sets_and_states() {
-        let layout = AggregateSpillSchema::try_new(
-            vec![VeinDataType::Int64],
-            vec![vec![0], vec![]],
-        )
-            .expect("create typed aggregate spill schema");
+        let layout =
+            AggregateSpillSchema::try_new(vec![VeinDataType::Int64], vec![vec![0], vec![]])
+                .expect("create typed aggregate spill schema");
         let key: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(17)]));
-        let groups = [sample_group(0, Some((Arc::clone(&key), 0)), 2),
+        let groups = [
+            sample_group(0, Some((Arc::clone(&key), 0)), 2),
             sample_group(0, Some((Arc::clone(&key), 1)), 5),
-            sample_group(1, None, 7)];
+            sample_group(1, None, 7),
+        ];
         let mut bytes = Cursor::new(Vec::new());
         layout
             .write_run(&mut bytes, groups.iter().cloned())
@@ -628,7 +660,10 @@ mod tests {
         let mut reader = layout
             .open_reader(Cursor::new(bytes.into_inner()))
             .expect("validate and open IPC run");
-        let restored = reader.next_batch().expect("read IPC batch").expect("run batch");
+        let restored = reader
+            .next_batch()
+            .expect("read IPC batch")
+            .expect("run batch");
         assert_eq!(restored.len(), 3);
         assert_eq!(restored[0].hash, 2);
         assert_eq!(restored[1].hash, 5);
@@ -646,10 +681,20 @@ mod tests {
             .source_row()
             .expect("resolve ordinary key")
             .expect("ordinary key has a source row");
-        assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().value(row), 17);
+        assert_eq!(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row),
+            17
+        );
         assert_eq!(restored[0].grouping_set_id, 0);
         assert_eq!(restored[2].grouping_set_id, 1);
-        assert!(restored[2].keys[0].is_none(), "omitted grouping key stays absent");
+        assert!(
+            restored[2].keys[0].is_none(),
+            "omitted grouping key stays absent"
+        );
         assert_eq!(restored[2].aggregate_states.len(), 1);
         assert!(reader.next_batch().expect("end of run").is_none());
     }
@@ -705,16 +750,13 @@ mod tests {
         use arrow::array::{DictionaryArray, Int32Array};
         use arrow::datatypes::Int32Type;
 
-        let layout = AggregateSpillSchema::try_new(
-            vec![VeinDataType::Utf8],
-            vec![vec![0]],
-        )
+        let layout = AggregateSpillSchema::try_new(vec![VeinDataType::Utf8], vec![vec![0]])
             .expect("create UTF-8 spill schema");
         let dict = DictionaryArray::<Int32Type>::try_new(
             Int32Array::from(vec![Some(0), Some(1)]),
             Arc::new(StringArray::from(vec!["alpha", "beta"])),
         )
-            .expect("dictionary source key");
+        .expect("dictionary source key");
         let key: ArrayRef = Arc::new(dict);
         let groups = [sample_group(0, Some((key, 1)), 1)];
         let mut bytes = Cursor::new(Vec::new());
@@ -730,7 +772,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(array.data_type(), &DataType::Utf8);
-        assert_eq!(array.as_any().downcast_ref::<StringArray>().unwrap().value(row), "beta");
+        assert_eq!(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row),
+            "beta"
+        );
     }
 
     #[test]
@@ -761,7 +810,7 @@ mod tests {
                     Arc::new(StringArray::from(vec!["wrong type"])) as ArrayRef,
                     0,
                 )
-                    .expect("valid mismatched key row"),
+                .expect("valid mismatched key row"),
             )],
             aggregate_states: vec![AggregateIntermediateState::Count(1)],
         };
@@ -791,13 +840,21 @@ mod tests {
             )
         });
         let mut bytes = Cursor::new(Vec::new());
-        layout.write_run(&mut bytes, groups).expect("write streamed run");
+        layout
+            .write_run(&mut bytes, groups)
+            .expect("write streamed run");
 
         let mut reader = layout
             .open_reader(Cursor::new(bytes.into_inner()))
             .expect("open streamed run");
-        let first = reader.next_batch().expect("read first batch").expect("first batch");
-        let second = reader.next_batch().expect("read second batch").expect("second batch");
+        let first = reader
+            .next_batch()
+            .expect("read first batch")
+            .expect("first batch");
+        let second = reader
+            .next_batch()
+            .expect("read second batch")
+            .expect("second batch");
         assert_eq!(first.len(), SPILL_RECORD_BATCH_SIZE);
         assert_eq!(second.len(), 1);
         assert!(matches!(
@@ -826,15 +883,14 @@ mod tests {
             .partition_runs(std::slice::from_ref(&source), &tracker, 0)
             .expect("partition by low hash bit");
 
-        assert!(manager.exists(&source), "source remains live until caller commits replacement");
+        assert!(
+            manager.exists(&source),
+            "source remains live until caller commits replacement"
+        );
         drop(source);
         assert_eq!(
             tracker.spill_bytes_used(),
-            children
-                .iter()
-                .flatten()
-                .map(SpillRun::bytes)
-                .sum::<u64>()
+            children.iter().flatten().map(SpillRun::bytes).sum::<u64>()
         );
         let hashes = children
             .into_iter()
@@ -907,11 +963,17 @@ mod tests {
             layout.partition_runs(std::slice::from_ref(&source), &tracker, 0),
             Err(VeinError::Cancelled)
         ));
-        assert!(manager.exists(&source), "failed partition leaves source data intact");
+        assert!(
+            manager.exists(&source),
+            "failed partition leaves source data intact"
+        );
 
         drop(source);
         drop(tracker);
         drop(manager);
-        assert!(!directory.exists(), "query cleanup removes runs after cancellation");
+        assert!(
+            !directory.exists(),
+            "query cleanup removes runs after cancellation"
+        );
     }
 }

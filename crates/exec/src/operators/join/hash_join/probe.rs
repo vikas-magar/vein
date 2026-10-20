@@ -29,14 +29,14 @@ pub struct HashJoin {
     output_columns: Vec<ViewColumnRef>,
     probe_types: Vec<DataType>,
     build_types: Vec<DataType>,
-    next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
     /// Coalesces matches across retained build chunks into bounded views.
     output_composer: JoinOutputComposer,
     output_batch: Vec<OutputRow>,
     probe_rows: Vec<Option<usize>>,
     build_rows: Vec<Option<usize>>,
     residual_view_columns: Vec<ViewColumnRef>,
-    residual_transform: Option<Box<dyn Transform<DataChunkView>>>,
+    residual_transform: Option<Box<dyn Transform>>,
     residual_output: Option<JoinFilterCollector>,
     /// The build rows this task consumed, for the flavours that owe unmatched
     /// ones. Kept here, not in the table, because the table is shared.
@@ -85,7 +85,7 @@ impl HashJoin {
         columns: Vec<OutputColumn>,
         probe_types: Vec<DataType>,
         build_types: Vec<DataType>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
     ) -> Self {
         let output_columns = view_column_refs(&columns);
         let output_composer = JoinOutputComposer::new(&output_columns, &build_types);
@@ -128,7 +128,7 @@ impl HashJoin {
     pub fn with_residual_filter(
         mut self,
         columns: Vec<OutputColumn>,
-        transform: Box<dyn Transform<DataChunkView>>,
+        transform: Box<dyn Transform>,
         output: JoinFilterCollector,
     ) -> Self {
         self.residual_view_columns = view_column_refs(&columns);
@@ -365,7 +365,7 @@ impl HashJoin {
     }
 }
 
-impl PipelineNode<DataChunkView> for HashJoin {
+impl PipelineNode for HashJoin {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.probe(view)
     }
@@ -414,7 +414,7 @@ impl PipelineNode<DataChunkView> for HashJoin {
         self.next.finished()
     }
 
-    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
         // Right/full joins must account for build rows matched by every probe
         // worker. Residual transform state is task-local and is not reconstructed
         // from the immutable build table, so those plans retain the serial path.
@@ -447,7 +447,7 @@ impl PipelineNode<DataChunkView> for HashJoin {
 
     fn combine_local(
         self: Box<Self>,
-        canonical: &mut dyn PipelineNode<DataChunkView>,
+        canonical: &mut dyn PipelineNode,
     ) -> Result<()> {
         let target = canonical
             .as_any_mut()
@@ -490,4 +490,4 @@ impl PipelineNode<DataChunkView> for HashJoin {
     }
 }
 
-impl crate::pipeline::Transform<DataChunkView> for HashJoin {}
+impl crate::pipeline::Transform for HashJoin {}

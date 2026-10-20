@@ -4,12 +4,12 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow::array::BooleanArray;
-use arrow::record_batch::RecordBatch;
 use catalog::StatisticsPredicate;
 use common::Result;
 use types::{ColumnId, LogicalLiteral, VeinSchema};
 
 use crate::memory::QueryMemoryTracker;
+use crate::pipeline::DataChunkView;
 
 /// A necessary-condition filter over one or more columns.
 ///
@@ -38,7 +38,7 @@ pub trait RuntimeFilter: Debug + Send + Sync {
     /// `column_positions` maps each required column to a position in `batch`.
     fn evaluate(
         &self,
-        batch: &RecordBatch,
+        view: &DataChunkView,
         column_positions: &[usize],
     ) -> Result<BooleanArray>;
 

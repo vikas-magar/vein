@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use arrow::record_batch::RecordBatch;
 use binder::LogicalBinder;
 use catalog::AnalyzedTableStatistics;
 use common::cancellation::CancellationToken;
@@ -18,10 +17,11 @@ use common::statistics::{
     TableStatisticsLog,
 };
 use common::{Result, VeinError};
-use exec::operators::sink::{ViewResultBatch, WriteReceipt, WriteStorage};
+use exec::operators::sink::{WriteReceipt, WriteStorage};
+use exec::pipeline::DataChunkView;
 use exec::runtime::TaskExecutor;
 use exec::udf::{FunctionRegistry, register_builtin_scalars};
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use physical::PhysicalPlanner;
 use plan::{CatalogProvider, LogicalPlan, PlanTraversal};
 
@@ -419,41 +419,6 @@ impl LocalQuery {
         })
     }
 
-    /// Explicitly gathers reference-backed results into contiguous Arrow batches.
-    pub fn into_record_batch_stream(self) -> LocalRecordBatchStream {
-        Box::pin(async_stream::stream! {
-            let mut views = self.into_stream();
-            while let Some(result) = views.next().await {
-                let view = match result {
-                    Ok(view) => view,
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
-                };
-                let started = Instant::now();
-                match view.to_record_batch_with_report() {
-                    Ok((batch, report)) => {
-                        tracing::info!(
-                            target: "vein.audit",
-                            event = "client_result_materialized",
-                            rows = batch.num_rows(),
-                            elapsed_us = started.elapsed().as_micros() as u64,
-                            shared_columns = report.shared_columns,
-                            gathered_columns = report.gathered_columns,
-                            gathered_output_buffer_bytes = report.gathered_output_buffer_bytes,
-                            "client_result_materialized"
-                        );
-                        yield Ok(batch);
-                    }
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
-                }
-            }
-        })
-    }
 }
 
 fn tasks_from_job(
@@ -527,7 +492,7 @@ fn query_statistics_context(plan: &LogicalPlan) -> QueryStatisticsContext {
 async fn run_task(
     executor: &Arc<dyn TaskExecutor>,
     task: &ExecuteTask,
-    senders: &[Mutex<Option<flume::Sender<ViewResultBatch>>>],
+    senders: &[Mutex<Option<flume::Sender<DataChunkView>>>],
     outcomes: &Mutex<Vec<Option<Result<()>>>>,
     index: usize,
     resources: Option<Arc<exec::runtime::QueryExecutionResources>>,
@@ -537,7 +502,7 @@ async fn run_task(
     };
     let outcome = match resources {
         Some(resources) => executor
-            .execute_views_streaming_with_resources(
+            .execute_streaming_with_resources(
                 task,
                 CancellationToken::new(),
                 sender.clone(),
@@ -546,7 +511,7 @@ async fn run_task(
             .await
             .map(|_| ()),
         None => executor
-            .execute_views_streaming(task, CancellationToken::new(), sender.clone())
+            .execute_streaming(task, CancellationToken::new(), sender.clone())
             .await
             .map(|_| ()),
     };
@@ -559,24 +524,26 @@ async fn run_task(
 }
 
 /// Reference-backed query results; no output columns are gathered by the stream.
-pub type LocalResultStream = Pin<Box<dyn Stream<Item=Result<ViewResultBatch>> + Send>>;
-
-/// An explicit stream of contiguous Arrow record batches.
-pub type LocalRecordBatchStream = Pin<Box<dyn Stream<Item=Result<RecordBatch>> + Send>>;
+pub type LocalResultStream = Pin<Box<dyn Stream<Item = Result<DataChunkView>> + Send>>;
 
 #[cfg(test)]
 mod tests {
     use std::fs::File;
 
+    use futures::StreamExt;
     use arrow::array::{
         Array, FixedSizeListArray, Float32Array, Float64Array, Int64Array, StringArray,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use futures::StreamExt;
     use parquet::arrow::ArrowWriter;
 
     use super::*;
+
+    fn materialized_result_column(view: &DataChunkView, column: usize) -> arrow::array::ArrayRef {
+        view.materialize_column(column)
+            .expect("materialize result column for assertion")
+    }
 
     #[test]
     fn query_statistics_context_registers_catalog_resolved_external_sources() {
@@ -692,7 +659,6 @@ mod tests {
             let batch = batch.expect("query batch");
             for row in 0..batch.num_rows() {
                 let (array, index) = batch
-                    .view()
                     .resolve(0, row)
                     .expect("resolve reference-backed value")
                     .expect("selected value is not null-extended");
@@ -735,7 +701,7 @@ mod tests {
             .prepare("FROM flights |> SELECT id")
             .await
             .expect("prepare complete table scan");
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let mut scanned_rows = 0;
         while let Some(batch) = stream.next().await {
             scanned_rows += batch.expect("full scan batch").num_rows();
@@ -766,13 +732,13 @@ mod tests {
             .prepare("FROM flights |> SELECT id |> ORDER id + 1 DESC")
             .await
             .expect("prepare computed ORDER BY query");
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let mut computed_order_ids = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.expect("computed ORDER BY batch");
             assert_eq!(batch.num_columns(), 1, "temporary sort key must not escape");
-            let ids = batch
-                .column(0)
+            let ids_array = materialized_result_column(&batch, 0);
+            let ids = ids_array
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("Int64 projected output");
@@ -786,12 +752,12 @@ mod tests {
             )
             .await
             .expect("prepare ordered aggregate query");
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let mut grouped_ids = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.expect("aggregate query batch");
-            let ids = batch
-                .column(0)
+            let ids_array = materialized_result_column(&batch, 0);
+            let ids = ids_array
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("Int64 grouping key");
@@ -898,17 +864,17 @@ mod tests {
             "the physical join already builds this filtered input before probing"
         );
 
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let mut rows = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.expect("continuation output batch");
-            let left_values = batch
-                .column(0)
+            let left_array = materialized_result_column(&batch, 0);
+            let left_values = left_array
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("left value output");
-            let right_values = batch
-                .column(1)
+            let right_array = materialized_result_column(&batch, 1);
+            let right_values = right_array
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("right value output");
@@ -967,14 +933,14 @@ mod tests {
             vec!["id", "value"],
         );
 
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let batch = stream
             .next()
             .await
             .expect("query batch")
             .expect("successful scan");
-        let values = batch
-            .column(0)
+        let values_array = materialized_result_column(&batch, 0);
+        let values = values_array
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("Int64 output");
@@ -1036,7 +1002,7 @@ mod tests {
             "only the selected column is scanned"
         );
 
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let mut row_count = 0;
         while let Some(batch) = stream.next().await {
             row_count += batch.expect("query batch").num_rows();
@@ -1115,14 +1081,14 @@ mod tests {
             .prepare("FROM names |> SELECT LOWER(name) AS lowered")
             .await
             .expect("prepare LOWER projection");
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let result = stream
             .next()
             .await
             .expect("query batch")
             .expect("successful LOWER projection");
-        let values = result
-            .column(0)
+        let values_array = materialized_result_column(&result, 0);
+        let values = values_array
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("UTF-8 output");
@@ -1135,14 +1101,14 @@ mod tests {
             .prepare("FROM names |> SELECT ROUND(amount) AS rounded")
             .await
             .expect("prepare ROUND projection");
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let result = stream
             .next()
             .await
             .expect("query batch")
             .expect("successful ROUND projection");
-        let values = result
-            .column(0)
+        let values_array = materialized_result_column(&result, 0);
+        let values = values_array
             .as_any()
             .downcast_ref::<Float64Array>()
             .expect("Float64 output");
@@ -1157,22 +1123,22 @@ mod tests {
             )
             .await
             .expect("prepare EXTRACT and YEAR projections");
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let result = stream
             .next()
             .await
             .expect("query batch")
             .expect("successful temporal projections");
-        let years = result
-            .column(0)
+        let year_array = materialized_result_column(&result, 0);
+        let years = year_array
             .as_any()
             .downcast_ref::<arrow::array::Int32Array>()
             .expect("Int32 output");
         assert_eq!(years.value(0), 1970);
         assert_eq!(years.value(1), 2024);
         assert!(years.is_null(2));
-        let year_alias = result
-            .column(1)
+        let year_alias_array = materialized_result_column(&result, 1);
+        let year_alias = year_alias_array
             .as_any()
             .downcast_ref::<arrow::array::Int32Array>()
             .expect("Int32 YEAR alias output");
@@ -1185,20 +1151,20 @@ mod tests {
             )
             .await
             .expect("prepare temporal EXTEND and timestamp literal");
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let result = stream
             .next()
             .await
             .expect("query batch")
             .expect("successful temporal EXTEND and timestamp literal");
-        let month_start = result
-            .column(0)
+        let month_start_array = materialized_result_column(&result, 0);
+        let month_start = month_start_array
             .as_any()
             .downcast_ref::<arrow::array::Date32Array>()
             .expect("Date32 TRUNCATE output");
         assert_eq!(month_start.value(0), 0);
-        let hour_start = result
-            .column(1)
+        let hour_start_array = materialized_result_column(&result, 1);
+        let hour_start = hour_start_array
             .as_any()
             .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
             .expect("timestamp TRUNCATE output");
@@ -1209,14 +1175,14 @@ mod tests {
             .prepare("FROM names |> SELECT VECTOR_DISTANCE(left_vector, right_vector) AS distance")
             .await
             .expect("prepare VECTOR_DISTANCE projection");
-        let mut stream = query.into_record_batch_stream();
+        let mut stream = query.into_stream();
         let result = stream
             .next()
             .await
             .expect("query batch")
             .expect("successful VECTOR_DISTANCE projection");
-        let distances = result
-            .column(0)
+        let distance_array = materialized_result_column(&result, 0);
+        let distances = distance_array
             .as_any()
             .downcast_ref::<Float64Array>()
             .expect("Float64 output");

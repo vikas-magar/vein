@@ -1,13 +1,15 @@
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use common::{Result, VeinError};
-use exec::operators::sink::ViewResultBatch;
+use exec::pipeline::DataChunkView;
 
 /// Formats only the requested result views; source arrays are read in place.
-pub(super) fn pretty_format_views(batches: &[ViewResultBatch]) -> Result<String> {
+pub(super) fn pretty_format_views(batches: &[DataChunkView]) -> Result<String> {
     let Some(first) = batches.first() else {
         return Ok(String::new());
     };
-    let schema = first.schema();
+    let schema = first
+        .schema()
+        .ok_or_else(|| VeinError::internal("result view is missing its schema"))?;
     let mut rows = Vec::new();
     let mut widths = schema
         .fields()
@@ -16,7 +18,10 @@ pub(super) fn pretty_format_views(batches: &[ViewResultBatch]) -> Result<String>
         .collect::<Vec<_>>();
 
     for batch in batches {
-        if batch.schema().as_ref() != schema.as_ref() {
+        if batch
+            .schema()
+            .is_none_or(|actual| actual.as_ref() != schema.as_ref())
+        {
             return Err(VeinError::internal(
                 "result schema changed while formatting pretty output",
             ));
@@ -25,7 +30,6 @@ pub(super) fn pretty_format_views(batches: &[ViewResultBatch]) -> Result<String>
         let formatters = (0..schema.fields().len())
             .map(|column| {
                 batch
-                    .view()
                     .source_arrays_for_column(column)?
                     .iter()
                     .map(|array| {
@@ -39,7 +43,7 @@ pub(super) fn pretty_format_views(batches: &[ViewResultBatch]) -> Result<String>
         for row in 0..batch.num_rows() {
             let mut values = Vec::with_capacity(schema.fields().len());
             for column in 0..schema.fields().len() {
-                let value = match batch.view().source_row(column, row)? {
+                let value = match batch.source_row(column, row)? {
                     Some((source, source_row)) => formatters[column]
                         .get(source)
                         .ok_or_else(|| VeinError::internal("result source formatter is missing"))?
@@ -101,7 +105,6 @@ mod tests {
     use arrow::array::{ArrayRef, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use common::arrow::SelectionVector;
-    use exec::operators::sink::ViewResultBatch;
     use exec::pipeline::{DataChunkView, RowMapping, SourceRow, ViewColumn};
     use std::sync::Arc;
 
@@ -114,7 +117,7 @@ mod tests {
             SelectionVector::new_sparse(vec![2, 0]),
         )
         .unwrap();
-        let batch = ViewResultBatch::new(schema, view).unwrap();
+        let batch = view.with_schema(schema).unwrap();
 
         assert_eq!(
             pretty_format_views(&[batch]).unwrap(),
@@ -131,7 +134,7 @@ mod tests {
         let column = ViewColumn::new(vec![source], DataType::Utf8, mapping).unwrap();
         let view = DataChunkView::new(1, vec![column], SelectionVector::new_dense(1)).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
-        let batch = ViewResultBatch::new(schema, view).unwrap();
+        let batch = view.with_schema(schema).unwrap();
 
         assert_eq!(
             pretty_format_views(&[batch]).unwrap(),

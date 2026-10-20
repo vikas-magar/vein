@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use common::Result;
+use common::arrow::SelectionVector;
 
 use crate::pipeline::{DataChunkView, PipelineNode, Source};
 use crate::operators::source::scan::{ParquetScanReader, parquet::ParquetScanRequest};
@@ -15,21 +15,21 @@ struct EmittingReader(Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
 impl ParquetScanReader for EmittingReader {
-    type Batch = DataChunkView;
-
     async fn execute(
         &self,
         _request: ParquetScanRequest<'_>,
-        next: &mut dyn PipelineNode<Self::Batch>,
+        next: &mut dyn PipelineNode,
     ) -> Result<()> {
         self.0.fetch_add(1, Ordering::Relaxed);
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![41, 42]))],
-        )
-        .expect("valid test batch");
-        next.push(DataChunkView::from_record_batch(batch)?)
+        let values = Arc::new(Int64Array::from(vec![41, 42]));
+        let view = DataChunkView::from_arrays(
+            vec![values],
+            2,
+            SelectionVector::new_dense(2),
+        )?
+        .with_schema(schema)?;
+        next.push(view)
     }
 }
 

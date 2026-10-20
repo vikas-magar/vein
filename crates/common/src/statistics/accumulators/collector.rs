@@ -128,20 +128,13 @@ where
         })
     }
 
-    /// Add one batch by borrowing its existing Arrow arrays.
-    pub fn update(&mut self, batch: &RecordBatch) -> Result<()> {
-        if batch.schema().as_ref() != self.schema.as_ref() {
-            return Err(VeinError::internal(
-                "statistics batch schema differs from the collector schema",
-            ));
-        }
-        self.update_input(batch)
-    }
-
-    /// Observe active values from a borrowed batch or a reference-backed view.
+    /// Observe active values from a reference-backed statistics input.
     /// Column names belong to the collector schema; inputs are matched by
     /// position and type, allowing query-local column identities as keys.
-    pub fn update_input(&mut self, batch: &impl super::super::StatisticsInput) -> Result<()> {
+    pub fn update_input<I: super::super::StatisticsInput + ?Sized>(
+        &mut self,
+        batch: &I,
+    ) -> Result<()> {
         if batch.num_columns() != self.columns.len() {
             return Err(VeinError::internal("statistics input column count changed"));
         }
@@ -173,12 +166,12 @@ where
 
                 if let Some(sketch) = &mut column.sketch
                     && column.distinct_complete {
-                        if let Some(hash) = self.encoder.hash_value(array, row) {
-                            sketch.update_hash(hash);
-                        } else {
-                            column.distinct_complete = false;
-                        }
+                    if let Some(hash) = self.encoder.hash_value(array, row) {
+                        sketch.update_hash(hash);
+                    } else {
+                        column.distinct_complete = false;
                     }
+                }
 
                 let numeric_value = self.encoder.numeric_value(array, row);
                 if let Some(numeric) = &mut column.numeric {
@@ -208,23 +201,23 @@ where
                 if !is_nan {
                     if let Some(most_common) = &mut column.most_common
                         && !most_common.update(
-                            &self.encoder,
+                        &self.encoder,
+                        array,
+                        row,
+                        self.config.max_synopsis_value_bytes,
+                    )? {
+                        column.most_common = None;
+                    }
+                    if let Some(histogram) = &mut column.histogram
+                        && !histogram.update(|| {
+                        self.encoder.bound_value(
                             array,
                             row,
                             self.config.max_synopsis_value_bytes,
-                        )? {
-                            column.most_common = None;
-                        }
-                    if let Some(histogram) = &mut column.histogram
-                        && !histogram.update(|| {
-                            self.encoder.bound_value(
-                                array,
-                                row,
-                                self.config.max_synopsis_value_bytes,
-                            )
-                        })? {
-                            column.histogram = None;
-                        }
+                        )
+                    })? {
+                        column.histogram = None;
+                    }
                 }
 
                 if column.min_max_complete && !is_nan {

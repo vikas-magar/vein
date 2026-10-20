@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use catalog::AnalyzedTableStatistics;
 use common::statistics::analysis::{
     revision_from_identities, StatisticsAnalysisProvider, StatisticsAnalysisSnapshot,
 };
+use common::statistics::StatisticsInput;
 use common::statistics::schema_fingerprint;
 use error::{Result, VeinError};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -79,7 +79,7 @@ impl StatisticsAnalysisProvider for ParquetCatalog {
             source_revision,
             source_identities,
             expected_num_rows: metadata.statistics.as_ref().and_then(|stats| stats.num_rows),
-            batches,
+            inputs: batches,
         })
     }
 
@@ -121,7 +121,7 @@ fn send_parquet_batches(
     files: Vec<String>,
     expected_schema: SchemaRef,
     batch_size: usize,
-    sender: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    sender: tokio::sync::mpsc::Sender<Result<Box<dyn StatisticsInput + Send>>>,
 ) -> Result<()> {
     for file_path in files {
         let path = PathBuf::from(&file_path);
@@ -144,9 +144,10 @@ fn send_parquet_batches(
                 "read ANALYZE batch from '{}': {error}",
                 path.display()
             )))?;
+            let view = exec::pipeline::arrow_adapter::from_record_batch(batch)?;
             sender
-                .blocking_send(Ok(batch))
-                .map_err(|_| VeinError::internal("ANALYZE consumer closed its batch stream"))?;
+                .blocking_send(Ok(Box::new(view)))
+                .map_err(|_| VeinError::internal("ANALYZE consumer closed its input stream"))?;
         }
     }
     Ok(())

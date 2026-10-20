@@ -9,13 +9,13 @@ fn result_batch(
     schema: SchemaRef,
     columns: Vec<ArrayRef>,
     rows: Vec<u32>,
-) -> ViewResultBatch {
+) -> DataChunkView {
     let view = DataChunkView::from_selected_arrays(
         columns,
         SelectionVector::new_sparse(rows),
     )
     .expect("valid view");
-    ViewResultBatch::new(schema, view).expect("valid result batch")
+    view.with_schema(schema).expect("valid result view")
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn json_row_batch_slices_share_the_source_value_buffer() {
     let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
     let result = result_batch(Arc::clone(&schema), vec![Arc::clone(&source)], vec![2]);
 
-    let (row, run_len) = contiguous_run_batch(result.view(), schema, 0).unwrap();
+    let (row, run_len) = contiguous_run_batch(&result, schema, 0).unwrap();
     assert_eq!(run_len, 1);
     let source_buffer = source.to_data().buffers()[0].as_ptr();
     let row_buffer = row.column(0).to_data().buffers()[0].as_ptr();
@@ -71,7 +71,7 @@ fn json_writer_coalesces_contiguous_rows_into_one_shared_buffer_slice() {
     let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
     let result = result_batch(Arc::clone(&schema), vec![Arc::clone(&source)], vec![0, 1, 2]);
 
-    let (batch, run_len) = contiguous_run_batch(result.view(), schema, 0).unwrap();
+    let (batch, run_len) = contiguous_run_batch(&result, schema, 0).unwrap();
 
     assert_eq!(run_len, 3);
     let source_buffer = source.to_data().buffers()[0].as_ptr();

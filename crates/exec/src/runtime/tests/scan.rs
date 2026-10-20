@@ -38,14 +38,7 @@ async fn multi_file_scan_uses_bounded_zero_copy_fan_in_on_current_thread_runtime
     let mut actual = result
         .output
         .iter()
-        .map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("int64 output")
-                .value(0)
-        })
+        .flat_map(|view| view_int64_values(view, 0))
         .collect::<Vec<_>>();
     actual.sort_unstable();
     assert_eq!(actual, vec![1, 2, 3]);
@@ -56,8 +49,11 @@ async fn multi_file_scan_uses_bounded_zero_copy_fan_in_on_current_thread_runtime
         .expect("test source array mutex")
         .clone();
     for batch in &result.output {
-        let output = batch
-            .column(0)
+        let (output, _) = batch
+            .resolve(0, 0)
+            .expect("resolve scan output")
+            .expect("scan output is non-null");
+        let output = output
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
             .expect("int64 output");
@@ -81,11 +77,11 @@ async fn intermediate_physical_source_replays_registered_checkpoint_views() {
         Arc::clone(&arrow_schema),
         vec![Arc::new(arrow::array::Int64Array::from(vec![7, 11]))],
     )
-        .expect("valid checkpoint batch");
+    .expect("valid checkpoint batch");
     let memory = QueryMemoryTracker::new(1 << 20, CancellationToken::new());
     let relation = crate::runtime::checkpoint::IntermediateRelation::new(arrow_schema, memory);
     let mut sink = relation.sink();
-    sink.push(DataChunkView::from_record_batch(batch.clone()).unwrap())
+    sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch.clone()).unwrap())
         .expect("retain checkpoint batch");
     sink.flush().expect("seal checkpoint before execution");
 
@@ -132,7 +128,7 @@ async fn intermediate_physical_source_replays_registered_checkpoint_views() {
     task.plan = fragments.continuation;
 
     let result = runner
-        .execute_views(&task, CancellationToken::new())
+        .execute(&task, CancellationToken::new())
         .await
         .expect("intermediate source should run as a normal pipeline input");
 
@@ -144,7 +140,6 @@ async fn intermediate_physical_source_replays_registered_checkpoint_views() {
             (0..output.num_rows())
                 .map(|row| {
                     let (array, physical_row) = output
-                        .view()
                         .resolve(0, row)
                         .expect("resolve reference-backed output row")
                         .expect("non-null output row");
@@ -158,14 +153,13 @@ async fn intermediate_physical_source_replays_registered_checkpoint_views() {
         })
         .collect::<Vec<_>>();
     assert_eq!(output_values, vec![7, 11]);
-    assert!(result
-                .output
-                .iter()
-                .any(|output| {
-                    let (array, _) = output.view().resolve(0, 0).unwrap().unwrap();
-                    Arc::ptr_eq(array, batch.column(0))
-                }),
-            "checkpoint replay and view operators should retain the original Arrow array");
+    assert!(
+        result.output.iter().any(|output| {
+            let (array, _) = output.resolve(0, 0).unwrap().unwrap();
+            Arc::ptr_eq(array, batch.column(0))
+        }),
+        "checkpoint replay and view operators should retain the original Arrow array"
+    );
 }
 
 #[tokio::test]
@@ -194,7 +188,7 @@ async fn multi_file_worker_failure_is_returned_without_waiting_on_blocked_sender
                 runtime_statistics: None,
             })),
             input_schema: Arc::clone(&schema),
-                    program: Arc::new(ExpressionProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         },
     );
     task.plan = plan_with_input(&task, input);
@@ -203,8 +197,8 @@ async fn multi_file_worker_failure_is_returned_without_waiting_on_blocked_sender
         std::time::Duration::from_secs(2),
         runner.execute(&task, CancellationToken::new()),
     )
-        .await
-        .expect("failed scan workers must not leave peers blocked")
-        .expect_err("an invalid source work item should fail the task");
+    .await
+    .expect("failed scan workers must not leave peers blocked")
+    .expect_err("an invalid source work item should fail the task");
     assert!(result.to_string().contains("invalid value"));
 }

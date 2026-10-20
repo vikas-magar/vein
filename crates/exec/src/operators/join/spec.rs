@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use crate::pipeline::{DataChunkView, PipelineNode};
+use crate::pipeline::PipelineNode;
 
 use super::hash_join::{BuildSink, HashJoin};
 use super::hash_table::{HashTable, JoinKeys};
@@ -57,7 +57,7 @@ impl JoinSpec {
     pub fn into_probe(
         self,
         table: Arc<HashTable>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
     ) -> HashJoin {
         HashJoin::new(
             table,
@@ -82,7 +82,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct Collect(Arc<Mutex<Vec<DataChunkView>>>);
 
-    impl PipelineNode<DataChunkView> for Collect {
+    impl PipelineNode for Collect {
         fn push(&mut self, chunk: DataChunkView) -> Result<(), error::VeinError> {
             self.0.lock().expect("collect lock").push(chunk);
             Ok(())

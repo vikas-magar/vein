@@ -1,14 +1,14 @@
 //! Adapts compiled Vein and runtime predicates to Parquet's late materializer.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use arrow::array::Array;
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
-use common::protocol::{ScanPredicate, ScanPredicateStage};
 use common::Result;
+use common::protocol::{ScanPredicate, ScanPredicateStage};
 use error::VeinError;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
@@ -18,17 +18,14 @@ use parquet::schema::types::SchemaDescriptor;
 use types::{ResolvedColumnRef, VeinSchema};
 
 use crate::expression::eval::{ExpressionEvaluator, ExpressionKernelProvider};
-use crate::pipeline::DataChunkView;
 use crate::runtime::filter::RuntimeFilterSet;
 use crate::udf::FunctionRegistry;
 
 use super::super::metrics::ScanPredicateMetrics;
 use super::super::projection::root_indices;
-use super::super::selection::project_batch;
 use super::adaptive_order::{AdaptiveFilterConfig, AdaptiveFilterOrder};
 
-pub type PredicateStageMetrics =
-(usize, usize, Vec<String>, Arc<ScanPredicateMetrics>);
+pub type PredicateStageMetrics = (usize, usize, Vec<String>, Arc<ScanPredicateMetrics>);
 
 pub struct ScanPredicateContext<'a> {
     pub arrow_schema: &'a Schema,
@@ -52,12 +49,18 @@ pub struct ScanPredicatePipeline {
     pub adaptive_order: Option<Arc<AdaptiveFilterOrder>>,
 }
 
-pub fn build_scan_predicates(
-    context: ScanPredicateContext<'_>,
-) -> Result<ScanPredicatePipeline> {
+pub fn build_scan_predicates(context: ScanPredicateContext<'_>) -> Result<ScanPredicatePipeline> {
     let ScanPredicateContext {
-        arrow_schema, parquet_schema, path, projected, pushdown, registry,
-        detailed_metrics_enabled, predicate_metrics, runtime_filters, adaptive_order,
+        arrow_schema,
+        parquet_schema,
+        path,
+        projected,
+        pushdown,
+        registry,
+        detailed_metrics_enabled,
+        predicate_metrics,
+        runtime_filters,
+        adaptive_order,
         expression_kernels,
     } = context;
     let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
@@ -68,14 +71,29 @@ pub fn build_scan_predicates(
         for (index, stage) in pushdown.stages.iter().enumerate() {
             reorder_safe &= stage.reorder_safe;
             let metrics = Arc::new(ScanPredicateMetrics::default());
-            stage_metrics.push((index, stage.predicate_count,
-                                stage.input.fields.iter().map(|field| field.name.clone()).collect(),
-                                Arc::clone(&metrics)));
+            stage_metrics.push((
+                index,
+                stage.predicate_count,
+                stage
+                    .input
+                    .fields
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect(),
+                Arc::clone(&metrics),
+            ));
             predicates.push(expression_predicate(
-                arrow_schema, parquet_schema, &stage.input.fields, stage, path,
-                Arc::clone(registry), detailed_metrics_enabled,
+                arrow_schema,
+                parquet_schema,
+                &stage.input.fields,
+                stage,
+                path,
+                Arc::clone(registry),
+                detailed_metrics_enabled,
                 Arc::clone(expression_kernels),
-                Arc::clone(predicate_metrics), metrics, index == 0,
+                Arc::clone(predicate_metrics),
+                metrics,
+                index == 0,
             )?);
         }
     }
@@ -90,9 +108,8 @@ pub fn build_scan_predicates(
             reorder_safe &= binding.reorder_safe();
             let stage_filter_names = binding.filter_names();
             let key_columns = binding.columns().len();
-            let (mask, positions) = predicate_projection(
-                arrow_schema, parquet_schema, binding.columns(), path,
-            )?;
+            let (mask, positions) =
+                predicate_projection(arrow_schema, parquet_schema, binding.columns(), path)?;
             let record_source_rows = predicates.is_empty() && index == 0;
             let metrics = Arc::clone(predicate_metrics);
             let first_filter = Arc::new(AtomicBool::new(record_source_rows));
@@ -102,8 +119,10 @@ pub fn build_scan_predicates(
                     if record_first_filter.load(Ordering::Relaxed) {
                         metrics.record_source_rows(batch.num_rows());
                     }
-                    let narrow = project_batch(&batch, &positions).map_err(as_arrow_error)?;
-                    binding.evaluate(&narrow).map_err(as_arrow_error)
+                    let view = crate::pipeline::arrow_adapter::from_record_batch_ref(&batch)
+                        .and_then(|view| view.project(&positions))
+                        .map_err(as_arrow_error)?;
+                    binding.evaluate(&Arc::new(view)).map_err(as_arrow_error)
                 })
                     .with_first_filter_callback(move |first| {
                         first_filter.store(first, Ordering::Relaxed);
@@ -185,32 +204,42 @@ fn expression_predicate(
     let expression = stage.predicate.clone();
     let first_filter = Arc::new(AtomicBool::new(record_source_rows));
     let record_first_filter = Arc::clone(&first_filter);
-    Ok(Box::new(ArrowPredicateFn::new(mask, move |batch| {
-        if record_first_filter.load(Ordering::Relaxed) {
-            total_metrics.record_source_rows(batch.num_rows());
-        }
-        let array_bytes = detailed.then(|| positions.iter().fold(0usize, |bytes, &position| {
-            bytes.saturating_add(batch.column(position).get_array_memory_size())
-        })).unwrap_or_default();
-        let started = detailed.then(Instant::now);
-        let narrow = project_batch(&batch, &positions).map_err(as_arrow_error)?;
-        let view = Arc::new(DataChunkView::from_record_batch(narrow).map_err(as_arrow_error)?);
-        let evaluator = ExpressionEvaluator::new(
-            expression_kernels.as_ref(),
-            registry.as_ref(),
-        );
-        let predicate = evaluator.evaluate_boolean(&expression, &view).map_err(as_arrow_error)?;
-        if let Some(started) = started {
-            let rows_kept = (0..predicate.len())
-                .filter(|&row| predicate.is_valid(row) && predicate.value(row)).count();
-            let elapsed = started.elapsed();
-            total_metrics.record_batch(batch.num_rows(), rows_kept, elapsed, array_bytes);
-            stage_metrics.record_batch(batch.num_rows(), rows_kept, elapsed, array_bytes);
-        }
-        Ok(predicate)
-    }).with_first_filter_callback(move |first| {
-        first_filter.store(first, Ordering::Relaxed);
-    })))
+    Ok(Box::new(
+        ArrowPredicateFn::new(mask, move |batch| {
+            if record_first_filter.load(Ordering::Relaxed) {
+                total_metrics.record_source_rows(batch.num_rows());
+            }
+            let array_bytes = detailed
+                .then(|| {
+                    positions.iter().fold(0usize, |bytes, &position| {
+                        bytes.saturating_add(batch.column(position).get_array_memory_size())
+                    })
+                })
+                .unwrap_or_default();
+            let started = detailed.then(Instant::now);
+            let view = crate::pipeline::arrow_adapter::from_record_batch_ref(&batch)
+                .and_then(|view| view.project(&positions))
+                .map_err(as_arrow_error)?;
+            let view = Arc::new(view);
+            let evaluator =
+                ExpressionEvaluator::new(expression_kernels.as_ref(), registry.as_ref());
+            let predicate = evaluator
+                .evaluate_boolean(&expression, &view)
+                .map_err(as_arrow_error)?;
+            if let Some(started) = started {
+                let rows_kept = (0..predicate.len())
+                    .filter(|&row| predicate.is_valid(row) && predicate.value(row))
+                    .count();
+                let elapsed = started.elapsed();
+                total_metrics.record_batch(batch.num_rows(), rows_kept, elapsed, array_bytes);
+                stage_metrics.record_batch(batch.num_rows(), rows_kept, elapsed, array_bytes);
+            }
+            Ok(predicate)
+        })
+            .with_first_filter_callback(move |first| {
+                first_filter.store(first, Ordering::Relaxed);
+            }),
+    ))
 }
 
 fn predicate_projection(
@@ -219,14 +248,22 @@ fn predicate_projection(
     fields: &[ResolvedColumnRef],
     path: &str,
 ) -> Result<(ProjectionMask, Vec<usize>)> {
-    let field_roots = fields.iter().map(|field| {
-        root_indices(arrow_schema, std::slice::from_ref(field), path).map(|roots| roots[0])
-    }).collect::<Result<Vec<_>>>()?;
+    let field_roots = fields
+        .iter()
+        .map(|field| {
+            root_indices(arrow_schema, std::slice::from_ref(field), path).map(|roots| roots[0])
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut roots = field_roots.clone();
     roots.sort_unstable();
     roots.dedup();
-    let positions = field_roots.iter().map(|root| roots.binary_search(root)
-        .map_err(|_| VeinError::internal("predicate field is absent from its Parquet projection")))
+    let positions = field_roots
+        .iter()
+        .map(|root| {
+            roots.binary_search(root).map_err(|_| {
+                VeinError::internal("predicate field is absent from its Parquet projection")
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok((ProjectionMask::roots(parquet_schema, roots), positions))
 }

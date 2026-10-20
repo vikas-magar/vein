@@ -11,7 +11,7 @@ use crate::pipeline::DataChunkView;
 #[derive(Clone)]
 struct Capture(Arc<Mutex<Vec<DataChunkView>>>);
 
-impl PipelineNode<DataChunkView> for Capture {
+impl PipelineNode for Capture {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0.lock().unwrap().push(view);
         Ok(())

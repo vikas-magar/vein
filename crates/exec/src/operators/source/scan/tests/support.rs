@@ -5,6 +5,7 @@ use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use ::parquet::arrow::ArrowWriter;
+use crate::DataChunkView;
 
 pub(super) fn write_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> PathBuf {
     let path = dir.join(relative);
@@ -101,19 +102,25 @@ impl RuntimeFilter for KeepIds {
 
     fn evaluate(
         &self,
-        batch: &RecordBatch,
+        view: &DataChunkView,
         column_positions: &[usize],
     ) -> Result<BooleanArray> {
-        let values = batch
-            .column(*column_positions.first().ok_or_else(|| {
+        let column = *column_positions.first().ok_or_else(|| {
                 VeinError::internal("test runtime filter has no bound key column")
-            })?)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| VeinError::internal("test runtime filter requires Int64"))?;
-        let mut selection = arrow::array::builder::BooleanBuilder::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
-            selection.append_value(values.is_valid(row) && self.ids.contains(&values.value(row)));
+            })?;
+        let mut selection = arrow::array::builder::BooleanBuilder::with_capacity(view.num_rows());
+        for row in 0..view.num_rows() {
+            let keep = match view.resolve(column, row)? {
+                Some((array, index)) => {
+                    let values = array
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| VeinError::internal("test runtime filter requires Int64"))?;
+                    values.is_valid(index) && self.ids.contains(&values.value(index))
+                }
+                None => false,
+            };
+            selection.append_value(keep);
         }
         Ok(selection.finish())
     }
@@ -122,7 +129,7 @@ impl RuntimeFilter for KeepIds {
 #[derive(Default)]
 pub(super) struct Int64Collector(pub(super) Vec<i64>);
 
-impl PipelineNode<DataChunkView> for Int64Collector {
+impl PipelineNode for Int64Collector {
     fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         let column = chunk.materialize_column(0)?;
         let values = column
@@ -145,7 +152,7 @@ impl PipelineNode<DataChunkView> for Int64Collector {
 #[derive(Default)]
 pub(super) struct ArrayTypeSink(pub(super) Option<DataType>);
 
-impl PipelineNode<DataChunkView> for ArrayTypeSink {
+impl PipelineNode for ArrayTypeSink {
     fn push(&mut self, batch: DataChunkView) -> Result<()> {
         self.0 = Some(batch.materialize_column(0)?.data_type().clone());
         Ok(())

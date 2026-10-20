@@ -7,6 +7,6 @@ pub mod client;
 /// Incremental storage sink backed by an injected transactional writer.
 pub mod storage;
 
-pub use client::{ClientOutput, CollectSink, ViewResultBatch};
+pub use client::CollectSink;
 pub use discard::DiscardSink;
 pub use storage::{WriteReceipt, WriteSink, WriteStorage, WriteTransaction};
