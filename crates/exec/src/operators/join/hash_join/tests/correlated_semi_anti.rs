@@ -12,22 +12,13 @@ fn run_correlated_shape(join_type: JoinType, empty_build: bool) -> Vec<i64> {
     }
 
     let collector = JoinFilterCollector::default();
-    let program = Arc::new(MicroProgram::new(
-        3,
-        vec![
-            MicroOp::CmpNeq {
-                dst: 2,
-                src1: 0,
-                src2: 1,
-            },
-            MicroOp::FilterMask { bool_reg: 2 },
-        ],
-    ));
-    let vm = VectorVmExecutor::<DataChunkView>::new_view(
-        program,
-        Arc::new(FunctionRegistry::new()),
-        Box::new(collector.clone()),
+    let predicate = expression_binary(
+        common::protocol::BinaryExprOp::NotEqual,
+        expression_column(0, types::VeinDataType::Int64),
+        expression_column(1, types::VeinDataType::Int64),
+        types::VeinDataType::Boolean,
     );
+    let executor = expression_filter(predicate, collector.clone());
     let sink = Collect::default();
     let mut join = HashJoin::new(
         Arc::new(table),
@@ -39,7 +30,7 @@ fn run_correlated_shape(join_type: JoinType, empty_build: bool) -> Vec<i64> {
     )
         .with_residual_filter(
             vec![OutputColumn::Probe(1), OutputColumn::Build(1)],
-            Box::new(vm),
+            Box::new(executor),
             collector,
         );
 

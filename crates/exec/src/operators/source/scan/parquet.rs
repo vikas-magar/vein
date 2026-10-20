@@ -1,5 +1,6 @@
 use crate::pipeline::{DataChunkView, PipelineNode};
-use crate::runtime_filter::RuntimeFilterSet;
+use crate::expression::eval::ExpressionKernelProvider;
+use crate::runtime::filter::RuntimeFilterSet;
 use crate::udf::FunctionRegistry;
 use common::Result;
 use common::protocol::RuntimeStatisticsScan;
@@ -73,6 +74,8 @@ pub struct ParquetScanRequest<'a> {
     pub metadata_store: &'a MetadataStore,
     /// Functions available to compiled scan predicates.
     pub registry: &'a Arc<FunctionRegistry>,
+    /// Shared typed kernels used by source predicates.
+    pub expression_kernels: &'a Arc<dyn ExpressionKernelProvider>,
     /// Shared byte counter for storage reads performed by the scan.
     pub bytes_read: &'a Arc<AtomicU64>,
     /// Query-local filters produced by runtime operators.
@@ -98,6 +101,7 @@ pub(super) async fn execute_parquet_scan(
         pushdown,
         metadata_store,
         registry,
+        expression_kernels,
         bytes_read,
         runtime_filters,
         runtime_statistics,
@@ -783,6 +787,7 @@ pub(super) async fn execute_parquet_scan(
             projected,
             pushdown,
             registry,
+            expression_kernels,
             detailed_metrics_enabled,
             predicate_metrics: &predicate_metrics,
             runtime_filters,
@@ -865,13 +870,6 @@ pub(super) async fn execute_parquet_scan(
             pushed_filter_count = pushdown.map_or(0, |predicate| predicate.predicate_count),
             pushed_filter_stage_count = pushdown.map_or(0, |predicate| predicate.stages.len()),
             pushed_filter_columns = ?pushed_filter_columns,
-            pushed_filter_program_instructions = pushdown.map_or(0, |predicate| {
-                predicate
-                    .stages
-                    .iter()
-                    .map(|stage| stage.program.instructions.len())
-                    .sum()
-            }),
             runtime_filter_count = runtime_filter_names.len(),
             runtime_filter_names = ?runtime_filter_names,
             runtime_filter_bytes = runtime_filters.memory_bytes(),

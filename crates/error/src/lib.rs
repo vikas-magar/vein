@@ -540,7 +540,7 @@ mod tests {
             "lowering a recursive filter",
             VeinError::external(
                 ErrorCategory::Unsupported,
-                "VM expression lowering",
+                "typed expression lowering",
                 std::io::Error::other("expression opcode unavailable"),
             ),
         );

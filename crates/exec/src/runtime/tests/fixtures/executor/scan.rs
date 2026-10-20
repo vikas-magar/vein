@@ -1,5 +1,5 @@
-use super::*;
 use super::input::MemoryFeedBuilder;
+use super::*;
 
 /// Supplies one borrowed Arrow batch for each synthetic file in a scan.
 pub(in crate::runtime::tests) struct MultiFileFeedBuilder {
@@ -88,20 +88,12 @@ impl ExecutorBuilder for MultiFileFeedBuilder {
         }))
     }
 
-    fn build_vm(
+    fn build_expression_executor(
         &self,
-        program: &Arc<MicroProgram>,
-        next: Box<dyn PipelineNode<DataChunk>>,
-    ) -> Result<Box<dyn Transform<DataChunk>>> {
-        self.inner.build_vm(program, next)
-    }
-
-    fn build_view_vm(
-        &self,
-        program: &Arc<MicroProgram>,
+        program: &Arc<ExpressionProgram>,
         next: Box<dyn PipelineNode<DataChunkView>>,
     ) -> Result<Box<dyn Transform<DataChunkView>>> {
-        self.inner.build_view_vm(program, next)
+        self.inner.build_expression_executor(program, next)
     }
 
     fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunkView>>> {

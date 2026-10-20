@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use common::protocol::{MicroOp, MicroProgram, ScanPredicate, ScanPredicateStage};
+use common::protocol::{
+    BinaryExprOp, ExprKind, PhysicalExpr, ScanPredicate, ScanPredicateStage,
+};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 use types::{ColumnId, LogicalLiteral, ResolvedColumn, VeinDataType, VeinSchema};
 
+use crate::expression::eval::{ExpressionKernelProvider, ExpressionKernelRegistry};
 use crate::operators::source::scan::parquet::metrics::ScanPredicateMetrics;
-use crate::runtime_filter::RuntimeFilterSet;
+use crate::runtime::filter::RuntimeFilterSet;
 use crate::udf::FunctionRegistry;
 
 use super::super::adaptive_order::AdaptiveFilterOrder;
@@ -34,21 +37,20 @@ fn setup() -> (Schema, SchemaDescriptor, VeinSchema, ScanPredicate, Arc<Function
         predicate_count: 1,
         reorder_safe: true,
         input: Arc::new(VeinSchema::new(vec![Arc::clone(&key)])),
-        program: Arc::new(MicroProgram::new(
-            3,
-            vec![
-                MicroOp::LoadConstant {
-                    dst: 1,
-                    value: LogicalLiteral::Int64(4),
-                },
-                MicroOp::CmpEq {
-                    dst: 2,
-                    src1: 0,
-                    src2: 1,
-                },
-            ],
-        )),
-        result: 2,
+        predicate: PhysicalExpr {
+            return_type: VeinDataType::Boolean,
+            kind: ExprKind::Binary {
+                op: BinaryExprOp::Equal,
+                left: Box::new(PhysicalExpr {
+                    return_type: VeinDataType::Int64,
+                    kind: ExprKind::Column { index: 0 },
+                }),
+                right: Box::new(PhysicalExpr {
+                    return_type: VeinDataType::Int64,
+                    kind: ExprKind::Literal(LogicalLiteral::Int64(4)),
+                }),
+            },
+        },
     };
     let pushdown = ScanPredicate {
         predicate_count: 2,
@@ -72,6 +74,8 @@ fn pipeline(
     registry: &Arc<FunctionRegistry>,
     adaptive_order: Option<Arc<AdaptiveFilterOrder>>,
 ) -> ScanPredicatePipeline {
+    let expression_kernels: Arc<dyn ExpressionKernelProvider> =
+        Arc::new(ExpressionKernelRegistry::with_builtins());
     build_scan_predicates(ScanPredicateContext {
         arrow_schema: schema,
         parquet_schema,
@@ -79,6 +83,7 @@ fn pipeline(
         projected,
         pushdown: Some(pushdown),
         registry,
+        expression_kernels: &expression_kernels,
         detailed_metrics_enabled: false,
         predicate_metrics: &Arc::new(ScanPredicateMetrics::default()),
         runtime_filters: &RuntimeFilterSet::empty(),

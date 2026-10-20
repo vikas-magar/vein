@@ -4,7 +4,7 @@ use super::*;
 async fn recursive_sort_and_limit_run_in_logical_order_over_join_output() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
     };
     let join = || InputPlanFixture::Join {
         probe: Box::new(leaf()),
@@ -94,7 +94,7 @@ async fn recursive_sort_and_limit_run_in_logical_order_over_join_output() {
 async fn recursive_aggregate_filter_sort_limit_execute_once_in_order() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+                program: Arc::new(ExpressionProgram::empty()),
     };
     let join = InputPlanFixture::Join {
         probe: Box::new(leaf()),
@@ -123,20 +123,11 @@ async fn recursive_aggregate_filter_sort_limit_execute_once_in_order() {
     };
     let filtered = InputPlanFixture::Transform {
         input: Box::new(aggregate),
-        program: Arc::new(MicroProgram::new(
-            4,
-            vec![
-                MicroOp::LoadConstant {
-                    dst: 2,
-                    value: types::LogicalLiteral::Int64(1),
-                },
-                MicroOp::CmpGt {
-                    dst: 3,
-                    src1: 1,
-                    src2: 2,
-                },
-                MicroOp::FilterMask { bool_reg: 3 },
-            ],
+        program: filter_program(binary_expr(
+            BinaryExprOp::Greater,
+            column_expr(1, VeinDataType::Int64),
+            literal_expr(LogicalLiteral::Int64(1), VeinDataType::Int64),
+            VeinDataType::Boolean,
         )),
     };
     let sorted = InputPlanFixture::Sort {

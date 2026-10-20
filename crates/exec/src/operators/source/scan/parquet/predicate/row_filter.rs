@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Array, BooleanArray};
+use arrow::array::Array;
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use common::protocol::{ScanPredicate, ScanPredicateStage};
@@ -17,10 +17,10 @@ use parquet::arrow::arrow_reader::{
 use parquet::schema::types::SchemaDescriptor;
 use types::{ResolvedColumnRef, VeinSchema};
 
-use crate::pipeline::DataChunk;
-use crate::runtime_filter::RuntimeFilterSet;
+use crate::expression::eval::{ExpressionEvaluator, ExpressionKernelProvider};
+use crate::pipeline::DataChunkView;
+use crate::runtime::filter::RuntimeFilterSet;
 use crate::udf::FunctionRegistry;
-use crate::vm::VectorVmExecutor;
 
 use super::super::metrics::ScanPredicateMetrics;
 use super::super::projection::root_indices;
@@ -37,6 +37,7 @@ pub struct ScanPredicateContext<'a> {
     pub projected: &'a VeinSchema,
     pub pushdown: Option<&'a ScanPredicate>,
     pub registry: &'a Arc<FunctionRegistry>,
+    pub expression_kernels: &'a Arc<dyn ExpressionKernelProvider>,
     pub detailed_metrics_enabled: bool,
     pub predicate_metrics: &'a Arc<ScanPredicateMetrics>,
     pub runtime_filters: &'a RuntimeFilterSet,
@@ -57,6 +58,7 @@ pub fn build_scan_predicates(
     let ScanPredicateContext {
         arrow_schema, parquet_schema, path, projected, pushdown, registry,
         detailed_metrics_enabled, predicate_metrics, runtime_filters, adaptive_order,
+        expression_kernels,
     } = context;
     let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
     let mut stage_metrics = Vec::new();
@@ -69,9 +71,10 @@ pub fn build_scan_predicates(
             stage_metrics.push((index, stage.predicate_count,
                                 stage.input.fields.iter().map(|field| field.name.clone()).collect(),
                                 Arc::clone(&metrics)));
-            predicates.push(vm_predicate(
+            predicates.push(expression_predicate(
                 arrow_schema, parquet_schema, &stage.input.fields, stage, path,
                 Arc::clone(registry), detailed_metrics_enabled,
+                Arc::clone(expression_kernels),
                 Arc::clone(predicate_metrics), metrics, index == 0,
             )?);
         }
@@ -165,7 +168,7 @@ pub fn build_scan_predicates(
     })
 }
 
-fn vm_predicate(
+fn expression_predicate(
     arrow_schema: &Schema,
     parquet_schema: &SchemaDescriptor,
     fields: &[ResolvedColumnRef],
@@ -173,13 +176,13 @@ fn vm_predicate(
     path: &str,
     registry: Arc<FunctionRegistry>,
     detailed: bool,
+    expression_kernels: Arc<dyn ExpressionKernelProvider>,
     total_metrics: Arc<ScanPredicateMetrics>,
     stage_metrics: Arc<ScanPredicateMetrics>,
     record_source_rows: bool,
 ) -> Result<Box<dyn ArrowPredicate>> {
     let (mask, positions) = predicate_projection(arrow_schema, parquet_schema, fields, path)?;
-    let mut evaluator = VectorVmExecutor::for_evaluation(Arc::clone(&stage.program), registry);
-    let result = stage.result;
+    let expression = stage.predicate.clone();
     let first_filter = Arc::new(AtomicBool::new(record_source_rows));
     let record_first_filter = Arc::clone(&first_filter);
     Ok(Box::new(ArrowPredicateFn::new(mask, move |batch| {
@@ -190,15 +193,13 @@ fn vm_predicate(
             bytes.saturating_add(batch.column(position).get_array_memory_size())
         })).unwrap_or_default();
         let started = detailed.then(Instant::now);
-        let arrays = positions.iter().map(|&position| Arc::clone(batch.column(position))).collect();
-        let mut chunk = DataChunk::from_vectors(arrays);
-        let value = evaluator.evaluate(&mut chunk, result).map_err(as_arrow_error)?;
-        let predicate = value.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-            ArrowError::ComputeError("scan predicate did not return a boolean array".into())
-        })?;
-        if predicate.len() != batch.num_rows() {
-            return Err(ArrowError::ComputeError("scan predicate returned a mask with the wrong row count".into()));
-        }
+        let narrow = project_batch(&batch, &positions).map_err(as_arrow_error)?;
+        let view = Arc::new(DataChunkView::from_record_batch(narrow).map_err(as_arrow_error)?);
+        let evaluator = ExpressionEvaluator::new(
+            expression_kernels.as_ref(),
+            registry.as_ref(),
+        );
+        let predicate = evaluator.evaluate_boolean(&expression, &view).map_err(as_arrow_error)?;
         if let Some(started) = started {
             let rows_kept = (0..predicate.len())
                 .filter(|&row| predicate.is_valid(row) && predicate.value(row)).count();
@@ -206,7 +207,7 @@ fn vm_predicate(
             total_metrics.record_batch(batch.num_rows(), rows_kept, elapsed, array_bytes);
             stage_metrics.record_batch(batch.num_rows(), rows_kept, elapsed, array_bytes);
         }
-        Ok(predicate.clone())
+        Ok(predicate)
     }).with_first_filter_callback(move |first| {
         first_filter.store(first, Ordering::Relaxed);
     })))

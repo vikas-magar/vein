@@ -17,7 +17,7 @@ impl DefaultTaskExecutor {
         next: Box<dyn PipelineNode<DataChunkView>>,
         context: &'a RecursiveExecutionContext<'a>,
         depth: usize,
-    ) -> Pin<Box<dyn Future<Output=Result<u64>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
         self.execute_input_with_runtime_filters(input, next, context, None, depth)
     }
 
@@ -31,7 +31,7 @@ impl DefaultTaskExecutor {
         context: &'a RecursiveExecutionContext<'a>,
         runtime_filters: Option<Arc<RuntimeFilterSet>>,
         depth: usize,
-    ) -> Pin<Box<dyn Future<Output=Result<u64>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
         let RecursiveExecutionContext {
             task,
             cancel,
@@ -85,10 +85,10 @@ impl DefaultTaskExecutor {
                             let mut source = self
                                 .intermediate_sources
                                 .source(task.query_id, *source_id)?;
-                            let mut pipeline = if program.instructions.is_empty() {
+                            let mut pipeline = if program.is_empty() {
                                 next
                             } else {
-                                self.builder.build_view_vm(program, next)?
+                                self.builder.build_expression_executor(program, next)?
                             };
                             tracing::info!(
                                 target: "vein.audit",
@@ -118,10 +118,10 @@ impl DefaultTaskExecutor {
                                 worker_count = 0,
                                 "scan has no candidate storage units"
                             );
-                            let mut empty_pipeline = if program.instructions.is_empty() {
+                            let mut empty_pipeline = if program.is_empty() {
                                 next
                             } else {
-                                self.builder.build_view_vm(program, next)?
+                                self.builder.build_expression_executor(program, next)?
                             };
                             empty_pipeline.flush()?;
                             trace.record_source_bytes(node_id, 0);
@@ -165,11 +165,11 @@ impl DefaultTaskExecutor {
                             }
                             if local_nodes.len() == worker_count && fan_in_fallback.is_none() {
                                 let mut canonical: Box<dyn PipelineNode<DataChunkView>> =
-                                    if program.instructions.is_empty() {
+                                    if program.is_empty() {
                                         next
                                     } else {
                                         Box::new(TransformHandle(
-                                            self.builder.build_view_vm(program, next)?,
+                                            self.builder.build_expression_executor(program, next)?,
                                         ))
                                     };
                                 tracing::debug!(
@@ -203,11 +203,11 @@ impl DefaultTaskExecutor {
                                         let worker_tail: Box<dyn PipelineNode<DataChunkView>> =
                                             Box::new(SuppressFlush::new(local));
                                         let mut pipeline: Box<dyn PipelineNode<DataChunkView>> =
-                                            if program.instructions.is_empty() {
+                                            if program.is_empty() {
                                                 worker_tail
                                             } else {
                                                 Box::new(TransformHandle(
-                                                    builder.build_view_vm(&program, worker_tail)?,
+                                                    builder.build_expression_executor(&program, worker_tail)?,
                                                 ))
                                             };
                                         loop {
@@ -369,7 +369,7 @@ impl DefaultTaskExecutor {
                                                 finished: Arc::clone(&finished),
                                             })),
                                         );
-                                        let result = if program.instructions.is_empty() {
+                                        let result = if program.is_empty() {
                                             let mut next = channel;
                                             runtime.block_on(async {
                                                 tokio::select! {
@@ -379,8 +379,8 @@ impl DefaultTaskExecutor {
                                             }
                                             })
                                         } else {
-                                            let vm = builder.build_view_vm(&program, channel)?;
-                                            let mut next = vm;
+                                            let expression_executor = builder.build_expression_executor(&program, channel)?;
+                                            let mut next = expression_executor;
                                             runtime.block_on(async {
                                                 tokio::select! {
                                                 biased;
@@ -466,7 +466,7 @@ impl DefaultTaskExecutor {
                             runtime_filters.as_deref(),
                             Some(trace.query_statistics_context()),
                         )?;
-                        let bytes_read = if program.instructions.is_empty() {
+                        let bytes_read = if program.is_empty() {
                             let mut source_next = next;
                             tokio::select! {
                             biased;
@@ -477,8 +477,8 @@ impl DefaultTaskExecutor {
                             }
                         }
                         } else {
-                            let vm = self.builder.build_view_vm(program, next)?;
-                            let mut source_next = vm;
+                            let expression_executor = self.builder.build_expression_executor(program, next)?;
+                            let mut source_next = expression_executor;
                             tokio::select! {
                             biased;
                             _ = cancel.cancelled() => Err(VeinError::cancelled()),
@@ -494,7 +494,7 @@ impl DefaultTaskExecutor {
                         bytes_read
                     }
                     PhysicalPlanOperator::Transform { input, program } => {
-                        let transform = self.builder.build_view_vm(program, next)?;
+                        let transform = self.builder.build_expression_executor(program, next)?;
                         let bytes = self
                             .execute_input(
                                 input,
@@ -600,7 +600,7 @@ impl DefaultTaskExecutor {
                             )?);
                         let next: Box<dyn PipelineNode<DataChunkView>> = match key_program {
                             Some(program) => {
-                                Box::new(TransformHandle(self.builder.build_view_vm(program, sort)?))
+                                Box::new(TransformHandle(self.builder.build_expression_executor(program, sort)?))
                             }
                             None => sort,
                         };

@@ -19,13 +19,13 @@ fn scan_leaf(schema: &Arc<types::VeinSchema>) -> Arc<PhysicalPlanNode> {
                 runtime_statistics: None,
             })),
             input_schema: Arc::clone(schema),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         },
     )
 }
 
 #[tokio::test]
-async fn scan_join_vm_aggregate_sort_preserve_passthrough_arrays_to_view_sink() {
+async fn scan_join_expression_aggregate_sort_preserve_passthrough_arrays_to_view_sink() {
     let builder = Arc::new(MultiFileFeedBuilder::new());
     let runner = DefaultTaskExecutor::new(builder.clone());
     let scan_schema = int64_schema();
@@ -52,25 +52,28 @@ async fn scan_join_vm_aggregate_sort_preserve_passthrough_arrays_to_view_sink() 
         Arc::clone(&transformed_schema),
         PhysicalPlanOperator::Transform {
             input: join,
-            program: Arc::new(MicroProgram {
-                register_count: 5,
-                instructions: vec![
-                    MicroOp::Add {
-                        dst: 2,
-                        src1: 0,
-                        src2: 1,
-                    },
-                    MicroOp::LoadConstant {
-                        dst: 3,
-                        value: types::LogicalLiteral::Int64(2),
-                    },
-                    MicroOp::CmpGt {
-                        dst: 4,
-                        src1: 2,
-                        src2: 3,
-                    },
-                    MicroOp::FilterMask { bool_reg: 4 },
-                    MicroOp::ProjectRegisters { out_regs: vec![0, 2] },
+            program: Arc::new(ExpressionProgram {
+                steps: vec![
+                    ExpressionStep::Projection(vec![
+                        column_expr(0, types::VeinDataType::Int64),
+                        column_expr(1, types::VeinDataType::Int64),
+                        binary_expr(
+                            BinaryExprOp::Add,
+                            column_expr(0, types::VeinDataType::Int64),
+                            column_expr(1, types::VeinDataType::Int64),
+                            types::VeinDataType::Int64,
+                        ),
+                    ]),
+                    ExpressionStep::Filter(binary_expr(
+                        BinaryExprOp::Greater,
+                        column_expr(2, types::VeinDataType::Int64),
+                        literal_expr(LogicalLiteral::Int64(2), types::VeinDataType::Int64),
+                        types::VeinDataType::Boolean,
+                    )),
+                    ExpressionStep::Projection(vec![
+                        column_expr(0, types::VeinDataType::Int64),
+                        column_expr(2, types::VeinDataType::Int64),
+                    ]),
                 ],
             }),
         },
@@ -125,7 +128,7 @@ async fn scan_join_vm_aggregate_sort_preserve_passthrough_arrays_to_view_sink() 
                 source_arrays
                     .iter()
                     .any(|source| std::ptr::eq(source.as_ref(), key_values)),
-                "group key must still reference a scan array after join, VM, aggregate, and sort"
+                "group key must still reference a scan array after join, expression, aggregate, and sort"
             );
             let (sum_array, sum_row) = batch.view().resolve(1, row).unwrap().unwrap();
             let sum_values = sum_array.as_any().downcast_ref::<Int64Array>().unwrap();

@@ -3,12 +3,15 @@ use std::sync::Arc;
 use arrow::array::{Array, BooleanArray, BooleanBuilder, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use common::protocol::{MicroOp, MicroProgram, ScanPredicate, ScanPredicateStage};
+use common::protocol::{
+    BinaryExprOp, ExprKind, PhysicalExpr, ScanPredicate, ScanPredicateStage,
+};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 use types::{ColumnId, LogicalLiteral, ResolvedColumn, VeinDataType, VeinSchema};
 
+use crate::expression::eval::{ExpressionKernelProvider, ExpressionKernelRegistry};
 use crate::operators::source::scan::parquet::metrics::ScanPredicateMetrics;
-use crate::runtime_filter::{RuntimeFilter, RuntimeFilterSet};
+use crate::runtime::filter::{RuntimeFilter, RuntimeFilterSet};
 use crate::udf::FunctionRegistry;
 
 use super::{ScanPredicateContext, build_scan_predicates};
@@ -71,14 +74,25 @@ fn compiled_scan_predicate_runs_as_narrow_parquet_filter_and_preserves_nulls() {
         predicate_count: 1,
         reorder_safe: true,
         input: Arc::new(VeinSchema::new(vec![Arc::clone(&key)])),
-        program: Arc::new(MicroProgram::new(3, vec![
-            MicroOp::LoadConstant { dst: 1, value: LogicalLiteral::Int64(7) },
-            MicroOp::CmpEq { dst: 2, src1: 0, src2: 1 },
-        ])),
-        result: 2,
+        predicate: PhysicalExpr {
+            return_type: VeinDataType::Boolean,
+            kind: ExprKind::Binary {
+                op: BinaryExprOp::Equal,
+                left: Box::new(PhysicalExpr {
+                    return_type: VeinDataType::Int64,
+                    kind: ExprKind::Column { index: 0 },
+                }),
+                right: Box::new(PhysicalExpr {
+                    return_type: VeinDataType::Int64,
+                    kind: ExprKind::Literal(LogicalLiteral::Int64(7)),
+                }),
+            },
+        },
     };
     let pushdown = ScanPredicate { predicate_count: 1, stages: vec![stage], statistics: vec![] };
     let metrics = Arc::new(ScanPredicateMetrics::default());
+    let expression_kernels: Arc<dyn ExpressionKernelProvider> =
+        Arc::new(ExpressionKernelRegistry::with_builtins());
     let pipeline = build_scan_predicates(ScanPredicateContext {
         arrow_schema: &arrow_schema,
         parquet_schema: &parquet_schema,
@@ -86,6 +100,7 @@ fn compiled_scan_predicate_runs_as_narrow_parquet_filter_and_preserves_nulls() {
         projected: &VeinSchema::new(vec![key]),
         pushdown: Some(&pushdown),
         registry: &Arc::new(FunctionRegistry::new()),
+        expression_kernels: &expression_kernels,
         detailed_metrics_enabled: true,
         predicate_metrics: &metrics,
         runtime_filters: &RuntimeFilterSet::empty(),
@@ -133,6 +148,8 @@ fn runtime_filters_bind_as_independent_narrow_parquet_predicates() {
         Arc::new(KeepColumnValue { column: ColumnId(10), expected: 2 }),
         Arc::new(KeepColumnValue { column: ColumnId(11), expected: 3 }),
     ]);
+    let expression_kernels: Arc<dyn ExpressionKernelProvider> =
+        Arc::new(ExpressionKernelRegistry::with_builtins());
     let pipeline = build_scan_predicates(ScanPredicateContext {
         arrow_schema: &arrow_schema,
         parquet_schema: &parquet_schema,
@@ -140,6 +157,7 @@ fn runtime_filters_bind_as_independent_narrow_parquet_predicates() {
         projected: &projected,
         pushdown: None,
         registry: &Arc::new(FunctionRegistry::new()),
+        expression_kernels: &expression_kernels,
         detailed_metrics_enabled: false,
         predicate_metrics: &Arc::new(ScanPredicateMetrics::default()),
         runtime_filters: &runtime_filters,

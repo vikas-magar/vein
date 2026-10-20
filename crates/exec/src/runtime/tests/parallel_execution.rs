@@ -22,7 +22,7 @@ async fn parallel_join_probe_combines_worker_local_aggregate_state() {
             runtime_statistics: None,
                 })),
                 input_schema: Arc::clone(&input_schema),
-                program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
             },
         )
     };
@@ -118,7 +118,7 @@ async fn multi_file_scan_cancellation_releases_workers_and_channel_senders() {
             runtime_statistics: None,
             })),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         },
     );
     task.plan = plan_with_input(&task, input);

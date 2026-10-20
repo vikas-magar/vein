@@ -591,10 +591,10 @@ fn operator_config(operator: &PhysicalPlanOperator) -> String {
                 common::protocol::DataSource::Memory => "memory",
                 common::protocol::DataSource::Intermediate(_) => "intermediate",
             };
-            format!("source={source_kind}, program_instructions={}", program.instructions.len())
+            format!("source={source_kind}, expression_steps={}", program.steps.len())
         }
         PhysicalPlanOperator::Transform { program, .. } => {
-            format!("program_instructions={}", program.instructions.len())
+            format!("expression_steps={}", program.steps.len())
         }
         PhysicalPlanOperator::Join { plan, .. } => format!(
             "join_type={:?}, probe_keys={:?}, build_keys={:?}, outputs={:?}",
@@ -608,9 +608,9 @@ fn operator_config(operator: &PhysicalPlanOperator) -> String {
             plan.grouping_sets.as_ref().map_or(0, Vec::len)
         ),
         PhysicalPlanOperator::Sort { plan, key_program, output_columns, .. } => format!(
-            "keys={:?}, computed_key_instructions={}, output_columns={output_columns}",
+            "keys={:?}, computed_key_steps={}, output_columns={output_columns}",
             plan.keys,
-            key_program.as_ref().map_or(0, |program| program.instructions.len())
+            key_program.as_ref().map_or(0, |program| program.steps.len())
         ),
         PhysicalPlanOperator::Limit { spec, .. } => {
             format!("offset={}, count={}", spec.offset, spec.count)
@@ -639,7 +639,7 @@ mod tests {
     use common::Result;
     use common::protocol::{
         AggOpCode, AggregatePlan, DataSource, JoinKind, JoinOutput, JoinPlan, LimitSpec,
-        MicroProgram, SortKey, SortPlan,
+        ExpressionProgram, SortKey, SortPlan,
     };
     use std::io::Write;
     use std::sync::Arc;
@@ -656,7 +656,7 @@ mod tests {
         node(PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::new(VeinSchema::empty()),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         })
     }
 
@@ -702,7 +702,7 @@ mod tests {
     fn stable_explain_describes_chained_joins_aggregate_sort_and_boundaries() {
         let filtered = node(PhysicalPlanOperator::Transform {
             input: source(),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         });
         let join_plan = || JoinPlan {
             join_type: JoinKind::Inner,

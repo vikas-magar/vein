@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
 use crate::pipeline::{DataChunk, DataChunkView, MaterializationReport};
-use crate::runtime_filter::{RuntimeFilter, RuntimeFilterBuildInput, RuntimeFilterFactory};
+use crate::runtime::filter::{RuntimeFilter, RuntimeFilterBuildInput, RuntimeFilterFactory};
 use common::Result;
 use error::VeinError;
 use types::{ColumnId, LogicalLiteral};
@@ -1081,9 +1081,9 @@ impl HashTable {
         let report = MaterializationReport::default();
         let inline_i64 = probe_keys.is_single_i64()
             && self
-                .keys_by_chunk
-                .first()
-                .is_some_and(ChunkKeys::is_single_i64);
+            .keys_by_chunk
+            .first()
+            .is_some_and(ChunkKeys::is_single_i64);
         for position in 0..probe.num_rows() {
             let row = position as u32;
             let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position, Some(probe))? else {
@@ -1097,24 +1097,24 @@ impl HashTable {
                 let entry = self.entries[head as usize];
                 let same = self.hashes[head as usize] == hash
                     && (if inline_i64 {
-                        let value = inline_key.ok_or_else(|| {
-                            VeinError::internal("single-Int64 probe key is missing its value")
-                        })?;
-                        self.keys_by_chunk[entry.chunk as usize]
-                            .single_i64_value(
-                                &self.chunks[entry.chunk as usize],
-                                entry.row as usize,
-                            )?
-                            == Some(value)
-                    } else {
-                        self.keys_by_chunk[entry.chunk as usize].equals(
-                            entry.row as usize,
+                    let value = inline_key.ok_or_else(|| {
+                        VeinError::internal("single-Int64 probe key is missing its value")
+                    })?;
+                    self.keys_by_chunk[entry.chunk as usize]
+                        .single_i64_value(
                             &self.chunks[entry.chunk as usize],
-                            &probe_keys,
-                            row as usize,
-                            probe,
+                            entry.row as usize,
                         )?
-                    });
+                        == Some(value)
+                } else {
+                    self.keys_by_chunk[entry.chunk as usize].equals(
+                        entry.row as usize,
+                        &self.chunks[entry.chunk as usize],
+                        &probe_keys,
+                        row as usize,
+                        probe,
+                    )?
+                });
                 if same {
                     matches.push((row, (entry.chunk, entry.row)));
                 }

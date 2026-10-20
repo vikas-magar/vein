@@ -1,6 +1,6 @@
 //! The default [`ExecutorBuilder`] implementation.
 //!
-//! Maps task descriptions onto concrete sources, sinks, and Vector VM execution.
+//! Maps task descriptions onto concrete sources, sinks, and typed expressions.
 
 mod scan_work;
 
@@ -10,24 +10,25 @@ use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
 
+use crate::memory::ExecutionResourceLimits;
+use crate::expression::executor::ExpressionExecutor;
+use crate::expression::{ExpressionKernelProvider, ExpressionKernelRegistry, ScalarFunctionProvider};
 use crate::operators::join::JoinBloomFilterFactory;
 use crate::operators::sink::{CollectSink, DiscardSink, WriteSink, WriteStorage};
-use crate::memory::ExecutionResourceLimits;
-use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};
-use crate::operators::source::scan::{PARQUET_FOOTER, ScanFile, ScanSourceConfig};
 use crate::operators::source::ScanSource;
-use crate::pipeline::{DataChunk, DataChunkView, PipelineNode, Sink, Source, Transform};
-use crate::runtime_filter::{
+use crate::operators::source::scan::{PARQUET_FOOTER, ScanFile, ScanSourceConfig};
+use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
+use crate::runtime::{ExecutorBuilder, MaterializeViewNode, split_scan_by_file};
+use crate::runtime::filter::{
     ConservativeRuntimeFilterPolicy, RuntimeFilterDecisionPolicy, RuntimeFilterFactory,
     RuntimeFilterSet,
 };
-use crate::runtime::{ExecutorBuilder, MaterializeViewNode, split_scan_by_file};
+use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};
 use crate::udf::FunctionRegistry;
-use crate::vm::VectorVmExecutor;
 use catalog::{MetadataKey, MetadataStore};
 use common::Result;
 use common::identifiers::TaskId;
-use common::protocol::{DataSink, DataSource, FileFormat, FileScanTask, MicroProgram};
+use common::protocol::{DataSink, DataSource, ExpressionProgram, FileFormat, FileScanTask};
 use common::statistics::{QueryStatisticsContext, RuntimeStatisticsStore};
 use error::VeinError;
 use opendal::Operator;
@@ -35,7 +36,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::file::metadata::ParquetMetaData;
 
 /// Builds a [`TaskExecutor`](crate::runtime::TaskExecutor) with configurable
-/// stages and Vector VM execution engine.
+/// stages and typed expression evaluator.
 ///
 /// `new()` wires the default implementation ([`DefaultExecutorBuilder`] with a
 /// default [`FunctionRegistry`]); the `with_*` methods override specific parts
@@ -43,6 +44,7 @@ use parquet::file::metadata::ParquetMetaData;
 pub struct TaskExecutorBuilder {
     builder: Arc<dyn ExecutorBuilder>,
     registry: Arc<FunctionRegistry>,
+    expression_kernels: Arc<dyn ExpressionKernelProvider>,
     storage: Option<Arc<dyn WriteStorage>>,
     metadata_store: MetadataStore,
     resource_limits: ExecutionResourceLimits,
@@ -53,12 +55,17 @@ pub struct TaskExecutorBuilder {
 }
 
 impl TaskExecutorBuilder {
-    /// Build a task executor with the default stages and Vector VM engine.
+    /// Builds a task executor with the default stages and expression kernels.
     pub fn new() -> Self {
         let registry = Arc::new(FunctionRegistry::new());
+        let expression_kernels: Arc<dyn ExpressionKernelProvider> =
+            Arc::new(ExpressionKernelRegistry::with_builtins());
+        let builder = DefaultExecutorBuilder::new(registry.clone())
+            .with_expression_kernels(Arc::clone(&expression_kernels));
         Self {
-            builder: Arc::new(DefaultExecutorBuilder::new(registry.clone())),
+            builder: Arc::new(builder),
             registry,
+            expression_kernels,
             storage: None,
             metadata_store: MetadataStore::new(),
             resource_limits: ExecutionResourceLimits::default(),
@@ -103,10 +110,7 @@ impl TaskExecutorBuilder {
     ///
     /// Source adapters still decide whether they can apply the resulting filter
     /// before decoding payload columns.
-    pub fn with_runtime_filter_factory(
-        mut self,
-        factory: Arc<dyn RuntimeFilterFactory>,
-    ) -> Self {
+    pub fn with_runtime_filter_factory(mut self, factory: Arc<dyn RuntimeFilterFactory>) -> Self {
         self.runtime_filter_factory = factory;
         self.rebuild_default();
         self
@@ -122,7 +126,7 @@ impl TaskExecutorBuilder {
         self
     }
 
-    /// Override the UDF function registry used by the Vector VM.
+    /// Overrides the UDF function registry used by expression calls.
     pub fn with_registry(mut self, registry: Arc<FunctionRegistry>) -> Self {
         self.registry = registry;
         self.rebuild_default();
@@ -136,15 +140,27 @@ impl TaskExecutorBuilder {
         self
     }
 
+    /// Injects a composed expression-kernel provider for all typed expression stages.
+    pub fn with_expression_kernels(
+        mut self,
+        kernels: Arc<dyn ExpressionKernelProvider>,
+    ) -> Self {
+        self.expression_kernels = kernels;
+        self.rebuild_default();
+        self
+    }
+
     fn rebuild_default(&mut self) {
         let mut builder = DefaultExecutorBuilder::new(self.registry.clone());
+        builder = builder.with_expression_kernels(Arc::clone(&self.expression_kernels));
         if let Some(storage) = &self.storage {
             builder = builder.with_write_storage(storage.clone());
         }
         builder = builder.with_metadata_store(self.metadata_store.clone());
         builder = builder.with_runtime_statistics_store(self.runtime_statistics.clone());
         builder = builder.with_runtime_filter_factory(Arc::clone(&self.runtime_filter_factory));
-        builder = builder.with_runtime_filter_decision_policy(Arc::clone(&self.runtime_filter_policy));
+        builder =
+            builder.with_runtime_filter_decision_policy(Arc::clone(&self.runtime_filter_policy));
         self.builder = Arc::new(builder);
     }
 
@@ -156,7 +172,10 @@ impl TaskExecutorBuilder {
 
     /// Build the task executor.
     pub fn build(self) -> crate::runtime::DefaultTaskExecutor {
-        crate::runtime::DefaultTaskExecutor::with_resource_limits(self.builder, self.resource_limits)
+        crate::runtime::DefaultTaskExecutor::with_resource_limits(
+            self.builder,
+            self.resource_limits,
+        )
             .with_spill_storage_factory(self.spill_storage_factory)
     }
 }
@@ -174,10 +193,10 @@ impl Default for TaskExecutorBuilder {
 /// without limit.
 const OPERATOR_CACHE_CAPACITY: usize = 64;
 
-/// The default executor builder: builds concrete sources, sinks, and the
-/// [`VectorVmExecutor`] from a wire task description.
+/// The default executor builder: builds concrete sources, sinks, and expression transforms.
 pub struct DefaultExecutorBuilder {
     registry: Arc<FunctionRegistry>,
+    expression_kernels: Arc<dyn ExpressionKernelProvider>,
     storage: Option<Arc<dyn WriteStorage>>,
     metadata_store: MetadataStore,
     runtime_filter_factory: Arc<dyn RuntimeFilterFactory>,
@@ -194,10 +213,11 @@ pub struct DefaultExecutorBuilder {
 }
 
 impl DefaultExecutorBuilder {
-    /// Create a builder with the given UDF function registry for the Vector VM.
+    /// Create a builder with the given scalar-function registry.
     pub fn new(registry: Arc<FunctionRegistry>) -> Self {
         Self {
             registry,
+            expression_kernels: Arc::new(ExpressionKernelRegistry::with_builtins()),
             storage: None,
             metadata_store: MetadataStore::new(),
             runtime_filter_factory: Arc::new(JoinBloomFilterFactory::default()),
@@ -205,6 +225,15 @@ impl DefaultExecutorBuilder {
             runtime_statistics: RuntimeStatisticsStore::default(),
             operators: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Injects the kernel provider used to dispatch typed expression nodes.
+    pub fn with_expression_kernels(
+        mut self,
+        kernels: Arc<dyn ExpressionKernelProvider>,
+    ) -> Self {
+        self.expression_kernels = kernels;
+        self
     }
 
     /// Attach a transactional table storage implementation.
@@ -226,10 +255,7 @@ impl DefaultExecutorBuilder {
     }
 
     /// Configure the strategy used to create query-local join filters.
-    pub fn with_runtime_filter_factory(
-        mut self,
-        factory: Arc<dyn RuntimeFilterFactory>,
-    ) -> Self {
+    pub fn with_runtime_filter_factory(mut self, factory: Arc<dyn RuntimeFilterFactory>) -> Self {
         self.runtime_filter_factory = factory;
         self
     }
@@ -283,6 +309,7 @@ impl DefaultExecutorBuilder {
                     runtime_filters: runtime_filters.clone(),
                     metadata_store: self.metadata_store.clone(),
                     registry: self.registry.clone(),
+                    expression_kernels: Arc::clone(&self.expression_kernels),
                     runtime_statistics: self.runtime_statistics.clone(),
                     statistics_scan: scan.runtime_statistics.clone(),
                 });
@@ -292,9 +319,9 @@ impl DefaultExecutorBuilder {
                 };
                 Ok(Box::new(source))
             }
-            DataSource::Stream(_) => Err(
-                VeinError::internal("this local executor supports only memory and Parquet sources"),
-            ),
+            DataSource::Stream(_) => Err(VeinError::internal(
+                "this local executor supports only memory and Parquet sources",
+            )),
         }
     }
 
@@ -339,7 +366,12 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         max_parallelism: usize,
         runtime_filters: Option<&RuntimeFilterSet>,
     ) -> Result<Vec<DataSource>> {
-        partition_source(source, &self.metadata_store, max_parallelism, runtime_filters)
+        partition_source(
+            source,
+            &self.metadata_store,
+            max_parallelism,
+            runtime_filters,
+        )
     }
 
     fn build_source(
@@ -382,9 +414,9 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         columns: &[types::ColumnId],
     ) -> bool {
         match source {
-            DataSource::File(scan) if scan.format == FileFormat::Parquet => columns.iter().all(|id| {
-                scan.projected.fields.iter().any(|column| column.id == *id)
-            }),
+            DataSource::File(scan) if scan.format == FileFormat::Parquet => columns
+                .iter()
+                .all(|id| scan.projected.fields.iter().any(|column| column.id == *id)),
             _ => false,
         }
     }
@@ -397,26 +429,16 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         Arc::clone(&self.runtime_filter_policy)
     }
 
-    fn build_vm(
+    fn build_expression_executor(
         &self,
-        program: &Arc<MicroProgram>,
-        next: Box<dyn PipelineNode<DataChunk>>,
-    ) -> Result<Box<dyn Transform<DataChunk>>> {
-        Ok(Box::new(VectorVmExecutor::new(
-            program.clone(),
-            self.registry.clone(),
-            next,
-        )))
-    }
-
-    fn build_view_vm(
-        &self,
-        program: &Arc<MicroProgram>,
+        program: &Arc<ExpressionProgram>,
         next: Box<dyn PipelineNode<DataChunkView>>,
     ) -> Result<Box<dyn Transform<DataChunkView>>> {
-        Ok(Box::new(VectorVmExecutor::<DataChunkView>::new_view(
-            program.clone(),
-            self.registry.clone(),
+        let functions: Arc<dyn ScalarFunctionProvider> = self.registry.clone();
+        Ok(Box::new(ExpressionExecutor::new(
+            Arc::clone(program),
+            Arc::clone(&self.expression_kernels),
+            functions,
             next,
         )))
     }
@@ -432,7 +454,8 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                     VeinError::internal("WRITE requires a configured table storage backend")
                 })?;
                 Ok(Box::new(MaterializeViewNode::new(
-                    Box::new(WriteSink::new(target.clone(), storage.clone())?), "storage",
+                    Box::new(WriteSink::new(target.clone(), storage.clone())?),
+                    "storage",
                 )))
             }
         }
@@ -444,12 +467,10 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         output: flume::Sender<RecordBatch>,
     ) -> Result<Box<dyn Sink<DataChunkView>>> {
         match sink {
-            DataSink::Client { schema } => {
-                Ok(Box::new(CollectSink::with_sender(
-                    Arc::new(schema.to_arrow()),
-                    output,
-                )))
-            }
+            DataSink::Client { schema } => Ok(Box::new(CollectSink::with_sender(
+                Arc::new(schema.to_arrow()),
+                output,
+            ))),
             _ => self.build_sink(sink),
         }
     }
@@ -533,13 +554,11 @@ fn partition_parquet_scan(
         footer_hits += 1;
         total_row_groups = total_row_groups.saturating_add(metadata.num_row_groups());
 
-        let arrow_metadata = ArrowReaderMetadata::try_new(
-            Arc::clone(&metadata),
-            ArrowReaderOptions::new(),
-        )
-            .map_err(|error| {
-                VeinError::internal(format!("Failed to derive Parquet scan schema: {error}"))
-            })?;
+        let arrow_metadata =
+            ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::new())
+                .map_err(|error| {
+                    VeinError::internal(format!("Failed to derive Parquet scan schema: {error}"))
+                })?;
         let candidates = crate::parquet_statistics::prune_row_groups(
             arrow_metadata.schema().as_ref(),
             &metadata,
@@ -547,14 +566,26 @@ fn partition_parquet_scan(
         );
         candidate_units = candidate_units.saturating_add(candidates.selected.len());
         if !candidates.selected.is_empty() {
-            let weights = candidates.selected.iter().map(|index| {
-                let group = metadata.row_group(*index);
-                let bytes = group.columns().iter().filter(|column| {
-                    scan.projected.fields.is_empty() || scan.projected.fields.iter()
-                        .any(|field| column.column_path().parts().first() == Some(&field.name))
-                }).fold(0_u64, |sum, column| sum.saturating_add(column.compressed_size().max(1) as u64));
-                bytes.max(1)
-            }).collect::<Vec<_>>();
+            let weights = candidates
+                .selected
+                .iter()
+                .map(|index| {
+                    let group = metadata.row_group(*index);
+                    let bytes = group
+                        .columns()
+                        .iter()
+                        .filter(|column| {
+                            scan.projected.fields.is_empty()
+                                || scan.projected.fields.iter().any(|field| {
+                                column.column_path().parts().first() == Some(&field.name)
+                            })
+                        })
+                        .fold(0_u64, |sum, column| {
+                            sum.saturating_add(column.compressed_size().max(1) as u64)
+                        });
+                    bytes.max(1)
+                })
+                .collect::<Vec<_>>();
             row_group_files.push((file, candidates.selected, weights));
         }
     }
@@ -562,10 +593,15 @@ fn partition_parquet_scan(
     // Keep one active and one ready morsel per worker. More work than workers
     // permits stealing while amortizing reader setup over adjacent row groups.
     // Compressed bytes cover only projected columns, including filter inputs.
-    let total_weight = row_group_files.iter().flat_map(|(_, _, weights)| weights)
+    let total_weight = row_group_files
+        .iter()
+        .flat_map(|(_, _, weights)| weights)
         .fold(0_u64, |sum, weight| sum.saturating_add(*weight));
-    let target_bytes = (max_parallelism > 1).then(|| total_weight
-        .div_ceil(max_parallelism.saturating_mul(2).max(1) as u64).max(1));
+    let target_bytes = (max_parallelism > 1).then(|| {
+        total_weight
+            .div_ceil(max_parallelism.saturating_mul(2).max(1) as u64)
+            .max(1)
+    });
     let mut work = whole_file_work;
     for (file, groups, weights) in row_group_files {
         for range in scan_work::row_group_ranges(groups.into_iter().zip(weights), target_bytes) {
@@ -593,7 +629,6 @@ fn partition_parquet_scan(
     Ok(work)
 }
 
-
 fn file_scan_work_unit(
     scan: &FileScanTask,
     file: &str,
@@ -605,7 +640,6 @@ fn file_scan_work_unit(
     work_unit.task_id = TaskId::new();
     DataSource::File(work_unit)
 }
-
 
 fn local_scan_paths(files: &[String]) -> Result<(PathBuf, Vec<String>)> {
     let paths = files
@@ -651,8 +685,8 @@ mod tests {
     fn write_row_groups(path: &Path, row_group_count: usize) -> ParquetMetaData {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let file = std::fs::File::create(path).expect("create Parquet file");
-        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
-            .expect("create Parquet writer");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("create Parquet writer");
         for row_group in 0..row_group_count {
             let first = (row_group * 2) as i64;
             let batch = RecordBatch::try_new(
@@ -671,7 +705,6 @@ mod tests {
             .expect("read Parquet footer");
         reader.metadata().as_ref().clone()
     }
-
 
     #[test]
     fn parquet_scan_partitions_cached_footer_by_available_parallelism() {
@@ -716,7 +749,7 @@ mod tests {
     #[test]
     fn runtime_join_key_bounds_prune_row_groups_before_scheduling() {
         use crate::memory::QueryMemoryTracker;
-        use crate::runtime_filter::RuntimeFilterBuildInput;
+        use crate::runtime::filter::RuntimeFilterBuildInput;
         use common::cancellation::CancellationToken;
         use types::{ColumnId, LogicalLiteral, ResolvedColumn, VeinDataType};
 
@@ -749,10 +782,7 @@ mod tests {
             .build_filters(RuntimeFilterBuildInput {
                 probe_columns: &[ColumnId(70)],
                 build_hashes: &build_hashes,
-                build_key_bounds: vec![Some((
-                    LogicalLiteral::Int64(2),
-                    LogicalLiteral::Int64(3),
-                ))],
+                build_key_bounds: vec![Some((LogicalLiteral::Int64(2), LogicalLiteral::Int64(3)))],
                 memory: &tracker,
             })
             .expect("build runtime join filters");
@@ -772,7 +802,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(ranges, vec![1..2], "only the row group spanning build bounds remains scheduled");
+        assert_eq!(
+            ranges,
+            vec![1..2],
+            "only the row group spanning build bounds remains scheduled"
+        );
     }
 
     #[test]
@@ -780,13 +814,15 @@ mod tests {
         for (file_count, groups_per_file, workers) in [(2, 5, 3), (5, 17, 8), (7, 3, 4)] {
             let dir = tempfile::tempdir().expect("temporary directory");
             let metadata_store = MetadataStore::new();
-            let files = (0..file_count).map(|index| {
-                let path = dir.path().join(format!("part-{index}.parquet"));
-                let metadata = Arc::new(write_row_groups(&path, groups_per_file));
-                let key = MetadataKey::for_file(PARQUET_FOOTER, &path).unwrap();
-                metadata_store.insert(key, metadata);
-                path.to_string_lossy().into_owned()
-            }).collect::<Vec<_>>();
+            let files = (0..file_count)
+                .map(|index| {
+                    let path = dir.path().join(format!("part-{index}.parquet"));
+                    let metadata = Arc::new(write_row_groups(&path, groups_per_file));
+                    let key = MetadataKey::for_file(PARQUET_FOOTER, &path).unwrap();
+                    metadata_store.insert(key, metadata);
+                    path.to_string_lossy().into_owned()
+                })
+                .collect::<Vec<_>>();
             let scan = FileScanTask {
                 files: files.clone(),
                 format: FileFormat::Parquet,
@@ -802,10 +838,17 @@ mod tests {
             let work = partition_parquet_scan(&scan, &metadata_store, workers, None).unwrap();
             assert!(work.len() > workers);
             for file in files {
-                let mut groups = work.iter().filter_map(|source| {
-                    let DataSource::File(task) = source else { panic!("expected file work") };
-                    (task.files == [file.clone()]).then(|| task.scan_unit_range.clone().unwrap())
-                }).flatten().collect::<Vec<_>>();
+                let mut groups = work
+                    .iter()
+                    .filter_map(|source| {
+                        let DataSource::File(task) = source else {
+                            panic!("expected file work")
+                        };
+                        (task.files == [file.clone()])
+                            .then(|| task.scan_unit_range.clone().unwrap())
+                    })
+                    .flatten()
+                    .collect::<Vec<_>>();
                 groups.sort_unstable();
                 assert_eq!(groups, (0..groups_per_file).collect::<Vec<_>>());
             }

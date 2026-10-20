@@ -5,7 +5,7 @@ async fn cancellation_aborts() {
     let mut task = task();
     let input = InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
     };
     set_input_plan(&mut task, input);
     let cancel = CancellationToken::new();
@@ -23,11 +23,11 @@ async fn runs_a_join_task() {
             input: Box::new(InputPlanFixture::Join {
                 probe: Box::new(InputPlanFixture::Pipeline {
                     source: DataSource::Memory,
-                    program: Arc::new(MicroProgram::empty()),
+                    program: Arc::new(ExpressionProgram::empty()),
                 }),
                 build: Box::new(InputPlanFixture::Pipeline {
                     source: DataSource::Memory,
-                    program: Arc::new(MicroProgram::empty()),
+                    program: Arc::new(ExpressionProgram::empty()),
                 }),
                 plan: JoinPlan {
                     join_type: JoinKind::Inner,
@@ -79,7 +79,7 @@ async fn runs_a_join_task() {
 async fn streams_chained_joins_between_hash_join_nodes() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+        program: Arc::new(ExpressionProgram::empty()),
     };
     let join_plan = || JoinPlan {
         join_type: JoinKind::Inner,
@@ -96,12 +96,7 @@ async fn streams_chained_joins_between_hash_join_nodes() {
             build: Box::new(leaf()),
             plan: join_plan(),
         }),
-        program: Arc::new(MicroProgram {
-            register_count: 2,
-            instructions: vec![common::protocol::MicroOp::ProjectRegisters {
-                out_regs: vec![0],
-            }],
-        }),
+        program: projection_program(vec![column_expr(0, types::VeinDataType::Int64)]),
     };
     let input = InputPlanFixture::Join {
         probe: Box::new(projected_inner),

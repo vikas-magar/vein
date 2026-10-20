@@ -1,6 +1,6 @@
 use super::support::{equality, test_column};
 use super::super::{DefaultPipelineStageBuilder, PipelineStageBuilder};
-use common::protocol::PhysicalPlanOperator;
+use common::protocol::{ExpressionStep, PhysicalPlanOperator};
 use plan::schema::VeinDataType;
 use plan::{LogicalExpr, LogicalPlan, SortKey as LogicalSortKey};
 use plan::schema::VeinSchema;
@@ -121,14 +121,14 @@ fn recursive_lowering_fuses_adjacent_transforms_above_join() {
         panic!("adjacent filter and projection should fuse into one transform");
     };
     assert!(matches!(join.operator, PhysicalPlanOperator::Join { .. }));
-    assert!(program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            common::protocol::MicroOp::FilterMask { .. }
-        )));
-    assert!(program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            common::protocol::MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 1
-        )));
+    assert!(program
+        .steps
+        .iter()
+        .any(|step| matches!(step, ExpressionStep::Filter(_))));
+    assert!(program.steps.iter().any(|step| matches!(
+        step,
+        ExpressionStep::Projection(expressions) if expressions.len() == 1
+    )));
 }
 
 #[test]
@@ -167,14 +167,14 @@ fn recursive_lowering_fuses_source_filter_and_projection_into_pipeline() {
     let PhysicalPlanOperator::Pipeline { program, .. } = &input.operator else {
         panic!("source row-wise operators should remain fused with the scan");
     };
-    assert!(program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            common::protocol::MicroOp::FilterMask { .. }
-        )));
-    assert!(program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            common::protocol::MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 1
-        )));
+    assert!(program
+        .steps
+        .iter()
+        .any(|step| matches!(step, ExpressionStep::Filter(_))));
+    assert!(program.steps.iter().any(|step| matches!(
+        step,
+        ExpressionStep::Projection(expressions) if expressions.len() == 1
+    )));
 }
 
 #[test]

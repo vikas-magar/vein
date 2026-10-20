@@ -5,7 +5,7 @@
 /// The physical plan builder subsystem.
 pub mod builder;
 
-/// The physical bytecode compiler and lowering engine.
+/// Typed scalar-expression and physical-plan lowering.
 pub mod compiler;
 
 /// Pipeline boundaries and dependencies derived from the canonical plan tree.

@@ -8,7 +8,7 @@ async fn aggregates_recursive_input_before_forwarding_batches() {
         InputPlanFixture::Aggregate {
             input: Box::new(InputPlanFixture::Pipeline {
                 source: DataSource::Memory,
-                program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
             }),
             plan: AggregatePlan {
                 groups: 0,
@@ -40,7 +40,7 @@ async fn aggregates_recursive_input_before_forwarding_batches() {
 async fn distinct_operator_removes_duplicate_rows_from_recursive_join() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
     };
     let mut task = task();
     set_input_plan(
@@ -97,7 +97,7 @@ async fn distinct_operator_removes_duplicate_rows_from_recursive_join() {
 async fn recursive_chained_joins_wait_for_each_build_pipeline() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
     };
     let join = || InputPlanFixture::Join {
         probe: Box::new(leaf()),

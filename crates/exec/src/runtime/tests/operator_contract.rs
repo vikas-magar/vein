@@ -7,7 +7,7 @@ fn whole_batch_adapter_checks_the_canonical_operator_contract() {
         operator: PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::new(types::VeinSchema::empty()),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         },
     });
     let aggregate_plan = AggregatePlan {

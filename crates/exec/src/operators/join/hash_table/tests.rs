@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
-use crate::runtime_filter::RuntimeFilterSet;
+use crate::runtime::filter::RuntimeFilterSet;
 
 use super::*;
 
@@ -101,7 +101,7 @@ fn row_key_encoding_hashes_composite_values_and_skips_null_keys() {
     let single_i64 = ChunkKeys::resolve_arrays(&[
         Arc::new(Int64Array::from(vec![Some(3), None])) as ArrayRef,
     ])
-    .expect("resolve single Int64 key");
+        .expect("resolve single Int64 key");
     let expected_i64_hash = fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET);
     assert_eq!(
         single_i64.hash_and_single_i64(0, None).unwrap(),
@@ -114,7 +114,7 @@ fn row_key_encoding_hashes_composite_values_and_skips_null_keys() {
         Arc::new(Int64Array::from(vec![Some(3), Some(3), None])) as ArrayRef,
         Arc::new(StringArray::from(vec![Some("north"), None, Some("north")])) as ArrayRef,
     ])
-    .expect("resolve composite key");
+        .expect("resolve composite key");
     let expected_composite_hash = fnv1a(
         b"north",
         fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET),
@@ -717,7 +717,7 @@ fn row_index_budget_failure_does_not_partially_insert_a_build_batch() {
         JoinKeys::new(vec![0]),
         sizing_tracker.clone(),
     )
-    .expect("create sizing table");
+        .expect("create sizing table");
     let initial_usage = sizing_tracker.used();
     sizing_table
         .insert_view(DataChunkView::from_chunk(chunk(Arc::clone(&first))).unwrap())

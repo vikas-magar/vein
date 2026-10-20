@@ -24,7 +24,7 @@ async fn view_and_arrow_results_share_execution_for_join_sort_limit() {
             runtime_statistics: None,
                 })),
                 input_schema: Arc::clone(&schema),
-                program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
             },
         )
     };

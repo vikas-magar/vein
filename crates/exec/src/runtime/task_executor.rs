@@ -1,162 +1,138 @@
-use async_trait::async_trait;
+//! Asynchronous execution contract for one physical task.
+
+use std::sync::Arc;
+
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::identifiers::{IntermediateSourceId, QueryId};
-use common::protocol::{DataSink, ExecuteTask};
+use common::protocol::ExecuteTask;
 use error::VeinError;
-use std::sync::{Arc, Mutex};
 
 use crate::operators::sink::ViewResultBatch;
-use crate::runtime::checkpoint::{CheckpointTaskResult, IntermediateRelation};
+use super::checkpoint;
+use super::{QueryExecutionResources, TaskResult};
 
-use super::{DefaultTaskExecutor, QueryExecutionResources, TaskExecutor, TaskResult};
-
+/// Executes a single task (`source -> transforms -> sink`) end-to-end.
+///
+/// This is the unit of work the distributed master schedules: the executor
+/// receives a self-contained [`ExecuteTask`] and runs it, returning its result.
+///
+/// Every future here is `Send`, so tasks can be dispatched onto a multi-threaded
+/// runtime and executed concurrently; nothing in the pipeline holds `!Send`
+/// state.
 #[async_trait]
-impl TaskExecutor for DefaultTaskExecutor {
+pub trait TaskExecutor: Send + Sync {
+    /// Create one resource scope for a multi-stage query execution.
+    ///
+    /// Executors that do not support query-wide accounting return an error;
+    /// callers can then keep the original single-stage plan.
     fn create_query_resources(
         &self,
-        cancel: CancellationToken,
-    ) -> common::Result<Arc<QueryExecutionResources>> {
-        let spill_storage = self.spill_storage_factory.create_for_query()?;
-        let memory = crate::memory::QueryMemoryTracker::with_spill_storage(
-            self.resource_limits,
-            cancel,
-            spill_storage,
-        );
-        Ok(Arc::new(QueryExecutionResources { memory }))
+        _cancel: CancellationToken,
+    ) -> Result<Arc<QueryExecutionResources>> {
+        Err(VeinError::unsupported(
+            "executor does not support query-scoped resources",
+            None,
+        ))
     }
 
-    async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult> {
-        self.execute_with_output(task, cancel, |builder, sink, _memory| builder.build_sink(sink))
-            .await
-    }
+    /// Run one task, driving its source through the operator chain.
+    async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult>;
 
+    /// Executes the same canonical plan while retaining client result views.
     async fn execute_views(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
-    ) -> Result<TaskResult<ViewResultBatch>> {
-        self.execute_with_output(task, cancel, |builder, sink, _memory| {
-            builder.build_view_result_sink(sink, None)
-        })
-            .await
-    }
+    ) -> Result<TaskResult<ViewResultBatch>>;
 
+    /// Runs a client-result task into a query-accounted, replayable checkpoint.
+    ///
+    /// This is the producer-side seam for multi-stage adaptive execution. The
+    /// checkpoint retains `DataChunkView`s while memory permits and spills via
+    /// the same tracker used by the task.
     async fn execute_to_checkpoint(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
-    ) -> Result<CheckpointTaskResult> {
-        let resources = self.create_query_resources(cancel.clone())?;
-        self.execute_to_checkpoint_with_resources(task, cancel, resources).await
-    }
+    ) -> Result<checkpoint::CheckpointTaskResult>;
 
+    /// Run a checkpoint producer with the query's shared memory/spill budget.
     async fn execute_to_checkpoint_with_resources(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
-        resources: Arc<QueryExecutionResources>,
-    ) -> Result<CheckpointTaskResult> {
-        let relation_slot = Arc::new(Mutex::new(None));
-        let slot = Arc::clone(&relation_slot);
-        let result = self
-            .execute_with_output_and_resources(
-                task,
-                cancel,
-                Some(Arc::clone(&resources)),
-                move |_builder, sink, memory| {
-                    let DataSink::Client { schema } = sink else {
-                        return Err(VeinError::planning(
-                            "checkpoint output requires a client-result task",
-                            None,
-                        ));
-                    };
-                    let relation = IntermediateRelation::new(
-                        Arc::new(schema.to_arrow()),
-                        memory.clone(),
-                    );
-                    *slot.lock().map_err(|_| {
-                        VeinError::internal("checkpoint result slot poisoned")
-                    })? = Some(relation.clone());
-                    Ok(Box::new(relation.sink()))
-                },
-            )
-            .await?;
-        let relation = relation_slot
-            .lock()
-            .map_err(|_| VeinError::internal("checkpoint result slot poisoned"))?
-            .take()
-            .ok_or_else(|| VeinError::internal("checkpoint task completed without a relation"))?;
-        Ok(CheckpointTaskResult {
-            relation,
-            row_count: result.row_count,
-            metrics: result.metrics,
-        })
+        _resources: Arc<QueryExecutionResources>,
+    ) -> Result<checkpoint::CheckpointTaskResult> {
+        self.execute_to_checkpoint(task, cancel).await
     }
 
+    /// Make a sealed query-local relation available to a later physical fragment.
+    ///
+    /// The returned guard owns the registration and removes it when dropped.
+    /// Custom executors may leave this unsupported until they implement runtime
+    /// source resolution.
     fn register_intermediate_source(
         &self,
-        query_id: QueryId,
-        source_id: IntermediateSourceId,
-        relation: IntermediateRelation,
-    ) -> common::Result<crate::runtime::checkpoint::IntermediateSourceRegistration> {
-        self.intermediate_sources.register(query_id, source_id, relation)
+        _query_id: QueryId,
+        _source_id: IntermediateSourceId,
+        _relation: checkpoint::IntermediateRelation,
+    ) -> Result<checkpoint::IntermediateSourceRegistration> {
+        Err(VeinError::unsupported(
+            "executor does not support query-local intermediate sources",
+            None,
+        ))
     }
 
+    /// Streams reference-backed results through a bounded channel.
     async fn execute_views_streaming(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
         output: flume::Sender<ViewResultBatch>,
-    ) -> Result<TaskResult<ViewResultBatch>> {
-        self.execute_with_output(task, cancel, move |builder, sink, _memory| {
-            builder.build_view_result_sink(sink, Some(output))
-        })
-            .await
-    }
+    ) -> Result<TaskResult<ViewResultBatch>>;
 
+    /// Stream a continuation using the same resource budget as earlier stages.
     async fn execute_views_streaming_with_resources(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
         output: flume::Sender<ViewResultBatch>,
-        resources: Arc<QueryExecutionResources>,
+        _resources: Arc<QueryExecutionResources>,
     ) -> Result<TaskResult<ViewResultBatch>> {
-        self.execute_with_output_and_resources(
-            task,
-            cancel,
-            Some(resources),
-            move |builder, sink, _memory| builder.build_view_result_sink(sink, Some(output)),
-        )
-            .await
+        self.execute_views_streaming(task, cancel, output).await
     }
 
+    /// Stream client batches using the query-wide memory and spill budget.
+    async fn execute_streaming_with_resources(
+        &self,
+        task: &ExecuteTask,
+        cancel: CancellationToken,
+        output: flume::Sender<RecordBatch>,
+        _resources: Arc<QueryExecutionResources>,
+    ) -> Result<TaskResult> {
+        self.execute_streaming(task, cancel, output).await
+    }
+
+    /// Execute a task while forwarding client batches through a bounded channel.
+    ///
+    /// The default adapter preserves compatibility for custom executors; the
+    /// default executor overrides this to avoid retaining the complete output.
     async fn execute_streaming(
         &self,
         task: &ExecuteTask,
         cancel: CancellationToken,
         output: flume::Sender<RecordBatch>,
     ) -> Result<TaskResult> {
-        self.execute_with_output(task, cancel, move |builder, sink, _memory| {
-            builder.build_streaming_sink(sink, output)
-        })
-            .await
-    }
-
-    async fn execute_streaming_with_resources(
-        &self,
-        task: &ExecuteTask,
-        cancel: CancellationToken,
-        output: flume::Sender<RecordBatch>,
-        resources: Arc<QueryExecutionResources>,
-    ) -> Result<TaskResult> {
-        self.execute_with_output_and_resources(
-            task,
-            cancel,
-            Some(resources),
-            move |builder, sink, _memory| builder.build_streaming_sink(sink, output),
-        )
-            .await
+        let mut result = self.execute(task, cancel).await?;
+        for batch in result.output.drain(..) {
+            output
+                .send_async(batch)
+                .await
+                .map_err(|e| VeinError::internal(format!("task output channel closed: {e}")))?;
+        }
+        Ok(result)
     }
 }

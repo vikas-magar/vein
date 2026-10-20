@@ -5,14 +5,16 @@ use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode};
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use common::Result;
-use common::protocol::{MicroOp, MicroProgram};
 use error::VeinError;
 
 use super::super::{HashTable, JoinKeys, JoinType, OutputColumn};
 use super::*;
 use crate::pipeline::DataChunk;
-use crate::udf::FunctionRegistry;
-use crate::vm::VectorVmExecutor;
+#[path = "tests/residual_support.rs"]
+mod residual_support;
+use residual_support::{
+    TestExpressionExecutor, expression_binary, expression_column, expression_filter,
+};
 
 #[derive(Clone, Default)]
 struct Collect(Arc<Mutex<Vec<DataChunk>>>);
@@ -126,25 +128,15 @@ fn selected_rows(chunk: &DataChunk) -> Vec<[Option<i64>; 4]> {
         .collect()
 }
 
-fn residual_greater_than_filter() -> (VectorVmExecutor<DataChunkView>, JoinFilterCollector) {
+fn residual_greater_than_filter() -> (TestExpressionExecutor, JoinFilterCollector) {
     let collector = JoinFilterCollector::default();
-    let program = Arc::new(MicroProgram::new(
-        3,
-        vec![
-            MicroOp::CmpGt {
-                dst: 2,
-                src1: 0,
-                src2: 1,
-            },
-            MicroOp::FilterMask { bool_reg: 2 },
-        ],
-    ));
-    let vm = VectorVmExecutor::<DataChunkView>::new_view(
-        program,
-        Arc::new(FunctionRegistry::new()),
-        Box::new(collector.clone()),
+    let predicate = expression_binary(
+        common::protocol::BinaryExprOp::Greater,
+        expression_column(0, types::VeinDataType::Int64),
+        expression_column(1, types::VeinDataType::Int64),
+        types::VeinDataType::Boolean,
     );
-    (vm, collector)
+    (expression_filter(predicate, collector.clone()), collector)
 }
 
 fn run_outer_join_with_residual(join_type: JoinType) -> Vec<[Option<i64>; 4]> {
@@ -157,7 +149,7 @@ fn run_outer_join_with_residual(join_type: JoinType) -> Vec<[Option<i64>; 4]> {
         .expect("build rows");
 
     let sink = Collect::default();
-    let (vm, collector) = residual_greater_than_filter();
+    let (residual_transform, collector) = residual_greater_than_filter();
     let mut join = HashJoin::new(
         Arc::new(table),
         join_type,
@@ -173,7 +165,7 @@ fn run_outer_join_with_residual(join_type: JoinType) -> Vec<[Option<i64>; 4]> {
     )
         .with_residual_filter(
             vec![OutputColumn::Probe(1), OutputColumn::Build(1)],
-            Box::new(vm),
+            Box::new(residual_transform),
             collector,
         );
 

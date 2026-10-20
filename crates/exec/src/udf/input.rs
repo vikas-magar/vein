@@ -4,21 +4,21 @@ use arrow::array::Array;
 use arrow::datatypes::DataType;
 use common::Result;
 
-use crate::vm::register::RegValue;
+use crate::expression::value::ExpressionValue;
 
 /// One UDF argument as a logical batch mapped onto existing Arrow storage.
 ///
-/// The wrapper borrows the VM register, so mapped source arrays and their memory
+/// The wrapper borrows the expression value, so mapped source arrays and memory
 /// leases stay alive for the duration of the UDF call. Resolving a row never
 /// gathers or copies its value.
 #[derive(Debug, Clone, Copy)]
 pub struct MappedUdfInput<'a> {
-    value: &'a RegValue,
+    value: &'a ExpressionValue,
     row_count: usize,
 }
 
 impl<'a> MappedUdfInput<'a> {
-    pub(crate) const fn new(value: &'a RegValue, row_count: usize) -> Self {
+    pub(crate) const fn new(value: &'a ExpressionValue, row_count: usize) -> Self {
         Self { value, row_count }
     }
 

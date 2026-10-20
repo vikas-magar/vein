@@ -927,7 +927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parquet_projection_keeps_filter_columns_and_compacts_vm_registers() {
+    async fn parquet_projection_keeps_filter_columns_and_compacts_predicate_input() {
         let root = tempfile::tempdir().expect("temporary data root");
         let table_dir = root.path().join("wide");
         std::fs::create_dir_all(&table_dir).expect("create table directory");

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::StringArray;
 use arrow::datatypes::DataType;
-use common::protocol::{MicroOp, MicroProgram};
+use common::protocol::{ExprKind, PhysicalExpr};
 
 use super::*;
 
@@ -17,23 +17,15 @@ fn not_like_residual_reads_declared_utf8_slots_independent_of_join_output() {
         .expect("insert build keys and residual patterns");
 
     let output = JoinFilterCollector::default();
-    let program = Arc::new(MicroProgram::new(
-        3,
-        vec![
-            MicroOp::Like {
-                dst: 2,
-                src: 0,
-                pattern: 1,
-                negated: true,
-            },
-            MicroOp::FilterMask { bool_reg: 2 },
-        ],
-    ));
-    let vm = VectorVmExecutor::<DataChunkView>::new_view(
-        program,
-        Arc::new(FunctionRegistry::new()),
-        Box::new(output.clone()),
-    );
+    let predicate = PhysicalExpr {
+        return_type: types::VeinDataType::Boolean,
+        kind: ExprKind::Like {
+            expr: Box::new(expression_column(0, types::VeinDataType::Utf8)),
+            pattern: Box::new(expression_column(1, types::VeinDataType::Utf8)),
+            negated: true,
+        },
+    };
+    let executor = expression_filter(predicate, output.clone());
     let sink = Collect::default();
     let mut join = HashJoin::new(
         Arc::new(table),
@@ -45,7 +37,7 @@ fn not_like_residual_reads_declared_utf8_slots_independent_of_join_output() {
     )
         .with_residual_filter(
             vec![OutputColumn::Probe(1), OutputColumn::Build(1)],
-            Box::new(vm),
+            Box::new(executor),
             output,
         );
 

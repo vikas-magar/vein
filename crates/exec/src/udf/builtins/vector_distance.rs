@@ -28,7 +28,7 @@ impl ScalarUDFImpl for VectorDistanceFunction {
                 "VECTOR_DISTANCE expects two arguments",
             ));
         };
-        crate::vm::ops::eval_cosine_distance(lhs, rhs)
+        crate::expression::kernels::eval_cosine_distance(lhs, rhs)
     }
 }
 

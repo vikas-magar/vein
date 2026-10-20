@@ -40,7 +40,7 @@ impl PipelineNode<DataChunk> for MaterializationCollector {
 pub(in crate::runtime::tests) fn full_join_spill_task() -> ExecuteTask {
     let input = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
     };
     let plan = JoinPlan {
         join_type: JoinKind::Full,

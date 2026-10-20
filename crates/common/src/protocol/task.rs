@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use types::VeinSchemaRef;
 
-use super::ir::{MicroProgram, RegId};
+use super::expression::{ExpressionProgram, PhysicalExpr};
 use crate::identifiers::{IntermediateSourceId, QueryId, RequestId, StageId, TaskId};
 use crate::statistics::QueryStatisticsContext;
 
@@ -23,9 +23,8 @@ pub enum FileFormat {
 
 /// A source predicate plan evaluated before projected rows are materialized.
 ///
-/// It is held as compiled Micro-IR so a source uses the same VM as the residual
-/// pipeline. Stages are applied in order, allowing a selective safe predicate to
-/// reduce the input to later stages without materializing conjunction arrays.
+/// Stages are applied in order, allowing a selective safe predicate to reduce
+/// the input to later stages without materializing conjunction arrays.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanPredicate {
     /// Number of logical conjuncts in the source predicate.
@@ -47,13 +46,10 @@ pub struct ScanPredicateStage {
     /// A missing value defaults to false so older serialized plans stay conservative.
     #[serde(default)]
     pub reorder_safe: bool,
-    /// Stage input columns, in register order: input column `i` is mounted into
-    /// VM register `i`.
+    /// Stage input columns in the order addressed by its expression tree.
     pub input: VeinSchemaRef,
-    /// Program computing this stage's boolean for one input batch.
-    pub program: Arc<MicroProgram>,
-    /// Register holding the boolean result.
-    pub result: RegId,
+    /// Boolean expression evaluated for one source batch.
+    pub predicate: PhysicalExpr,
 }
 
 /// Self-contained file scan instruction for an Executor.
@@ -187,7 +183,7 @@ impl PhysicalPlan {
             operator: PhysicalPlanOperator::Pipeline {
                 source: Arc::new(DataSource::Intermediate(source_id)),
                 input_schema: Arc::clone(&target.output_schema),
-                program: Arc::new(MicroProgram::empty()),
+                program: Arc::new(ExpressionProgram::empty()),
             },
         });
         let (continuation_root, replacements) = replace_plan_node(&self.root, target, &source);
@@ -334,21 +330,21 @@ pub struct PhysicalPlanNode {
 /// Physical operator semantics stored in the canonical plan tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PhysicalPlanOperator {
-    /// A data source and its source-local vector program.
+    /// A data source and its source-local expression pipeline.
     Pipeline {
         /// Source descriptor.
         source: Arc<DataSource>,
         /// Ordered columns emitted by the source before the program runs.
         input_schema: VeinSchemaRef,
-        /// Program applied to each source batch.
-        program: Arc<MicroProgram>,
+        /// Expressions applied to each source batch.
+        program: Arc<ExpressionProgram>,
     },
-    /// A vector program applied to a recursively produced input.
+    /// Expressions applied to a recursively produced input.
     Transform {
         /// Child input.
         input: Arc<PhysicalPlanNode>,
-        /// Program applied to the child batches.
-        program: Arc<MicroProgram>,
+        /// Expressions applied to the child batches.
+        program: Arc<ExpressionProgram>,
     },
     /// A hash join over probe and build inputs.
     Join {
@@ -379,8 +375,8 @@ pub enum PhysicalPlanOperator {
         input: Arc<PhysicalPlanNode>,
         /// Sort keys and their ordering semantics.
         plan: SortPlan,
-        /// Optional program that appends computed sort keys.
-        key_program: Option<Arc<MicroProgram>>,
+        /// Optional expression pipeline that appends computed sort keys.
+        key_program: Option<Arc<ExpressionProgram>>,
         /// Number of child columns to retain after removing helper keys.
         output_columns: u32,
     },
@@ -447,7 +443,7 @@ pub struct OperatorDataFlow {
 impl PhysicalPlanOperator {
     /// Derives the view/materialization contract from this canonical operator.
     ///
-    /// Kernel conversions are conditional: direct VM projections do not need
+    /// Kernel conversions are conditional: direct column projections do not need
     /// arrays, and Cross joins with no residual do not need hash-key conversion.
     /// Sort includes any computed-key program. Aggregate and DISTINCT kernels
     /// read only their required columns; grouping keys remain reference-backed.
@@ -650,8 +646,8 @@ pub struct JoinPlan {
 pub struct JoinResidualPlan {
     /// Columns gathered from the probe and build rows for predicate evaluation.
     pub input_columns: Vec<JoinOutput>,
-    /// VM program that filters candidate pairs in place through its selection.
-    pub program: Arc<MicroProgram>,
+    /// Typed expression steps that filter candidate pairs through a selection.
+    pub program: Arc<ExpressionProgram>,
 }
 
 /// The row window a task emits: skip `offset` rows, then emit at most `count`.
@@ -731,7 +727,7 @@ fn default_emit_empty_group() -> bool {
 mod tests {
     use super::{
         AggOpCode, AggregatePlan, DataSink, DataSource, InputMaterialization, JoinKind, JoinOutput,
-        JoinPlan, LimitSpec, MicroProgram, OutputRepresentation, PhysicalPlan, PhysicalPlanNode,
+        JoinPlan, LimitSpec, ExpressionProgram, OutputRepresentation, PhysicalPlan, PhysicalPlanNode,
         PhysicalPlanOperator, SortKey, SortPlan,
     };
     use crate::identifiers::IntermediateSourceId;
@@ -801,7 +797,7 @@ mod tests {
         let input = node(PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::new(VeinSchema::empty()),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         });
         for (sink, expected) in [
             (DataSink::Discard, InputMaterialization::None),
@@ -906,7 +902,7 @@ mod tests {
             node(PhysicalPlanOperator::Pipeline {
                 source: Arc::new(DataSource::Memory),
                 input_schema: Arc::new(VeinSchema::empty()),
-                program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
             })
         };
         let join = node(PhysicalPlanOperator::Join {
@@ -924,7 +920,7 @@ mod tests {
         });
         let transformed = node(PhysicalPlanOperator::Transform {
             input: join,
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         });
         let aggregated = node(PhysicalPlanOperator::Aggregate {
             input: transformed,
@@ -1006,7 +1002,7 @@ mod tests {
         let child = node(PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::new(VeinSchema::empty()),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         });
         let plan = PhysicalPlan {
             root: node(PhysicalPlanOperator::Limit {
@@ -1039,13 +1035,13 @@ mod tests {
         let source = node(PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         });
         let boundary = Arc::new(PhysicalPlanNode {
             output_schema: Arc::clone(&schema),
             operator: PhysicalPlanOperator::Transform {
                 input: source,
-                program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
             },
         });
         let plan = PhysicalPlan {

@@ -11,7 +11,7 @@ use super::{
 };
 
 impl DefaultPipelineStageBuilder {
-    /// A scan and its adjacent row-wise operators form one source VM segment.
+    /// A scan and its adjacent row-wise operators form one source pipeline segment.
     /// Keeping this segment fused avoids materializing intermediate batches.
     fn is_source_pipeline(plan: &LogicalPlan) -> bool {
         match plan {

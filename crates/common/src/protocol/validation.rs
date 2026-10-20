@@ -1,19 +1,20 @@
 //! Structural validation for the canonical physical plan.
 
-use std::collections::HashSet;
-
 use crate::{Result, VeinError};
 
 use super::{
-    ir::{MicroOp, MicroProgram, RegId},
+    expression::ExpressionProgram,
     task::{
         DataSink, DataSource, JoinOutput, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator,
     },
 };
 use types::VeinSchema;
 
+#[path = "validation/expression.rs"]
+mod expression_validation;
+
 impl PhysicalPlan {
-    /// Validates operator inputs, register references, and schema boundaries
+    /// Validates operator inputs, expression references, and schema boundaries
     /// throughout this plan before it is scheduled or executed.
     pub fn validate(&self) -> Result<()> {
         if !matches!(self.root.operator, PhysicalPlanOperator::Sink { .. }) {
@@ -374,203 +375,18 @@ fn validate_node(node: &PhysicalPlanNode, path: &str, root: bool) -> Result<()> 
     Ok(())
 }
 
-/// Checks register bounds and initialization without allocating by the declared
-/// register count. The set grows only for registers actually written by code.
 fn validate_program(
-    program: &MicroProgram,
+    program: &ExpressionProgram,
     input_schema: &VeinSchema,
     expected_output_width: Option<usize>,
     path: &str,
 ) -> Result<Option<usize>> {
-    let input_width = u32::try_from(input_schema.fields.len()).map_err(|_| {
-        invalid(
-            path,
-            "input schema has more columns than Micro-IR can address",
-        )
-    })?;
-    if !program.instructions.is_empty() && program.register_count < input_width {
-        return Err(invalid(
-            path,
-            format!(
-                "program declares {} registers for {} input columns ({input_schema})",
-                program.register_count,
-                input_schema.fields.len()
-            ),
-        ));
-    }
-    let mut initialized: HashSet<RegId> = if program.instructions.is_empty() {
-        HashSet::new()
-    } else {
-        (0..input_width).collect()
-    };
-    let mut projected_width = None;
-
-    for (index, instruction) in program.instructions.iter().enumerate() {
-        let op_path = format!("{path}.program[{index}]");
-        match instruction {
-            MicroOp::LoadConstant { dst, .. } => {
-                write_register(*dst, program, &mut initialized, &op_path)?
-            }
-            MicroOp::CopyRegister { dst, src }
-            | MicroOp::Cast { dst, src, .. }
-            | MicroOp::Neg { dst, src }
-            | MicroOp::Not { dst, src }
-            | MicroOp::IsNull { dst, src }
-            | MicroOp::IsNotNull { dst, src } => {
-                read_register(*src, program, &initialized, &op_path)?;
-                write_register(*dst, program, &mut initialized, &op_path)?;
-            }
-            MicroOp::Add { dst, src1, src2 }
-            | MicroOp::Sub { dst, src1, src2 }
-            | MicroOp::Mul { dst, src1, src2 }
-            | MicroOp::Div { dst, src1, src2 }
-            | MicroOp::Mod { dst, src1, src2 }
-            | MicroOp::CmpEq { dst, src1, src2 }
-            | MicroOp::CmpNeq { dst, src1, src2 }
-            | MicroOp::CmpLt { dst, src1, src2 }
-            | MicroOp::CmpLte { dst, src1, src2 }
-            | MicroOp::CmpGt { dst, src1, src2 }
-            | MicroOp::CmpGte { dst, src1, src2 }
-            | MicroOp::And { dst, src1, src2 }
-            | MicroOp::Or { dst, src1, src2 }
-            | MicroOp::VectorCosineDistance { dst, src1, src2 }
-            | MicroOp::VectorL2Distance { dst, src1, src2 }
-            | MicroOp::VectorDotProduct { dst, src1, src2 } => {
-                read_register(*src1, program, &initialized, &op_path)?;
-                read_register(*src2, program, &initialized, &op_path)?;
-                write_register(*dst, program, &mut initialized, &op_path)?;
-            }
-            MicroOp::Like {
-                dst, src, pattern, ..
-            } => {
-                read_register(*src, program, &initialized, &op_path)?;
-                read_register(*pattern, program, &initialized, &op_path)?;
-                write_register(*dst, program, &mut initialized, &op_path)?;
-            }
-            MicroOp::InList {
-                dst,
-                value,
-                candidates,
-                ..
-            } => {
-                read_register(*value, program, &initialized, &op_path)?;
-                for &candidate in candidates {
-                    read_register(candidate, program, &initialized, &op_path)?;
-                }
-                write_register(*dst, program, &mut initialized, &op_path)?;
-            }
-            MicroOp::Case {
-                dst,
-                when_regs,
-                then_regs,
-                else_reg,
-                ..
-            } => {
-                if when_regs.len() != then_regs.len() {
-                    return Err(invalid(&op_path, "CASE condition and result counts differ"));
-                }
-                for &reg in when_regs.iter().chain(then_regs) {
-                    read_register(reg, program, &initialized, &op_path)?;
-                }
-                if let Some(reg) = else_reg {
-                    read_register(*reg, program, &initialized, &op_path)?;
-                }
-                write_register(*dst, program, &mut initialized, &op_path)?;
-            }
-            MicroOp::CallUdf { dst, arg_regs, .. } => {
-                for &reg in arg_regs {
-                    read_register(reg, program, &initialized, &op_path)?;
-                }
-                write_register(*dst, program, &mut initialized, &op_path)?;
-            }
-            MicroOp::FilterMask { bool_reg } => {
-                read_register(*bool_reg, program, &initialized, &op_path)?;
-            }
-            MicroOp::ProjectRegisters { out_regs } => {
-                for &reg in out_regs {
-                    read_register(reg, program, &initialized, &op_path)?;
-                }
-                projected_width = Some(out_regs.len());
-            }
-            MicroOp::StateBuild {
-                key_regs,
-                payload_regs,
-                ..
-            } => {
-                for &reg in key_regs.iter().chain(payload_regs) {
-                    read_register(reg, program, &initialized, &op_path)?;
-                }
-            }
-            MicroOp::StateProbe {
-                key_regs, out_regs, ..
-            } => {
-                for &reg in key_regs {
-                    read_register(reg, program, &initialized, &op_path)?;
-                }
-                for &reg in out_regs {
-                    write_register(reg, program, &mut initialized, &op_path)?;
-                }
-            }
-            MicroOp::StateFold { agg_regs, .. } => {
-                for &reg in agg_regs {
-                    read_register(reg, program, &initialized, &op_path)?;
-                }
-            }
-        }
-    }
-
-    let output_width = projected_width.unwrap_or(input_schema.fields.len());
-    if let Some(expected) = expected_output_width
-        && output_width != expected {
-            return Err(invalid(
-                path,
-                format!("program emits {output_width} columns but node schema has {expected}"),
-            ));
-        }
-    Ok(projected_width)
-}
-
-fn read_register(
-    register: RegId,
-    program: &MicroProgram,
-    initialized: &HashSet<RegId>,
-    path: &str,
-) -> Result<()> {
-    if register >= program.register_count {
-        return Err(invalid(
-            path,
-            format!(
-                "read of register {register} exceeds register count {}",
-                program.register_count
-            ),
-        ));
-    }
-    if !initialized.contains(&register) {
-        return Err(invalid(
-            path,
-            format!("read of uninitialized register {register}"),
-        ));
-    }
-    Ok(())
-}
-
-fn write_register(
-    register: RegId,
-    program: &MicroProgram,
-    initialized: &mut HashSet<RegId>,
-    path: &str,
-) -> Result<()> {
-    if register >= program.register_count {
-        return Err(invalid(
-            path,
-            format!(
-                "write of register {register} exceeds register count {}",
-                program.register_count
-            ),
-        ));
-    }
-    initialized.insert(register);
-    Ok(())
+    expression_validation::validate_program(
+        program,
+        input_schema,
+        expected_output_width,
+        path,
+    )
 }
 
 fn check_column_index(index: u32, width: usize, path: &str, role: &str) -> Result<()> {
@@ -614,7 +430,8 @@ fn invalid(path: &str, message: impl std::fmt::Display) -> VeinError {
 mod tests {
     use super::*;
     use crate::protocol::{
-        AggregatePlan, DataSource, JoinKind, JoinPlan, LimitSpec, PhysicalPlanNode, SortPlan,
+        AggregatePlan, DataSource, ExprKind, ExpressionProgram, ExpressionStep, JoinKind,
+        JoinPlan, LimitSpec, PhysicalExpr, PhysicalPlanNode, SortPlan,
     };
     use std::sync::Arc;
     use types::{ColumnId, ResolvedColumn, VeinDataType};
@@ -635,7 +452,7 @@ mod tests {
         })
     }
 
-    fn pipeline(schema: Arc<VeinSchema>, program: MicroProgram) -> Arc<PhysicalPlanNode> {
+    fn pipeline(schema: Arc<VeinSchema>, program: ExpressionProgram) -> Arc<PhysicalPlanNode> {
         node(
             Arc::clone(&schema),
             PhysicalPlanOperator::Pipeline {
@@ -661,7 +478,7 @@ mod tests {
     #[test]
     fn validates_recursive_passthrough_and_sink_schema_contracts() {
         let schema = schema("value");
-        let source = pipeline(Arc::clone(&schema), MicroProgram::new(1, Vec::new()));
+        let source = pipeline(Arc::clone(&schema), ExpressionProgram::empty());
         let limited = node(
             Arc::clone(&schema),
             PhysicalPlanOperator::Limit {
@@ -679,73 +496,74 @@ mod tests {
     }
 
     #[test]
-    fn accepts_zero_register_program_as_input_passthrough() {
+    fn accepts_empty_expression_pipeline_as_input_passthrough() {
         let schema = schema("value");
-        let source = pipeline(Arc::clone(&schema), MicroProgram::empty());
+        let source = pipeline(Arc::clone(&schema), ExpressionProgram::empty());
 
         client_plan(source, Arc::clone(&schema))
             .validate()
-            .expect("an empty program passes through its input without registers");
+            .expect("an empty expression pipeline passes through its input");
     }
 
     #[test]
-    fn accepts_vm_instructions_after_projection() {
+    fn validates_filter_and_projection_expression_steps() {
         let schema = schema("value");
+        let input = PhysicalExpr {
+            return_type: VeinDataType::Int64,
+            kind: ExprKind::Column { index: 0 },
+        };
+        let predicate = PhysicalExpr {
+            return_type: VeinDataType::Boolean,
+            kind: ExprKind::Binary {
+                op: crate::protocol::BinaryExprOp::Greater,
+                left: Box::new(input.clone()),
+                right: Box::new(PhysicalExpr {
+                    return_type: VeinDataType::Int64,
+                    kind: ExprKind::Literal(types::LogicalLiteral::Int64(0)),
+                }),
+            },
+        };
         let source = pipeline(
             Arc::clone(&schema),
-            MicroProgram::new(
-                3,
-                vec![
-                    MicroOp::ProjectRegisters { out_regs: vec![0] },
-                    MicroOp::LoadConstant {
-                        dst: 1,
-                        value: types::LogicalLiteral::Int64(1),
-                    },
-                    MicroOp::Add {
-                        dst: 2,
-                        src1: 0,
-                        src2: 1,
-                    },
+            ExpressionProgram {
+                steps: vec![
+                    ExpressionStep::Filter(predicate),
+                    ExpressionStep::Projection(vec![input]),
                 ],
-            ),
+            },
         );
 
         client_plan(source, schema)
             .validate()
-            .expect("projection updates the output layout without ending register execution");
+            .expect("typed filter and projection steps preserve their ordered schema");
     }
 
     #[test]
-    fn reports_uninitialized_source_register_with_recursive_operator_path() {
+    fn rejects_expression_column_outside_the_current_schema() {
         let schema = schema("available_column");
         let source = pipeline(
             Arc::clone(&schema),
-            MicroProgram::new(2, vec![MicroOp::ProjectRegisters { out_regs: vec![1] }]),
-        );
-        let limited = node(
-            Arc::clone(&schema),
-            PhysicalPlanOperator::Limit {
-                input: source,
-                spec: LimitSpec {
-                    offset: 0,
-                    count: 1,
-                },
+            ExpressionProgram {
+                steps: vec![ExpressionStep::Projection(vec![PhysicalExpr {
+                    return_type: VeinDataType::Int64,
+                    kind: ExprKind::Column { index: 1 },
+                }])],
             },
         );
 
-        let error = client_plan(limited, schema)
+        let error = client_plan(source, schema)
             .validate()
-            .expect_err("a program cannot project an unproduced input column");
+            .expect_err("an expression cannot refer outside the current input schema");
         let message = error.to_string();
-        assert!(message.contains("root.input.input.program[0]"), "{message}");
-        assert!(message.contains("uninitialized register 1"), "{message}");
+        assert!(message.contains("root.input.steps[0].projection[0]"), "{message}");
+        assert!(message.contains("column 1 is outside schema width 1"), "{message}");
     }
 
     #[test]
     fn rejects_join_key_positions_outside_recursive_child_schema() {
         let side_schema = schema("key");
-        let probe = pipeline(Arc::clone(&side_schema), MicroProgram::new(1, Vec::new()));
-        let build = pipeline(Arc::clone(&side_schema), MicroProgram::new(1, Vec::new()));
+        let probe = pipeline(Arc::clone(&side_schema), ExpressionProgram::empty());
+        let build = pipeline(Arc::clone(&side_schema), ExpressionProgram::empty());
         let joined = node(
             Arc::clone(&side_schema),
             PhysicalPlanOperator::Join {
@@ -772,8 +590,8 @@ mod tests {
     #[test]
     fn validates_join_output_positions_nullability_and_repeated_columns() {
         let input_schema = schema("key");
-        let probe = pipeline(Arc::clone(&input_schema), MicroProgram::new(1, Vec::new()));
-        let build = pipeline(Arc::clone(&input_schema), MicroProgram::new(1, Vec::new()));
+        let probe = pipeline(Arc::clone(&input_schema), ExpressionProgram::empty());
+        let build = pipeline(Arc::clone(&input_schema), ExpressionProgram::empty());
         let output_schema = Arc::new(VeinSchema::new(vec![
             Arc::new(ResolvedColumn::new(
                 ColumnId(1),
@@ -869,7 +687,7 @@ mod tests {
         let aggregate = node(
             Arc::clone(&schema),
             PhysicalPlanOperator::Aggregate {
-                input: pipeline(Arc::clone(&schema), MicroProgram::new(1, Vec::new())),
+                input: pipeline(Arc::clone(&schema), ExpressionProgram::empty()),
                 plan: AggregatePlan {
                     groups: 1,
                     estimated_groups: None,
@@ -889,7 +707,7 @@ mod tests {
         let sorted = node(
             Arc::clone(&schema),
             PhysicalPlanOperator::Sort {
-                input: pipeline(Arc::clone(&schema), MicroProgram::new(1, Vec::new())),
+                input: pipeline(Arc::clone(&schema), ExpressionProgram::empty()),
                 plan: SortPlan {
                     keys: vec![crate::protocol::SortKey {
                         column: 1,
@@ -910,7 +728,7 @@ mod tests {
     #[test]
     fn rejects_non_sink_root_and_malformed_aggregate_widths() {
         let schema = schema("value");
-        let source = pipeline(Arc::clone(&schema), MicroProgram::new(1, Vec::new()));
+        let source = pipeline(Arc::clone(&schema), ExpressionProgram::empty());
         let rootless = PhysicalPlan {
             root: node(
                 Arc::clone(&schema),
@@ -933,7 +751,7 @@ mod tests {
         let aggregate = node(
             Arc::clone(&schema),
             PhysicalPlanOperator::Aggregate {
-                input: pipeline(Arc::clone(&schema), MicroProgram::new(1, Vec::new())),
+                input: pipeline(Arc::clone(&schema), ExpressionProgram::empty()),
                 plan: AggregatePlan {
                     groups: 1,
                     estimated_groups: None,
@@ -961,7 +779,7 @@ mod tests {
         let valid = node(
             Arc::clone(&schema),
             PhysicalPlanOperator::Distinct {
-                input: pipeline(Arc::clone(&schema), MicroProgram::new(1, Vec::new())),
+                input: pipeline(Arc::clone(&schema), ExpressionProgram::empty()),
                 plan: AggregatePlan {
                     groups: 1,
                     estimated_groups: None,
@@ -981,7 +799,7 @@ mod tests {
         let zero_column_distinct = node(
             Arc::clone(&empty_schema),
             PhysicalPlanOperator::Distinct {
-                input: pipeline(Arc::clone(&empty_schema), MicroProgram::new(0, Vec::new())),
+                input: pipeline(Arc::clone(&empty_schema), ExpressionProgram::empty()),
                 plan: AggregatePlan {
                     groups: 0,
                     estimated_groups: None,
@@ -1000,7 +818,7 @@ mod tests {
         let malformed = node(
             Arc::clone(&schema),
             PhysicalPlanOperator::Distinct {
-                input: pipeline(Arc::clone(&schema), MicroProgram::new(1, Vec::new())),
+                input: pipeline(Arc::clone(&schema), ExpressionProgram::empty()),
                 plan: AggregatePlan {
                     groups: 1,
                     estimated_groups: None,

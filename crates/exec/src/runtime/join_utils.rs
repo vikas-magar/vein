@@ -22,7 +22,7 @@ pub(super) fn direct_scan_probe_columns<'a>(
     else {
         return None;
     };
-    if !program.instructions.is_empty() {
+    if !program.is_empty() {
         return None;
     }
     let DataSource::File(scan) = source.as_ref() else {

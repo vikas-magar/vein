@@ -22,7 +22,7 @@ async fn multi_file_scan_uses_bounded_zero_copy_fan_in_on_current_thread_runtime
                 runtime_statistics: None,
             })),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         },
     );
     task.plan = plan_with_input(&task, input);
@@ -98,21 +98,21 @@ async fn intermediate_physical_source_replays_registered_checkpoint_views() {
         PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         },
     );
     let boundary = plan_node(
         Arc::clone(&schema),
         PhysicalPlanOperator::Transform {
             input: base,
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         },
     );
     let downstream = plan_node(
         Arc::clone(&schema),
         PhysicalPlanOperator::Transform {
             input: Arc::clone(&boundary),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         },
     );
     let plan = PhysicalPlan {
@@ -194,7 +194,7 @@ async fn multi_file_worker_failure_is_returned_without_waiting_on_blocked_sender
                 runtime_statistics: None,
             })),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram::empty()),
+                    program: Arc::new(ExpressionProgram::empty()),
         },
     );
     task.plan = plan_with_input(&task, input);

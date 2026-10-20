@@ -1,5 +1,6 @@
 use super::*;
-use crate::runtime_filter::RuntimeFilter;
+use crate::expression::eval::ExpressionKernelRegistry;
+use crate::runtime::filter::RuntimeFilter;
 use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -73,6 +74,7 @@ pub(super) fn scan_over(dir: &std::path::Path, files: &[(&str, PathBuf)]) -> Sca
         runtime_filters: RuntimeFilterSet::empty(),
         metadata_store: MetadataStore::new(),
         registry: Arc::new(FunctionRegistry::new()),
+        expression_kernels: Arc::new(ExpressionKernelRegistry::with_builtins()),
         runtime_statistics: RuntimeStatisticsStore::default(),
         statistics_scan: None,
     })

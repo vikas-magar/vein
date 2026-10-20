@@ -5,10 +5,11 @@ use arrow::array::Array;
 use common::identifiers::{QueryId, RequestId, StageId, TaskId};
 use common::protocol::{
     AggOpCode, AggregatePlan, ExecutionMode, FileFormat, FileScanTask, JoinKind, JoinOutput,
-    JoinPlan, LimitSpec, MicroOp, MicroProgram, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator,
-    SortKey, SortPlan,
+    BinaryExprOp, ExprKind, ExpressionProgram, ExpressionStep, JoinPlan, LimitSpec,
+    PhysicalExpr, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator, SortKey, SortPlan,
 };
 use std::sync::atomic::AtomicUsize;
+use types::{LogicalLiteral, VeinDataType};
 
 mod fixtures;
 mod fan_in;
@@ -25,6 +26,43 @@ mod task_output;
 mod view_contract;
 mod view_streaming;
 mod zero_copy_e2e;
-mod vm_fusion;
+mod expression_pipeline;
 
 pub(in crate::runtime::tests) use fixtures::*;
+
+pub(in crate::runtime::tests) fn column_expr(index: u32, return_type: VeinDataType) -> PhysicalExpr {
+    PhysicalExpr { return_type, kind: ExprKind::Column { index } }
+}
+
+pub(in crate::runtime::tests) fn literal_expr(
+    value: LogicalLiteral,
+    return_type: VeinDataType,
+) -> PhysicalExpr {
+    PhysicalExpr { return_type, kind: ExprKind::Literal(value) }
+}
+
+pub(in crate::runtime::tests) fn binary_expr(
+    op: BinaryExprOp,
+    left: PhysicalExpr,
+    right: PhysicalExpr,
+    return_type: VeinDataType,
+) -> PhysicalExpr {
+    PhysicalExpr {
+        return_type,
+        kind: ExprKind::Binary { op, left: Box::new(left), right: Box::new(right) },
+    }
+}
+
+pub(in crate::runtime::tests) fn filter_program(predicate: PhysicalExpr) -> Arc<ExpressionProgram> {
+    Arc::new(ExpressionProgram {
+        steps: vec![ExpressionStep::Filter(predicate)],
+    })
+}
+
+pub(in crate::runtime::tests) fn projection_program(
+    expressions: Vec<PhysicalExpr>,
+) -> Arc<ExpressionProgram> {
+    Arc::new(ExpressionProgram {
+        steps: vec![ExpressionStep::Projection(expressions)],
+    })
+}

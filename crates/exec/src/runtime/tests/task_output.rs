@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn filters_aggregate_output_in_the_post_aggregate_vm() {
+async fn filters_aggregate_output_in_the_post_aggregate_expression_pipeline() {
     let task = aggregate_task_with_post_filter(4);
     let result = runner()
         .execute(&task, CancellationToken::new())
@@ -38,10 +38,7 @@ async fn sorts_task_output_before_applying_limit() {
         PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram {
-                register_count: 1,
-                instructions: vec![MicroOp::ProjectRegisters { out_regs: vec![0] }],
-            }),
+            program: projection_program(vec![column_expr(0, types::VeinDataType::Int64)]),
         },
     );
     let sorted = plan_node(
@@ -111,10 +108,7 @@ async fn runs_empty_global_count_as_one_zero_row() {
         PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram {
-                register_count: 1,
-                instructions: vec![MicroOp::ProjectRegisters { out_regs: vec![0] }],
-            }),
+            program: projection_program(vec![column_expr(0, types::VeinDataType::Int64)]),
         },
     );
     let aggregate = plan_node(

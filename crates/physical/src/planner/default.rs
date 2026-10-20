@@ -178,7 +178,7 @@ mod tests {
             _plan: &LogicalPlan,
         ) -> Result<(
             common::protocol::DataSource,
-            common::protocol::MicroProgram,
+            common::protocol::ExpressionProgram,
             plan::schema::VeinSchema,
             plan::schema::VeinSchema,
         )> {
@@ -271,7 +271,10 @@ mod tests {
         let common::protocol::PhysicalPlanOperator::Pipeline { program, .. } = &input.operator else {
             panic!("scan-only plan should lower to a pipeline");
         };
-        assert_eq!(program.register_count, 2);
+        assert!(program.steps.iter().any(|step| matches!(
+            step,
+            common::protocol::ExpressionStep::Projection(columns) if columns.len() == 2
+        )));
     }
 
     #[test]
@@ -549,11 +552,24 @@ mod tests {
             common::protocol::PhysicalPlanOperator::Aggregate { .. }
         ));
         assert!(
-            program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::Add { .. })),
+            program.steps.iter().any(|step| matches!(
+                step,
+                common::protocol::ExpressionStep::Projection(expressions)
+                    if expressions.iter().any(|expression| matches!(
+                        expression.kind,
+                        common::protocol::ExprKind::Binary {
+                            op: common::protocol::BinaryExprOp::Add,
+                            ..
+                        }
+                    ))
+            )),
             "computed projection must run against aggregate output"
         );
         assert!(
-            program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 2)),
+            program.steps.iter().any(|step| matches!(
+                step,
+                common::protocol::ExpressionStep::Projection(expressions) if expressions.len() == 2
+            )),
             "projection must preserve both aliased output columns"
         );
 
@@ -583,7 +599,7 @@ mod tests {
             common::protocol::PhysicalPlanOperator::Aggregate { .. }
         ));
         assert!(
-            program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::FilterMask { .. })),
+            program.steps.iter().any(|step| matches!(step, common::protocol::ExpressionStep::Filter(_))),
             "HAVING transform must contain its filter instruction"
         );
     }
@@ -632,9 +648,9 @@ mod tests {
         let common::protocol::PhysicalPlanOperator::Transform { input, program } = &input.operator else {
             panic!("post-aggregate filter should be a transform node");
         };
-        assert!(program.instructions.iter().any(|op| matches!(
-            op,
-            common::protocol::MicroOp::FilterMask { .. }
+        assert!(program.steps.iter().any(|step| matches!(
+            step,
+            common::protocol::ExpressionStep::Filter(_)
         )));
         let common::protocol::PhysicalPlanOperator::Aggregate { input, .. } = &input.operator else {
             panic!("post-aggregate filter should follow an aggregate node");
@@ -645,9 +661,9 @@ mod tests {
         let common::protocol::PhysicalPlanOperator::Pipeline { program, .. } = &input.operator else {
             panic!("the aggregate input transform should consume the scan pipeline");
         };
-        assert!(program.instructions.iter().all(|op| !matches!(
-            op,
-            common::protocol::MicroOp::FilterMask { .. }
+        assert!(program.steps.iter().all(|step| !matches!(
+            step,
+            common::protocol::ExpressionStep::Filter(_)
         )));
     }
 
@@ -975,9 +991,9 @@ mod tests {
             &input.operator,
             common::protocol::PhysicalPlanOperator::Join { .. }
         ));
-        assert!(program.instructions.iter().any(|op| matches!(
-            op,
-            common::protocol::MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 2
+        assert!(program.steps.iter().any(|step| matches!(
+            step,
+            common::protocol::ExpressionStep::Projection(expressions) if expressions.len() == 2
         )));
     }
 

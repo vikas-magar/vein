@@ -1,14 +1,16 @@
-//! Inter-node protocol types, vectorized Micro-IR, and RPC definitions.
+//! Typed physical plan, task, and expression protocol definitions.
 
-pub mod ir;
+pub mod expression;
+pub mod operators;
 pub mod pipeline_graph;
 pub mod task;
 mod validation;
 
-// Re-export Micro-IR definitions
-pub use ir::op::MicroOp;
-pub use ir::program::{MicroProgram, RegId};
-pub use ir::state::{AggOpCode, JoinKind, StateMode};
+// Re-export operator semantics used throughout physical planning and execution.
+pub use operators::{AggOpCode, JoinKind, StateMode};
+pub use expression::{
+    BinaryExprOp, ExprKind, ExpressionProgram, ExpressionStep, PhysicalExpr, UnaryExprOp,
+};
 
 // The catalog owns table-identity types; the protocol carries them on the wire.
 pub use catalog::CatalogSnapshotToken;

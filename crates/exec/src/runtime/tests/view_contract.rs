@@ -36,12 +36,7 @@ async fn both_result_apis_preserve_zero_column_counts_and_empty_input() {
         PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: int64_schema(),
-            program: Arc::new(MicroProgram::new(
-                1,
-                vec![MicroOp::ProjectRegisters {
-                    out_regs: Vec::new(),
-                }],
-            )),
+            program: projection_program(Vec::new()),
         },
     );
     task.plan = plan_with_input(&task, input);

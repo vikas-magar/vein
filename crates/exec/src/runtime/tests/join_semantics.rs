@@ -4,7 +4,7 @@ use super::*;
 async fn recursive_left_join_applies_residual_before_preserving_unmatched_probe_rows() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+        program: Arc::new(ExpressionProgram::empty()),
     };
     let mut task = task();
     set_input_plan(
@@ -18,20 +18,11 @@ async fn recursive_left_join_applies_residual_before_preserving_unmatched_probe_
                 build_keys: vec![0],
                 residual: Some(common::protocol::JoinResidualPlan {
                     input_columns: vec![JoinOutput::Build(0)],
-                    program: Arc::new(MicroProgram::new(
-                        3,
-                        vec![
-                            common::protocol::MicroOp::LoadConstant {
-                                dst: 1,
-                                value: types::LogicalLiteral::Int64(3),
-                            },
-                            common::protocol::MicroOp::CmpLt {
-                                dst: 2,
-                                src1: 0,
-                                src2: 1,
-                            },
-                            common::protocol::MicroOp::FilterMask { bool_reg: 2 },
-                        ],
+                    program: filter_program(binary_expr(
+                        BinaryExprOp::Less,
+                        column_expr(0, types::VeinDataType::Int64),
+                        literal_expr(LogicalLiteral::Int64(3), types::VeinDataType::Int64),
+                        types::VeinDataType::Boolean,
                     )),
                 }),
                 outputs: vec![JoinOutput::Probe(0), JoinOutput::Build(0)],
@@ -73,7 +64,7 @@ async fn recursive_left_join_applies_residual_before_preserving_unmatched_probe_
 async fn recursive_right_join_does_not_mark_residual_rejections_as_matches() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+        program: Arc::new(ExpressionProgram::empty()),
     };
     let mut task = task();
     set_input_plan(
@@ -87,20 +78,11 @@ async fn recursive_right_join_does_not_mark_residual_rejections_as_matches() {
                 build_keys: vec![0],
                 residual: Some(common::protocol::JoinResidualPlan {
                     input_columns: vec![JoinOutput::Build(0)],
-                    program: Arc::new(MicroProgram::new(
-                        3,
-                        vec![
-                            common::protocol::MicroOp::LoadConstant {
-                                dst: 1,
-                                value: types::LogicalLiteral::Int64(3),
-                            },
-                            common::protocol::MicroOp::CmpLt {
-                                dst: 2,
-                                src1: 0,
-                                src2: 1,
-                            },
-                            common::protocol::MicroOp::FilterMask { bool_reg: 2 },
-                        ],
+                    program: filter_program(binary_expr(
+                        BinaryExprOp::Less,
+                        column_expr(0, types::VeinDataType::Int64),
+                        literal_expr(LogicalLiteral::Int64(3), types::VeinDataType::Int64),
+                        types::VeinDataType::Boolean,
                     )),
                 }),
                 outputs: vec![JoinOutput::Probe(0), JoinOutput::Build(0)],

@@ -7,7 +7,7 @@ use crate::pipeline_graph::DerivedPipelineGraph;
 use common::Result;
 use common::identifiers::{PartitionId, StageId, TaskId};
 use common::protocol::{
-    DataSink, DataSource, MicroProgram, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator,
+    DataSink, DataSource, ExpressionProgram, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator,
 };
 use error::VeinError;
 use plan::schema::VeinSchema;
@@ -39,7 +39,7 @@ pub trait PipelineStageBuilder: Send + Sync {
     fn compile_pipeline(
         &self,
         plan: &LogicalPlan,
-    ) -> Result<(DataSource, MicroProgram, VeinSchema, VeinSchema)>;
+    ) -> Result<(DataSource, ExpressionProgram, VeinSchema, VeinSchema)>;
 }
 
 /// Default recursive stage builder with fused scan pipelines.
@@ -181,7 +181,7 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
     fn compile_pipeline(
         &self,
         plan: &LogicalPlan,
-    ) -> Result<(DataSource, MicroProgram, VeinSchema, VeinSchema)> {
+    ) -> Result<(DataSource, ExpressionProgram, VeinSchema, VeinSchema)> {
         PipelineCompiler::compile(plan)
     }
 }

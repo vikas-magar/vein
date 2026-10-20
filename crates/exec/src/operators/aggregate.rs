@@ -1,11 +1,10 @@
 //! Hash aggregation: the pipeline breaker that groups rows and folds them.
 //!
 //! Like a join, an aggregate needs the whole input before it can emit anything,
-//! so it is not a VM instruction: the runtime drains the program into
-//! [`AggregateSink`] and then takes the groups. The columns it receives are the
-//! program's output registers — the group keys first, then one argument column
-//! per aggregate — so a key or an argument like `sum(price * quantity)` is an
-//! ordinary register and this module never interprets an expression.
+//! so the runtime drains its input view into [`AggregateSink`] and then takes
+//! the groups. Input columns are ordered with group keys first, followed by one
+//! argument per aggregate. Scalar expressions such as `sum(price * quantity)`
+//! are evaluated before this operator; it only consumes their result columns.
 //!
 //! A `DISTINCT` arrives here as the same shape with every column a key and no
 //! aggregates, which is why it has no operator of its own.

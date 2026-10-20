@@ -27,3 +27,9 @@ approval_mode = "approve"
 
 [mcp_servers.rustrover.tools.xdebug_get_value_by_path]
 approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.open_file_in_editor]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.execute_terminal_command]
+approval_mode = "approve"

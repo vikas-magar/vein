@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::pipeline::{DataChunkView, PipelineNode, Source};
-use crate::runtime_filter::RuntimeFilterSet;
+use crate::expression::eval::ExpressionKernelProvider;
+use crate::runtime::filter::RuntimeFilterSet;
 use crate::udf::FunctionRegistry;
 use catalog::MetadataStore;
 use common::protocol::FileFormat;
@@ -59,6 +60,8 @@ pub struct ScanSourceConfig {
     pub metadata_store: MetadataStore,
     /// Functions available to compiled scan predicates.
     pub registry: Arc<FunctionRegistry>,
+    /// Kernels shared by pipeline transforms and source predicates.
+    pub expression_kernels: Arc<dyn ExpressionKernelProvider>,
     /// Background collector for lazily computed source statistics.
     pub runtime_statistics: RuntimeStatisticsStore,
     /// Scan identity and coverage information for synopsis completion.
@@ -70,7 +73,7 @@ pub struct ScanSource {
     operator: Operator,
     files: Vec<ScanFile>,
     format: FileFormat,
-    parquet_reader: Arc<dyn ParquetScanReader<Batch = DataChunkView>>,
+    parquet_reader: Arc<dyn ParquetScanReader<Batch=DataChunkView>>,
     projected: VeinSchemaRef,
     /// Projected columns whose Parquet dictionary encoding should be retained.
     dictionary_columns: Vec<u32>,
@@ -82,6 +85,7 @@ pub struct ScanSource {
     metadata_store: MetadataStore,
     /// Function registry the compiled predicate program runs against.
     registry: Arc<FunctionRegistry>,
+    expression_kernels: Arc<dyn ExpressionKernelProvider>,
     runtime_statistics: RuntimeStatisticsStore,
     statistics_scan: Option<RuntimeStatisticsScan>,
     query_statistics: Option<Arc<QueryStatisticsContext>>,
@@ -104,6 +108,7 @@ impl ScanSource {
             runtime_filters: config.runtime_filters,
             metadata_store: config.metadata_store,
             registry: config.registry,
+            expression_kernels: config.expression_kernels,
             runtime_statistics: config.runtime_statistics,
             statistics_scan: config.statistics_scan,
             query_statistics: None,
@@ -126,7 +131,7 @@ impl ScanSource {
     /// selections in `DataChunkView` instead of compacting payload columns.
     pub fn with_parquet_reader(
         mut self,
-        reader: Arc<dyn ParquetScanReader<Batch = DataChunkView>>,
+        reader: Arc<dyn ParquetScanReader<Batch=DataChunkView>>,
     ) -> Self {
         self.parquet_reader = reader;
         self
@@ -147,6 +152,7 @@ impl Source<DataChunkView> for ScanSource {
                         pushdown: self.pushdown.as_deref(),
                         metadata_store: &self.metadata_store,
                         registry: &self.registry,
+                        expression_kernels: &self.expression_kernels,
                         bytes_read: &self.bytes_read,
                         runtime_filters: &self.runtime_filters,
                         runtime_statistics: &self.runtime_statistics,

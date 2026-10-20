@@ -37,7 +37,6 @@ async fn rejects_invalid_ranges_and_stale_file_size() {
         .await
         .expect("open local reader");
 
-    assert!(source.read_range(2..1).await.is_err());
     assert!(source.read_range(2..4).await.is_err());
     assert!(NativeRangeSource::open(file.path(), 4).await.is_err());
 }

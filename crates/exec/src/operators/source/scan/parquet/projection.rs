@@ -6,7 +6,7 @@ use arrow::datatypes::{DataType as ArrowDataType, Schema, SchemaRef};
 use common::protocol::ScanPredicate;
 use common::Result;
 use error::VeinError;
-use crate::runtime_filter::RuntimeFilterSet;
+use crate::runtime::filter::RuntimeFilterSet;
 use types::{ResolvedColumnRef, VeinDataType, VeinSchema};
 
 /// Reader columns and output positions for one projected scan batch.

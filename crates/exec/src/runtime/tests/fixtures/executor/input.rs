@@ -3,11 +3,11 @@ use super::*;
 pub(in crate::runtime::tests) enum InputPlanFixture {
     Pipeline {
         source: DataSource,
-        program: Arc<MicroProgram>,
+        program: Arc<ExpressionProgram>,
     },
     Transform {
         input: Box<InputPlanFixture>,
-        program: Arc<MicroProgram>,
+        program: Arc<ExpressionProgram>,
     },
     Aggregate {
         input: Box<InputPlanFixture>,
@@ -20,7 +20,7 @@ pub(in crate::runtime::tests) enum InputPlanFixture {
     Sort {
         input: Box<InputPlanFixture>,
         plan: SortPlan,
-        key_program: Option<Arc<MicroProgram>>,
+        key_program: Option<Arc<ExpressionProgram>>,
         output_columns: u32,
     },
     Limit {
@@ -79,20 +79,12 @@ impl ExecutorBuilder for MemoryFeedBuilder {
         Ok(Box::new(MemorySource::new(batch)))
     }
 
-    fn build_vm(
+    fn build_expression_executor(
         &self,
-        program: &Arc<MicroProgram>,
-        next: Box<dyn PipelineNode<DataChunk>>,
-    ) -> Result<Box<dyn Transform<DataChunk>>> {
-        self.inner.build_vm(program, next)
-    }
-
-    fn build_view_vm(
-        &self,
-        program: &Arc<MicroProgram>,
+        program: &Arc<ExpressionProgram>,
         next: Box<dyn PipelineNode<DataChunkView>>,
     ) -> Result<Box<dyn Transform<DataChunkView>>> {
-        self.inner.build_view_vm(program, next)
+        self.inner.build_expression_executor(program, next)
     }
 
     fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunkView>>> {

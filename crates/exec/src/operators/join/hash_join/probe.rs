@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use arrow::datatypes::DataType;
 
-use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode, Transform, ViewColumnRef, ViewInputRows};
+use crate::pipeline::{
+    DataChunkView, MaterializationReport, PipelineNode, Transform, ViewColumnRef, ViewInputRows,
+};
 use common::Result;
 use error::VeinError;
 
@@ -34,7 +36,7 @@ pub struct HashJoin {
     probe_rows: Vec<Option<usize>>,
     build_rows: Vec<Option<usize>>,
     residual_view_columns: Vec<ViewColumnRef>,
-    residual_vm: Option<Box<dyn Transform<DataChunkView>>>,
+    residual_transform: Option<Box<dyn Transform<DataChunkView>>>,
     residual_output: Option<JoinFilterCollector>,
     /// The build rows this task consumed, for the flavours that owe unmatched
     /// ones. Kept here, not in the table, because the table is shared.
@@ -52,7 +54,7 @@ pub struct HashJoin {
     pub(super) output_rows: u64,
     pub(super) max_output_batch_rows: usize,
     residual_us: u64,
-    /// Probe key conversions; residual expressions have their own VM reports.
+    /// Probe key conversions; residual predicate time is tracked separately.
     pub(super) probe_key_materialization: MaterializationReport,
     probe_key_materialize_us: u64,
 }
@@ -104,7 +106,7 @@ impl HashJoin {
             probe_rows: Vec::new(),
             build_rows: Vec::new(),
             residual_view_columns: Vec::new(),
-            residual_vm: None,
+            residual_transform: None,
             residual_output: None,
             matched_build: HashSet::new(),
             probed_rows: 0,
@@ -126,11 +128,11 @@ impl HashJoin {
     pub fn with_residual_filter(
         mut self,
         columns: Vec<OutputColumn>,
-        vm: Box<dyn Transform<DataChunkView>>,
+        transform: Box<dyn Transform<DataChunkView>>,
         output: JoinFilterCollector,
     ) -> Self {
         self.residual_view_columns = view_column_refs(&columns);
-        self.residual_vm = Some(vm);
+        self.residual_transform = Some(transform);
         self.residual_output = Some(output);
         self
     }
@@ -150,15 +152,17 @@ impl HashJoin {
         let mut null_probe_rows = Vec::new();
         let probe_started = Instant::now();
         let (report, materialize_us) = if self.join_type == JoinType::NullAwareAnti {
-            self.table.probe_view_with_null_rows(&chunk, &mut matches, &mut null_probe_rows)?
+            self.table
+                .probe_view_with_null_rows(&chunk, &mut matches, &mut null_probe_rows)?
         } else {
             self.table.probe_view(&chunk, &mut matches)?
         };
         self.probe_key_materialization.accumulate(report);
-        self.probe_key_materialize_us = self.probe_key_materialize_us.saturating_add(materialize_us);
+        self.probe_key_materialize_us =
+            self.probe_key_materialize_us.saturating_add(materialize_us);
         self.probe_us += probe_started.elapsed().as_micros() as u64;
 
-        if self.residual_vm.is_some() && !matches.is_empty() {
+        if self.residual_transform.is_some() && !matches.is_empty() {
             let (filtered, elapsed) = self.filter_residual_matches(&chunk, &matches)?;
             matches = filtered;
             self.residual_us += elapsed;
@@ -175,7 +179,8 @@ impl HashJoin {
             }
         }
         if matches!(self.join_type, JoinType::Right | JoinType::Full) {
-            self.matched_build.extend(matches.iter().map(|(_, build)| *build));
+            self.matched_build
+                .extend(matches.iter().map(|(_, build)| *build));
         }
         self.probed_rows += u64::from(probe_row_count);
         self.matched_rows += matches.len() as u64;
@@ -206,14 +211,14 @@ impl HashJoin {
     }
 
     /// Applies a residual predicate to candidates partitioned by retained build
-    /// batch. Each candidate is still a view; only the VM's referenced columns
-    /// are materialized by its expression kernels.
+    /// batch. Each candidate remains a view that expression kernels consume
+    /// through the referenced column mappings.
     fn filter_residual_matches(
         &mut self,
         probe: &DataChunkView,
         matches: &[JoinMatch],
     ) -> Result<(Vec<JoinMatch>, u64)> {
-        if self.residual_vm.is_none() {
+        if self.residual_transform.is_none() {
             return Ok((matches.to_vec(), 0));
         }
         let output = self.residual_output.as_ref().cloned().ok_or_else(|| {
@@ -232,18 +237,17 @@ impl HashJoin {
         let mut accepted = Vec::with_capacity(matches.len());
         let mut elapsed = 0u64;
         for (build_chunk, pairs) in groups {
-            let candidates = pairs.iter().map(|(probe, build)| OutputRow {
-                probe: Some(*probe),
-                build: Some(*build),
-            }).collect::<Vec<_>>();
-            let candidate = self.compose_group(
-                Some(probe),
-                Some(build_chunk),
-                &candidates,
-            )?;
+            let candidates = pairs
+                .iter()
+                .map(|(probe, build)| OutputRow {
+                    probe: Some(*probe),
+                    build: Some(*build),
+                })
+                .collect::<Vec<_>>();
+            let candidate = self.compose_group(Some(probe), Some(build_chunk), &candidates)?;
             output.clear()?;
             let started = Instant::now();
-            self.residual_vm
+            self.residual_transform
                 .as_mut()
                 .ok_or_else(|| VeinError::internal("join residual transform is missing"))?
                 .push(candidate)?;
@@ -279,7 +283,9 @@ impl HashJoin {
         } else {
             None
         };
-        let probe_view = probe.or(null_probe.as_ref()).expect("probe view or null extension");
+        let probe_view = probe
+            .or(null_probe.as_ref())
+            .expect("probe view or null extension");
         let build_view = build_chunk
             .map(|chunk| self.table.build_chunk(chunk))
             .or(null_build.as_ref())
@@ -288,11 +294,19 @@ impl HashJoin {
         self.probe_rows
             .extend(rows.iter().map(|row| row.probe.map(|row| row as usize)));
         self.build_rows.clear();
-        self.build_rows
-            .extend(rows.iter().map(|row| row.build.map(|(_, row)| row as usize)));
+        self.build_rows.extend(
+            rows.iter()
+                .map(|row| row.build.map(|(_, row)| row as usize)),
+        );
         let inputs = [
-            ViewInputRows { view: probe_view, rows: &self.probe_rows },
-            ViewInputRows { view: build_view, rows: &self.build_rows },
+            ViewInputRows {
+                view: probe_view,
+                rows: &self.probe_rows,
+            },
+            ViewInputRows {
+                view: build_view,
+                rows: &self.build_rows,
+            },
         ];
         DataChunkView::combine(&inputs, &self.residual_view_columns)
     }
@@ -301,7 +315,7 @@ impl HashJoin {
     fn forward_rows(
         &mut self,
         probe: Option<&DataChunkView>,
-        rows: impl IntoIterator<Item=OutputRow>,
+        rows: impl IntoIterator<Item = OutputRow>,
     ) -> Result<()> {
         let batch_limit = probe
             .map_or(self.build_batch_rows, |view| {
@@ -323,12 +337,9 @@ impl HashJoin {
     fn push_output_batch(&mut self, probe: Option<&DataChunkView>) -> Result<()> {
         let mut rows = std::mem::take(&mut self.output_batch);
         let compose_started = Instant::now();
-        let composed = self.output_composer.compose(
-            &self.table,
-            probe,
-            &self.probe_types,
-            &rows,
-        );
+        let composed = self
+            .output_composer
+            .compose(&self.table, probe, &self.probe_types, &rows);
         self.view_compose_us = self
             .view_compose_us
             .saturating_add(compose_started.elapsed().as_micros() as u64);
@@ -405,10 +416,10 @@ impl PipelineNode<DataChunkView> for HashJoin {
 
     fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
         // Right/full joins must account for build rows matched by every probe
-        // worker. Residual VM state is task-local and is not reconstructed from
-        // the immutable build table, so those plans retain the serial path.
+        // worker. Residual transform state is task-local and is not reconstructed
+        // from the immutable build table, so those plans retain the serial path.
         if matches!(self.join_type, JoinType::Right | JoinType::Full)
-            || self.residual_vm.is_some()
+            || self.residual_transform.is_some()
         {
             return Ok(None);
         }
@@ -443,14 +454,13 @@ impl PipelineNode<DataChunkView> for HashJoin {
             .downcast_mut::<HashJoin>()
             .ok_or_else(|| VeinError::internal("hash join local state has a mismatched target"))?;
         if !Arc::ptr_eq(&self.table, &target.table)
-            || std::mem::discriminant(&self.join_type)
-            != std::mem::discriminant(&target.join_type)
+            || std::mem::discriminant(&self.join_type) != std::mem::discriminant(&target.join_type)
             || self.output_columns.len() != target.output_columns.len()
             || !self
-            .output_columns
-            .iter()
-            .zip(&target.output_columns)
-            .all(|(left, right)| left.input == right.input && left.column == right.column)
+                .output_columns
+                .iter()
+                .zip(&target.output_columns)
+                .all(|(left, right)| left.input == right.input && left.column == right.column)
             || self.probe_types != target.probe_types
             || self.build_types != target.build_types
         {
@@ -465,9 +475,7 @@ impl PipelineNode<DataChunkView> for HashJoin {
         target.output_rows = target.output_rows.saturating_add(self.output_rows);
         target.max_output_batch_rows = target.max_output_batch_rows.max(self.max_output_batch_rows);
         target.probe_us = target.probe_us.saturating_add(self.probe_us);
-        target.view_compose_us = target
-            .view_compose_us
-            .saturating_add(self.view_compose_us);
+        target.view_compose_us = target.view_compose_us.saturating_add(self.view_compose_us);
         target.downstream_push_us = target
             .downstream_push_us
             .saturating_add(self.downstream_push_us);

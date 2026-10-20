@@ -11,8 +11,8 @@ pub(super) struct AggregateProjection {
 }
 
 /// Extract aggregate calls when an aggregate output contains scalar operators.
-/// Direct aggregate-only plans stay on their existing path without an extra VM
-/// projection.
+/// Direct aggregate-only plans stay on their existing path without an extra
+/// projection step.
 pub(super) fn normalize<F>(
     grouping_sets: &[Vec<LogicalExpr>],
     aggregates: &[LogicalExpr],
