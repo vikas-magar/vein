@@ -177,9 +177,8 @@ pub struct SortTransform {
 
 #[derive(Default)]
 struct SortMetrics {
-    /// Sort-key conversions on the external spill path only.
-    key_materialization: MaterializationReport,
-    key_materialize_us: u64,
+    /// Arrow arrays created when ordered views are serialized into spill runs.
+    spill_write_materialization: MaterializationReport,
     input_batches: u64,
     input_rows: u64,
     candidate_rows_examined: u64,
@@ -188,7 +187,6 @@ struct SortMetrics {
     row_comparisons: u64,
     comparator_cache_entries: u64,
     output_rows: u64,
-    key_encode_us: u64,
     selection_us: u64,
     sort_us: u64,
     emit_us: u64,
@@ -507,7 +505,7 @@ impl SortTransform {
                 let sorted_view =
                     DataChunkView::compose_rows(&[view], &row_refs, view.num_columns())?;
                 let report = writer.write_view(&sorted_view, "write sort spill batch")?;
-                self.metrics.key_materialization.accumulate(report);
+                self.metrics.spill_write_materialization.accumulate(report);
             }
             let output = writer.finish("finish sort spill run")?;
             let run = pending.commit(output)?;
@@ -1053,12 +1051,10 @@ impl PipelineNode for SortTransform {
             row_comparisons = self.metrics.row_comparisons,
             comparator_cache_entries = self.metrics.comparator_cache_entries,
             output_rows = self.metrics.output_rows,
-            key_encode_us = self.metrics.key_encode_us,
-            key_shared_columns = self.metrics.key_materialization.shared_columns,
-            key_gathered_columns = self.metrics.key_materialization.gathered_columns,
-            key_empty_columns = self.metrics.key_materialization.empty_columns,
-            key_gathered_output_buffer_bytes = self.metrics.key_materialization.gathered_output_buffer_bytes,
-            key_materialize_us = self.metrics.key_materialize_us,
+            spill_write_shared_columns = self.metrics.spill_write_materialization.shared_columns,
+            spill_write_gathered_columns = self.metrics.spill_write_materialization.gathered_columns,
+            spill_write_empty_columns = self.metrics.spill_write_materialization.empty_columns,
+            spill_write_output_buffer_bytes = self.metrics.spill_write_materialization.gathered_output_buffer_bytes,
             selection_us = self.metrics.selection_us,
             sort_us = self.metrics.sort_us,
             emit_us = self.metrics.emit_us,

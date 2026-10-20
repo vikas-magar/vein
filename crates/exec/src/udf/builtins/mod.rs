@@ -1,20 +1,21 @@
-use std::sync::Arc;
-
 use super::FunctionRegistry;
 
+mod extract;
 mod lower;
+#[cfg(test)]
+#[path = "reference_input_tests.rs"]
+mod reference_input_tests;
 mod round;
 mod substring;
-mod vector_distance;
-mod extract;
 mod truncate;
+mod vector_distance;
 
 /// Registers scalar built-ins that have executable implementations.
 pub fn register_builtin_scalars(registry: &mut FunctionRegistry) {
-    registry.register_scalar(Arc::new(lower::LowerFunction));
-    registry.register_scalar(Arc::new(round::RoundFunction));
-    registry.register_scalar(Arc::new(substring::SubstringFunction));
-    registry.register_scalar(Arc::new(vector_distance::VectorDistanceFunction));
+    registry.register(lower::LowerFunction);
+    registry.register(round::RoundFunction);
+    registry.register(substring::SubstringFunction);
+    registry.register(vector_distance::VectorDistanceFunction);
     for (name, part) in [
         ("year", DatePart::Year),
         ("isoyear", DatePart::YearISO),
@@ -35,11 +36,11 @@ pub fn register_builtin_scalars(registry: &mut FunctionRegistry) {
         ("microsecond", DatePart::Microsecond),
         ("nanosecond", DatePart::Nanosecond),
     ] {
-        registry.register_scalar(Arc::new(extract::ExtractFunction { name, part }));
+        registry.register(extract::ExtractFunction { name, part });
     }
     for unit in types::TemporalUnit::ALL {
         let name = unit.truncate_function_name();
-        registry.register_scalar(Arc::new(truncate::TruncateFunction { name, unit }));
+        registry.register(truncate::TruncateFunction { name, unit });
     }
 }
 

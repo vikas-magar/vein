@@ -108,7 +108,11 @@ fn dictionary_utf8_grouping_handles_nulls_unused_values_and_batch_local_ids() {
         "unused dictionary values must not form groups"
     );
     assert_eq!(metrics.input_rows, 8);
-    assert_eq!(metrics.grouping_probes, 7);
+    assert_eq!(
+        metrics.grouping_probes,
+        8,
+        "view-backed keys probe input rows while preserving NULL grouping semantics"
+    );
     assert_eq!(metrics.new_groups, 3);
     assert_eq!(metrics.string_key_bytes_copied, 0);
 }

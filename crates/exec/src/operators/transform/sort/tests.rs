@@ -79,12 +79,12 @@ fn globally_sorts_multiple_chunks_by_keys_and_null_order() {
         vec![strings(&[Some("b"), Some("a")]), integers(&[1, 1])],
         SelectionVector::new_dense(2),
     )))
-    .unwrap();
+        .unwrap();
     sort.push(view(crate::pipeline::test_support::selected_view(
         vec![strings(&[Some("b"), None]), integers(&[3, 9])],
         SelectionVector::new_dense(2),
     )))
-    .unwrap();
+        .unwrap();
 
     sort.flush().unwrap();
 
@@ -125,13 +125,13 @@ fn full_sort_accounts_distinct_source_arrays_once_across_retained_views() {
         tracker.clone(),
         Box::new(Collect(Arc::clone(&output))),
     )
-    .expect("construct sort with tracked memory");
+        .expect("construct sort with tracked memory");
 
     for _ in 0..2 {
         sort.push(view(crate::pipeline::test_support::dense_view(vec![
             Arc::clone(&source),
         ])))
-        .expect("retain view without copying source values");
+            .expect("retain view without copying source values");
     }
 
     assert_eq!(
@@ -181,12 +181,12 @@ fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mu
         tracker.clone(),
         Box::new(Collect(Arc::clone(&output))),
     )
-    .expect("construct budgeted Top-N sort");
+        .expect("construct budgeted Top-N sort");
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         Arc::clone(&first_key),
         Arc::clone(&first_payload),
     ])))
-    .expect("retain first candidate");
+        .expect("retain first candidate");
     let retained_bytes = tracker.used();
 
     let large_payload = strings(&[Some(&"x".repeat(8192))]);
@@ -194,7 +194,7 @@ fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mu
         integers(&[99]),
         Arc::clone(&large_payload),
     ])))
-    .expect("discard a batch that cannot enter Top-N");
+        .expect("discard a batch that cannot enter Top-N");
     assert_eq!(tracker.used(), retained_bytes);
     assert_eq!(sort.chunks.len(), 1, "non-candidate view is not retained");
     let retained_sort_bytes = sort.memory.bytes();
@@ -250,12 +250,12 @@ fn full_sort_includes_source_arrays_when_selecting_spill_path() {
         tracker.clone(),
         Box::new(Collect(Arc::clone(&output))),
     )
-    .expect("construct constrained sort");
+        .expect("construct constrained sort");
 
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         source,
     ])))
-    .expect("fall back to external sorting when retained memory is over budget");
+        .expect("fall back to external sorting when retained memory is over budget");
     assert!(
         sort.spilling,
         "source arrays are included in the sort budget"
@@ -266,9 +266,15 @@ fn full_sort_includes_source_arrays_when_selecting_spill_path() {
         "the batch is written as a spill run"
     );
     assert_eq!(
-        sort.metrics.key_materialization,
-        MaterializationReport::default(),
-        "building a spill run compares sort values through the retained view"
+        sort.metrics.spill_write_materialization.gathered_columns, 1,
+        "spill serialization gathers selected values into an IPC batch"
+    );
+    assert!(
+        sort.metrics
+            .spill_write_materialization
+            .gathered_output_buffer_bytes
+            > 0,
+        "spill output buffers are accounted separately from sort comparisons"
     );
     assert!(sort.metrics.row_comparisons > 0);
     assert!(tracker.used() <= tracker.limit());
@@ -307,12 +313,12 @@ fn sort_composes_cross_batch_payload_references_with_sparse_selections() {
         vec![Arc::clone(&first_keys), Arc::clone(&first_payload)],
         SelectionVector::new_sparse(vec![0, 2]),
     )))
-    .expect("push first sparse input view");
+        .expect("push first sparse input view");
     sort.push(view(crate::pipeline::test_support::selected_view(
         vec![Arc::clone(&second_keys), Arc::clone(&second_payload)],
         SelectionVector::new_dense(2),
     )))
-    .expect("push second input view");
+        .expect("push second input view");
 
     sort.flush().expect("sort sparse input views");
 
@@ -356,7 +362,7 @@ fn single_chunk_sort_reuses_arrow_columns_and_reorders_selection() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         values.clone(),
     ])))
-    .unwrap();
+        .unwrap();
 
     sort.flush().unwrap();
 
@@ -399,11 +405,11 @@ fn full_sort_and_top_n_compare_retained_sort_values_without_gathering() {
                 vec![Arc::clone(&keys), Arc::clone(&payload)],
                 selection,
             )))
-            .unwrap();
+                .unwrap();
         }
         sort.flush().unwrap();
         assert_eq!(
-            sort.metrics.key_materialization,
+            sort.metrics.spill_write_materialization,
             MaterializationReport::default()
         );
         assert!(sort.metrics.row_comparisons > 0);
@@ -454,7 +460,7 @@ fn top_n_sorts_only_offset_plus_count_and_keeps_single_chunk_payload_shared() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         values.clone(),
     ])))
-    .unwrap();
+        .unwrap();
 
     sort.flush().unwrap();
 
@@ -490,11 +496,11 @@ fn top_n_releases_chunks_without_current_winning_rows() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         integers(&[8, 9]),
     ])))
-    .unwrap();
+        .unwrap();
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         winner.clone(),
     ])))
-    .unwrap();
+        .unwrap();
 
     assert!(sort.chunks[0].is_none());
     assert!(sort.chunks[1].is_some());
@@ -529,11 +535,11 @@ fn top_n_gathers_sorted_winners_from_multiple_chunks() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         first.clone(),
     ])))
-    .unwrap();
+        .unwrap();
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         second.clone(),
     ])))
-    .unwrap();
+        .unwrap();
 
     let replacement = sort
         .top_n
@@ -555,7 +561,7 @@ fn top_n_gathers_sorted_winners_from_multiple_chunks() {
     assert_eq!(sort.metrics.candidate_replacements, 1);
     assert!(sort.metrics.row_comparisons > 0);
     assert_eq!(
-        sort.metrics.key_materialization,
+        sort.metrics.spill_write_materialization,
         MaterializationReport::default()
     );
     assert_eq!(sort.metrics.output_rows, 3);
@@ -612,13 +618,13 @@ fn top_n_keeps_candidate_reference_reservation_when_replacing_source_chunk() {
         tracker.clone(),
         Box::new(Collect(output)),
     )
-    .expect("create budgeted Top-N sort");
+        .expect("create budgeted Top-N sort");
     let long_key = Arc::new(StringArray::from(vec!["z".repeat(128)]));
     let short_key = Arc::new(StringArray::from(vec!["a"]));
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         long_key,
     ])))
-    .expect("retain first candidate");
+        .expect("retain first candidate");
     let before_replacement = sort.memory.bytes();
     let chunk_metadata = size_of::<Option<DataChunkView>>() + size_of::<usize>();
     let short_key_bytes = short_key.get_array_memory_size();
@@ -626,7 +632,7 @@ fn top_n_keeps_candidate_reference_reservation_when_replacing_source_chunk() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         short_key,
     ])))
-    .expect("replace with better short candidate");
+        .expect("replace with better short candidate");
 
     assert_eq!(
         sort.memory.bytes(),
@@ -663,7 +669,7 @@ fn zero_count_top_n_finishes_without_retaining_input() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         integers(&[3, 1, 2]),
     ])))
-    .unwrap();
+        .unwrap();
     sort.flush().unwrap();
 
     assert!(sort.chunks.is_empty());
@@ -685,7 +691,7 @@ fn sort_reference_growth_respects_budget_and_releases_on_error() {
         tracker.clone(),
         Box::new(Collect(Arc::new(Mutex::new(Vec::new())))),
     )
-    .expect("empty sort state fits zero bytes");
+        .expect("empty sort state fits zero bytes");
     let error = sort
         .push(view(crate::pipeline::test_support::dense_view(vec![
             integers(&[3, 1, 2]),
@@ -711,16 +717,16 @@ fn memory_pressure_switches_sort_to_spill_and_releases_temporary_reservations() 
         tracker.clone(),
         Box::new(Collect(Arc::new(Mutex::new(Vec::new())))),
     )
-    .expect("construct sort under a small budget");
+        .expect("construct sort under a small budget");
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         integers(&[2]),
     ])))
-    .expect("retain first row within budget");
+        .expect("retain first row within budget");
 
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         integers(&[1]),
     ])))
-    .expect("spill retained and incoming views when references exceed budget");
+        .expect("spill retained and incoming views when references exceed budget");
 
     assert!(sort.spilling);
     assert_eq!(sort.spill_runs.len(), 2);
@@ -758,18 +764,18 @@ fn spill_runs_merge_without_losing_projection_and_account_for_retained_output() 
         tracker.clone(),
         Box::new(Collect(Arc::clone(&output))),
     )
-    .expect("construct constrained sort");
+        .expect("construct constrained sort");
     sort.spilling = true;
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         Arc::clone(&payload_a),
         Arc::clone(&keys_a),
     ])))
-    .expect("retain first batch within budget");
+        .expect("retain first batch within budget");
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         Arc::clone(&payload_b),
         Arc::clone(&keys_b),
     ])))
-    .expect("spill after the second batch exceeds the budget");
+        .expect("spill after the second batch exceeds the budget");
     let spill_directory = tracker
         .spill_manager()
         .local_directory()
@@ -830,13 +836,13 @@ fn external_sort_uses_bounded_multi_pass_merge_for_many_spill_runs() {
         tracker.clone(),
         Box::new(Collect(Arc::clone(&output))),
     )
-    .expect("construct constrained sort");
+        .expect("construct constrained sort");
     sort.spilling = true;
     for value in (0..68i64).rev() {
         sort.push(view(crate::pipeline::test_support::dense_view(vec![
             integers(&[value]),
         ])))
-        .expect("spill input after memory budget fills");
+            .expect("spill input after memory budget fills");
     }
     assert!(sort.spill_runs.len() > SPILL_MERGE_FAN_IN);
 
@@ -879,7 +885,7 @@ fn external_sort_preserves_null_order_and_duplicate_keys() {
         tracker,
         Box::new(Collect(Arc::clone(&output))),
     )
-    .expect("construct constrained sort");
+        .expect("construct constrained sort");
     sort.spilling = true;
     for (payload, key) in [
         (vec![1, 2], vec![None, Some("z")]),
@@ -889,7 +895,7 @@ fn external_sort_preserves_null_order_and_duplicate_keys() {
             integers(&payload),
             strings(&key),
         ])))
-        .expect("spill input rows");
+            .expect("spill input rows");
     }
 
     sort.flush().expect("merge duplicate and NULL keys");
@@ -919,12 +925,12 @@ fn canceled_external_merge_returns_cancelled_and_cleans_spill_files() {
         tracker.clone(),
         Box::new(Collect(Arc::clone(&output))),
     )
-    .expect("construct constrained sort");
+        .expect("construct constrained sort");
     for values in [[4, 1], [3, 2]] {
         sort.push(view(crate::pipeline::test_support::dense_view(vec![
             integers(&values),
         ])))
-        .expect("spill input rows");
+            .expect("spill input rows");
     }
     let spill_directory = tracker
         .spill_manager()
@@ -958,7 +964,7 @@ fn external_merge_emits_bounded_batches_across_run_batch_boundaries() {
         tracker,
         Box::new(Collect(Arc::clone(&output))),
     )
-    .expect("construct constrained sort");
+        .expect("construct constrained sort");
     sort.spilling = true;
     for batch in (0..4i64).rev() {
         let values = (0..9_000i64)
@@ -968,18 +974,21 @@ fn external_merge_emits_bounded_batches_across_run_batch_boundaries() {
         sort.push(view(crate::pipeline::test_support::dense_view(vec![
             integers(&values),
         ])))
-        .expect("spill after the retained views exceed the budget");
+            .expect("spill after the retained views exceed the budget");
     }
 
     sort.flush().expect("merge runs with multiple IPC batches");
 
-    assert_eq!(
-        sort.metrics.key_materialization,
-        MaterializationReport::default(),
-        "sort key comparisons read spill-backed Arrow arrays directly"
+    assert!(
+        sort.metrics.spill_write_materialization.gathered_columns > 0,
+        "spill runs gather output arrays at the IPC boundary"
     );
-    assert_eq!(sort.metrics.key_encode_us, 0);
-    assert_eq!(sort.metrics.key_materialize_us, 0);
+    assert!(
+        sort.metrics
+            .spill_write_materialization
+            .gathered_output_buffer_bytes
+            > 0
+    );
     assert!(sort.metrics.row_comparisons > 0);
     assert!(sort.metrics.comparator_cache_entries > 0);
 

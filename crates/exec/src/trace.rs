@@ -687,7 +687,7 @@ mod tests {
         );
         assert!(explain.contains("#0 limit children=[1] [offset=1, count=3]"));
         assert!(
-            explain.contains("#1 pipeline children=[] [source=memory, program_instructions=0]")
+            explain.contains("#1 pipeline children=[] [source=memory, expression_steps=0]")
         );
         assert!(explain.contains("flow=reference-input->References"));
     }

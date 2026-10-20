@@ -69,7 +69,10 @@ fn full_sort_and_top_n_keep_sparse_source_buffers() {
                 vec![Some(2), Some(4), Some(5), Some(7)]
             }
         );
-        assert_eq!(sort.metrics.key_materialization, MaterializationReport::default());
+        assert_eq!(
+            sort.metrics.spill_write_materialization,
+            MaterializationReport::default()
+        );
         assert!(sort.metrics.row_comparisons > 0);
         for view in output.iter() {
             for row in 0..view.num_rows() {
@@ -107,6 +110,9 @@ fn comparator_orders_null_extended_rows_without_building_null_arrays() {
 
         let output = output.lock().unwrap();
         assert_eq!(collect_values(&output), expected);
-        assert_eq!(sort.metrics.key_materialization, MaterializationReport::default());
+        assert_eq!(
+            sort.metrics.spill_write_materialization,
+            MaterializationReport::default()
+        );
     }
 }

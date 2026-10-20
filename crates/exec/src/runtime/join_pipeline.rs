@@ -161,12 +161,20 @@ impl SpilledJoinProbe {
         bit: u32,
     ) -> Result<()> {
         self.tracker.check_cancelled()?;
+        let partition_build_rows = build_runs
+            .iter()
+            .map(|run| run.rows)
+            .fold(0_u64, u64::saturating_add);
+        let partition_probe_rows = probe_runs
+            .iter()
+            .map(|run| run.rows)
+            .fold(0_u64, u64::saturating_add);
         let mut table = HashTable::with_memory_tracker(
             join_keys(&self.plan.build_keys),
             join_keys(&self.plan.probe_keys),
             self.tracker.clone(),
         )?;
-        let mut overflow = false;
+        let mut overflow_reason = None;
         'build_runs: for run in &build_runs {
             let reader = open_reader(run)?;
             for batch in reader {
@@ -183,7 +191,7 @@ impl SpilledJoinProbe {
                 {
                     Ok(view) => view,
                     Err(VeinError::ResourceExhausted { .. }) => {
-                        overflow = true;
+                        overflow_reason = Some("build_payload_memory");
                         break 'build_runs;
                     }
                     Err(error) => return Err(error),
@@ -191,7 +199,7 @@ impl SpilledJoinProbe {
                 match table.insert(view) {
                     Ok(()) => {}
                     Err(VeinError::ResourceExhausted { .. }) => {
-                        overflow = true;
+                        overflow_reason = Some("build_index_memory");
                         break 'build_runs;
                     }
                     Err(error) => return Err(error),
@@ -202,7 +210,7 @@ impl SpilledJoinProbe {
         // Load the complete build partition first, but do not emit any output
         // until the largest probe batch can coexist with it. If it cannot,
         // repartition both sides before the downstream operator sees rows.
-        if !overflow {
+        if overflow_reason.is_none() {
             let working_set = self.tracker.used();
             'probe_runs: for run in &probe_runs {
                 let reader = open_reader(run)?;
@@ -220,15 +228,29 @@ impl SpilledJoinProbe {
                         .checked_add(batch_bytes)
                         .is_none_or(|required| required > self.tracker.limit())
                     {
-                        overflow = true;
+                        overflow_reason = Some("probe_batch_memory");
                         break 'probe_runs;
                     }
                 }
             }
         }
 
-        if overflow {
+        if let Some(overflow_reason) = overflow_reason {
+            let query_memory_used_bytes = self.tracker.used();
             drop(table);
+            tracing::debug!(
+                target: "vein.audit",
+                event = "join_spill_repartition",
+                partition_bit = bit,
+                partition_build_rows,
+                partition_probe_rows,
+                build_runs = build_runs.len(),
+                probe_runs = probe_runs.len(),
+                overflow_reason,
+                query_memory_used_bytes,
+                query_memory_limit_bytes = self.tracker.limit(),
+                "join spill partition still exceeds memory budget"
+            );
             if bit >= u64::BITS {
                 return Err(VeinError::resource_exhausted(
                     "recursive hash join partition",
@@ -236,14 +258,6 @@ impl SpilledJoinProbe {
                     u128::from(u64::BITS),
                 ));
             }
-            tracing::debug!(
-                target: "vein.audit",
-                event = "join_spill_repartition",
-                partition_bit = bit,
-                build_runs = build_runs.len(),
-                probe_runs = probe_runs.len(),
-                "join spill partition still exceeds memory budget"
-            );
             let build_children = if build_runs.is_empty() {
                 [None, None]
             } else {

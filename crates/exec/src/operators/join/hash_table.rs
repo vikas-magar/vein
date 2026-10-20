@@ -40,8 +40,8 @@ impl JoinKeys {
 /// "No entry", since entry 0 is a valid index.
 const NONE: u32 = u32::MAX;
 
-/// Buckets before growth; a power of two so the modulo is a mask.
-const INITIAL_BUCKETS: usize = 1 << 12;
+/// Smallest valid table; insert sizes growth from the actual indexed row count.
+const MINIMUM_BUCKETS: usize = 1;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -554,7 +554,7 @@ impl HashTable {
             probe_keys,
             QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new()),
         )
-        .expect("unlimited join budget must fit initial buckets")
+            .expect("unlimited join budget must fit initial buckets")
     }
 
     /// Create a hash table that charges owned index state to `tracker`.
@@ -563,7 +563,7 @@ impl HashTable {
         probe_keys: JoinKeys,
         tracker: QueryMemoryTracker,
     ) -> Result<Self> {
-        let bucket_bytes = INITIAL_BUCKETS
+        let bucket_bytes = MINIMUM_BUCKETS
             .checked_mul(size_of::<u32>())
             .ok_or_else(|| VeinError::internal("initial join bucket size overflow"))?;
         let bounds_bytes = build_keys
@@ -577,13 +577,13 @@ impl HashTable {
         let mut memory = tracker.reserve(initial_bytes, "hash join initial state")?;
         let mut buckets = Vec::new();
         buckets
-            .try_reserve_exact(INITIAL_BUCKETS)
+            .try_reserve_exact(MINIMUM_BUCKETS)
             .map_err(|error| {
                 VeinError::internal(format!(
                     "cannot allocate initial hash join buckets: {error}"
                 ))
             })?;
-        buckets.resize(INITIAL_BUCKETS, NONE);
+        buckets.resize(MINIMUM_BUCKETS, NONE);
         let mut key_bounds = Vec::new();
         key_bounds
             .try_reserve_exact(build_keys.columns.len())
@@ -1019,7 +1019,7 @@ impl HashTable {
             .buckets
             .len()
             .max(wanted_buckets)
-            .max(INITIAL_BUCKETS)
+            .max(MINIMUM_BUCKETS)
             .max(1)
             .next_power_of_two();
         let new_bucket_bytes = bucket_count
@@ -1069,9 +1069,9 @@ impl HashTable {
         let report = MaterializationReport::default();
         let inline_i64 = probe_keys.is_single_i64()
             && self
-                .keys_by_chunk
-                .first()
-                .is_some_and(ChunkKeys::is_single_i64);
+            .keys_by_chunk
+            .first()
+            .is_some_and(ChunkKeys::is_single_i64);
         for position in 0..probe.num_rows() {
             let row = position as u32;
             let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position, probe)?
@@ -1086,22 +1086,22 @@ impl HashTable {
                 let entry = self.entries[head as usize];
                 let same = self.hashes[head as usize] == hash
                     && (if inline_i64 {
-                        let value = inline_key.ok_or_else(|| {
-                            VeinError::internal("single-Int64 probe key is missing its value")
-                        })?;
-                        self.keys_by_chunk[entry.chunk as usize].single_i64_value(
-                            &self.chunks[entry.chunk as usize],
-                            entry.row as usize,
-                        )? == Some(value)
-                    } else {
-                        self.keys_by_chunk[entry.chunk as usize].equals(
-                            entry.row as usize,
-                            &self.chunks[entry.chunk as usize],
-                            &probe_keys,
-                            row as usize,
-                            probe,
-                        )?
-                    });
+                    let value = inline_key.ok_or_else(|| {
+                        VeinError::internal("single-Int64 probe key is missing its value")
+                    })?;
+                    self.keys_by_chunk[entry.chunk as usize].single_i64_value(
+                        &self.chunks[entry.chunk as usize],
+                        entry.row as usize,
+                    )? == Some(value)
+                } else {
+                    self.keys_by_chunk[entry.chunk as usize].equals(
+                        entry.row as usize,
+                        &self.chunks[entry.chunk as usize],
+                        &probe_keys,
+                        row as usize,
+                        probe,
+                    )?
+                });
                 if same {
                     matches.push((row, (entry.chunk, entry.row)));
                 }
@@ -1163,3 +1163,7 @@ mod tests;
 #[cfg(test)]
 #[path = "hash_table/int32_tests.rs"]
 mod int32_tests;
+
+#[cfg(test)]
+#[path = "hash_table/capacity_tests.rs"]
+mod capacity_tests;

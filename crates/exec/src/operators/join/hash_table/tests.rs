@@ -20,6 +20,21 @@ fn view(columns: Vec<ArrayRef>) -> DataChunkView {
         .expect("valid test view")
 }
 
+fn replaced_merge_index_bytes(left: &HashTable, right: &HashTable) -> usize {
+    (left.buckets.len() + right.buckets.len()) * size_of::<u32>()
+        + right.key_bounds.capacity() * size_of::<BuildKeyBounds>()
+}
+
+fn rebuilt_merge_bucket_bytes(left: &HashTable, right: &HashTable) -> usize {
+    let wanted = (left.entries.len() + right.entries.len()) * 2;
+    left.buckets
+        .len()
+        .max(wanted)
+        .max(MINIMUM_BUCKETS)
+        .next_power_of_two()
+        * size_of::<u32>()
+}
+
 fn hashes_for_view(view: &DataChunkView, columns: Vec<usize>) -> Vec<u64> {
     let keys = ChunkKeys::resolve_view(&JoinKeys::new(columns), view)
         .expect("resolve view join keys")
@@ -374,8 +389,8 @@ fn range_filter_prunes_from_statistics_without_binding_a_row_mask() {
         vec![Some((LogicalLiteral::Int64(2), LogicalLiteral::Int64(5)))],
         &memory,
     )
-    .expect("create bounded filter")
-    .expect("range bounds are available");
+        .expect("create bounded filter")
+        .expect("range bounds are available");
     let filters = RuntimeFilterSet::new(vec![Arc::new(filter)]);
     let schema = types::VeinSchema::new(vec![Arc::new(types::ResolvedColumn::new(
         ColumnId(7),
@@ -415,7 +430,7 @@ fn merging_hash_tables_combines_and_rebases_runtime_key_bounds() {
         ints(&[5, 7]),
         Arc::new(StringArray::from(vec!["m", "z"])) as ArrayRef,
     ]))
-    .expect("insert first worker rows");
+        .expect("insert first worker rows");
     right
         .insert(crate::pipeline::test_support::dense_view(vec![
             ints(&[1, 9]),
@@ -516,8 +531,8 @@ fn the_table_grows_with_the_build_side() {
     let values: Vec<i64> = (0..20_000).collect();
     table.insert(chunk(ints(&values))).expect("insert");
     assert!(
-        table.buckets.len() > INITIAL_BUCKETS,
-        "buckets must grow past the initial size"
+        table.buckets.len() > MINIMUM_BUCKETS,
+        "buckets must grow with the indexed build rows"
     );
     assert!(
         table.buckets.len().is_power_of_two(),
@@ -641,14 +656,14 @@ fn merging_different_keys_is_refused() {
 #[test]
 fn build_index_respects_budget_and_releases_reservation_on_error() {
     let cancel = common::cancellation::CancellationToken::new();
-    let initial_bytes = INITIAL_BUCKETS * size_of::<u32>() + size_of::<BuildKeyBounds>();
+    let initial_bytes = MINIMUM_BUCKETS * size_of::<u32>() + size_of::<BuildKeyBounds>();
     let budget = QueryMemoryTracker::new(initial_bytes, cancel);
     let mut table = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         budget.clone(),
     )
-    .expect("initial bucket table fits the configured budget");
+        .expect("initial bucket table fits the configured budget");
     assert_eq!(budget.used(), initial_bytes);
 
     let error = table
@@ -673,7 +688,7 @@ fn retained_build_arrays_are_charged_once_across_views_and_live_through_outputs(
         JoinKeys::new(vec![0]),
         tracker.clone(),
     )
-    .expect("create budgeted table");
+        .expect("create budgeted table");
     let initial_bytes = tracker.used();
 
     for _ in 0..2 {
@@ -715,7 +730,7 @@ fn equal_sized_distinct_build_arrays_each_consume_their_own_budget() {
         JoinKeys::new(vec![0]),
         shared_tracker.clone(),
     )
-    .expect("create shared-array table");
+        .expect("create shared-array table");
     let source = ints(&[10, 20]);
     let array_bytes = source.get_array_memory_size();
     let initial_shared_bytes = shared_tracker.used();
@@ -734,7 +749,7 @@ fn equal_sized_distinct_build_arrays_each_consume_their_own_budget() {
         JoinKeys::new(vec![0]),
         distinct_tracker.clone(),
     )
-    .expect("create distinct-array table");
+        .expect("create distinct-array table");
     let initial_distinct_bytes = distinct_tracker.used();
     for _ in 0..2 {
         distinct_table
@@ -754,7 +769,7 @@ fn equal_sized_distinct_build_arrays_each_consume_their_own_budget() {
 fn retained_build_array_budget_failure_happens_before_retaining_the_view() {
     let source = ints(&[10, 20]);
     let source_bytes = source.get_array_memory_size();
-    let initial_buckets = INITIAL_BUCKETS * size_of::<u32>() + size_of::<BuildKeyBounds>();
+    let initial_buckets = MINIMUM_BUCKETS * size_of::<u32>() + size_of::<BuildKeyBounds>();
     let tracker = QueryMemoryTracker::new(
         initial_buckets + source_bytes - 1,
         common::cancellation::CancellationToken::new(),
@@ -764,7 +779,7 @@ fn retained_build_array_budget_failure_happens_before_retaining_the_view() {
         JoinKeys::new(vec![0]),
         tracker.clone(),
     )
-    .expect("initial buckets fit the budget");
+        .expect("initial buckets fit the budget");
     let view = chunk(source);
 
     let error = table
@@ -784,7 +799,7 @@ fn retained_build_array_budget_failure_happens_before_retaining_the_view() {
 fn row_index_budget_failure_does_not_partially_insert_a_build_batch() {
     let first = ints(&[10]);
     let second = ints(&[20]);
-    let initial_bytes = INITIAL_BUCKETS * size_of::<u32>() + size_of::<BuildKeyBounds>();
+    let initial_bytes = MINIMUM_BUCKETS * size_of::<u32>() + size_of::<BuildKeyBounds>();
     let sizing_tracker =
         QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let mut sizing_table = HashTable::with_memory_tracker(
@@ -792,7 +807,7 @@ fn row_index_budget_failure_does_not_partially_insert_a_build_batch() {
         JoinKeys::new(vec![0]),
         sizing_tracker.clone(),
     )
-    .expect("create sizing table");
+        .expect("create sizing table");
     let initial_usage = sizing_tracker.used();
     sizing_table
         .insert(chunk(Arc::clone(&first)))
@@ -809,7 +824,7 @@ fn row_index_budget_failure_does_not_partially_insert_a_build_batch() {
         JoinKeys::new(vec![0]),
         tracker.clone(),
     )
-    .expect("initial buckets fit the budget");
+        .expect("minimum buckets fit the budget");
     table
         .insert(chunk(Arc::clone(&first)))
         .expect("first build batch fits");
@@ -851,23 +866,25 @@ fn merging_budgeted_tables_releases_the_replaced_bucket_allocation() {
         JoinKeys::new(vec![0]),
         tracker.clone(),
     )
-    .expect("create left table");
+        .expect("create left table");
     let mut right = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         tracker.clone(),
     )
-    .expect("create right table");
+        .expect("create right table");
     left.insert(chunk(ints(&[1]))).expect("insert left row");
     right.insert(chunk(ints(&[2]))).expect("insert right row");
     let before_merge = tracker.used();
+    let replaced_bytes = replaced_merge_index_bytes(&left, &right);
+    let rebuilt_bucket_bytes = rebuilt_merge_bucket_bytes(&left, &right);
 
     left.merge(right).expect("merge tables sharing one tracker");
 
     assert_eq!(
         tracker.used(),
-        before_merge - INITIAL_BUCKETS * size_of::<u32>() - size_of::<BuildKeyBounds>(),
-        "merge replaces the second bucket array and key-bounds vector"
+        before_merge + rebuilt_bucket_bytes - replaced_bytes,
+        "merge accounts for the rebuilt buckets and releases replaced index state"
     );
     drop(left);
     assert_eq!(tracker.used(), 0);
@@ -884,17 +901,19 @@ fn merging_tables_from_independent_budgets_transfers_accounting() {
         JoinKeys::new(vec![0]),
         left_tracker.clone(),
     )
-    .expect("create left table");
+        .expect("create left table");
     let mut right = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         right_tracker.clone(),
     )
-    .expect("create right table");
+        .expect("create right table");
     left.insert(chunk(ints(&[10]))).expect("insert left row");
     right.insert(chunk(ints(&[20]))).expect("insert right row");
     let left_before = left_tracker.used();
     let right_before = right_tracker.used();
+    let replaced_bytes = replaced_merge_index_bytes(&left, &right);
+    let rebuilt_bucket_bytes = rebuilt_merge_bucket_bytes(&left, &right);
 
     left.merge(right)
         .expect("merge independently budgeted tables");
@@ -906,9 +925,7 @@ fn merging_tables_from_independent_budgets_transfers_accounting() {
     );
     assert_eq!(
         left_tracker.used(),
-        left_before + right_before
-            - INITIAL_BUCKETS * size_of::<u32>()
-            - size_of::<BuildKeyBounds>(),
+        left_before + right_before + rebuilt_bucket_bytes - replaced_bytes,
         "destination owns merged state with one bucket array and one key-bounds vector"
     );
     let mut pairs = Vec::new();
@@ -934,13 +951,13 @@ fn merged_build_array_lease_moves_to_destination_and_outlives_the_table() {
         JoinKeys::new(vec![0]),
         left_tracker.clone(),
     )
-    .expect("create destination table");
+        .expect("create destination table");
     let mut right = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         right_tracker.clone(),
     )
-    .expect("create source table");
+        .expect("create source table");
     let source = ints(&[20, 30]);
     let source_bytes = source.get_array_memory_size();
     right

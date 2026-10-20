@@ -1,34 +1,26 @@
-use arrow::array::ArrayRef;
 use common::Result;
 
-use crate::udf::{FunctionRegistry, MappedUdfInput};
+use crate::udf::{FunctionRegistry, FunctionInput, UdfOutput};
 
 /// Plugin interface consumed by expression kernels for scalar functions.
 /// Implementations may dispatch to built-ins, user functions, or composed providers.
 pub trait ScalarFunctionProvider: Send + Sync {
-    /// Evaluates a function against dense Arrow arguments.
-    fn invoke(&self, name: &str, arguments: &[ArrayRef]) -> Result<ArrayRef>;
-
-    /// Evaluates a function against reference-backed arguments when supported.
-    fn invoke_mapped(
+    /// Evaluates a function against reference-backed logical batch arguments.
+    fn invoke(
         &self,
         name: &str,
-        arguments: &[MappedUdfInput<'_>],
+        arguments: &[FunctionInput<'_>],
         row_count: usize,
-    ) -> Result<Option<ArrayRef>>;
+    ) -> Result<UdfOutput>;
 }
 
 impl ScalarFunctionProvider for FunctionRegistry {
-    fn invoke(&self, name: &str, arguments: &[ArrayRef]) -> Result<ArrayRef> {
-        crate::expression::kernels::eval_call_udf(self, name, arguments)
-    }
-
-    fn invoke_mapped(
+    fn invoke(
         &self,
         name: &str,
-        arguments: &[MappedUdfInput<'_>],
+        arguments: &[FunctionInput<'_>],
         row_count: usize,
-    ) -> Result<Option<ArrayRef>> {
-        crate::expression::kernels::eval_call_udf_mapped(self, name, arguments, row_count)
+    ) -> Result<UdfOutput> {
+        FunctionRegistry::invoke(self, name, arguments, row_count)
     }
 }

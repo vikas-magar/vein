@@ -94,9 +94,15 @@ fn retained_group_keys_share_input_arrow_buffers() {
     ]))
         .expect("accumulate keys");
 
-    let Some(GroupKeyColumn::Int64(retained)) = &sink.group_key_batches[0][0] else {
-        panic!("retained key batch should contain the int64 Arrow array");
-    };
+    let retained_sources = sink.group_key_batches[0][0]
+        .as_ref()
+        .expect("retained grouping key")
+        .source_arrays()
+        .expect("retained key sources are available");
+    let retained = retained_sources
+        .iter()
+        .find_map(|array| array.as_any().downcast_ref::<Int64Array>())
+        .expect("retained source is an int64 Arrow array");
     assert_eq!(retained.values().as_ptr(), source_values);
     assert_eq!(sink.metrics().string_key_bytes_copied, 0);
     assert!(

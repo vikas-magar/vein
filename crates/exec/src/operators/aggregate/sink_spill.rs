@@ -12,6 +12,7 @@ impl AggregateSink {
         let mut pending = self.tracker.spill_manager().create_run()?;
         let output = self.spill_schema.write_run_with(
             pending.writer()?,
+            &self.tracker,
             self.groups.len(),
             |slot| self.intermediate_group_state(slot),
         )?;
@@ -44,6 +45,7 @@ impl AggregateSink {
         let mut pending = self.tracker.spill_manager().create_run()?;
         let output = self.spill_schema.write_run_with(
             pending.writer()?,
+            &self.tracker,
             group_count,
             |offset| self.intermediate_group_state(first_group + offset),
         )?;

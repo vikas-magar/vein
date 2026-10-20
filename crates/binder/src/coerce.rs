@@ -33,20 +33,31 @@ pub fn coerce_types(
     let right_type = right.data_type();
     let common = unify_types(&left_type, &right_type)?;
 
+    let (left, right) = coerce_to_common_type(left, right, &left_type, &right_type, &common);
+    Ok((left, right, common))
+}
+
+fn coerce_to_common_type(
+    left: LogicalExpr,
+    right: LogicalExpr,
+    left_type: &VeinDataType,
+    right_type: &VeinDataType,
+    common: &VeinDataType,
+) -> (LogicalExpr, LogicalExpr) {
     // A `Null` operand is never wrapped in a cast; it simply adopts the other
     // side's type. Any other differing operand is coerced to the common type.
-    let left = if left_type == VeinDataType::Null {
+    let left = if left_type == &VeinDataType::Null {
         left
     } else {
-        cast_to(left, common.clone())
+        cast_to(left, (*common).clone())
     };
-    let right = if right_type == VeinDataType::Null {
+    let right = if right_type == &VeinDataType::Null {
         right
     } else {
-        cast_to(right, common.clone())
+        cast_to(right, (*common).clone())
     };
 
-    Ok((left, right, common))
+    (left, right)
 }
 
 /// Applies operator-specific temporal arithmetic rules before falling back to
@@ -81,7 +92,23 @@ pub fn coerce_arithmetic(
         return Ok((right, left, right_type));
     }
 
-    let (left, right, common_type) = coerce_types(left, right)?;
+    let common_type = unify_types(&left_type, &right_type)?;
+    if op == BinaryOp::Divide
+        && matches!(
+            &common_type,
+            VeinDataType::Decimal128(_, _) | VeinDataType::Decimal256(_, _)
+        )
+    {
+        let result_type = VeinDataType::Float64;
+        return Ok((
+            cast_to(left, result_type.clone()),
+            cast_to(right, result_type.clone()),
+            result_type,
+        ));
+    }
+
+    let (left, right) =
+        coerce_to_common_type(left, right, &left_type, &right_type, &common_type);
     let decimal_op = match op {
         BinaryOp::Plus => Some(types::coercion::DecimalArithmeticOp::Add),
         BinaryOp::Minus => Some(types::coercion::DecimalArithmeticOp::Subtract),

@@ -43,7 +43,8 @@ pub fn eval_neg(src: &dyn Array) -> Result<ArrayRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int64Array;
+    use arrow::array::{Array, Decimal128Array, Float64Array, Int64Array};
+    use types::VeinDataType;
     use std::sync::Arc;
 
     #[test]
@@ -74,5 +75,23 @@ mod tests {
         assert_eq!(div_down.value(0), 5);
         assert_eq!(div_down.value(1), 4);
         assert_eq!(div_down.value(2), 5);
+    }
+
+    #[test]
+    fn float64_decimal_division_preserves_precision_and_nulls() {
+        let left = Decimal128Array::from(vec![Some(38_125_i128), None])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let right = Decimal128Array::from(vec![Some(700_i128), Some(700_i128)])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let left = crate::expression::kernels::eval_cast(&left, &VeinDataType::Float64).unwrap();
+        let right = crate::expression::kernels::eval_cast(&right, &VeinDataType::Float64).unwrap();
+
+        let result = eval_div(&left, &right).unwrap();
+        let values = result.as_any().downcast_ref::<Float64Array>().unwrap();
+
+        assert!((values.value(0) - 54.464_285_714_285_715).abs() < 1e-12);
+        assert!(values.is_null(1));
     }
 }

@@ -1197,7 +1197,18 @@ impl DataChunkView {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Self::new(self.row_count, projected, self.selection.clone())
+        let projected_schema = self
+            .schema
+            .as_ref()
+            .map(|schema| schema::project_schema(schema, columns))
+            .transpose()?;
+        let mut view = Self::new(self.row_count, projected, self.selection.clone())?;
+        if let Some(schema) = projected_schema {
+            // The source schema was validated and each projected field follows
+            // the same checked index as its already-validated view column.
+            view.schema = Some(schema);
+        }
+        Ok(view)
     }
 
     /// Replaces the active row selection while retaining source arrays and maps.
@@ -1215,9 +1226,12 @@ impl DataChunkView {
         Ok(self)
     }
 
-    /// Whether an active output value in this column is null-extended.
+    /// Whether an active output value is NULL in its source array or null-extended.
     pub fn is_null(&self, column: usize, logical_row: usize) -> Result<bool> {
-        Ok(self.resolve(column, logical_row)?.is_none())
+        match self.resolve(column, logical_row)? {
+            Some((array, physical_row)) => Ok(array.is_null(physical_row)),
+            None => Ok(true),
+        }
     }
 }
 
@@ -1265,4 +1279,7 @@ mod schema_tests;
 #[cfg(test)]
 #[path = "view/selection_tests.rs"]
 mod selection_tests;
+#[cfg(test)]
+#[path = "view/null_tests.rs"]
+mod null_tests;
 pub(crate) use derived::{DerivedColumnBuilder, ViewSourceRow};

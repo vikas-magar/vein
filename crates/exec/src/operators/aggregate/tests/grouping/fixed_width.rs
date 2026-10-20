@@ -64,16 +64,16 @@ fn decimal_group_keys_preserve_scale_nulls_and_spill_merge() {
     }
     assert!(!sink.spill_runs.is_empty(), "decimal groups should exercise spill");
 
-    let output = sink.finish().unwrap();
     let mut observed = std::collections::HashMap::new();
-    for batch in output {
+    sink.finish_with(std::num::NonZeroUsize::new(32).unwrap(), |batch| {
         assert_eq!(batch.column_data_type(0).unwrap(), &arrow::datatypes::DataType::Decimal128(12, 2));
         let keys = crate::pipeline::test_support::materialized_column::<Decimal128Array>(&batch, 0);
         let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
         for row in 0..batch.num_rows() {
             observed.insert(keys.is_valid(row).then(|| keys.value(row)), sums.value(row));
         }
-    }
+        Ok(())
+    }).unwrap();
     assert_eq!(observed.len(), 2049);
     for (key, sum) in observed {
         let expected = (0..rows)
@@ -113,16 +113,16 @@ fn decimal256_group_keys_keep_exact_wide_values_through_spill_merge() {
             .unwrap();
     }
     assert!(!sink.spill_runs.is_empty(), "wide decimal groups should spill");
-    let output = sink.finish().unwrap();
     let mut observed = std::collections::HashMap::new();
-    for batch in output {
+    sink.finish_with(std::num::NonZeroUsize::new(32).unwrap(), |batch| {
         assert_eq!(batch.column_data_type(0).unwrap(), &arrow::datatypes::DataType::Decimal256(76, 0));
         let keys = crate::pipeline::test_support::materialized_column::<Decimal256Array>(&batch, 0);
         let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
         for row in 0..batch.num_rows() {
             observed.insert(keys.is_valid(row).then(|| keys.value(row)), sums.value(row));
         }
-    }
+        Ok(())
+    }).unwrap();
     assert_eq!(observed.len(), 2049);
     let group_ids = (1..2049_i64)
         .map(|group_id| (high + i256::from(group_id), group_id))

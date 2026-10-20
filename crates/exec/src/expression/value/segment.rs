@@ -42,8 +42,17 @@ impl ExpressionSegment {
     pub(crate) fn len(&self) -> usize {
         self.len
     }
+
+    pub(crate) fn is_scalar(&self) -> bool {
+        self.scalar
+    }
+
     pub(crate) fn is_null_extended(&self) -> bool {
         self.array.is_none()
+    }
+
+    pub(crate) fn into_array(self) -> Option<ArrayRef> {
+        self.array
     }
 
     pub(crate) fn take_prefix(&mut self, len: usize) -> Self {

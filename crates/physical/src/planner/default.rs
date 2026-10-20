@@ -268,13 +268,15 @@ mod tests {
         assert_eq!(stage.tasks().len(), 1);
 
         let input = task_input(&stage.tasks()[0]);
-        let common::protocol::PhysicalPlanOperator::Pipeline { program, .. } = &input.operator else {
+        let common::protocol::PhysicalPlanOperator::Pipeline {
+            input_schema,
+            program,
+            ..
+        } = &input.operator else {
             panic!("scan-only plan should lower to a pipeline");
         };
-        assert!(program.steps.iter().any(|step| matches!(
-            step,
-            common::protocol::ExpressionStep::Projection(columns) if columns.len() == 2
-        )));
+        assert_eq!(input_schema.fields.len(), 2);
+        assert!(program.is_empty(), "a full scan must not add an identity projection");
     }
 
     #[test]

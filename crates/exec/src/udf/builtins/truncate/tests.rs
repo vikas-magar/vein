@@ -8,17 +8,21 @@ fn truncates_calendar_values_and_preserves_nulls() {
         Some(-1),
         None,
     ])) as ArrayRef;
-    let output = TruncateFunction { name: "truncate_quarter", unit: TemporalUnit::Quarter }
-        .invoke(&[input])
-        .unwrap();
+    let function = TruncateFunction {
+        name: "truncate_quarter",
+        unit: TemporalUnit::Quarter,
+    };
+    let output = crate::udf::test_support::invoke_dense(&function, vec![input]).unwrap();
     let output = output.as_any().downcast_ref::<Date32Array>().unwrap();
     assert_eq!(output.value(0), types::days_from_civil(2024, 1, 1) as i32);
     assert_eq!(output.value(1), types::days_from_civil(1969, 10, 1) as i32);
     assert!(output.is_null(2));
 
     let date64 = Arc::new(Date64Array::from(vec![Some(1_709_251_200_000)])) as ArrayRef;
-    let output = TruncateFunction { name: "truncate_month", unit: TemporalUnit::Month }
-        .invoke(&[date64])
+    let output = crate::udf::test_support::invoke_dense(
+        &TruncateFunction { name: "truncate_month", unit: TemporalUnit::Month },
+        vec![date64],
+    )
         .unwrap();
     assert_eq!(
             output.as_any().downcast_ref::<Date64Array>().unwrap().value(0),
@@ -29,14 +33,18 @@ fn truncates_calendar_values_and_preserves_nulls() {
 #[test]
 fn truncates_negative_timestamps_and_time_values_at_their_physical_scale() {
     let input = Arc::new(TimestampNanosecondArray::from(vec![Some(-1_000_000_001)])) as ArrayRef;
-    let output = TruncateFunction { name: "truncate_second", unit: TemporalUnit::Second }
-        .invoke(&[input])
+    let output = crate::udf::test_support::invoke_dense(
+        &TruncateFunction { name: "truncate_second", unit: TemporalUnit::Second },
+        vec![input],
+    )
         .unwrap();
     assert_eq!(output.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap().value(0), -2_000_000_000);
 
     let input = Arc::new(Time64MicrosecondArray::from(vec![Some(1_923_456_789)])) as ArrayRef;
-    let output = TruncateFunction { name: "truncate_minute", unit: TemporalUnit::Minute }
-        .invoke(&[input])
+    let output = crate::udf::test_support::invoke_dense(
+        &TruncateFunction { name: "truncate_minute", unit: TemporalUnit::Minute },
+        vec![input],
+    )
         .unwrap();
     assert_eq!(output.as_any().downcast_ref::<Time64MicrosecondArray>().unwrap().value(0), 1_920_000_000);
 }
@@ -48,5 +56,5 @@ fn validates_temporal_types_and_rejects_timezone_aware_timestamps() {
     assert!(function.return_type(&[DataType::Time64(TimeUnit::Microsecond)]).is_err());
     assert!(function.return_type(&[DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))]).is_err());
     let input = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
-    assert!(function.invoke(&[input]).is_err());
+    assert!(crate::udf::test_support::invoke_dense(&function, vec![input]).is_err());
 }

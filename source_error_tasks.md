@@ -13,7 +13,7 @@ This plan tracks confirmed findings from the Q1–Q22 run and workspace diagnost
 ## Tasks
 
 ### T0 — Establish a test-suite baseline [P0, complete]
-The current workspace `Test` configuration passes with exit code 0. The earlier exit-101 run is not reproducible from the available output, so its original failing test cannot be attributed retrospectively.
+The previous workspace failure was a stale assertion in `exec::trace::tests::canonical_node_ids_are_deterministic_preorder_ids`: it expected `program_instructions=0`, but the current formatter reports `expression_steps=0`. Updated the assertion to match the current trace contract. The focused regression passes; the workspace `Test` configuration now passes all 1,177 unit and integration tests, and workspace `Check` passes.
 
 - Identify the failing test(s) through the existing `Test` configuration and RustRover results.
 - Determine whether failures are regressions, flaky tests, or existing failures; record the exact crate and test names.
@@ -68,7 +68,7 @@ Q8 and Q14 fail because aggregate lowering expects a bare function call, rejecti
 Q17 cannot coerce `Float64` and `Decimal128(1, 1)`; the common-type error originates at `crates/types/src/coercion.rs:58`.
 
 - Define and document a consistent numeric promotion rule for aggregate results and decimal literals.
-- Infer decimal arithmetic result precision and scale using Arrow-compatible rules for add/subtract/multiply/divide/remainder; this also fixes Q14's declared-versus-produced Decimal256 mismatch.
+- Infer decimal arithmetic result precision and scale using Arrow-compatible rules for add/subtract/multiply/remainder. For ordinary `/` with Decimal128/Decimal256 operands, cast both sides to Float64 to match DuckDB's SQL behavior and retain result precision.
 - Tests: decimal AVG multiplied by decimal/float literals, overflow/scale boundaries, and NULLs.
 - Acceptance: preserve numeric correctness and avoid unnecessary casts or copied columns. The Q17-shaped AVG query and Q14-shaped ratio both execute successfully.
 
@@ -131,9 +131,10 @@ Ran Q1–Q22 through the existing Query configuration using the pipe definitions
 | Q21 | 650 rows, 24,309 ms | 650 |
 | Q22 | 7 rows, 568 ms | 7 |
 
-- First-row samples match for the 20 successful queries checked before Q22 except numeric representation differences in Q8 (`0.03781923` vs `0.03781923245010446`) and Q14 (`16.483182755636` vs `16.483182755636385`); determine whether these are display truncation or result precision/type defects. Q22's row count matches DuckDB; full row values still need comparison.
-- Q12's two complete rows match DuckDB. Q17 now lowers the correlated projected aggregate into a grouped aggregate and left join; its one-row result displays `535732.331428`, while DuckDB returns `535732.3314285714`. Vein's CLI shows only six fractional digits here, so full numeric precision remains unverified. The Vein run took 36,933 ms, which is a substantial performance gap to investigate separately.
+- The earlier Q8 (`0.03781923`), Q14 (`16.483182755636`), and Q17 (`535732.331428`) values were real Decimal result precision loss, not display truncation. Decimal `/` now binds both operands as `Float64`, matching DuckDB's ordinary division semantics. Binder and execution regressions cover the bound operand/result types, numeric precision, and NULL propagation.
+- Validation through `Query` with JSONL output now returns Q8 `0.03781923245010446` and `0.03588441759268987`, Q14 `16.483182755636385`, and Q17 `535732.3314285714`, matching the previously captured DuckDB results. This run observed 3,175 ms, 269 ms, and 5,276 ms respectively; these are not controlled DuckDB timing comparisons.
+- Q12's two complete rows match DuckDB. Q17's correlated projected aggregate lowers into a grouped aggregate and left join. Its old 36,933 ms timing predates this validation and is not directly comparable to the new sample. The full Q1–Q22 ordered result comparison and controlled timing comparison remain open.
 - Q20 now completes through a scope-aware membership rewrite and composite-key correlated aggregate decorrelation. It returns 273 rows, matching DuckDB's count. Q22 also completes with 7 rows; DuckDB confirms Q17, Q20, and Q22 are valid query shapes and returns 1, 273, and 7 rows respectively.
-- Q22's optimizer volatility analysis descends into scalar-subquery plans, allowing its deterministic global `AVG` beside `NOT EXISTS` while preserving rejection for nested `RANDOM()` and other volatile work. Workspace Test and Check, incremental build, and Query validation pass; Query returns 7 rows in 568 ms with `VEIN_DISPLAY_ROWS=1`. Full ordered result equality remains open.
-- Remaining work: investigate Q8/Q14 and Q17 numeric precision, then compare complete ordered result sets and collect comparable per-query timings.
+- Q22's optimizer volatility analysis descends into scalar-subquery plans, allowing its deterministic global `AVG` beside `NOT EXISTS` while preserving rejection for nested `RANDOM()` and other volatile work. The earlier Q22 validation run passed Test and Check and returned 7 rows in 568 ms with `VEIN_DISPLAY_ROWS=1`. The current workspace Test and Check baseline passes. Full ordered result equality remains open.
+- Remaining work: compare complete ordered result sets and collect comparable per-query timings. The table above records earlier measurements, not a controlled current benchmark.
 - Acceptance: all 22 queries either produce DuckDB-equivalent results or have a documented, intentional unsupported-feature status; report performance and remaining gaps explicitly.

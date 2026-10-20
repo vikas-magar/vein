@@ -1,7 +1,8 @@
 //! Schema metadata attached to a reference-backed view.
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use common::Result;
+use std::sync::Arc;
 
 use super::DataChunkView;
 
@@ -24,4 +25,21 @@ impl DataChunkView {
     pub fn slice_rows(&self, offset: usize, limit: usize) -> Result<Self> {
         self.with_selection(self.selection.slice(offset, limit))
     }
+}
+
+pub(super) fn project_schema(schema: &SchemaRef, columns: &[usize]) -> Result<SchemaRef> {
+    let fields = columns
+        .iter()
+        .map(|&index| {
+            schema.fields().get(index).cloned().ok_or_else(|| {
+                common::VeinError::internal(format!(
+                    "view schema projection column {index} is out of bounds"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
 }

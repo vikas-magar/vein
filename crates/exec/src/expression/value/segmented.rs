@@ -1,6 +1,11 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 
-use arrow::array::{Array, ArrayRef};
+use arrow::array::ArrayRef;
+#[cfg(test)]
+use arrow::array::Array;
+#[cfg(test)]
 use arrow::compute::concat;
 use arrow::datatypes::DataType;
 use common::Result;
@@ -16,6 +21,7 @@ struct SegmentedArrayInner {
     end_offsets: Arc<[usize]>,
     row_count: usize,
     data_type: DataType,
+    #[cfg(test)]
     materialized: OnceLock<std::result::Result<ArrayRef, String>>,
 }
 
@@ -49,6 +55,7 @@ impl SegmentedArray {
             end_offsets: Arc::from(end_offsets),
             row_count,
             data_type,
+            #[cfg(test)]
             materialized: OnceLock::new(),
         })))
     }
@@ -115,6 +122,7 @@ impl SegmentedArray {
         Ok((self.0.arrays[index].slice(start - segment_start, len), len))
     }
 
+    #[cfg(test)]
     pub(crate) fn materialized_array(&self) -> Result<ArrayRef> {
         let cached = self.0.materialized.get_or_init(|| {
             let arrays: Vec<&dyn Array> = self.0.arrays.iter().map(AsRef::as_ref).collect();

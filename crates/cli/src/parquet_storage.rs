@@ -762,8 +762,8 @@ mod tests {
         let storage = ParquetStorage::new(root.path());
         let mut transaction = storage.begin_write(&target(None)).expect("begin create");
         transaction.write_view(&chunk(vec![1])).expect("write first chunk");
-        let incompatible_schema = Arc::new(Schema::new(vec![Field::new("other", DataType::Int64, false)]));
-        let incompatible = DataChunkView::from_dense_arrays(vec![Arc::new(Int64Array::from(vec![2]))])
+        let incompatible_schema = Arc::new(Schema::new(vec![Field::new("other", DataType::Int32, false)]));
+        let incompatible = DataChunkView::from_dense_arrays(vec![Arc::new(arrow::array::Int32Array::from(vec![2]))])
             .expect("valid incompatible chunk")
             .with_schema(incompatible_schema)
             .expect("valid incompatible schema");

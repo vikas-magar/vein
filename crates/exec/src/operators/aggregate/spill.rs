@@ -5,7 +5,7 @@
 //! shared array references so the merge path can retain them without scalar
 //! copies.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ use types::VeinDataType;
 use super::intermediate::{AggregateGroupKeyRef, AggregateIntermediateGroup};
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
 use crate::pipeline::DataChunkView;
-use crate::spill::{IpcRunOutput, IpcRunWriter, SpillRun};
+use crate::spill::{IpcRunOutput, SpillRun};
 
 const FORMAT_METADATA_KEY: &str = "vein.aggregate.spill.format";
 const FORMAT_METADATA_VALUE: &str = "2";
@@ -31,9 +31,14 @@ const GROUPING_SET_ID_FIELD: &str = "grouping_set_id";
 const HASH_FIELD: &str = "group_hash";
 const STATE_FIELD: &str = "aggregate_state";
 mod decimal_key_builder;
+mod batch_memory;
+mod writer;
+use writer::AggregateSpillWriter;
+
 /// Spill batches stay smaller than normal aggregate batches because decoded
 /// runs temporarily retain key, metadata, and state arrays during partitioning.
 const SPILL_RECORD_BATCH_SIZE: usize = super::AGGREGATE_BATCH_ROWS.get() / 16;
+const SPILL_WORKSPACE_BUDGET_DIVISOR: usize = 16;
 
 /// Describes the stable typed layout shared by all runs of one aggregate.
 #[derive(Clone)]
@@ -85,9 +90,9 @@ impl AggregateSpillSchema {
     pub(super) fn write_run<W, I>(&self, output: W, groups: I) -> Result<W>
     where
         W: IpcRunOutput,
-        I: IntoIterator<Item = AggregateIntermediateGroup>,
+        I: IntoIterator<Item=AggregateIntermediateGroup>,
     {
-        let mut writer = AggregateSpillWriter::new(self, output)?;
+        let mut writer = AggregateSpillWriter::new(self, output, usize::MAX)?;
         for group in groups {
             writer.push(group)?;
         }
@@ -99,13 +104,18 @@ impl AggregateSpillSchema {
     pub(super) fn write_run_with<W>(
         &self,
         output: W,
+        tracker: &QueryMemoryTracker,
         group_count: usize,
         mut group_at: impl FnMut(usize) -> Result<AggregateIntermediateGroup>,
     ) -> Result<W>
     where
         W: IpcRunOutput,
     {
-        let mut writer = AggregateSpillWriter::new(self, output)?;
+        let mut writer = AggregateSpillWriter::new(
+            self,
+            output,
+            self.spill_workspace_target(tracker),
+        )?;
         for slot in 0..group_count {
             writer.push(group_at(slot)?)?;
         }
@@ -132,8 +142,9 @@ impl AggregateSpillSchema {
         let manager = tracker.spill_manager();
         let mut zero_pending = manager.create_run()?;
         let mut one_pending = manager.create_run()?;
-        let mut zero = AggregateSpillWriter::new(self, zero_pending.writer()?)?;
-        let mut one = AggregateSpillWriter::new(self, one_pending.writer()?)?;
+        let target_bytes = self.spill_workspace_target(tracker);
+        let mut zero = AggregateSpillWriter::new(self, zero_pending.writer()?, target_bytes)?;
+        let mut one = AggregateSpillWriter::new(self, one_pending.writer()?, target_bytes)?;
         let mut has_zero = false;
         let mut has_one = false;
 
@@ -144,13 +155,17 @@ impl AggregateSpillSchema {
                 tracker.check_cancelled()?;
                 for group in std::mem::take(&mut batch.groups) {
                     if group.hash & (1_u64 << bit) == 0 {
-                        zero.push(group)?;
+                        zero.push_retained(group, &batch._leases)?;
                         has_zero = true;
                     } else {
-                        one.push(group)?;
+                        one.push_retained(group, &batch._leases)?;
                         has_one = true;
                     }
                 }
+                // Do not let pending key references outlive the lease owned by
+                // this decoded batch. The writer retains the lease until flush.
+                zero.flush()?;
+                one.flush()?;
             }
         }
 
@@ -251,7 +266,7 @@ impl AggregateSpillSchema {
             groups.len(),
             SelectionVector::new_dense(groups.len()),
         )?
-        .with_schema(Arc::clone(&self.schema))
+            .with_schema(Arc::clone(&self.schema))
     }
 
     fn decode_batch(&self, batch: &DataChunkView) -> Result<Vec<AggregateIntermediateGroup>> {
@@ -315,82 +330,6 @@ impl AggregateSpillSchema {
             });
         }
         Ok(groups)
-    }
-
-    fn reserve_decoded_batch(
-        &self,
-        batch: &DataChunkView,
-        tracker: &QueryMemoryTracker,
-    ) -> Result<(MemoryReservation, Vec<Arc<MemoryReservation>>)> {
-        let mut identities = HashSet::with_capacity(batch.num_columns());
-        let mut key_leases = Vec::with_capacity(self.key_types.len());
-        let mut workspace_bytes = 0_usize;
-        let first_key = 2;
-        let end_key = first_key + self.key_types.len();
-        for column in 0..batch.num_columns() {
-            for array in batch.source_arrays_for_column(column)? {
-                if (first_key..end_key).contains(&column) {
-                    let identity = Arc::as_ptr(array) as *const () as usize;
-                    if identities.insert(identity) {
-                        key_leases.push(tracker.lease_retained_array(
-                            identity,
-                            array.get_array_memory_size(),
-                            "aggregate retained spill keys",
-                        )?);
-                    }
-                } else {
-                    workspace_bytes = workspace_bytes
-                        .checked_add(array.get_array_memory_size())
-                        .ok_or_else(|| {
-                            VeinError::internal("aggregate spill workspace size overflow")
-                        })?;
-                }
-            }
-        }
-        let workspace = tracker.reserve(workspace_bytes, "aggregate spill decode workspace")?;
-        Ok((workspace, key_leases))
-    }
-}
-
-/// Bounded, incremental IPC writer shared by flush and repartition paths.
-struct AggregateSpillWriter<'a, W: IpcRunOutput> {
-    layout: &'a AggregateSpillSchema,
-    writer: IpcRunWriter<W>,
-    pending: Vec<AggregateIntermediateGroup>,
-}
-
-impl<'a, W: IpcRunOutput> AggregateSpillWriter<'a, W> {
-    fn new(layout: &'a AggregateSpillSchema, output: W) -> Result<Self> {
-        let writer = IpcRunWriter::new(output, &layout.schema, "create aggregate IPC writer")?;
-        Ok(Self {
-            layout,
-            writer,
-            pending: Vec::with_capacity(SPILL_RECORD_BATCH_SIZE),
-        })
-    }
-
-    fn push(&mut self, group: AggregateIntermediateGroup) -> Result<()> {
-        self.pending.push(group);
-        if self.pending.len() == SPILL_RECORD_BATCH_SIZE {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let encoded = self.layout.encode_batch(&self.pending)?;
-        self.writer
-            .write_view(&encoded, "write aggregate IPC batch")?;
-        self.pending.clear();
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<W> {
-        self.flush()?;
-        self.writer.finish("finish aggregate IPC run")
     }
 }
 
@@ -629,7 +568,7 @@ mod tests {
     fn managed_run(
         layout: &AggregateSpillSchema,
         tracker: &QueryMemoryTracker,
-        groups: impl IntoIterator<Item = AggregateIntermediateGroup>,
+        groups: impl IntoIterator<Item=AggregateIntermediateGroup>,
     ) -> SpillRun {
         let mut pending = tracker
             .spill_manager()
@@ -756,7 +695,7 @@ mod tests {
             Int32Array::from(vec![Some(0), Some(1)]),
             Arc::new(StringArray::from(vec!["alpha", "beta"])),
         )
-        .expect("dictionary source key");
+            .expect("dictionary source key");
         let key: ArrayRef = Arc::new(dict);
         let groups = [sample_group(0, Some((key, 1)), 1)];
         let mut bytes = Cursor::new(Vec::new());
@@ -810,7 +749,7 @@ mod tests {
                     Arc::new(StringArray::from(vec!["wrong type"])) as ArrayRef,
                     0,
                 )
-                .expect("valid mismatched key row"),
+                    .expect("valid mismatched key row"),
             )],
             aggregate_states: vec![AggregateIntermediateState::Count(1)],
         };
@@ -938,6 +877,7 @@ mod tests {
             .partition_runs(std::slice::from_ref(&source), &tracker, 0)
             .expect("partition groups with an unused child");
 
+        assert_eq!(tracker.used(), 0, "partition output releases decoded key leases");
         assert!(children[0].is_some());
         assert!(children[1].is_none());
         drop(source);
@@ -977,3 +917,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "spill/batch_tests.rs"]
+mod batch_tests;

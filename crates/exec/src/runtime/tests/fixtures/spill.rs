@@ -12,14 +12,13 @@ impl SpillStorageFactory for CountingSpillStorageFactory {
 }
 
 
-
 // Compact fixture DSL; runtime tests immediately lower it to the canonical plan tree.
 
 /// Builds a full join task for spill tests.
 pub(in crate::runtime::tests) fn full_join_spill_task() -> ExecuteTask {
     let input = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-            program: Arc::new(ExpressionProgram::empty()),
+        program: Arc::new(ExpressionProgram::empty()),
     };
     let plan = JoinPlan {
         join_type: JoinKind::Full,
@@ -41,7 +40,7 @@ pub(in crate::runtime::tests) fn full_join_spill_task() -> ExecuteTask {
 }
 
 pub(in crate::runtime::tests) fn full_join_feed() -> Arc<MemoryFeedBuilder> {
-    let mut values = (0..128).map(Some).collect::<Vec<_>>();
+    let mut values = (0..1_024).map(Some).collect::<Vec<_>>();
     values.extend([Some(20), None]);
     Arc::new(MemoryFeedBuilder::with_nullable_values(values))
 }

@@ -33,3 +33,21 @@ approval_mode = "approve"
 
 [mcp_servers.rustrover.tools.execute_terminal_command]
 approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_set_breakpoints]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_start_debugger_session]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_control_session]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_get_stack]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_get_frame_values]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_list_breakpoints]
+approval_mode = "approve"

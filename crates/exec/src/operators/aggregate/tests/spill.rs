@@ -86,19 +86,20 @@ fn aggregate_spill_flushes_retries_and_merges_repeated_keys() {
     );
     assert!(tracker.spill_bytes_used() > 0, "aggregate runs consume query spill budget");
 
-    let output = sink.finish().expect("merge spill runs");
-    assert!(
-        tracker.spill_bytes_used() == 0,
-        "successfully consumed aggregate runs release the query spill budget"
-    );
     let mut counts = std::collections::BTreeMap::new();
-    for batch in output {
+    sink.finish_with(AGGREGATE_BATCH_ROWS, |batch| {
         let keys = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 0);
         let values = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
         for row in 0..batch.num_rows() {
             counts.insert(keys.value(row), values.value(row));
         }
-    }
+        Ok(())
+    })
+        .expect("merge spill runs");
+    assert!(
+        tracker.spill_bytes_used() == 0,
+        "successfully consumed aggregate runs release the query spill budget"
+    );
     let expected = keys.into_iter().fold(
         std::collections::BTreeMap::new(),
         |mut counts, key| {
@@ -161,9 +162,16 @@ fn worker_local_aggregate_states_combine_null_and_repeated_keys_without_copying_
         .group_key_batches
         .iter()
         .flat_map(|batch| batch.iter().flatten())
-        .filter_map(|column| match column {
-            GroupKeyColumn::Int64(values) => Some(values.values().as_ptr()),
-            _ => None,
+        .flat_map(|column| {
+            column
+                .source_arrays()
+                .expect("retained key sources are available")
+        })
+        .filter_map(|array| {
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|values| values.values().as_ptr())
         })
         .collect::<Vec<_>>();
     assert!(
@@ -222,9 +230,8 @@ fn aggregate_spill_preserves_null_keys_and_grouping_set_identity() {
         !sink.spill_runs.is_empty(),
         "the constrained budget must create a spill run"
     );
-    let output = sink.finish().expect("merge grouping-set spill runs");
     let mut null_key_counts = Vec::new();
-    for batch in output {
+    sink.finish_with(AGGREGATE_BATCH_ROWS, |batch| {
         let keys = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 0);
         let values = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
         for row in 0..batch.num_rows() {
@@ -232,7 +239,9 @@ fn aggregate_spill_preserves_null_keys_and_grouping_set_identity() {
                 null_key_counts.push(values.value(row));
             }
         }
-    }
+        Ok(())
+    })
+        .expect("merge grouping-set spill runs");
     null_key_counts.sort_unstable();
     let null_rows = keys.iter().filter(|key| key.is_none()).count() as i64;
     assert_eq!(null_key_counts, [null_rows, input_rows]);

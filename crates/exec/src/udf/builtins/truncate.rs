@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, PrimitiveArray, PrimitiveBuilder};
+use arrow::array::{Array, ArrayRef, PrimitiveArray, PrimitiveBuilder, new_null_array};
 use arrow::array::types::{
     ArrowPrimitiveType, Date32Type, Date64Type, Time32MillisecondType, Time32SecondType,
     Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
@@ -10,7 +10,8 @@ use arrow::datatypes::{DataType, TimeUnit};
 use error::{Result, VeinError};
 use types::TemporalUnit;
 
-use super::super::ScalarUDFImpl;
+use super::super::{ScalarFunction, FunctionInput, UdfOutput};
+use crate::udf::segments::invoke_segments;
 
 #[derive(Debug)]
 pub(super) struct TruncateFunction {
@@ -18,7 +19,7 @@ pub(super) struct TruncateFunction {
     pub(super) unit: TemporalUnit,
 }
 
-impl ScalarUDFImpl for TruncateFunction {
+impl ScalarFunction for TruncateFunction {
     fn name(&self) -> &str {
         self.name
     }
@@ -43,14 +44,30 @@ impl ScalarUDFImpl for TruncateFunction {
         Ok(data_type.clone())
     }
 
-    fn invoke(&self, args: &[ArrayRef]) -> Result<ArrayRef> {
-        let [input] = args else {
-            return Err(VeinError::internal(format!(
-                "{} expects exactly one argument",
-                self.name
-            )));
-        };
-        self.return_type(&[input.data_type().clone()])?;
+    fn invoke(
+        &self,
+        args: &[FunctionInput<'_>],
+        rows: usize,
+        return_type: &DataType,
+    ) -> Result<UdfOutput> {
+        invoke_segments(args, rows, return_type, |segments, segment_rows| {
+            let [input] = segments else {
+                return Err(VeinError::internal(format!(
+                    "{} expects exactly one argument",
+                    self.name
+                )));
+            };
+            let Some(array) = input.array() else {
+                return Ok(new_null_array(return_type, segment_rows));
+            };
+            self.invoke_segment(array)
+        })
+    }
+}
+
+impl TruncateFunction {
+    fn invoke_segment(&self, input: &dyn Array) -> Result<ArrayRef> {
+        self.return_type(std::slice::from_ref(input.data_type()))?;
 
         let (units_per_second, units_per_day, is_date, is_time) = match input.data_type() {
             DataType::Date32 => (None, 1, true, false),

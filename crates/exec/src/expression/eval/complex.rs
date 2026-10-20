@@ -1,14 +1,10 @@
-use std::sync::Arc;
-
-use arrow::array::{Array, ArrayRef, UInt32Array, new_empty_array, new_null_array};
-use arrow::compute::take;
 use common::Result;
 use common::protocol::{ExprKind, PhysicalExpr};
 use error::VeinError;
 
 use crate::expression::kernels as ops;
 use crate::expression::value::ExpressionValue;
-use crate::udf::MappedUdfInput;
+use crate::udf::FunctionInput;
 
 use super::ExpressionEvaluationContext;
 
@@ -74,43 +70,10 @@ pub(super) fn evaluate_call(
     let values = args.iter().map(|argument| context.evaluate(argument))
         .collect::<Result<Vec<_>>>()?;
     let rows = context.input().num_rows();
-    let mapped = values.iter().map(|value| MappedUdfInput::new(value, rows))
+    let arguments = values.iter().map(|value| FunctionInput::new(value, rows))
         .collect::<Vec<_>>();
-    if let Some(result) = context.functions().invoke_mapped(name, &mapped, rows)? {
-        return Ok(output_value(result, rows));
-    }
-    if values.iter().any(ExpressionValue::is_mapped) {
-        return Err(VeinError::unsupported(
-            format!("function {name} must support reference-backed expression inputs"), None,
-        ));
-    }
-    let arguments = values.iter().map(|value| dense_argument(value, rows))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(output_value(context.functions().invoke(name, &arguments)?, rows))
-}
-
-fn output_value(array: ArrayRef, rows: usize) -> ExpressionValue {
-    if array.len() == 1 && rows != 1 {
-        ExpressionValue::Scalar(array)
-    } else {
-        ExpressionValue::Array(array)
-    }
-}
-
-fn dense_argument(value: &ExpressionValue, rows: usize) -> Result<ArrayRef> {
-    match value {
-        ExpressionValue::Array(array) if array.len() == rows => Ok(Arc::clone(array)),
-        ExpressionValue::Scalar(array) if array.len() == 1 => broadcast(array, rows),
-        ExpressionValue::Segments(segments) if segments.len() == rows => segments.materialized_array(),
-        _ => Err(VeinError::internal("function argument has an invalid dense shape")),
-    }
-}
-
-pub(crate) fn broadcast(array: &ArrayRef, rows: usize) -> Result<ArrayRef> {
-    if rows == 0 { return Ok(new_empty_array(array.data_type())); }
-    if array.is_null(0) { return Ok(new_null_array(array.data_type(), rows)); }
-    if rows == 1 { return Ok(Arc::clone(array)); }
-    let indices = UInt32Array::from(vec![0; rows]);
-    take(array.as_ref(), &indices, None)
-        .map_err(|error| VeinError::internal(format!("broadcast scalar failed: {error}")))
+    Ok(context
+        .functions()
+        .invoke(name, &arguments, rows)?
+        .into_expression_value())
 }
