@@ -216,7 +216,7 @@ impl<O: ClientOutput> Sink<DataChunkView, O> for CollectSink<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{DataChunk, ViewColumnRef, ViewInputRows};
+    use crate::pipeline::{DataChunkView, ViewColumnRef, ViewInputRows};
     use arrow::array::{Array, ArrayRef, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use common::arrow::SelectionVector;
@@ -231,11 +231,10 @@ mod tests {
     }
 
     fn view(array: &ArrayRef, rows: Vec<u32>) -> DataChunkView {
-        DataChunkView::from_chunk(DataChunk::new(
+        crate::pipeline::test_support::selected_view(
             vec![Arc::clone(array)],
             SelectionVector::new_sparse(rows),
-        ))
-            .unwrap()
+        )
     }
 
     #[test]
@@ -285,7 +284,7 @@ mod tests {
     fn sparse_repeated_and_null_extended_results_convert_only_at_arrow_boundary() {
         let source: ArrayRef = Arc::new(Int64Array::from(vec![Some(10), None, Some(30)]));
         let input =
-            DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(&source)])).unwrap();
+            crate::pipeline::test_support::dense_view(vec![Arc::clone(&source)]);
         let rows = vec![Some(2), None, Some(0), Some(2), Some(1)];
         let input = DataChunkView::combine(
             &[ViewInputRows {
@@ -338,9 +337,10 @@ mod tests {
         let mut arrow = CollectSink::<RecordBatch>::new(Arc::clone(&schema));
         let mut references = CollectSink::<ViewResultBatch>::new(schema);
         for rows in [0, 3] {
-            let input =
-                DataChunkView::from_chunk(DataChunk::new(vec![], SelectionVector::new_dense(rows)))
-                    .unwrap();
+            let input = crate::pipeline::test_support::selected_view(
+                vec![],
+                SelectionVector::new_dense(rows),
+            );
             arrow.push(input.clone()).unwrap();
             references.push(input).unwrap();
         }
@@ -372,8 +372,7 @@ mod tests {
         assert_eq!(sink.row_count(), 1);
         assert_eq!(sink.collect().len(), 1);
         let wrong_width =
-            DataChunkView::from_chunk(DataChunk::new(vec![], SelectionVector::new_dense(2)))
-                .unwrap();
+            crate::pipeline::test_support::selected_view(vec![], SelectionVector::new_dense(2));
         assert!(
             sink.push(wrong_width)
                 .unwrap_err()

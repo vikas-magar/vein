@@ -1,5 +1,5 @@
-use std::time::Instant;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::datatypes::DataType;
 
@@ -37,7 +37,7 @@ impl BuildSink {
             build_keys,
             QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new()),
         )
-            .expect("unlimited join memory budget must create a build sink")
+        .expect("unlimited join memory budget must create a build sink")
     }
 
     /// Create a build sink that charges its index to `tracker`.
@@ -46,7 +46,8 @@ impl BuildSink {
         build_keys: JoinKeys,
         tracker: QueryMemoryTracker,
     ) -> Result<Self> {
-        let table = HashTable::with_memory_tracker(build_keys.clone(), probe_keys, tracker.clone())?;
+        let table =
+            HashTable::with_memory_tracker(build_keys.clone(), probe_keys, tracker.clone())?;
         Ok(Self {
             table: Some(table),
             spill_writer: None,
@@ -70,17 +71,15 @@ impl BuildSink {
         tracker: QueryMemoryTracker,
     ) -> Result<Self> {
         let schema = JoinSpillSchema::new(build_types);
-        let (table, spill_writer) = match HashTable::with_memory_tracker(
-            build_keys.clone(),
-            probe_keys,
-            tracker.clone(),
-        ) {
-            Ok(table) => (Some(table), None),
-            Err(VeinError::ResourceExhausted { .. }) => {
-                (None, Some(JoinSpillWriter::new(tracker.clone(), schema.clone())?))
-            }
-            Err(error) => return Err(error),
-        };
+        let (table, spill_writer) =
+            match HashTable::with_memory_tracker(build_keys.clone(), probe_keys, tracker.clone()) {
+                Ok(table) => (Some(table), None),
+                Err(VeinError::ResourceExhausted { .. }) => (
+                    None,
+                    Some(JoinSpillWriter::new(tracker.clone(), schema.clone())?),
+                ),
+                Err(error) => return Err(error),
+            };
         Ok(Self {
             table,
             spill_writer,
@@ -164,7 +163,8 @@ impl BuildSink {
 
     /// The finished table, ready to probe.
     pub fn finish(self) -> HashTable {
-        self.table.expect("in-memory build sink cannot finish after spilling")
+        self.table
+            .expect("in-memory build sink cannot finish after spilling")
     }
 
     /// Finish either the retained hash table or its spill run.
@@ -189,7 +189,10 @@ impl BuildSink {
 
 pub(crate) enum BuildResult {
     InMemory(Arc<HashTable>),
-    Spilled { run: JoinSpillRun, schema: JoinSpillSchema },
+    Spilled {
+        run: JoinSpillRun,
+        schema: JoinSpillSchema,
+    },
 }
 
 impl PipelineNode<DataChunkView> for BuildSink {
@@ -203,7 +206,7 @@ impl PipelineNode<DataChunkView> for BuildSink {
                 .table
                 .as_mut()
                 .ok_or_else(|| VeinError::internal("join build table is unavailable"))?;
-            match table.insert_view(view.clone()) {
+            match table.insert(view.clone()) {
                 Ok(()) => {
                     if self.spill_schema.is_some() {
                         self.spill_backup.push(view);
@@ -239,10 +242,9 @@ impl PipelineNode<DataChunkView> for BuildSink {
 
     fn flush(&mut self) -> Result<()> {
         if self.is_worker_local {
-            let table = self
-                .table
-                .as_ref()
-                .ok_or_else(|| VeinError::internal("worker-local join build table is unavailable at flush"))?;
+            let table = self.table.as_ref().ok_or_else(|| {
+                VeinError::internal("worker-local join build table is unavailable at flush")
+            })?;
             tracing::debug!(
                 target: "vein.audit",
                 event = "join_build_worker_finished",

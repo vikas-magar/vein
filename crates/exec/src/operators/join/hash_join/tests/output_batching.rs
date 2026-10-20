@@ -19,7 +19,7 @@ fn join_batches_multiple_build_chunks_without_copying_payloads() {
         (&[7, 8][..], &build_payloads[2]),
     ] {
         table
-            .insert(DataChunk::from_vectors(vec![ints(keys), Arc::clone(payload)]))
+            .insert(crate::pipeline::test_support::dense_view(vec![ints(keys), Arc::clone(payload)]))
             .expect("insert build batch");
     }
 
@@ -34,7 +34,7 @@ fn join_batches_multiple_build_chunks_without_copying_payloads() {
         Box::new(sink.clone()),
     );
     join.push(
-        DataChunk::from_vectors(vec![ints(&[7, 8, 9]), Arc::clone(&probe_payload)]),
+        crate::pipeline::test_support::dense_view(vec![ints(&[7, 8, 9]), Arc::clone(&probe_payload)]),
     )
         .expect("probe rows across build chunks");
     join.flush().expect("flush join");

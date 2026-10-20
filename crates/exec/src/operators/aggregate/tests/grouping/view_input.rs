@@ -25,12 +25,10 @@ fn sum_plan() -> AggregatePlan {
 
 fn mapped_input() -> (DataChunkView, ArrayRef) {
     let key_array: ArrayRef = Arc::new(Int64Array::from(vec![10, 20]));
-    let key_view = DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(&key_array)]))
-        .expect("key source view");
-    let value_view = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+    let key_view = crate::pipeline::test_support::dense_view(vec![Arc::clone(&key_array)]);
+    let value_view = crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
-    ]))
-        .expect("value source view");
+    ]);
     let joined = DataChunkView::combine(
         &[
             ViewInputRows {
@@ -56,8 +54,8 @@ fn grouped_rows(sink: &mut AggregateSink) -> BTreeMap<Option<i64>, i64> {
         .expect("finish aggregate")
         .into_iter()
         .flat_map(|batch| {
-            let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let sums = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            let keys = materialized_column::<Int64Array>(&batch, 0);
+            let sums = materialized_column::<Int64Array>(&batch, 1);
             (0..batch.num_rows())
                 .map(|row| {
                     (
@@ -77,7 +75,7 @@ fn aggregate_view_groups_mapped_duplicate_and_null_extended_keys_without_gatheri
     let mut sink = AggregateSink::with_memory_tracker(sum_plan(), tracker.clone())
         .expect("aggregate sink");
 
-    sink.accumulate_view(view).expect("aggregate mapped view");
+    sink.accumulate(view).expect("aggregate mapped view");
 
     let Some(GroupKeyColumn::View(retained)) = &sink.group_key_batches[0][0] else {
         panic!("aggregate must retain the grouping key as a view");
@@ -106,10 +104,10 @@ fn combining_view_backed_local_groups_preserves_keys_and_merges_duplicates() {
     local
         .inherit_hash_builders(&target)
         .expect("local worker inherits canonical hash seeds");
-    local.accumulate_view(view).expect("accumulate local mapped view");
+    local.accumulate(view).expect("accumulate local mapped view");
 
     target
-        .accumulate(DataChunk::from_vectors(vec![
+        .accumulate(crate::pipeline::test_support::dense_view(vec![
             Arc::new(Int64Array::from(vec![10])) as ArrayRef,
             Arc::new(Int64Array::from(vec![7])) as ArrayRef,
         ]))
@@ -120,7 +118,7 @@ fn combining_view_backed_local_groups_preserves_keys_and_merges_duplicates() {
         .inherit_hash_builders(&target)
         .expect("materialized worker inherits canonical hash seeds");
     materialized_local
-        .accumulate(DataChunk::from_vectors(vec![
+        .accumulate(crate::pipeline::test_support::dense_view(vec![
             Arc::new(Int64Array::from(vec![10])) as ArrayRef,
             Arc::new(Int64Array::from(vec![9])) as ArrayRef,
         ]))
@@ -158,7 +156,7 @@ fn spilling_view_backed_groups_resolves_source_rows_and_null_extensions() {
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let mut sink = AggregateSink::with_memory_tracker(sum_plan(), tracker.clone())
         .expect("aggregate sink");
-    sink.accumulate_view(view).expect("aggregate mapped view");
+    sink.accumulate(view).expect("aggregate mapped view");
     assert!(matches!(
         &sink.group_key_batches[0][0],
         Some(GroupKeyColumn::View(_))

@@ -10,7 +10,7 @@ use super::*;
 fn not_like_residual_reads_declared_utf8_slots_independent_of_join_output() {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     table
-        .insert(DataChunk::from_vectors(vec![
+        .insert(crate::pipeline::test_support::dense_view(vec![
             ints(&[1, 2]),
             Arc::new(StringArray::from(vec![Some("%blocked%"), Some("%blocked%")])),
         ]))
@@ -41,7 +41,7 @@ fn not_like_residual_reads_declared_utf8_slots_independent_of_join_output() {
             output,
         );
 
-    join.push(DataChunk::from_vectors(vec![
+    join.push(crate::pipeline::test_support::dense_view(vec![
         ints(&[1, 2]),
         Arc::new(StringArray::from(vec![Some("visible"), Some("blocked item")])),
     ]))

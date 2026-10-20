@@ -322,13 +322,12 @@
     }
 
     #[test]
-    fn wrapping_a_chunk_preserves_selection_and_arrow_buffer_identity() {
+    fn selected_view_preserves_selection_and_arrow_buffer_identity() {
         let input = ints(&[10, 20, 30]);
-        let view = DataChunkView::from_chunk(DataChunk::new(
+        let view = crate::pipeline::test_support::selected_view(
             vec![Arc::clone(&input)],
             SelectionVector::new_sparse(vec![2, 0]),
-        ))
-        .expect("wrap chunk as a view");
+        );
 
         assert_eq!(view.num_rows(), 2);
         assert_eq!(int_at(&view, 0, 0), Some(30));
@@ -363,7 +362,7 @@
     }
 
     #[test]
-    fn explicit_chunk_boundary_materializes_mapped_and_null_extended_rows() {
+    fn arrow_boundary_materializes_mapped_and_null_extended_rows() {
         let first = ints(&[10, 20]);
         let second = ints(&[30, 40]);
         let mapping = int64_mapping(
@@ -381,16 +380,19 @@
         )
         .expect("joined view");
 
-        let chunk = view
-            .to_data_chunk()
-            .expect("materialize at operator boundary");
-        let values = chunk
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, true),
+        ]));
+        let (batch, _) = view
+            .to_record_batch_with_report(schema)
+            .expect("materialize at Arrow boundary");
+        let values = batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("int64 output");
         assert_eq!(values, &Int64Array::from(vec![Some(20), None, Some(30)]));
-        assert_eq!(chunk.num_rows(), 3);
+        assert_eq!(batch.num_rows(), 3);
     }
 
     #[test]
@@ -421,11 +423,15 @@
             SelectionVector::new_dense(3),
         )
         .unwrap();
-        let (chunk, report) = view.to_data_chunk_with_report().unwrap();
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("shared", DataType::Int64, false),
+            arrow::datatypes::Field::new("gathered", DataType::Int64, true),
+        ]));
+        let (batch, report) = view.to_record_batch_with_report(schema).unwrap();
         let mut column_reports = MaterializationReport::default();
         for column in 0..view.num_columns() {
             let (array, report) = view.materialize_column_with_report(column).unwrap();
-            assert_eq!(array.to_data(), chunk.column(column).to_data());
+            assert_eq!(array.to_data(), batch.column(column).to_data());
             column_reports.accumulate(report);
         }
         assert_eq!(column_reports, report);
@@ -433,12 +439,12 @@
             view.materialize_column_with_report(view.num_columns())
                 .is_err()
         );
-        let shared = chunk
+        let shared = batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        let gathered = chunk
+        let gathered = batch
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -458,14 +464,16 @@
 
     #[test]
     fn materialization_report_handles_empty_and_zero_column_batches() {
-        let empty = DataChunkView::from_chunk(DataChunk::new(
+        let empty = crate::pipeline::test_support::selected_view(
             vec![ints(&[10, 20])],
             SelectionVector::new_sparse(vec![]),
-        ))
-        .unwrap();
-        let (chunk, report) = empty.to_data_chunk_with_report().unwrap();
-        assert_eq!(chunk.num_rows(), 0);
-        assert_eq!(chunk.column(0).data_type(), &DataType::Int64);
+        );
+        let empty_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+        ]));
+        let (batch, report) = empty.to_record_batch_with_report(empty_schema).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.column(0).data_type(), &DataType::Int64);
         assert_eq!(
             report,
             MaterializationReport {
@@ -475,9 +483,11 @@
         );
 
         let view = DataChunkView::new(3, vec![], SelectionVector::new_dense(3)).unwrap();
-        let (chunk, report) = view.to_data_chunk_with_report().unwrap();
-        assert_eq!(chunk.num_rows(), 3);
-        assert_eq!(chunk.num_columns(), 0);
+        let (batch, report) = view
+            .to_record_batch_with_report(Arc::new(arrow::datatypes::Schema::empty()))
+            .unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 0);
         assert_eq!(report, MaterializationReport::default());
     }
 
@@ -485,16 +495,14 @@
     fn composing_reordered_rows_across_views_keeps_original_arrays() {
         let first = ints(&[10, 99, 20]);
         let second = ints(&[30, 40]);
-        let first_view = DataChunkView::from_chunk(DataChunk::new(
+        let first_view = crate::pipeline::test_support::selected_view(
             vec![Arc::clone(&first)],
             SelectionVector::new_sparse(vec![2, 0]),
-        ))
-        .expect("first sparse view");
-        let second_view = DataChunkView::from_chunk(DataChunk::new(
+        );
+        let second_view = crate::pipeline::test_support::selected_view(
             vec![Arc::clone(&second)],
             SelectionVector::new_dense(2),
-        ))
-        .expect("second view");
+        );
 
         let output = DataChunkView::compose_rows(
             &[&first_view, &second_view],
@@ -528,9 +536,7 @@
             SelectionVector::new_dense(2),
         )
         .expect("outer-join view with a null-extended row");
-        let present =
-            DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(&present_values)]))
-                .expect("present input view");
+        let present = crate::pipeline::test_support::dense_view(vec![Arc::clone(&present_values)]);
 
         let output = DataChunkView::compose_rows(&[&null_extended, &present], &[(0, 1), (1, 0)], 1)
             .expect("compose a null extension and a present row");
@@ -547,25 +553,30 @@
 
     #[test]
     fn wrapping_rejects_selection_or_columns_outside_the_physical_rows() {
-        let unequal_columns = DataChunk::new(
-            vec![ints(&[1, 2]), ints(&[3])],
-            SelectionVector::new_dense(1),
+        assert!(
+            DataChunkView::from_arrays(
+                vec![ints(&[1, 2]), ints(&[3])],
+                2,
+                SelectionVector::new_dense(2),
+            )
+            .is_err()
         );
-        assert!(DataChunkView::from_chunk(unequal_columns).is_err());
-
-        let invalid_selection =
-            DataChunk::new(vec![ints(&[1, 2])], SelectionVector::new_sparse(vec![2]));
-        assert!(DataChunkView::from_chunk(invalid_selection).is_err());
+        assert!(
+            DataChunkView::from_selected_arrays(
+                vec![ints(&[1, 2])],
+                SelectionVector::new_sparse(vec![2]),
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn source_array_footprint_deduplicates_array_handles_within_a_view() {
         let shared = ints(&[1, 2, 3]);
-        let view = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+        let view = crate::pipeline::test_support::dense_view(vec![
             Arc::clone(&shared),
             Arc::clone(&shared),
-        ]))
-        .expect("view with a shared array in two columns");
+        ]);
 
         let (array_count, bytes) = view.source_array_footprint();
 

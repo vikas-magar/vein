@@ -42,7 +42,7 @@ mod output_view;
 mod pipeline;
 mod sink_spill;
 mod spill_finish;
-pub use pipeline::{shared, shared_with_memory_tracker, shared_view_with_memory_tracker};
+pub use pipeline::{shared, shared_with_memory_tracker};
 use intermediate::{
     AggregateGroupKeyRef, AggregateIntermediateGroup, AggregateIntermediateState, NumericPartial,
 };
@@ -53,7 +53,7 @@ use numeric::{
 };
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
 use crate::spill::SpillRun;
-use crate::pipeline::{DataChunk, DataChunkView, PipelineNode};
+use crate::pipeline::{DataChunkView, PipelineNode};
 use common::Result;
 use common::arrow::SelectionVector;
 use common::protocol::{AggOpCode, AggregatePlan};

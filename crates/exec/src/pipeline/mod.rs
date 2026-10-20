@@ -1,15 +1,13 @@
 //! Core streaming pipeline primitives and abstractions.
 //!
-//! Provides materialized [`DataChunk`] and reference-backed [`DataChunkView`]
-//! containers, plus the streaming execution node contracts ([`PipelineNode`],
-//! [`Source`], [`Transform`], [`Sink`]).
+//! Provides the reference-backed [`DataChunkView`] container and streaming
+//! execution node contracts ([`PipelineNode`], [`Source`], [`Transform`], [`Sink`]).
 
-pub mod chunk;
-pub mod batch;
 pub mod node;
 pub mod view;
 
-pub use batch::PipelineBatch;
-pub use chunk::DataChunk;
 pub use node::{PipelineNode, Sink, Source, Transform};
 pub use view::{DataChunkView, MaterializationReport, RowMapping, SourceRow, ViewColumn, ViewColumnRef, ViewInputRows};
+
+#[cfg(test)]
+pub(crate) mod test_support;

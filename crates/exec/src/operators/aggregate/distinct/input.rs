@@ -1,21 +1,6 @@
 use super::super::*;
 use super::DistinctCollector;
 
-#[derive(Clone)]
-enum DistinctInput {
-    Chunk(DataChunk),
-    View(DataChunkView),
-}
-
-impl DistinctInput {
-    fn accumulate(self, sink: &mut AggregateSink) -> Result<()> {
-        match self {
-            Self::Chunk(chunk) => sink.accumulate(chunk),
-            Self::View(view) => sink.accumulate_view(view),
-        }
-    }
-}
-
 impl AggregateSink {
     pub(in crate::operators::aggregate) fn initialize_distinct_collectors(&mut self) -> Result<()> {
         let mut collectors = Vec::new();
@@ -60,27 +45,7 @@ impl AggregateSink {
         Ok(())
     }
 
-    pub(in crate::operators::aggregate) fn accumulate_distinct(&mut self, chunk: &DataChunk) -> Result<()> {
-        let parent_groups = self.plan.groups as usize;
-        for collector_index in 0..self.distinct_collectors.len() {
-            let collector = &self.distinct_collectors[collector_index];
-            let mut columns = collector
-                .parent_columns
-                .iter()
-                .map(|&column| Arc::clone(chunk.column(column)))
-                .collect::<Vec<_>>();
-            columns.push(Arc::clone(
-                chunk.column(parent_groups + collector.aggregate_index),
-            ));
-            self.push_distinct_input(
-                collector_index,
-                DistinctInput::Chunk(DataChunk::new(columns, chunk.selection.clone())),
-            )?;
-        }
-        Ok(())
-    }
-
-    pub(in crate::operators::aggregate) fn accumulate_distinct_view(
+    pub(in crate::operators::aggregate) fn accumulate_distinct(
         &mut self,
         view: &DataChunkView,
     ) -> Result<()> {
@@ -91,16 +56,16 @@ impl AggregateSink {
             columns.push(parent_groups + collector.aggregate_index);
             self.push_distinct_input(
                 collector_index,
-                DistinctInput::View(view.project(&columns)?),
+                view.project(&columns)?,
             )?;
         }
         Ok(())
     }
 
-    fn push_distinct_input(&mut self, collector_index: usize, input: DistinctInput) -> Result<()> {
-        let result = input
-            .clone()
-            .accumulate(&mut self.distinct_collectors[collector_index].sink);
+    fn push_distinct_input(&mut self, collector_index: usize, input: DataChunkView) -> Result<()> {
+        let result = self.distinct_collectors[collector_index]
+            .sink
+            .accumulate(input.clone());
         match result {
             Ok(()) => Ok(()),
             Err(VeinError::ResourceExhausted { .. }) => {
@@ -110,7 +75,7 @@ impl AggregateSink {
                         collector.sink.flush_current_run()?;
                     }
                 }
-                input.accumulate(&mut self.distinct_collectors[collector_index].sink)
+                self.distinct_collectors[collector_index].sink.accumulate(input)
             }
             Err(error) => Err(error),
         }

@@ -14,7 +14,7 @@ fn estimated_group_count_reserves_index_before_accumulation() {
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
     let mut sink = AggregateSink::new(plan).expect("create aggregate sink");
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
         Arc::new(Int64Array::from(vec![1, 1, 1, 1])),
     ]))
@@ -37,7 +37,7 @@ fn first_batch_candidate_bound_reserves_index_without_group_estimate() {
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
     let mut sink = AggregateSink::new(plan).expect("create aggregate sink");
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
         Arc::new(Int64Array::from(vec![1, 1, 1, 1])),
     ]))
@@ -68,7 +68,7 @@ fn aggregate_group_growth_respects_budget_and_releases_on_error() {
     let mut sink = AggregateSink::with_memory_tracker(plan, tracker.clone())
         .expect("empty aggregate state fits zero bytes");
     let error = sink
-        .accumulate(DataChunk::from_vectors(vec![
+        .accumulate(crate::pipeline::test_support::dense_view(vec![
             Arc::new(Int64Array::from(vec![1])),
             Arc::new(Int64Array::from(vec![1])),
         ]))
@@ -101,7 +101,7 @@ fn failed_key_array_reservation_rolls_back_group_index_and_state() {
         AggregateSink::with_memory_tracker(plan.clone(), baseline_tracker.clone())
             .expect("create baseline sink");
     baseline
-        .accumulate(DataChunk::from_vectors(vec![
+        .accumulate(crate::pipeline::test_support::dense_view(vec![
             Arc::clone(&key_array) as ArrayRef,
             Arc::new(Int64Array::from(vec![1])) as ArrayRef,
         ]))
@@ -116,7 +116,7 @@ fn failed_key_array_reservation_rolls_back_group_index_and_state() {
     let mut sink = AggregateSink::with_memory_tracker(plan, tracker.clone())
         .expect("create budget-limited sink");
     let error = sink
-        .accumulate(DataChunk::from_vectors(vec![
+        .accumulate(crate::pipeline::test_support::dense_view(vec![
             key_array as ArrayRef,
             Arc::new(Int64Array::from(vec![1])) as ArrayRef,
         ]))
@@ -156,7 +156,7 @@ fn later_group_budget_failure_rolls_back_earlier_groups_in_the_batch() {
         AggregateSink::with_memory_tracker(plan.clone(), baseline_tracker.clone())
             .expect("create baseline sink");
     baseline
-        .accumulate(DataChunk::new(
+        .accumulate(crate::pipeline::test_support::selected_view(
             vec![
                 Arc::clone(&key_array) as ArrayRef,
                 Arc::new(Int64Array::from(vec![1, 1])) as ArrayRef,
@@ -174,7 +174,7 @@ fn later_group_budget_failure_rolls_back_earlier_groups_in_the_batch() {
     let mut sink = AggregateSink::with_memory_tracker(plan, tracker.clone())
         .expect("create budget-limited sink");
     let error = sink
-        .accumulate(DataChunk::from_vectors(vec![
+        .accumulate(crate::pipeline::test_support::dense_view(vec![
             key_array,
             Arc::new(Int64Array::from(vec![1, 1])),
         ]))

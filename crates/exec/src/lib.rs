@@ -5,7 +5,7 @@
 
 #![deny(missing_docs)]
 
-/// Streaming pipeline abstractions and DataChunk primitives.
+/// Streaming pipeline abstractions and the canonical reference-backed batch view.
 pub mod pipeline;
 
 /// User-Defined Function (UDF) extensibility and registry.
@@ -29,4 +29,4 @@ pub mod spill;
 /// Structured execution tracing for canonical plans and batch flow.
 mod trace;
 
-pub use pipeline::{DataChunk, PipelineNode, Sink, Source, Transform};
+pub use pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};

@@ -18,7 +18,7 @@ fn decimal256_sum_and_extrema_preserve_wide_values_and_nulls() {
         types: vec![VeinDataType::Decimal256(76, 0); 3],
     };
     let mut sink = AggregateSink::new(plan).unwrap();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(input.clone()),
         Arc::new(input.clone()),
         Arc::new(input),
@@ -26,21 +26,9 @@ fn decimal256_sum_and_extrema_preserve_wide_values_and_nulls() {
         .unwrap();
     let output = sink.finish().unwrap();
 
-    let sum = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .unwrap();
-    let minimum = output[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .unwrap();
-    let maximum = output[0]
-        .column(2)
-        .as_any()
-        .downcast_ref::<Decimal256Array>()
-        .unwrap();
+    let sum = crate::pipeline::test_support::materialized_column::<Decimal256Array>(&output[0], 0);
+    let minimum = crate::pipeline::test_support::materialized_column::<Decimal256Array>(&output[0], 1);
+    let maximum = crate::pipeline::test_support::materialized_column::<Decimal256Array>(&output[0], 2);
     assert_eq!(sum.value(0), large.checked_add(i256::ONE).unwrap());
     assert_eq!(minimum.value(0), i256::ONE);
     assert_eq!(maximum.value(0), large);
@@ -64,15 +52,11 @@ fn decimal256_average_accumulates_exactly_across_batches_and_applies_scale() {
         let input = Decimal256Array::from(vec![value])
             .with_precision_and_scale(76, 2)
             .unwrap();
-        sink.accumulate(DataChunk::from_vectors(vec![Arc::new(input)]))
+        sink.accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(input)]))
             .unwrap();
     }
     let output = sink.finish().unwrap();
-    let average = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
+    let average = crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0);
     assert_eq!(average.value(0), 1.0 / 300.0);
 }
 
@@ -97,7 +81,7 @@ fn decimal256_sum_enforces_76_digit_precision() {
     };
     let mut sink = AggregateSink::new(plan).unwrap();
     let error = sink
-        .accumulate(DataChunk::from_vectors(vec![Arc::new(input)]))
+        .accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(input)]))
         .unwrap_err();
     assert!(error.to_string().contains("overflow while computing SUM"));
 }
@@ -118,14 +102,10 @@ fn decimal_sum_preserves_unscaled_integer_and_scale() {
     };
     let mut sink = AggregateSink::new(plan).unwrap();
 
-    sink.accumulate(DataChunk::from_vectors(vec![Arc::new(input)]))
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(input)]))
         .unwrap();
     let output = sink.finish().unwrap();
-    let sum = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .unwrap();
+    let sum = crate::pipeline::test_support::materialized_column::<Decimal128Array>(&output[0], 0);
 
     assert_eq!(sum.value(0), 123_456_789_012_345_679_i128);
     assert_eq!(sum.precision(), 38);
@@ -148,14 +128,10 @@ fn decimal_average_applies_the_input_scale() {
     };
     let mut sink = AggregateSink::new(plan).unwrap();
 
-    sink.accumulate(DataChunk::from_vectors(vec![Arc::new(input)]))
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(input)]))
         .unwrap();
     let output = sink.finish().unwrap();
-    let average = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
+    let average = crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0);
 
     assert_eq!(average.value(0), 17.5);
 }
@@ -179,15 +155,11 @@ fn decimal_average_accumulates_unscaled_values_exactly() {
     };
     let mut sink = AggregateSink::new(plan).unwrap();
 
-    sink.accumulate(DataChunk::from_vectors(vec![Arc::new(input)]))
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(input)]))
         .unwrap();
 
     let output = sink.finish().unwrap();
-    let average = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
+    let average = crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0);
     assert_eq!(average.value(0), 0.5);
 }
 
@@ -209,7 +181,7 @@ fn decimal_sum_reports_precision_overflow() {
     let mut sink = AggregateSink::new(plan).unwrap();
 
     let error = sink
-        .accumulate(DataChunk::from_vectors(vec![Arc::new(input)]))
+        .accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(input)]))
         .unwrap_err();
     assert!(error.to_string().contains("overflow while computing SUM"));
 }

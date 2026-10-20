@@ -31,10 +31,8 @@ impl AggregateSink {
         self.metrics
     }
 
-    /// Collects the finished groups for callers that need an owned result list.
-    /// Runtime operators should use `finish_with` so output batches are forwarded
-    /// and released one at a time.
-    pub fn finish(&mut self) -> Result<Vec<DataChunk>> {
+    /// Collects finished output views for callers that need an owned result list.
+    pub fn finish(&mut self) -> Result<Vec<DataChunkView>> {
         let mut output = Vec::new();
         self.finish_with(AGGREGATE_BATCH_ROWS, |batch| {
             output.push(batch);
@@ -43,20 +41,10 @@ impl AggregateSink {
         Ok(output)
     }
 
-    /// Emits bounded output chunks while retaining only the aggregate state.
+    /// Emits bounded output views while retaining only the aggregate state.
     /// The callback runs synchronously for each chunk and can stop emission by
     /// returning an error.
     pub fn finish_with(
-        &mut self,
-        batch_rows: NonZeroUsize,
-        mut emit: impl FnMut(DataChunk) -> Result<()>,
-    ) -> Result<()> {
-        self.finish_view_with(batch_rows, |view| emit(view.to_data_chunk()?))
-    }
-
-    /// Emits aggregate batches as views over retained grouping keys and newly
-    /// computed aggregate result arrays.
-    pub fn finish_view_with(
         &mut self,
         batch_rows: NonZeroUsize,
         mut emit: impl FnMut(DataChunkView) -> Result<()>,

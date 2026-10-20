@@ -13,17 +13,18 @@ fn assert_grouped(keys: ArrayRef, key_type: VeinDataType) {
         types: vec![key_type, VeinDataType::Int64],
     };
     let mut sink = AggregateSink::new(plan).unwrap();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         keys,
         Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
     ]))
         .unwrap();
 
     let output = sink.finish().unwrap();
-    let keys = arrow::compute::cast(output[0].column(0), &arrow::datatypes::DataType::Int64)
+    let source_keys = output[0].materialize_column(0).unwrap();
+    let keys = arrow::compute::cast(source_keys.as_ref(), &arrow::datatypes::DataType::Int64)
         .unwrap();
     let keys = keys.as_any().downcast_ref::<Int64Array>().unwrap();
-    let sums = output[0].column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
     let actual = (0..keys.len())
         .map(|row| (keys.is_valid(row).then(|| keys.value(row)), sums.value(row)))
         .collect::<std::collections::BTreeMap<_, _>>();

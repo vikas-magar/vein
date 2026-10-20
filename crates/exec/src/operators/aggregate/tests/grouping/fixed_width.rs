@@ -18,20 +18,20 @@ fn fixed_key_plan(key_type: VeinDataType) -> AggregatePlan {
 #[test]
 fn int32_group_keys_merge_across_batches_and_preserve_nulls() {
     let mut sink = AggregateSink::new(fixed_key_plan(VeinDataType::Int32)).unwrap();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int32Array::from(vec![Some(-2), None, Some(4), Some(-2)])),
         Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
     ]))
         .unwrap();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int32Array::from(vec![Some(4), None, Some(9)])),
         Arc::new(Int64Array::from(vec![5, 6, 7])),
     ]))
         .unwrap();
 
     let output = sink.finish().unwrap();
-    let keys = output[0].column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    let sums = output[0].column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let keys = crate::pipeline::test_support::materialized_column::<Int32Array>(&output[0], 0);
+    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
     let actual = (0..keys.len())
         .map(|row| (keys.is_valid(row).then(|| keys.value(row)), sums.value(row)))
         .collect::<std::collections::BTreeMap<_, _>>();
@@ -56,7 +56,7 @@ fn decimal_group_keys_preserve_scale_nulls_and_spill_merge() {
         let keys = Decimal128Array::from(key_values)
             .with_precision_and_scale(12, 2)
             .unwrap();
-        sink.accumulate(DataChunk::from_vectors(vec![
+        sink.accumulate(crate::pipeline::test_support::dense_view(vec![
             Arc::new(keys),
             Arc::new(Int64Array::from_iter_values(start + 1..=end)),
         ]))
@@ -67,9 +67,9 @@ fn decimal_group_keys_preserve_scale_nulls_and_spill_merge() {
     let output = sink.finish().unwrap();
     let mut observed = std::collections::HashMap::new();
     for batch in output {
-        assert_eq!(batch.column(0).data_type(), &arrow::datatypes::DataType::Decimal128(12, 2));
-        let keys = batch.column(0).as_any().downcast_ref::<Decimal128Array>().unwrap();
-        let sums = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(batch.column_data_type(0).unwrap(), &arrow::datatypes::DataType::Decimal128(12, 2));
+        let keys = crate::pipeline::test_support::materialized_column::<Decimal128Array>(&batch, 0);
+        let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
         for row in 0..batch.num_rows() {
             observed.insert(keys.is_valid(row).then(|| keys.value(row)), sums.value(row));
         }
@@ -106,7 +106,7 @@ fn decimal256_group_keys_keep_exact_wide_values_through_spill_merge() {
         let keys = Decimal256Array::from(values)
             .with_precision_and_scale(76, 0)
             .unwrap();
-        sink.accumulate(DataChunk::from_vectors(vec![
+        sink.accumulate(crate::pipeline::test_support::dense_view(vec![
             Arc::new(keys),
             Arc::new(Int64Array::from_iter_values(start + 1..=end)),
         ]))
@@ -116,9 +116,9 @@ fn decimal256_group_keys_keep_exact_wide_values_through_spill_merge() {
     let output = sink.finish().unwrap();
     let mut observed = std::collections::HashMap::new();
     for batch in output {
-        assert_eq!(batch.column(0).data_type(), &arrow::datatypes::DataType::Decimal256(76, 0));
-        let keys = batch.column(0).as_any().downcast_ref::<Decimal256Array>().unwrap();
-        let sums = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(batch.column_data_type(0).unwrap(), &arrow::datatypes::DataType::Decimal256(76, 0));
+        let keys = crate::pipeline::test_support::materialized_column::<Decimal256Array>(&batch, 0);
+        let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
         for row in 0..batch.num_rows() {
             observed.insert(keys.is_valid(row).then(|| keys.value(row)), sums.value(row));
         }

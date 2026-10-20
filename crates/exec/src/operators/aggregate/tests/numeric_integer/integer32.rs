@@ -26,7 +26,7 @@ fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
     };
     let mut sink = AggregateSink::new(plan).unwrap();
 
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         values.clone(),
         values.clone(),
         values.clone(),
@@ -36,38 +36,22 @@ fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
     let output = sink.finish().unwrap();
 
     assert_eq!(
-        output[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0)
             .value(0),
         4
     );
     assert_eq!(
-        output[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int32Array>(&output[0], 1)
             .value(0),
         1
     );
     assert_eq!(
-        output[0]
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int32Array>(&output[0], 2)
             .value(0),
         3
     );
     assert_eq!(
-        output[0]
-            .column(3)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 3)
             .value(0),
         2.0
     );

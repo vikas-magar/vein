@@ -75,7 +75,7 @@ fn aggregate_spill_flushes_retries_and_merges_repeated_keys() {
     let input_rows = 2048_i64;
     let keys = (0..input_rows).map(|row| row % 257).collect::<Vec<_>>();
     let values = (0..input_rows).collect::<Vec<_>>();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(keys.clone())) as ArrayRef,
         Arc::new(Int64Array::from(values)) as ArrayRef,
     ]))
@@ -93,8 +93,8 @@ fn aggregate_spill_flushes_retries_and_merges_repeated_keys() {
     );
     let mut counts = std::collections::BTreeMap::new();
     for batch in output {
-        let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let values = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let keys = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 0);
+        let values = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
         for row in 0..batch.num_rows() {
             counts.insert(keys.value(row), values.value(row));
         }
@@ -138,13 +138,13 @@ fn worker_local_aggregate_states_combine_null_and_repeated_keys_without_copying_
         .expect("aggregate supports worker-local state");
 
     first
-        .push(DataChunk::from_vectors(vec![
+        .push(crate::pipeline::test_support::dense_view(vec![
             Arc::clone(&first_keys) as ArrayRef,
             Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
         ]))
         .expect("accumulate first worker batch");
     second
-        .push(DataChunk::from_vectors(vec![
+        .push(crate::pipeline::test_support::dense_view(vec![
             Arc::clone(&second_keys) as ArrayRef,
             Arc::new(Int64Array::from(vec![30, 40])) as ArrayRef,
         ]))
@@ -175,8 +175,8 @@ fn worker_local_aggregate_states_combine_null_and_repeated_keys_without_copying_
     let output = aggregate.finish().expect("finish combined aggregate");
     let mut counts = std::collections::BTreeMap::new();
     for batch in output {
-        let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let values = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let keys = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 0);
+        let values = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
         for row in 0..batch.num_rows() {
             let key = keys.is_valid(row).then(|| keys.value(row));
             counts.insert(key, values.value(row));
@@ -213,7 +213,7 @@ fn aggregate_spill_preserves_null_keys_and_grouping_set_identity() {
     let keys = (0..input_rows)
         .map(|row| (row % 100 != 0).then_some(row % 257))
         .collect::<Vec<_>>();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(keys.clone())) as ArrayRef,
         Arc::new(Int64Array::from_iter_values(0..input_rows)) as ArrayRef,
     ]))
@@ -225,8 +225,8 @@ fn aggregate_spill_preserves_null_keys_and_grouping_set_identity() {
     let output = sink.finish().expect("merge grouping-set spill runs");
     let mut null_key_counts = Vec::new();
     for batch in output {
-        let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let values = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let keys = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 0);
+        let values = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
         for row in 0..batch.num_rows() {
             if keys.is_null(row) {
                 null_key_counts.push(values.value(row));

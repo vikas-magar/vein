@@ -15,7 +15,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
-use crate::pipeline::{DataChunk, DataChunkView, MaterializationReport};
+use crate::pipeline::{DataChunkView, MaterializationReport};
 use crate::runtime::filter::{RuntimeFilter, RuntimeFilterBuildInput, RuntimeFilterFactory};
 use common::Result;
 use error::VeinError;
@@ -141,11 +141,8 @@ impl RuntimeFilterFactory for JoinBloomFilterFactory {
         }
 
         let mut filters: Vec<Arc<dyn RuntimeFilter>> = Vec::with_capacity(2);
-        if let Some(filter) = JoinKeyRangeFilter::try_new(
-            probe_columns,
-            build_key_bounds,
-            memory,
-        )? {
+        if let Some(filter) = JoinKeyRangeFilter::try_new(probe_columns, build_key_bounds, memory)?
+        {
             filters.push(Arc::new(filter));
         }
 
@@ -203,7 +200,11 @@ impl RuntimeFilterFactory for JoinBloomFilterFactory {
         }
         words.resize(word_count, 0u64);
         let actual_bytes = words.capacity().saturating_mul(size_of::<u64>());
-        if self.config.max_bytes.is_some_and(|limit| actual_bytes > limit) {
+        if self
+            .config
+            .max_bytes
+            .is_some_and(|limit| actual_bytes > limit)
+        {
             return Ok(filters);
         }
         if actual_bytes > reservation.bytes() {
@@ -279,9 +280,8 @@ impl JoinBloomFilter {
         }
         let step = hash.rotate_left(32) | 1;
         for iteration in 0..self.hash_functions {
-            let bit = hash
-                .wrapping_add((iteration as u64).wrapping_mul(step)) as usize
-                & self.bit_mask;
+            let bit =
+                hash.wrapping_add((iteration as u64).wrapping_mul(step)) as usize & self.bit_mask;
             visit(bit);
         }
     }
@@ -289,9 +289,8 @@ impl JoinBloomFilter {
     fn insert(&mut self, hash: u64) {
         let step = hash.rotate_left(32) | 1;
         for iteration in 0..self.hash_functions {
-            let bit = hash
-                .wrapping_add((iteration as u64).wrapping_mul(step)) as usize
-                & self.bit_mask;
+            let bit =
+                hash.wrapping_add((iteration as u64).wrapping_mul(step)) as usize & self.bit_mask;
             self.words[bit / u64::BITS as usize] |= 1u64 << (bit % u64::BITS as usize);
         }
     }
@@ -302,9 +301,8 @@ impl JoinBloomFilter {
         }
         let mut present = true;
         self.bit_positions(hash, |bit| {
-            present &= self.words[bit / u64::BITS as usize]
-                & (1u64 << (bit % u64::BITS as usize))
-                != 0;
+            present &=
+                self.words[bit / u64::BITS as usize] & (1u64 << (bit % u64::BITS as usize)) != 0;
         });
         present
     }
@@ -327,11 +325,7 @@ impl RuntimeFilter for JoinBloomFilter {
         true
     }
 
-    fn evaluate(
-        &self,
-        batch: &RecordBatch,
-        column_positions: &[usize],
-    ) -> Result<BooleanArray> {
+    fn evaluate(&self, batch: &RecordBatch, column_positions: &[usize]) -> Result<BooleanArray> {
         if column_positions.len() != self.columns.len() {
             return Err(VeinError::internal(
                 "runtime filter key positions do not match its declared columns",
@@ -340,11 +334,9 @@ impl RuntimeFilter for JoinBloomFilter {
         let arrays = column_positions
             .iter()
             .map(|position| {
-                batch
-                    .columns()
-                    .get(*position)
-                    .cloned()
-                    .ok_or_else(|| VeinError::internal("runtime filter key position is out of range"))
+                batch.columns().get(*position).cloned().ok_or_else(|| {
+                    VeinError::internal("runtime filter key position is out of range")
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         let keys = ChunkKeys::resolve_arrays(&arrays)?;
@@ -437,11 +429,7 @@ impl RuntimeFilter for JoinKeyRangeFilter {
         self.memory.bytes()
     }
 
-    fn evaluate(
-        &self,
-        _batch: &RecordBatch,
-        _column_positions: &[usize],
-    ) -> Result<BooleanArray> {
+    fn evaluate(&self, _batch: &RecordBatch, _column_positions: &[usize]) -> Result<BooleanArray> {
         Err(VeinError::internal(
             "statistics-only join key range filter cannot evaluate rows",
         ))
@@ -451,7 +439,10 @@ impl RuntimeFilter for JoinKeyRangeFilter {
         false
     }
 
-    fn statistics_predicates(&self, schema: &types::VeinSchema) -> Vec<catalog::StatisticsPredicate> {
+    fn statistics_predicates(
+        &self,
+        schema: &types::VeinSchema,
+    ) -> Vec<catalog::StatisticsPredicate> {
         let mut predicates = Vec::with_capacity(self.bounds.len().saturating_mul(2));
         for (column_id, bounds) in self.columns.iter().zip(&self.bounds) {
             let Some((min, max)) = bounds else {
@@ -539,7 +530,7 @@ impl HashTable {
     /// Computes the join's canonical row hashes for a spill batch.
     ///
     /// Null keys receive a deterministic hash only to choose a spill partition;
-    /// they remain non-matching because [`Self::probe_view`] skips null keys.
+    /// they remain non-matching because [`Self::probe`] skips null keys.
     /// Keeping this beside the in-memory key encoder prevents spill partitioning
     /// from introducing a second, potentially incompatible key representation.
     pub fn hashes_for_view(view: &DataChunkView, keys: &JoinKeys) -> Result<Vec<u64>> {
@@ -571,7 +562,7 @@ impl HashTable {
             probe_keys,
             QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new()),
         )
-            .expect("unlimited join budget must fit initial buckets")
+        .expect("unlimited join budget must fit initial buckets")
     }
 
     /// Create a hash table that charges owned index state to `tracker`.
@@ -593,9 +584,13 @@ impl HashTable {
             .ok_or_else(|| VeinError::internal("initial hash join state size overflow"))?;
         let mut memory = tracker.reserve(initial_bytes, "hash join initial state")?;
         let mut buckets = Vec::new();
-        buckets.try_reserve_exact(INITIAL_BUCKETS).map_err(|error| {
-            VeinError::internal(format!("cannot allocate initial hash join buckets: {error}"))
-        })?;
+        buckets
+            .try_reserve_exact(INITIAL_BUCKETS)
+            .map_err(|error| {
+                VeinError::internal(format!(
+                    "cannot allocate initial hash join buckets: {error}"
+                ))
+            })?;
         buckets.resize(INITIAL_BUCKETS, NONE);
         let mut key_bounds = Vec::new();
         key_bounds
@@ -639,12 +634,12 @@ impl HashTable {
     fn key_chunk(&self, reference: BuildRowReference) -> Result<(&ChunkKeys, &DataChunkView)> {
         let index = reference.chunk as usize;
         Ok((
-            self.keys_by_chunk
-                .get(index)
-                .ok_or_else(|| VeinError::internal("join key reference points outside retained key arrays"))?,
-            self.chunks
-                .get(index)
-                .ok_or_else(|| VeinError::internal("join key reference points outside retained chunks"))?,
+            self.keys_by_chunk.get(index).ok_or_else(|| {
+                VeinError::internal("join key reference points outside retained key arrays")
+            })?,
+            self.chunks.get(index).ok_or_else(|| {
+                VeinError::internal("join key reference points outside retained chunks")
+            })?,
         ))
     }
 
@@ -677,11 +672,12 @@ impl HashTable {
                 };
                 continue;
             };
-            let max = self.key_bounds[key_index]
-                .max
-                .ok_or_else(|| VeinError::internal("join key bounds have an incomplete endpoint"))?;
+            let max = self.key_bounds[key_index].max.ok_or_else(|| {
+                VeinError::internal("join key bounds have an incomplete endpoint")
+            })?;
             let replace_min = self.compare_build_rows(key_index, current, min)? == Ordering::Less;
-            let replace_max = self.compare_build_rows(key_index, current, max)? == Ordering::Greater;
+            let replace_max =
+                self.compare_build_rows(key_index, current, max)? == Ordering::Greater;
             if replace_min {
                 self.key_bounds[key_index].min = Some(current);
             }
@@ -707,13 +703,13 @@ impl HashTable {
     /// Inclusive bounds of each build key, derived incrementally while rows
     /// enter the hash table. Endpoints are copied only as typed scalar
     /// metadata; the table itself stores row references into retained arrays.
-    pub fn runtime_key_bounds(
-        &self,
-    ) -> Result<Vec<Option<(LogicalLiteral, LogicalLiteral)>>> {
+    pub fn runtime_key_bounds(&self) -> Result<Vec<Option<(LogicalLiteral, LogicalLiteral)>>> {
         let mut bounds = Vec::new();
         bounds
             .try_reserve_exact(self.key_bounds.len())
-            .map_err(|error| VeinError::internal(format!("cannot allocate join key bounds snapshot: {error}")))?;
+            .map_err(|error| {
+                VeinError::internal(format!("cannot allocate join key bounds snapshot: {error}"))
+            })?;
         for (key_index, key_bounds) in self.key_bounds.iter().enumerate() {
             let (Some(min), Some(max)) = (key_bounds.min, key_bounds.max) else {
                 bounds.push(None);
@@ -734,21 +730,13 @@ impl HashTable {
         self.entries.is_empty() && self.null_keyed.is_empty()
     }
 
-    /// Adds a build chunk.
-    ///
-    /// The chunk is retained: entries point into its columns, so it must outlive
-    /// the probe. A row with a null key is entered — an outer join still has to
-    /// emit it — but is left out of the buckets, so no probe can ever match it.
-    pub fn insert(&mut self, chunk: DataChunk) -> Result<()> {
-        self.insert_view(DataChunkView::from_chunk(chunk)?)
-    }
-
     /// Retains a reference-backed build batch and indexes its active rows.
-    pub fn insert_view(&mut self, mut chunk: DataChunkView) -> Result<()> {
+    pub fn insert(&mut self, mut chunk: DataChunkView) -> Result<()> {
         let tracker_id = self.tracker.identity();
         chunk.account_source_arrays(tracker_id, |identity, bytes| {
-            let lease: std::sync::Arc<dyn crate::pipeline::view::ViewMemoryLease> =
-                self.tracker.lease_retained_array(identity, bytes, "hash join retained arrays")?;
+            let lease: std::sync::Arc<dyn crate::pipeline::view::ViewMemoryLease> = self
+                .tracker
+                .lease_retained_array(identity, bytes, "hash join retained arrays")?;
             Ok(lease)
         })?;
         let (keys, key_access_us) = ChunkKeys::resolve_view(&self.build_keys, &chunk)?;
@@ -821,7 +809,9 @@ impl HashTable {
         )?;
 
         self.chunks.try_reserve(1).map_err(|error| {
-            VeinError::internal(format!("cannot reserve hash join chunk references: {error}"))
+            VeinError::internal(format!(
+                "cannot reserve hash join chunk references: {error}"
+            ))
         })?;
         self.keys_by_chunk.try_reserve(1).map_err(|error| {
             VeinError::internal(format!("cannot reserve hash join key references: {error}"))
@@ -918,15 +908,19 @@ impl HashTable {
             for chunk in &mut other.chunks {
                 let tracker_id = self.tracker.identity();
                 chunk.account_source_arrays(tracker_id, |identity, bytes| {
-                    let lease: std::sync::Arc<dyn crate::pipeline::view::ViewMemoryLease> = self
-                        .tracker
-                        .lease_retained_array(identity, bytes, "merged hash join retained arrays")?;
+                    let lease: std::sync::Arc<dyn crate::pipeline::view::ViewMemoryLease> =
+                        self.tracker.lease_retained_array(
+                            identity,
+                            bytes,
+                            "merged hash join retained arrays",
+                        )?;
                     Ok(lease)
                 })?;
             }
         }
-        let offset = u32::try_from(self.chunks.len())
-            .map_err(|_| VeinError::internal("hash join chunk index exceeds row-reference range"))?;
+        let offset = u32::try_from(self.chunks.len()).map_err(|_| {
+            VeinError::internal("hash join chunk index exceeds row-reference range")
+        })?;
         let other_bounds_bytes = other
             .key_bounds
             .capacity()
@@ -935,7 +929,9 @@ impl HashTable {
         let mut merged_key_bounds = Vec::new();
         merged_key_bounds
             .try_reserve_exact(self.key_bounds.len())
-            .map_err(|error| VeinError::internal(format!("cannot reserve merged join key bounds: {error}")))?;
+            .map_err(|error| {
+                VeinError::internal(format!("cannot reserve merged join key bounds: {error}"))
+            })?;
         merged_key_bounds.extend_from_slice(&self.key_bounds);
         for (key_index, other_bounds) in other.key_bounds.iter().copied().enumerate() {
             let (Some(other_min), Some(other_max)) = (other_bounds.min, other_bounds.max) else {
@@ -962,15 +958,17 @@ impl HashTable {
                             current_min.row as usize,
                             current_min_view,
                         )?
-                        .ok_or_else(|| VeinError::internal("join key bound type changed during merge"))?
+                        .ok_or_else(|| {
+                            VeinError::internal("join key bound type changed during merge")
+                        })?
                         == Ordering::Less
                     {
                         merged_key_bounds[key_index].min = Some(rebased_min);
                     }
 
-                    let current_max = merged_key_bounds[key_index]
-                        .max
-                        .ok_or_else(|| VeinError::internal("join key bounds have an incomplete endpoint"))?;
+                    let current_max = merged_key_bounds[key_index].max.ok_or_else(|| {
+                        VeinError::internal("join key bounds have an incomplete endpoint")
+                    })?;
                     let (other_max_keys, other_max_view) = other.key_chunk(other_max)?;
                     let (current_max_keys, current_max_view) = self.key_chunk(current_max)?;
                     if other_max_keys
@@ -982,7 +980,9 @@ impl HashTable {
                             current_max.row as usize,
                             current_max_view,
                         )?
-                        .ok_or_else(|| VeinError::internal("join key bound type changed during merge"))?
+                        .ok_or_else(|| {
+                            VeinError::internal("join key bound type changed during merge")
+                        })?
                         == Ordering::Greater
                     {
                         merged_key_bounds[key_index].max = Some(rebased_max);
@@ -997,8 +997,11 @@ impl HashTable {
             .and_then(|count| count.checked_mul(size_of::<u32>()))
             .ok_or_else(|| VeinError::internal("merged join bucket bytes overflow"))?;
         self.memory.absorb(other.memory)?;
-        self.build_key_materialization.accumulate(other.build_key_materialization);
-        self.build_key_materialize_us = self.build_key_materialize_us.saturating_add(other.build_key_materialize_us);
+        self.build_key_materialization
+            .accumulate(other.build_key_materialization);
+        self.build_key_materialize_us = self
+            .build_key_materialize_us
+            .saturating_add(other.build_key_materialize_us);
         self.chunks.extend(other.chunks);
         self.keys_by_chunk.extend(other.keys_by_chunk);
         self.key_bounds.copy_from_slice(&merged_key_bounds);
@@ -1015,7 +1018,9 @@ impl HashTable {
                 .into_iter()
                 .map(|(chunk, row)| (chunk + offset, row)),
         );
-        let wanted_buckets = self.entries.len()
+        let wanted_buckets = self
+            .entries
+            .len()
             .checked_mul(2)
             .ok_or_else(|| VeinError::internal("merged join bucket count overflow"))?;
         let bucket_count = self
@@ -1039,24 +1044,15 @@ impl HashTable {
         Ok(())
     }
 
-    /// Appends `(probe row, (build chunk, build row))` for every match.
-    ///
-    /// Rows are physical indices, so the caller can gather columns by them. The
-    /// build reference is resolved here, where the entry is already in hand:
-    /// returning entry indices and resolving them in the caller was a second
-    /// pass over every match, and the pair list it filled was another ~8 bytes
-    /// per row of scratch.
-    ///
-    /// A probe row with a null key contributes nothing.
-    pub fn probe(&self, probe: &DataChunk, matches: &mut Vec<(u32, (u32, u32))>) -> Result<()> {
-        self.probe_view(&DataChunkView::from_chunk(probe.clone())?, matches).map(|_| ())
-    }
-
     /// Probes a reference-backed batch. Returned rows are logical positions in
     /// the selected input batches.
     /// Returns the probe key conversion report and resolution time in microseconds.
     /// The report excludes hash/index allocations and never mutates build metrics.
-    pub fn probe_view(&self, probe: &DataChunkView, matches: &mut Vec<(u32, (u32, u32))>) -> Result<(MaterializationReport, u64)> {
+    pub fn probe(
+        &self,
+        probe: &DataChunkView,
+        matches: &mut Vec<(u32, (u32, u32))>,
+    ) -> Result<(MaterializationReport, u64)> {
         self.probe_view_inner(probe, matches, None)
     }
 
@@ -1081,12 +1077,13 @@ impl HashTable {
         let report = MaterializationReport::default();
         let inline_i64 = probe_keys.is_single_i64()
             && self
-            .keys_by_chunk
-            .first()
-            .is_some_and(ChunkKeys::is_single_i64);
+                .keys_by_chunk
+                .first()
+                .is_some_and(ChunkKeys::is_single_i64);
         for position in 0..probe.num_rows() {
             let row = position as u32;
-            let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position, Some(probe))? else {
+            let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position, Some(probe))?
+            else {
                 if let Some(rows) = &mut null_probe_rows {
                     rows.push(row);
                 }
@@ -1097,24 +1094,22 @@ impl HashTable {
                 let entry = self.entries[head as usize];
                 let same = self.hashes[head as usize] == hash
                     && (if inline_i64 {
-                    let value = inline_key.ok_or_else(|| {
-                        VeinError::internal("single-Int64 probe key is missing its value")
-                    })?;
-                    self.keys_by_chunk[entry.chunk as usize]
-                        .single_i64_value(
+                        let value = inline_key.ok_or_else(|| {
+                            VeinError::internal("single-Int64 probe key is missing its value")
+                        })?;
+                        self.keys_by_chunk[entry.chunk as usize].single_i64_value(
                             &self.chunks[entry.chunk as usize],
                             entry.row as usize,
+                        )? == Some(value)
+                    } else {
+                        self.keys_by_chunk[entry.chunk as usize].equals(
+                            entry.row as usize,
+                            &self.chunks[entry.chunk as usize],
+                            &probe_keys,
+                            row as usize,
+                            probe,
                         )?
-                        == Some(value)
-                } else {
-                    self.keys_by_chunk[entry.chunk as usize].equals(
-                        entry.row as usize,
-                        &self.chunks[entry.chunk as usize],
-                        &probe_keys,
-                        row as usize,
-                        probe,
-                    )?
-                });
+                    });
                 if same {
                     matches.push((row, (entry.chunk, entry.row)));
                 }
@@ -1131,7 +1126,10 @@ impl HashTable {
 
     /// Accumulated build key conversion work, including merged build tables.
     pub(crate) fn build_key_materialization(&self) -> (MaterializationReport, u64) {
-        (self.build_key_materialization, self.build_key_materialize_us)
+        (
+            self.build_key_materialization,
+            self.build_key_materialize_us,
+        )
     }
 
     /// Every build row the table holds, as `(chunk, row)`.

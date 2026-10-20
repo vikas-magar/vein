@@ -507,11 +507,9 @@ impl SortTransform {
                 let row_refs = rows.iter().map(|row| (0, *row)).collect::<Vec<_>>();
                 let sorted_view =
                     DataChunkView::compose_rows(&[view], &row_refs, view.num_columns())?;
-                let chunk = sorted_view.to_data_chunk()?;
-                let batch =
-                    RecordBatch::try_new(Arc::clone(&schema), chunk.vectors).map_err(|error| {
-                        VeinError::internal(format!("build sort spill batch: {error}"))
-                    })?;
+                let (batch, report) =
+                    sorted_view.to_record_batch_with_report(Arc::clone(&schema))?;
+                self.metrics.key_materialization.accumulate(report);
                 writer.write_batch(&batch, "write sort spill batch")?;
             }
             let output = writer.finish("finish sort spill run")?;
@@ -547,11 +545,8 @@ impl SortTransform {
             &self.tracker,
             &mut self.metrics,
             |view| {
-                let chunk = view.to_data_chunk()?;
-                let batch =
-                    RecordBatch::try_new(Arc::clone(&schema), chunk.vectors).map_err(|error| {
-                        VeinError::internal(format!("build merged sort batch: {error}"))
-                    })?;
+                let (batch, _) =
+                    view.to_record_batch_with_report(Arc::clone(&schema))?;
                 writer.write_batch(&batch, "write merged sort batch")
             },
         )?;
@@ -785,7 +780,7 @@ fn view_from_spill_batch(
     batch: RecordBatch,
     tracker: &QueryMemoryTracker,
 ) -> Result<DataChunkView> {
-    let mut view = DataChunkView::from_chunk(crate::pipeline::DataChunk::from_record_batch(batch))?;
+    let mut view = DataChunkView::from_record_batch(batch)?;
     let leases = view
         .source_array_memory_sizes()?
         .into_iter()

@@ -514,7 +514,7 @@ impl DefaultTaskExecutor {
                             } else {
                                 "aggregate"
                             };
-                        let (accumulator, handle) = aggregate::shared_view_with_memory_tracker(
+                        let (accumulator, handle) = aggregate::shared_with_memory_tracker(
                             plan.clone(),
                             operator_memory,
                         )?;
@@ -537,7 +537,7 @@ impl DefaultTaskExecutor {
                             let mut accumulator = accumulator
                                 .lock()
                                 .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
-                            accumulator.finish_view_with(aggregate::AGGREGATE_BATCH_ROWS, |batch| {
+                            accumulator.finish_with(aggregate::AGGREGATE_BATCH_ROWS, |batch| {
                                 next.push(batch)
                             })?;
                             (accumulator.metrics(), accumulator.group_count())

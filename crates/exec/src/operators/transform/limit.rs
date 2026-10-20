@@ -1,20 +1,24 @@
 //! Limit transform operator: truncates and offsets in-flight rows.
 
-use crate::pipeline::{DataChunk, PipelineBatch, PipelineNode, Transform};
+use crate::pipeline::{DataChunkView, PipelineNode, Transform};
 use common::Result;
 
 /// A synchronous [`Transform`] that limits the number of rows produced by a pipeline.
-pub struct LimitTransform<B = DataChunk> {
+pub struct LimitTransform {
     offset: u64,
     count: u64,
     rows_seen: u64,
     rows_emitted: u64,
-    next: Box<dyn PipelineNode<B>>,
+    next: Box<dyn PipelineNode<DataChunkView>>,
 }
 
-impl<B: PipelineBatch> LimitTransform<B> {
+impl LimitTransform {
     /// Create a new [`LimitTransform`] with the given offset and count.
-    pub fn new(offset: u64, count: u64, next: Box<dyn PipelineNode<B>>) -> Self {
+    pub fn new(
+        offset: u64,
+        count: u64,
+        next: Box<dyn PipelineNode<DataChunkView>>,
+    ) -> Self {
         Self {
             offset,
             count,
@@ -25,8 +29,8 @@ impl<B: PipelineBatch> LimitTransform<B> {
     }
 }
 
-impl<B: PipelineBatch> PipelineNode<B> for LimitTransform<B> {
-    fn push(&mut self, chunk: B) -> Result<()> {
+impl PipelineNode<DataChunkView> for LimitTransform {
+    fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         if self.rows_emitted >= self.count {
             // Maximum rows already reached; drop further pushes
             return Ok(());
@@ -61,7 +65,8 @@ impl<B: PipelineBatch> PipelineNode<B> for LimitTransform<B> {
             return Ok(());
         }
 
-        let limited = chunk.slice_rows(start_in_chunk, take_count)?;
+        let selection = chunk.selection().slice(start_in_chunk, take_count);
+        let limited = chunk.into_selection(selection)?;
         self.next.push(limited)
     }
 
@@ -75,7 +80,7 @@ impl<B: PipelineBatch> PipelineNode<B> for LimitTransform<B> {
     }
 }
 
-impl<B: PipelineBatch> Transform<B> for LimitTransform<B> {}
+impl Transform<DataChunkView> for LimitTransform {}
 
 #[cfg(test)]
 mod tests;

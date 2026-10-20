@@ -1,6 +1,6 @@
 //! Discard sink for benchmarking and development.
 
-use crate::pipeline::{PipelineBatch, PipelineNode, Sink};
+use crate::pipeline::{DataChunkView, PipelineNode, Sink};
 use common::Result;
 use tracing::info;
 
@@ -23,8 +23,8 @@ impl Default for DiscardSink {
     }
 }
 
-impl<B: PipelineBatch> PipelineNode<B> for DiscardSink {
-    fn push(&mut self, batch: B) -> Result<()> {
+impl PipelineNode<DataChunkView> for DiscardSink {
+    fn push(&mut self, batch: DataChunkView) -> Result<()> {
         self.rows_seen += batch.num_rows();
         Ok(())
     }
@@ -38,7 +38,7 @@ impl<B: PipelineBatch> PipelineNode<B> for DiscardSink {
     }
 }
 
-impl<B: PipelineBatch> Sink<B> for DiscardSink {
+impl Sink<DataChunkView> for DiscardSink {
     fn row_count(&self) -> u64 {
         self.rows_seen as u64
     }
@@ -47,15 +47,21 @@ impl<B: PipelineBatch> Sink<B> for DiscardSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{DataChunk, DataChunkView};
+    use crate::pipeline::DataChunkView;
     use common::arrow::SelectionVector;
 
     #[test]
     fn discard_counts_chunk_and_view_rows_without_materialization() {
         let mut sink = DiscardSink::new();
-        sink.push(DataChunk::new(vec![], SelectionVector::new_dense(2))).unwrap();
-        sink.push(DataChunkView::from_chunk(
-            DataChunk::new(vec![], SelectionVector::new_dense(3)),
+        sink.push(DataChunkView::from_arrays(
+            vec![],
+            2,
+            SelectionVector::new_dense(2),
+        ).unwrap()).unwrap();
+        sink.push(DataChunkView::from_arrays(
+            vec![],
+            3,
+            SelectionVector::new_dense(3),
         ).unwrap()).unwrap();
         assert_eq!(Sink::<DataChunkView>::row_count(&sink), 5);
         assert!(Sink::<DataChunkView>::collect(&mut sink).is_empty());

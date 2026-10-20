@@ -14,11 +14,8 @@ use super::*;
 fn aggregate_view_reads_mapped_arguments_from_original_arrow_buffers() {
     let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 1, 2, 2]));
     let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30, 40]));
-    let key_view = DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(&keys)]))
-        .expect("key source view");
-    let value_view =
-        DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(&values)]))
-            .expect("value source view");
+    let key_view = crate::pipeline::test_support::dense_view(vec![Arc::clone(&keys)]);
+    let value_view = crate::pipeline::test_support::dense_view(vec![Arc::clone(&values)]);
     let view = DataChunkView::combine(
         &[
             ViewInputRows {
@@ -45,9 +42,7 @@ fn aggregate_view_reads_mapped_arguments_from_original_arrow_buffers() {
 
     let batch = AggregateBatch::from_view(&view, 1, 1, &[vec![0]])
         .expect("construct aggregate input");
-    let AggregateColumn::View(argument) = &batch.aggregate_columns[0] else {
-        panic!("aggregate argument must stay view-backed");
-    };
+    let AggregateColumn::View(argument) = &batch.aggregate_columns[0];
     let sources = argument.source_arrays_for_column(0).expect("argument sources");
     assert!(sources.iter().any(|array| Arc::ptr_eq(array, &values)));
 
@@ -62,15 +57,15 @@ fn aggregate_view_reads_mapped_arguments_from_original_arrow_buffers() {
     };
     let tracker = QueryMemoryTracker::unlimited(CancellationToken::new());
     let mut sink = AggregateSink::with_memory_tracker(plan, tracker).expect("aggregate sink");
-    sink.accumulate_view(view).expect("aggregate mapped input");
+    sink.accumulate(view).expect("aggregate mapped input");
 
     let rows = sink
         .finish()
         .expect("finish")
         .into_iter()
         .flat_map(|batch| {
-            let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let sums = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            let keys = materialized_column::<Int64Array>(&batch, 0);
+            let sums = materialized_column::<Int64Array>(&batch, 1);
             (0..batch.num_rows())
                 .map(|row| (keys.value(row), sums.value(row)))
                 .collect::<Vec<_>>()

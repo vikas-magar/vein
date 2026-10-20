@@ -8,6 +8,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{Int32Type, i256};
 use common::arrow::SelectionVector;
+use crate::pipeline::test_support::materialized_column;
 
 use super::*;
 

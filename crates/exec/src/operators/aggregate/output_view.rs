@@ -113,7 +113,11 @@ impl AggregateSink {
 }
 
 fn owned_array_view(array: ArrayRef, rows: usize) -> Result<ViewColumn> {
-    DataChunkView::from_chunk(DataChunk::from_vectors(vec![array]))?.column_view(0).and_then(|column| {
+    DataChunkView::from_arrays(
+        vec![array],
+        rows,
+        SelectionVector::new_dense(rows),
+    )?.column_view(0).and_then(|column| {
         if column.row_mapping().len() == rows {
             Ok(column)
         } else {

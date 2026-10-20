@@ -1,42 +1,29 @@
-//! Shared aggregate input layout for materialized chunks and reference-backed views.
+//! Aggregate input layout over reference-backed view columns.
 
 use super::*;
-use crate::pipeline::{DataChunk, DataChunkView};
+use crate::pipeline::DataChunkView;
 
 #[derive(Clone)]
 pub(super) enum AggregateColumn {
-    Array(ArrayRef),
     View(DataChunkView),
 }
 
 impl AggregateColumn {
     pub(super) fn source_arrays(&self) -> Result<Vec<ArrayRef>> {
-        match self {
-            Self::Array(array) => Ok(vec![Arc::clone(array)]),
-            Self::View(view) => Ok(view.source_arrays_for_column(0)?.to_vec()),
-        }
+        let Self::View(view) = self;
+        Ok(view.source_arrays_for_column(0)?.to_vec())
     }
 
     pub(super) fn source_row(&self, row: usize) -> Result<Option<(usize, usize)>> {
-        match self {
-            Self::Array(array) if row < array.len() => Ok(Some((0, row))),
-            Self::Array(array) => Err(VeinError::internal(format!(
-                "aggregate input row {row} exceeds array length {}",
-                array.len()
-            ))),
-            Self::View(view) => view.source_row(0, row),
-        }
+        let Self::View(view) = self;
+        view.source_row(0, row)
     }
 
     pub(super) fn source_array(&self, source: usize) -> Result<&ArrayRef> {
-        match self {
-            Self::Array(array) if source == 0 => Ok(array),
-            Self::View(view) => view
-                .source_arrays_for_column(0)?
-                .get(source)
-                .ok_or_else(|| VeinError::internal("aggregate source array is out of bounds")),
-            Self::Array(_) => Err(VeinError::internal("aggregate source array is out of bounds")),
-        }
+        let Self::View(view) = self;
+        view.source_arrays_for_column(0)?
+            .get(source)
+            .ok_or_else(|| VeinError::internal("aggregate source array is out of bounds"))
     }
 
     pub(super) fn is_null(&self, row: usize) -> Result<bool> {
@@ -54,10 +41,8 @@ impl AggregateColumn {
     }
 
     fn data_type(&self) -> Result<&arrow::datatypes::DataType> {
-        match self {
-            Self::Array(array) => Ok(array.data_type()),
-            Self::View(view) => view.column_data_type(0),
-        }
+        let Self::View(view) = self;
+        view.column_data_type(0)
     }
 }
 
@@ -71,28 +56,6 @@ pub(super) struct AggregateBatch {
 }
 
 impl AggregateBatch {
-    pub(super) fn from_chunk(
-        chunk: &DataChunk,
-        groups: usize,
-        aggregate_count: usize,
-        grouping_sets: &[Vec<u32>],
-    ) -> Result<Self> {
-        Self::validate_width(chunk.num_columns(), groups, aggregate_count)?;
-        let mut batch = Self::empty(chunk.selection.clone(), groups, aggregate_count);
-        for &column in grouping_sets.iter().flatten() {
-            let column = column as usize;
-            if batch.key_columns[column].is_none() {
-                let array = chunk.column(column);
-                batch.key_columns[column] = Some(GroupKeyColumn::new(array)?);
-                batch.key_arrays[column].push(Arc::clone(array));
-            }
-        }
-        batch.aggregate_columns = (0..aggregate_count)
-            .map(|offset| AggregateColumn::Array(Arc::clone(chunk.column(groups + offset))))
-            .collect();
-        Ok(batch)
-    }
-
     pub(super) fn from_view(
         view: &DataChunkView,
         groups: usize,

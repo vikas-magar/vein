@@ -75,30 +75,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use arrow::array::{Array, ArrayRef, Int64Array};
-    use crate::pipeline::DataChunk;
+    use crate::pipeline::DataChunkView;
 
     use super::*;
 
     #[derive(Clone, Default)]
-    struct Collect(Arc<Mutex<Vec<DataChunk>>>);
-
-    impl PipelineNode<DataChunk> for Collect {
-        fn push(&mut self, chunk: DataChunk) -> Result<(), error::VeinError> {
-            self.0.lock().expect("collect lock").push(chunk);
-            Ok(())
-        }
-
-        fn flush(&mut self) -> Result<(), error::VeinError> {
-            Ok(())
-        }
-    }
+    struct Collect(Arc<Mutex<Vec<DataChunkView>>>);
 
     impl PipelineNode<DataChunkView> for Collect {
-        fn push(&mut self, view: DataChunkView) -> Result<(), error::VeinError> {
-            self.0
-                .lock()
-                .expect("collect lock")
-                .push(view.to_data_chunk()?);
+        fn push(&mut self, chunk: DataChunkView) -> Result<(), error::VeinError> {
+            self.0.lock().expect("collect lock").push(chunk);
             Ok(())
         }
 
@@ -111,12 +97,8 @@ mod tests {
         Arc::new(Int64Array::from(values.to_vec()))
     }
 
-    fn cells(chunk: &DataChunk, column: usize) -> Vec<Option<i64>> {
-        let array = chunk.column(column);
-        let ints = array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 output");
+    fn cells(chunk: &DataChunkView, column: usize) -> Vec<Option<i64>> {
+        let ints = crate::pipeline::test_support::materialized_column::<Int64Array>(chunk, column);
         (0..ints.len())
             .map(|row| ints.is_valid(row).then(|| ints.value(row)))
             .collect()
@@ -141,17 +123,17 @@ mod tests {
 
         let mut build = spec.build_sink();
         build
-            .push(DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+            .push(crate::pipeline::test_support::dense_view(vec![
                 ints(&[100, 200]),
                 ints(&[7, 8]),
-            ])).expect("build view"))
+            ]))
             .expect("build");
         let table = build.finish();
 
         let sink = Collect::default();
         let mut probe = spec.into_probe(Arc::new(table), Box::new(sink.clone()));
         probe
-            .push(DataChunkView::from_chunk(DataChunk::from_vectors(vec![ints(&[8])])).expect("probe view"))
+            .push(crate::pipeline::test_support::dense_view(vec![ints(&[8])]))
             .expect("probe");
         probe.flush().expect("flush");
 

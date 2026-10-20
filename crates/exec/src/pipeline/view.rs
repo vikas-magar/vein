@@ -18,9 +18,7 @@ use common::Result;
 use common::arrow::SelectionVector;
 use error::VeinError;
 
-use super::chunk::DataChunk;
-
-/// Describes the array work performed by an explicit view-to-chunk conversion.
+/// Describes array work performed when a view crosses an Arrow batch boundary.
 ///
 /// Gathered output buffer bytes are Arrow's reported buffer footprint, not an
 /// exact count of bytes copied or newly allocated: dictionary and nested arrays
@@ -526,25 +524,15 @@ impl DataChunkView {
     ///
     /// The batch's column handles move into the view. This is the scan-source
     /// constructor: readers can enter the reference-backed pipeline directly
-    /// without first creating a materialized `DataChunk`.
+    /// without first creating a materialized `DataChunkView`.
     pub fn from_record_batch(batch: RecordBatch) -> Result<Self> {
         let (_, arrays, row_count) = batch.into_parts();
         Self::from_arrays(arrays, row_count, SelectionVector::new_dense(row_count))
     }
 
-    /// Wraps a materialized chunk without copying its Arrow arrays.
-    ///
-    /// The view keeps the chunk's active selection and represents each source
-    /// column through one shared identity row mapping. For a zero-column chunk,
-    /// the row count is inferred from its dense selection or the largest sparse
-    /// selected row, since `DataChunk` has no separate physical-row-count field.
-    pub fn from_chunk(chunk: DataChunk) -> Result<Self> {
-        let DataChunk { vectors, selection } = chunk;
-        let row_count = infer_physical_row_count(&vectors, &selection);
-        Self::from_arrays(vectors, row_count, selection)
-    }
-
-    fn from_arrays(
+    /// Creates a view over owned Arrow array handles and an explicit active-row
+    /// selection. Array payload buffers are retained by reference.
+    pub fn from_arrays(
         arrays: Vec<ArrayRef>,
         row_count: usize,
         selection: SelectionVector,
@@ -1051,24 +1039,6 @@ impl DataChunkView {
             })
     }
 
-    /// Materializes active rows into ordinary columns for an operator that
-    /// requires Arrow arrays. Contiguous source ranges remain zero-copy slices;
-    /// mapped rows and null extensions are gathered by `materialize_column`.
-    pub fn to_data_chunk(&self) -> Result<DataChunk> {
-        self.to_data_chunk_with_report().map(|(chunk, _)| chunk)
-    }
-
-    /// Converts active rows once and reports whether columns shared or gathered
-    /// source buffers. The report is collected at the actual conversion branch;
-    /// it does not infer copying from the size of a potentially shared slice.
-    pub fn to_data_chunk_with_report(&self) -> Result<(DataChunk, MaterializationReport)> {
-        let (columns, report) = self.materialize_columns_with_report()?;
-        Ok((
-            DataChunk::new(columns, SelectionVector::new_dense(self.num_rows())),
-            report,
-        ))
-    }
-
     /// Checks the result schema against active rows without flattening the view.
     ///
     /// Non-nullable fields are checked only against selected rows, so excluded
@@ -1132,7 +1102,7 @@ impl DataChunkView {
         &self,
         schema: SchemaRef,
     ) -> Result<(RecordBatch, MaterializationReport)> {
-        self.validate_schema_types(&schema)?;
+        self.validate_schema(&schema)?;
         let (columns, report) = self.materialize_columns_with_report()?;
         let options = RecordBatchOptions::new().with_row_count(Some(self.num_rows()));
         let batch = RecordBatch::try_new_with_options(schema, columns, &options)
@@ -1297,21 +1267,6 @@ fn validate_selection(selection: &SelectionVector, row_count: usize) -> Result<(
     Ok(())
 }
 
-fn infer_physical_row_count(vectors: &[ArrayRef], selection: &SelectionVector) -> usize {
-    if let Some(array) = vectors.first() {
-        return array.len();
-    }
-    selection.contiguous_range().map_or_else(
-        || {
-            (0..selection.size())
-                .map(|row| selection.get_index(row) + 1)
-                .max()
-                .unwrap_or(0)
-        },
-        |range| range.end,
-    )
-}
-
 #[cfg(test)]
 #[path = "view/tests.rs"]
 mod tests;
@@ -1322,4 +1277,6 @@ mod mapping_tests;
 
 #[path = "view/derived.rs"]
 mod derived;
+#[path = "view/constructors.rs"]
+mod constructors;
 pub(crate) use derived::{DerivedColumnBuilder, ViewSourceRow};

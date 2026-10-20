@@ -14,11 +14,11 @@ fn date_sum_plan() -> AggregatePlan {
     }
 }
 
-fn collect_date_sums(batches: &[DataChunk]) -> std::collections::BTreeMap<Option<i32>, i64> {
+fn collect_date_sums(batches: &[DataChunkView]) -> std::collections::BTreeMap<Option<i32>, i64> {
     let mut groups = std::collections::BTreeMap::new();
     for batch in batches {
-        let dates = batch.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
-        let sums = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let dates = crate::pipeline::test_support::materialized_column::<Date32Array>(batch, 0);
+        let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(batch, 1);
         for row in 0..batch.num_rows() {
             groups.insert(dates.is_valid(row).then(|| dates.value(row)), sums.value(row));
         }
@@ -29,12 +29,12 @@ fn collect_date_sums(batches: &[DataChunk]) -> std::collections::BTreeMap<Option
 #[test]
 fn date32_group_keys_preserve_nulls_and_merge_repeated_values_across_batches() {
     let mut sink = AggregateSink::new(date_sum_plan()).expect("create aggregate sink");
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Date32Array::from(vec![Some(10), None, Some(20), Some(10)])),
         Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
     ]))
         .expect("accumulate first date batch");
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Date32Array::from(vec![Some(20), None, Some(30)])),
         Arc::new(Int64Array::from(vec![5, 6, 7])),
     ]))
@@ -61,7 +61,7 @@ fn date32_group_keys_survive_aggregate_spill_and_merge() {
         .expect("create budgeted date aggregate");
     let rows = 4096_i64;
     let dates = (0..rows).map(|row| Some((row % 257) as i32)).collect::<Vec<_>>();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Date32Array::from(dates)),
         Arc::new(Int64Array::from_iter_values(1..=rows)),
     ]))

@@ -12,27 +12,6 @@ impl SpillStorageFactory for CountingSpillStorageFactory {
 }
 
 
-pub(in crate::runtime::tests) struct MaterializationCollector {
-    pub(in crate::runtime::tests) chunks: Arc<Mutex<Vec<DataChunk>>>,
-    pub(in crate::runtime::tests) flushed: Arc<AtomicBool>,
-}
-
-impl PipelineNode<DataChunk> for MaterializationCollector {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
-        self.chunks.lock().unwrap().push(chunk);
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.flushed.store(true, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn finished(&self) -> bool {
-        self.flushed.load(Ordering::Relaxed)
-    }
-}
-
 
 // Compact fixture DSL; runtime tests immediately lower it to the canonical plan tree.
 

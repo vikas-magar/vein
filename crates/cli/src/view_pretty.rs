@@ -86,7 +86,9 @@ fn write_row(output: &mut String, values: &[String], widths: &[usize]) {
         output.push_str(value);
         output.extend(std::iter::repeat_n(
             ' ',
-            width.saturating_sub(value.chars().count()).saturating_add(1),
+            width
+                .saturating_sub(value.chars().count())
+                .saturating_add(1),
         ));
         output.push('|');
     }
@@ -100,18 +102,18 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use common::arrow::SelectionVector;
     use exec::operators::sink::ViewResultBatch;
-    use exec::pipeline::{DataChunk, DataChunkView, RowMapping, SourceRow, ViewColumn};
+    use exec::pipeline::{DataChunkView, RowMapping, SourceRow, ViewColumn};
     use std::sync::Arc;
 
     #[test]
     fn pretty_output_reads_noncontiguous_view_rows_in_logical_order() {
         let values: ArrayRef = Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"]));
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
-        let view = DataChunkView::from_chunk(DataChunk::new(
+        let view = DataChunkView::from_selected_arrays(
             vec![values],
             SelectionVector::new_sparse(vec![2, 0]),
-        ))
-            .unwrap();
+        )
+        .unwrap();
         let batch = ViewResultBatch::new(schema, view).unwrap();
 
         assert_eq!(

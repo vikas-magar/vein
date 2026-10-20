@@ -6,8 +6,6 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array};
 use common::cancellation::CancellationToken;
-use crate::pipeline::DataChunkView;
-
 use super::*;
 
 #[test]
@@ -24,16 +22,15 @@ fn aggregate_view_output_reuses_key_array_and_retains_its_memory_lease() {
         aggregate_input_types: vec![VeinDataType::Int64],
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
-    let input = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+    let input = crate::pipeline::test_support::dense_view(vec![
         Arc::clone(&keys),
         values,
-    ]))
-        .expect("source view");
+    ]);
     let mut sink = AggregateSink::with_memory_tracker(plan, tracker.clone()).expect("sink");
-    sink.accumulate_view(input).expect("accumulate view");
+    sink.accumulate(input).expect("accumulate view");
 
     let mut output = Vec::new();
-    sink.finish_view_with(NonZeroUsize::new(8).unwrap(), |view| {
+    sink.finish_with(NonZeroUsize::new(8).unwrap(), |view| {
         output.push(view);
         Ok(())
     })
@@ -45,20 +42,8 @@ fn aggregate_view_output_reuses_key_array_and_retains_its_memory_lease() {
         .iter()
         .any(|array| Arc::ptr_eq(array, &keys)));
 
-    let rows = output[0]
-        .materialize_column(0)
-        .unwrap();
-    let rows = rows
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
-    let sums = output[0]
-        .materialize_column(1)
-        .unwrap();
-    let sums = sums
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let rows = materialized_column::<Int64Array>(&output[0], 0);
+    let sums = materialized_column::<Int64Array>(&output[0], 1);
     let actual = (0..output[0].num_rows())
         .map(|row| (rows.value(row), sums.value(row)))
         .collect::<BTreeMap<_, _>>();

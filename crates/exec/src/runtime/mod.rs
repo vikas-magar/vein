@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
 
+use self::filter::{RuntimeFilterBuildInput, RuntimeFilterSet};
 use crate::memory::{ExecutionResourceLimits, QueryMemoryTracker};
 use crate::operators::aggregate;
 use crate::operators::join::hash_join::BuildResult;
@@ -27,12 +28,7 @@ use crate::operators::join::spill::{
 use crate::operators::join::{BuildSink, HashJoin, HashTable, JoinFilterCollector};
 use crate::operators::sink::ClientOutput;
 use crate::operators::{LimitTransform, SortTransform};
-#[cfg(test)]
-use crate::pipeline::DataChunk;
 use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
-use self::filter::{
-    RuntimeFilterBuildInput, RuntimeFilterSet,
-};
 use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};
 use crate::trace::ExecutionTrace;
 use common::Result;
@@ -57,9 +53,6 @@ pub use result::{TaskMetrics, TaskResult};
 mod resources;
 pub use resources::QueryExecutionResources;
 
-mod materialize;
-pub(crate) use materialize::MaterializeViewNode;
-
 mod dependency_guard;
 mod join_utils;
 mod schedule;
@@ -76,8 +69,8 @@ pub use task_executor::TaskExecutor;
 mod default_task_executor;
 mod execution;
 mod executor_config;
-mod join_residual;
 pub mod filter;
+mod join_residual;
 use join_residual::install_join_residual;
 
 mod join_pipeline;

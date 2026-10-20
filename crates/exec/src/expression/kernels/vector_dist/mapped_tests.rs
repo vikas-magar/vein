@@ -1,6 +1,6 @@
 use super::*;
-use crate::pipeline::{DataChunk, DataChunkView};
 use crate::expression::value::ExpressionValue;
+use crate::pipeline::DataChunkView;
 use arrow::array::{ArrayRef, Float32Array, ListArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field};
@@ -34,10 +34,11 @@ fn nullable_list(values: Vec<Option<f32>>) -> ArrayRef {
 fn mapped_cosine_distance_reads_sparse_rows_without_materializing_input_columns() {
     let left = list(vec![vec![1.0, 0.0], vec![3.0, 4.0], vec![2.0, 2.0]]);
     let right = list(vec![vec![0.0, 1.0], vec![3.0, 4.0], vec![1.0, 1.0]]);
-    let view = Arc::new(DataChunkView::from_chunk(DataChunk::from_vectors(vec![left, right]))
-        .unwrap()
-        .with_selection(SelectionVector::new_sparse(vec![1, 0]))
-        .unwrap());
+    let view = Arc::new(
+        crate::pipeline::test_support::dense_view(vec![left, right])
+            .with_selection(SelectionVector::new_sparse(vec![1, 0]))
+            .unwrap(),
+    );
     let left_value = ExpressionValue::view_column(Arc::clone(&view), 0).unwrap();
     let right_value = ExpressionValue::view_column(Arc::clone(&view), 1).unwrap();
 
@@ -53,7 +54,7 @@ fn mapped_cosine_distance_reads_sparse_rows_without_materializing_input_columns(
 fn mapped_distance_propagates_null_extended_rows_and_null_elements() {
     let left = list(vec![vec![1.0, 0.0], vec![1.0, 1.0]]);
     let right = list(vec![vec![0.0, 1.0], vec![1.0, 1.0]]);
-    let source = DataChunkView::from_chunk(DataChunk::from_vectors(vec![left, right])).unwrap();
+    let source = crate::pipeline::test_support::dense_view(vec![left, right]);
     let rows = [Some(0), None];
     let view = DataChunkView::combine(
         &[crate::pipeline::ViewInputRows {
@@ -80,11 +81,10 @@ fn mapped_distance_propagates_null_extended_rows_and_null_elements() {
     assert_eq!(values.value(0), 1.0);
     assert!(values.is_null(1));
 
-    let nullable = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+    let nullable = crate::pipeline::test_support::dense_view(vec![
         nullable_list(vec![Some(1.0), None]),
         nullable_list(vec![Some(0.0), Some(1.0)]),
-    ]))
-    .unwrap();
+    ]);
     let nullable = Arc::new(nullable);
     let left_value = ExpressionValue::view_column(Arc::clone(&nullable), 0).unwrap();
     let right_value = ExpressionValue::view_column(Arc::clone(&nullable), 1).unwrap();

@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int32Array};
 
-use super::{DataChunk, HashTable, JoinKeys};
+use super::{DataChunkView, HashTable, JoinKeys};
 
-fn chunk(values: &[Option<i32>]) -> DataChunk {
-    DataChunk::from_vectors(vec![Arc::new(Int32Array::from(values.to_vec())) as ArrayRef])
+fn chunk(values: &[Option<i32>]) -> DataChunkView {
+    crate::pipeline::test_support::dense_view(vec![Arc::new(Int32Array::from(values.to_vec())) as ArrayRef])
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use crate::runtime::filter::RuntimeFilterSet;
+use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 
 use super::*;
 
@@ -9,8 +9,8 @@ fn ints(values: &[i64]) -> ArrayRef {
     Arc::new(Int64Array::from(values.to_vec()))
 }
 
-fn chunk(column: ArrayRef) -> DataChunk {
-    DataChunk::from_vectors(vec![column])
+fn chunk(column: ArrayRef) -> DataChunkView {
+    crate::pipeline::test_support::dense_view(vec![column])
 }
 
 fn hashes_for_arrays(columns: &[ArrayRef]) -> Vec<u64> {
@@ -26,10 +26,7 @@ fn hashes_for_arrays(columns: &[ArrayRef]) -> Vec<u64> {
 }
 
 fn query_memory(limit: usize) -> QueryMemoryTracker {
-    QueryMemoryTracker::new(
-        limit,
-        common::cancellation::CancellationToken::new(),
-    )
+    QueryMemoryTracker::new(limit, common::cancellation::CancellationToken::new())
 }
 
 #[test]
@@ -58,16 +55,27 @@ fn bloom_runtime_filter_preserves_composite_join_keys_and_null_semantics() {
         ),
         (
             "region",
-            Arc::new(StringArray::from(vec![Some("a"), Some("missing"), Some("b"), Some("a")])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("missing"),
+                Some("b"),
+                Some("a"),
+            ])) as ArrayRef,
         ),
     ])
-        .expect("probe key batch");
+    .expect("probe key batch");
     let selection = filters[0]
         .evaluate(&probe, &[0, 1])
         .expect("evaluate composite runtime filter");
 
-    assert!(selection.value(0), "every build key must survive the filter");
-    assert!(selection.value(2), "every build key must survive the filter");
+    assert!(
+        selection.value(0),
+        "every build key must survive the filter"
+    );
+    assert!(
+        selection.value(2),
+        "every build key must survive the filter"
+    );
     assert!(!selection.value(3), "null join keys never match");
     assert!(
         filters[0].memory_bytes() > 0,
@@ -98,10 +106,9 @@ fn bloom_runtime_filter_declines_optional_allocation_when_budget_is_exhausted() 
 
 #[test]
 fn row_key_encoding_hashes_composite_values_and_skips_null_keys() {
-    let single_i64 = ChunkKeys::resolve_arrays(&[
-        Arc::new(Int64Array::from(vec![Some(3), None])) as ArrayRef,
-    ])
-        .expect("resolve single Int64 key");
+    let single_i64 =
+        ChunkKeys::resolve_arrays(&[Arc::new(Int64Array::from(vec![Some(3), None])) as ArrayRef])
+            .expect("resolve single Int64 key");
     let expected_i64_hash = fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET);
     assert_eq!(
         single_i64.hash_and_single_i64(0, None).unwrap(),
@@ -114,41 +121,50 @@ fn row_key_encoding_hashes_composite_values_and_skips_null_keys() {
         Arc::new(Int64Array::from(vec![Some(3), Some(3), None])) as ArrayRef,
         Arc::new(StringArray::from(vec![Some("north"), None, Some("north")])) as ArrayRef,
     ])
-        .expect("resolve composite key");
-    let expected_composite_hash = fnv1a(
-        b"north",
-        fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET),
-    );
+    .expect("resolve composite key");
+    let expected_composite_hash = fnv1a(b"north", fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET));
     assert_eq!(
         composite.hash_and_single_i64(0, None).unwrap(),
         Some((expected_composite_hash, None)),
         "composite keys preserve column order in the canonical hash"
     );
-    assert_eq!(composite.hash_and_single_i64(1, None).unwrap(), None, "a null in any key column skips the row");
-    assert_eq!(composite.hash_and_single_i64(2, None).unwrap(), None, "null leading key columns skip the row");
+    assert_eq!(
+        composite.hash_and_single_i64(1, None).unwrap(),
+        None,
+        "a null in any key column skips the row"
+    );
+    assert_eq!(
+        composite.hash_and_single_i64(2, None).unwrap(),
+        None,
+        "null leading key columns skip the row"
+    );
 }
 
 #[test]
 fn spill_hashes_use_the_same_composite_key_encoding_as_join_indexing() {
     let keys = JoinKeys::new(vec![0, 1]);
-    let build = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+    let build = crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![Some(3), Some(3), None])) as ArrayRef,
-        Arc::new(StringArray::from(vec![Some("north"), Some("south"), Some("north")]))
-            as ArrayRef,
-    ]))
-        .expect("build view");
-    let probe = DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+        Arc::new(StringArray::from(vec![
+            Some("north"),
+            Some("south"),
+            Some("north"),
+        ])) as ArrayRef,
+    ]);
+    let probe = crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![Some(3)])) as ArrayRef,
         Arc::new(StringArray::from(vec![Some("north")])) as ArrayRef,
-    ]))
-        .expect("probe view");
+    ]);
 
     let build_hashes = HashTable::hashes_for_view(&build, &keys).expect("build hashes");
     let probe_hashes = HashTable::hashes_for_view(&probe, &keys).expect("probe hashes");
 
     assert_eq!(build_hashes[0], probe_hashes[0]);
     assert_ne!(build_hashes[0], build_hashes[1]);
-    assert_eq!(build_hashes[2], FNV_OFFSET, "null keys still receive a partition hash");
+    assert_eq!(
+        build_hashes[2], FNV_OFFSET,
+        "null keys still receive a partition hash"
+    );
 }
 
 #[test]
@@ -158,44 +174,75 @@ fn sparse_composite_join_keys_stay_reference_backed_through_table_merge_and_prob
     let numbers: ArrayRef = Arc::new(Int64Array::from(vec![Some(7), None, Some(8)]));
     let strings: ArrayRef = Arc::new(StringArray::from(vec!["A", "B", "C"]));
     let payload = ints(&[70, 0, 80]);
-    let make_view = |selection| DataChunkView::from_chunk(DataChunk::new(
-        vec![Arc::clone(&numbers), Arc::clone(&strings), Arc::clone(&payload)], selection,
-    )).unwrap();
+    let make_view = |selection| {
+        crate::pipeline::test_support::selected_view(
+            vec![
+                Arc::clone(&numbers),
+                Arc::clone(&strings),
+                Arc::clone(&payload),
+            ],
+            selection,
+        )
+    };
     let mut left = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
-    left.insert_view(make_view(SelectionVector::new_dense(3))).unwrap();
+    left.insert(make_view(SelectionVector::new_dense(3)))
+        .unwrap();
     let (shared, shared_us) = left.build_key_materialization();
     assert_eq!(shared, MaterializationReport::default());
     let mut right = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
     let sparse = make_view(SelectionVector::new_sparse(vec![2, 1, 0]));
-    right.insert_view(sparse.clone()).unwrap();
+    right.insert(sparse.clone()).unwrap();
     let (gathered, gathered_us) = right.build_key_materialization();
     assert_eq!(gathered, MaterializationReport::default());
     for (column, expected) in [(&numbers, 0), (&strings, 1)] {
-        assert!(Arc::ptr_eq(
-            &right.build_chunk(0).source_arrays_for_column(expected).unwrap()[0],
-            column
-        ), "sparse join-key access retains source Arrow arrays");
+        assert!(
+            Arc::ptr_eq(
+                &right
+                    .build_chunk(0)
+                    .source_arrays_for_column(expected)
+                    .unwrap()[0],
+                column
+            ),
+            "sparse join-key access retains source Arrow arrays"
+        );
     }
     left.merge(right).unwrap();
     let mut expected = shared;
     expected.accumulate(gathered);
-    assert_eq!(left.build_key_materialization(), (expected, shared_us.saturating_add(gathered_us)));
+    assert_eq!(
+        left.build_key_materialization(),
+        (expected, shared_us.saturating_add(gathered_us))
+    );
     for index in 0..2 {
-        assert!(Arc::ptr_eq(left.build_chunk(index).resolve(2, 0).unwrap().unwrap().0, &payload));
+        assert!(Arc::ptr_eq(
+            left.build_chunk(index).resolve(2, 0).unwrap().unwrap().0,
+            &payload
+        ));
     }
 
     let before = left.build_key_materialization();
     let mut matches = Vec::new();
-    let (report, _) = left.probe_view(&sparse, &mut matches).unwrap();
+    let (report, _) = left.probe(&sparse, &mut matches).unwrap();
     assert_eq!(report, MaterializationReport::default());
     matches.sort_unstable();
-    assert_eq!(matches, vec![(0, (0, 2)), (0, (1, 0)), (2, (0, 0)), (2, (1, 2))]);
-    assert_eq!(left.build_key_materialization(), before, "probing must not mutate the shared build table");
+    assert_eq!(
+        matches,
+        vec![(0, (0, 2)), (0, (1, 0)), (2, (0, 0)), (2, (1, 2))]
+    );
+    assert_eq!(
+        left.build_key_materialization(),
+        before,
+        "probing must not mutate the shared build table"
+    );
     matches.clear();
-    let (report, _) = left.probe_view(&make_view(SelectionVector::new_dense(3)), &mut matches).unwrap();
+    let (report, _) = left
+        .probe(&make_view(SelectionVector::new_dense(3)), &mut matches)
+        .unwrap();
     assert_eq!(report, shared);
     let mut incompatible = HashTable::new(JoinKeys::new(vec![2]), JoinKeys::new(vec![2]));
-    incompatible.insert_view(make_view(SelectionVector::new_dense(3))).unwrap();
+    incompatible
+        .insert(make_view(SelectionVector::new_dense(3)))
+        .unwrap();
     assert!(left.merge(incompatible).is_err());
     assert_eq!(left.build_key_materialization(), before);
 }
@@ -204,20 +251,29 @@ fn sparse_composite_join_keys_stay_reference_backed_through_table_merge_and_prob
 fn key_reports_handle_empty_batches_and_keyless_joins() {
     use common::arrow::SelectionVector;
 
-    let empty = DataChunkView::from_chunk(DataChunk::new(vec![ints(&[1])], SelectionVector::new_sparse(vec![]))).unwrap();
+    let empty = crate::pipeline::test_support::selected_view(
+        vec![ints(&[1])],
+        SelectionVector::new_sparse(vec![]),
+    );
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
-    table.insert_view(empty.clone()).unwrap();
+    table.insert(empty.clone()).unwrap();
     let expected = MaterializationReport::default();
     assert_eq!(table.build_key_materialization().0, expected);
     let mut matches = Vec::new();
-    assert_eq!(table.probe_view(&empty, &mut matches).unwrap().0, expected);
+    assert_eq!(table.probe(&empty, &mut matches).unwrap().0, expected);
     assert!(matches.is_empty());
 
     let mut keyless = HashTable::new(JoinKeys::new(vec![]), JoinKeys::new(vec![]));
-    let view = DataChunkView::from_chunk(chunk(ints(&[1, 2]))).unwrap();
-    keyless.insert_view(view.clone()).unwrap();
-    assert_eq!(keyless.build_key_materialization().0, MaterializationReport::default());
-    assert_eq!(keyless.probe_view(&view, &mut matches).unwrap().0, MaterializationReport::default());
+    let view = chunk(ints(&[1, 2]));
+    keyless.insert(view.clone()).unwrap();
+    assert_eq!(
+        keyless.build_key_materialization().0,
+        MaterializationReport::default()
+    );
+    assert_eq!(
+        keyless.probe(&view, &mut matches).unwrap().0,
+        MaterializationReport::default()
+    );
     assert_eq!(matches.len(), 4);
 }
 
@@ -254,7 +310,10 @@ fn insert_rejects_key_types_without_a_hash_join_representation() {
 
     assert!(error.to_string().contains("not supported by hash join"));
     assert!(error.to_string().contains("Boolean"));
-    assert_eq!(table.build_key_materialization(), (MaterializationReport::default(), 0));
+    assert_eq!(
+        table.build_key_materialization(),
+        (MaterializationReport::default(), 0)
+    );
 }
 
 /// A null key never matches, on either side of the join.
@@ -263,13 +322,16 @@ fn null_keys_never_match() {
     let build: ArrayRef = Arc::new(Int64Array::from(vec![Some(10), None]));
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     table
-        .insert(DataChunk::from_vectors(vec![build]))
+        .insert(crate::pipeline::test_support::dense_view(vec![build]))
         .expect("insert");
 
     let probe: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(10)]));
     let mut pairs = Vec::new();
     table
-        .probe(&DataChunk::from_vectors(vec![probe]), &mut pairs)
+        .probe(
+            &crate::pipeline::test_support::dense_view(vec![probe]),
+            &mut pairs,
+        )
         .expect("probe");
 
     assert_eq!(pairs.len(), 1, "only the non-null key may match");
@@ -280,7 +342,7 @@ fn null_keys_never_match() {
 fn runtime_key_bounds_track_each_composite_component_and_ignore_null_rows() {
     let mut table = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
     table
-        .insert(DataChunk::from_vectors(vec![
+        .insert(crate::pipeline::test_support::dense_view(vec![
             Arc::new(Int64Array::from(vec![Some(5), None, Some(8)])) as ArrayRef,
             Arc::new(StringArray::from(vec![Some("m"), Some("z"), Some("a")])) as ArrayRef,
         ]))
@@ -307,8 +369,8 @@ fn range_filter_prunes_from_statistics_without_binding_a_row_mask() {
         vec![Some((LogicalLiteral::Int64(2), LogicalLiteral::Int64(5)))],
         &memory,
     )
-        .expect("create bounded filter")
-        .expect("range bounds are available");
+    .expect("create bounded filter")
+    .expect("range bounds are available");
     let filters = RuntimeFilterSet::new(vec![Arc::new(filter)]);
     let schema = types::VeinSchema::new(vec![Arc::new(types::ResolvedColumn::new(
         ColumnId(7),
@@ -344,13 +406,13 @@ fn merging_hash_tables_combines_and_rebases_runtime_key_bounds() {
     let keys = JoinKeys::new(vec![0, 1]);
     let mut left = HashTable::new(keys.clone(), keys.clone());
     let mut right = HashTable::new(keys.clone(), keys);
-    left.insert(DataChunk::from_vectors(vec![
+    left.insert(crate::pipeline::test_support::dense_view(vec![
         ints(&[5, 7]),
         Arc::new(StringArray::from(vec!["m", "z"])) as ArrayRef,
     ]))
-        .expect("insert first worker rows");
+    .expect("insert first worker rows");
     right
-        .insert(DataChunk::from_vectors(vec![
+        .insert(crate::pipeline::test_support::dense_view(vec![
             ints(&[1, 9]),
             Arc::new(StringArray::from(vec!["a", "y"])) as ArrayRef,
         ]))
@@ -390,7 +452,7 @@ fn the_probe_reports_its_matches_and_the_table_every_row() {
 fn multi_column_keys_and_strings_match() {
     let mut table = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
     table
-        .insert(DataChunk::from_vectors(vec![
+        .insert(crate::pipeline::test_support::dense_view(vec![
             ints(&[1, 1]),
             Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
         ]))
@@ -399,7 +461,7 @@ fn multi_column_keys_and_strings_match() {
     let mut pairs = Vec::new();
     table
         .probe(
-            &DataChunk::from_vectors(vec![
+            &crate::pipeline::test_support::dense_view(vec![
                 ints(&[1]),
                 Arc::new(StringArray::from(vec!["b"])) as ArrayRef,
             ]),
@@ -412,7 +474,7 @@ fn multi_column_keys_and_strings_match() {
     let mut none = Vec::new();
     table
         .probe(
-            &DataChunk::from_vectors(vec![
+            &crate::pipeline::test_support::dense_view(vec![
                 ints(&[1]),
                 Arc::new(StringArray::from(vec!["c"])) as ArrayRef,
             ]),
@@ -429,9 +491,15 @@ fn build_columns_are_retained_not_copied() {
     let key: ArrayRef = ints(&[1, 2, 3]);
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     table
-        .insert(DataChunk::from_vectors(vec![Arc::clone(&key)]))
+        .insert(crate::pipeline::test_support::dense_view(vec![Arc::clone(
+            &key,
+        )]))
         .expect("insert");
-    let (retained, _) = table.build_chunk(0).resolve(0, 0).expect("resolve row").unwrap();
+    let (retained, _) = table
+        .build_chunk(0)
+        .resolve(0, 0)
+        .expect("resolve row")
+        .unwrap();
     assert!(Arc::ptr_eq(retained, &key));
 }
 
@@ -465,7 +533,7 @@ fn the_two_sides_may_key_on_different_columns() {
     // Build columns are [payload, key]; the probe's only column is the key.
     let mut table = HashTable::new(JoinKeys::new(vec![1]), JoinKeys::new(vec![0]));
     table
-        .insert(DataChunk::from_vectors(vec![
+        .insert(crate::pipeline::test_support::dense_view(vec![
             ints(&[100, 200]),
             ints(&[7, 8]),
         ]))
@@ -490,7 +558,7 @@ fn merged_tables_find_every_row_from_both() {
     // A null key on the merged-in side must survive the rebase too.
     let with_null: ArrayRef = Arc::new(Int64Array::from(vec![Some(40), None]));
     right
-        .insert(DataChunk::from_vectors(vec![with_null]))
+        .insert(crate::pipeline::test_support::dense_view(vec![with_null]))
         .expect("insert");
 
     left.merge(right).expect("merge");
@@ -529,15 +597,20 @@ fn merged_tables_find_every_row_from_both() {
 fn composite_keys_match_only_when_every_key_column_matches() {
     let mut table = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
     table
-        .insert(DataChunk::from_vectors(vec![
+        .insert(crate::pipeline::test_support::dense_view(vec![
             ints(&[1, 1, 2]),
             ints(&[10, 20, 10]),
         ]))
         .expect("insert composite build keys");
 
-    let probe = DataChunk::from_vectors(vec![ints(&[1, 1, 2, 2]), ints(&[20, 99, 10, 11])]);
+    let probe = crate::pipeline::test_support::dense_view(vec![
+        ints(&[1, 1, 2, 2]),
+        ints(&[20, 99, 10, 11]),
+    ]);
     let mut pairs = Vec::new();
-    table.probe(&probe, &mut pairs).expect("probe composite keys");
+    table
+        .probe(&probe, &mut pairs)
+        .expect("probe composite keys");
 
     let mut matches: Vec<(u32, u32)> = pairs
         .iter()
@@ -570,7 +643,7 @@ fn build_index_respects_budget_and_releases_reservation_on_error() {
         JoinKeys::new(vec![0]),
         budget.clone(),
     )
-        .expect("initial bucket table fits the configured budget");
+    .expect("initial bucket table fits the configured budget");
     assert_eq!(budget.used(), initial_bytes);
 
     let error = table
@@ -578,29 +651,29 @@ fn build_index_respects_budget_and_releases_reservation_on_error() {
         .expect_err("the row index must not exceed the budget");
     assert!(matches!(error, VeinError::ResourceExhausted { .. }));
     drop(table);
-    assert_eq!(budget.used(), 0, "failed build state releases all reservations");
+    assert_eq!(
+        budget.used(),
+        0,
+        "failed build state releases all reservations"
+    );
 }
 
 #[test]
 fn retained_build_arrays_are_charged_once_across_views_and_live_through_outputs() {
     let source = ints(&[10, 20]);
     let source_bytes = source.get_array_memory_size();
-    let tracker = QueryMemoryTracker::new(
-        1 << 20,
-        common::cancellation::CancellationToken::new(),
-    );
+    let tracker = QueryMemoryTracker::new(1 << 20, common::cancellation::CancellationToken::new());
     let mut table = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         tracker.clone(),
     )
-        .expect("create budgeted table");
+    .expect("create budgeted table");
     let initial_bytes = tracker.used();
 
     for _ in 0..2 {
-        let view = DataChunkView::from_chunk(chunk(Arc::clone(&source)))
-            .expect("wrap retained source array");
-        table.insert_view(view).expect("retain build view");
+        let view = chunk(Arc::clone(&source));
+        table.insert(view).expect("retain build view");
     }
     let after_build = tracker.used();
     assert!(
@@ -621,52 +694,46 @@ fn retained_build_arrays_are_charged_once_across_views_and_live_through_outputs(
         "the output maps to the requested source row"
     );
     drop(output);
-    assert_eq!(tracker.used(), 0, "the last retaining view releases all state");
+    assert_eq!(
+        tracker.used(),
+        0,
+        "the last retaining view releases all state"
+    );
 }
 
 #[test]
 fn equal_sized_distinct_build_arrays_each_consume_their_own_budget() {
-    let shared_tracker = QueryMemoryTracker::new(
-        1 << 20,
-        common::cancellation::CancellationToken::new(),
-    );
+    let shared_tracker =
+        QueryMemoryTracker::new(1 << 20, common::cancellation::CancellationToken::new());
     let mut shared_table = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         shared_tracker.clone(),
     )
-        .expect("create shared-array table");
+    .expect("create shared-array table");
     let source = ints(&[10, 20]);
     let array_bytes = source.get_array_memory_size();
     let initial_shared_bytes = shared_tracker.used();
 
     for _ in 0..2 {
         shared_table
-            .insert_view(
-                DataChunkView::from_chunk(chunk(Arc::clone(&source)))
-                    .expect("shared array view"),
-            )
+            .insert(chunk(Arc::clone(&source)))
             .expect("insert shared array");
     }
     let shared_bytes = shared_tracker.used() - initial_shared_bytes;
 
-    let distinct_tracker = QueryMemoryTracker::new(
-        1 << 20,
-        common::cancellation::CancellationToken::new(),
-    );
+    let distinct_tracker =
+        QueryMemoryTracker::new(1 << 20, common::cancellation::CancellationToken::new());
     let mut distinct_table = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         distinct_tracker.clone(),
     )
-        .expect("create distinct-array table");
+    .expect("create distinct-array table");
     let initial_distinct_bytes = distinct_tracker.used();
     for _ in 0..2 {
         distinct_table
-            .insert_view(
-                DataChunkView::from_chunk(chunk(ints(&[10, 20])))
-                    .expect("distinct array view"),
-            )
+            .insert(chunk(ints(&[10, 20])))
             .expect("insert distinct array");
     }
     let distinct_bytes = distinct_tracker.used() - initial_distinct_bytes;
@@ -692,14 +759,18 @@ fn retained_build_array_budget_failure_happens_before_retaining_the_view() {
         JoinKeys::new(vec![0]),
         tracker.clone(),
     )
-        .expect("initial buckets fit the budget");
-    let view = DataChunkView::from_chunk(chunk(source)).expect("wrap build array");
+    .expect("initial buckets fit the budget");
+    let view = chunk(source);
 
     let error = table
-        .insert_view(view)
+        .insert(view)
         .expect_err("the retained source array must respect the query budget");
     assert!(matches!(error, VeinError::ResourceExhausted { .. }));
-    assert_eq!(tracker.used(), initial_buckets, "failed insertion releases its lease");
+    assert_eq!(
+        tracker.used(),
+        initial_buckets,
+        "failed insertion releases its lease"
+    );
     drop(table);
     assert_eq!(tracker.used(), 0);
 }
@@ -709,18 +780,17 @@ fn row_index_budget_failure_does_not_partially_insert_a_build_batch() {
     let first = ints(&[10]);
     let second = ints(&[20]);
     let initial_bytes = INITIAL_BUCKETS * size_of::<u32>() + size_of::<BuildKeyBounds>();
-    let sizing_tracker = QueryMemoryTracker::unlimited(
-        common::cancellation::CancellationToken::new(),
-    );
+    let sizing_tracker =
+        QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let mut sizing_table = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         sizing_tracker.clone(),
     )
-        .expect("create sizing table");
+    .expect("create sizing table");
     let initial_usage = sizing_tracker.used();
     sizing_table
-        .insert_view(DataChunkView::from_chunk(chunk(Arc::clone(&first))).unwrap())
+        .insert(chunk(Arc::clone(&first)))
         .expect("insert sizing row");
     let per_batch_bytes = sizing_tracker.used() - initial_usage;
     drop(sizing_table);
@@ -734,20 +804,32 @@ fn row_index_budget_failure_does_not_partially_insert_a_build_batch() {
         JoinKeys::new(vec![0]),
         tracker.clone(),
     )
-        .expect("initial buckets fit the budget");
+    .expect("initial buckets fit the budget");
     table
-        .insert_view(DataChunkView::from_chunk(chunk(Arc::clone(&first))).unwrap())
+        .insert(chunk(Arc::clone(&first)))
         .expect("first build batch fits");
     let used_before = tracker.used();
 
     let error = table
-        .insert_view(DataChunkView::from_chunk(chunk(Arc::clone(&second))).unwrap())
+        .insert(chunk(Arc::clone(&second)))
         .expect_err("second row index exceeds the remaining budget");
 
     assert!(matches!(error, VeinError::ResourceExhausted { .. }));
-    assert_eq!(table.len(), 1, "failed insertion leaves the row count intact");
-    assert_eq!(table.chunk_count(), 1, "failed insertion retains no partial chunk");
-    assert_eq!(tracker.used(), used_before, "failed batch releases its array lease");
+    assert_eq!(
+        table.len(),
+        1,
+        "failed insertion leaves the row count intact"
+    );
+    assert_eq!(
+        table.chunk_count(),
+        1,
+        "failed insertion retains no partial chunk"
+    );
+    assert_eq!(
+        tracker.used(),
+        used_before,
+        "failed batch releases its array lease"
+    );
     let mut matches = Vec::new();
     table
         .probe(&chunk(ints(&[10, 20])), &mut matches)
@@ -758,22 +840,19 @@ fn row_index_budget_failure_does_not_partially_insert_a_build_batch() {
 
 #[test]
 fn merging_budgeted_tables_releases_the_replaced_bucket_allocation() {
-    let tracker = QueryMemoryTracker::new(
-        1 << 20,
-        common::cancellation::CancellationToken::new(),
-    );
+    let tracker = QueryMemoryTracker::new(1 << 20, common::cancellation::CancellationToken::new());
     let mut left = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         tracker.clone(),
     )
-        .expect("create left table");
+    .expect("create left table");
     let mut right = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         tracker.clone(),
     )
-        .expect("create right table");
+    .expect("create right table");
     left.insert(chunk(ints(&[1]))).expect("insert left row");
     right.insert(chunk(ints(&[2]))).expect("insert right row");
     let before_merge = tracker.used();
@@ -782,9 +861,7 @@ fn merging_budgeted_tables_releases_the_replaced_bucket_allocation() {
 
     assert_eq!(
         tracker.used(),
-        before_merge
-            - INITIAL_BUCKETS * size_of::<u32>()
-            - size_of::<BuildKeyBounds>(),
+        before_merge - INITIAL_BUCKETS * size_of::<u32>() - size_of::<BuildKeyBounds>(),
         "merge replaces the second bucket array and key-bounds vector"
     );
     drop(left);
@@ -793,80 +870,85 @@ fn merging_budgeted_tables_releases_the_replaced_bucket_allocation() {
 
 #[test]
 fn merging_tables_from_independent_budgets_transfers_accounting() {
-    let left_tracker = QueryMemoryTracker::new(
-        1 << 20,
-        common::cancellation::CancellationToken::new(),
-    );
-    let right_tracker = QueryMemoryTracker::new(
-        1 << 20,
-        common::cancellation::CancellationToken::new(),
-    );
+    let left_tracker =
+        QueryMemoryTracker::new(1 << 20, common::cancellation::CancellationToken::new());
+    let right_tracker =
+        QueryMemoryTracker::new(1 << 20, common::cancellation::CancellationToken::new());
     let mut left = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         left_tracker.clone(),
     )
-        .expect("create left table");
+    .expect("create left table");
     let mut right = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         right_tracker.clone(),
     )
-        .expect("create right table");
+    .expect("create right table");
     left.insert(chunk(ints(&[10]))).expect("insert left row");
     right.insert(chunk(ints(&[20]))).expect("insert right row");
     let left_before = left_tracker.used();
     let right_before = right_tracker.used();
 
-    left.merge(right).expect("merge independently budgeted tables");
+    left.merge(right)
+        .expect("merge independently budgeted tables");
 
-    assert_eq!(right_tracker.used(), 0, "source reservation was transferred");
+    assert_eq!(
+        right_tracker.used(),
+        0,
+        "source reservation was transferred"
+    );
     assert_eq!(
         left_tracker.used(),
-        left_before
-            + right_before
+        left_before + right_before
             - INITIAL_BUCKETS * size_of::<u32>()
             - size_of::<BuildKeyBounds>(),
         "destination owns merged state with one bucket array and one key-bounds vector"
     );
     let mut pairs = Vec::new();
-    left.probe(&chunk(ints(&[10, 20])), &mut pairs).expect("probe merged table");
+    left.probe(&chunk(ints(&[10, 20])), &mut pairs)
+        .expect("probe merged table");
     assert_eq!(pairs.len(), 2);
     drop(left);
-    assert_eq!(left_tracker.used(), 0, "merged reservation releases with table");
+    assert_eq!(
+        left_tracker.used(),
+        0,
+        "merged reservation releases with table"
+    );
 }
 
 #[test]
 fn merged_build_array_lease_moves_to_destination_and_outlives_the_table() {
-    let left_tracker = QueryMemoryTracker::new(
-        1 << 20,
-        common::cancellation::CancellationToken::new(),
-    );
-    let right_tracker = QueryMemoryTracker::new(
-        1 << 20,
-        common::cancellation::CancellationToken::new(),
-    );
+    let left_tracker =
+        QueryMemoryTracker::new(1 << 20, common::cancellation::CancellationToken::new());
+    let right_tracker =
+        QueryMemoryTracker::new(1 << 20, common::cancellation::CancellationToken::new());
     let mut left = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         left_tracker.clone(),
     )
-        .expect("create destination table");
+    .expect("create destination table");
     let mut right = HashTable::with_memory_tracker(
         JoinKeys::new(vec![0]),
         JoinKeys::new(vec![0]),
         right_tracker.clone(),
     )
-        .expect("create source table");
+    .expect("create source table");
     let source = ints(&[20, 30]);
     let source_bytes = source.get_array_memory_size();
     right
-        .insert_view(DataChunkView::from_chunk(chunk(Arc::clone(&source))).unwrap())
+        .insert(chunk(Arc::clone(&source)))
         .expect("retain source build array");
 
     left.merge(right).expect("transfer source table accounting");
 
-    assert_eq!(right_tracker.used(), 0, "source budget releases after merge");
+    assert_eq!(
+        right_tracker.used(),
+        0,
+        "source budget releases after merge"
+    );
     assert!(
         left_tracker.used() >= source_bytes,
         "destination budget includes the merged build array"
@@ -881,5 +963,9 @@ fn merged_build_array_lease_moves_to_destination_and_outlives_the_table() {
     );
     assert_eq!(output.resolve(0, 0).unwrap().unwrap().1, 1);
     drop(output);
-    assert_eq!(left_tracker.used(), 0, "final output drop releases destination lease");
+    assert_eq!(
+        left_tracker.used(),
+        0,
+        "final output drop releases destination lease"
+    );
 }

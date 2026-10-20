@@ -20,24 +20,10 @@ impl AggregateSink {
         Ok(slot)
     }
 
-    /// Folds one chunk into the groups.
-    pub fn accumulate(&mut self, chunk: DataChunk) -> Result<()> {
-        if !self.distinct_collectors.is_empty() {
-            self.accumulate_distinct(&chunk)?;
-        }
-        let batch = AggregateBatch::from_chunk(
-            &chunk,
-            self.plan.groups as usize,
-            self.plan.aggs.len(),
-            &self.grouping_sets,
-        )?;
-        self.accumulate_with_spill(&batch)
-    }
-
     /// Folds a reference-backed input while retaining grouping columns as views.
-    pub(super) fn accumulate_view(&mut self, view: DataChunkView) -> Result<()> {
+    pub fn accumulate(&mut self, view: DataChunkView) -> Result<()> {
         if !self.distinct_collectors.is_empty() {
-            self.accumulate_distinct_view(&view)?;
+            self.accumulate_distinct(&view)?;
         }
         let batch = AggregateBatch::from_view(
             &view,

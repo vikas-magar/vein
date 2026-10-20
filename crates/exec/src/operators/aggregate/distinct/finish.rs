@@ -32,32 +32,28 @@ impl AggregateSink {
         aggregate_index: usize,
         grouping_set_id: usize,
         parent_columns: &[usize],
-        batch: &DataChunk,
+        batch: &DataChunkView,
     ) -> Result<()> {
         let distinct_position = parent_columns.len();
-        let distinct_values = batch.column(distinct_position);
-        let key_arrays = batch.vectors[..distinct_position].to_vec();
-        let key_columns = key_arrays
-            .iter()
-            .map(GroupKeyColumn::new)
+        let key_columns = (0..distinct_position)
+            .map(|column| batch.project(&[column]).and_then(GroupKeyColumn::from_view))
             .collect::<Result<Vec<_>>>()?;
         let empty_states = self.empty_intermediate_states()?;
 
-        for logical_row in 0..batch.selection.size() {
-            let row = batch.selection.get_index(logical_row);
-            if distinct_values.is_null(row) {
+        for row in 0..batch.num_rows() {
+            if batch.is_null(distinct_position, row)? {
                 continue;
             }
             let mut hasher = self.hash_builder.build_hasher();
             grouping_set_id.hash(&mut hasher);
             for (&parent_column, key) in parent_columns.iter().zip(&key_columns) {
-                key.hash_row(parent_column as u32, row, &mut hasher);
+                    key.hash_row(parent_column as u32, row, &mut hasher);
             }
             let hash = hasher.finish();
             let mut keys = vec![None; self.plan.groups as usize];
             for (child_column, &parent_column) in parent_columns.iter().enumerate() {
-                keys[parent_column] = Some(AggregateGroupKeyRef::from_array(
-                    Arc::clone(&key_arrays[child_column]),
+                keys[parent_column] = Some(AggregateGroupKeyRef::from_column(
+                    key_columns[child_column].clone(),
                     row,
                 )?);
             }

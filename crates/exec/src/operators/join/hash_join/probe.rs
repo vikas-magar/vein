@@ -155,7 +155,7 @@ impl HashJoin {
             self.table
                 .probe_view_with_null_rows(&chunk, &mut matches, &mut null_probe_rows)?
         } else {
-            self.table.probe_view(&chunk, &mut matches)?
+            self.table.probe(&chunk, &mut matches)?
         };
         self.probe_key_materialization.accumulate(report);
         self.probe_key_materialize_us =

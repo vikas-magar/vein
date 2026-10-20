@@ -28,10 +28,8 @@ impl<'a, T: Array + Clone + 'static> MappedArray<'a, T> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let view = match column {
-            AggregateColumn::Array(_) => None,
-            AggregateColumn::View(view) => Some(view),
-        };
+        let AggregateColumn::View(view) = column;
+        let view = Some(view);
         Ok(Self { sources, view })
     }
 

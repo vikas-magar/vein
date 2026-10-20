@@ -18,7 +18,7 @@ use crate::operators::sink::{CollectSink, DiscardSink, WriteSink, WriteStorage};
 use crate::operators::source::ScanSource;
 use crate::operators::source::scan::{PARQUET_FOOTER, ScanFile, ScanSourceConfig};
 use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
-use crate::runtime::{ExecutorBuilder, MaterializeViewNode, split_scan_by_file};
+use crate::runtime::{ExecutorBuilder, split_scan_by_file};
 use crate::runtime::filter::{
     ConservativeRuntimeFilterPolicy, RuntimeFilterDecisionPolicy, RuntimeFilterFactory,
     RuntimeFilterSet,
@@ -453,10 +453,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
                 let storage = self.storage.as_ref().ok_or_else(|| {
                     VeinError::internal("WRITE requires a configured table storage backend")
                 })?;
-                Ok(Box::new(MaterializeViewNode::new(
-                    Box::new(WriteSink::new(target.clone(), storage.clone())?),
-                    "storage",
-                )))
+                Ok(Box::new(WriteSink::new(target.clone(), storage.clone())?))
             }
         }
     }

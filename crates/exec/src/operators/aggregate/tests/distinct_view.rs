@@ -13,10 +13,8 @@ fn count_distinct_view_keeps_source_buffers_and_ignores_null_values() {
     let groups: ArrayRef = Arc::new(Int64Array::from(vec![1, 1, 1, 2, 2, 2]));
     let values: ArrayRef =
         Arc::new(Int64Array::from(vec![Some(10), Some(10), None, Some(20), Some(30), Some(30)]));
-    let group_view = DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(&groups)]))
-        .expect("group source view");
-    let value_view = DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(&values)]))
-        .expect("value source view");
+    let group_view = crate::pipeline::test_support::dense_view(vec![Arc::clone(&groups)]);
+    let value_view = crate::pipeline::test_support::dense_view(vec![Arc::clone(&values)]);
     let view = DataChunkView::combine(
         &[
             ViewInputRows {
@@ -45,7 +43,7 @@ fn count_distinct_view_keeps_source_buffers_and_ignores_null_values() {
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
     let mut sink = AggregateSink::new(plan).expect("distinct aggregate sink");
-    sink.accumulate_view(view).expect("accumulate reference-backed input");
+    sink.accumulate(view).expect("accumulate reference-backed input");
 
     let retained_value_source = sink.distinct_collectors[0]
         .sink
@@ -66,8 +64,8 @@ fn count_distinct_view_keeps_source_buffers_and_ignores_null_values() {
         .expect("finish distinct aggregate")
         .into_iter()
         .flat_map(|batch| {
-            let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let counts = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            let keys = materialized_column::<Int64Array>(&batch, 0);
+            let counts = materialized_column::<Int64Array>(&batch, 1);
             (0..batch.num_rows())
                 .map(|row| (keys.value(row), counts.value(row)))
                 .collect::<Vec<_>>()

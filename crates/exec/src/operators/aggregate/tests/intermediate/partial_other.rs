@@ -45,7 +45,7 @@ fn intermediate_group_state_preserves_grouping_set_and_null_key_identity() {
     let mut sink = AggregateSink::new(plan).expect("create grouping-set aggregate");
     let input_keys = Arc::new(Int64Array::from(vec![None, Some(1)]));
     let input_key_values = input_keys.values().as_ptr();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         input_keys,
         Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
     ]))

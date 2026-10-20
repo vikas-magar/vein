@@ -68,7 +68,7 @@ impl PipelineNode<DataChunkView> for LocalBuildSink {
 
 /// Transfers owned chunks from scan workers to the sole downstream owner.
 ///
-/// The bounded channel moves `DataChunk` handles; Arrow buffers remain shared.
+/// The bounded channel moves `DataChunkView` handles; Arrow buffers remain shared.
 /// `finished` lets source readers stop after a downstream limit has completed.
 /// Counts active rows and chunks entering a join without inspecting or cloning columns.
 pub(super) struct JoinProbeCounter {
@@ -186,7 +186,7 @@ impl SpilledJoinProbe {
                     }
                     Err(error) => return Err(error),
                 };
-                match table.insert_view(view) {
+                match table.insert(view) {
                     Ok(()) => {}
                     Err(VeinError::ResourceExhausted { .. }) => {
                         overflow = true;

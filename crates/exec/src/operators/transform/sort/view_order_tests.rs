@@ -6,7 +6,7 @@ use common::arrow::SelectionVector;
 use common::protocol::{LimitSpec, SortKey, SortPlan};
 
 use super::*;
-use crate::pipeline::DataChunk;
+use crate::pipeline::DataChunkView;
 
 #[derive(Clone)]
 struct Capture(Arc<Mutex<Vec<DataChunkView>>>);
@@ -53,11 +53,11 @@ fn full_sort_and_top_n_keep_sparse_source_buffers() {
             limit,
             Box::new(Capture(Arc::clone(&output))),
         );
-        let input = DataChunk::new(
+        let input = crate::pipeline::test_support::selected_view(
             vec![Arc::clone(&source)],
             SelectionVector::new_sparse(vec![4, 1, 3, 2]),
         );
-        sort.push(DataChunkView::from_chunk(input).unwrap()).unwrap();
+        sort.push(input).unwrap();
         sort.flush().unwrap();
 
         let output = output.lock().unwrap();
@@ -99,8 +99,7 @@ fn comparator_orders_null_extended_rows_without_building_null_arrays() {
         );
         let values: ArrayRef = Arc::new(Int64Array::from(vec![2, 1]));
         sort.push(
-            DataChunkView::from_chunk(DataChunk::from_vectors(vec![values]))
-                .unwrap(),
+            crate::pipeline::test_support::dense_view(vec![values]),
         )
             .unwrap();
         sort.push(DataChunkView::nulls(&[DataType::Int64], 1).unwrap()).unwrap();

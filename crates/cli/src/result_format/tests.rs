@@ -3,18 +3,18 @@ use super::*;
 use arrow::array::{ArrayRef, Decimal128Array, Float64Array, Int64Array};
 use arrow::datatypes::DataType;
 use common::arrow::SelectionVector;
-use exec::pipeline::DataChunk;
+use exec::pipeline::DataChunkView;
 
 fn result_batch(
     schema: SchemaRef,
     columns: Vec<ArrayRef>,
     rows: Vec<u32>,
 ) -> ViewResultBatch {
-    let view = DataChunkView::from_chunk(DataChunk::new(
+    let view = DataChunkView::from_selected_arrays(
         columns,
         SelectionVector::new_sparse(rows),
-    ))
-        .expect("valid view");
+    )
+    .expect("valid view");
     ViewResultBatch::new(schema, view).expect("valid result batch")
 }
 

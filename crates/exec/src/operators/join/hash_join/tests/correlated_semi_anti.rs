@@ -4,7 +4,7 @@ fn run_correlated_shape(join_type: JoinType, empty_build: bool) -> Vec<i64> {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     if !empty_build {
         table
-            .insert(DataChunk::from_vectors(vec![
+            .insert(crate::pipeline::test_support::dense_view(vec![
                 ints(&[1, 1, 2, 4]),
                 nullable_ints(&[Some(10), Some(20), Some(5), None]),
             ]))
@@ -34,7 +34,7 @@ fn run_correlated_shape(join_type: JoinType, empty_build: bool) -> Vec<i64> {
             collector,
         );
 
-    join.push(DataChunk::from_vectors(vec![
+    join.push(crate::pipeline::test_support::dense_view(vec![
         ints(&[1, 1, 2, 3, 4]),
         nullable_ints(&[Some(10), Some(15), None, Some(8), Some(7)]),
         ints(&[101, 102, 103, 104, 105]),

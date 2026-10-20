@@ -17,7 +17,7 @@ use common::Result;
 use error::VeinError;
 
 use crate::memory::QueryMemoryTracker;
-use crate::pipeline::{DataChunk, DataChunkView};
+use crate::pipeline::DataChunkView;
 use crate::pipeline::view::ViewMemoryLease;
 use crate::spill::{IpcRunWriter, PendingSpillRun, SpillRun, SpillStream, SpillWriteHandle};
 
@@ -109,8 +109,9 @@ impl JoinSpillWriter {
         }
 
         let hashes = HashTable::hashes_for_view(view, keys)?;
-        let chunk = view.to_data_chunk()?;
-        let mut columns = chunk.vectors;
+        let (payload, _) = view
+            .to_record_batch_with_report(Arc::clone(self.schema.payload_schema()))?;
+        let (_, mut columns, _) = payload.into_parts();
         columns.push(Arc::new(UInt64Array::from(hashes)) as ArrayRef);
         let batch = RecordBatch::try_new_with_options(
             Arc::clone(self.schema.run_schema()),
@@ -253,7 +254,7 @@ pub(crate) fn payload_view(
         &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )
         .map_err(|error| spill_error("build join payload batch", error))?;
-    let mut view = DataChunkView::from_chunk(DataChunk::from_record_batch(payload))?;
+    let mut view = DataChunkView::from_record_batch(payload)?;
     let leases = view
         .source_array_memory_sizes()?
         .into_iter()
@@ -284,13 +285,12 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::pipeline::DataChunk;
+    use crate::pipeline::DataChunkView;
 
     fn view(values: &[i64]) -> DataChunkView {
-        DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+        crate::pipeline::test_support::dense_view(vec![
             Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
-        ]))
-            .expect("construct test view")
+        ])
     }
 
     fn hashes(run: &JoinSpillRun, schema: &JoinSpillSchema) -> Vec<u64> {
