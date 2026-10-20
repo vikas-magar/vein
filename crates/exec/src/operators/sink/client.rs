@@ -39,6 +39,20 @@ impl ViewResultBatch {
         self.view.num_rows()
     }
 
+    /// Returns a logical row window while retaining the same source arrays.
+    ///
+    /// The operation only changes selection metadata. It does not gather or
+    /// copy column values, which lets presentation layers materialize a bounded
+    /// prefix instead of converting an entire result batch.
+    pub fn slice_rows(&self, offset: usize, limit: usize) -> Result<Self> {
+        let selection = self.view.selection().slice(offset, limit);
+        let view = self.view.with_selection(selection)?;
+        Ok(Self {
+            schema: self.schema.clone(),
+            view,
+        })
+    }
+
     /// Take the reference-backed result without converting its arrays.
     pub fn into_view(self) -> DataChunkView {
         self.view
@@ -221,7 +235,7 @@ mod tests {
             vec![Arc::clone(array)],
             SelectionVector::new_sparse(rows),
         ))
-        .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -283,7 +297,7 @@ mod tests {
                 column: 0,
             }],
         )
-        .unwrap();
+            .unwrap();
         let mut arrow = CollectSink::<RecordBatch>::new(schema(true));
         let mut references = CollectSink::<ViewResultBatch>::new(schema(true));
         references.push(input.clone()).unwrap();
@@ -408,6 +422,27 @@ mod tests {
             2,
             "failed sends are not counted as emitted rows"
         );
+    }
+
+    #[test]
+    fn result_row_slice_retains_source_arrays_and_composes_logical_offsets() {
+        let source: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30, 40]));
+        let result = ViewResultBatch::new(schema(false), view(&source, vec![3, 1, 2, 0]))
+            .expect("reference-backed result");
+
+        let slice = result.slice_rows(1, 2).expect("slice result rows");
+        assert_eq!(slice.num_rows(), 2);
+        for (logical_row, source_row) in [(0, 1), (1, 2)] {
+            let (array, row) = slice
+                .view()
+                .resolve(0, logical_row)
+                .expect("resolve row")
+                .expect("non-null source row");
+            assert!(Arc::ptr_eq(array, &source));
+            assert_eq!(row, source_row);
+        }
+        assert_eq!(result.num_rows(), 4, "slicing leaves the source result intact");
+        assert_eq!(result.slice_rows(9, 2).unwrap().num_rows(), 0);
     }
 
     #[test]

@@ -16,14 +16,21 @@ use metadata::exact_scalar_at;
 mod page;
 pub use page::{
     PageHeaderRowStatistics, PageHeaderStatistics, PagePruning,
-    column_statistics_from_page_header, page_header_columns_needed,
-    page_header_columns_needed_with_audit, prune_data_pages,
-    prune_data_pages_with_headers, prune_row_groups, prune_row_groups_in_range,
+    column_statistics_from_page_header, prune_data_pages, prune_data_pages_with_headers,
+    prune_row_groups, prune_row_groups_in_range,
 };
+mod page_header_plan;
+pub use page_header_plan::{PageHeaderReadPlan, page_header_requests_with_audit};
 #[cfg(test)]
 use page::page_statistic_literal;
 mod bloom;
 mod dictionary;
+mod dictionary_page;
+
+pub use dictionary_page::{
+    dictionary_page_header_requests, has_dictionary_encoded_page, prune_dictionary_encoded_pages,
+    DictionaryPagePruning,
+};
 
 /// Extracts one file node and all its row-group children from a cached footer.
 ///

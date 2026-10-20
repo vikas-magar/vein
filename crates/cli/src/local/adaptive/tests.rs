@@ -1,69 +1,10 @@
 use super::*;
+use super::test_support::{join, predicate, scan};
 use catalog::{TableFormat, TableMetadata};
 use plan::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
 
-fn predicate() -> plan::LogicalExpr {
-    plan::LogicalExpr::BinaryOp {
-        left: Box::new(plan::LogicalExpr::Column(Arc::new(ResolvedColumn::new(
-            ColumnId(0),
-            "id",
-            None,
-            VeinDataType::Int64,
-        )))),
-        op: parser::ast::expr::BinaryOp::Gt,
-        right: Box::new(plan::LogicalExpr::Literal(plan::LogicalLiteral::Int64(0))),
-        return_type: VeinDataType::Boolean,
-    }
-}
-
-impl StatisticsCheckpointPolicy {
-    fn choose_for_test(&self, plan: &LogicalPlan) -> Option<AdaptiveBoundary> {
-        self.choose_boundary(plan, Arc::new(QueryStatisticsContext::new([])))
-    }
-}
-
-fn scan(name: &str, rows: u64) -> LogicalPlan {
-    let schema = Box::new(VeinSchema::new(vec![Arc::new(ResolvedColumn::new(
-        ColumnId(0),
-        "id",
-        None,
-        VeinDataType::Int64,
-    ))]));
-    let mut metadata =
-        TableMetadata::new(name, Arc::new(*schema.clone())).with_format(TableFormat::Parquet);
-    metadata.statistics = Some(catalog::TableStatistics {
-        num_rows: Some(rows),
-        ..Default::default()
-    });
-    LogicalPlan::Scan {
-        table: Arc::new(metadata),
-        projection: None,
-        filters: vec![predicate()],
-        schema,
-    }
-}
-
-fn join(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
-    let schema = Box::new(VeinSchema::new(
-        left.schema()
-            .fields
-            .iter()
-            .chain(&right.schema().fields)
-            .cloned()
-            .collect(),
-    ));
-    LogicalPlan::Join {
-        join_type: parser::ast::pipe_op::JoinType::Inner,
-        left: Box::new(left),
-        right: Box::new(right),
-        on: None,
-        using: vec![],
-        schema,
-    }
-}
-
 #[test]
-fn selects_largest_estimated_unique_scan_without_table_name_rules() {
+fn selects_smallest_estimated_unique_scan_without_table_name_rules() {
     let plan = join(scan("arbitrary_left", 12), scan("arbitrary_right", 120));
     let boundary = StatisticsCheckpointPolicy
         .choose_for_test(&plan)
@@ -74,7 +15,7 @@ fn selects_largest_estimated_unique_scan_without_table_name_rules() {
     else {
         panic!("producer should be a scan");
     };
-    assert_eq!(table.name, "arbitrary_right");
+    assert_eq!(table.name, "arbitrary_left");
     assert!(
         projection.is_none(),
         "checkpoint producer must expose its schema"
@@ -87,20 +28,21 @@ fn replacement_uses_observed_rows_and_preserves_schema() {
     let boundary = StatisticsCheckpointPolicy.choose_for_test(&plan).unwrap();
     let source = IntermediateSourceId::new();
     let rewritten = boundary.replace(plan, source, 3).unwrap();
-    let LogicalPlan::Join { right, .. } = rewritten else {
+    let LogicalPlan::Join { left, right, .. } = rewritten else {
         panic!("join root must remain in the remaining plan");
     };
     let LogicalPlan::Intermediate {
         source_id,
         row_count,
         schema,
-    } = *right
+    } = *left
     else {
         panic!("selected scan should become an intermediate source");
     };
     assert_eq!(source_id, source.into_raw());
     assert_eq!(row_count, 3);
     assert_eq!(schema.fields.len(), 1);
+    assert!(matches!(*right, LogicalPlan::Scan { .. }));
 }
 
 #[test]
@@ -132,7 +74,7 @@ fn checkpoint_producer_preserves_projection_and_intermediate_schema() {
         filters: vec![predicate()],
         schema,
     };
-    let plan = join(projected, scan("other", 10));
+    let plan = join(projected, scan("other", 1_000));
 
     let boundary = StatisticsCheckpointPolicy
         .choose_for_test(&plan)

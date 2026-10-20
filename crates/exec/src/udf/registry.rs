@@ -6,6 +6,8 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 use error::Result;
 
+use super::MappedUdfInput;
+
 /// Trait defining a User-Defined Scalar Function (UDF).
 ///
 /// This trait is the cornerstone of extensibility. Whether a function is a built-in
@@ -19,6 +21,21 @@ pub trait ScalarUDFImpl: Debug + Send + Sync {
 
     /// Execute the function in a vectorized manner against batches of data.
     fn invoke(&self, args: &[ArrayRef]) -> Result<ArrayRef>;
+
+    /// Optionally execute against row-mapped source arrays without gathering inputs.
+    ///
+    /// Return `Ok(None)` to request the dense [`Self::invoke`] fallback. View
+    /// execution permits that fallback only when inputs are already dense; mapped
+    /// or segmented inputs are rejected rather than copied into dense arrays.
+    /// A mapped implementation receives the whole logical batch and may return
+    /// either one result per row or a one-value broadcast result for a non-empty batch.
+    fn invoke_mapped(
+        &self,
+        _args: &[MappedUdfInput<'_>],
+        _row_count: usize,
+    ) -> Result<Option<ArrayRef>> {
+        Ok(None)
+    }
 }
 
 /// A central registry of all available scalar and aggregate functions.

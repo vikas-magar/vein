@@ -4,23 +4,20 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow::datatypes::DataType;
 use bytes::Bytes;
 use catalog::StatisticsPredicate;
 use parquet::arrow::arrow_reader::RowGroupSelection;
-use parquet::basic::{Encoding, Type as ParquetType};
+use parquet::basic::Encoding;
 use parquet::column::page::{Page, PageReader};
 use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 use parquet::file::reader::{ChunkReader, Length, SerializedPageReader};
 use types::LogicalLiteral;
 
-use super::bloom::{dictionary_value_type, BloomFilterColumn};
+use super::bloom::BloomFilterColumn;
 use super::metadata::{nonnegative, row_group_unit};
 
 mod decoder;
-use decoder::{
-    decode_dictionary, BoolType, ByteArrayType, DoubleType, FloatType, Int32Type, Int64Type,
-};
+mod values;
 
 /// One equality or same-column `IN` condition eligible for dictionary checks.
 ///
@@ -122,15 +119,16 @@ pub fn is_fully_dictionary_encoded(column: &ColumnChunkMetaData) -> bool {
     })
 }
 
-/// Gets the serialized dictionary page range when its offsets are complete and
+/// Gets the serialized dictionary-page range when its offsets are complete and
 /// contained by the known file length.
+///
+/// This only locates the dictionary payload. Callers may use its membership
+/// result to prune dictionary-encoded pages in a mixed chunk, but must require
+/// [`is_fully_dictionary_encoded`] before pruning a whole row group.
 pub fn dictionary_page_range(
     column: &ColumnChunkMetaData,
     file_length: u64,
 ) -> Option<std::ops::Range<u64>> {
-    if !is_fully_dictionary_encoded(column) {
-        return None;
-    }
     let start = u64::try_from(column.dictionary_page_offset()?).ok()?;
     let end = u64::try_from(column.data_page_offset()).ok()?;
     (start < end && end <= file_length).then_some(start..end)
@@ -151,7 +149,7 @@ pub fn dictionary_page_predicate_matches(
     column: &BloomFilterColumn,
     predicates: &[DictionaryPredicate],
 ) -> Vec<Option<bool>> {
-    if predicates.is_empty() || !is_fully_dictionary_encoded(chunk) {
+    if predicates.is_empty() {
         return vec![None; predicates.len()];
     }
     let Some(range) = dictionary_page_range(chunk, file_length) else {
@@ -179,110 +177,7 @@ pub fn dictionary_page_predicate_matches(
         return vec![None; predicates.len()];
     };
 
-    let data_type = dictionary_value_type(&column.arrow_type);
-    match (data_type, column.parquet_type) {
-        (DataType::Boolean, ParquetType::BOOLEAN) => {
-            decode_dictionary::<BoolType>(buf, num_values, column.type_length, predicates, |value, literal| {
-                match literal {
-                    LogicalLiteral::Boolean(candidate) => Some(value == candidate),
-                    _ => None,
-                }
-            })
-        }
-        (
-            DataType::Int8 | DataType::Int16 | DataType::Int32,
-            ParquetType::INT32,
-        ) => decode_dictionary::<Int32Type>(
-            buf,
-            num_values,
-            column.type_length,
-            predicates,
-            |value, literal| match literal {
-                LogicalLiteral::Int64(candidate) => Some(i64::from(*value) == *candidate),
-                _ => None,
-            },
-        ),
-        (
-            DataType::UInt8 | DataType::UInt16 | DataType::UInt32,
-            ParquetType::INT32,
-        ) => decode_dictionary::<Int32Type>(
-            buf,
-            num_values,
-            column.type_length,
-            predicates,
-            |value, literal| match literal {
-                LogicalLiteral::UInt64(candidate) => Some(u64::from(*value as u32) == *candidate),
-                _ => None,
-            },
-        ),
-        (DataType::Date32, ParquetType::INT32) => decode_dictionary::<Int32Type>(
-            buf,
-            num_values,
-            column.type_length,
-            predicates,
-            |value, literal| match literal {
-                LogicalLiteral::Date(candidate) => Some(*value == *candidate),
-                _ => None,
-            },
-        ),
-        (DataType::Int64, ParquetType::INT64) => decode_dictionary::<Int64Type>(
-            buf,
-            num_values,
-            column.type_length,
-            predicates,
-            |value, literal| match literal {
-                LogicalLiteral::Int64(candidate) => Some(*value == *candidate),
-                _ => None,
-            },
-        ),
-        (DataType::UInt64, ParquetType::INT64) => decode_dictionary::<Int64Type>(
-            buf,
-            num_values,
-            column.type_length,
-            predicates,
-            |value, literal| match literal {
-                LogicalLiteral::UInt64(candidate) => Some(*value as u64 == *candidate),
-                _ => None,
-            },
-        ),
-        (DataType::Float32, ParquetType::FLOAT) => decode_dictionary::<FloatType>(
-            buf,
-            num_values,
-            column.type_length,
-            predicates,
-            |value, literal| match literal {
-                LogicalLiteral::Float64(candidate) => Some(*value == *candidate as f32),
-                _ => None,
-            },
-        ),
-        (DataType::Float64, ParquetType::DOUBLE) => decode_dictionary::<DoubleType>(
-            buf,
-            num_values,
-            column.type_length,
-            predicates,
-            |value, literal| match literal {
-                LogicalLiteral::Float64(candidate) => Some(*value == *candidate),
-                _ => None,
-            },
-        ),
-        (
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
-            ParquetType::BYTE_ARRAY,
-        ) => decode_dictionary::<ByteArrayType>(
-            buf,
-            num_values,
-            column.type_length,
-            predicates,
-            |value, literal| match literal {
-                LogicalLiteral::String(candidate) => {
-                    std::str::from_utf8(value.as_ref()).ok()?;
-                    Some(value.as_ref() == candidate.as_bytes())
-                }
-                _ => None,
-            },
-        ),
-        _ => vec![None; predicates.len()],
-    }
+    values::decode_values(column, buf, num_values, predicates)
 }
 
 struct DictionaryPageChunkReader {

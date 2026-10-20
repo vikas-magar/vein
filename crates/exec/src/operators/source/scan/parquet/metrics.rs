@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(test)]
 use arrow::array::{Array, BooleanArray};
 
 /// Debug-only counters for the compiled predicate Arrow evaluates during a scan.
@@ -10,6 +11,7 @@ use arrow::array::{Array, BooleanArray};
 /// normal query execution does not pay for an extra pass over predicate output.
 #[derive(Debug, Default)]
 pub(super) struct ScanPredicateMetrics {
+    pub(super) rows_before_filter: AtomicU64,
     pub(super) batches: AtomicU64,
     pub(super) rows_in: AtomicU64,
     pub(super) rows_kept: AtomicU64,
@@ -19,6 +21,7 @@ pub(super) struct ScanPredicateMetrics {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ScanPredicateMetricsSnapshot {
+    pub(super) rows_before_filter: u64,
     pub(super) batches: u64,
     pub(super) rows_in: u64,
     pub(super) rows_kept: u64,
@@ -27,6 +30,10 @@ pub(super) struct ScanPredicateMetricsSnapshot {
 }
 
 impl ScanPredicateMetrics {
+    pub(super) fn record_source_rows(&self, rows: usize) {
+        self.rows_before_filter.fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
     pub(super) fn record_batch(
         &self,
         rows_in: usize,
@@ -46,6 +53,7 @@ impl ScanPredicateMetrics {
 
     pub(super) fn snapshot(&self) -> ScanPredicateMetricsSnapshot {
         ScanPredicateMetricsSnapshot {
+            rows_before_filter: self.rows_before_filter.load(Ordering::Relaxed),
             batches: self.batches.load(Ordering::Relaxed),
             rows_in: self.rows_in.load(Ordering::Relaxed),
             rows_kept: self.rows_kept.load(Ordering::Relaxed),
@@ -55,6 +63,7 @@ impl ScanPredicateMetrics {
     }
 }
 
+#[cfg(test)]
 pub(super) fn count_true_rows(values: &BooleanArray) -> usize {
     (0..values.len())
         .filter(|row| values.is_valid(*row) && values.value(*row))

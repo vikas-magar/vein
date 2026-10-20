@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use common::arrow::SelectionVector;
 use common::protocol::{LimitSpec, SortKey, SortPlan};
 
@@ -195,6 +195,7 @@ fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mu
         .expect("discard a batch that cannot enter Top-N");
     assert_eq!(tracker.used(), retained_bytes);
     assert_eq!(sort.chunks.len(), 1, "non-candidate view is not retained");
+    let retained_sort_bytes = sort.memory.bytes();
 
     let error = sort
         .push(view(DataChunk::from_vectors(vec![
@@ -204,8 +205,9 @@ fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mu
         .expect_err("candidate source arrays exceed the query budget");
     assert!(matches!(error, VeinError::ResourceExhausted { .. }));
     assert_eq!(tracker.used(), retained_bytes);
+    assert_eq!(sort.memory.bytes(), retained_sort_bytes);
     assert_eq!(sort.chunks.len(), 1, "failed accounting leaves retained chunks intact");
-    let retained_row = sort.top_n.as_ref().unwrap().peek().unwrap().row;
+    let retained_row = *sort.top_n.as_ref().unwrap().peek().unwrap();
     assert_eq!(retained_row.chunk, 0);
     assert_eq!(
         retained_row.row, 0,
@@ -249,6 +251,12 @@ fn full_sort_includes_source_arrays_when_selecting_spill_path() {
         .expect("fall back to external sorting when retained memory is over budget");
     assert!(sort.spilling, "source arrays are included in the sort budget");
     assert_eq!(sort.spill_runs.len(), 1, "the batch is written as a spill run");
+    assert_eq!(
+        sort.metrics.key_materialization,
+        MaterializationReport::default(),
+        "building a spill run compares sort values through the retained view"
+    );
+    assert!(sort.metrics.row_comparisons > 0);
     assert!(tracker.used() <= tracker.limit());
     let spill_directory = tracker
         .spill_manager()
@@ -347,7 +355,7 @@ fn single_chunk_sort_reuses_arrow_columns_and_reorders_selection() {
 }
 
 #[test]
-fn full_sort_and_top_n_report_only_sort_key_conversions() {
+fn full_sort_and_top_n_compare_retained_sort_values_without_gathering() {
     for top_n in [false, true] {
         let output = Arc::new(Mutex::new(Vec::new()));
         let keys = integers(&[30, 10, 20]);
@@ -378,15 +386,9 @@ fn full_sort_and_top_n_report_only_sort_key_conversions() {
                 .unwrap();
         }
         sort.flush().unwrap();
-        assert_eq!(sort.metrics.key_materialization.shared_columns, 1);
-        assert_eq!(sort.metrics.key_materialization.gathered_columns, 1);
-        assert_eq!(sort.metrics.key_materialization.empty_columns, 0);
-        assert!(
-            sort.metrics
-                .key_materialization
-                .gathered_output_buffer_bytes
-                > 0
-        );
+        assert_eq!(sort.metrics.key_materialization, MaterializationReport::default());
+        assert!(sort.metrics.row_comparisons > 0);
+        assert!(sort.metrics.comparator_cache_entries > 0);
         let views = output.lock().unwrap();
         let rows: Vec<_> = views
             .iter()
@@ -501,7 +503,6 @@ fn top_n_gathers_sorted_winners_from_multiple_chunks() {
     let second = integers(&[3, 2]);
     sort.push(view(DataChunk::from_vectors(vec![first.clone()])))
         .unwrap();
-    let evicted_key_buffer = sort.top_n.as_ref().unwrap().peek().unwrap().key.as_ptr();
     sort.push(view(DataChunk::from_vectors(vec![second.clone()])))
         .unwrap();
 
@@ -511,9 +512,10 @@ fn top_n_gathers_sorted_winners_from_multiple_chunks() {
         .unwrap()
         .entries
         .iter()
-        .find(|entry| entry.row.chunk == 1 && entry.row.row == 1)
+        .find(|row| row.chunk == 1 && row.row == 1)
         .expect("second chunk's better candidate remains in the heap");
-    assert_eq!(replacement.key.as_ptr(), evicted_key_buffer);
+    assert_eq!(replacement.chunk, 1);
+    assert_eq!(replacement.row, 1);
 
     sort.flush().unwrap();
 
@@ -522,8 +524,8 @@ fn top_n_gathers_sorted_winners_from_multiple_chunks() {
     assert_eq!(sort.metrics.candidate_rows_examined, 4);
     assert_eq!(sort.metrics.candidate_insertions, 4);
     assert_eq!(sort.metrics.candidate_replacements, 1);
-    assert_eq!(sort.metrics.candidate_key_buffer_allocations, 3);
-    assert!(sort.metrics.candidate_key_bytes_copied > 0);
+    assert!(sort.metrics.row_comparisons > 0);
+    assert_eq!(sort.metrics.key_materialization, MaterializationReport::default());
     assert_eq!(sort.metrics.output_rows, 3);
 
     let chunks = output.lock().unwrap();
@@ -541,7 +543,25 @@ fn top_n_gathers_sorted_winners_from_multiple_chunks() {
 }
 
 #[test]
-fn top_n_keeps_key_reservation_when_a_shorter_key_reuses_capacity() {
+fn top_n_sort_reuses_its_candidate_reference_buffer() {
+    let mut top_n = BoundedTopN::new(4);
+    let mut compare = |left: &i64, right: &i64| Ok(left.cmp(right));
+    for value in [3, 1, 4, 2] {
+        assert!(matches!(
+            top_n.offer(value, &mut compare).unwrap(),
+            TopNChange::Inserted
+        ));
+    }
+    let candidate_buffer = top_n.entries.as_ptr();
+
+    let sorted = top_n.sort_and_take_by(&mut compare).unwrap();
+
+    assert_eq!(sorted.as_ptr(), candidate_buffer);
+    assert_eq!(sorted, vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn top_n_keeps_candidate_reference_reservation_when_replacing_source_chunk() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let tracker =
         QueryMemoryTracker::new(1 << 20, common::cancellation::CancellationToken::new());
@@ -576,7 +596,7 @@ fn top_n_keeps_key_reservation_when_a_shorter_key_reuses_capacity() {
     assert_eq!(
         sort.memory.bytes(),
         before_replacement + chunk_metadata,
-        "the key Vec keeps its allocation after its logical length shrinks"
+        "replacement keeps the candidate reference and accounts the new chunk"
     );
     assert_eq!(
         tracker.used(),
@@ -903,6 +923,16 @@ fn external_merge_emits_bounded_batches_across_run_batch_boundaries() {
     }
 
     sort.flush().expect("merge runs with multiple IPC batches");
+
+    assert_eq!(
+        sort.metrics.key_materialization,
+        MaterializationReport::default(),
+        "sort key comparisons read spill-backed Arrow arrays directly"
+    );
+    assert_eq!(sort.metrics.key_encode_us, 0);
+    assert_eq!(sort.metrics.key_materialize_us, 0);
+    assert!(sort.metrics.row_comparisons > 0);
+    assert!(sort.metrics.comparator_cache_entries > 0);
 
     let output = output.lock().unwrap();
     assert!(output.len() > 1);

@@ -3,10 +3,13 @@
 //! Evaluates [`MicroOp::Add`], [`MicroOp::Sub`], [`MicroOp::Mul`], and [`MicroOp::Div`]
 //! using Arrow's SIMD-accelerated compute kernels.
 
-use arrow::array::{ArrayRef, Datum};
+use arrow::array::{Array, ArrayRef, Datum, new_null_array};
 use arrow::compute::kernels::numeric;
 use common::Result;
+use common::protocol::MicroOp;
 use error::VeinError;
+
+use crate::vm::register::RegValue;
 
 /// Performs element-wise vector addition between `lhs` and `rhs`.
 ///
@@ -42,12 +45,39 @@ pub fn eval_mod(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<ArrayRef> {
 
 /// Performs element-wise unary negation (`-src`).
 ///
-/// Arrow's negation kernel takes a materialized `Array` rather than a [`Datum`],
+/// Arrow's negation kernel accepts an `Array` rather than a [`Datum`],
 /// but this costs nothing for the zero-copy path: negating a length-1 broadcast
 /// scalar yields another length-1 array, so the register stays a scalar.
-pub fn eval_neg(src: &ArrayRef) -> Result<ArrayRef> {
+pub fn eval_neg(src: &dyn Array) -> Result<ArrayRef> {
     numeric::neg(src)
         .map_err(|e| VeinError::internal(format!("Vector VM Neg error: {e}")))
+}
+
+pub(crate) fn eval_mapped_arithmetic(
+    op: &MicroOp,
+    lhs: &RegValue,
+    rhs: &RegValue,
+    row_count: usize,
+) -> Result<RegValue> {
+    let kernel = match op {
+        MicroOp::Add { .. } => eval_add,
+        MicroOp::Sub { .. } => eval_sub,
+        MicroOp::Mul { .. } => eval_mul,
+        MicroOp::Div { .. } => eval_div,
+        MicroOp::Mod { .. } => eval_mod,
+        _ => return Err(VeinError::internal("expected binary arithmetic operation")),
+    };
+    super::eval_mapped_binary_value(lhs, rhs, row_count, kernel)
+}
+
+pub(crate) fn eval_mapped_neg(value: &RegValue, row_count: usize) -> Result<RegValue> {
+    let data_type = value.data_type().clone();
+    super::eval_mapped_unary_value(
+        value,
+        row_count,
+        |len| Ok(new_null_array(&data_type, len)),
+        eval_neg,
+    )
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ fn whole_batch_adapter_checks_the_canonical_operator_contract() {
             program: Arc::new(MicroProgram::empty()),
         },
     });
-    let aggregate = AggregatePlan {
+    let aggregate_plan = AggregatePlan {
         groups: 0,
         estimated_groups: None,
         grouping_sets: None,
@@ -25,25 +25,14 @@ fn whole_batch_adapter_checks_the_canonical_operator_contract() {
             flushed: Arc::new(AtomicBool::new(false)),
         }) as Box<dyn PipelineNode<DataChunk>>
     };
-    for (operator, boundary) in [
-        (
-            PhysicalPlanOperator::Aggregate {
-                input: Arc::clone(&source),
-                plan: aggregate.clone(),
-            },
-            "aggregate",
-        ),
-        (
-            PhysicalPlanOperator::Distinct {
-                input: Arc::clone(&source),
-                plan: aggregate,
-            },
-            "distinct",
-        ),
-    ] {
-        let adapter = MaterializeViewNode::for_operator(sink(), &operator).unwrap();
-        assert_eq!(adapter.boundary, boundary);
-    }
+    let distinct = PhysicalPlanOperator::Distinct {
+        input: Arc::clone(&source),
+        plan: aggregate_plan.clone(),
+    };
+    let aggregate = PhysicalPlanOperator::Aggregate {
+        input: Arc::clone(&source),
+        plan: aggregate_plan,
+    };
     let limit = PhysicalPlanOperator::Limit {
         input: Arc::clone(&source),
         spec: LimitSpec {
@@ -61,7 +50,7 @@ fn whole_batch_adapter_checks_the_canonical_operator_contract() {
             schema: Arc::new(types::VeinSchema::empty()),
         }),
     };
-    for operator in [&source.operator, &limit, &discard, &client] {
+    for operator in [&source.operator, &distinct, &aggregate, &limit, &discard, &client] {
         let error = MaterializeViewNode::for_operator(sink(), operator)
             .err()
             .unwrap();

@@ -10,7 +10,7 @@
 //! A `DISTINCT` arrives here as the same shape with every column a key and no
 //! aggregates, which is why it has no operator of its own.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::size_of;
 use std::num::NonZeroUsize;
@@ -35,21 +35,26 @@ mod spill;
 mod metrics;
 mod init;
 mod input;
+mod input_batch;
 mod distinct;
 mod intermediate_merge;
 mod output;
+mod output_view;
 mod pipeline;
 mod sink_spill;
 mod spill_finish;
-pub use pipeline::{shared, shared_with_memory_tracker};
-use intermediate::{AggregateIntermediateGroup, AggregateIntermediateState, NumericPartial};
+pub use pipeline::{shared, shared_with_memory_tracker, shared_view_with_memory_tracker};
+use intermediate::{
+    AggregateGroupKeyRef, AggregateIntermediateGroup, AggregateIntermediateState, NumericPartial,
+};
+use input_batch::AggregateBatch;
 use numeric::{
     AggregateInput, GroupRows, NumericAccumulator, average_values, numeric_values,
     update_numeric_states,
 };
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
 use crate::spill::SpillRun;
-use crate::pipeline::{DataChunk, PipelineNode};
+use crate::pipeline::{DataChunk, DataChunkView, PipelineNode};
 use common::Result;
 use common::arrow::SelectionVector;
 use common::protocol::{AggOpCode, AggregatePlan};
@@ -137,8 +142,10 @@ pub struct AggregateSink {
     batch_new_groups: Vec<usize>,
     /// Arrow-backed grouping columns for batches that contributed new groups.
     group_key_batches: Vec<Vec<Option<GroupKeyColumn>>>,
+    /// Original arrays used by each grouping column, retained by source identity.
+    group_key_batch_arrays: Vec<Vec<Vec<ArrayRef>>>,
     /// Memory leases for the distinct source arrays retained by each key batch.
-    group_key_batch_leases: Vec<Vec<Arc<MemoryReservation>>>,
+    group_key_batch_leases: Vec<HashMap<usize, Arc<MemoryReservation>>>,
     /// Reusable group IDs for each grouping set in the current input batch.
     group_ids_by_set: Vec<Vec<usize>>,
     groups: Vec<Group>,

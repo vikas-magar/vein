@@ -16,6 +16,8 @@ impl AdaptiveCoordinator {
             cancel: CancellationToken::new(),
         };
         let mut current = plan;
+        let mut completed_stages = 0_usize;
+        let mut followups_scheduled = 0_usize;
         // Each boundary removes at least one unexecuted operator. The original
         // node count also caps attempts if a rewrite introduces fresh wrappers.
         for stage in 0..node_count(&current) {
@@ -35,17 +37,26 @@ impl AdaptiveCoordinator {
                 .instrument(tracing::info_span!(target: "vein.adaptive", "adaptive_stage",
                     query_id = %self.query_id, stage, source_id = %source_id)).await;
             match transition {
-                Ok((tasks, optimized, registration)) => {
+                Ok((tasks, optimized, registration, schedule_followup)) => {
+                    completed_stages += 1;
+                    followups_scheduled += usize::from(schedule_followup);
                     execution.tasks = tasks;
                     current = Arc::new(optimized);
                     execution.registrations.insert(source_id.into_raw(), registration);
                     let mut active = HashSet::new();
                     relation_ids(&current, &mut active);
                     execution.registrations.retain(|id, _| active.contains(id));
-                    pending = self.policy.choose_boundary(&current, Arc::clone(&self.statistics))
-                        .and_then(|boundary| prepare_checkpoint(self.planner.as_ref(), boundary,
-                                                                Arc::clone(&self.statistics), self.request_id, self.query_id,
-                                                                &execution.tasks, &current));
+                    if schedule_followup {
+                        pending = self.policy.choose_boundary(&current, Arc::clone(&self.statistics))
+                            .and_then(|boundary| prepare_checkpoint(self.planner.as_ref(), boundary,
+                                                                    Arc::clone(&self.statistics), self.request_id, self.query_id,
+                                                                    &execution.tasks, &current));
+                    } else {
+                        pending = None;
+                        tracing::info!(target: "vein.adaptive", event = "adaptive_checkpoint_skipped",
+                            stage, reason = "no_statistics_blocked_join_order_decisions",
+                            "optimizer found no remaining join-order decision that needs more statistics");
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(target: "vein.adaptive", event = "adaptive_reoptimization_fallback",
@@ -54,6 +65,13 @@ impl AdaptiveCoordinator {
                 }
             }
         }
+        tracing::info!(target: "vein.adaptive.summary", event = "adaptive_execution_summary",
+            query_id = %self.query_id,
+            completed_stages,
+            followups_scheduled,
+            retained_intermediate_sources = execution.registrations.len(),
+            stage_budget_exhausted = pending.is_some(),
+            "adaptive execution stages completed");
         execution
     }
 }

@@ -12,15 +12,10 @@ use super::super::hash_table::HashTable;
 use super::super::rows::{JoinType, OutputRow, null_aware_anti_rows, output_rows};
 use super::super::spec::OutputColumn;
 use super::JoinFilterCollector;
+use super::output::JoinOutputComposer;
 
 type JoinMatch = (u32, (u32, u32));
 type BuildChunkMatchGroups = Vec<(u32, Vec<JoinMatch>)>;
-
-#[derive(Clone, Copy)]
-enum ComposedColumns {
-    ResidualPredicate,
-    JoinOutput,
-}
 
 /// Probes a shared build table and forwards matching rows as chunk views.
 pub struct HashJoin {
@@ -28,15 +23,14 @@ pub struct HashJoin {
     /// table. Read-only by construction: `probe` takes `&self`.
     table: Arc<HashTable>,
     join_type: JoinType,
+    build_batch_rows: usize,
     output_columns: Vec<ViewColumnRef>,
     probe_types: Vec<DataType>,
     build_types: Vec<DataType>,
     next: Box<dyn PipelineNode<DataChunkView>>,
-    /// Reused buckets avoid rebuilding a hash map and per-group vectors for
-    /// every probe batch. Keys are retained build-chunk IDs; None is the
-    /// null-extended group used by outer joins.
-    rows_by_build_chunk: HashMap<Option<u32>, Vec<OutputRow>>,
-    build_chunk_order: Vec<Option<u32>>,
+    /// Coalesces matches across retained build chunks into bounded views.
+    output_composer: JoinOutputComposer,
+    output_batch: Vec<OutputRow>,
     probe_rows: Vec<Option<usize>>,
     build_rows: Vec<Option<usize>>,
     residual_view_columns: Vec<ViewColumnRef>,
@@ -54,6 +48,9 @@ pub struct HashJoin {
     pub(super) view_compose_us: u64,
     /// Time inside downstream push calls, including calls that return an error.
     pub(super) downstream_push_us: u64,
+    pub(super) output_batches: u64,
+    pub(super) output_rows: u64,
+    pub(super) max_output_batch_rows: usize,
     residual_us: u64,
     /// Probe key conversions; residual expressions have their own VM reports.
     pub(super) probe_key_materialization: MaterializationReport,
@@ -89,15 +86,21 @@ impl HashJoin {
         next: Box<dyn PipelineNode<DataChunkView>>,
     ) -> Self {
         let output_columns = view_column_refs(&columns);
+        let output_composer = JoinOutputComposer::new(&output_columns, &build_types);
+        let build_batch_rows = (0..table.chunk_count())
+            .map(|chunk| table.build_chunk(chunk as u32).num_rows())
+            .max()
+            .unwrap_or(1);
         Self {
             table,
             join_type,
+            build_batch_rows,
             output_columns,
             probe_types,
             build_types,
             next,
-            rows_by_build_chunk: HashMap::new(),
-            build_chunk_order: Vec::new(),
+            output_composer,
+            output_batch: Vec::new(),
             probe_rows: Vec::new(),
             build_rows: Vec::new(),
             residual_view_columns: Vec::new(),
@@ -109,6 +112,9 @@ impl HashJoin {
             probe_us: 0,
             view_compose_us: 0,
             downstream_push_us: 0,
+            output_batches: 0,
+            output_rows: 0,
+            max_output_batch_rows: 0,
             residual_us: 0,
             probe_key_materialization: MaterializationReport::default(),
             probe_key_materialize_us: 0,
@@ -234,7 +240,6 @@ impl HashJoin {
                 Some(probe),
                 Some(build_chunk),
                 &candidates,
-                ComposedColumns::ResidualPredicate,
             )?;
             output.clear()?;
             let started = Instant::now();
@@ -262,7 +267,6 @@ impl HashJoin {
         probe: Option<&DataChunkView>,
         build_chunk: Option<u32>,
         rows: &[OutputRow],
-        columns: ComposedColumns,
     ) -> Result<DataChunkView> {
         let row_count = rows.len();
         let null_probe = if probe.is_none() {
@@ -290,62 +294,63 @@ impl HashJoin {
             ViewInputRows { view: probe_view, rows: &self.probe_rows },
             ViewInputRows { view: build_view, rows: &self.build_rows },
         ];
-        let columns = match columns {
-            ComposedColumns::ResidualPredicate => &self.residual_view_columns,
-            ComposedColumns::JoinOutput => &self.output_columns,
-        };
-        DataChunkView::combine(&inputs, columns)
+        DataChunkView::combine(&inputs, &self.residual_view_columns)
     }
 
-    /// Preserves output row order while splitting only at build-batch changes.
+    /// Preserves row order while emitting probe-sized, multi-source views.
     fn forward_rows(
         &mut self,
         probe: Option<&DataChunkView>,
         rows: impl IntoIterator<Item=OutputRow>,
     ) -> Result<()> {
-        let grouping_started = Instant::now();
+        let batch_limit = probe
+            .map_or(self.build_batch_rows, |view| {
+                view.num_rows().max(self.build_batch_rows)
+            })
+            .max(1);
         for row in rows {
-            let key = row.build.map(|(chunk, _)| chunk);
-            let group = self.rows_by_build_chunk.entry(key).or_default();
-            if group.is_empty() {
-                self.build_chunk_order.push(key);
+            self.output_batch.push(row);
+            if self.output_batch.len() == batch_limit {
+                self.push_output_batch(probe)?;
             }
-            group.push(row);
         }
+        if !self.output_batch.is_empty() {
+            self.push_output_batch(probe)?;
+        }
+        Ok(())
+    }
+
+    fn push_output_batch(&mut self, probe: Option<&DataChunkView>) -> Result<()> {
+        let mut rows = std::mem::take(&mut self.output_batch);
+        let compose_started = Instant::now();
+        let composed = self.output_composer.compose(
+            &self.table,
+            probe,
+            &self.probe_types,
+            &rows,
+        );
         self.view_compose_us = self
             .view_compose_us
-            .saturating_add(grouping_started.elapsed().as_micros() as u64);
-
-        let mut build_chunk_order = std::mem::take(&mut self.build_chunk_order);
-        for build_chunk in build_chunk_order.drain(..) {
-            let compose_started = Instant::now();
-            let mut group = self
-                .rows_by_build_chunk
-                .remove(&build_chunk)
-                .ok_or_else(|| VeinError::internal("join output row bucket disappeared"))?;
-            let composed = self.compose_group(
-                probe,
-                build_chunk,
-                &group,
-                ComposedColumns::JoinOutput,
-            );
-            group.clear();
-            self.rows_by_build_chunk.insert(build_chunk, group);
-            self.view_compose_us = self
-                .view_compose_us
-                .saturating_add(compose_started.elapsed().as_micros() as u64);
-            let view = composed?;
-            if !view.is_empty() {
-                let downstream_started = Instant::now();
-                let pushed = self.next.push(view);
-                self.downstream_push_us = self
-                    .downstream_push_us
-                    .saturating_add(downstream_started.elapsed().as_micros() as u64);
-                pushed?;
+            .saturating_add(compose_started.elapsed().as_micros() as u64);
+        let result = composed.and_then(|view| {
+            if view.is_empty() {
+                return Ok(());
             }
-        }
-        self.build_chunk_order = build_chunk_order;
-        Ok(())
+            let row_count = view.num_rows();
+            let downstream_started = Instant::now();
+            let pushed = self.next.push(view);
+            self.downstream_push_us = self
+                .downstream_push_us
+                .saturating_add(downstream_started.elapsed().as_micros() as u64);
+            pushed?;
+            self.output_batches = self.output_batches.saturating_add(1);
+            self.output_rows = self.output_rows.saturating_add(row_count as u64);
+            self.max_output_batch_rows = self.max_output_batch_rows.max(row_count);
+            Ok(())
+        });
+        rows.clear();
+        self.output_batch = rows;
+        result
     }
 }
 
@@ -374,6 +379,9 @@ impl PipelineNode<DataChunkView> for HashJoin {
             event = "join_finished",
             probed_rows = self.probed_rows,
             matched_rows = self.matched_rows,
+            output_batches = self.output_batches,
+            output_rows = self.output_rows,
+            max_output_batch_rows = self.max_output_batch_rows,
             probe_us = self.probe_us,
             view_compose_us = self.view_compose_us,
             downstream_push_us = self.downstream_push_us,
@@ -453,6 +461,9 @@ impl PipelineNode<DataChunkView> for HashJoin {
         self.next.combine_local(target.next.as_mut())?;
         target.probed_rows = target.probed_rows.saturating_add(self.probed_rows);
         target.matched_rows = target.matched_rows.saturating_add(self.matched_rows);
+        target.output_batches = target.output_batches.saturating_add(self.output_batches);
+        target.output_rows = target.output_rows.saturating_add(self.output_rows);
+        target.max_output_batch_rows = target.max_output_batch_rows.max(self.max_output_batch_rows);
         target.probe_us = target.probe_us.saturating_add(self.probe_us);
         target.view_compose_us = target
             .view_compose_us

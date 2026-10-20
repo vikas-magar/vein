@@ -6,10 +6,10 @@ use super::*;
 pub(in crate::operators::aggregate) fn update_numeric_states<T: AggregateValue>(
     states: &mut [NumericAccumulator<T>],
     group_rows: GroupRows<'_>,
-    value_at: impl Fn(usize) -> Option<T>,
+    value_at: impl Fn(usize) -> Result<Option<T>>,
 ) -> Result<()> {
     for (slot, row) in group_rows {
-        states[slot].update(value_at(row))?;
+        states[slot].update(value_at(row)?)?;
     }
     Ok(())
 }

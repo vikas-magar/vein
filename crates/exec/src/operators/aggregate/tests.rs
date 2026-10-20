@@ -20,3 +20,4 @@ mod memory;
 mod intermediate;
 mod spill;
 mod distinct;
+mod distinct_view;

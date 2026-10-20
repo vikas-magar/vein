@@ -42,6 +42,7 @@ impl GroupKeyColumn {
                     KeyValueRef::Utf8(values.value(value))
                 }
             }
+            Self::View(view) => super::view::value(view, row),
         }
     }
 

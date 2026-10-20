@@ -32,6 +32,7 @@ impl GroupKeyColumn {
                 let value = value_index.filter(|index| !values.is_null(*index));
                 value.map(|index| values.value(index)).hash(hasher);
             }
+            Self::View(_) => super::view::hash_value(self, row, hasher),
         }
     }
 }

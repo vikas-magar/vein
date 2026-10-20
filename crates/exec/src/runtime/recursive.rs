@@ -514,11 +514,10 @@ impl DefaultTaskExecutor {
                             } else {
                                 "aggregate"
                             };
-                        let (accumulator, handle) =
-                            aggregate::shared_with_memory_tracker(plan.clone(), operator_memory)?;
-                        let handle: Box<dyn PipelineNode<DataChunkView>> =
-                            Box::new(MaterializeViewNode::for_operator(handle, &input.operator)?
-                                .with_trace(trace.materialization_handle(node_id)));
+                        let (accumulator, handle) = aggregate::shared_view_with_memory_tracker(
+                            plan.clone(),
+                            operator_memory,
+                        )?;
                         let bytes = self
                             .execute_input(
                                 child,
@@ -538,8 +537,8 @@ impl DefaultTaskExecutor {
                             let mut accumulator = accumulator
                                 .lock()
                                 .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
-                            accumulator.finish_with(aggregate::AGGREGATE_BATCH_ROWS, |batch| {
-                                next.push(DataChunkView::from_chunk(batch)?)
+                            accumulator.finish_view_with(aggregate::AGGREGATE_BATCH_ROWS, |batch| {
+                                next.push(batch)
                             })?;
                             (accumulator.metrics(), accumulator.group_count())
                         };

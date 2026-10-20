@@ -56,7 +56,10 @@ impl AggregateSink {
             let hash = hasher.finish();
             let mut keys = vec![None; self.plan.groups as usize];
             for (child_column, &parent_column) in parent_columns.iter().enumerate() {
-                keys[parent_column] = Some((Arc::clone(&key_arrays[child_column]), row));
+                keys[parent_column] = Some(AggregateGroupKeyRef::from_array(
+                    Arc::clone(&key_arrays[child_column]),
+                    row,
+                )?);
             }
             let mut aggregate_states = empty_states.clone();
             aggregate_states[aggregate_index] = AggregateIntermediateState::Count(1);

@@ -24,6 +24,7 @@ mod spill;
 mod task_output;
 mod view_contract;
 mod view_streaming;
+mod zero_copy_e2e;
 mod vm_fusion;
 
 pub(in crate::runtime::tests) use fixtures::*;

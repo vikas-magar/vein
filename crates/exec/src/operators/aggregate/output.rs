@@ -5,6 +5,7 @@ impl AggregateSink {
         self.index = GroupIndex::default();
         self.groups = Vec::new();
         self.group_key_batches = Vec::new();
+        self.group_key_batch_arrays = Vec::new();
         self.group_key_batch_leases = Vec::new();
         self.aggregate_states = self
             .plan
@@ -50,15 +51,25 @@ impl AggregateSink {
         batch_rows: NonZeroUsize,
         mut emit: impl FnMut(DataChunk) -> Result<()>,
     ) -> Result<()> {
+        self.finish_view_with(batch_rows, |view| emit(view.to_data_chunk()?))
+    }
+
+    /// Emits aggregate batches as views over retained grouping keys and newly
+    /// computed aggregate result arrays.
+    pub fn finish_view_with(
+        &mut self,
+        batch_rows: NonZeroUsize,
+        mut emit: impl FnMut(DataChunkView) -> Result<()>,
+    ) -> Result<()> {
         if !self.distinct_collectors.is_empty() {
             self.finish_distinct_counts(batch_rows)?;
         }
         if self.spill_runs.is_empty() {
-            return self.finish_in_memory_with(batch_rows, &mut emit);
+            return self.finish_in_memory_view_with(batch_rows, &mut emit);
         }
         self.flush_current_run()?;
         let runs = std::mem::take(&mut self.spill_runs);
-        Self::finish_spill_partition(
+        Self::finish_spill_partition_view(
             &self.plan,
             &self.tracker,
             &self.spill_schema,
@@ -69,11 +80,7 @@ impl AggregateSink {
         )
     }
 
-    pub(super) fn finish_in_memory_with(
-        &mut self,
-        batch_rows: NonZeroUsize,
-        emit: &mut impl FnMut(DataChunk) -> Result<()>,
-    ) -> Result<()> {
+    pub(super) fn ensure_empty_groups(&mut self) -> Result<()> {
         if self.groups.is_empty() && self.plan.emit_empty_group_on_empty_input {
             let empty_sets: Vec<usize> = self
                 .grouping_sets
@@ -82,8 +89,6 @@ impl AggregateSink {
                 .filter_map(|(set_id, grouping_set)| grouping_set.is_empty().then_some(set_id))
                 .collect();
             for set_id in empty_sets {
-                
-                
                 let hash = self.hash_builder.hash_one(set_id);
                 let exists = self.index.find(hash, |entry| {
                     self.groups[entry.slot].grouping_set_id == set_id
@@ -103,28 +108,6 @@ impl AggregateSink {
                         .saturating_add(self.plan.groups as u64);
                 }
             }
-        }
-        if self.groups.is_empty() {
-            return Ok(());
-        }
-        let mut start = 0;
-        while start < self.groups.len() {
-            let end = start.saturating_add(batch_rows.get()).min(self.groups.len());
-            let output_materialize_started = Instant::now();
-            let range = start..end;
-            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.plan.types.len());
-            for (column, data_type) in self.plan.types.iter().enumerate() {
-                arrays.push(self.column_range(column, data_type, range.clone())?);
-            }
-            self.metrics.output_materialize_ns = self
-                .metrics
-                .output_materialize_ns
-                .saturating_add(output_materialize_started.elapsed().as_nanos() as u64);
-            emit(DataChunk::new(
-                arrays,
-                SelectionVector::new_dense(end - start),
-            ))?;
-            start = end;
         }
         Ok(())
     }

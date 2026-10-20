@@ -32,6 +32,7 @@
 use crate::file::page_index::offset_index::PageLocation;
 use arrow_array::{Array, BooleanArray};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
+use arrow_select::filter::prep_null_mask_filter;
 use arrow_select::filter::SlicesIterator;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -213,6 +214,19 @@ impl RowSelection {
         }
     }
 
+    /// Creates a selection from a BooleanArray predicate result.
+    ///
+    /// Non-null arrays share the predicate bitmap directly. Null predicate
+    /// results are converted to false, as required when filtering rows.
+    pub fn from_filter(filter: &BooleanArray) -> Self {
+        let filter = if filter.null_count() == 0 {
+            filter.clone()
+        } else {
+            prep_null_mask_filter(filter)
+        };
+        Self::from_boolean_buffer(filter.values().clone())
+    }
+
     fn from_mask_selection(mask: MaskSelection) -> Self {
         Self {
             inner: RowSelectionInner::Mask(Box::new(mask)),
@@ -330,7 +344,7 @@ impl RowSelection {
     }
 
     /// Creates a [`RowSelection`] from an iterator of consecutive ranges to keep
-    pub fn from_consecutive_ranges<I: Iterator<Item = Range<usize>>>(
+    pub fn from_consecutive_ranges<I: Iterator<Item=Range<usize>>>(
         ranges: I,
         total_rows: usize,
     ) -> Self {
@@ -616,7 +630,7 @@ impl RowSelection {
     /// over mask-backed selections, prefer streaming directly via
     /// [`Self::as_mask`] + [`MaskRunIter::new`] — that path is allocation-free
     /// and avoids populating the cache.
-    pub fn iter(&self) -> impl Iterator<Item = &RowSelector> {
+    pub fn iter(&self) -> impl Iterator<Item=&RowSelector> {
         match &self.inner {
             RowSelectionInner::Selectors(s) => s.iter(),
             RowSelectionInner::Mask(m) => m.selectors().iter(),
@@ -675,6 +689,10 @@ impl RowSelection {
     }
 }
 
+#[cfg(test)]
+#[path = "filter_selection_tests.rs"]
+mod filter_selection_tests;
+
 impl From<Vec<RowSelector>> for RowSelection {
     fn from(selectors: Vec<RowSelector>) -> Self {
         selectors.into_iter().collect()
@@ -688,7 +706,7 @@ impl From<BooleanBuffer> for RowSelection {
 }
 
 impl FromIterator<RowSelector> for RowSelection {
-    fn from_iter<T: IntoIterator<Item = RowSelector>>(iter: T) -> Self {
+    fn from_iter<T: IntoIterator<Item=RowSelector>>(iter: T) -> Self {
         let iter = iter.into_iter();
 
         // Capacity before filter
@@ -735,7 +753,7 @@ impl FromIterator<RowSelection> for RowSelection {
     /// When every input is mask-backed the result stays mask-backed
     /// (`BooleanBuffer`s are appended); otherwise falls back to flattening
     /// through the per-`RowSelector` form.
-    fn from_iter<T: IntoIterator<Item = RowSelection>>(iter: T) -> Self {
+    fn from_iter<T: IntoIterator<Item=RowSelection>>(iter: T) -> Self {
         let items: Vec<RowSelection> = iter.into_iter().collect();
 
         let all_mask = items

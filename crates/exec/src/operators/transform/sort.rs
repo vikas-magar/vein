@@ -1,17 +1,13 @@
 //! Blocking Arrow row sort that retains input column buffers until final gather.
 
-use arrow::array::ArrayRef;
-use arrow::compute::SortOptions;
 use arrow::datatypes::{Field, Schema, SchemaRef};
-use arrow::error::ArrowError;
 use arrow::ipc::reader::FileReader;
 use arrow::record_batch::RecordBatch;
-use arrow_row::{RowConverter, Rows, SortField};
 use common::Result;
 use common::protocol::{LimitSpec, SortPlan};
 use error::VeinError;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,6 +19,8 @@ use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode, Transf
 
 mod spill;
 use spill::HeapSize;
+mod view_order;
+use view_order::ViewRowOrder;
 
 const OUTPUT_BATCH_ROWS: usize = 8192;
 const SPILL_MERGE_FAN_IN: usize = 32;
@@ -34,49 +32,31 @@ struct RowRef {
     row: usize,
 }
 
-/// A candidate owns only its encoded sort key; its payload stays in the input
-/// Arrow chunk referenced by `row`.
-struct TopNEntry {
-    key: Vec<u8>,
-    row: RowRef,
-}
-
-impl PartialEq for TopNEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.row.chunk == other.row.chunk && self.row.row == other.row.row
-    }
-}
-
-impl Eq for TopNEntry {}
-
-impl PartialOrd for TopNEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for TopNEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key
-            .cmp(&other.key)
-            .then_with(|| self.row.chunk.cmp(&other.row.chunk))
-            .then_with(|| self.row.row.cmp(&other.row.row))
+impl HeapSize for RowRef {
+    fn heap_size(&self) -> usize {
+        0
     }
 }
 
 /// Retains the smallest `capacity` values using a max-heap whose root is the
-/// worst retained candidate. Generic over `Ord` so the selection logic is
-/// reusable without dynamic dispatch.
-struct BoundedTopN<T: Ord> {
+/// worst retained candidate. The ordering is supplied by the caller so entries
+/// can refer to source rows instead of owning copied sort keys.
+struct BoundedTopN<T> {
     capacity: usize,
-    entries: BinaryHeap<T>,
+    entries: Vec<T>,
 }
 
-impl<T: Ord> BoundedTopN<T> {
+enum TopNChange<T> {
+    Rejected,
+    Inserted,
+    Replaced(T),
+}
+
+impl<T> BoundedTopN<T> {
     fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            entries: BinaryHeap::new(),
+            entries: Vec::new(),
         }
     }
 
@@ -85,43 +65,107 @@ impl<T: Ord> BoundedTopN<T> {
     }
 
     fn peek(&self) -> Option<&T> {
-        self.entries.peek()
+        self.entries.first()
     }
 
-    fn push(&mut self, value: T) {
+    fn offer(
+        &mut self,
+        value: T,
+        compare: &mut impl FnMut(&T, &T) -> Result<Ordering>,
+    ) -> Result<TopNChange<T>> {
         if self.capacity == 0 {
-            return;
+            return Ok(TopNChange::Rejected);
         }
         if self.entries.len() < self.capacity {
             self.entries.push(value);
-        } else if self.entries.peek().is_some_and(|worst| value < *worst) {
-            self.entries.pop();
-            self.entries.push(value);
+            self.sift_up(self.entries.len() - 1, compare)?;
+            return Ok(TopNChange::Inserted);
+        }
+        if compare(&value, &self.entries[0])? != Ordering::Less {
+            return Ok(TopNChange::Rejected);
+        }
+        let worst = std::mem::replace(&mut self.entries[0], value);
+        self.sift_down(0, compare)?;
+        Ok(TopNChange::Replaced(worst))
+    }
+
+    fn sift_up(
+        &mut self,
+        mut child: usize,
+        compare: &mut impl FnMut(&T, &T) -> Result<Ordering>,
+    ) -> Result<()> {
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            if compare(&self.entries[parent], &self.entries[child])? != Ordering::Less {
+                break;
+            }
+            self.entries.swap(parent, child);
+            child = parent;
+        }
+        Ok(())
+    }
+
+    fn sift_down(
+        &mut self,
+        mut parent: usize,
+        compare: &mut impl FnMut(&T, &T) -> Result<Ordering>,
+    ) -> Result<()> {
+        loop {
+            let left = parent * 2 + 1;
+            if left >= self.entries.len() {
+                return Ok(());
+            }
+            let right = left + 1;
+            let worst_child = if right < self.entries.len()
+                && compare(&self.entries[left], &self.entries[right])? == Ordering::Less
+            {
+                right
+            } else {
+                left
+            };
+            if compare(&self.entries[parent], &self.entries[worst_child])? != Ordering::Less {
+                return Ok(());
+            }
+            self.entries.swap(parent, worst_child);
+            parent = worst_child;
         }
     }
 
-    fn replace_worst_with<R>(&mut self, replace: impl FnOnce(&mut T) -> R) -> Option<R> {
-        let mut worst = self.entries.peek_mut()?;
-        Some(replace(&mut worst))
-    }
-
-    fn drain_sorted(&mut self) -> Vec<T> {
-        std::mem::take(&mut self.entries).into_sorted_vec()
+    fn sort_and_take_by(
+        &mut self,
+        compare: &mut impl FnMut(&T, &T) -> Result<Ordering>,
+    ) -> Result<Vec<T>> {
+        let mut compare_error = None;
+        self.entries.sort_unstable_by(|left, right| {
+            if compare_error.is_some() {
+                return Ordering::Equal;
+            }
+            match compare(left, right) {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    compare_error = Some(error);
+                    Ordering::Equal
+                }
+            }
+        });
+        if let Some(error) = compare_error {
+            return Err(error);
+        }
+        Ok(std::mem::take(&mut self.entries))
     }
 }
 
 /// Collects one task's views, sorts references to their rows, then composes output views.
 ///
-/// Input arrays stay shared while the keys are encoded and sorted. Sort-key
-/// arrays and encoded keys may be materialized, but payload columns remain
-/// references until a downstream operator explicitly requests Arrow arrays.
+/// Input arrays stay shared while row references are compared and sorted.
+/// Payload values remain in their source Arrow arrays until a downstream
+/// operator explicitly requests materialized arrays.
 pub struct SortTransform {
     plan: SortPlan,
     output_columns: Option<usize>,
     chunks: Vec<Option<DataChunkView>>,
     top_n_references: Vec<usize>,
-    top_n: Option<BoundedTopN<TopNEntry>>,
-    row_converter: Option<RowConverter>,
+    top_n: Option<BoundedTopN<RowRef>>,
     metrics: SortMetrics,
     memory: MemoryReservation,
     tracker: QueryMemoryTracker,
@@ -134,7 +178,7 @@ pub struct SortTransform {
 
 #[derive(Default)]
 struct SortMetrics {
-    /// Sort-key array conversions, excluding encoded row keys and payloads.
+    /// Sort-key conversions on the external spill path only.
     key_materialization: MaterializationReport,
     key_materialize_us: u64,
     input_batches: u64,
@@ -142,8 +186,8 @@ struct SortMetrics {
     candidate_rows_examined: u64,
     candidate_insertions: u64,
     candidate_replacements: u64,
-    candidate_key_buffer_allocations: u64,
-    candidate_key_bytes_copied: u64,
+    row_comparisons: u64,
+    comparator_cache_entries: u64,
     output_rows: u64,
     key_encode_us: u64,
     selection_us: u64,
@@ -218,7 +262,6 @@ impl SortTransform {
             chunks: Vec::new(),
             top_n_references: Vec::new(),
             top_n: candidate_limit.map(BoundedTopN::new),
-            row_converter: None,
             metrics: SortMetrics::default(),
             memory,
             tracker,
@@ -230,75 +273,25 @@ impl SortTransform {
         })
     }
 
-    fn sort_fields(&self, first: &DataChunkView) -> Result<Vec<SortField>> {
-        if self.plan.keys.is_empty() {
-            return Err(VeinError::planning(
-                "ORDER requires at least one sort key",
-                None,
-            ));
-        }
-
-        self.plan
-            .keys
-            .iter()
-            .map(|key| {
-                let data_type = first.column_data_type(key.column as usize).map_err(|_| {
-                    VeinError::planning(
-                        format!("ORDER BY column {} is outside the input schema", key.column),
-                        None,
-                    )
-                })?;
-                Ok(SortField::new_with_options(
-                    data_type.clone(),
-                    SortOptions {
-                        descending: !key.ascending,
-                        nulls_first: key.nulls_first,
-                    },
-                ))
-            })
-            .collect()
-    }
-
-    fn sort_key_columns(
-        &self,
-        chunk: &DataChunkView,
-    ) -> Result<(Vec<ArrayRef>, MaterializationReport, u64)> {
-        let started = Instant::now();
-        let mut report = MaterializationReport::default();
-        let columns = self
-            .plan
-            .keys
-            .iter()
-            .map(|key| {
-                chunk
-                    .materialize_column_with_report(key.column as usize)
-                    .map(|(array, column_report)| {
-                        report.accumulate(column_report);
-                        array
-                    })
-                    .map_err(|_| {
-                        VeinError::planning(
-                            format!("ORDER BY column {} is outside the input schema", key.column),
-                            None,
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok((
-            columns,
-            report,
-            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-        ))
-    }
-
     fn sort_and_emit(&mut self) -> Result<()> {
         let order = if let Some(top_n) = self.top_n.as_mut() {
             let started = Instant::now();
-            let order = top_n
-                .drain_sorted()
-                .into_iter()
-                .map(|entry| entry.row)
-                .collect::<Vec<_>>();
+            let mut ordering = ViewRowOrder::new(&self.plan, self.tracker.clone())?;
+            let order = {
+                let chunks = &self.chunks;
+                let mut compare = |left: &RowRef, right: &RowRef| {
+                    ordering.compare_rows(chunks, *left, *right)
+                };
+                top_n.sort_and_take_by(&mut compare)?
+            };
+            self.metrics.row_comparisons = self
+                .metrics
+                .row_comparisons
+                .saturating_add(ordering.comparisons());
+            self.metrics.comparator_cache_entries = self
+                .metrics
+                .comparator_cache_entries
+                .saturating_add(ordering.cache_entries_created());
             self.metrics.sort_us = self
                 .metrics
                 .sort_us
@@ -329,49 +322,45 @@ impl SortTransform {
             ));
         }
 
-        let converter = RowConverter::new(self.sort_fields(first)?).map_err(row_sort_error)?;
-        let mut encoded_keys = Vec::<Rows>::with_capacity(self.chunks.len());
         let mut order = Vec::new();
-
-        let encode_started = Instant::now();
         for (chunk_index, chunk) in self.chunks.iter().enumerate() {
             let Some(chunk) = chunk else {
                 continue;
             };
-            let (key_columns, report, materialize_us) = self.sort_key_columns(chunk)?;
-            self.metrics.key_materialization.accumulate(report);
-            self.metrics.key_materialize_us = self
-                .metrics
-                .key_materialize_us
-                .saturating_add(materialize_us);
-            let keys = converter
-                .convert_columns(&key_columns)
-                .map_err(row_sort_error)?;
-            let encoded_bytes = (0..chunk.num_rows())
-                .try_fold(0usize, |bytes, row| {
-                    bytes.checked_add(keys.row(row).data().len())
-                })
-                .ok_or_else(|| VeinError::internal("encoded sort key size overflow"))?;
-            self.memory.grow(encoded_bytes, "sort encoded keys")?;
             for active_row in 0..chunk.num_rows() {
                 order.push(RowRef {
                     chunk: chunk_index,
                     row: active_row,
                 });
             }
-            encoded_keys.push(keys);
         }
-        self.metrics.key_encode_us = self
-            .metrics
-            .key_encode_us
-            .saturating_add(encode_started.elapsed().as_micros() as u64);
 
         let sort_started = Instant::now();
+        let mut ordering = ViewRowOrder::new(&self.plan, self.tracker.clone())?;
+        let mut compare_error = None;
         order.sort_unstable_by(|left, right| {
-            encoded_keys[left.chunk]
-                .row(left.row)
-                .cmp(&encoded_keys[right.chunk].row(right.row))
+            if compare_error.is_some() {
+                return Ordering::Equal;
+            }
+            match ordering.compare_rows(&self.chunks, *left, *right) {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    compare_error = Some(error);
+                    Ordering::Equal
+                }
+            }
         });
+        if let Some(error) = compare_error {
+            return Err(error);
+        }
+        self.metrics.row_comparisons = self
+            .metrics
+            .row_comparisons
+            .saturating_add(ordering.comparisons());
+        self.metrics.comparator_cache_entries = self
+            .metrics
+            .comparator_cache_entries
+            .saturating_add(ordering.cache_entries_created());
         self.metrics.sort_us = self
             .metrics
             .sort_us
@@ -472,37 +461,38 @@ impl SortTransform {
             .checked_mul(size_of::<usize>())
             .ok_or_else(|| VeinError::internal("sort spill row index size overflow"))?;
         self.memory.grow(row_bytes, "sort spill row indexes")?;
-        let mut scratch_bytes = row_bytes;
         let result = (|| {
-            let (key_columns, report, materialize_us) = self.sort_key_columns(view)?;
-            self.metrics.key_materialization.accumulate(report);
-            self.metrics.key_materialize_us = self
-                .metrics
-                .key_materialize_us
-                .saturating_add(materialize_us);
-            let converter = RowConverter::new(self.sort_fields(view)?).map_err(row_sort_error)?;
-            let encode_started = Instant::now();
-            let keys = converter
-                .convert_columns(&key_columns)
-                .map_err(row_sort_error)?;
-            self.metrics.key_encode_us = self
-                .metrics
-                .key_encode_us
-                .saturating_add(encode_started.elapsed().as_micros() as u64);
-            let key_bytes = (0..view.num_rows())
-                .try_fold(0usize, |total, row| {
-                    total.checked_add(keys.row(row).data().len())
-                })
-                .ok_or_else(|| VeinError::internal("sort spill key size overflow"))?;
-            let next_scratch = scratch_bytes
-                .checked_add(key_bytes)
-                .ok_or_else(|| VeinError::internal("sort spill scratch size overflow"))?;
-            self.memory.grow(key_bytes, "sort spill encoded keys")?;
-            scratch_bytes = next_scratch;
-
             let mut order = (0..view.num_rows()).collect::<Vec<_>>();
             let sort_started = Instant::now();
-            order.sort_unstable_by(|left, right| keys.row(*left).cmp(&keys.row(*right)));
+            let mut ordering = ViewRowOrder::new(&self.plan, self.tracker.clone())?;
+            let mut compare_error = None;
+            order.sort_unstable_by(|left, right| {
+                if compare_error.is_some() {
+                    return Ordering::Equal;
+                }
+                match ordering
+                    .compare_view_rows(view, *left, view, *right)
+                    .map(|ordering| ordering.then_with(|| left.cmp(right)))
+                {
+                    Ok(ordering) => ordering,
+                    Err(error) => {
+                        compare_error = Some(error);
+                        Ordering::Equal
+                    }
+                }
+            });
+            if let Some(error) = compare_error {
+                return Err(error);
+            }
+            self.metrics.row_comparisons = self
+                .metrics
+                .row_comparisons
+                .saturating_add(ordering.comparisons());
+            self.metrics.comparator_cache_entries = self
+                .metrics
+                .comparator_cache_entries
+                .saturating_add(ordering.cache_entries_created());
+            ordering.clear_cache();
             self.metrics.sort_us = self
                 .metrics
                 .sort_us
@@ -536,7 +526,7 @@ impl SortTransform {
                 .saturating_add(file_started.elapsed().as_micros() as u64);
             Ok(())
         })();
-        self.memory.shrink(scratch_bytes);
+        self.memory.shrink(row_bytes);
         result
     }
 
@@ -550,14 +540,21 @@ impl SortTransform {
         let output = pending.writer()?;
         let mut writer = IpcRunWriter::new(output, &schema, "create merged sort run")?;
         let plan = self.plan.clone();
-        merge_spill_group(paths, &plan, schema.fields().len(), &self.tracker, |view| {
-            let chunk = view.to_data_chunk()?;
-            let batch =
-                RecordBatch::try_new(Arc::clone(&schema), chunk.vectors).map_err(|error| {
-                    VeinError::internal(format!("build merged sort batch: {error}"))
-                })?;
-            writer.write_batch(&batch, "write merged sort batch")
-        })?;
+        merge_spill_group(
+            paths,
+            &plan,
+            schema.fields().len(),
+            &self.tracker,
+            &mut self.metrics,
+            |view| {
+                let chunk = view.to_data_chunk()?;
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&schema), chunk.vectors).map_err(|error| {
+                        VeinError::internal(format!("build merged sort batch: {error}"))
+                    })?;
+                writer.write_batch(&batch, "write merged sort batch")
+            },
+        )?;
         let output = writer.finish("finish merged sort run")?;
         let run = pending.commit(output)?;
         let bytes = run.bytes();
@@ -600,10 +597,17 @@ impl SortTransform {
         let plan = self.plan.clone();
         let next = &mut self.next;
         let mut output_rows = 0u64;
-        merge_spill_group(&runs, &plan, output_columns, &self.tracker, |view| {
-            output_rows = output_rows.saturating_add(view.num_rows() as u64);
-            next.push(view)
-        })?;
+        merge_spill_group(
+            &runs,
+            &plan,
+            output_columns,
+            &self.tracker,
+            &mut self.metrics,
+            |view| {
+                output_rows = output_rows.saturating_add(view.num_rows() as u64);
+                next.push(view)
+            },
+        )?;
         self.metrics.output_rows = output_rows;
         Ok(())
     }
@@ -648,117 +652,85 @@ impl SortTransform {
             .input_rows
             .saturating_add(chunk.num_rows() as u64);
 
-        if self.row_converter.is_none() {
-            self.row_converter =
-                Some(RowConverter::new(self.sort_fields(&chunk)?).map_err(row_sort_error)?);
-        }
-        let (key_columns, report, materialize_us) = self.sort_key_columns(&chunk)?;
-        self.metrics.key_materialization.accumulate(report);
-        self.metrics.key_materialize_us = self
-            .metrics
-            .key_materialize_us
-            .saturating_add(materialize_us);
-        let encode_started = Instant::now();
-        let keys = self
-            .row_converter
-            .as_ref()
-            .expect("row converter initialized above")
-            .convert_columns(&key_columns)
-            .map_err(row_sort_error)?;
-        self.metrics.key_encode_us = self
-            .metrics
-            .key_encode_us
-            .saturating_add(encode_started.elapsed().as_micros() as u64);
-
         let row_count = chunk.num_rows();
         let selection_started = Instant::now();
-        let has_candidate = if top_n.is_full() {
-            let worst = top_n
-                .peek()
-                .ok_or_else(|| VeinError::internal("full Top-N heap is empty"))?;
-            (0..row_count).any(|row| keys.row(row).data() < worst.key.as_slice())
-        } else {
-            true
-        };
-        if !has_candidate {
-            self.metrics.candidate_rows_examined = self
-                .metrics
-                .candidate_rows_examined
-                .saturating_add(row_count as u64);
-            self.metrics.selection_us = self
-                .metrics
-                .selection_us
-                .saturating_add(selection_started.elapsed().as_micros() as u64);
-            return Ok(());
-        }
-
-        let mut chunk = chunk;
-        self.account_retained_arrays(&mut chunk)?;
         let chunk_index = self.chunks.len();
         let chunk_metadata = size_of::<Option<DataChunkView>>()
             .checked_add(size_of::<usize>())
             .ok_or_else(|| VeinError::internal("sort chunk metadata size overflow"))?;
-        self.memory.grow(chunk_metadata, "sort chunk references")?;
-        self.chunks.push(Some(chunk));
-        self.top_n_references.push(0);
-        let top_n = self.top_n.as_mut().expect("Top-N selector checked above");
+        let mut retained_chunk = None;
+        let mut ordering = ViewRowOrder::new(&self.plan, self.tracker.clone())?;
         for active_row in 0..row_count {
             self.metrics.candidate_rows_examined =
                 self.metrics.candidate_rows_examined.saturating_add(1);
-            let key = keys.row(active_row).data();
             let candidate_row = RowRef {
                 chunk: chunk_index,
                 row: active_row,
             };
-            let replaced_row = if top_n.is_full() {
-                let Some(worst) = top_n.peek() else {
+            let is_full = self.top_n.as_ref().is_some_and(BoundedTopN::is_full);
+            if is_full {
+                let worst = *self
+                    .top_n
+                    .as_ref()
+                    .and_then(BoundedTopN::peek)
+                    .ok_or_else(|| VeinError::internal("full Top-N heap is empty"))?;
+                let worst_view = self
+                    .chunks
+                    .get(worst.chunk)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        VeinError::internal("Top-N candidate references a released chunk")
+                    })?;
+                let key_order = ordering.compare_view_rows(&chunk, active_row, worst_view, worst.row)?;
+                let candidate_order = key_order
+                    .then_with(|| candidate_row.chunk.cmp(&worst.chunk))
+                    .then_with(|| candidate_row.row.cmp(&worst.row));
+                if candidate_order != Ordering::Less {
                     continue;
+                }
+            }
+
+            if self.chunks.len() == chunk_index {
+                let mut retained = chunk.clone();
+                self.account_retained_arrays(&mut retained)?;
+                self.memory.grow(chunk_metadata, "sort chunk references")?;
+                self.chunks.push(Some(retained.clone()));
+                self.top_n_references.push(0);
+                retained_chunk = Some(retained);
+            } else if self.chunks[chunk_index].is_none() {
+                let retained = if let Some(retained) = retained_chunk.as_ref() {
+                    retained.clone()
+                } else {
+                    let mut retained = chunk.clone();
+                    self.account_retained_arrays(&mut retained)?;
+                    retained_chunk = Some(retained.clone());
+                    retained
                 };
-                if key >= worst.key.as_slice() {
+                self.chunks[chunk_index] = Some(retained);
+            }
+
+            if !is_full {
+                self.memory
+                    .grow(size_of::<RowRef>(), "sort Top-N row references")?;
+            }
+            let change = {
+                let top_n = self.top_n.as_mut().expect("Top-N selector checked above");
+                let chunks = &self.chunks;
+                let mut compare = |left: &RowRef, right: &RowRef| {
+                    ordering.compare_rows(chunks, *left, *right)
+                };
+                top_n.offer(candidate_row, &mut compare)?
+            };
+            let replaced_row = match change {
+                TopNChange::Rejected => {
+                    if !is_full {
+                        self.memory.shrink(size_of::<RowRef>());
+                    }
                     continue;
                 }
-                let old_key_len = worst.key.len();
-                if key.len() > old_key_len {
-                    self.memory
-                        .grow(key.len() - old_key_len, "sort Top-N keys")?;
-                }
-                let (replaced_row, buffer_grew) = top_n
-                    .replace_worst_with(|worst| {
-                        let replaced_row = worst.row;
-                        let capacity = worst.key.capacity();
-                        worst.key.clear();
-                        worst.key.extend_from_slice(key);
-                        worst.row = candidate_row;
-                        (replaced_row, worst.key.capacity() > capacity)
-                    })
-                    .ok_or_else(|| VeinError::internal("Top-N heap unexpectedly empty"))?;
-                if buffer_grew {
-                    self.metrics.candidate_key_buffer_allocations = self
-                        .metrics
-                        .candidate_key_buffer_allocations
-                        .saturating_add(1);
-                }
-                Some(replaced_row)
-            } else {
-                let candidate_bytes = key
-                    .len()
-                    .checked_add(size_of::<TopNEntry>())
-                    .ok_or_else(|| VeinError::internal("Top-N candidate size overflow"))?;
-                self.memory.grow(candidate_bytes, "sort Top-N keys")?;
-                self.metrics.candidate_key_buffer_allocations = self
-                    .metrics
-                    .candidate_key_buffer_allocations
-                    .saturating_add(1);
-                top_n.push(TopNEntry {
-                    key: key.to_vec(),
-                    row: candidate_row,
-                });
-                None
+                TopNChange::Inserted => None,
+                TopNChange::Replaced(row) => Some(row),
             };
-            self.metrics.candidate_key_bytes_copied = self
-                .metrics
-                .candidate_key_bytes_copied
-                .saturating_add(key.len() as u64);
             self.metrics.candidate_insertions = self.metrics.candidate_insertions.saturating_add(1);
             self.top_n_references[chunk_index] = self.top_n_references[chunk_index]
                 .checked_add(1)
@@ -771,93 +743,42 @@ impl SortTransform {
                     .checked_sub(1)
                     .ok_or_else(|| VeinError::internal("Top-N candidate count underflow"))?;
                 if self.top_n_references[replaced_row.chunk] == 0 {
+                    ordering.clear_cache();
                     self.chunks[replaced_row.chunk] = None;
+                    if replaced_row.chunk == chunk_index {
+                        retained_chunk = None;
+                    }
                 }
             }
         }
+        self.metrics.row_comparisons = self
+            .metrics
+            .row_comparisons
+            .saturating_add(ordering.comparisons());
+        self.metrics.comparator_cache_entries = self
+            .metrics
+            .comparator_cache_entries
+            .saturating_add(ordering.cache_entries_created());
         self.metrics.selection_us = self
             .metrics
             .selection_us
             .saturating_add(selection_started.elapsed().as_micros() as u64);
-        if self.top_n_references[chunk_index] == 0 {
+        if self.top_n_references.get(chunk_index).copied().unwrap_or(0) == 0
+            && self.chunks.len() > chunk_index
+        {
+            ordering.clear_cache();
             self.chunks[chunk_index] = None;
+            drop(retained_chunk.take());
         }
         Ok(())
     }
 }
 
-fn row_sort_error(error: ArrowError) -> VeinError {
-    VeinError::planning(format!("ORDER BY key cannot be sorted: {error}"), None)
-}
-
 struct SpillMergeCursor {
     reader: FileReader<Box<dyn SpillStream>>,
     view: DataChunkView,
-    keys: Option<Arc<Rows>>,
-    key_memory: MemoryReservation,
-    key_bytes: usize,
     row: usize,
     snapshot: usize,
-}
-
-#[derive(Clone)]
-struct SpillRowKey {
-    keys: Arc<Rows>,
-    row: usize,
-}
-
-impl PartialEq for SpillRowKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for SpillRowKey {}
-
-impl PartialOrd for SpillRowKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for SpillRowKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.keys.row(self.row).cmp(&other.keys.row(other.row))
-    }
-}
-
-impl HeapSize for SpillRowKey {
-    fn heap_size(&self) -> usize {
-        size_of::<Self>()
-    }
-}
-
-fn encode_spill_keys(
-    view: &DataChunkView,
-    plan: &SortPlan,
-    converter: &RowConverter,
-) -> Result<Rows> {
-    let columns = plan
-        .keys
-        .iter()
-        .map(|key| {
-            view.materialize_column(key.column as usize).map_err(|_| {
-                VeinError::planning(
-                    format!("ORDER BY column {} is outside the spill schema", key.column),
-                    None,
-                )
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    converter.convert_columns(&columns).map_err(row_sort_error)
-}
-
-fn encoded_rows_size(rows: &Rows) -> Result<usize> {
-    (0..rows.num_rows())
-        .try_fold(0usize, |bytes, row| {
-            bytes.checked_add(rows.row(row).data().len())
-        })
-        .ok_or_else(|| VeinError::internal("encoded spill key size overflow"))
 }
 
 fn view_from_spill_batch(
@@ -886,6 +807,7 @@ fn merge_spill_group(
     plan: &SortPlan,
     output_columns: usize,
     tracker: &QueryMemoryTracker,
+    metrics: &mut SortMetrics,
     mut consume: impl FnMut(DataChunkView) -> Result<()>,
 ) -> Result<()> {
     if paths.is_empty() {
@@ -932,101 +854,85 @@ fn merge_spill_group(
     let Some(first_view) = first_view else {
         return Ok(());
     };
-    let fields = plan
-        .keys
-        .iter()
-        .map(|key| {
-            let data_type = first_view
-                .column_data_type(key.column as usize)
-                .map_err(|_| {
-                    VeinError::planning(
-                        format!("ORDER BY column {} is outside the spill schema", key.column),
-                        None,
-                    )
-                })?;
-            Ok(SortField::new_with_options(
-                data_type.clone(),
-                SortOptions {
-                    descending: !key.ascending,
-                    nulls_first: key.nulls_first,
-                },
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let converter = RowConverter::new(fields).map_err(row_sort_error)?;
+    for key in &plan.keys {
+        first_view
+            .column_data_type(key.column as usize)
+            .map_err(|_| {
+                VeinError::planning(
+                    format!("ORDER BY column {} is outside the spill schema", key.column),
+                    None,
+                )
+            })?;
+    }
     drop(first_view);
 
     let mut snapshots = Vec::<DataChunkView>::new();
     let mut cursors = Vec::with_capacity(readers.len());
-    let mut heap = spill::KWayMerge::new(tracker)?;
+    let mut heap = spill::KWayMerge::<RowRef, (usize, usize)>::new(tracker)?;
+    let mut ordering = ViewRowOrder::new(plan, tracker.clone())?;
     for (reader, view) in readers.into_iter().zip(initial) {
         let Some(view) = view else {
             continue;
         };
-        let keys = Arc::new(encode_spill_keys(&view, plan, &converter)?);
-        let key_bytes = encoded_rows_size(&keys)?;
-        let key_memory = tracker.reserve(key_bytes, "sort merge encoded keys")?;
         let snapshot = snapshots.len();
         snapshots.push(view.clone());
-        let row = 0;
         let cursor_index = cursors.len();
         cursors.push(SpillMergeCursor {
             reader,
             view,
-            keys: Some(Arc::clone(&keys)),
-            key_memory,
-            key_bytes,
-            row,
+            row: 0,
             snapshot,
         });
-        heap.push(
-            SpillRowKey { keys, row },
-            (cursor_index, row),
-            (cursor_index, row),
-        )?;
+        let key = RowRef {
+            chunk: cursor_index,
+            row: 0,
+        };
+        let mut compare = |left: &RowRef, right: &RowRef| {
+            compare_spill_rows(&mut ordering, &cursors, *left, *right)
+        };
+        heap.push(key, (0, 0), (cursor_index, 0), &mut compare)?;
     }
 
     let mut rows = Vec::<(usize, usize)>::with_capacity(OUTPUT_BATCH_ROWS);
-    while let Some((run, row)) = heap.pop() {
+    loop {
+        let next = {
+            let mut compare = |left: &RowRef, right: &RowRef| {
+                compare_spill_rows(&mut ordering, &cursors, *left, *right)
+            };
+            heap.pop(&mut compare)?
+        };
+        let Some((run, row)) = next else {
+            break;
+        };
         tracker.check_cancelled()?;
         let cursor = &mut cursors[run];
         rows.push((cursor.snapshot, row));
         cursor.row += 1;
         if cursor.row < cursor.view.num_rows() {
-            let keys = Arc::clone(
-                cursor
-                    .keys
-                    .as_ref()
-                    .ok_or_else(|| VeinError::internal("sort merge cursor keys are missing"))?,
-            );
-            heap.push(
-                SpillRowKey {
-                    keys,
-                    row: cursor.row,
-                },
-                (run, cursor.row),
-                (run, cursor.row),
-            )?;
+            let next_row = cursor.row;
+            let key = RowRef {
+                chunk: run,
+                row: next_row,
+            };
+            let mut compare = |left: &RowRef, right: &RowRef| {
+                compare_spill_rows(&mut ordering, &cursors, *left, *right)
+            };
+            heap.push(key, (0, 0), (run, next_row), &mut compare)?;
         } else {
-            cursor.key_memory.shrink(cursor.key_bytes);
-            cursor.key_bytes = 0;
-            cursor.keys = None;
             let batch = cursor.reader.next().transpose().map_err(|error| {
                 VeinError::internal(format!("decode sort spill batch: {error}"))
             })?;
             if let Some(batch) = batch {
+                ordering.clear_cache();
                 cursor.view = view_from_spill_batch(batch, tracker)?;
-                let keys = Arc::new(encode_spill_keys(&cursor.view, plan, &converter)?);
-                let key_bytes = encoded_rows_size(&keys)?;
-                cursor
-                    .key_memory
-                    .grow(key_bytes, "sort merge encoded keys")?;
-                cursor.key_bytes = key_bytes;
-                cursor.keys = Some(Arc::clone(&keys));
                 cursor.row = 0;
                 cursor.snapshot = snapshots.len();
                 snapshots.push(cursor.view.clone());
-                heap.push(SpillRowKey { keys, row: 0 }, (run, 0), (run, 0))?;
+                let key = RowRef { chunk: run, row: 0 };
+                let mut compare = |left: &RowRef, right: &RowRef| {
+                    compare_spill_rows(&mut ordering, &cursors, *left, *right)
+                };
+                heap.push(key, (0, 0), (run, 0), &mut compare)?;
             }
         }
 
@@ -1049,7 +955,30 @@ fn merge_spill_group(
         let output = DataChunkView::compose_rows(&inputs, &rows, output_columns)?;
         consume(output)?;
     }
+    metrics.row_comparisons = metrics
+        .row_comparisons
+        .saturating_add(ordering.comparisons());
+    metrics.comparator_cache_entries = metrics
+        .comparator_cache_entries
+        .saturating_add(ordering.cache_entries_created());
     Ok(())
+}
+
+fn compare_spill_rows(
+    ordering: &mut ViewRowOrder<'_>,
+    cursors: &[SpillMergeCursor],
+    left: RowRef,
+    right: RowRef,
+) -> Result<Ordering> {
+    let left_view = cursors
+        .get(left.chunk)
+        .ok_or_else(|| VeinError::internal("sort merge row references a missing run"))?;
+    let right_view = cursors
+        .get(right.chunk)
+        .ok_or_else(|| VeinError::internal("sort merge row references a missing run"))?;
+    ordering
+        .compare_view_rows(&left_view.view, left.row, &right_view.view, right.row)
+        .map(|ordering| ordering.then_with(|| left.chunk.cmp(&right.chunk)).then_with(|| left.row.cmp(&right.row)))
 }
 
 impl PipelineNode<DataChunkView> for SortTransform {
@@ -1126,8 +1055,8 @@ impl PipelineNode<DataChunkView> for SortTransform {
             candidate_rows_examined = self.metrics.candidate_rows_examined,
             candidate_insertions = self.metrics.candidate_insertions,
             candidate_replacements = self.metrics.candidate_replacements,
-            candidate_key_buffer_allocations = self.metrics.candidate_key_buffer_allocations,
-            candidate_key_bytes_copied = self.metrics.candidate_key_bytes_copied,
+            row_comparisons = self.metrics.row_comparisons,
+            comparator_cache_entries = self.metrics.comparator_cache_entries,
             output_rows = self.metrics.output_rows,
             key_encode_us = self.metrics.key_encode_us,
             key_shared_columns = self.metrics.key_materialization.shared_columns,
@@ -1158,3 +1087,7 @@ impl Transform<DataChunkView> for SortTransform {}
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "sort/view_order_tests.rs"]
+mod view_order_tests;

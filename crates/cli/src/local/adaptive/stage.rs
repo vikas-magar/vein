@@ -1,11 +1,19 @@
 //! One atomic transition: execute, measure, optimize, lower, then register.
 use super::*;
+use optimizer::context::JoinOrderOutcome;
+
+fn outcome_needs_more_statistics(outcome: JoinOrderOutcome) -> bool {
+    matches!(
+        outcome,
+        JoinOrderOutcome::InsufficientStatistics | JoinOrderOutcome::AmbiguousEstimates
+    )
+}
 
 impl AdaptiveCoordinator {
     pub(super) async fn transition(
         &self, prepared: &PreparedAdaptiveCheckpoint, current: &LogicalPlan,
         execution: &AdaptiveExecution, stage: usize, source_id: IntermediateSourceId,
-    ) -> common::Result<(Vec<ExecuteTask>, LogicalPlan, IntermediateSourceRegistration)> {
+    ) -> common::Result<(Vec<ExecuteTask>, LogicalPlan, IntermediateSourceRegistration, bool)> {
         let resources = execution.resources.as_ref().expect("resources created before transition");
         tracing::info!(target: "vein.adaptive", event = "adaptive_checkpoint_started", stage,
         source = prepared.boundary.table_name(), "executing checkpoint producer");
@@ -38,20 +46,72 @@ impl AdaptiveCoordinator {
             selected_order = ?decision.selected_order, outcome = ?decision.outcome,
             "remaining join-order decision");
         }
+        let statistics_blocked_decisions = diagnostics
+            .join_order_decisions
+            .iter()
+            .filter(|decision| outcome_needs_more_statistics(decision.outcome))
+            .count();
+        let schedule_followup = statistics_blocked_decisions > 0;
+        tracing::info!(target: "vein.adaptive", event = "adaptive_checkpoint_continuation_decision", stage,
+            join_order_decision_count = diagnostics.join_order_decisions.len(),
+            statistics_blocked_decision_count = statistics_blocked_decisions,
+            schedule_followup, "decided whether additional runtime statistics can inform remaining joins");
         let plan_changed = optimized != before;
         let job = self.planner.create_physical_plan_with_statistics(self.request_id, optimized.clone(), Arc::clone(&self.statistics))?;
         let tasks = tasks_from_job(job, Arc::clone(&self.statistics), self.query_id)?;
         let registration = self.executor.register_intermediate_source(
             self.query_id, source_id, checkpoint.relation,
         )?;
+        let reoptimization_us = started.elapsed().as_micros() as u64;
+        tracing::info!(target: "vein.adaptive.summary", event = "adaptive_stage_summary",
+            stage,
+            source = prepared.boundary.table_name(),
+            estimated_rows = ?prepared.boundary.estimated_rows(),
+            observed_rows = rows,
+            join_order_decisions = diagnostics.join_order_decisions.len(),
+            statistics_blocked_decisions,
+            logical_plan_changed = plan_changed,
+            schedule_followup,
+            reoptimization_us,
+            checkpoint_duration_ns = checkpoint.metrics.duration_ns,
+            checkpoint_bytes_read = checkpoint.metrics.bytes_read,
+            "adaptive checkpoint stage completed");
         tracing::info!(target: "vein.adaptive", event = "adaptive_reoptimization_completed", stage,
         observed_rows = rows, estimated_rows = ?prepared.boundary.estimated_rows(),
         logical_plan_changed = plan_changed, physical_replanned = true,
-        reoptimization_us = started.elapsed().as_micros() as u64,
+        reoptimization_us,
         checkpoint_duration_ns = checkpoint.metrics.duration_ns,
         checkpoint_bytes_read = checkpoint.metrics.bytes_read,
         memory_used_bytes = resources.memory_used_bytes(), memory_peak_bytes = resources.memory_peak_bytes(),
         "remaining physical plan replaced using completed population statistics");
-        Ok::<_, common::VeinError>((tasks, optimized, registration))
+        Ok::<_, common::VeinError>((tasks, optimized, registration, schedule_followup))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::outcome_needs_more_statistics;
+    use optimizer::context::JoinOrderOutcome;
+
+    #[test]
+    fn only_statistics_resolvable_join_outcomes_request_another_checkpoint() {
+        assert!(outcome_needs_more_statistics(JoinOrderOutcome::InsufficientStatistics));
+        assert!(outcome_needs_more_statistics(JoinOrderOutcome::AmbiguousEstimates));
+
+        for outcome in [
+            JoinOrderOutcome::Reordered,
+            JoinOrderOutcome::NoImprovement,
+            JoinOrderOutcome::InsufficientRelations,
+            JoinOrderOutcome::RelationLimitExceeded,
+            JoinOrderOutcome::SearchBudgetExceeded,
+            JoinOrderOutcome::DisconnectedGraph,
+            JoinOrderOutcome::UnsupportedShape,
+            JoinOrderOutcome::InvalidCost,
+        ] {
+            assert!(
+                !outcome_needs_more_statistics(outcome),
+                "unexpected follow-up checkpoint for {outcome:?}"
+            );
+        }
     }
 }

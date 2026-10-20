@@ -33,6 +33,8 @@ pub struct PagePruning {
     pub page_bounds_complete: u64,
     /// Indexed page entries whose min/max bounds are absent, inexact, or unsafe.
     pub page_bounds_incomplete: u64,
+    /// Row-group/column pairs whose page index provides complete bounds for all pages.
+    pub page_index_complete_columns: HashMap<usize, HashSet<String>>,
     /// Number of row ranges considered after taking the union of indexed page boundaries.
     pub row_ranges_considered: u64,
     /// Number of ranges proven unable to satisfy the predicates.
@@ -59,6 +61,8 @@ pub struct PageHeaderRowStatistics {
     pub first_row: usize,
     /// Number of rows covered by the page.
     pub row_count: usize,
+    /// Encoding used for values in this data page.
+    pub encoding: parquet::basic::Encoding,
     /// Statistics decoded from the page header. Unsupported or absent values
     /// are represented as incomplete statistics and never prune the page.
     pub statistics: ColumnStatistics,
@@ -237,6 +241,19 @@ pub fn prune_data_pages_with_headers(
                     column,
                 )
             });
+            if index_statistics.as_ref().is_some_and(|statistics| {
+                !statistics.pages.is_empty()
+                    && statistics
+                    .pages
+                    .iter()
+                    .all(|page| page.min_max_complete == Some(true))
+            }) {
+                pruning
+                    .page_index_complete_columns
+                    .entry(*row_group_index)
+                    .or_default()
+                    .insert((*column).to_string());
+            }
             let header_statistics = header_pages
                 .get(row_group_index)
                 .and_then(|columns| columns.get(*column))
@@ -345,64 +362,6 @@ pub fn prune_data_pages_with_headers(
     }
 
     pruning
-}
-
-/// Returns predicate columns for a header pre-read when the page index does not
-/// cover every candidate row-group/column pair with complete bounds.
-pub fn page_header_columns_needed(
-    predicates: &[StatisticsPredicate],
-    row_groups_to_probe: &[usize],
-    index_candidate_row_groups: &[usize],
-    page_index_available: bool,
-    page_index_pruning: &PagePruning,
-) -> Vec<String> {
-    page_header_columns_needed_with_audit(
-        predicates,
-        row_groups_to_probe,
-        index_candidate_row_groups,
-        page_index_available,
-        page_index_pruning,
-        false,
-    )
-}
-
-/// Returns predicate columns for a header pre-read, optionally auditing even
-/// when a complete page index is available. Audit mode enables comparing page
-/// header statistics with page-index statistics on real files; it adds an
-/// extra header read before the regular scan and should remain opt-in.
-pub fn page_header_columns_needed_with_audit(
-    predicates: &[StatisticsPredicate],
-    row_groups_to_probe: &[usize],
-    index_candidate_row_groups: &[usize],
-    page_index_available: bool,
-    page_index_pruning: &PagePruning,
-    audit_complete_page_index: bool,
-) -> Vec<String> {
-    if predicates.is_empty() || row_groups_to_probe.is_empty() {
-        return Vec::new();
-    }
-
-    let mut referenced = HashSet::<&str>::new();
-    for predicate in predicates {
-        predicate.collect_columns(&mut referenced);
-    }
-    if referenced.is_empty() {
-        return Vec::new();
-    }
-
-    let expected_indexed_columns = u64::try_from(referenced.len())
-        .unwrap_or(u64::MAX)
-        .saturating_mul(u64::try_from(index_candidate_row_groups.len()).unwrap_or(u64::MAX));
-    let page_index_covers_predicates = page_index_available
-        && page_index_pruning.indexed_columns == expected_indexed_columns
-        && page_index_pruning.page_bounds_incomplete == 0;
-    if page_index_covers_predicates && !audit_complete_page_index {
-        return Vec::new();
-    }
-
-    let mut needed = referenced.into_iter().map(str::to_owned).collect::<Vec<_>>();
-    needed.sort_unstable();
-    needed
 }
 
 fn full_row_group_selections(row_groups: &[usize]) -> PagePruning {
@@ -731,7 +690,7 @@ fn page_range_unit(
     Some(unit)
 }
 
-fn append_selector(selectors: &mut Vec<RowSelector>, selector: RowSelector) {
+pub(super) fn append_selector(selectors: &mut Vec<RowSelector>, selector: RowSelector) {
     if let Some(last) = selectors.last_mut()
         && last.skip == selector.skip
     {

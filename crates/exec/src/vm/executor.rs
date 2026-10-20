@@ -4,16 +4,17 @@
 //! incoming in-flight [`DataChunk`]s in a tight, cache-coherent instruction loop.
 
 use super::ops;
-use super::register::RegisterFile;
+use super::register::{RegValue, RegisterFile};
 use crate::operators::sink::DiscardSink;
 use crate::pipeline::{DataChunk, DataChunkView, MaterializationReport, PipelineNode, Transform};
-use crate::udf::FunctionRegistry;
+use crate::udf::{FunctionRegistry, MappedUdfInput};
 use arrow::array::ArrayRef;
 use common::Result;
 use common::protocol::{MicroOp, MicroProgram, RegId};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
+use self::view_safety::supports_view_execution;
 
 /// Aggregated execution statistics for one VM pipeline run.
 #[derive(Debug, Default)]
@@ -30,7 +31,22 @@ struct VmStats {
     input_materialization: MaterializationReport,
     /// Time spent converting referenced view input columns.
     input_materialize_us: u64,
+    /// UDF batches handled through borrowed source-row mappings.
+    mapped_udf_batches: u64,
+    /// UDF batches that used the dense compatibility path.
+    dense_udf_fallback_batches: u64,
 }
+
+#[cfg(test)]
+#[path = "executor/view_tests.rs"]
+mod view_tests;
+
+#[cfg(test)]
+#[path = "executor/udf_tests.rs"]
+mod udf_tests;
+
+#[path = "executor/view_safety.rs"]
+mod view_safety;
 
 impl VmStats {
     fn accumulate(&mut self, other: Self) {
@@ -43,6 +59,12 @@ impl VmStats {
         self.input_materialize_us = self
             .input_materialize_us
             .saturating_add(other.input_materialize_us);
+        self.mapped_udf_batches = self
+            .mapped_udf_batches
+            .saturating_add(other.mapped_udf_batches);
+        self.dense_udf_fallback_batches = self
+            .dense_udf_fallback_batches
+            .saturating_add(other.dense_udf_fallback_batches);
     }
 }
 
@@ -56,6 +78,7 @@ pub struct VectorVmExecutor<B = DataChunk> {
     registry: Arc<FunctionRegistry>,
     next: Box<dyn PipelineNode<B>>,
     input_registers: Vec<RegId>,
+    instruction_inputs: Vec<Vec<RegId>>,
     written_registers: HashSet<RegId>,
     projection: Option<Vec<RegId>>,
     stats: VmStats,
@@ -68,13 +91,15 @@ impl<B> VectorVmExecutor<B> {
         next: Box<dyn PipelineNode<B>>,
     ) -> Self {
         let register_count = program.register_count;
-        let (input_registers, written_registers, projection) = analyze_registers(&program);
+        let (input_registers, written_registers, projection, instruction_inputs) =
+            analyze_registers(&program);
         Self {
             program,
             registers: RegisterFile::new(register_count),
             registry,
             next,
             input_registers,
+            instruction_inputs,
             written_registers,
             projection,
             stats: VmStats::default(),
@@ -158,25 +183,30 @@ fn store_result(registers: &mut RegisterFile, dst: RegId, array: ArrayRef) -> Re
     }
 }
 
+fn store_value_result(registers: &mut RegisterFile, dst: RegId, value: RegValue) -> Result<()> {
+    match value {
+        RegValue::Array(array) => store_result(registers, dst, array),
+        value => registers.set_value(dst, value),
+    }
+}
+
 /// Finds registers that need an input value, registers written by the program,
 /// and the final requested projection. This runs once when the VM node is built
 /// so view batches only materialize input columns that the program reads.
 fn analyze_registers(
     program: &MicroProgram,
-) -> (Vec<RegId>, HashSet<RegId>, Option<Vec<RegId>>) {
+) -> (
+    Vec<RegId>,
+    HashSet<RegId>,
+    Option<Vec<RegId>>,
+    Vec<Vec<RegId>>,
+) {
     let mut defined = HashSet::new();
     let mut reads = HashSet::new();
     let mut writes = HashSet::new();
     let mut projection = None;
+    let mut instruction_inputs = Vec::with_capacity(program.instructions.len());
 
-    macro_rules! read {
-        ($register:expr) => {{
-            let register = $register;
-            if !defined.contains(&register) {
-                reads.insert(register);
-            }
-        }};
-    }
     macro_rules! write {
         ($register:expr) => {{
             let register = $register;
@@ -186,6 +216,18 @@ fn analyze_registers(
     }
 
     for instruction in &program.instructions {
+        let mut current_inputs = Vec::new();
+        macro_rules! read {
+            ($register:expr) => {{
+                let register = $register;
+                if !defined.contains(&register) {
+                    reads.insert(register);
+                }
+                if !current_inputs.contains(&register) {
+                    current_inputs.push(register);
+                }
+            }};
+        }
         match instruction {
             MicroOp::LoadConstant { dst, .. } => write!(*dst),
             MicroOp::CopyRegister { dst, src } => {
@@ -220,37 +262,74 @@ fn analyze_registers(
                 read!(*src2);
                 write!(*dst);
             }
-            MicroOp::Like { dst, src, pattern, .. } => {
+            MicroOp::Like {
+                dst, src, pattern, ..
+            } => {
                 read!(*src);
                 read!(*pattern);
                 write!(*dst);
             }
-            MicroOp::InList { dst, value, candidates, .. } => {
+            MicroOp::InList {
+                dst,
+                value,
+                candidates,
+                ..
+            } => {
                 read!(*value);
-                for register in candidates { read!(*register); }
+                for register in candidates {
+                    read!(*register);
+                }
                 write!(*dst);
             }
-            MicroOp::Case { dst, when_regs, then_regs, else_reg, .. } => {
-                for register in when_regs { read!(*register); }
-                for register in then_regs { read!(*register); }
-                if let Some(register) = else_reg { read!(*register); }
+            MicroOp::Case {
+                dst,
+                when_regs,
+                then_regs,
+                else_reg,
+                ..
+            } => {
+                for register in when_regs {
+                    read!(*register);
+                }
+                for register in then_regs {
+                    read!(*register);
+                }
+                if let Some(register) = else_reg {
+                    read!(*register);
+                }
                 write!(*dst);
             }
             MicroOp::CallUdf { dst, arg_regs, .. } => {
-                for register in arg_regs { read!(*register); }
+                for register in arg_regs {
+                    read!(*register);
+                }
                 write!(*dst);
             }
             MicroOp::FilterMask { bool_reg } => read!(*bool_reg),
             MicroOp::ProjectRegisters { out_regs } => {
                 projection = Some(out_regs.clone());
             }
-            MicroOp::StateBuild { key_regs, payload_regs, .. } => {
-                for register in key_regs { read!(*register); }
-                for register in payload_regs { read!(*register); }
+            MicroOp::StateBuild {
+                key_regs,
+                payload_regs,
+                ..
+            } => {
+                for register in key_regs {
+                    read!(*register);
+                }
+                for register in payload_regs {
+                    read!(*register);
+                }
             }
-            MicroOp::StateProbe { key_regs, out_regs, .. } => {
-                for register in key_regs { read!(*register); }
-                for register in out_regs { write!(*register); }
+            MicroOp::StateProbe {
+                key_regs, out_regs, ..
+            } => {
+                for register in key_regs {
+                    read!(*register);
+                }
+                for register in out_regs {
+                    write!(*register);
+                }
             }
             MicroOp::StateFold { agg_regs, .. } => {
                 for register in agg_regs {
@@ -259,23 +338,32 @@ fn analyze_registers(
                 }
             }
         }
+        instruction_inputs.push(current_inputs);
     }
 
     let mut input_registers = reads.into_iter().collect::<Vec<_>>();
     input_registers.sort_unstable();
-    (input_registers, writes, projection)
+    (input_registers, writes, projection, instruction_inputs)
 }
 
 impl<B> VectorVmExecutor<B> {
     /// Evaluates `chunk` through the program, leaving results in the registers.
     fn eval_chunk(&mut self, chunk: &mut DataChunk) -> Result<()> {
         self.registers.mount_chunk(chunk)?;
-        self.eval_mounted_chunk(chunk)
+        self.eval_mounted_chunk(chunk, false)
     }
 
     /// Evaluates a program after its input registers have been mounted.
-    fn eval_mounted_chunk(&mut self, chunk: &mut DataChunk) -> Result<()> {
-        for op in &self.program.instructions {
+    fn eval_mounted_chunk(
+        &mut self,
+        chunk: &mut DataChunk,
+        retain_view_columns: bool,
+    ) -> Result<()> {
+        let program = Arc::clone(&self.program);
+        for (instruction_index, op) in program.instructions.iter().enumerate() {
+            if retain_view_columns && !supports_view_execution(op) {
+                self.reject_mapped_instruction_inputs(instruction_index, op)?;
+            }
             match op {
                 MicroOp::LoadConstant { dst, value } => {
                     let scalar = ops::literal_to_scalar(value)?;
@@ -286,54 +374,61 @@ impl<B> VectorVmExecutor<B> {
                     self.registers.set_value(*dst, value)?;
                 }
                 MicroOp::Cast { dst, src, target } => {
-                    let (is_scalar, casted) = {
+                    let casted = {
                         let source = self.registers.get(*src)?;
-                        (source.is_scalar(), ops::eval_cast(source.array(), target)?)
+                        ops::eval_mapped_cast(
+                            source,
+                            self.registers.chunk_len(),
+                            target,
+                        )?
                     };
-                    if is_scalar {
-                        self.registers.set_scalar(*dst, casted)?;
-                    } else {
-                        store_result(&mut self.registers, *dst, casted)?;
-                    }
+                    store_value_result(&mut self.registers, *dst, casted)?;
                 }
-                MicroOp::Add { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_add(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
-                }
-                MicroOp::Sub { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_sub(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
-                }
-                MicroOp::Mul { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_mul(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
-                }
-                MicroOp::Div { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_div(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
-                }
-                MicroOp::Mod { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_mod(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                MicroOp::Add { dst, src1, src2 }
+                | MicroOp::Sub { dst, src1, src2 }
+                | MicroOp::Mul { dst, src1, src2 }
+                | MicroOp::Div { dst, src1, src2 }
+                | MicroOp::Mod { dst, src1, src2 } => {
+                    let result = {
+                        let lhs = self.registers.get(*src1)?;
+                        let rhs = self.registers.get(*src2)?;
+                        ops::eval_mapped_arithmetic(
+                            op,
+                            lhs,
+                            rhs,
+                            self.registers.chunk_len(),
+                        )?
+                    };
+                    store_value_result(&mut self.registers, *dst, result)?;
                 }
                 MicroOp::Neg { dst, src } => {
-                    let res = ops::eval_neg(self.registers.get(*src)?.array())?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let result = {
+                        let source = self.registers.get(*src)?;
+                        ops::eval_mapped_neg(source, self.registers.chunk_len())?
+                    };
+                    store_value_result(&mut self.registers, *dst, result)?;
                 }
                 MicroOp::CmpEq { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_cmp_eq(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let lhs = self.registers.get(*src1)?;
+                    let rhs = self.registers.get(*src2)?;
+                    let res = ops::eval_mapped_boolean_binary(
+                        lhs,
+                        rhs,
+                        self.registers.chunk_len(),
+                        ops::eval_cmp_eq,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::CmpNeq { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_cmp_neq(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let lhs = self.registers.get(*src1)?;
+                    let rhs = self.registers.get(*src2)?;
+                    let res = ops::eval_mapped_boolean_binary(
+                        lhs,
+                        rhs,
+                        self.registers.chunk_len(),
+                        ops::eval_cmp_neq,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::Like {
                     dst,
@@ -341,12 +436,15 @@ impl<B> VectorVmExecutor<B> {
                     pattern,
                     negated,
                 } => {
-                    let res = ops::eval_like(
-                        self.registers.get(*src)?,
-                        self.registers.get(*pattern)?,
-                        *negated,
+                    let value = self.registers.get(*src)?;
+                    let pattern = self.registers.get(*pattern)?;
+                    let res = ops::eval_mapped_boolean_binary(
+                        value,
+                        pattern,
+                        self.registers.chunk_len(),
+                        |value, pattern| ops::eval_like(value, pattern, *negated),
                     )?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::InList {
                     dst,
@@ -359,13 +457,13 @@ impl<B> VectorVmExecutor<B> {
                         .iter()
                         .map(|register| self.registers.get(*register).cloned())
                         .collect::<Result<Vec<_>>>()?;
-                    let res = ops::eval_in_list(
+                    let res = ops::eval_in_list_value(
                         &value,
                         &candidates,
                         self.registers.chunk_len(),
                         *negated,
                     )?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::Case {
                     dst,
@@ -385,100 +483,207 @@ impl<B> VectorVmExecutor<B> {
                     let otherwise = else_reg
                         .map(|register| self.registers.get(register).cloned())
                         .transpose()?;
-                    let res = ops::eval_case(
+                    let res = ops::eval_case_value(
                         &conditions,
                         &results,
                         otherwise.as_ref(),
                         &return_type.to_arrow(),
                         self.registers.chunk_len(),
                     )?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::CmpGt { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_cmp_gt(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let lhs = self.registers.get(*src1)?;
+                    let rhs = self.registers.get(*src2)?;
+                    let res = ops::eval_mapped_boolean_binary(
+                        lhs,
+                        rhs,
+                        self.registers.chunk_len(),
+                        ops::eval_cmp_gt,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::CmpGte { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_cmp_gte(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let lhs = self.registers.get(*src1)?;
+                    let rhs = self.registers.get(*src2)?;
+                    let res = ops::eval_mapped_boolean_binary(
+                        lhs,
+                        rhs,
+                        self.registers.chunk_len(),
+                        ops::eval_cmp_gte,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::CmpLt { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_cmp_lt(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let lhs = self.registers.get(*src1)?;
+                    let rhs = self.registers.get(*src2)?;
+                    let res = ops::eval_mapped_boolean_binary(
+                        lhs,
+                        rhs,
+                        self.registers.chunk_len(),
+                        ops::eval_cmp_lt,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::CmpLte { dst, src1, src2 } => {
-                    let res =
-                        ops::eval_cmp_lte(self.registers.get(*src1)?, self.registers.get(*src2)?)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let lhs = self.registers.get(*src1)?;
+                    let rhs = self.registers.get(*src2)?;
+                    let res = ops::eval_mapped_boolean_binary(
+                        lhs,
+                        rhs,
+                        self.registers.chunk_len(),
+                        ops::eval_cmp_lte,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::And { dst, src1, src2 } => {
-                    let lhs = self.registers.to_array(*src1)?;
-                    let rhs = self.registers.to_array(*src2)?;
-                    let res = ops::eval_and(&lhs, &rhs)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let lhs = self.registers.get(*src1)?;
+                    let rhs = self.registers.get(*src2)?;
+                    let res = ops::eval_mapped_boolean_binary(
+                        lhs,
+                        rhs,
+                        self.registers.chunk_len(),
+                        ops::eval_and_datum,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::Or { dst, src1, src2 } => {
-                    let lhs = self.registers.to_array(*src1)?;
-                    let rhs = self.registers.to_array(*src2)?;
-                    let res = ops::eval_or(&lhs, &rhs)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let lhs = self.registers.get(*src1)?;
+                    let rhs = self.registers.get(*src2)?;
+                    let res = ops::eval_mapped_boolean_binary(
+                        lhs,
+                        rhs,
+                        self.registers.chunk_len(),
+                        ops::eval_or_datum,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::Not { dst, src } => {
-                    let value = self.registers.to_array(*src)?;
-                    let res = ops::eval_not(&value)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let value = self.registers.get(*src)?;
+                    let res = ops::eval_mapped_unary_predicate(
+                        value,
+                        self.registers.chunk_len(),
+                        None,
+                        ops::eval_not,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::IsNull { dst, src } => {
-                    let value = self.registers.to_array(*src)?;
-                    let res = ops::eval_is_null(&value)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let value = self.registers.get(*src)?;
+                    let res = ops::eval_mapped_unary_predicate(
+                        value,
+                        self.registers.chunk_len(),
+                        Some(true),
+                        ops::eval_is_null,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::IsNotNull { dst, src } => {
-                    let value = self.registers.to_array(*src)?;
-                    let res = ops::eval_is_not_null(&value)?;
-                    store_result(&mut self.registers, *dst, res)?;
+                    let value = self.registers.get(*src)?;
+                    let res = ops::eval_mapped_unary_predicate(
+                        value,
+                        self.registers.chunk_len(),
+                        Some(false),
+                        ops::eval_is_not_null,
+                    )?;
+                    store_value_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::FilterMask { bool_reg } => {
                     let mask = self.registers.get(*bool_reg)?;
-                    chunk.selection = ops::apply_filter_mask(&chunk.selection, mask)?;
+                    chunk.selection = ops::apply_filter_mask(
+                        &chunk.selection,
+                        mask,
+                        self.registers.chunk_len(),
+                    )?;
                     if chunk.selection.is_empty() {
                         return Ok(());
                     }
                 }
                 MicroOp::ProjectRegisters { out_regs } => {
-                    chunk.vectors = self.registers.project(out_regs)?;
+                    if !retain_view_columns {
+                        let row_count = self.registers.chunk_len();
+                        chunk.vectors = self.registers.project_dense(out_regs, row_count)?;
+                    }
                 }
                 MicroOp::CallUdf {
                     name,
                     arg_regs,
                     dst,
                 } => {
-                    let mut args = Vec::with_capacity(arg_regs.len());
-                    for &reg in arg_regs {
-                        args.push(self.registers.to_array(reg)?);
-                    }
-                    let res = ops::eval_call_udf(&self.registry, name, &args)?;
+                    let row_count = self.registers.chunk_len();
+                    let mapped_result = {
+                        let mapped_args = arg_regs
+                            .iter()
+                            .map(|&reg| {
+                                self.registers
+                                    .get(reg)
+                                    .map(|value| MappedUdfInput::new(value, row_count))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        ops::eval_call_udf_mapped(
+                            &self.registry,
+                            name,
+                            &mapped_args,
+                            row_count,
+                        )?
+                    };
+                    let res = match mapped_result {
+                        Some(result) => {
+                            self.stats.mapped_udf_batches =
+                                self.stats.mapped_udf_batches.saturating_add(1);
+                            result
+                        }
+                        None => {
+                            if retain_view_columns {
+                                for &register in arg_regs {
+                                    if self.registers.get(register)?.is_mapped() {
+                                        return Err(common::VeinError::unsupported(
+                                            format!(
+                                                "UDF {name} must implement invoke_mapped for source-backed or segmented inputs"
+                                            ),
+                                            None,
+                                        ));
+                                    }
+                                }
+                            }
+                            self.stats.dense_udf_fallback_batches = self
+                                .stats
+                                .dense_udf_fallback_batches
+                                .saturating_add(1);
+                            let args = arg_regs
+                                .iter()
+                                .map(|&reg| self.registers.to_array(reg))
+                                .collect::<Result<Vec<_>>>()?;
+                            ops::eval_call_udf(&self.registry, name, &args)?
+                        }
+                    };
                     store_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::VectorCosineDistance { dst, src1, src2 } => {
-                    let lhs = self.registers.to_array(*src1)?;
-                    let rhs = self.registers.to_array(*src2)?;
-                    let res = ops::eval_cosine_distance(&lhs, &rhs)?;
+                    let res = ops::eval_mapped_vector_distance(
+                        self.registers.get(*src1)?,
+                        self.registers.get(*src2)?,
+                        self.registers.chunk_len(),
+                        ops::VectorDistance::Cosine,
+                    )?;
                     store_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::VectorL2Distance { dst, src1, src2 } => {
-                    let lhs = self.registers.to_array(*src1)?;
-                    let rhs = self.registers.to_array(*src2)?;
-                    let res = ops::eval_l2_distance(&lhs, &rhs)?;
+                    let res = ops::eval_mapped_vector_distance(
+                        self.registers.get(*src1)?,
+                        self.registers.get(*src2)?,
+                        self.registers.chunk_len(),
+                        ops::VectorDistance::L2,
+                    )?;
                     store_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::VectorDotProduct { dst, src1, src2 } => {
-                    let lhs = self.registers.to_array(*src1)?;
-                    let rhs = self.registers.to_array(*src2)?;
-                    let res = ops::eval_dot_product(&lhs, &rhs)?;
+                    let res = ops::eval_mapped_vector_distance(
+                        self.registers.get(*src1)?,
+                        self.registers.get(*src2)?,
+                        self.registers.chunk_len(),
+                        ops::VectorDistance::Dot,
+                    )?;
                     store_result(&mut self.registers, *dst, res)?;
                 }
                 MicroOp::StateBuild { .. }
@@ -518,13 +723,15 @@ impl PipelineNode<DataChunk> for VectorVmExecutor {
     fn flush(&mut self) -> Result<()> {
         let stats = std::mem::take(&mut self.stats);
         if stats.chunks > 0 {
-            tracing::info!(
+            tracing::debug!(
                 target: "vein.audit",
                 event = "vm_finished",
                 chunks = stats.chunks,
                 rows_in = stats.rows_in,
                 rows_out = stats.rows_out,
                 eval_us = stats.eval_us,
+                mapped_udf_batches = stats.mapped_udf_batches,
+                dense_udf_fallback_batches = stats.dense_udf_fallback_batches,
                 "vm_finished"
             );
         }
@@ -568,34 +775,21 @@ impl PipelineNode<DataChunkView> for VectorVmExecutor<DataChunkView> {
         let started = Instant::now();
         let rows_in = view.num_rows();
         let input_columns = view.num_columns();
-        let active_view = view.compact_active_rows()?;
+        let active_view = Arc::new(view.compact_active_rows()?);
         let row_count = active_view.num_rows();
-        let materialize_started = Instant::now();
-        let mut report = MaterializationReport::default();
         let mounted = self
             .input_registers
             .iter()
             .copied()
             .filter(|register| (*register as usize) < input_columns)
-            .map(|register| {
-                active_view
-                    .materialize_column_with_report(register as usize)
-                    .map(|(array, column_report)| {
-                        report.accumulate(column_report);
-                        (register, array)
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.stats.input_materialization.accumulate(report);
-        self.stats.input_materialize_us = self.stats.input_materialize_us.saturating_add(
-            u64::try_from(materialize_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-        );
+            .collect::<Vec<_>>();
         let mut chunk = DataChunk::new(
             Vec::new(),
             common::arrow::SelectionVector::new_dense(row_count),
         );
-        self.registers.mount_columns(row_count, mounted)?;
-        self.eval_mounted_chunk(&mut chunk)?;
+        self.registers
+            .mount_view_columns(row_count, Arc::clone(&active_view), mounted)?;
+        self.eval_mounted_chunk(&mut chunk, true)?;
         let result = if chunk.selection.is_empty() {
             None
         } else {
@@ -606,20 +800,20 @@ impl PipelineNode<DataChunkView> for VectorVmExecutor<DataChunkView> {
             let mut output_columns = Vec::with_capacity(output_registers.len());
             let mut computed = Vec::new();
             for register in output_registers {
-                let input_column = (register as usize) < input_columns
-                    && !self.written_registers.contains(&register);
-                if input_column {
-                    output_columns.push(Some(register as usize));
+                let source_column = self.registers.view_column_from(register, &active_view)?;
+                let input_column = source_column.or_else(|| {
+                    ((register as usize) < input_columns
+                        && !self.written_registers.contains(&register))
+                        .then_some(register as usize)
+                });
+                if let Some(column) = input_column {
+                    output_columns.push(Some(column));
                 } else {
                     output_columns.push(None);
-                    computed.push(self.registers.to_array(register)?);
+                    computed.push(self.registers.to_view_column(register, row_count)?);
                 }
             }
-            Some(active_view.project_with_arrays(
-                &output_columns,
-                computed,
-                chunk.selection,
-            )?)
+            Some(active_view.project_with_columns(&output_columns, computed, chunk.selection)?)
         };
         self.stats.chunks += 1;
         self.stats.rows_in += rows_in as u64;
@@ -634,7 +828,7 @@ impl PipelineNode<DataChunkView> for VectorVmExecutor<DataChunkView> {
     fn flush(&mut self) -> Result<()> {
         let stats = std::mem::take(&mut self.stats);
         if stats.chunks > 0 {
-            tracing::info!(
+            tracing::debug!(
                 target: "vein.audit",
                 event = "vm_finished",
                 chunks = stats.chunks,
@@ -655,7 +849,6 @@ impl PipelineNode<DataChunkView> for VectorVmExecutor<DataChunkView> {
     fn finished(&self) -> bool {
         self.next.finished()
     }
-
 }
 
 impl Transform<DataChunkView> for VectorVmExecutor<DataChunkView> {
@@ -702,8 +895,8 @@ mod tests {
     use super::*;
     use crate::pipeline::{DataChunkView, RowMapping, ViewColumn};
     use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
-    use types::LogicalLiteral;
     use std::sync::Mutex;
+    use types::LogicalLiteral;
     use types::VeinDataType;
 
     struct CollectNode {
@@ -762,26 +955,44 @@ mod tests {
         let program = MicroProgram {
             register_count: 5,
             instructions: vec![
-                MicroOp::LoadConstant { dst: 2, value: LogicalLiteral::Int64(2) },
-                MicroOp::CmpGt { dst: 3, src1: 0, src2: 2 },
+                MicroOp::LoadConstant {
+                    dst: 2,
+                    value: LogicalLiteral::Int64(2),
+                },
+                MicroOp::CmpGt {
+                    dst: 3,
+                    src1: 0,
+                    src2: 2,
+                },
                 MicroOp::FilterMask { bool_reg: 3 },
-                MicroOp::Add { dst: 4, src1: 0, src2: 2 },
-                MicroOp::ProjectRegisters { out_regs: vec![1, 4] },
+                MicroOp::Add {
+                    dst: 4,
+                    src1: 0,
+                    src2: 2,
+                },
+                MicroOp::ProjectRegisters {
+                    out_regs: vec![1, 4],
+                },
             ],
         };
         let views = Arc::new(Mutex::new(Vec::new()));
         let mut vm = VectorVmExecutor::new_view(
             Arc::new(program),
             Arc::new(FunctionRegistry::new()),
-            Box::new(CollectViewNode { views: Arc::clone(&views) }),
+            Box::new(CollectViewNode {
+                views: Arc::clone(&views),
+            }),
         );
 
         vm.push(view).expect("view VM pipeline should run");
-        assert_eq!(vm.stats.input_materialization.gathered_columns, 1);
+        assert_eq!(vm.stats.input_materialization.gathered_columns, 0);
         assert_eq!(vm.stats.input_materialization.shared_columns, 0);
-        assert!(vm.stats.input_materialization.gathered_output_buffer_bytes > 0);
+        assert_eq!(vm.stats.input_materialization.gathered_output_buffer_bytes, 0);
         vm.flush().expect("view VM pipeline should flush");
-        assert_eq!(vm.stats.input_materialization, MaterializationReport::default());
+        assert_eq!(
+            vm.stats.input_materialization,
+            MaterializationReport::default()
+        );
 
         let views = views.lock().unwrap();
         let output = &views[0];
@@ -792,7 +1003,11 @@ mod tests {
             let (array, physical_row) = output.resolve(0, row).unwrap().unwrap();
             assert!(Arc::ptr_eq(array, &labels));
             output_labels.push(
-                array.as_any().downcast_ref::<StringArray>().unwrap().value(physical_row),
+                array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(physical_row),
             );
         }
         assert_eq!(output_labels, vec!["D", "B"]);
@@ -812,31 +1027,62 @@ mod tests {
         for compute in [false, true] {
             let instructions = if compute {
                 vec![
-                    MicroOp::Add { dst: 1, src1: 0, src2: 0 },
-                    MicroOp::ProjectRegisters { out_regs: vec![0, 1] },
+                    MicroOp::Add {
+                        dst: 1,
+                        src1: 0,
+                        src2: 0,
+                    },
+                    MicroOp::ProjectRegisters {
+                        out_regs: vec![0, 1],
+                    },
                 ]
             } else {
-                vec![MicroOp::ProjectRegisters { out_regs: vec![0, 0] }]
+                vec![MicroOp::ProjectRegisters {
+                    out_regs: vec![0, 0],
+                }]
             };
             let output = Arc::new(Mutex::new(Vec::new()));
             let mut vm = VectorVmExecutor::new_view(
-                Arc::new(MicroProgram { register_count: 2, instructions }),
+                Arc::new(MicroProgram {
+                    register_count: 2,
+                    instructions,
+                }),
                 Arc::new(FunctionRegistry::new()),
-                Box::new(CollectViewNode { views: Arc::clone(&output) }),
+                Box::new(CollectViewNode {
+                    views: Arc::clone(&output),
+                }),
             );
             for _ in 0..2 {
-                vm.push(DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(&source)])).unwrap()).unwrap();
+                vm.push(
+                    DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(&source)]))
+                        .unwrap(),
+                )
+                    .unwrap();
             }
-            assert_eq!(vm.stats.input_materialization.shared_columns, if compute { 2 } else { 0 });
+            assert_eq!(
+                vm.stats.input_materialization.shared_columns,
+                0,
+                "view inputs and mapped outputs stay reference-backed",
+            );
             assert_eq!(vm.stats.input_materialization.gathered_columns, 0);
-            assert_eq!(vm.stats.input_materialization.gathered_output_buffer_bytes, 0);
+            assert_eq!(
+                vm.stats.input_materialization.gathered_output_buffer_bytes,
+                0
+            );
             let views = output.lock().unwrap();
             assert_eq!(views.len(), 2);
             for view in views.iter() {
                 assert!(Arc::ptr_eq(view.resolve(0, 0).unwrap().unwrap().0, &source));
                 let values = view.materialize_column(1).unwrap();
                 let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
-                assert_eq!(values.values(), if compute { &[20, 40, 60] } else { &[10, 20, 30] });
+                assert_eq!(
+                    values.values(),
+                    if compute {
+                        &[20, 40, 60]
+                    } else {
+                        &[10, 20, 30]
+                    }
+                );
             }
         }
     }
@@ -930,13 +1176,11 @@ mod tests {
         let sink = Box::new(CollectNode {
             chunks: Arc::clone(&collected),
         });
-        let mut vm = VectorVmExecutor::new(
-            Arc::new(program),
-            Arc::new(FunctionRegistry::new()),
-            sink,
-        );
+        let mut vm =
+            VectorVmExecutor::new(Arc::new(program), Arc::new(FunctionRegistry::new()), sink);
 
-        vm.push(chunk).expect("filter and projection should execute");
+        vm.push(chunk)
+            .expect("filter and projection should execute");
         vm.flush().expect("projected chunk should flush");
 
         let chunks = collected.lock().expect("collected chunks");
@@ -1045,17 +1289,15 @@ mod tests {
         let sink = Box::new(CollectNode {
             chunks: Arc::clone(&collected),
         });
-        let mut vm = VectorVmExecutor::new(
-            Arc::new(program),
-            Arc::new(FunctionRegistry::new()),
-            sink,
-        );
+        let mut vm =
+            VectorVmExecutor::new(Arc::new(program), Arc::new(FunctionRegistry::new()), sink);
 
         vm.push(chunk).expect("LIKE instruction should execute");
         vm.flush().expect("LIKE result should flush");
 
         let chunks = collected.lock().unwrap();
         assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].num_rows(), 3);
         let result = chunks[0]
             .column(0)
             .as_any()
@@ -1142,18 +1384,20 @@ mod tests {
                     else_reg: Some(5),
                     return_type: VeinDataType::Utf8,
                 },
-                MicroOp::ProjectRegisters { out_regs: vec![3, 6] },
+                MicroOp::ProjectRegisters {
+                    out_regs: vec![3, 6],
+                },
             ],
         };
         let collected = Arc::new(Mutex::new(Vec::new()));
-        let sink = Box::new(CollectNode { chunks: collected.clone() });
-        let mut vm = VectorVmExecutor::new(
-            Arc::new(program),
-            Arc::new(FunctionRegistry::new()),
-            sink,
-        );
+        let sink = Box::new(CollectNode {
+            chunks: collected.clone(),
+        });
+        let mut vm =
+            VectorVmExecutor::new(Arc::new(program), Arc::new(FunctionRegistry::new()), sink);
 
-        vm.push(chunk).expect("conditional instructions should execute");
+        vm.push(chunk)
+            .expect("conditional instructions should execute");
         vm.flush().expect("conditional results should flush");
 
         let chunks = collected.lock().unwrap();
@@ -1162,8 +1406,23 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
             .unwrap();
-        assert_eq!(membership, &arrow::array::BooleanArray::from(vec![None, Some(true), None, None]));
-        let labels = chunks[0].column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(labels, &StringArray::from(vec![Some("other"), Some("matched"), Some("other"), Some("other")]));
+        assert_eq!(
+            membership,
+            &arrow::array::BooleanArray::from(vec![None, Some(true), None, None])
+        );
+        let labels = chunks[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            labels,
+            &StringArray::from(vec![
+                Some("other"),
+                Some("matched"),
+                Some("other"),
+                Some("other")
+            ])
+        );
     }
 }

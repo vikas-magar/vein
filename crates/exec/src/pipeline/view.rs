@@ -122,6 +122,15 @@ enum MappingRows {
         first_row: u32,
         len: usize,
     },
+    Concatenated {
+        end_offsets: Arc<[usize]>,
+        len: usize,
+    },
+    Repeated {
+        source: u32,
+        row: u32,
+        len: usize,
+    },
     Explicit(Arc<[SourceRow]>),
 }
 
@@ -144,6 +153,68 @@ impl RowMapping {
             rows: MappingRows::Identity {
                 source: source_index,
                 first_row: 0,
+                len: row_count,
+            },
+        })
+    }
+
+    /// Maps a dense output range across adjacent source arrays without one row
+    /// mapping entry per value.
+    pub fn concatenated(source_lengths: Arc<[usize]>) -> Result<Self> {
+        if source_lengths.len() >= u32::MAX as usize {
+            return Err(VeinError::internal(
+                "concatenated row mapping has more source groups than its u32 index can represent",
+            ));
+        }
+        let mut row_count = 0usize;
+        let mut end_offsets = Vec::with_capacity(source_lengths.len());
+        for (index, source_len) in source_lengths.iter().copied().enumerate() {
+            if source_len > u32::MAX as usize {
+                return Err(VeinError::internal(format!(
+                    "concatenated row mapping source {index} exceeds the u32 row index limit"
+                )));
+            }
+            row_count = row_count.checked_add(source_len).ok_or_else(|| {
+                VeinError::internal("concatenated row mapping length overflow")
+            })?;
+            end_offsets.push(row_count);
+        }
+        if row_count > u32::MAX as usize {
+            return Err(VeinError::internal(
+                "concatenated row mapping exceeds the u32 output index limit",
+            ));
+        }
+        if source_lengths.len() == 1 {
+            return Self::identity(source_lengths, 0, row_count);
+        }
+        Ok(Self {
+            source_lengths,
+            rows: MappingRows::Concatenated {
+                end_offsets: Arc::from(end_offsets),
+                len: row_count,
+            },
+        })
+    }
+
+    /// Maps each output row to one scalar source value without expanding it.
+    pub fn repeated(
+        source_lengths: Arc<[usize]>,
+        source_index: u32,
+        source_row: u32,
+        row_count: usize,
+    ) -> Result<Self> {
+        validate_source_index(&source_lengths, source_index)?;
+        let source_len = source_lengths[source_index as usize];
+        if source_row as usize >= source_len || row_count > u32::MAX as usize {
+            return Err(VeinError::internal(format!(
+                "repeated row mapping source row {source_row} or output length {row_count} is invalid"
+            )));
+        }
+        Ok(Self {
+            source_lengths,
+            rows: MappingRows::Repeated {
+                source: source_index,
+                row: source_row,
                 len: row_count,
             },
         })
@@ -184,7 +255,9 @@ impl RowMapping {
     /// Number of physical output rows represented by this mapping.
     pub fn len(&self) -> usize {
         match &self.rows {
-            MappingRows::Identity { len, .. } => *len,
+            MappingRows::Identity { len, .. }
+            | MappingRows::Repeated { len, .. }
+            | MappingRows::Concatenated { len, .. } => *len,
             MappingRows::Explicit(rows) => rows.len(),
         }
     }
@@ -208,6 +281,20 @@ impl RowMapping {
                 source: *source,
                 row: first_row + output_row as u32,
             },
+            MappingRows::Concatenated { end_offsets, .. } => {
+                let source = end_offsets.partition_point(|offset| *offset <= output_row);
+                let first_row = source
+                    .checked_sub(1)
+                    .map_or(0, |previous| end_offsets[previous]);
+                SourceRow {
+                    source: source as u32,
+                    row: (output_row - first_row) as u32,
+                }
+            }
+            MappingRows::Repeated { source, row, .. } => SourceRow {
+                source: *source,
+                row: *row,
+            },
             MappingRows::Explicit(rows) => rows[output_row],
         })
     }
@@ -227,6 +314,20 @@ impl RowMapping {
                 *first_row as usize + selection.start,
                 selection.len(),
             )),
+            MappingRows::Concatenated { len, .. }
+            if selection.end <= *len && selection.start < selection.end =>
+                {
+                    let (first_source, first_row) = self.source_row(selection.start).ok()?.indexes()?;
+                    let (last_source, last_row) = self.source_row(selection.end - 1).ok()?.indexes()?;
+                    (first_source == last_source
+                        && last_row as usize - first_row as usize + 1 == selection.len())
+                        .then_some((first_source as usize, first_row as usize, selection.len()))
+                }
+            MappingRows::Repeated { source, row, len }
+            if selection.end <= *len && selection.len() == 1 =>
+                {
+                    Some((*source as usize, *row as usize, 1))
+                }
             _ => None,
         }
     }
@@ -365,13 +466,19 @@ pub struct DataChunkView {
 }
 
 impl common::statistics::StatisticsInput for DataChunkView {
-    fn num_rows(&self) -> usize { DataChunkView::num_rows(self) }
-    fn num_columns(&self) -> usize { DataChunkView::num_columns(self) }
+    fn num_rows(&self) -> usize {
+        DataChunkView::num_rows(self)
+    }
+    fn num_columns(&self) -> usize {
+        DataChunkView::num_columns(self)
+    }
     fn column_type(&self, column: usize) -> Result<&DataType> {
         self.column_data_type(column)
     }
     fn value(&self, column: usize, row: usize) -> Result<Option<(&dyn Array, usize)>> {
-        Ok(self.resolve(column, row)?.map(|(array, index)| (array.as_ref(), index)))
+        Ok(self
+            .resolve(column, row)?
+            .map(|(array, index)| (array.as_ref(), index)))
     }
 }
 
@@ -716,6 +823,14 @@ impl DataChunkView {
             .ok_or_else(|| VeinError::internal(format!("view column {column} is out of bounds")))
     }
 
+    /// Returns retained source arrays for one column without copying payloads.
+    pub fn source_arrays_for_column(&self, column: usize) -> Result<&[ArrayRef]> {
+        self.columns
+            .get(column)
+            .map(|column| column.source_arrays().as_ref())
+            .ok_or_else(|| VeinError::internal(format!("view column {column} is out of bounds")))
+    }
+
     /// Arrow footprint estimates for distinct retained source arrays.
     ///
     /// Array identity deduplicates repeated references to the same Arrow array.
@@ -815,6 +930,27 @@ impl DataChunkView {
         column.resolve(self.selection.get_index(logical_row))
     }
 
+    /// Resolves an active logical row to its source-array index and physical row.
+    /// This exposes row lineage to kernels that can read typed values directly
+    /// from retained arrays instead of materializing a selected Arrow column.
+    pub fn source_row(&self, column: usize, logical_row: usize) -> Result<Option<(usize, usize)>> {
+        let view_column = self
+            .columns
+            .get(column)
+            .ok_or_else(|| VeinError::internal(format!("view column {column} is out of bounds")))?;
+        if logical_row >= self.selection.size() {
+            return Err(VeinError::internal(format!(
+                "logical view row {logical_row} is outside selected row count {}",
+                self.selection.size()
+            )));
+        }
+        Ok(view_column
+            .mapping
+            .source_row(self.selection.get_index(logical_row))?
+            .indexes()
+            .map(|(source, row)| (source as usize, row as usize)))
+    }
+
     /// Materializes one active column for an Arrow kernel.
     ///
     /// A contiguous range from one source is returned as a zero-copy slice.
@@ -902,10 +1038,9 @@ impl DataChunkView {
             }
         }
 
-        if can_slice
-            && let Some((array, start, len)) = contiguous {
-                return Ok((array.slice(start, len), ColumnMaterialization::Shared));
-            }
+        if can_slice && let Some((array, start, len)) = contiguous {
+            return Ok((array.slice(start, len), ColumnMaterialization::Shared));
+        }
 
         let null_array = new_null_array(&column.data_type, 1);
         source_arrays.push(null_array.as_ref());
@@ -946,9 +1081,10 @@ impl DataChunkView {
                 let column = &self.columns[index];
                 if let Some((source, _, _)) =
                     column.mapping.contiguous_source_range(&self.selection)
-                    && column.arrays[source].null_count() == 0 {
-                        continue;
-                    }
+                    && column.arrays[source].null_count() == 0
+                {
+                    continue;
+                }
                 for row in 0..self.num_rows() {
                     let null = match self.resolve(index, row)? {
                         Some((array, source_row)) => array.is_null(source_row),
@@ -1049,6 +1185,32 @@ impl DataChunkView {
         computed: Vec<ArrayRef>,
         selection: SelectionVector,
     ) -> Result<Self> {
+        let computed = computed
+            .into_iter()
+            .map(|array| {
+                let mapping = Arc::new(RowMapping::identity(
+                    Arc::from(vec![array.len()]),
+                    0,
+                    array.len(),
+                )?);
+                ViewColumn::new(
+                    vec![Arc::clone(&array)],
+                    array.data_type().clone(),
+                    mapping,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.project_with_columns(columns, computed, selection)
+    }
+
+    /// Projects passthrough and computed view columns without materializing
+    /// their source arrays.
+    pub fn project_with_columns(
+        &self,
+        columns: &[Option<usize>],
+        computed: Vec<ViewColumn>,
+        selection: SelectionVector,
+    ) -> Result<Self> {
         let mut computed = computed.into_iter();
         let mut output = Vec::with_capacity(columns.len());
         for column in columns {
@@ -1057,32 +1219,23 @@ impl DataChunkView {
                     VeinError::internal(format!("view projection column {index} is out of bounds"))
                 })?),
                 None => {
-                    let array = computed.next().ok_or_else(|| {
-                        VeinError::internal("view projection is missing a computed array")
+                    let column = computed.next().ok_or_else(|| {
+                        VeinError::internal("view projection is missing a computed column")
                     })?;
-                    if array.len() != self.row_count {
+                    if column.mapping.len() != self.row_count {
                         return Err(VeinError::internal(format!(
-                            "computed view column has {} rows, expected {}",
-                            array.len(),
+                            "computed view column mapping has {} rows, expected {}",
+                            column.mapping.len(),
                             self.row_count
                         )));
                     }
-                    let mapping = Arc::new(RowMapping::identity(
-                        Arc::from(vec![array.len()]),
-                        0,
-                        array.len(),
-                    )?);
-                    output.push(ViewColumn::new(
-                        vec![Arc::clone(&array)],
-                        array.data_type().clone(),
-                        mapping,
-                    )?);
+                    output.push(column);
                 }
             }
         }
         if computed.next().is_some() {
             return Err(VeinError::internal(
-                "view projection has unused computed arrays",
+                "view projection has unused computed columns",
             ));
         }
         Self::new(self.row_count, output, selection)
@@ -1162,3 +1315,11 @@ fn infer_physical_row_count(vectors: &[ArrayRef], selection: &SelectionVector) -
 #[cfg(test)]
 #[path = "view/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "view/mapping_tests.rs"]
+mod mapping_tests;
+
+#[path = "view/derived.rs"]
+mod derived;
+pub(crate) use derived::{DerivedColumnBuilder, ViewSourceRow};

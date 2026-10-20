@@ -785,6 +785,7 @@ name = "exec"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-cmp",
  "arrow-row",
  "async-trait",
  "bytes",

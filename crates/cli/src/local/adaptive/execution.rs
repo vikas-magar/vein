@@ -88,9 +88,36 @@ fn node_count(plan: &LogicalPlan) -> usize {
     1 + plan.children().into_iter().map(node_count).sum::<usize>()
 }
 
-fn join_count(plan: &LogicalPlan) -> usize {
+pub(super) fn join_count(plan: &LogicalPlan) -> usize {
     usize::from(matches!(plan, LogicalPlan::Join { .. }))
         + plan.children().into_iter().map(join_count).sum::<usize>()
+}
+
+pub(super) fn join_checkpoint_has_search_space(
+    plan: &LogicalPlan,
+    node: &LogicalPlan,
+    path: &[usize],
+) -> bool {
+    if !matches!(node, LogicalPlan::Join { .. }) {
+        return true;
+    }
+    let remaining = continuation_join_count(plan, path);
+    if remaining >= 2 {
+        return true;
+    }
+    tracing::info!(target: "vein.adaptive", event = "adaptive_checkpoint_candidate_skipped",
+        boundary_operator = node.operator_name(), remaining_join_count = remaining,
+        reason = "checkpoint_leaves_no_join_order_alternatives",
+        "skipped join checkpoint before statistics collection");
+    false
+}
+
+fn continuation_join_count(plan: &LogicalPlan, path: &[usize]) -> usize {
+    let Some((&target, rest)) = path.split_first() else { return 0; };
+    usize::from(matches!(plan, LogicalPlan::Join { .. }))
+        + plan.children().into_iter().enumerate().map(|(index, child)| {
+        if index == target { continuation_join_count(child, rest) } else { join_count(child) }
+    }).sum::<usize>()
 }
 
 fn already_builds(node: &PhysicalPlanNode, schema: &plan::VeinSchema) -> bool {
@@ -102,3 +129,7 @@ fn already_builds(node: &PhysicalPlanNode, schema: &plan::VeinSchema) -> bool {
         PhysicalPlanOperator::Pipeline { .. } => false,
     }
 }
+
+#[cfg(test)]
+#[path = "policy_eligibility_tests.rs"]
+mod eligibility_tests;

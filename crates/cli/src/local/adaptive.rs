@@ -112,3 +112,11 @@ fn replace_at(
 #[cfg(test)]
 #[path = "adaptive/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "adaptive/test_support.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "adaptive/policy_selection_tests.rs"]
+mod policy_selection_tests;

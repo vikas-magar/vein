@@ -3,9 +3,73 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType as ArrowDataType, Schema, SchemaRef};
+use common::protocol::ScanPredicate;
 use common::Result;
 use error::VeinError;
+use crate::runtime_filter::RuntimeFilterSet;
 use types::{ResolvedColumnRef, VeinDataType, VeinSchema};
+
+/// Reader columns and output positions for one projected scan batch.
+pub(super) struct ScanProjection {
+    /// Union of output and filter roots, retained for scan diagnostics.
+    pub(super) read_roots: Vec<usize>,
+    /// Parquet roots needed in the final output batch, in source order.
+    pub(super) output_roots: Vec<usize>,
+    /// Output columns' positions in the source-ordered output projection.
+    pub(super) output_positions: Vec<usize>,
+}
+
+/// Resolves narrow predicate inputs separately from the final output projection.
+pub(super) fn scan_projection(
+    arrow_schema: &Schema,
+    projected: &VeinSchema,
+    pushdown: Option<&ScanPredicate>,
+    runtime_filters: &RuntimeFilterSet,
+    path: &str,
+) -> Result<ScanProjection> {
+    let mut fields = projected.fields.clone();
+    if let Some(pushdown) = pushdown {
+        for field in pushdown.stages.iter().flat_map(|stage| &stage.input.fields) {
+            add_unique_field(&mut fields, field);
+        }
+    }
+    if let Some(binding) = runtime_filters.bind(projected) {
+        for field in binding.columns() {
+            add_unique_field(&mut fields, field);
+        }
+    }
+
+    let mut roots = fields
+        .iter()
+        .map(|field| {
+            let index = root_indices(arrow_schema, std::slice::from_ref(field), path)?;
+            Ok((index[0], field.name.as_str()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    roots.sort_unstable_by_key(|(index, _)| *index);
+    let read_roots = roots.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+    let projected_roots = projected
+        .fields
+        .iter()
+        .map(|field| root_indices(arrow_schema, std::slice::from_ref(field), path).map(|roots| roots[0]))
+        .collect::<Result<Vec<_>>>()?;
+    let mut output_roots = projected_roots.clone();
+    output_roots.sort_unstable();
+    output_roots.dedup();
+    let output_positions = projected_roots
+        .iter()
+        .map(|root| output_roots.binary_search(root).map_err(|_| {
+            VeinError::internal("output column is absent from its Parquet projection")
+        }))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ScanProjection { read_roots, output_roots, output_positions })
+}
+
+fn add_unique_field(fields: &mut Vec<ResolvedColumnRef>, field: &ResolvedColumnRef) {
+    if !fields.iter().any(|existing| existing.name == field.name) {
+        fields.push(Arc::clone(field));
+    }
+}
 
 pub(super) fn dictionary_schema_hint(
     parquet_schema: &SchemaRef,

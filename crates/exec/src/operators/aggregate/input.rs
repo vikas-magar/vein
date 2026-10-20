@@ -25,32 +25,46 @@ impl AggregateSink {
         if !self.distinct_collectors.is_empty() {
             self.accumulate_distinct(&chunk)?;
         }
-        self.accumulate_with_spill(&chunk)
+        let batch = AggregateBatch::from_chunk(
+            &chunk,
+            self.plan.groups as usize,
+            self.plan.aggs.len(),
+            &self.grouping_sets,
+        )?;
+        self.accumulate_with_spill(&batch)
+    }
+
+    /// Folds a reference-backed input while retaining grouping columns as views.
+    pub(super) fn accumulate_view(&mut self, view: DataChunkView) -> Result<()> {
+        if !self.distinct_collectors.is_empty() {
+            self.accumulate_distinct_view(&view)?;
+        }
+        let batch = AggregateBatch::from_view(
+            &view,
+            self.plan.groups as usize,
+            self.plan.aggs.len(),
+            &self.grouping_sets,
+        )?;
+        self.accumulate_with_spill(&batch)
     }
 
     /// Retries only resource failures, splitting an oversized selection while
-    /// keeping every Arrow column shared with the original input chunk.
-    fn accumulate_with_spill(&mut self, chunk: &DataChunk) -> Result<()> {
-        match self.accumulate_batch(chunk) {
+    /// keeping every retained Arrow array shared with the input batch.
+    fn accumulate_with_spill(&mut self, batch: &AggregateBatch) -> Result<()> {
+        match self.accumulate_batch(batch) {
             Ok(()) => Ok(()),
             Err(VeinError::ResourceExhausted { .. }) if !self.groups.is_empty() => {
                 self.flush_current_run()?;
-                self.accumulate_with_spill(chunk)
+                self.accumulate_with_spill(batch)
             }
             Err(error @ VeinError::ResourceExhausted { .. }) => {
-                let rows = chunk.selection.size();
+                let rows = batch.selection.size();
                 if rows <= 1 {
                     return Err(error);
                 }
                 let midpoint = rows / 2;
-                let left = DataChunk::new(
-                    chunk.vectors.clone(),
-                    chunk.selection.slice(0, midpoint),
-                );
-                let right = DataChunk::new(
-                    chunk.vectors.clone(),
-                    chunk.selection.slice(midpoint, rows - midpoint),
-                );
+                let left = batch.with_selection(batch.selection.slice(0, midpoint));
+                let right = batch.with_selection(batch.selection.slice(midpoint, rows - midpoint));
                 self.accumulate_with_spill(&left)?;
                 self.accumulate_with_spill(&right)
             }
@@ -58,31 +72,26 @@ impl AggregateSink {
         }
     }
 
-    fn accumulate_batch(&mut self, chunk: &DataChunk) -> Result<()> {
+    fn accumulate_batch(&mut self, batch: &AggregateBatch) -> Result<()> {
         let groups = self.plan.groups as usize;
-        if chunk.num_columns() != groups + self.plan.aggs.len() {
+        if batch.key_columns.len() != groups
+            || batch.aggregate_columns.len() != self.plan.aggs.len()
+        {
             return Err(VeinError::internal(format!(
-                "aggregate expects {} columns, got {}",
-                groups + self.plan.aggs.len(),
-                chunk.num_columns()
+                "aggregate batch has {} grouping columns and {} aggregate columns; expected {groups} and {}",
+                batch.key_columns.len(),
+                batch.aggregate_columns.len(),
+                self.plan.aggs.len()
             )));
         }
         for group_ids in &mut self.group_ids_by_set {
             group_ids.clear();
-            if group_ids.capacity() < chunk.selection.size() {
-                group_ids.reserve(chunk.selection.size());
+            if group_ids.capacity() < batch.selection.size() {
+                group_ids.reserve(batch.selection.size());
             }
         }
-        let mut key_columns = std::iter::repeat_with(|| None)
-            .take(groups)
-            .collect::<Vec<Option<GroupKeyColumn>>>();
-        for &column in self.grouping_sets.iter().flatten() {
-            let column = column as usize;
-            if key_columns[column].is_none() {
-                key_columns[column] = Some(GroupKeyColumn::new(chunk.column(column))?);
-            }
-        }
-        let input_rows = chunk.selection.size();
+        let key_columns = &batch.key_columns;
+        let input_rows = batch.selection.size();
         let grouping_set_count = self.grouping_sets.len();
         // With one Utf8 grouping key, each referenced dictionary entry is a
         // group candidate. The row loop below only fans the resolved IDs out.
@@ -100,7 +109,7 @@ impl AggregateSink {
                 .resize(cardinality + 1, usize::MAX);
             self.dictionary_group_slots.fill(usize::MAX);
             for logical_row in 0..input_rows {
-                let row = chunk.selection.get_index(logical_row);
+                let row = batch.selection.get_index(logical_row);
                 let dictionary_id = column
                     .dictionary_id(row)
                     .expect("dictionary fast path has a dictionary key column");
@@ -160,7 +169,7 @@ impl AggregateSink {
                 if let Some(key_column) = key_column {
                     key_column.hash_batch(
                         column as u32,
-                        &chunk.selection,
+                        &batch.selection,
                         &self.grouping_sets_by_column[column],
                         grouping_set_count,
                         &mut self.group_hashers,
@@ -229,7 +238,7 @@ impl AggregateSink {
             let row = if dictionary_fast_path {
                 self.dictionary_first_rows[candidate]
             } else {
-                chunk.selection.get_index(logical_row)
+                batch.selection.get_index(logical_row)
             };
             match existing_slot {
                 Some(slot) => {
@@ -268,7 +277,7 @@ impl AggregateSink {
                             let leader_row = if dictionary_fast_path {
                                 self.dictionary_first_rows[leader]
                             } else {
-                                chunk.selection.get_index(leader / grouping_set_count)
+                                batch.selection.get_index(leader / grouping_set_count)
                             };
                             leader_set_id == set_id
                                 && grouping_set.iter().all(|&column| {
@@ -376,9 +385,8 @@ impl AggregateSink {
             // Group keys retain their source Arrow arrays. Charge the full array
             // footprint, deduplicated by array identity across operators that
             // share this query tracker, before retaining another Arc to them.
-            let mut retained_arrays = HashSet::new();
-            let mut key_leases = Vec::new();
-            if let Err(error) = key_leases.try_reserve(key_columns.len()) {
+            let mut key_leases = HashMap::new();
+            if let Err(error) = key_leases.try_reserve(batch.key_arrays.iter().flatten().count()) {
                 rollback_new_groups(
                     index,
                     hashes,
@@ -391,20 +399,18 @@ impl AggregateSink {
                     "cannot reserve aggregate group-key leases: {error}"
                 )));
             }
-            for (column, key_column) in key_columns.iter().enumerate() {
-                if key_column.is_none() {
-                    continue;
-                }
-                let array = chunk.column(column);
+            for array in batch.key_arrays.iter().flatten() {
                 let identity = Arc::as_ptr(array) as *const () as usize;
-                if retained_arrays.insert(identity) {
+                if !key_leases.contains_key(&identity) {
                     let lease = self.tracker.lease_retained_array(
                         identity,
                         array.get_array_memory_size(),
                         "aggregate retained group keys",
                     );
                     match lease {
-                        Ok(lease) => key_leases.push(lease),
+                        Ok(lease) => {
+                            key_leases.insert(identity, lease);
+                        }
                         Err(error) => {
                             rollback_new_groups(
                                 index,
@@ -445,10 +451,24 @@ impl AggregateSink {
                     "cannot reserve aggregate group-key lease batches: {error}"
                 )));
             }
-            let batch = self.group_key_batches.len();
-            self.group_key_batches.push(key_columns.clone());
+            if let Err(error) = self.group_key_batch_arrays.try_reserve(1) {
+                rollback_new_groups(
+                    index,
+                    hashes,
+                    groups_store.len(),
+                    new_groups,
+                    memory,
+                    group_memory_before_batch,
+                );
+                return Err(VeinError::internal(format!(
+                    "cannot reserve aggregate group-key source arrays: {error}"
+                )));
+            }
+            let key_batch_index = self.group_key_batches.len();
+            self.group_key_batches.push(key_columns.to_vec());
+            self.group_key_batch_arrays.push(batch.key_arrays.clone());
             self.group_key_batch_leases.push(key_leases);
-            Some(batch)
+            Some(key_batch_index)
         };
         let group_slot_base = groups_store.len();
         for (new_group_index, &candidate) in new_groups.iter().enumerate() {
@@ -457,7 +477,7 @@ impl AggregateSink {
             let row = if dictionary_fast_path {
                 self.dictionary_first_rows[candidate]
             } else {
-                chunk.selection.get_index(logical_row)
+                batch.selection.get_index(logical_row)
             };
             metrics.retained_key_slots_initialized = metrics
                 .retained_key_slots_initialized
@@ -480,7 +500,7 @@ impl AggregateSink {
                 .as_ref()
                 .expect("dictionary key column has a batch view");
             for logical_row in 0..input_rows {
-                let row = chunk.selection.get_index(logical_row);
+                let row = batch.selection.get_index(logical_row);
                 let dictionary_id = key_column
                     .dictionary_id(row)
                     .expect("dictionary fast path has a dictionary key column");
@@ -510,11 +530,11 @@ impl AggregateSink {
             let input = AggregateInput::new(
                 *op,
                 &self.plan.aggregate_input_types[offset],
-                chunk.column(groups + offset),
+                &batch.aggregate_columns[offset],
             )?;
             for group_ids in &self.group_ids_by_set {
                 self.aggregate_states[offset]
-                    .update_batch(input, GroupRows::new(group_ids, &chunk.selection))?;
+                    .update_batch(&input, GroupRows::new(group_ids, &batch.selection))?;
             }
         }
         self.metrics.state_update_ns = self

@@ -3,6 +3,8 @@
 /// Module containing the core LogicalExpr enum and traversal methods.
 pub mod logical;
 
+mod predicate_safety;
+
 /// Module containing volatility definitions for expressions and functions.
 pub mod volatility;
 

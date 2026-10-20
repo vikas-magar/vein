@@ -18,10 +18,10 @@ use common::statistics::{
     TableStatisticsLog,
 };
 use common::{Result, VeinError};
-use exec::operators::sink::{WriteReceipt, WriteStorage};
+use exec::operators::sink::{ViewResultBatch, WriteReceipt, WriteStorage};
 use exec::runtime::TaskExecutor;
 use exec::udf::{FunctionRegistry, register_builtin_scalars};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use physical::PhysicalPlanner;
 use plan::{CatalogProvider, LogicalPlan, PlanTraversal};
 
@@ -289,12 +289,13 @@ impl LocalQuery {
             .ok_or_else(|| VeinError::internal("WRITE task completed without a commit receipt"))
     }
 
-    /// Runs the query and yields Arrow batches through bounded per-task channels.
+    /// Runs the query and yields reference-backed batches through bounded channels.
     ///
     /// Tasks execute concurrently, yet their batches are drained in planning
     /// order, so the result is identical to sequential execution. Every task owns
     /// a bounded channel, which caps buffering at `workers * OUTPUT_BUFFER_BATCHES`
-    /// batches no matter how large the result is.
+    /// batches no matter how large the result is. The yielded views retain source
+    /// arrays and row mappings; consumers opt into contiguous Arrow conversion.
     pub fn into_stream(self) -> LocalResultStream {
         Box::pin(async_stream::stream! {
             let LocalQuery {
@@ -417,6 +418,42 @@ impl LocalQuery {
             }
         })
     }
+
+    /// Explicitly gathers reference-backed results into contiguous Arrow batches.
+    pub fn into_record_batch_stream(self) -> LocalRecordBatchStream {
+        Box::pin(async_stream::stream! {
+            let mut views = self.into_stream();
+            while let Some(result) = views.next().await {
+                let view = match result {
+                    Ok(view) => view,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                let started = Instant::now();
+                match view.to_record_batch_with_report() {
+                    Ok((batch, report)) => {
+                        tracing::info!(
+                            target: "vein.audit",
+                            event = "client_result_materialized",
+                            rows = batch.num_rows(),
+                            elapsed_us = started.elapsed().as_micros() as u64,
+                            shared_columns = report.shared_columns,
+                            gathered_columns = report.gathered_columns,
+                            gathered_output_buffer_bytes = report.gathered_output_buffer_bytes,
+                            "client_result_materialized"
+                        );
+                        yield Ok(batch);
+                    }
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+        })
+    }
 }
 
 fn tasks_from_job(
@@ -490,7 +527,7 @@ fn query_statistics_context(plan: &LogicalPlan) -> QueryStatisticsContext {
 async fn run_task(
     executor: &Arc<dyn TaskExecutor>,
     task: &ExecuteTask,
-    senders: &[Mutex<Option<flume::Sender<RecordBatch>>>],
+    senders: &[Mutex<Option<flume::Sender<ViewResultBatch>>>],
     outcomes: &Mutex<Vec<Option<Result<()>>>>,
     index: usize,
     resources: Option<Arc<exec::runtime::QueryExecutionResources>>,
@@ -500,7 +537,7 @@ async fn run_task(
     };
     let outcome = match resources {
         Some(resources) => executor
-            .execute_streaming_with_resources(
+            .execute_views_streaming_with_resources(
                 task,
                 CancellationToken::new(),
                 sender.clone(),
@@ -509,7 +546,7 @@ async fn run_task(
             .await
             .map(|_| ()),
         None => executor
-            .execute_streaming(task, CancellationToken::new(), sender.clone())
+            .execute_views_streaming(task, CancellationToken::new(), sender.clone())
             .await
             .map(|_| ()),
     };
@@ -521,8 +558,11 @@ async fn run_task(
     drop(sender);
 }
 
-/// A streamed sequence of local query batches.
-pub type LocalResultStream = Pin<Box<dyn Stream<Item=Result<RecordBatch>>>>;
+/// Reference-backed query results; no output columns are gathered by the stream.
+pub type LocalResultStream = Pin<Box<dyn Stream<Item=Result<ViewResultBatch>> + Send>>;
+
+/// An explicit stream of contiguous Arrow record batches.
+pub type LocalRecordBatchStream = Pin<Box<dyn Stream<Item=Result<RecordBatch>> + Send>>;
 
 #[cfg(test)]
 mod tests {
@@ -650,12 +690,18 @@ mod tests {
         let mut rows = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.expect("query batch");
-            let ids = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("Int64 output");
-            rows.extend(ids.values().iter().copied());
+            for row in 0..batch.num_rows() {
+                let (array, index) = batch
+                    .view()
+                    .resolve(0, row)
+                    .expect("resolve reference-backed value")
+                    .expect("selected value is not null-extended");
+                let ids = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 output");
+                rows.push(ids.value(index));
+            }
         }
 
         assert_eq!(rows, vec![5, 4, 3, 2]);
@@ -689,7 +735,7 @@ mod tests {
             .prepare("FROM flights |> SELECT id")
             .await
             .expect("prepare complete table scan");
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let mut scanned_rows = 0;
         while let Some(batch) = stream.next().await {
             scanned_rows += batch.expect("full scan batch").num_rows();
@@ -720,7 +766,7 @@ mod tests {
             .prepare("FROM flights |> SELECT id |> ORDER id + 1 DESC")
             .await
             .expect("prepare computed ORDER BY query");
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let mut computed_order_ids = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.expect("computed ORDER BY batch");
@@ -740,7 +786,7 @@ mod tests {
             )
             .await
             .expect("prepare ordered aggregate query");
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let mut grouped_ids = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.expect("aggregate query batch");
@@ -852,7 +898,7 @@ mod tests {
             "the physical join already builds this filtered input before probing"
         );
 
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let mut rows = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.expect("continuation output batch");
@@ -921,7 +967,7 @@ mod tests {
             vec!["id", "value"],
         );
 
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let batch = stream
             .next()
             .await
@@ -990,7 +1036,7 @@ mod tests {
             "only the selected column is scanned"
         );
 
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let mut row_count = 0;
         while let Some(batch) = stream.next().await {
             row_count += batch.expect("query batch").num_rows();
@@ -1069,7 +1115,7 @@ mod tests {
             .prepare("FROM names |> SELECT LOWER(name) AS lowered")
             .await
             .expect("prepare LOWER projection");
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let result = stream
             .next()
             .await
@@ -1089,7 +1135,7 @@ mod tests {
             .prepare("FROM names |> SELECT ROUND(amount) AS rounded")
             .await
             .expect("prepare ROUND projection");
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let result = stream
             .next()
             .await
@@ -1111,7 +1157,7 @@ mod tests {
             )
             .await
             .expect("prepare EXTRACT and YEAR projections");
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let result = stream
             .next()
             .await
@@ -1139,7 +1185,7 @@ mod tests {
             )
             .await
             .expect("prepare temporal EXTEND and timestamp literal");
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let result = stream
             .next()
             .await
@@ -1163,7 +1209,7 @@ mod tests {
             .prepare("FROM names |> SELECT VECTOR_DISTANCE(left_vector, right_vector) AS distance")
             .await
             .expect("prepare VECTOR_DISTANCE projection");
-        let mut stream = query.into_stream();
+        let mut stream = query.into_record_batch_stream();
         let result = stream
             .next()
             .await

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
@@ -11,7 +12,7 @@ use opendal::Operator;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::ParquetMetaData;
 
-use super::reader::{IoStats, OpendalParquetReader};
+use super::reader::{IoStats, ParquetFileReader, ParquetIoBackend};
 
 const INITIAL_PAGE_HEADER_PROBE_BYTES: u64 = 32;
 const MAX_PAGE_HEADER_PROBE_BYTES: u64 = 64 * 1024;
@@ -19,6 +20,7 @@ const MAX_PAGE_HEADER_PROBE_BYTES: u64 = 64 * 1024;
 #[derive(Debug, Default)]
 pub(super) struct PageHeaderReadMetrics {
     pub(super) columns_requested: u64,
+    pub(super) column_row_group_pairs_requested: u64,
     pub(super) chunks_scanned: u64,
     pub(super) pages_scanned: u64,
     pub(super) pages_with_statistics: u64,
@@ -40,22 +42,21 @@ pub(super) struct PageHeaderReadResult {
     pub(super) metrics: PageHeaderReadMetrics,
 }
 
-pub(super) type HeaderPageLocations = HashMap<
-    usize,
-    HashMap<usize, Vec<parquet::file::page_index::offset_index::PageLocation>>,
->;
+pub(super) type HeaderPageLocations =
+HashMap<usize, HashMap<usize, Vec<parquet::file::page_index::offset_index::PageLocation>>>;
 
 /// Inputs needed to inspect data-page headers for selected predicate columns.
 pub(super) struct PageHeaderReadRequest<'a> {
     pub(super) operator: &'a Operator,
     pub(super) path: &'a str,
+    pub(super) absolute_path: &'a Path,
+    pub(super) backend: ParquetIoBackend,
     pub(super) file_size_bytes: u64,
     pub(super) bytes_read: &'a Arc<AtomicU64>,
     pub(super) io: &'a Arc<IoStats>,
     pub(super) arrow_schema: &'a Schema,
     pub(super) metadata: &'a ParquetMetaData,
-    pub(super) needed_columns: &'a [String],
-    pub(super) row_groups: &'a [usize],
+    pub(super) plan: &'a crate::parquet_statistics::PageHeaderReadPlan,
 }
 
 /// Reads data-page headers for predicate columns when page-index coverage is
@@ -67,32 +68,33 @@ pub(super) async fn read_page_header_statistics(
     let PageHeaderReadRequest {
         operator,
         path,
+        absolute_path,
+        backend,
         file_size_bytes,
         bytes_read,
         io,
         arrow_schema,
         metadata,
-        needed_columns,
-        row_groups,
+        plan,
     } = request;
     let started = Instant::now();
     let mut result = PageHeaderReadResult::default();
     let parquet_schema = metadata.file_metadata().schema_descr();
+    let needed_columns = plan.column_names();
     let columns = needed_columns
         .iter()
         .filter_map(|name| {
             let (_, field) = arrow_schema.column_with_name(name)?;
-            let converter =
-                parquet::arrow::arrow_reader::statistics::StatisticsConverter::try_new(
-                    name,
-                    arrow_schema,
-                    parquet_schema,
-                )
-                    .ok()?;
+            let converter = parquet::arrow::arrow_reader::statistics::StatisticsConverter::try_new(
+                name,
+                arrow_schema,
+                parquet_schema,
+            )
+                .ok()?;
             let ordinal = converter.parquet_column_index()?;
             let descriptor = parquet_schema.column(ordinal);
             Some((
-                name.clone(),
+                (*name).to_string(),
                 ordinal,
                 field.data_type().clone(),
                 descriptor.physical_type(),
@@ -101,15 +103,36 @@ pub(super) async fn read_page_header_statistics(
         })
         .collect::<Vec<_>>();
     result.metrics.columns_requested = u64::try_from(needed_columns.len()).unwrap_or(u64::MAX);
-    let mut reader = OpendalParquetReader::new(
+    result.metrics.column_row_group_pairs_requested =
+        u64::try_from(plan.pair_count()).unwrap_or(u64::MAX);
+    let mut reader = match ParquetFileReader::new(
         operator,
         path,
+        absolute_path,
+        backend,
         file_size_bytes,
         Arc::clone(bytes_read),
         Arc::clone(io),
-    );
+    )
+        .await
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            result.metrics.failed_chunks = u64::try_from(plan.pair_count()).unwrap_or(u64::MAX);
+            tracing::debug!(
+                target: "vein.audit",
+                event = "parquet_page_header_reader_unavailable",
+                path = %path,
+                backend = backend.name(),
+                error = %error,
+                "page-header pruning unavailable; retaining all candidate rows"
+            );
+            result.metrics.elapsed_us = started.elapsed().as_micros() as u64;
+            return result;
+        }
+    };
 
-    for row_group_index in row_groups {
+    for (row_group_index, requested_columns) in plan.requests() {
         let Some(row_group) = metadata.row_groups().get(*row_group_index) else {
             continue;
         };
@@ -119,6 +142,9 @@ pub(super) async fn read_page_header_statistics(
         let mut row_group_pages = HashMap::new();
         let mut row_group_page_locations = HashMap::new();
         for (name, column_ordinal, arrow_type, physical_type, max_rep_level) in &columns {
+            if !requested_columns.contains(name) {
+                continue;
+            }
             // Page-header statistics do not provide the offset index's
             // authoritative first-row mapping for repeated fields. Their page
             // values may cover only part of a logical row, so fail open here.
@@ -174,35 +200,28 @@ pub(super) async fn read_page_header_statistics(
                     break;
                 }
                 page_ordinal = page_ordinal.saturating_add(1);
-                let (header, probe_bytes) = match read_page_header_at(
-                    &mut reader,
-                    offset,
-                    chunk_end,
-                    *physical_type,
-                )
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        result.metrics.probe_bytes = result
-                            .metrics
-                            .probe_bytes
-                            .saturating_add(error.probe_bytes);
-                        tracing::debug!(
-                            target: "vein.audit",
-                            event = "parquet_page_header_unavailable",
-                            path = %path,
-                            row_group = row_group_index,
-                            column = %name,
-                            offset,
-                            probe_bytes = error.probe_bytes,
-                            error = %error.message,
-                            "retaining page range because its header could not be parsed"
-                        );
-                        chunk_valid = false;
-                        break;
-                    }
-                };
+                let (header, probe_bytes) =
+                    match read_page_header_at(&mut reader, offset, chunk_end, *physical_type).await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            result.metrics.probe_bytes =
+                                result.metrics.probe_bytes.saturating_add(error.probe_bytes);
+                            tracing::debug!(
+                                target: "vein.audit",
+                                event = "parquet_page_header_unavailable",
+                                path = %path,
+                                row_group = row_group_index,
+                                column = %name,
+                                offset,
+                                probe_bytes = error.probe_bytes,
+                                error = %error.message,
+                                "retaining page range because its header could not be parsed"
+                            );
+                            chunk_valid = false;
+                            break;
+                        }
+                    };
                 result.metrics.pages_scanned = result.metrics.pages_scanned.saturating_add(1);
                 result.metrics.probe_bytes = result.metrics.probe_bytes.saturating_add(probe_bytes);
                 result.metrics.header_bytes = result
@@ -259,14 +278,13 @@ pub(super) async fn read_page_header_statistics(
                             result.metrics.pages_with_statistics.saturating_add(1);
                     }
                     if statistics.min_max_complete == Some(true) {
-                        result.metrics.pages_with_complete_bounds = result
-                            .metrics
-                            .pages_with_complete_bounds
-                            .saturating_add(1);
+                        result.metrics.pages_with_complete_bounds =
+                            result.metrics.pages_with_complete_bounds.saturating_add(1);
                     }
                     pages.push(crate::parquet_statistics::PageHeaderRowStatistics {
                         first_row,
                         row_count: page_rows,
+                        encoding: page.encoding,
                         statistics,
                     });
                     page_locations.push(parquet::file::page_index::offset_index::PageLocation {
@@ -299,11 +317,12 @@ pub(super) async fn read_page_header_statistics(
 }
 
 async fn read_page_header_at(
-    reader: &mut OpendalParquetReader,
+    reader: &mut ParquetFileReader,
     offset: u64,
     end: u64,
     physical_type: parquet::basic::Type,
-) -> std::result::Result<(parquet::file::serialized_reader::PageHeaderInfo, u64), PageHeaderReadError> {
+) -> std::result::Result<(parquet::file::serialized_reader::PageHeaderInfo, u64), PageHeaderReadError>
+{
     let available = end
         .checked_sub(offset)
         .filter(|available| *available > 0)
@@ -321,15 +340,16 @@ async fn read_page_header_at(
                 message: "page header probe range overflowed".to_string(),
                 probe_bytes: probe_bytes_read,
             })?;
-        let bytes = reader
-            .get_bytes(offset..probe_end)
-            .await
-            .map_err(|error| PageHeaderReadError {
-                message: error.to_string(),
-                probe_bytes: probe_bytes_read,
-            })?;
-        probe_bytes_read = probe_bytes_read
-            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        let bytes =
+            reader
+                .get_bytes(offset..probe_end)
+                .await
+                .map_err(|error| PageHeaderReadError {
+                    message: error.to_string(),
+                    probe_bytes: probe_bytes_read,
+                })?;
+        probe_bytes_read =
+            probe_bytes_read.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let parse_error = match parquet::file::serialized_reader::read_page_header(
             &mut Cursor::new(bytes.as_ref()),
             physical_type,

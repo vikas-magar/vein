@@ -8,6 +8,7 @@
 
 mod build;
 mod collector;
+mod output;
 mod probe;
 
 pub use build::BuildSink;

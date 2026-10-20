@@ -38,6 +38,13 @@ pub trait RuntimeFilter: Debug + Send + Sync {
     /// storage where available.
     fn memory_bytes(&self) -> usize;
 
+    /// Whether evaluation is total and independent of filter order for the
+    /// implementation's supported input schema. Unknown implementations remain
+    /// fixed in the planner's order by default.
+    fn reorder_safe(&self) -> bool {
+        false
+    }
+
     /// Evaluate a narrow batch containing only the filter's required columns.
     /// `column_positions` maps each required column to a position in `batch`.
     fn evaluate(
@@ -370,17 +377,68 @@ impl RuntimeFilterSet {
     /// Bind the set to a scan schema. `None` means at least one required column
     /// is absent, so a scan must retain its ordinary exact behavior.
     pub fn bind(&self, schema: &VeinSchema) -> Option<RuntimeFilterBinding> {
-        if !self.has_row_filters() {
-            return None;
-        }
-
         let row_filters = self
             .filters
             .iter()
             .filter(|filter| filter.supports_row_evaluation())
             .collect::<Vec<_>>();
+        self.bind_filters(schema, &row_filters, RuntimeFilterStatisticsRole::BOTH)
+    }
+
+    /// Bind each row filter independently so a scan reader can apply Arrow's
+    /// row selection between filters and avoid reading later filter columns for
+    /// rows rejected by earlier filters.
+    pub fn bind_stages(&self, schema: &VeinSchema) -> Option<Vec<RuntimeFilterBinding>> {
+        let row_filters = self
+            .filters
+            .iter()
+            .filter(|filter| filter.supports_row_evaluation())
+            .collect::<Vec<_>>();
+        if row_filters.is_empty() {
+            return None;
+        }
+
+        // Filters that need the same column set share one decode stage. Other
+        // sets stay separate so Parquet can apply the row selection between them.
+        let mut groups: Vec<(Vec<ColumnId>, Vec<&Arc<dyn RuntimeFilter>>)> = Vec::new();
+        for filter in row_filters {
+            let mut columns = filter.required_columns().to_vec();
+            columns.sort_unstable();
+            columns.dedup();
+            if let Some((_, group)) = groups.iter_mut().find(|(existing, _)| *existing == columns) {
+                group.push(filter);
+            } else {
+                groups.push((columns, vec![filter]));
+            }
+        }
+
+        let count = groups.len();
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, filters))| {
+                let role = match (index == 0, index + 1 == count) {
+                    (true, true) => RuntimeFilterStatisticsRole::BOTH,
+                    (true, false) => RuntimeFilterStatisticsRole::FIRST,
+                    (false, true) => RuntimeFilterStatisticsRole::LAST,
+                    (false, false) => RuntimeFilterStatisticsRole::NONE,
+                };
+                self.bind_filters(schema, &filters, role)
+            })
+            .collect()
+    }
+
+    fn bind_filters(
+        &self,
+        schema: &VeinSchema,
+        row_filters: &[&Arc<dyn RuntimeFilter>],
+        statistics_role: RuntimeFilterStatisticsRole,
+    ) -> Option<RuntimeFilterBinding> {
+        if row_filters.is_empty() {
+            return None;
+        }
         let mut column_ids = Vec::new();
-        for filter in &row_filters {
+        for filter in row_filters {
             for column in filter.required_columns() {
                 if !column_ids.contains(column) {
                     column_ids.push(*column);
@@ -419,6 +477,7 @@ impl RuntimeFilterSet {
             columns,
             filters,
             statistics: self.statistics.clone(),
+            statistics_role,
         })
     }
 
@@ -448,6 +507,7 @@ pub struct RuntimeFilterBinding {
     columns: Vec<ResolvedColumnRef>,
     filters: Vec<BoundRuntimeFilter>,
     statistics: Option<RuntimeFilterCounters>,
+    statistics_role: RuntimeFilterStatisticsRole,
 }
 
 impl RuntimeFilterBinding {
@@ -456,11 +516,40 @@ impl RuntimeFilterBinding {
         &self.columns
     }
 
+    /// Stable diagnostic names for the filters in this decode stage.
+    pub fn filter_names(&self) -> Vec<&'static str> {
+        self.filters.iter().map(|filter| filter.filter.name()).collect()
+    }
+
+    /// True only when every evaluator in this bound stage explicitly permits
+    /// evaluation in a different order.
+    pub fn reorder_safe(&self) -> bool {
+        self.filters.iter().all(|filter| filter.filter.reorder_safe())
+    }
+
     /// Evaluate all filters and return one combined selection mask.
     ///
     /// Only the boolean mask is newly allocated. The input payload arrays are
     /// borrowed through Arrow's `RecordBatch` and are never gathered or copied.
     pub fn evaluate(&self, batch: &RecordBatch) -> Result<BooleanArray> {
+        if let [bound] = self.filters.as_slice() {
+            let mask = bound.filter.evaluate(batch, &bound.positions)?;
+            if mask.len() != batch.num_rows() {
+                return Err(VeinError::internal(
+                    "runtime filter returned a mask with a different row count",
+                ));
+            }
+            if let Some(statistics) = &self.statistics {
+                let rows_kept = self.statistics_role.records_output.then(|| {
+                    (0..mask.len())
+                        .filter(|&row| mask.is_valid(row) && mask.value(row))
+                        .count() as u64
+                });
+                self.record_statistics(statistics, batch.num_rows(), rows_kept);
+            }
+            return Ok(mask);
+        }
+
         let masks = self
             .filters
             .iter()
@@ -482,11 +571,37 @@ impl RuntimeFilterBinding {
             rows_kept += u64::from(keep);
         }
         if let Some(statistics) = &self.statistics {
-            statistics.rows_seen.add(batch.num_rows() as u64);
-            statistics.rows_kept.add(rows_kept);
+            self.record_statistics(statistics, batch.num_rows(), Some(rows_kept));
         }
         Ok(output.finish())
     }
+
+    fn record_statistics(
+        &self,
+        statistics: &RuntimeFilterCounters,
+        rows_seen: usize,
+        rows_kept: Option<u64>,
+    ) {
+        if self.statistics_role.records_input {
+            statistics.rows_seen.add(rows_seen as u64);
+        }
+        if self.statistics_role.records_output {
+            statistics.rows_kept.add(rows_kept.unwrap_or_default());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeFilterStatisticsRole {
+    records_input: bool,
+    records_output: bool,
+}
+
+impl RuntimeFilterStatisticsRole {
+    const NONE: Self = Self { records_input: false, records_output: false };
+    const FIRST: Self = Self { records_input: true, records_output: false };
+    const LAST: Self = Self { records_input: false, records_output: true };
+    const BOTH: Self = Self { records_input: true, records_output: true };
 }
 
 struct BoundRuntimeFilter {

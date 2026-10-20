@@ -16,9 +16,14 @@
 // under the License.
 
 use crate::arrow::ProjectionMask;
+use super::RowSelection;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::ArrowError;
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
+
+mod reorder;
+pub use reorder::{PredicateOrder, PredicateOrderPolicy};
 
 /// A predicate operating on [`RecordBatch`]
 ///
@@ -44,6 +49,23 @@ pub trait ArrowPredicate: Send + 'static {
     /// * `true`:the row should be returned
     /// * `false` or `null`: the row should not be returned
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError>;
+
+    /// Evaluate this predicate directly into the reader's row-selection form.
+    ///
+    /// The default adapter preserves compatibility for BooleanArray predicates
+    /// and retains their packed bitmap when possible. Implementations with a
+    /// native selection evaluator can override this method to avoid creating a
+    /// BooleanArray.
+    fn evaluate_selection(&mut self, batch: RecordBatch) -> Result<RowSelection, ArrowError> {
+        let filter = self.evaluate(batch)?;
+        Ok(RowSelection::from_filter(&filter))
+    }
+
+    /// Notify the predicate of its position in the active filter order.
+    ///
+    /// The push decoder calls this immediately before evaluation so adapters
+    /// can collect input metrics from whichever predicate currently runs first.
+    fn set_first_filter(&mut self, _first: bool) {}
 }
 
 /// An [`ArrowPredicate`] created from an [`FnMut`] and a [`ProjectionMask`]
@@ -106,6 +128,7 @@ pub trait ArrowPredicate: Send + 'static {
 pub struct ArrowPredicateFn<F> {
     f: F,
     projection: ProjectionMask,
+    first_filter_callback: Option<Box<dyn FnMut(bool) + Send>>,
 }
 
 impl<F> ArrowPredicateFn<F>
@@ -115,7 +138,21 @@ where
     /// Create a new [`ArrowPredicateFn`] that invokes `f` on the columns
     /// specified in `projection`.
     pub fn new(projection: ProjectionMask, f: F) -> Self {
-        Self { f, projection }
+        Self {
+            f,
+            projection,
+            first_filter_callback: None,
+        }
+    }
+
+    /// Set a callback invoked immediately before evaluation with whether this
+    /// predicate is first in the active row-filter order.
+    pub fn with_first_filter_callback(
+        mut self,
+        callback: impl FnMut(bool) + Send + 'static,
+    ) -> Self {
+        self.first_filter_callback = Some(Box::new(callback));
+        self
     }
 }
 
@@ -129,6 +166,12 @@ where
 
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
         (self.f)(batch)
+    }
+
+    fn set_first_filter(&mut self, first: bool) {
+        if let Some(callback) = &mut self.first_filter_callback {
+            callback(first);
+        }
     }
 }
 
@@ -177,6 +220,9 @@ where
 pub struct RowFilter {
     /// A list of [`ArrowPredicate`]
     pub(crate) predicates: Vec<Box<dyn ArrowPredicate>>,
+    predicate_order: Vec<usize>,
+    order_epoch: u64,
+    order_policy: Option<Arc<dyn PredicateOrderPolicy>>,
 }
 
 impl Debug for RowFilter {
@@ -188,7 +234,39 @@ impl Debug for RowFilter {
 impl RowFilter {
     /// Create a new [`RowFilter`] from an array of [`ArrowPredicate`]
     pub fn new(predicates: Vec<Box<dyn ArrowPredicate>>) -> Self {
-        Self { predicates }
+        let predicate_order = (0..predicates.len()).collect();
+        Self {
+            predicates,
+            predicate_order,
+            order_epoch: 0,
+            order_policy: None,
+        }
+    }
+
+    /// Attach a policy that can reorder safe predicates between filter windows.
+    ///
+    /// The asynchronous push decoder consults the policy before each filter
+    /// window. The synchronous reader keeps the supplied initial order.
+    pub fn with_order_policy(mut self, policy: Arc<dyn PredicateOrderPolicy>) -> Self {
+        self.order_policy = Some(policy);
+        self
+    }
+
+    /// Apply a policy update at a filter-window boundary. Invalid policies fail
+    /// closed and leave the current predicate order unchanged.
+    pub(crate) fn reorder_for_filter_window(&mut self) -> bool {
+        reorder::apply_order(
+            &mut self.predicates,
+            &mut self.predicate_order,
+            &mut self.order_epoch,
+            self.order_policy.as_deref(),
+        )
+    }
+
+    pub(crate) fn observe_filter_duration(&self, duration: std::time::Duration) {
+        if let Some(policy) = &self.order_policy {
+            policy.observe_filter(duration, self.order_epoch);
+        }
     }
     /// Returns the inner predicates
     pub fn predicates(&self) -> &Vec<Box<dyn ArrowPredicate>> {

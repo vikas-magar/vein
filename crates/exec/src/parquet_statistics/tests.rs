@@ -419,6 +419,8 @@ fn page_indexes_select_only_possible_rows_and_missing_indexes_fail_open() {
     let pruning = prune_data_pages(&schema, &metadata, &predicates, &[0]);
     assert!(pruning.indexed_columns > 0);
     assert!(pruning.page_bounds_complete > 0);
+    assert!(pruning.page_index_complete_columns[&0].contains("value"));
+    assert!(page_header_requests_with_audit(&predicates, &[0], true, &pruning, false).is_empty());
     assert!(
         pruning.page_bounds_complete + pruning.page_bounds_incomplete > 0,
         "available indexes must account for each page's bound quality"
@@ -562,6 +564,60 @@ fn dictionary_predicates_extract_equality_and_safe_in_lists_only() {
     assert_eq!(predicates[0].candidates, vec![LogicalLiteral::String("MAIL".into())]);
     assert_eq!(predicates[1].index, 1);
     assert_eq!(predicates[1].candidates.len(), 2);
+}
+
+#[test]
+fn mixed_dictionary_chunk_still_supports_dictionary_page_membership() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let path = root.path().join("mixed_dictionary_filter.parquet");
+    write_dictionary_row_groups(&path);
+
+    let bytes = Bytes::from(std::fs::read(&path).expect("read test Parquet bytes"));
+    let file_length = u64::try_from(bytes.len()).expect("file length fits u64");
+    let file = std::fs::File::open(&path).expect("open dictionary Parquet file");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("read Parquet footer");
+    let original_chunk = builder.metadata().row_group(0).column(0);
+    let mixed_chunk = original_chunk
+        .clone()
+        .into_builder()
+        .set_page_encoding_stats(vec![
+            parquet::file::metadata::PageEncodingStats {
+                page_type: parquet::basic::PageType::DATA_PAGE,
+                encoding: parquet::basic::Encoding::RLE_DICTIONARY,
+                count: 1,
+            },
+            parquet::file::metadata::PageEncodingStats {
+                page_type: parquet::basic::PageType::DATA_PAGE,
+                encoding: parquet::basic::Encoding::PLAIN,
+                count: 1,
+            },
+        ])
+        .build()
+        .expect("build mixed encoding metadata");
+
+    assert!(!is_fully_dictionary_encoded(&mixed_chunk));
+    assert!(dictionary_page_range(&mixed_chunk, file_length).is_some());
+
+    let predicate = dictionary_equality("shipmode", LogicalLiteral::String("SHIP".into()));
+    let predicates = dictionary_predicates(std::slice::from_ref(&predicate));
+    let column = bloom_filter_columns(
+        builder.schema().as_ref(),
+        builder.metadata(),
+        std::slice::from_ref(&predicate),
+    )
+        .into_iter()
+        .next()
+        .expect("resolve dictionary column");
+    let membership = dictionary_page_predicate_matches(
+        dictionary_page_bytes(&bytes, file_length, &mixed_chunk),
+        file_length,
+        2,
+        &mixed_chunk,
+        &column,
+        &predicates,
+    );
+
+    assert_eq!(membership, vec![Some(false)]);
 }
 
 #[test]
@@ -717,109 +773,6 @@ fn equality(column: &str, value: i64) -> StatisticsPredicate {
         comparison: StatisticsComparison::Equal,
         literal: LogicalLiteral::Int64(value),
     }
-}
-
-#[test]
-fn complete_page_index_coverage_skips_header_pre_read() {
-    let predicates = [
-        equality("shipmode", 1),
-        StatisticsPredicate::And(vec![
-            equality("receiptdate", 2),
-            equality("shipmode", 3),
-        ]),
-    ];
-    let page_index = PagePruning {
-        indexed_columns: 4,
-        page_bounds_complete: 8,
-        ..PagePruning::default()
-    };
-
-    assert_eq!(
-        page_header_columns_needed(&predicates, &[0, 1], &[0, 1], true, &page_index),
-        Vec::<String>::new()
-    );
-}
-
-#[test]
-fn audit_mode_requests_predicate_headers_with_complete_page_index_coverage() {
-    let predicates = [
-        equality("shipmode", 1),
-        StatisticsPredicate::And(vec![
-            equality("receiptdate", 2),
-            equality("shipmode", 3),
-        ]),
-    ];
-    let complete_index = PagePruning {
-        indexed_columns: 4,
-        page_bounds_complete: 8,
-        ..PagePruning::default()
-    };
-
-    assert_eq!(
-        page_header_columns_needed_with_audit(
-            &predicates,
-            &[0, 1],
-            &[0, 1],
-            true,
-            &complete_index,
-            true,
-        ),
-        vec!["receiptdate", "shipmode"]
-    );
-}
-
-#[test]
-fn incomplete_or_missing_page_index_coverage_requests_predicate_headers() {
-    let predicates = [
-        equality("shipmode", 1),
-        StatisticsPredicate::And(vec![
-            equality("receiptdate", 2),
-            equality("shipmode", 3),
-        ]),
-    ];
-    let expected = vec!["receiptdate", "shipmode"];
-    let incomplete_index = PagePruning {
-        indexed_columns: 4,
-        page_bounds_incomplete: 1,
-        ..PagePruning::default()
-    };
-    let missing_column_index = PagePruning {
-        indexed_columns: 3,
-        ..PagePruning::default()
-    };
-
-    assert_eq!(
-        page_header_columns_needed(&predicates, &[1], &[0, 1], true, &incomplete_index),
-        expected
-    );
-    assert_eq!(
-        page_header_columns_needed(
-            &predicates,
-            &[1],
-            &[0, 1],
-            true,
-            &missing_column_index,
-        ),
-        expected
-    );
-    assert_eq!(
-        page_header_columns_needed(&predicates, &[1], &[0, 1], false, &PagePruning::default()),
-        expected
-    );
-}
-
-#[test]
-fn page_header_checks_are_omitted_without_predicates_or_probe_row_groups() {
-    let page_index = PagePruning::default();
-    assert!(page_header_columns_needed(&[], &[0], &[0], false, &page_index).is_empty());
-    assert!(page_header_columns_needed(
-        &[equality("shipmode", 1)],
-        &[],
-        &[0],
-        false,
-        &page_index,
-    )
-        .is_empty());
 }
 
 #[test]

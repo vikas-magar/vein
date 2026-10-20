@@ -44,18 +44,19 @@ async fn page_header_statistics_prune_flat_data_pages_without_dropping_matches()
         .expect("create local filesystem operator");
     let bytes_read = Arc::new(AtomicU64::new(0));
     let io = Arc::new(IoStats::default());
-    let needed_columns = ["value".to_string()];
-    let row_groups = [0];
+    let mut plan = crate::parquet_statistics::PageHeaderReadPlan::default();
+    plan.request(0, "value");
     let page_headers = read_page_header_statistics(PageHeaderReadRequest {
         operator: &operator,
         path: relative_path,
+        absolute_path: &path,
+        backend: ParquetIoBackend::OpenDal,
         file_size_bytes: file_size,
         bytes_read: &bytes_read,
         io: &io,
         arrow_schema: schema.as_ref(),
         metadata: &metadata,
-        needed_columns: &needed_columns,
-        row_groups: &row_groups,
+        plan: &plan,
     })
         .await;
 

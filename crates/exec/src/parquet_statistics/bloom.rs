@@ -265,7 +265,7 @@ pub(super) fn dictionary_value_type(data_type: &DataType) -> &DataType {
     }
 }
 
-fn timestamp_physical_value(value: i64, unit: &TimeUnit) -> Option<i64> {
+pub(super) fn timestamp_physical_value(value: i64, unit: &TimeUnit) -> Option<i64> {
     match unit {
         TimeUnit::Second => (value % 1_000_000 == 0).then_some(value / 1_000_000),
         TimeUnit::Millisecond => (value % 1_000 == 0).then_some(value / 1_000),
@@ -274,7 +274,7 @@ fn timestamp_physical_value(value: i64, unit: &TimeUnit) -> Option<i64> {
     }
 }
 
-fn time32_physical_value(value: i64, unit: &TimeUnit) -> Option<i32> {
+pub(super) fn time32_physical_value(value: i64, unit: &TimeUnit) -> Option<i32> {
     let subsecond_value = match unit {
         TimeUnit::Second => (value % 1_000_000 == 0).then_some(value / 1_000_000)?,
         TimeUnit::Millisecond => (value % 1_000 == 0).then_some(value / 1_000)?,
@@ -283,7 +283,7 @@ fn time32_physical_value(value: i64, unit: &TimeUnit) -> Option<i32> {
     i32::try_from(subsecond_value).ok()
 }
 
-fn time64_physical_value(value: i64, unit: &TimeUnit) -> Option<i64> {
+pub(super) fn time64_physical_value(value: i64, unit: &TimeUnit) -> Option<i64> {
     match unit {
         TimeUnit::Microsecond => Some(value),
         TimeUnit::Nanosecond => value.checked_mul(1_000),

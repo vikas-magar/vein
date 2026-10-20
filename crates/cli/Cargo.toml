@@ -14,7 +14,7 @@ physical = { path = "../physical" }
 optimizer = { path = "../optimizer" }
 parser = { path = "../parser" }
 async-trait.workspace = true
-arrow = { workspace = true, features = ["prettyprint"] }
+arrow = { workspace = true, features = ["json", "prettyprint"] }
 futures = { workspace = true }
 async-stream = "0.3"
 flume = "0.12"

@@ -1,6 +1,11 @@
 //! Statistics-driven selection of complete inputs to remaining joins.
 
 use super::*;
+#[path = "checkpoint_identity.rs"]
+mod checkpoint_identity;
+use checkpoint_identity::{
+    ScanPopulationSignature, scan_population_signature, signature_match_counts,
+};
 use optimizer::context::QueryStatisticsProvider;
 use optimizer::estimation::{CardinalityEstimator, EstimateConfidence, StatisticsEstimator};
 
@@ -18,29 +23,56 @@ impl AdaptiveCheckpointPolicy for StatisticsCheckpointPolicy {
         if !safe_subtree(plan) {
             return None;
         }
-        let provider = QueryStatisticsProvider::new(statistics);
+        let provider = QueryStatisticsProvider::new(Arc::clone(&statistics));
         let estimator = StatisticsEstimator::new(&provider);
-        let mut best: Option<((bool, f64), AdaptiveBoundary)> = None;
+        let observed = statistics.shared_query_state(0, "adaptive-checkpoint-populations-v1", || {
+            std::sync::Mutex::<Vec<ScanPopulationSignature>>::new(Vec::new())
+        });
+        let mut observed = observed.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut best: Option<((bool, u64), AdaptiveBoundary, Option<_>)> = None;
         let mut pending = vec![(plan, Vec::new(), false)];
         while let Some((node, path, join_input)) = pending.pop() {
             if join_input
                 && !matches!(node, LogicalPlan::Intermediate { .. })
                 && needs_feedback(node)
                 && known_input_rows(node).is_some()
+                && super::execution::join_checkpoint_has_search_space(plan, node, &path)
             {
                 let estimate = estimator.estimate_plan(node).pop()?.rows;
                 // Fully described inputs need no new materialization barrier.
                 // Missing source cardinality is not a reason to invent a cost.
                 let work = known_input_rows(node)?;
                 if estimate.confidence < EstimateConfidence::Statistics || missing_synopses(node) {
+                    let signature = scan_population_signature(node);
+                    let match_counts = signature
+                        .as_ref()
+                        .map(|signature| signature_match_counts(signature, &observed));
+                    if match_counts.is_some_and(|counts| counts.exact > 0) {
+                        tracing::info!(target: "vein.adaptive", event = "adaptive_checkpoint_candidate_skipped",
+                            source = node.table_name().unwrap_or(node.operator_name()),
+                            reason = "equivalent_population_already_scheduled",
+                            "avoided repeating a checkpoint for the same source population");
+                        continue;
+                    }
+                    if let Some(counts) = match_counts.filter(|counts| counts.same_source > 0) {
+                        tracing::info!(target: "vein.adaptive.identity", event = "adaptive_checkpoint_population_mismatch",
+                            source = node.table_name().unwrap_or(node.operator_name()),
+                            prior_same_source = counts.same_source,
+                            prior_same_filter = counts.same_filters,
+                            prior_same_projection = counts.same_projection,
+                            "same source had a scheduled checkpoint with a different population signature");
+                    }
                     let rows = estimate
                         .value()
                         .filter(|v| *v <= u64::MAX as f64)
                         .map(|v| v as u64);
-                    // Measure selective inputs before freezing larger join
-                    // subtrees, so the earliest feedback can still reorder them.
+                    // Prefer the cheapest eligible input, preserving time for
+                    // later join work instead of materializing a large subtree.
                     let score = (!contains_blocking_relation(node), work);
-                    if best.as_ref().is_none_or(|(current, _)| score > *current) {
+                    let better_candidate = best.as_ref().is_none_or(|(current, _, _)| {
+                        score.0 > current.0 || (score.0 == current.0 && score.1 < current.1)
+                    });
+                    if better_candidate {
                         let mut schema = node.schema().clone();
                         if let LogicalPlan::Scan {
                             projection: Some(columns),
@@ -57,6 +89,7 @@ impl AdaptiveCheckpointPolicy for StatisticsCheckpointPolicy {
                                 output_schema: Box::new(schema),
                                 estimated_rows: rows,
                             },
+                            signature,
                         ));
                     }
                 }
@@ -67,7 +100,12 @@ impl AdaptiveCheckpointPolicy for StatisticsCheckpointPolicy {
                 pending.push((child, child_path, matches!(node, LogicalPlan::Join { .. })));
             }
         }
-        best.map(|(_, boundary)| boundary)
+        best.map(|(_, boundary, signature)| {
+            if let Some(signature) = signature {
+                observed.push(signature);
+            }
+            boundary
+        })
     }
 }
 
@@ -138,16 +176,17 @@ fn contains_pending_operator(plan: &LogicalPlan) -> bool {
     ) || plan.children().into_iter().any(contains_pending_operator)
 }
 
-fn known_input_rows(plan: &LogicalPlan) -> Option<f64> {
+fn known_input_rows(plan: &LogicalPlan) -> Option<u64> {
     match plan {
-        LogicalPlan::Scan { table, .. } => table.statistics.as_ref()?.num_rows.map(|v| v as f64),
-        LogicalPlan::Intermediate { row_count, .. } => Some(*row_count as f64),
-        _ => plan
-            .children()
-            .into_iter()
-            .map(known_input_rows)
-            .collect::<Option<Vec<_>>>()
-            .map(|rows| rows.into_iter().sum()),
+        LogicalPlan::Scan { table, .. } => table.statistics.as_ref()?.num_rows,
+        LogicalPlan::Intermediate { row_count, .. } => Some(*row_count),
+        _ => {
+            let mut rows = 0_u64;
+            for child in plan.children() {
+                rows = rows.checked_add(known_input_rows(child)?)?;
+            }
+            Some(rows)
+        }
     }
 }
 

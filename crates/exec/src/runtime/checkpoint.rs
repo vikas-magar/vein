@@ -22,6 +22,9 @@ use crate::pipeline::{DataChunkView, PipelineNode, Source};
 use crate::pipeline::view::ViewMemoryLease;
 use crate::spill::{IpcRunWriter, PendingSpillRun, SpillRun, SpillWriteHandle};
 
+#[path = "checkpoint_statistics.rs"]
+mod statistics;
+
 enum CheckpointState {
     CollectingMemory(Vec<DataChunkView>),
     CollectingSpill(Box<SpillingCheckpoint>),
@@ -115,47 +118,6 @@ pub struct CheckpointTaskResult {
 }
 
 impl IntermediateRelation {
-    /// Lazily compute a complete relation synopsis at a re-optimization barrier.
-    /// Work runs on the blocking pool, reads existing view references, and uses
-    /// the same generic collector as ANALYZE. The producer's pinned population
-    /// is immutable; empty relations still publish typed zero-row synopses.
-    pub async fn collect_statistics(&self, schema: types::VeinSchemaRef) -> Result<Arc<catalog::TableStatistics>> {
-        let mut source = self.source()?;
-        let expected_rows = self.row_count()?;
-        if self.schema.as_ref() != &schema.to_arrow() {
-            return Err(VeinError::internal("checkpoint statistics schema does not match its relation"));
-        }
-        let fields = self.schema.fields().iter().zip(&schema.fields)
-            .map(|(field, column)| field.as_ref().clone().with_name(common::statistics::intermediate_column_key(column.id)))
-            .collect::<Vec<_>>();
-        let statistics_schema = Arc::new(arrow::datatypes::Schema::new(fields));
-        let tracker = self.tracker.clone();
-        let span = tracing::Span::current();
-        tokio::task::spawn_blocking(move || {
-            let _entered = span.enter();
-            let started = std::time::Instant::now();
-            let mut collector = common::statistics::StatisticsCollector::new(
-                statistics_schema, common::statistics::StatisticsConfig::default(),
-            )?;
-            source.for_each_batch(|view| {
-                tracker.check_cancelled()?;
-                collector.update_input(&view)
-            })?;
-            let statistics = collector.finish();
-            if statistics.num_rows != Some(expected_rows) {
-                return Err(VeinError::internal("checkpoint synopsis does not cover its complete population"));
-            }
-            tracing::info!(target: "vein.adaptive", event = "adaptive_checkpoint_statistics",
-                rows = expected_rows, columns = statistics.column_statistics.len(),
-                ndv_columns = statistics.column_statistics.values().filter(|c| c.distinct_count.is_some()).count(),
-                mcv_columns = statistics.column_statistics.values().filter(|c| c.most_common_values.is_some()).count(),
-                histogram_columns = statistics.column_statistics.values().filter(|c| c.histogram.is_some()).count(),
-                elapsed_us = started.elapsed().as_micros() as u64,
-                payload_bytes_gathered = 0u64, "checkpoint synopsis computed from borrowed values");
-            Ok(Arc::new(statistics))
-        }).await.map_err(|error| VeinError::internal(format!("checkpoint statistics task failed: {error}")))?
-    }
-
     /// Create an empty relation whose retained arrays share `tracker`'s budget.
     pub fn new(schema: SchemaRef, tracker: QueryMemoryTracker) -> Self {
         Self {

@@ -114,6 +114,33 @@ fn binding_maps_filter_columns_by_id_and_preserves_stable_order() {
 }
 
 #[test]
+fn independent_bindings_keep_each_filter_narrow_and_preserve_order() {
+    let set = RuntimeFilterSet::new(vec![
+        Arc::new(KeepValues { columns: vec![ColumnId(7)], expected: 2 }),
+        Arc::new(KeepValues { columns: vec![ColumnId(7)], expected: 3 }),
+    ]);
+    let bindings = set.bind_stages(&schema()).expect("row filters bind");
+
+    assert_eq!(bindings.len(), 1, "same-column filters share one decode stage");
+    assert_eq!(
+        bindings[0].filter_names(),
+        vec!["test_keep_values", "test_keep_values"]
+    );
+    assert_eq!(bindings[0].columns().len(), 1);
+    assert_eq!(bindings[0].columns()[0].id, ColumnId(7));
+
+    let batch = RecordBatch::try_from_iter(vec![(
+        "id",
+        Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+    )])
+    .expect("probe batch");
+    assert_eq!(
+        bindings[0].evaluate(&batch).expect("combined same-column stage"),
+        BooleanArray::from(vec![false, false, false])
+    );
+}
+
+#[test]
 fn diagnostics_separate_row_filters_from_metadata_pruning_filters() {
     let set = RuntimeFilterSet::new(vec![
         Arc::new(KeepValues {

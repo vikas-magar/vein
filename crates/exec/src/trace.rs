@@ -756,7 +756,7 @@ mod tests {
         assert!(explain.contains("probe_keys=[0], build_keys=[0]"));
         assert!(explain.contains("aggregate children="));
         assert!(explain.contains("sort children="));
-        assert!(explain.contains("flow=materialize-input->ResultArrays"));
+        assert!(explain.contains("flow=kernel-columns->ResultArrays"));
         assert!(explain.contains("keys=[SortKey { column: 0, ascending: false, nulls_first: false }]"));
     }
 

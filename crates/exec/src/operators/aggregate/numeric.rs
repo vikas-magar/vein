@@ -3,6 +3,7 @@
 use super::*;
 
 mod accumulator;
+mod column;
 mod fold;
 mod input;
 mod value;

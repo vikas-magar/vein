@@ -43,6 +43,10 @@ pub struct ScanPredicate {
 pub struct ScanPredicateStage {
     /// Number of logical conjuncts combined in this stage.
     pub predicate_count: usize,
+    /// Whether evaluating this stage in a different order is semantics-safe.
+    /// A missing value defaults to false so older serialized plans stay conservative.
+    #[serde(default)]
+    pub reorder_safe: bool,
     /// Stage input columns, in register order: input column `i` is mounted into
     /// VM register `i`.
     pub input: VeinSchemaRef,
@@ -445,8 +449,9 @@ impl PhysicalPlanOperator {
     ///
     /// Kernel conversions are conditional: direct VM projections do not need
     /// arrays, and Cross joins with no residual do not need hash-key conversion.
-    /// Sort includes any computed-key program. Aggregate/storage boundaries need
-    /// arrays; clients choose their result format and discard consumes references.
+    /// Sort includes any computed-key program. Aggregate and DISTINCT kernels
+    /// read only their required columns; grouping keys remain reference-backed.
+    /// Storage and client boundaries decide when complete arrays are required.
     pub fn data_flow(&self) -> OperatorDataFlow {
         use InputMaterialization::{ConsumerBoundary, KernelColumns, None, WholeBatch};
         use OutputRepresentation::{References, ReferencesAndComputed, ResultArrays, Sink};
@@ -457,8 +462,8 @@ impl PhysicalPlanOperator {
             Self::Join { .. } => ("join", KernelColumns, References),
             Self::Sort { .. } => ("sort", KernelColumns, References),
             Self::Limit { .. } => ("limit", None, References),
-            Self::Aggregate { .. } => ("aggregate", WholeBatch, ResultArrays),
-            Self::Distinct { .. } => ("distinct", WholeBatch, ResultArrays),
+            Self::Aggregate { .. } => ("aggregate", KernelColumns, ResultArrays),
+            Self::Distinct { .. } => ("distinct", KernelColumns, ResultArrays),
             Self::Sink { sink, .. } => (
                 "sink",
                 match sink.as_ref() {
@@ -841,8 +846,12 @@ mod tests {
             PhysicalPlanOperator::Limit { .. } => {
                 (InputMaterialization::None, OutputRepresentation::References)
             }
-            PhysicalPlanOperator::Aggregate { .. } | PhysicalPlanOperator::Distinct { .. } => (
-                InputMaterialization::WholeBatch,
+            PhysicalPlanOperator::Aggregate { .. } => (
+                InputMaterialization::KernelColumns,
+                OutputRepresentation::ResultArrays,
+            ),
+            PhysicalPlanOperator::Distinct { .. } => (
+                InputMaterialization::KernelColumns,
                 OutputRepresentation::ResultArrays,
             ),
             PhysicalPlanOperator::Sink { sink, .. } => (

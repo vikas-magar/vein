@@ -14,6 +14,9 @@ use error::VeinError;
 use opendal::Operator;
 use types::VeinSchemaRef;
 
+mod reader_operator;
+pub use reader_operator::{ArrowParquetScanReader, ParquetScanReader};
+
 /// Parquet source backed by a local-filesystem OpenDAL operator.
 pub mod parquet;
 
@@ -67,6 +70,7 @@ pub struct ScanSource {
     operator: Operator,
     files: Vec<ScanFile>,
     format: FileFormat,
+    parquet_reader: Arc<dyn ParquetScanReader<Batch = DataChunkView>>,
     projected: VeinSchemaRef,
     /// Projected columns whose Parquet dictionary encoding should be retained.
     dictionary_columns: Vec<u32>,
@@ -93,6 +97,7 @@ impl ScanSource {
             operator: config.operator,
             files: config.files,
             format: config.format,
+            parquet_reader: Arc::new(ArrowParquetScanReader),
             projected: config.projected,
             dictionary_columns: config.dictionary_columns,
             pushdown: config.pushdown,
@@ -114,6 +119,18 @@ impl ScanSource {
         self.query_statistics = Some(context);
         self
     }
+
+    /// Selects the Parquet scan backend used by this source.
+    ///
+    /// Readers emit pipeline batches directly, so a backend can preserve row
+    /// selections in `DataChunkView` instead of compacting payload columns.
+    pub fn with_parquet_reader(
+        mut self,
+        reader: Arc<dyn ParquetScanReader<Batch = DataChunkView>>,
+    ) -> Self {
+        self.parquet_reader = reader;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -121,7 +138,7 @@ impl Source<DataChunkView> for ScanSource {
     async fn execute(&mut self, next: &mut dyn PipelineNode<DataChunkView>) -> Result<()> {
         match self.format {
             FileFormat::Parquet => {
-                parquet::execute_parquet_scan(
+                self.parquet_reader.execute(
                     parquet::ParquetScanRequest {
                         operator: &self.operator,
                         files: &self.files,

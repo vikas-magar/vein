@@ -58,14 +58,18 @@ fn intermediate_group_state_preserves_grouping_set_and_null_key_identity() {
         .iter()
         .find(|state| state.grouping_set_id == 0)
         .expect("real NULL key group has its own grouping-set ID");
-    let (retained_keys, row) = real_null_group.keys[0]
+    let retained_key = real_null_group.keys[0]
         .as_ref()
         .expect("group key snapshot retains its Arrow column");
-    let retained_keys = retained_keys
+    let row = retained_key.row();
+    let retained_arrays = retained_key
+        .source_arrays()
+        .expect("snapshot retains its key sources");
+    let retained_keys = retained_arrays[0]
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("snapshot preserves the key array type");
-    assert!(retained_keys.is_null(*row));
+    assert!(retained_keys.is_null(row));
     assert_eq!(
         retained_keys.values().as_ptr(),
         input_key_values,
@@ -84,7 +88,7 @@ fn intermediate_group_state_preserves_grouping_set_and_null_key_identity() {
     assert!(states.iter().all(|state| state.aggregate_states.len() == 1));
     drop(sink);
     assert!(
-        retained_keys.is_null(*row),
+        retained_keys.is_null(row),
         "the intermediate group keeps its shared key view after the sink drops"
     );
 }

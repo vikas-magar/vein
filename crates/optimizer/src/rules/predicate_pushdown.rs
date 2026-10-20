@@ -12,6 +12,11 @@ use crate::rule::{OptimizerRule, RuleType};
 
 use super::predicate_utils::{referenced_columns, substitute_columns};
 
+#[path = "predicate_pushdown/filter_chain.rs"]
+mod filter_chain;
+#[path = "predicate_pushdown/disjunction.rs"]
+mod disjunction;
+
 /// A heuristic rule that moves deterministic predicates closer to their source.
 pub struct PredicatePushdownRule;
 
@@ -27,7 +32,7 @@ impl OptimizerRule for PredicatePushdownRule {
     fn apply(
         &self,
         plan: &LogicalPlan,
-        _context: &OptimizerContext,
+        context: &OptimizerContext,
     ) -> Result<Option<LogicalPlan>> {
         let LogicalPlan::Filter { input, predicate } = plan else {
             return Ok(None);
@@ -37,6 +42,9 @@ impl OptimizerRule for PredicatePushdownRule {
         }
 
         let rewritten = match input.as_ref() {
+            LogicalPlan::Filter { .. } => {
+                filter_chain::push_through_filter_chain(input, predicate, context)?
+            }
             LogicalPlan::Project {
                 input: project_input,
                 exprs,
@@ -67,7 +75,15 @@ impl OptimizerRule for PredicatePushdownRule {
                 on,
                 using,
                 schema,
-            } => push_through_inner_join(left, right, on, using, schema, predicate),
+            } => push_through_join(JoinType::Inner, left, right, on, using, schema, predicate),
+            LogicalPlan::Join {
+                join_type: JoinType::Left,
+                left,
+                right,
+                on,
+                using,
+                schema,
+            } => push_through_join(JoinType::Left, left, right, on, using, schema, predicate),
             LogicalPlan::SetOp {
                 kind,
                 all,
@@ -179,7 +195,8 @@ fn push_through_aggregate(
     })
 }
 
-fn push_through_inner_join(
+fn push_through_join(
+    join_type: JoinType,
     left: &LogicalPlan,
     right: &LogicalPlan,
     on: &Option<LogicalExpr>,
@@ -195,9 +212,11 @@ fn push_through_inner_join(
         return None;
     }
 
+    // LEFT JOIN preserves left rows, so a left-only filter can move below it.
+    // Filtering the nullable right side first could change unmatched-row semantics.
     if referenced.is_subset(&left_ids) {
         return Some(LogicalPlan::Join {
-            join_type: JoinType::Inner,
+            join_type,
             left: Box::new(LogicalPlan::Filter {
                 input: Box::new(left.clone()),
                 predicate: predicate.clone(),
@@ -209,9 +228,9 @@ fn push_through_inner_join(
         });
     }
 
-    if referenced.is_subset(&right_ids) {
+    if join_type == JoinType::Inner && referenced.is_subset(&right_ids) {
         return Some(LogicalPlan::Join {
-            join_type: JoinType::Inner,
+            join_type,
             left: Box::new(left.clone()),
             right: Box::new(LogicalPlan::Filter {
                 input: Box::new(right.clone()),
@@ -221,6 +240,12 @@ fn push_through_inner_join(
             using: using.to_vec(),
             schema: Box::new(schema.clone()),
         });
+    }
+
+    if join_type == JoinType::Inner {
+        return disjunction::pushdown_inner_join(
+            left, right, on, using, schema, predicate, &left_ids, &right_ids,
+        );
     }
 
     None
@@ -280,7 +305,7 @@ mod tests {
     use parser::ast::expr::BinaryOp;
     use plan::{ColumnId, LogicalLiteral, ResolvedColumn, ResolvedColumnRef, TableMetadata};
 
-    fn field(id: usize, name: &str, data_type: plan::VeinDataType) -> ResolvedColumnRef {
+    pub(super) fn field(id: usize, name: &str, data_type: plan::VeinDataType) -> ResolvedColumnRef {
         std::sync::Arc::new(ResolvedColumn::new(
             ColumnId(id),
             name,
@@ -289,7 +314,7 @@ mod tests {
         ))
     }
 
-    fn scan(fields: Vec<ResolvedColumnRef>) -> LogicalPlan {
+    pub(super) fn scan(fields: Vec<ResolvedColumnRef>) -> LogicalPlan {
         let schema = std::sync::Arc::new(VeinSchema {
             fields: fields.clone(),
         });
@@ -305,11 +330,24 @@ mod tests {
         LogicalExpr::Column(field.clone())
     }
 
-    fn bool_predicate(field: &ResolvedColumnRef) -> LogicalExpr {
+    pub(super) fn bool_predicate(field: &ResolvedColumnRef) -> LogicalExpr {
         LogicalExpr::BinaryOp {
             left: Box::new(column(field)),
             op: BinaryOp::Gt,
             right: Box::new(LogicalExpr::Literal(LogicalLiteral::Int64(0))),
+            return_type: plan::VeinDataType::Boolean,
+        }
+    }
+
+    pub(super) fn comparison_predicate(
+        left: &ResolvedColumnRef,
+        op: BinaryOp,
+        right: &ResolvedColumnRef,
+    ) -> LogicalExpr {
+        LogicalExpr::BinaryOp {
+            left: Box::new(column(left)),
+            op,
+            right: Box::new(column(right)),
             return_type: plan::VeinDataType::Boolean,
         }
     }
@@ -447,12 +485,7 @@ mod tests {
                 fields: vec![left_id.clone(), right_id.clone()],
             }),
         };
-        let predicate = LogicalExpr::BinaryOp {
-            left: Box::new(column(&left_id)),
-            op: BinaryOp::Eq,
-            right: Box::new(column(&right_id)),
-            return_type: plan::VeinDataType::Boolean,
-        };
+        let predicate = comparison_predicate(&left_id, BinaryOp::Eq, &right_id);
         let plan = LogicalPlan::Filter {
             input: Box::new(join),
             predicate,
@@ -547,3 +580,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "predicate_pushdown_join_tests.rs"]
+mod join_tests;
+
+#[cfg(test)]
+#[path = "predicate_pushdown/disjunction_tests.rs"]
+mod disjunction_tests;

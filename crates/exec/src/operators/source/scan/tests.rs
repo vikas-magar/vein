@@ -4,6 +4,8 @@ mod bytes_read;
 mod dictionary;
 mod row_group;
 mod runtime_filter;
+#[path = "tests/reader_operator.rs"]
+mod reader_operator;
 mod support;
 
 use support::{

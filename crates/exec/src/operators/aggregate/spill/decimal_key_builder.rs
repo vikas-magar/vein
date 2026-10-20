@@ -18,8 +18,9 @@ macro_rules! decimal_key_builder {
         }
 
         impl SpillKeyBuilder for $builder {
-            fn append(&mut self, key: Option<&(ArrayRef, usize)>) -> Result<()> {
-                let Some((array, row)) = key else {
+            fn append(&mut self, key: Option<&super::super::intermediate::AggregateGroupKeyRef>) -> Result<()> {
+                let source = super::resolve_source_key(key)?;
+                let Some((array, row)) = source.as_ref() else {
                     self.values.push(None);
                     return Ok(());
                 };
@@ -28,8 +29,7 @@ macro_rules! decimal_key_builder {
                     .as_any()
                     .downcast_ref::<$array>()
                     .ok_or_else(|| super::key_type_error(array, &expected))?;
-                self.values
-                    .push((!values.is_null(*row)).then(|| values.value(*row)));
+                self.values.push((!values.is_null(*row)).then(|| values.value(*row)));
                 Ok(())
             }
 

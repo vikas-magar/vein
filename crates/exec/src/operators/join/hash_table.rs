@@ -1,26 +1,28 @@
 //! The build side of a hash join, as a table of references.
 //!
-//! Build payloads stay in reference-backed views. Key resolution shares contiguous
-//! Arrow buffers or gathers mapped key rows; the single-Int64 fast path also
-//! copies keys into the hash index. These allocations are distinct from payload
-//! copying. Probe keys are execution-local, keeping the shared table immutable.
+//! Build payloads and keys stay in reference-backed views. Hashing and equality
+//! follow each key's row mapping into retained Arrow arrays without gathering key
+//! columns or storing duplicate scalar key payloads. Probe access is local to the
+//! execution, keeping the shared table immutable.
 //!
 //! Matching produces row references. The join operator composes output views;
 //! ordinary Arrow payload arrays are requested only at an explicit boundary.
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray, builder::BooleanBuilder};
+use arrow::array::{BooleanArray, builder::BooleanBuilder};
 use arrow::record_batch::RecordBatch;
 use std::cmp::Ordering;
 use std::mem::size_of;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
 use crate::pipeline::{DataChunk, DataChunkView, MaterializationReport};
 use crate::runtime_filter::{RuntimeFilter, RuntimeFilterBuildInput, RuntimeFilterFactory};
 use common::Result;
 use error::VeinError;
-use types::{ColumnId, HashJoinKeyType, LogicalLiteral, VeinDataType};
+use types::{ColumnId, LogicalLiteral};
+
+mod key_access;
+use key_access::ChunkKeys;
 
 /// Which columns of a chunk form the join key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,211 +65,6 @@ fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
 #[inline]
 fn bucket_of(hash: u64, buckets: usize) -> usize {
     (hash as usize) & (buckets - 1)
-}
-
-/// A key column resolved to its concrete Arrow type.
-///
-/// The array is an `Arc` clone rather than a borrow, so the resolved keys can be
-/// owned beside the chunk they describe without the table becoming
-/// self-referential.
-#[derive(Debug, Clone)]
-enum KeyArray {
-    Int32(Int32Array),
-    Int64(Int64Array),
-    Utf8(StringArray),
-}
-
-impl KeyArray {
-    #[inline]
-    fn is_null(&self, row: usize) -> bool {
-        match self {
-            KeyArray::Int32(array) => array.is_null(row),
-            KeyArray::Int64(array) => array.is_null(row),
-            KeyArray::Utf8(array) => array.is_null(row),
-        }
-    }
-
-    #[inline]
-    fn hash_into(&self, row: usize, hash: u64) -> u64 {
-        match self {
-            KeyArray::Int32(array) => fnv1a(&array.value(row).to_ne_bytes(), hash),
-            KeyArray::Int64(array) => fnv1a(&array.value(row).to_ne_bytes(), hash),
-            KeyArray::Utf8(array) => fnv1a(array.value(row).as_bytes(), hash),
-        }
-    }
-
-    #[inline]
-    fn value_eq(&self, row: usize, other: &KeyArray, other_row: usize) -> bool {
-        match (self, other) {
-            (KeyArray::Int32(left), KeyArray::Int32(right)) => {
-                left.value(row) == right.value(other_row)
-            }
-            (KeyArray::Int64(left), KeyArray::Int64(right)) => {
-                left.value(row) == right.value(other_row)
-            }
-            (KeyArray::Utf8(left), KeyArray::Utf8(right)) => {
-                left.value(row) == right.value(other_row)
-            }
-            _ => false,
-        }
-    }
-
-    #[inline]
-    fn compare_values(&self, row: usize, other: &KeyArray, other_row: usize) -> Option<Ordering> {
-        match (self, other) {
-            (KeyArray::Int32(left), KeyArray::Int32(right)) => {
-                Some(left.value(row).cmp(&right.value(other_row)))
-            }
-            (KeyArray::Int64(left), KeyArray::Int64(right)) => {
-                Some(left.value(row).cmp(&right.value(other_row)))
-            }
-            (KeyArray::Utf8(left), KeyArray::Utf8(right)) => {
-                Some(left.value(row).cmp(right.value(other_row)))
-            }
-            _ => None,
-        }
-    }
-
-    fn logical_literal(&self, row: usize) -> Result<LogicalLiteral> {
-        match self {
-            KeyArray::Int32(array) => Ok(LogicalLiteral::Int64(i64::from(array.value(row)))),
-            KeyArray::Int64(array) => Ok(LogicalLiteral::Int64(array.value(row))),
-            KeyArray::Utf8(array) => Ok(LogicalLiteral::String(array.value(row).to_owned())),
-        }
-    }
-}
-
-/// The key columns of one chunk, resolved once rather than once per row.
-#[derive(Debug, Clone)]
-struct ChunkKeys {
-    columns: Vec<KeyArray>,
-}
-
-impl ChunkKeys {
-    fn resolve(keys: &JoinKeys, chunk: &DataChunkView) -> Result<(Self, MaterializationReport, u64)> {
-        let started = Instant::now();
-        let mut report = MaterializationReport::default();
-        let mut columns = Vec::with_capacity(keys.columns.len());
-        for index in &keys.columns {
-            // Only the join keys cross an Arrow-kernel boundary; payload arrays
-            // stay retained by the reference-backed view.
-            let (array, column_report) = chunk.materialize_column_with_report(*index)?;
-            report.accumulate(column_report);
-            columns.push(Self::resolve_array(*index, array)?);
-        }
-        Ok((Self { columns }, report, u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)))
-    }
-
-    /// Resolve Arrow references without copying their value buffers.
-    fn resolve_arrays(columns: &[ArrayRef]) -> Result<Self> {
-        let columns = columns
-            .iter()
-            .enumerate()
-            .map(|(index, array)| Self::resolve_array(index, Arc::clone(array)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self { columns })
-    }
-
-    fn resolve_array(index: usize, array: ArrayRef) -> Result<KeyArray> {
-        let data_type = VeinDataType::try_from(array.data_type()).map_err(|error| {
-            VeinError::internal(format!(
-                "join key column {index} has an unsupported Arrow type {:?}: {error}",
-                array.data_type()
-            ))
-        })?;
-        match data_type.hash_join_key_type() {
-            Some(HashJoinKeyType::Int32) => {
-                let ints = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                    VeinError::internal(format!(
-                        "join key column {index} does not match its declared Int32 type"
-                    ))
-                })?;
-                Ok(KeyArray::Int32(ints.clone()))
-            }
-            Some(HashJoinKeyType::Int64) => {
-                let ints = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                    VeinError::internal(format!(
-                        "join key column {index} does not match its declared Int64 type"
-                    ))
-                })?;
-                Ok(KeyArray::Int64(ints.clone()))
-            }
-            Some(HashJoinKeyType::Utf8) => {
-                let strings = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    VeinError::internal(format!(
-                        "join key column {index} does not match its declared Utf8 type"
-                    ))
-                })?;
-                Ok(KeyArray::Utf8(strings.clone()))
-            }
-            None => Err(VeinError::internal(format!(
-                "join key column {index} has type {:?}, which is not supported by hash join",
-                array.data_type()
-            ))),
-        }
-    }
-
-    /// Whether any key column is null at `row`.
-    ///
-    /// Build insertion uses this lightweight pass to count null rows before it
-    /// reserves index memory, keeping an allocation failure from leaving a
-    /// partially inserted batch.
-    fn any_null(&self, row: usize) -> bool {
-        self.columns.iter().any(|column| column.is_null(row))
-    }
-
-    /// Encodes one row's key in one pass over its key columns.
-    ///
-    /// Null keys do not participate in equality joins. For a single Int64 key,
-    /// return the inline value alongside its hash so callers do not read the
-    /// same Arrow value again just to prepare the fast comparison path.
-    #[inline]
-    fn hash_and_single_i64(&self, row: usize) -> Option<(u64, Option<i64>)> {
-        if let [KeyArray::Int64(array)] = self.columns.as_slice() {
-            if array.is_null(row) {
-                return None;
-            }
-            let value = array.value(row);
-            let hash = fnv1a(&value.to_ne_bytes(), FNV_OFFSET);
-            return Some((hash, Some(value)));
-        }
-
-        let mut hash = FNV_OFFSET;
-        for column in &self.columns {
-            if column.is_null(row) {
-                return None;
-            }
-            hash = column.hash_into(row, hash);
-        }
-        Some((hash, None))
-    }
-
-    /// Whether this is a single `Int64` key, the shape that can be compared as a
-    /// plain value instead of through the encoding.
-    fn is_single_i64(&self) -> bool {
-        matches!(self.columns.as_slice(), [KeyArray::Int64(_)])
-    }
-
-    fn equals(&self, row: usize, other: &Self, other_row: usize) -> bool {
-        self.columns
-            .iter()
-            .zip(&other.columns)
-            .all(|(left, right)| left.value_eq(row, right, other_row))
-    }
-
-    fn has_compatible_types(&self, other: &Self) -> bool {
-        self.columns.len() == other.columns.len()
-            && self
-            .columns
-            .iter()
-            .zip(&other.columns)
-            .all(|(left, right)| matches!(
-                    (left, right),
-                    (KeyArray::Int32(_), KeyArray::Int32(_))
-                        | (KeyArray::Int64(_), KeyArray::Int64(_))
-                        | (KeyArray::Utf8(_), KeyArray::Utf8(_))
-                ))
-    }
 }
 
 /// Configuration for the default join-key Bloom runtime filter.
@@ -526,6 +323,10 @@ impl RuntimeFilter for JoinBloomFilter {
         self.memory.bytes()
     }
 
+    fn reorder_safe(&self) -> bool {
+        true
+    }
+
     fn evaluate(
         &self,
         batch: &RecordBatch,
@@ -550,7 +351,7 @@ impl RuntimeFilter for JoinBloomFilter {
         let mut mask = BooleanBuilder::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             let may_match = keys
-                .hash_and_single_i64(row)
+                .hash_and_single_i64(row, None)?
                 .is_some_and(|(hash, _)| self.may_contain(hash));
             mask.append_value(may_match);
         }
@@ -725,14 +526,7 @@ pub struct HashTable {
     /// Build rows whose key is null: entered, but never bucketed, because no
     /// probe row may match them and an outer join still has to emit them.
     null_keyed: Vec<(u32, u32)>,
-    /// The build key of each entry, when the key is a single `Int64`. Comparing
-    /// these is one array read instead of resolving the key's encoding and
-    /// dereferencing an Arrow array per chain candidate — DuckDB's trick of
-    /// keeping the key beside the hash (`tuple_data_layout.cpp`: "NULL byte +
-    /// fixed-width type"). Only the key is copied; payload columns stay
-    /// columnar and shared.
-    keys: Vec<i64>,
-    /// Build key array conversions, excluding inline-key/index allocations.
+    /// Key array handles and row mappings are retained without gathering values.
     build_key_materialization: MaterializationReport,
     build_key_materialize_us: u64,
     /// Per-key min/max endpoints stored as references into retained build arrays.
@@ -749,7 +543,7 @@ impl HashTable {
     /// Keeping this beside the in-memory key encoder prevents spill partitioning
     /// from introducing a second, potentially incompatible key representation.
     pub fn hashes_for_view(view: &DataChunkView, keys: &JoinKeys) -> Result<Vec<u64>> {
-        let (resolved, _, _) = ChunkKeys::resolve(keys, view)?;
+        let (resolved, _) = ChunkKeys::resolve_view(keys, view)?;
         let mut hashes = Vec::new();
         hashes.try_reserve_exact(view.num_rows()).map_err(|error| {
             VeinError::internal(format!("cannot reserve join spill hashes: {error}"))
@@ -757,7 +551,7 @@ impl HashTable {
         for row in 0..view.num_rows() {
             hashes.push(
                 resolved
-                    .hash_and_single_i64(row)
+                    .hash_and_single_i64(row, Some(view))?
                     .map_or(FNV_OFFSET, |(hash, _)| hash),
             );
         }
@@ -825,7 +619,6 @@ impl HashTable {
             hashes: Vec::new(),
             buckets,
             null_keyed: Vec::new(),
-            keys: Vec::new(),
             build_key_materialization: MaterializationReport::default(),
             build_key_materialize_us: 0,
             key_bounds,
@@ -843,16 +636,16 @@ impl HashTable {
         )
     }
 
-    /// Whether the build key is a single `Int64`, so [`Self::keys`] is usable.
-    fn inline_keys(&self) -> bool {
-        self.keys.len() == self.entries.len()
-    }
-
-    fn key_array(&self, reference: BuildRowReference, key_index: usize) -> Result<&KeyArray> {
-        self.keys_by_chunk
-            .get(reference.chunk as usize)
-            .and_then(|keys| keys.columns.get(key_index))
-            .ok_or_else(|| VeinError::internal("join key bound points outside retained key arrays"))
+    fn key_chunk(&self, reference: BuildRowReference) -> Result<(&ChunkKeys, &DataChunkView)> {
+        let index = reference.chunk as usize;
+        Ok((
+            self.keys_by_chunk
+                .get(index)
+                .ok_or_else(|| VeinError::internal("join key reference points outside retained key arrays"))?,
+            self.chunks
+                .get(index)
+                .ok_or_else(|| VeinError::internal("join key reference points outside retained chunks"))?,
+        ))
     }
 
     fn compare_build_rows(
@@ -861,12 +654,17 @@ impl HashTable {
         left: BuildRowReference,
         right: BuildRowReference,
     ) -> Result<Ordering> {
-        self.key_array(left, key_index)?
-            .compare_values(
+        let (left_keys, left_view) = self.key_chunk(left)?;
+        let (right_keys, right_view) = self.key_chunk(right)?;
+        left_keys
+            .compare_value(
+                key_index,
                 left.row as usize,
-                self.key_array(right, key_index)?,
+                left_view,
+                right_keys,
                 right.row as usize,
-            )
+                right_view,
+            )?
             .ok_or_else(|| VeinError::internal("join key bound type changed during build"))
     }
 
@@ -916,16 +714,16 @@ impl HashTable {
         bounds
             .try_reserve_exact(self.key_bounds.len())
             .map_err(|error| VeinError::internal(format!("cannot allocate join key bounds snapshot: {error}")))?;
-        for key_bounds in &self.key_bounds {
+        for (key_index, key_bounds) in self.key_bounds.iter().enumerate() {
             let (Some(min), Some(max)) = (key_bounds.min, key_bounds.max) else {
                 bounds.push(None);
                 continue;
             };
-            let min_column = self.key_array(min, bounds.len())?;
-            let max_column = self.key_array(max, bounds.len())?;
+            let (min_keys, min_view) = self.key_chunk(min)?;
+            let (max_keys, max_view) = self.key_chunk(max)?;
             bounds.push(Some((
-                min_column.logical_literal(min.row as usize)?,
-                max_column.logical_literal(max.row as usize)?,
+                min_keys.logical_literal(key_index, min.row as usize, min_view)?,
+                max_keys.logical_literal(key_index, max.row as usize, max_view)?,
             )));
         }
         Ok(bounds)
@@ -953,7 +751,7 @@ impl HashTable {
                 self.tracker.lease_retained_array(identity, bytes, "hash join retained arrays")?;
             Ok(lease)
         })?;
-        let (keys, report, materialize_us) = ChunkKeys::resolve(&self.build_keys, &chunk)?;
+        let (keys, key_access_us) = ChunkKeys::resolve_view(&self.build_keys, &chunk)?;
         if self
             .keys_by_chunk
             .first()
@@ -975,23 +773,24 @@ impl HashTable {
         // caller can spill the retained input views without recovering a
         // partially indexed batch. Counting nulls is cheaper than retaining a
         // per-row scratch vector and does not copy payload data.
-        let null_rows = (0..row_count)
-            .filter(|row| keys.any_null(*row))
-            .count();
+        let mut null_rows = 0usize;
+        for row in 0..row_count {
+            if keys.any_null(&chunk, row)? {
+                null_rows += 1;
+            }
+        }
         let indexed_rows = row_count - null_rows;
-        let inline_key_bytes = if keys.is_single_i64() {
-            size_of::<i64>()
-        } else {
-            0
-        };
         let entry_bytes = size_of::<Entry>()
             .checked_add(size_of::<u64>())
-            .and_then(|bytes| bytes.checked_add(inline_key_bytes))
             .ok_or_else(|| VeinError::internal("join index entry size overflow"))?;
         let index_bytes = size_of::<DataChunkView>()
-            .checked_add(null_rows.checked_mul(size_of::<(u32, u32)>()).ok_or_else(|| {
-                VeinError::internal("join null-key index size overflow")
-            })?)
+            .checked_add(size_of::<ChunkKeys>())
+            .and_then(|bytes| bytes.checked_add(keys.metadata_bytes()))
+            .and_then(|bytes| {
+                null_rows
+                    .checked_mul(size_of::<(u32, u32)>())
+                    .and_then(|null_bytes| bytes.checked_add(null_bytes))
+            })
             .and_then(|bytes| bytes.checked_add(indexed_rows.checked_mul(entry_bytes)?))
             .ok_or_else(|| VeinError::internal("join index batch size overflow"))?;
 
@@ -1036,11 +835,6 @@ impl HashTable {
         self.hashes.try_reserve(indexed_rows).map_err(|error| {
             VeinError::internal(format!("cannot reserve hash join values: {error}"))
         })?;
-        if keys.is_single_i64() && self.keys.len() == self.entries.len() {
-            self.keys.try_reserve(indexed_rows).map_err(|error| {
-                VeinError::internal(format!("cannot reserve inline hash join keys: {error}"))
-            })?;
-        }
         if bucket_count > self.buckets.len() {
             let old_bucket_count = self.buckets.len();
             self.rebucket(bucket_count)?;
@@ -1050,16 +844,15 @@ impl HashTable {
             self.memory.shrink(old_bytes);
         }
 
-        self.build_key_materialization.accumulate(report);
-        self.build_key_materialize_us = self.build_key_materialize_us.saturating_add(materialize_us);
+        self.build_key_materialize_us = self.build_key_materialize_us.saturating_add(key_access_us);
         let chunk_index = self.chunks.len() as u32;
         self.chunks.push(chunk);
         self.keys_by_chunk.push(keys);
 
         for position in 0..row_count {
             let row = position as u32;
-            let Some((hash, inline_key)) = self.keys_by_chunk[chunk_index as usize]
-                .hash_and_single_i64(position)
+            let Some((hash, _)) = self.keys_by_chunk[chunk_index as usize]
+                .hash_and_single_i64(position as usize, Some(&self.chunks[chunk_index as usize]))?
             else {
                 self.null_keyed.push((chunk_index, row));
                 continue;
@@ -1074,18 +867,10 @@ impl HashTable {
                 next,
             });
             self.hashes.push(hash);
-            if let Some(value) = inline_key {
-                self.keys.push(value);
-            }
             self.update_key_bounds(BuildRowReference {
                 chunk: chunk_index,
                 row,
             })?;
-        }
-        // A chunk whose key is not a single Int64 invalidates the inline array:
-        // drop it rather than leave a partially filled one behind.
-        if self.keys.len() != self.entries.len() {
-            self.keys.clear();
         }
         Ok(())
     }
@@ -1140,8 +925,6 @@ impl HashTable {
                 })?;
             }
         }
-        let self_inline = self.inline_keys();
-        let other_inline = other.inline_keys();
         let offset = u32::try_from(self.chunks.len())
             .map_err(|_| VeinError::internal("hash join chunk index exceeds row-reference range"))?;
         let other_bounds_bytes = other
@@ -1168,14 +951,17 @@ impl HashTable {
                     };
                 }
                 Some(current_min) => {
-                    let other_min_array = other.key_array(other_min, key_index)?;
-                    let current_min_array = self.key_array(current_min, key_index)?;
-                    if other_min_array
-                        .compare_values(
+                    let (other_min_keys, other_min_view) = other.key_chunk(other_min)?;
+                    let (current_min_keys, current_min_view) = self.key_chunk(current_min)?;
+                    if other_min_keys
+                        .compare_value(
+                            key_index,
                             other_min.row as usize,
-                            current_min_array,
+                            other_min_view,
+                            current_min_keys,
                             current_min.row as usize,
-                        )
+                            current_min_view,
+                        )?
                         .ok_or_else(|| VeinError::internal("join key bound type changed during merge"))?
                         == Ordering::Less
                     {
@@ -1185,14 +971,17 @@ impl HashTable {
                     let current_max = merged_key_bounds[key_index]
                         .max
                         .ok_or_else(|| VeinError::internal("join key bounds have an incomplete endpoint"))?;
-                    let other_max_array = other.key_array(other_max, key_index)?;
-                    let current_max_array = self.key_array(current_max, key_index)?;
-                    if other_max_array
-                        .compare_values(
+                    let (other_max_keys, other_max_view) = other.key_chunk(other_max)?;
+                    let (current_max_keys, current_max_view) = self.key_chunk(current_max)?;
+                    if other_max_keys
+                        .compare_value(
+                            key_index,
                             other_max.row as usize,
-                            current_max_array,
+                            other_max_view,
+                            current_max_keys,
                             current_max.row as usize,
-                        )
+                            current_max_view,
+                        )?
                         .ok_or_else(|| VeinError::internal("join key bound type changed during merge"))?
                         == Ordering::Greater
                     {
@@ -1226,13 +1015,6 @@ impl HashTable {
                 .into_iter()
                 .map(|(chunk, row)| (chunk + offset, row)),
         );
-        // The inline key array is only meaningful if *both* sides kept one.
-        if self_inline && other_inline {
-            self.keys.extend(other.keys);
-        } else {
-            self.keys.clear();
-        }
-
         let wanted_buckets = self.entries.len()
             .checked_mul(2)
             .ok_or_else(|| VeinError::internal("merged join bucket count overflow"))?;
@@ -1295,36 +1077,51 @@ impl HashTable {
         matches: &mut Vec<(u32, (u32, u32))>,
         mut null_probe_rows: Option<&mut Vec<u32>>,
     ) -> Result<(MaterializationReport, u64)> {
-        let (probe_keys, report, materialize_us) = ChunkKeys::resolve(&self.probe_keys, probe)?;
-        let inline = self.inline_keys() && probe_keys.is_single_i64();
+        let (probe_keys, key_access_us) = ChunkKeys::resolve_view(&self.probe_keys, probe)?;
+        let report = MaterializationReport::default();
+        let inline_i64 = probe_keys.is_single_i64()
+            && self
+                .keys_by_chunk
+                .first()
+                .is_some_and(ChunkKeys::is_single_i64);
         for position in 0..probe.num_rows() {
             let row = position as u32;
-            let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position) else {
+            let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position, Some(probe))? else {
                 if let Some(rows) = &mut null_probe_rows {
                     rows.push(row);
                 }
                 continue;
             };
-            let value = inline.then(|| inline_key.unwrap_or_default());
             let mut head = self.buckets[bucket_of(hash, self.buckets.len())];
             while head != NONE {
                 let entry = self.entries[head as usize];
                 let same = self.hashes[head as usize] == hash
-                    && match value {
-                    Some(value) => self.keys[head as usize] == value,
-                    None => self.keys_by_chunk[entry.chunk as usize].equals(
-                        entry.row as usize,
-                        &probe_keys,
-                        row as usize,
-                    ),
-                };
+                    && (if inline_i64 {
+                        let value = inline_key.ok_or_else(|| {
+                            VeinError::internal("single-Int64 probe key is missing its value")
+                        })?;
+                        self.keys_by_chunk[entry.chunk as usize]
+                            .single_i64_value(
+                                &self.chunks[entry.chunk as usize],
+                                entry.row as usize,
+                            )?
+                            == Some(value)
+                    } else {
+                        self.keys_by_chunk[entry.chunk as usize].equals(
+                            entry.row as usize,
+                            &self.chunks[entry.chunk as usize],
+                            &probe_keys,
+                            row as usize,
+                            probe,
+                        )?
+                    });
                 if same {
                     matches.push((row, (entry.chunk, entry.row)));
                 }
                 head = entry.next;
             }
         }
-        Ok((report, materialize_us))
+        Ok((report, key_access_us))
     }
 
     /// Whether a single-key membership build contains a NULL key.

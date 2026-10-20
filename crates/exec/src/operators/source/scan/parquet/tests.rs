@@ -15,3 +15,5 @@ mod metrics;
 mod page_header;
 #[path = "tests/projection.rs"]
 mod projection;
+#[path = "tests/page_selection_io.rs"]
+mod page_selection_io;

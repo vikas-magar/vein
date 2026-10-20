@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use catalog::TableStatistics;
 
 use super::RuntimeStatisticsObservation;
+use super::QueryStateRegistry;
 
 /// Statistics for one table input, keyed by its pinned source revision.
 #[derive(Debug, Clone)]
@@ -303,6 +304,7 @@ struct RuntimeState {
 pub struct QueryStatisticsContext {
     sources: Arc<[QuerySourceStatistics]>,
     runtime: Arc<Mutex<RuntimeState>>,
+    query_state: QueryStateRegistry,
 }
 
 impl std::fmt::Debug for QueryStatisticsContext {
@@ -338,7 +340,22 @@ impl QueryStatisticsContext {
         Self {
             sources: Arc::from(sources.into_iter().collect::<Vec<_>>()),
             runtime: Arc::new(Mutex::new(RuntimeState::default())),
+            query_state: QueryStateRegistry::default(),
         }
+    }
+
+    /// Returns shared, query-lifetime state for an adaptive execution policy.
+    pub fn shared_query_state<T, F>(
+        &self,
+        scan_id: u128,
+        signature: impl Into<String>,
+        create: F,
+    ) -> Arc<T>
+    where
+        T: std::any::Any + Send + Sync,
+        F: FnOnce() -> T,
+    {
+        self.query_state.get_or_insert_with(scan_id, signature, create)
     }
 
     /// Looks up source statistics by the revision-pinned key.

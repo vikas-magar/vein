@@ -17,7 +17,11 @@ fn hashes_for_arrays(columns: &[ArrayRef]) -> Vec<u64> {
     let keys = ChunkKeys::resolve_arrays(columns).expect("resolve key arrays");
     let rows = columns.first().map_or(0, |column| column.len());
     (0..rows)
-        .filter_map(|row| keys.hash_and_single_i64(row).map(|(hash, _)| hash))
+        .filter_map(|row| {
+            keys.hash_and_single_i64(row, None)
+                .expect("hash key row")
+                .map(|(hash, _)| hash)
+        })
         .collect()
 }
 
@@ -94,34 +98,34 @@ fn bloom_runtime_filter_declines_optional_allocation_when_budget_is_exhausted() 
 
 #[test]
 fn row_key_encoding_hashes_composite_values_and_skips_null_keys() {
-    let single_i64 = ChunkKeys {
-        columns: vec![KeyArray::Int64(Int64Array::from(vec![Some(3), None]))],
-    };
+    let single_i64 = ChunkKeys::resolve_arrays(&[
+        Arc::new(Int64Array::from(vec![Some(3), None])) as ArrayRef,
+    ])
+    .expect("resolve single Int64 key");
     let expected_i64_hash = fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET);
     assert_eq!(
-        single_i64.hash_and_single_i64(0),
+        single_i64.hash_and_single_i64(0, None).unwrap(),
         Some((expected_i64_hash, Some(3))),
-        "the inline Int64 comparison key shares the one-pass encoding result"
+        "the Int64 scalar is read for hashing without retaining a duplicate"
     );
-    assert_eq!(single_i64.hash_and_single_i64(1), None);
+    assert_eq!(single_i64.hash_and_single_i64(1, None).unwrap(), None);
 
-    let composite = ChunkKeys {
-        columns: vec![
-            KeyArray::Int64(Int64Array::from(vec![Some(3), Some(3), None])),
-            KeyArray::Utf8(StringArray::from(vec![Some("north"), None, Some("north")])),
-        ],
-    };
+    let composite = ChunkKeys::resolve_arrays(&[
+        Arc::new(Int64Array::from(vec![Some(3), Some(3), None])) as ArrayRef,
+        Arc::new(StringArray::from(vec![Some("north"), None, Some("north")])) as ArrayRef,
+    ])
+    .expect("resolve composite key");
     let expected_composite_hash = fnv1a(
         b"north",
         fnv1a(&3_i64.to_ne_bytes(), FNV_OFFSET),
     );
     assert_eq!(
-        composite.hash_and_single_i64(0),
+        composite.hash_and_single_i64(0, None).unwrap(),
         Some((expected_composite_hash, None)),
         "composite keys preserve column order in the canonical hash"
     );
-    assert_eq!(composite.hash_and_single_i64(1), None, "a null in any key column skips the row");
-    assert_eq!(composite.hash_and_single_i64(2), None, "null leading key columns skip the row");
+    assert_eq!(composite.hash_and_single_i64(1, None).unwrap(), None, "a null in any key column skips the row");
+    assert_eq!(composite.hash_and_single_i64(2, None).unwrap(), None, "null leading key columns skip the row");
 }
 
 #[test]
@@ -148,7 +152,7 @@ fn spill_hashes_use_the_same_composite_key_encoding_as_join_indexing() {
 }
 
 #[test]
-fn key_reports_cover_composite_null_keys_sparse_probes_and_table_merges() {
+fn sparse_composite_join_keys_stay_reference_backed_through_table_merge_and_probe() {
     use common::arrow::SelectionVector;
 
     let numbers: ArrayRef = Arc::new(Int64Array::from(vec![Some(7), None, Some(8)]));
@@ -160,18 +164,18 @@ fn key_reports_cover_composite_null_keys_sparse_probes_and_table_merges() {
     let mut left = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
     left.insert_view(make_view(SelectionVector::new_dense(3))).unwrap();
     let (shared, shared_us) = left.build_key_materialization();
-    assert_eq!(shared.shared_columns, 2);
-    assert_eq!(shared.gathered_columns, 0);
+    assert_eq!(shared, MaterializationReport::default());
     let mut right = HashTable::new(JoinKeys::new(vec![0, 1]), JoinKeys::new(vec![0, 1]));
     let sparse = make_view(SelectionVector::new_sparse(vec![2, 1, 0]));
-    let (_, first) = sparse.materialize_column_with_report(0).unwrap();
-    let (_, second) = sparse.materialize_column_with_report(1).unwrap();
-    let expected_bytes = first.gathered_output_buffer_bytes + second.gathered_output_buffer_bytes;
     right.insert_view(sparse.clone()).unwrap();
     let (gathered, gathered_us) = right.build_key_materialization();
-    assert_eq!(gathered.gathered_columns, 2);
-    assert_eq!(gathered.gathered_output_buffer_bytes, expected_bytes);
-    assert!(expected_bytes > 0);
+    assert_eq!(gathered, MaterializationReport::default());
+    for (column, expected) in [(&numbers, 0), (&strings, 1)] {
+        assert!(Arc::ptr_eq(
+            &right.build_chunk(0).source_arrays_for_column(expected).unwrap()[0],
+            column
+        ), "sparse join-key access retains source Arrow arrays");
+    }
     left.merge(right).unwrap();
     let mut expected = shared;
     expected.accumulate(gathered);
@@ -183,7 +187,7 @@ fn key_reports_cover_composite_null_keys_sparse_probes_and_table_merges() {
     let before = left.build_key_materialization();
     let mut matches = Vec::new();
     let (report, _) = left.probe_view(&sparse, &mut matches).unwrap();
-    assert_eq!(report, gathered);
+    assert_eq!(report, MaterializationReport::default());
     matches.sort_unstable();
     assert_eq!(matches, vec![(0, (0, 2)), (0, (1, 0)), (2, (0, 0)), (2, (1, 2))]);
     assert_eq!(left.build_key_materialization(), before, "probing must not mutate the shared build table");
@@ -203,7 +207,7 @@ fn key_reports_handle_empty_batches_and_keyless_joins() {
     let empty = DataChunkView::from_chunk(DataChunk::new(vec![ints(&[1])], SelectionVector::new_sparse(vec![]))).unwrap();
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     table.insert_view(empty.clone()).unwrap();
-    let expected = MaterializationReport { empty_columns: 1, ..Default::default() };
+    let expected = MaterializationReport::default();
     assert_eq!(table.build_key_materialization().0, expected);
     let mut matches = Vec::new();
     assert_eq!(table.probe_view(&empty, &mut matches).unwrap().0, expected);
@@ -310,7 +314,7 @@ fn range_filter_prunes_from_statistics_without_binding_a_row_mask() {
         ColumnId(7),
         "id",
         None,
-        VeinDataType::Int64,
+        types::VeinDataType::Int64,
     ))]);
 
     assert!(!filters.has_row_filters());
@@ -704,16 +708,25 @@ fn retained_build_array_budget_failure_happens_before_retaining_the_view() {
 fn row_index_budget_failure_does_not_partially_insert_a_build_batch() {
     let first = ints(&[10]);
     let second = ints(&[20]);
-    let per_row_index_bytes = size_of::<DataChunkView>()
-        + size_of::<Entry>()
-        + size_of::<u64>()
-        + size_of::<i64>();
-    let per_batch_bytes = first.get_array_memory_size() + per_row_index_bytes;
+    let initial_bytes = INITIAL_BUCKETS * size_of::<u32>() + size_of::<BuildKeyBounds>();
+    let sizing_tracker = QueryMemoryTracker::unlimited(
+        common::cancellation::CancellationToken::new(),
+    );
+    let mut sizing_table = HashTable::with_memory_tracker(
+        JoinKeys::new(vec![0]),
+        JoinKeys::new(vec![0]),
+        sizing_tracker.clone(),
+    )
+    .expect("create sizing table");
+    let initial_usage = sizing_tracker.used();
+    sizing_table
+        .insert_view(DataChunkView::from_chunk(chunk(Arc::clone(&first))).unwrap())
+        .expect("insert sizing row");
+    let per_batch_bytes = sizing_tracker.used() - initial_usage;
+    drop(sizing_table);
+
     let tracker = QueryMemoryTracker::new(
-        INITIAL_BUCKETS * size_of::<u32>()
-            + size_of::<BuildKeyBounds>()
-            + per_batch_bytes * 2
-            - 1,
+        initial_bytes + per_batch_bytes * 2 - 1,
         common::cancellation::CancellationToken::new(),
     );
     let mut table = HashTable::with_memory_tracker(

@@ -22,7 +22,7 @@ use types::VeinDataType;
 
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
 use crate::spill::{IpcRunOutput, IpcRunWriter, SpillRun};
-use super::intermediate::AggregateIntermediateGroup;
+use super::intermediate::{AggregateGroupKeyRef, AggregateIntermediateGroup};
 
 const FORMAT_METADATA_KEY: &str = "vein.aggregate.spill.format";
 const FORMAT_METADATA_VALUE: &str = "2";
@@ -195,11 +195,6 @@ impl AggregateSpillSchema {
             {
                 let included = grouping_set.contains(&key_index);
                 match (included, group_key) {
-                    (true, Some((array, row))) if *row >= array.len() => {
-                        return Err(VeinError::internal(
-                            "aggregate spill key row is outside its Arrow array",
-                        ));
-                    }
                     (true, Some(key)) => builder.append(Some(key))?,
                     (true, None) => {
                         return Err(VeinError::internal(
@@ -277,12 +272,16 @@ impl AggregateSpillSchema {
             let keys = (0..self.key_types.len())
                 .map(|key_index| {
                     if grouping_set.contains(&key_index) {
-                        Some((Arc::clone(batch.column(key_index + 2)), row))
+                        AggregateGroupKeyRef::from_array(
+                            Arc::clone(batch.column(key_index + 2)),
+                            row,
+                        )
+                            .map(Some)
                     } else {
-                        None
+                        Ok(None)
                     }
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let aggregate_states =
                 AggregateIntermediateGroup::decode_aggregate_states(state_payloads.value(row))?;
             groups.push(AggregateIntermediateGroup {
@@ -414,15 +413,24 @@ impl<R: Read + Seek> AggregateSpillReader<R> {
 }
 
 trait SpillKeyBuilder {
-    fn append(&mut self, key: Option<&(ArrayRef, usize)>) -> Result<()>;
+    fn append(&mut self, key: Option<&AggregateGroupKeyRef>) -> Result<()>;
     fn finish(self: Box<Self>) -> Result<ArrayRef>;
+}
+
+pub(super) fn resolve_source_key(
+    key: Option<&AggregateGroupKeyRef>,
+) -> Result<Option<(ArrayRef, usize)>> {
+    key.map(AggregateGroupKeyRef::source_row)
+        .transpose()
+        .map(Option::flatten)
 }
 
 struct PrimitiveKeyColumnBuilder<T: ArrowPrimitiveType>(PrimitiveBuilder<T>);
 
 impl<T: ArrowPrimitiveType> SpillKeyBuilder for PrimitiveKeyColumnBuilder<T> {
-    fn append(&mut self, key: Option<&(ArrayRef, usize)>) -> Result<()> {
-        let Some((array, row)) = key else {
+    fn append(&mut self, key: Option<&AggregateGroupKeyRef>) -> Result<()> {
+        let source = resolve_source_key(key)?;
+        let Some((array, row)) = source.as_ref() else {
             self.0.append_null();
             return Ok(());
         };
@@ -463,8 +471,9 @@ impl Utf8KeyColumnBuilder {
 }
 
 impl SpillKeyBuilder for Utf8KeyColumnBuilder {
-    fn append(&mut self, key: Option<&(ArrayRef, usize)>) -> Result<()> {
-        let Some((array, row)) = key else {
+    fn append(&mut self, key: Option<&AggregateGroupKeyRef>) -> Result<()> {
+        let source = resolve_source_key(key)?;
+        let Some((array, row)) = source.as_ref() else {
             self.values.append_null();
             return Ok(());
         };
@@ -581,7 +590,9 @@ mod tests {
         AggregateIntermediateGroup {
             hash: u64::try_from(count).expect("test count is non-negative"),
             grouping_set_id,
-            keys: vec![key],
+            keys: vec![key.map(|(array, row)| {
+                AggregateGroupKeyRef::from_array(array, row).expect("valid test key row")
+            })],
             aggregate_states: vec![AggregateIntermediateState::Count(count)],
         }
     }
@@ -622,13 +633,20 @@ mod tests {
         assert_eq!(restored[0].hash, 2);
         assert_eq!(restored[1].hash, 5);
         assert_eq!(restored[2].hash, 7);
-        assert!(restored[0].keys[0]
+        let null_key = restored[0].keys[0]
             .as_ref()
-            .expect("real NULL grouping key")
-            .0
-            .is_null(0));
-        let (array, row) = restored[1].keys[0].as_ref().expect("ordinary key");
-        assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().value(*row), 17);
+            .expect("real NULL grouping key");
+        let (array, row) = null_key
+            .source_row()
+            .expect("resolve NULL key")
+            .expect("a SQL NULL still has an Arrow source row");
+        assert!(array.is_null(row));
+        let ordinary_key = restored[1].keys[0].as_ref().expect("ordinary key");
+        let (array, row) = ordinary_key
+            .source_row()
+            .expect("resolve ordinary key")
+            .expect("ordinary key has a source row");
+        assert_eq!(array.as_any().downcast_ref::<Int64Array>().unwrap().value(row), 17);
         assert_eq!(restored[0].grouping_set_id, 0);
         assert_eq!(restored[2].grouping_set_id, 1);
         assert!(restored[2].keys[0].is_none(), "omitted grouping key stays absent");
@@ -659,10 +677,12 @@ mod tests {
         let decoded_bytes = tracker.used();
         assert!(decoded_bytes > 0, "decoded Arrow arrays must be accounted");
         assert_eq!(batch.groups.len(), 2);
-        let key_array = &batch.groups[0].keys[0]
+        let key_arrays = batch.groups[0].keys[0]
             .as_ref()
             .expect("group retains its decoded key array")
-            .0;
+            .source_arrays()
+            .expect("decoded key source arrays");
+        let key_array = &key_arrays[0];
         assert_eq!(
             decoded_bytes,
             key_array.get_array_memory_size(),
@@ -703,9 +723,14 @@ mod tests {
             .expect("write dictionary key");
         let mut reader = layout.open_reader(Cursor::new(bytes.into_inner())).unwrap();
         let restored = reader.next_batch().unwrap().unwrap();
-        let (array, row) = restored[0].keys[0].as_ref().unwrap();
+        let (array, row) = restored[0].keys[0]
+            .as_ref()
+            .unwrap()
+            .source_row()
+            .unwrap()
+            .unwrap();
         assert_eq!(array.data_type(), &DataType::Utf8);
-        assert_eq!(array.as_any().downcast_ref::<StringArray>().unwrap().value(*row), "beta");
+        assert_eq!(array.as_any().downcast_ref::<StringArray>().unwrap().value(row), "beta");
     }
 
     #[test]
@@ -731,7 +756,13 @@ mod tests {
         let mismatched_key = AggregateIntermediateGroup {
             hash: 1,
             grouping_set_id: 0,
-            keys: vec![Some((Arc::new(StringArray::from(vec!["wrong type"])) as ArrayRef, 0))],
+            keys: vec![Some(
+                AggregateGroupKeyRef::from_array(
+                    Arc::new(StringArray::from(vec!["wrong type"])) as ArrayRef,
+                    0,
+                )
+                    .expect("valid mismatched key row"),
+            )],
             aggregate_states: vec![AggregateIntermediateState::Count(1)],
         };
         assert!(layout.encode_batch(&[mismatched_key]).is_err());

@@ -58,6 +58,48 @@ async fn checkpoint_synopses_follow_mapped_rows_null_extensions_and_column_ident
 }
 
 #[tokio::test]
+async fn parallel_checkpoint_statistics_merge_batches_without_copying_arrays() {
+    let logical = schema();
+    let arrow = Arc::new(logical.to_arrow());
+    let tracker = QueryMemoryTracker::new(1 << 20, CancellationToken::new());
+    let relation = IntermediateRelation::new(Arc::clone(&arrow), tracker.clone());
+    let mut sink = relation.sink();
+    for _ in 0..8 {
+        sink.push(DataChunkView::from_record_batch(RecordBatch::try_new(
+            Arc::clone(&arrow),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), None, Some(2)])),
+                Arc::new(Int64Array::from(vec![Some(10), Some(20), None, Some(20)])),
+            ],
+        ).unwrap()).unwrap()).unwrap();
+    }
+    sink.flush().unwrap();
+    let retained_bytes = tracker.used();
+    let mut source = relation.source().unwrap();
+    let statistics_schema = super::statistics::statistics_schema(&relation, &logical).unwrap();
+    let (stats, batches) = super::statistics::collect_from_source(
+        &mut source,
+        statistics_schema,
+        32,
+        &tracker,
+        2,
+    ).unwrap();
+
+    assert_eq!(batches, 8);
+    assert_eq!(stats.num_rows, Some(32));
+    for (key, min, max) in [("11", 1, 2), ("22", 10, 20)] {
+        let column = &stats.column_statistics[key];
+        assert_eq!(column.null_count, Some(8));
+        assert_eq!(column.distinct_count, Some(2));
+        assert_eq!(column.min_value, Some(types::LogicalLiteral::Int64(min)));
+        assert_eq!(column.max_value, Some(types::LogicalLiteral::Int64(max)));
+        assert!(column.most_common_values.is_some());
+        assert_eq!(column.histogram.as_ref().map(|h| h.population_count), Some(24));
+    }
+    assert_eq!(tracker.used(), retained_bytes);
+}
+
+#[tokio::test]
 async fn empty_checkpoint_produces_typed_zero_population_and_rejects_wrong_schema() {
     let logical = schema();
     let relation = IntermediateRelation::new(Arc::new(logical.to_arrow()),

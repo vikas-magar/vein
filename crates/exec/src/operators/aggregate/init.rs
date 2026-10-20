@@ -112,6 +112,7 @@ impl AggregateSink {
             dictionary_group_slots: Vec::new(),
             batch_new_groups: Vec::new(),
             group_key_batches: Vec::new(),
+            group_key_batch_arrays: Vec::new(),
             group_key_batch_leases: Vec::new(),
             dictionary_first_rows: Vec::new(),
             group_ids_by_set,

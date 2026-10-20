@@ -8,6 +8,7 @@ default-members = ["crates/cli"]
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["full"] }
 arrow = "60.0.0"
+arrow-cmp = "60.0.0"
 arrow-row = "60.0.0"
 parquet = { version = "60.0.0", features = ["async", "arrow"] }
 opendal = { version = "0.59.3", features = ["services-fs"] }

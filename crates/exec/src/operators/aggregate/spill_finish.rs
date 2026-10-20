@@ -1,14 +1,14 @@
 use super::*;
 
 impl AggregateSink {
-    pub(super) fn finish_spill_partition(
+    pub(super) fn finish_spill_partition_view(
         plan: &AggregatePlan,
         tracker: &QueryMemoryTracker,
         schema: &AggregateSpillSchema,
         runs: Vec<SpillRun>,
         bit: u32,
         batch_rows: NonZeroUsize,
-        emit: &mut impl FnMut(DataChunk) -> Result<()>,
+        emit: &mut impl FnMut(DataChunkView) -> Result<()>,
     ) -> Result<()> {
         tracker.check_cancelled()?;
         let mut partition_plan = plan.clone();
@@ -32,7 +32,7 @@ impl AggregateSink {
 
         match merge_result {
             Ok(()) => {
-                let finish_result = sink.finish_in_memory_with(batch_rows, emit);
+                let finish_result = sink.finish_in_memory_view_with(batch_rows, emit);
                 drop(sink);
                 finish_result?;
                 drop(runs);
@@ -52,7 +52,7 @@ impl AggregateSink {
                     "aggregate spill partition exceeded memory and was repartitioned"
                 );
                 for child in children.into_iter().flatten() {
-                    Self::finish_spill_partition(
+                    Self::finish_spill_partition_view(
                         plan,
                         tracker,
                         schema,

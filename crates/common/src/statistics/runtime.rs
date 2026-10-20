@@ -13,9 +13,10 @@ use std::thread;
 use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
+use crate::arrow::SelectionVector;
 use catalog::{CatalogSnapshotToken, TableStatistics};
 
-use super::{ArrowScalarEncoder, HyperLogLog, StatisticsCollector, StatisticsConfig, TableStatisticsLog};
+use super::{ArrowScalarEncoder, HyperLogLog, SelectedRecordBatch, StatisticsCollector, StatisticsConfig, StatisticsInput, TableStatisticsLog};
 use super::QueryStatisticsContext;
 use crate::{Result, VeinError};
 
@@ -137,6 +138,7 @@ enum StatisticsWork {
         expected_partitions: usize,
         table_scan_candidate: bool,
         batch: RecordBatch,
+        selection: Option<SelectionVector>,
     },
 }
 
@@ -319,10 +321,49 @@ impl RuntimeStatisticsStore {
         table_scan_candidate: bool,
         batch: &RecordBatch,
     ) -> RuntimeStatisticsEnqueue {
+        self.enqueue_batch_with_selection(
+            scan_id, table_key, expected_rows, expected_partitions,
+            table_scan_candidate, batch, None,
+        )
+    }
+
+    /// Queue a shallow batch handle and its active rows for asynchronous synopsis collection.
+    /// The query thread copies only selection metadata; Arrow payloads remain shared.
+    pub fn enqueue_selected_batch(
+        &self,
+        scan_id: u128,
+        table_key: &str,
+        expected_rows: Option<u64>,
+        expected_partitions: usize,
+        table_scan_candidate: bool,
+        batch: &RecordBatch,
+        selection: &SelectionVector,
+    ) -> RuntimeStatisticsEnqueue {
+        self.enqueue_batch_with_selection(
+            scan_id, table_key, expected_rows, expected_partitions,
+            table_scan_candidate, batch, Some(selection.clone()),
+        )
+    }
+
+    fn enqueue_batch_with_selection(
+        &self,
+        scan_id: u128,
+        table_key: &str,
+        expected_rows: Option<u64>,
+        expected_partitions: usize,
+        table_scan_candidate: bool,
+        batch: &RecordBatch,
+        selection: Option<SelectionVector>,
+    ) -> RuntimeStatisticsEnqueue {
         let Some(worker) = &self.worker else {
             return RuntimeStatisticsEnqueue::WorkerUnavailable;
         };
-        if batch.get_array_memory_size() > worker.config.max_batch_bytes {
+        let selection_bytes = selection.as_ref().map_or(0, |selection| {
+            selection.size().saturating_mul(std::mem::size_of::<u32>())
+        });
+        if batch.get_array_memory_size().saturating_add(selection_bytes)
+            > worker.config.max_batch_bytes
+        {
             return RuntimeStatisticsEnqueue::BatchTooLarge;
         }
         let work = StatisticsWork::Batch {
@@ -332,6 +373,7 @@ impl RuntimeStatisticsStore {
             expected_partitions,
             table_scan_candidate,
             batch: batch.clone(),
+            selection,
         };
         match worker.batches.try_send(work) {
             Ok(()) => RuntimeStatisticsEnqueue::Queued,
@@ -385,6 +427,40 @@ impl RuntimeStatisticsStore {
         table_scan_candidate: bool,
         batch: &RecordBatch,
     ) -> Result<()> {
+        self.observe_input(
+            scan_id, table_key, expected_rows, expected_partitions,
+            table_scan_candidate, batch, batch,
+        )
+    }
+
+    /// Observe only selected rows while borrowing the original Arrow buffers.
+    pub fn observe_selected_batch(
+        &self,
+        scan_id: u128,
+        table_key: &str,
+        expected_rows: Option<u64>,
+        expected_partitions: usize,
+        table_scan_candidate: bool,
+        batch: &RecordBatch,
+        selection: &SelectionVector,
+    ) -> Result<()> {
+        let input = SelectedRecordBatch::new(batch, selection);
+        self.observe_input(
+            scan_id, table_key, expected_rows, expected_partitions,
+            table_scan_candidate, batch, &input,
+        )
+    }
+
+    fn observe_input<I: StatisticsInput>(
+        &self,
+        scan_id: u128,
+        table_key: &str,
+        expected_rows: Option<u64>,
+        expected_partitions: usize,
+        table_scan_candidate: bool,
+        schema_batch: &RecordBatch,
+        input: &I,
+    ) -> Result<()> {
         let entry = {
             let mut state = self
                 .state
@@ -415,7 +491,7 @@ impl RuntimeStatisticsStore {
         )?;
         if observation.collector.is_none() {
             observation.collector = Some(StatisticsCollector::new(
-                batch.schema(),
+                schema_batch.schema(),
                 StatisticsConfig::default(),
             )?);
         }
@@ -423,7 +499,7 @@ impl RuntimeStatisticsStore {
             .collector
             .as_mut()
             .ok_or_else(|| VeinError::internal("runtime statistics collector was not initialized"))?
-            .update(batch)
+            .update_input(input)
     }
 
     /// Mark one scan partition complete and publish a synopsis after all
@@ -517,8 +593,21 @@ impl RuntimeStatisticsStore {
 }
 
 fn process_statistics_batch(store: &RuntimeStatisticsStore, work: StatisticsWork) {
-    let StatisticsWork::Batch { scan_id, table_key, expected_rows, expected_partitions, table_scan_candidate, batch } = work;
-    if let Err(error) = store.observe_batch(scan_id, &table_key, expected_rows, expected_partitions, table_scan_candidate, &batch) {
+    let StatisticsWork::Batch {
+        scan_id, table_key, expected_rows, expected_partitions,
+        table_scan_candidate, batch, selection,
+    } = work;
+    let result = match selection {
+        Some(selection) => store.observe_selected_batch(
+            scan_id, &table_key, expected_rows, expected_partitions,
+            table_scan_candidate, &batch, &selection,
+        ),
+        None => store.observe_batch(
+            scan_id, &table_key, expected_rows, expected_partitions,
+            table_scan_candidate, &batch,
+        ),
+    };
+    if let Err(error) = result {
         tracing::warn!(target: "vein.audit", event = "runtime_statistics_batch_failed", scan_id, error = %error, "runtime statistics batch was discarded");
     }
 }
@@ -675,6 +764,36 @@ mod tests {
         };
         assert!(observation.complete_table_snapshot);
         assert_eq!(observation.statistics.num_rows, Some(4));
+    }
+
+    #[test]
+    fn selected_scan_statistics_observe_only_active_rows_without_batch_compaction() {
+        let store = RuntimeStatisticsStore::default();
+        let query_context = Arc::new(QueryStatisticsContext::new([]));
+        let input = batch(&[1, 2, 3, 4]);
+        let selection = SelectionVector::new_sparse(vec![1, 3]);
+        assert_eq!(
+            store.enqueue_selected_batch(23, "table@revision", Some(4), 1, false, &input, &selection),
+            RuntimeStatisticsEnqueue::Queued,
+        );
+        assert!(store.enqueue_partition_completion(RuntimeStatisticsPartitionCompletion {
+            scan_id: 23,
+            table_key: "table@revision",
+            expected_rows: Some(4),
+            expected_partitions: 1,
+            table_scan_candidate: false,
+            partition_index: 0,
+            query_context: Some(Arc::clone(&query_context)),
+        }));
+        store.flush_pending();
+
+        let observations = query_context.scan_statistics("table@revision");
+        let [observation] = observations.as_slice() else {
+            panic!("selected scan feedback should be published");
+        };
+        assert_eq!(observation.statistics.num_rows, Some(2));
+        assert_eq!(observation.statistics.column_statistics["key"].distinct_count, Some(2));
+        assert!(!observation.complete_table_snapshot);
     }
 
     #[test]

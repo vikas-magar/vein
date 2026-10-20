@@ -1,4 +1,4 @@
-//! Asynchronous Parquet reads over OpenDAL with bounded range concurrency.
+//! Asynchronous Parquet range reads with shared metrics and metadata loading.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,11 +11,14 @@ use opendal::Operator;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 
+mod backend;
+pub(super) use backend::ParquetIoBackend;
+use backend::ParquetRangeSource;
+
 const MAX_CONCURRENT_RANGE_READS: usize = 8;
 
-pub(super) struct OpendalParquetReader {
-    operator: Operator,
-    path: String,
+pub(super) struct ParquetFileReader {
+    source: Arc<dyn ParquetRangeSource>,
     size_bytes: u64,
     bytes_read: Arc<AtomicU64>,
     io: Arc<IoStats>,
@@ -86,49 +89,47 @@ fn thread_cpu_time() -> Duration {
     Duration::ZERO
 }
 
-impl OpendalParquetReader {
-    /// Wraps `operator` as a Parquet reader for `path`, which holds `size_bytes` bytes.
+impl ParquetFileReader {
+    /// Opens a Parquet range reader for one file.
     ///
-    /// The length is passed in rather than fetched: whoever builds the reader
-    /// already knows the file's identity, so a second stat of the same file
-    /// would only repeat work the caller has done.
-    pub(super) fn new(
+    /// The backend is selected once per scan, allowing the same Parquet decoding
+    /// and pruning path to be measured over OpenDAL or a persistent native file
+    /// handle. The caller supplies file size from the catalog to avoid a second stat.
+    pub(super) async fn new(
         operator: &Operator,
-        path: &str,
+        relative_path: &str,
+        absolute_path: &std::path::Path,
+        backend: ParquetIoBackend,
         size_bytes: u64,
         bytes_read: Arc<AtomicU64>,
         io: Arc<IoStats>,
-    ) -> Self {
-        Self {
-            operator: operator.clone(),
-            path: path.to_string(),
+    ) -> parquet::errors::Result<Self> {
+        let source = backend
+            .open_source(operator, relative_path, absolute_path, size_bytes)
+            .await?;
+        Ok(Self {
+            source,
             size_bytes,
             bytes_read,
             io,
-        }
+        })
     }
 }
 
-impl AsyncFileReader for OpendalParquetReader {
+impl AsyncFileReader for ParquetFileReader {
     fn get_bytes(
         &mut self,
         range: std::ops::Range<u64>,
     ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        self.io.record_call();
+        let source = Arc::clone(&self.source);
+        let bytes_read = Arc::clone(&self.bytes_read);
+        let io = Arc::clone(&self.io);
         Box::pin(async move {
-            self.io.record_call();
             let fetch_started = Instant::now();
-            let read_started = Instant::now();
-            let data = self
-                .operator
-                .read_with(&self.path)
-                .range(range.start..range.end)
-                .await
-                .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
-            self.io.record(read_started.elapsed());
-            self.bytes_read
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-            self.io.record_fetch(fetch_started.elapsed());
-            Ok(data.to_bytes())
+            let result = read_range(source, range, bytes_read, Arc::clone(&io)).await;
+            io.record_fetch(fetch_started.elapsed());
+            result
         })
     }
 
@@ -138,22 +139,16 @@ impl AsyncFileReader for OpendalParquetReader {
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         self.io.record_call();
         let io = self.io.clone();
-        let reads = ranges.into_iter().map(|range| {
-            let operator = self.operator.clone();
-            let path = self.path.clone();
-            let bytes_read = self.bytes_read.clone();
-            let io = self.io.clone();
-            async move {
-                let read_started = Instant::now();
-                let data = operator
-                    .read_with(&path)
-                    .range(range.start..range.end)
-                    .await
-                    .map_err(|error| parquet::errors::ParquetError::General(error.to_string()))?;
-                io.record(read_started.elapsed());
-                bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
-                Ok(data.to_bytes())
-            }
+        let range_io = Arc::clone(&io);
+        let source = Arc::clone(&self.source);
+        let bytes_read = Arc::clone(&self.bytes_read);
+        let reads = ranges.into_iter().map(move |range| {
+            read_range(
+                Arc::clone(&source),
+                range,
+                Arc::clone(&bytes_read),
+                Arc::clone(&range_io),
+            )
         });
 
         Box::pin(async move {
@@ -185,4 +180,19 @@ impl AsyncFileReader for OpendalParquetReader {
             Ok(std::sync::Arc::new(meta))
         })
     }
+}
+
+fn read_range(
+    source: Arc<dyn ParquetRangeSource>,
+    range: std::ops::Range<u64>,
+    bytes_read: Arc<AtomicU64>,
+    io: Arc<IoStats>,
+) -> BoxFuture<'static, parquet::errors::Result<Bytes>> {
+    Box::pin(async move {
+        let started = Instant::now();
+        let data = source.read_range(range).await?;
+        io.record(started.elapsed());
+        bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(data)
+    })
 }

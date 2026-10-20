@@ -116,7 +116,7 @@ impl DataRequest {
             page_locations,
         };
 
-        in_memory_row_group.fill_column_chunks(projection, page_start_offsets, chunks);
+        in_memory_row_group.fill_column_chunks(projection, page_start_offsets, chunks)?;
 
         // Clear the ranges that were explicitly requested
         buffers.clear_ranges(&ranges);

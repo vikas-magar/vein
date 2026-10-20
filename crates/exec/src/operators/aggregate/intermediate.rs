@@ -11,6 +11,8 @@ use arrow::datatypes::i256;
 use common::protocol::AggOpCode;
 use error::VeinError;
 use std::io::{Cursor, Read};
+use std::sync::Arc;
+use super::group_key::GroupKeyColumn;
 
 #[derive(Clone)]
 pub(super) struct NumericPartial<T> {
@@ -38,9 +40,57 @@ pub(super) enum AggregateIntermediateState {
     Decimal256(NumericPartial<i256>),
 }
 
-/// Aggregate state tied to a group identity. Key arrays are shared Arrow views,
-/// so a spill writer can consume this snapshot after the sink releases its own
-/// references without copying key payloads.
+/// Retains one group-key row either as an Arrow array row or as a typed column
+/// row. Column references preserve view mappings until spill serialization.
+#[derive(Clone)]
+pub(super) enum AggregateGroupKeyRef {
+    Arrow { array: ArrayRef, row: usize },
+    Column { column: GroupKeyColumn, row: usize },
+}
+
+impl AggregateGroupKeyRef {
+    pub(super) fn from_array(array: ArrayRef, row: usize) -> common::Result<Self> {
+        if row >= array.len() {
+            return Err(VeinError::internal("aggregate key row is outside its Arrow array"));
+        }
+        Ok(Self::Arrow { array, row })
+    }
+
+    pub(super) fn from_column(column: GroupKeyColumn, row: usize) -> common::Result<Self> {
+        if row >= column.len() {
+            return Err(VeinError::internal("aggregate key row is outside its key column"));
+        }
+        Ok(Self::Column { column, row })
+    }
+
+    pub(super) fn row(&self) -> usize {
+        match self {
+            Self::Arrow { row, .. } | Self::Column { row, .. } => *row,
+        }
+    }
+
+    pub(super) fn group_key_column(&self) -> common::Result<GroupKeyColumn> {
+        match self {
+            Self::Arrow { array, .. } => GroupKeyColumn::new(array),
+            Self::Column { column, .. } => Ok(column.clone()),
+        }
+    }
+
+    pub(super) fn source_arrays(&self) -> common::Result<Vec<ArrayRef>> {
+        match self {
+            Self::Arrow { array, .. } => Ok(vec![Arc::clone(array)]),
+            Self::Column { column, .. } => column.source_arrays(),
+        }
+    }
+
+    pub(super) fn source_row(&self) -> common::Result<Option<(ArrayRef, usize)>> {
+        match self {
+            Self::Arrow { array, row } => Ok(Some((Arc::clone(array), *row))),
+            Self::Column { column, row } => column.source_row(*row),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct AggregateIntermediateGroup {
     /// Hash produced by the owning aggregate's query-local hash builder.
@@ -48,7 +98,7 @@ pub(super) struct AggregateIntermediateGroup {
     /// partition without reconstructing a hasher or changing hash seeds.
     pub(super) hash: u64,
     pub(super) grouping_set_id: usize,
-    pub(super) keys: Vec<Option<(ArrayRef, usize)>>,
+    pub(super) keys: Vec<Option<AggregateGroupKeyRef>>,
     pub(super) aggregate_states: Vec<AggregateIntermediateState>,
 }
 

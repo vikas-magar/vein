@@ -624,6 +624,7 @@ impl PipelineCompiler {
             let mut compiler = BytecodeCompiler::new(register_count);
             let result = compiler.compile_predicate(&predicates, &input)?;
             let program = Arc::new(compiler.finish());
+            let reorder_safe = predicates.iter().all(super::scan_stages::reorder_safe);
             let input_columns = input
                 .fields
                 .iter()
@@ -638,10 +639,12 @@ impl PipelineCompiler {
                 input_column_count = input.fields.len(),
                 register_count,
                 instruction_count = program.instructions.len(),
+                reorder_safe,
                 "scan_predicate_stage_compiled"
             );
             stages.push(ScanPredicateStage {
                 predicate_count: predicates.len(),
+                reorder_safe,
                 input: Arc::new(input),
                 program,
                 result,

@@ -26,9 +26,7 @@ use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelectionCursor, RowSelector,
 };
 use crate::errors::{ParquetError, Result};
-use arrow_array::{Array, BooleanArray};
-use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
-use arrow_select::filter::prep_null_mask_filter;
+use arrow_buffer::BooleanBuffer;
 use std::sync::Arc;
 
 /// Options for [`ReadPlanBuilder::with_predicate_options`].
@@ -219,35 +217,30 @@ impl ReadPlanBuilder {
         for maybe_batch in reader {
             let maybe_batch = maybe_batch?;
             let input_rows = maybe_batch.num_rows();
-            let filter = predicate.evaluate(maybe_batch)?;
-            // Since user supplied predicate, check error here to catch bugs quickly
-            if filter.len() != input_rows {
+            let selection = predicate.evaluate_selection(maybe_batch)?;
+            // Validate user supplied selection evaluators before composing their
+            // results with the row-group selection.
+            if selection.total_row_count() != input_rows {
                 return Err(arrow_err!(
-                    "ArrowPredicate predicate returned {} rows, expected {input_rows}",
-                    filter.len()
+                    "ArrowPredicate selection spans {} rows, expected {input_rows}",
+                    selection.total_row_count()
                 ));
             }
-            let filter = match filter.null_count() {
-                0 => filter,
-                // RowSelection::from_filters expects non-null filters. Convert
-                // NULL predicate results to false so they are not selected.
-                _ => prep_null_mask_filter(&filter),
-            };
 
             processed_rows += input_rows;
 
             match limit {
-                Some(limit) if limit - matched_rows <= filter.len() => {
-                    let truncated = filter.take_n_true(limit - matched_rows);
-                    matched_rows += truncated.true_count();
+                Some(limit) if limit - matched_rows <= input_rows => {
+                    let truncated = selection.limit(limit - matched_rows);
+                    matched_rows += truncated.row_count();
                     filters.push(truncated);
                     if matched_rows >= limit {
                         break;
                     }
                 }
                 _ => {
-                    matched_rows += filter.true_count();
-                    filters.push(filter);
+                    matched_rows += selection.row_count();
+                    filters.push(selection);
                 }
             }
         }
@@ -261,26 +254,22 @@ impl ReadPlanBuilder {
             && processed_rows < expected
         {
             let pad_len = expected - processed_rows;
-            filters.push(BooleanArray::new(BooleanBuffer::new_unset(pad_len), None));
+            filters.push(RowSelection::from_boolean_buffer(BooleanBuffer::new_unset(
+                pad_len,
+            )));
         }
 
         // If the predicate selected all rows, applying it is a no-op. With no
         // prior selection this keeps selection as None, enabling coalesced page
         // fetches; with a prior selection it avoids rebuilding the same
         // selection.
-        let all_selected = filters.iter().all(|f| f.true_count() == f.len());
+        let all_selected = filters
+            .iter()
+            .all(|selection| selection.row_count() == selection.total_row_count());
         if all_selected {
             return Ok(self);
         }
-        let raw = if self
-            .selection
-            .as_ref()
-            .is_some_and(|s| s.as_mask().is_some())
-        {
-            RowSelection::from_boolean_buffer(filters_to_boolean_buffer(&filters))
-        } else {
-            RowSelection::from_filters(&filters)
-        };
+        let raw = filters.into_iter().collect::<RowSelection>();
         self.selection = match self.selection.take() {
             Some(selection) => Some(selection.and_then(&raw)),
             None => Some(raw),
@@ -421,16 +410,6 @@ impl LimitedReadPlanBuilder {
 
         inner
     }
-}
-
-fn filters_to_boolean_buffer(filters: &[BooleanArray]) -> BooleanBuffer {
-    let total_rows = filters.iter().map(|f| f.len()).sum();
-    let mut builder = BooleanBufferBuilder::new(total_rows);
-    for filter in filters {
-        assert_eq!(filter.null_count(), 0);
-        builder.append_buffer(filter.values());
-    }
-    builder.finish()
 }
 
 /// A plan reading specific rows from a Parquet Row Group.
@@ -792,3 +771,7 @@ mod tests {
         assert_eq!(selection.total_row_count(), TOTAL_ROWS);
     }
 }
+
+#[cfg(test)]
+#[path = "read_plan_filter_selection_tests.rs"]
+mod filter_selection_tests;

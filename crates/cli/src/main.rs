@@ -1,9 +1,13 @@
 use std::time::Instant;
 
-use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use cli::local::LocalQueryEngine;
 use common::{Result, VeinError};
+use exec::operators::sink::ViewResultBatch;
+
+mod result_format;
+mod view_pretty;
+mod query_timing;
 
 /// Rows the CLI renders before summarising the rest.
 ///
@@ -19,6 +23,7 @@ async fn main() -> Result<()> {
     let args = std::env::args().skip(1);
 
     common::logging::init("cli")?;
+    let output_format = result_format::OutputFormat::from_env()?;
 
     let query = query_argument(args.collect::<Vec<_>>().join(" "))?;
 
@@ -67,48 +72,62 @@ async fn main() -> Result<()> {
     let mut row_count = 0u64;
     let mut batch_count = 0u64;
     let display_rows = display_row_limit();
+    let stdout = std::io::stdout();
+    let mut json_writer = output_format
+        .is_json_lines()
+        .then(|| result_format::JsonRowsWriter::new(stdout.lock()));
+    let mut format_us = 0u64;
 
-    // Only the rendered prefix is retained. Slicing shares the batch's buffers, so
-    // discarding the rest costs no copy of the rows that are not shown.
-    let mut shown: Vec<RecordBatch> = Vec::new();
+    // Keep the rendered prefix as row mappings into the original Arrow buffers.
+    let mut shown: Vec<ViewResultBatch> = Vec::new();
     let mut shown_rows = 0usize;
 
     while let Some(batch) = batches.next().await {
         let batch = batch?;
-        row_count += batch.num_rows() as u64;
+        let batch_rows = batch.num_rows();
+        row_count += batch_rows as u64;
         batch_count += 1;
-        if display_rows.is_none_or(|limit| shown_rows < limit) {
-            let take = display_rows.map_or(batch.num_rows(), |limit| {
-                (limit - shown_rows).min(batch.num_rows())
+        if let Some(writer) = json_writer.as_mut() {
+            let format_started = Instant::now();
+            writer.write_view_batch(&batch)?;
+            format_us = format_us.saturating_add(format_started.elapsed().as_micros() as u64);
+        } else if display_rows.is_none_or(|limit| shown_rows < limit) {
+            let take = display_rows.map_or(batch_rows, |limit| {
+                (limit - shown_rows).min(batch_rows)
             });
             if take > 0 {
-                shown.push(batch.slice(0, take));
+                shown.push(batch.slice_rows(0, take)?);
                 shown_rows += take;
             }
         }
     }
 
     let format_started = Instant::now();
-    if shown_rows == 0 {
-        println!("Query returned 0 rows");
+    if let Some(writer) = json_writer.as_mut() {
+        writer.finish()?;
     } else {
-        println!("{}", arrow::util::pretty::pretty_format_batches(&shown)?);
-        if row_count > shown_rows as u64 {
-            println!("({shown_rows} of {row_count} rows shown)");
+        if shown_rows == 0 {
+            println!("Query returned 0 rows");
+        } else {
+            println!("{}", view_pretty::pretty_format_views(&shown)?);
+            if row_count > shown_rows as u64 {
+                println!("({shown_rows} of {row_count} rows shown)");
+            }
         }
     }
-    let format_us = format_started.elapsed().as_micros() as u64;
+    format_us = format_us.saturating_add(format_started.elapsed().as_micros() as u64);
 
     let total_us = started.elapsed().as_micros() as u64;
+    let execute_us = total_us.saturating_sub(prepare_us).saturating_sub(format_us);
     tracing::info!(
         target: "vein.audit",
         event = "query_finished",
         mode = "read",
         prepare_us,
-        execute_us = total_us.saturating_sub(prepare_us).saturating_sub(format_us),
+        execute_us,
         format_us,
         rows = row_count,
-        rows_shown = shown_rows,
+        rows_shown = if output_format.is_json_lines() { row_count } else { shown_rows as u64 },
         batches = batch_count,
         total_us,
         "query_finished"
@@ -117,6 +136,12 @@ async fn main() -> Result<()> {
         "Query completed: {row_count} rows in {} ms",
         total_us / 1000
     );
+    if output_format.is_json_lines() {
+        eprintln!(
+            "{}",
+            query_timing::machine_timing_line(prepare_us, execute_us, format_us, total_us)
+        );
+    }
     Ok(())
 }
 

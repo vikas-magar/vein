@@ -18,17 +18,22 @@ impl AggregateSink {
             .map(|state| state.intermediate_state(slot))
             .collect::<Result<Vec<_>>>()?;
         let keys = (0..self.plan.groups as usize)
-            .map(|column| {
+            .map(|column| -> Result<Option<AggregateGroupKeyRef>> {
                 if !self.grouping_sets_by_column[column].contains(&group.grouping_set_id) {
-                    return None;
+                    return Ok(None);
                 }
-                let location = group.key_location?;
+                let location = group.key_location.ok_or_else(|| {
+                    VeinError::internal("aggregate group with keys has no retained key location")
+                })?;
                 let key = self.group_key_batches[location.batch][column]
                     .as_ref()
-                    .expect("group source batch retains every grouping column");
-                Some((key.array_ref(), location.row))
+                    .ok_or_else(|| VeinError::internal("aggregate group key column is missing"))?;
+                Ok(Some(AggregateGroupKeyRef::from_column(
+                    key.clone(),
+                    location.row,
+                )?))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(AggregateIntermediateGroup {
             hash: group.hash,
             grouping_set_id: group.grouping_set_id,
@@ -56,12 +61,26 @@ impl AggregateSink {
         let mut key_columns = std::iter::repeat_with(|| None)
             .take(group.keys.len())
             .collect::<Vec<Option<GroupKeyColumn>>>();
+        let mut key_arrays = vec![Vec::new(); group.keys.len()];
         let mut key_row = None;
         for (column, key) in group.keys.iter().enumerate() {
             match (grouping_set.contains(&(column as u32)), key) {
-                (true, Some((array, row))) if *row < array.len() => {
-                    key_columns[column] = Some(GroupKeyColumn::new(array)?);
-                    key_row.get_or_insert(*row);
+                (true, Some(key)) => {
+                    let row = key.row();
+                    let key_column = key.group_key_column()?;
+                    if row >= key_column.len() {
+                        return Err(VeinError::internal(
+                            "aggregate intermediate key row is outside its key column",
+                        ));
+                    }
+                    if key_row.is_some_and(|existing| existing != row) {
+                        return Err(VeinError::internal(
+                            "aggregate intermediate keys disagree on their group row",
+                        ));
+                    }
+                    key_columns[column] = Some(key_column);
+                    key_arrays[column] = key.source_arrays()?;
+                    key_row.get_or_insert(row);
                 }
                 (true, _) => {
                     return Err(VeinError::internal(
@@ -125,23 +144,24 @@ impl AggregateSink {
                 return Err(error);
             }
 
-            let mut retained_arrays = HashSet::new();
-            let mut leases = Vec::new();
-            if let Err(error) = leases.try_reserve(key_columns.len()) {
+            let mut leases = HashMap::new();
+            if let Err(error) = leases.try_reserve(key_arrays.iter().map(Vec::len).sum()) {
                 self.memory.shrink(self.memory.bytes() - before);
                 return Err(VeinError::internal(format!(
                     "cannot reserve aggregate spill key leases: {error}"
                 )));
             }
-            for key in group.keys.iter().flatten() {
-                let identity = Arc::as_ptr(&key.0) as *const () as usize;
-                if retained_arrays.insert(identity) {
+            for array in key_arrays.iter().flatten() {
+                let identity = Arc::as_ptr(&array) as *const () as usize;
+                if !leases.contains_key(&identity) {
                     match self.tracker.lease_retained_array(
                         identity,
-                        key.0.get_array_memory_size(),
+                        array.get_array_memory_size(),
                         "aggregate spill merge keys",
                     ) {
-                        Ok(lease) => leases.push(lease),
+                        Ok(lease) => {
+                            leases.insert(identity, lease);
+                        }
                         Err(error) => {
                             self.memory.shrink(self.memory.bytes() - before);
                             return Err(error);
@@ -161,12 +181,19 @@ impl AggregateSink {
                     "cannot reserve aggregate spill key leases: {error}"
                 )));
             }
+            if let Err(error) = self.group_key_batch_arrays.try_reserve(1) {
+                self.memory.shrink(self.memory.bytes() - before);
+                return Err(VeinError::internal(format!(
+                    "cannot reserve aggregate spill key source arrays: {error}"
+                )));
+            }
 
             let location = key_row.map(|row| GroupKeyLocation {
                 batch: self.group_key_batches.len(),
                 row,
             });
             self.group_key_batches.push(key_columns);
+            self.group_key_batch_arrays.push(key_arrays);
             self.group_key_batch_leases.push(leases);
             let slot = Self::push_group(
                 &mut self.groups,

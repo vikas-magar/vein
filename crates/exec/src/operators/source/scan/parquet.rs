@@ -6,12 +6,11 @@ use common::protocol::RuntimeStatisticsScan;
 use common::protocol::ScanPredicate;
 use common::statistics::RuntimeStatisticsStore;
 #[cfg(test)]
-use common::statistics::runtime::{runtime_metric_availability, RUNTIME_STATISTIC_METRICS};
+use common::statistics::runtime::{RUNTIME_STATISTIC_METRICS, runtime_metric_availability};
 use error::VeinError;
 use futures::Stream;
 use opendal::Operator;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::RowFilter;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::AsyncFileReader;
@@ -28,13 +27,16 @@ use super::ScanFile;
 use catalog::{MetadataKind, MetadataStore};
 
 mod file;
+mod batch_size;
 mod metrics;
 mod page_header_reader;
 mod page_pruning;
 mod predicate;
 mod projection;
 mod reader;
+mod selection;
 
+use batch_size::{RowGroupBatchSizePolicy, ScanBatchSizePolicy};
 use file::prepare_parquet_file;
 use metrics::ScanPredicateMetrics;
 use page_header_reader::{
@@ -43,9 +45,10 @@ use page_header_reader::{
 use page_pruning::{
     attach_header_page_locations, page_header_audit_enabled, page_payload_pruning_metrics,
 };
-use predicate::{ScanPredicateContext, build_scan_predicates};
-use projection::{dictionary_schema_hint, root_indices};
-use reader::{IoStats, OpendalParquetReader, thread_cpu_time};
+use predicate::{AdaptiveFilterOrder, ScanPredicateContext, build_scan_predicates};
+use projection::{dictionary_schema_hint, scan_projection};
+use reader::{IoStats, ParquetFileReader, ParquetIoBackend, thread_cpu_time};
+use selection::{handoff_view, project_batch};
 
 /// Metadata kind under which this format publishes parsed Parquet footers.
 ///
@@ -55,19 +58,31 @@ use reader::{IoStats, OpendalParquetReader, thread_cpu_time};
 pub const PARQUET_FOOTER: MetadataKind = MetadataKind::new("parquet.footer");
 
 /// Borrowed inputs for one Parquet scan invocation.
-pub(super) struct ParquetScanRequest<'a> {
-    pub(super) operator: &'a Operator,
-    pub(super) files: &'a [ScanFile],
-    pub(super) projected: &'a VeinSchema,
-    pub(super) dictionary_columns: &'a [u32],
-    pub(super) pushdown: Option<&'a ScanPredicate>,
-    pub(super) metadata_store: &'a MetadataStore,
-    pub(super) registry: &'a Arc<FunctionRegistry>,
-    pub(super) bytes_read: &'a Arc<AtomicU64>,
-    pub(super) runtime_filters: &'a RuntimeFilterSet,
-    pub(super) runtime_statistics: &'a RuntimeStatisticsStore,
-    pub(super) statistics_scan: Option<&'a RuntimeStatisticsScan>,
-    pub(super) query_statistics: Option<&'a Arc<common::statistics::QueryStatisticsContext>>,
+pub struct ParquetScanRequest<'a> {
+    /// Storage operator used to read the scan files.
+    pub operator: &'a Operator,
+    /// Files and optional row-group ranges assigned to this scan.
+    pub files: &'a [ScanFile],
+    /// Columns requested by the query plan.
+    pub projected: &'a VeinSchema,
+    /// Projected columns that may retain dictionary encoding.
+    pub dictionary_columns: &'a [u32],
+    /// Compiled predicates the reader may evaluate during scanning.
+    pub pushdown: Option<&'a ScanPredicate>,
+    /// Shared cache for format metadata such as Parquet footers.
+    pub metadata_store: &'a MetadataStore,
+    /// Functions available to compiled scan predicates.
+    pub registry: &'a Arc<FunctionRegistry>,
+    /// Shared byte counter for storage reads performed by the scan.
+    pub bytes_read: &'a Arc<AtomicU64>,
+    /// Query-local filters produced by runtime operators.
+    pub runtime_filters: &'a RuntimeFilterSet,
+    /// Background collector for lazily computed runtime statistics.
+    pub runtime_statistics: &'a RuntimeStatisticsStore,
+    /// Optional scan identity and coverage information for statistics.
+    pub statistics_scan: Option<&'a RuntimeStatisticsScan>,
+    /// Shared statistics context for this query, when available.
+    pub query_statistics: Option<&'a Arc<common::statistics::QueryStatisticsContext>>,
 }
 
 /// Executes a scan over a list of Parquet files
@@ -89,6 +104,10 @@ pub(super) async fn execute_parquet_scan(
         statistics_scan,
         query_statistics,
     } = request;
+    let mut adaptive_order: Option<Arc<AdaptiveFilterOrder>> = None;
+    let io_backend = ParquetIoBackend::configured();
+    let batch_size_policy = RowGroupBatchSizePolicy::default();
+    let batch_rows_override = std::env::var("VEIN_SCAN_BATCH_ROWS").ok();
     'files: for file in files {
         let path = file.relative.as_str();
         let scan_started = Instant::now();
@@ -114,6 +133,7 @@ pub(super) async fn execute_parquet_scan(
             event = "scan_started",
             path = %path,
             format = "parquet",
+            io_backend = io_backend.name(),
             pushed_filter_count = pushdown.map_or(0, |predicate| predicate.predicate_count),
             pushed_filter_stage_count = pushdown.map_or(0, |predicate| predicate.stages.len()),
             pushed_filter_columns = ?pushed_filter_columns,
@@ -126,9 +146,15 @@ pub(super) async fn execute_parquet_scan(
         let bytes_before_file = bytes_read.load(Ordering::Relaxed);
         let io = Arc::new(IoStats::default());
 
-        let prepared_file =
-            prepare_parquet_file(operator, file, bytes_read, Arc::clone(&io), metadata_store)
-                .await?;
+        let prepared_file = prepare_parquet_file(
+            operator,
+            file,
+            io_backend,
+            bytes_read,
+            Arc::clone(&io),
+            metadata_store,
+        )
+            .await?;
         let reader = prepared_file.reader;
         let parquet_metadata = prepared_file.metadata;
         let file_size_bytes = prepared_file.file_size_bytes;
@@ -166,32 +192,16 @@ pub(super) async fn execute_parquet_scan(
         };
         builder = builder.with_metrics(reader_metrics.clone());
 
-        // Rows per scanned batch, overridable with `VEIN_SCAN_BATCH_ROWS` so the
-        // value can be measured rather than argued about.
-        //
-        // arrow-parquet defaults to 1024, DuckDB uses 2048 and DataFusion 8192.
-        // Every per-chunk cost in the engine — the index lists a gather builds,
-        // `take`/`interleave`, the channel handoff, the operator chain — is paid
-        // once per batch, so this is the cheapest lever on scan and join
-        // throughput alike.
-        const DEFAULT_SCAN_BATCH_ROWS: usize = 8192;
-        let batch_rows = std::env::var("VEIN_SCAN_BATCH_ROWS")
-            .ok()
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(DEFAULT_SCAN_BATCH_ROWS);
-        builder = builder.with_batch_size(batch_rows);
+        let scan_projection =
+            scan_projection(builder.schema(), projected, pushdown, runtime_filters, path)?;
+        let output_mask = ProjectionMask::roots(
+            builder.parquet_schema(),
+            scan_projection.output_roots.clone(),
+        );
+        builder = builder.with_projection(output_mask);
 
-        if !projected.fields.is_empty() {
-            let mask = ProjectionMask::roots(
-                builder.parquet_schema(),
-                root_indices(builder.schema(), &projected.fields, path)?,
-            );
-            builder = builder.with_projection(mask);
-        }
-
-        // Prune from statistics on this exact footer. The row filter remains
-        // the semantic check for every selected row group; statistics only
-        // remove groups that cannot produce a TRUE result.
+        // Prune from this file's footer before Arrow applies staged row filters
+        // and decodes projected output columns only for rows that pass.
         let row_groups_total = builder.metadata().num_row_groups();
         let row_group_pruning_started = Instant::now();
         let assigned_range = file.scan_unit_range.clone().unwrap_or(0..row_groups_total);
@@ -199,7 +209,31 @@ pub(super) async fn execute_parquet_scan(
             .end
             .min(row_groups_total)
             .saturating_sub(assigned_range.start.min(row_groups_total));
-        let static_predicates = pushdown.map_or(&[][..], |predicate| predicate.statistics.as_slice());
+        let assigned_row_group_rows = (assigned_range.start.min(row_groups_total)
+            ..assigned_range.end.min(row_groups_total))
+            .map(|index| builder.metadata().row_group(index).num_rows());
+        let batch_size =
+            batch_size_policy.select(assigned_row_group_rows, batch_rows_override.as_deref());
+        builder = builder.with_batch_size(batch_size.rows);
+        if file
+            .scan_unit_range
+            .as_ref()
+            .is_none_or(|range| range.start == 0)
+        {
+            tracing::debug!(
+                target: "vein.scan_batch_size",
+                event = "parquet_batch_size_selected",
+                path = %path,
+                batch_rows = batch_size.rows,
+                source = batch_size.source.as_str(),
+                assigned_row_groups = row_groups_assigned,
+                largest_assigned_row_group_rows = batch_size.largest_assigned_row_group.unwrap_or(0),
+                invalid_override = batch_size.invalid_override,
+                "selected Parquet scan batch size for first range in file"
+            );
+        }
+        let static_predicates =
+            pushdown.map_or(&[][..], |predicate| predicate.statistics.as_slice());
         let mut statistics_predicates = static_predicates.to_vec();
         let static_statistics_predicate_count = static_predicates.len();
         let (runtime_filter_predicates, runtime_filter_diagnostics) =
@@ -219,6 +253,21 @@ pub(super) async fn execute_parquet_scan(
             );
         }
         statistics_predicates.extend(runtime_filter_predicates);
+        let bloom_columns = crate::parquet_statistics::bloom_filter_columns(
+            builder.schema().as_ref(),
+            builder.metadata(),
+            &statistics_predicates,
+        );
+        let dictionary_predicates =
+            crate::parquet_statistics::dictionary_predicates(&statistics_predicates);
+        let dictionary_columns = bloom_columns
+            .iter()
+            .filter(|column| {
+                dictionary_predicates
+                    .iter()
+                    .any(|predicate| predicate.column == column.name)
+            })
+            .collect::<Vec<_>>();
         let row_group_pruning = crate::parquet_statistics::prune_row_groups_in_range(
             builder.schema().as_ref(),
             builder.metadata(),
@@ -269,28 +318,33 @@ pub(super) async fn execute_parquet_scan(
             .map(|selection| selection.row_group_index())
             .collect::<Vec<_>>();
         let audit_page_headers = page_header_audit_enabled();
-        let page_header_columns = crate::parquet_statistics::page_header_columns_needed_with_audit(
+        let mut page_header_plan = crate::parquet_statistics::page_header_requests_with_audit(
             &statistics_predicates,
             &header_row_groups,
-            &row_group_pruning.selected,
             page_index_available,
             &page_index_pruning,
             audit_page_headers,
         );
+        page_header_plan.merge(crate::parquet_statistics::dictionary_page_header_requests(
+            builder.metadata(),
+            &header_row_groups,
+            dictionary_columns.iter().copied(),
+        ));
         let page_header_started = Instant::now();
-        let page_header_result = if page_header_columns.is_empty() {
+        let page_header_result = if page_header_plan.is_empty() {
             PageHeaderReadResult::default()
         } else {
             read_page_header_statistics(PageHeaderReadRequest {
                 operator,
                 path,
+                absolute_path: &file.absolute,
+                backend: io_backend,
                 file_size_bytes,
                 bytes_read,
                 io: &io,
                 arrow_schema: builder.schema().as_ref(),
                 metadata: builder.metadata(),
-                needed_columns: &page_header_columns,
-                row_groups: &header_row_groups,
+                plan: &page_header_plan,
             })
                 .await
         };
@@ -329,7 +383,8 @@ pub(super) async fn execute_parquet_scan(
                 page_index_columns = page_index_columns,
                 page_bounds_complete,
                 page_bounds_incomplete,
-                columns_requested = page_header_columns.len(),
+                columns_requested = page_header_result.metrics.columns_requested,
+                column_row_group_pairs_requested = page_header_result.metrics.column_row_group_pairs_requested,
                 chunks_scanned = header_chunks_scanned,
                 chunks_failed = header_chunks_failed,
                 chunks_unsupported_row_mapping = header_chunks_unsupported_row_mapping,
@@ -349,7 +404,8 @@ pub(super) async fn execute_parquet_scan(
             path = %path,
             stage = "page_header",
             audit_forced = audit_page_headers,
-            columns_requested = page_header_columns.len(),
+            columns_requested = page_header_result.metrics.columns_requested,
+            column_row_group_pairs_requested = page_header_result.metrics.column_row_group_pairs_requested,
             chunks_scanned = header_chunks_scanned,
             chunks_failed = header_chunks_failed,
             chunks_unsupported_row_mapping = header_chunks_unsupported_row_mapping,
@@ -370,17 +426,11 @@ pub(super) async fn execute_parquet_scan(
         // Load filters only for groups that survived footer and page-index
         // pruning. Bloom filters are optional metadata: absent or unreadable
         // filters leave the affected group selected.
-        let bloom_columns = crate::parquet_statistics::bloom_filter_columns(
-            builder.schema().as_ref(),
-            builder.metadata(),
-            &statistics_predicates,
-        );
         let static_bloom_equality_columns =
             crate::parquet_statistics::equality_predicate_columns(static_predicates);
-        let runtime_bloom_equality_columns =
-            crate::parquet_statistics::equality_predicate_columns(
-                &statistics_predicates[static_statistics_predicate_count..],
-            );
+        let runtime_bloom_equality_columns = crate::parquet_statistics::equality_predicate_columns(
+            &statistics_predicates[static_statistics_predicate_count..],
+        );
         let bloom_row_groups_considered = page_pruning.selections.len() as u64;
         let bloom_filter_columns = bloom_columns.len();
         let mut bloom_filters_available = 0_u64;
@@ -496,38 +546,55 @@ pub(super) async fn execute_parquet_scan(
         let bloom_predicate_probes = bloom_pruning.probes;
         let bloom_pruning_us = bloom_pruning_started.elapsed().as_micros() as u64;
 
-        // Dictionary evidence applies only when every data page in the chunk
-        // uses that dictionary. We fetch the dictionary page alone and retain
-        // the row group on missing metadata, unsupported literals, or I/O errors.
-        let dictionary_predicates =
-            crate::parquet_statistics::dictionary_predicates(&statistics_predicates);
-        let dictionary_columns = bloom_columns
-            .iter()
-            .filter(|column| {
-                dictionary_predicates
-                    .iter()
-                    .any(|predicate| predicate.column == column.name)
-            })
-            .collect::<Vec<_>>();
+        // Decode each dictionary once. Whole-row-group elimination requires all
+        // data pages to use it; mixed chunks use the result only on matching pages.
         let mut dictionary_chunks_considered = 0_u64;
         let mut dictionary_chunks_eligible = 0_u64;
         let mut dictionary_pages_loaded = 0_u64;
         let mut dictionary_page_read_errors = 0_u64;
         let mut dictionary_unsupported_chunks = 0_u64;
         let mut dictionary_page_bytes = 0_u64;
+        let mut dictionary_chunks_fully_encoded = 0_u64;
+        let mut dictionary_chunks_page_filtered = 0_u64;
         let dictionary_load_started = Instant::now();
-        let mut dictionary_reader = OpendalParquetReader::new(
-            operator,
-            path,
-            file_size_bytes,
-            bytes_read.clone(),
-            Arc::clone(&io),
-        );
+        let mut dictionary_reader = if dictionary_predicates.is_empty()
+            || bloom_pruning.selections.is_empty()
+        {
+            None
+        } else {
+            match ParquetFileReader::new(
+                operator,
+                path,
+                &file.absolute,
+                io_backend,
+                file_size_bytes,
+                Arc::clone(bytes_read),
+                Arc::clone(&io),
+            )
+                .await
+            {
+                Ok(reader) => Some(reader),
+                Err(error) => {
+                    dictionary_page_read_errors = dictionary_page_read_errors.saturating_add(1);
+                    tracing::debug!(
+                        target: "vein.audit",
+                        event = "parquet_dictionary_reader_unavailable",
+                        path = %path,
+                        backend = io_backend.name(),
+                        error = %error,
+                        "dictionary pruning unavailable; retaining candidate rows"
+                    );
+                    None
+                }
+            }
+        };
         let mut dictionary_membership = HashMap::new();
+        let mut dictionary_page_membership = HashMap::new();
         for selection in &bloom_pruning.selections {
             let row_group_index = selection.row_group_index();
             let row_group = builder.metadata().row_group(row_group_index);
             let mut outcomes = vec![None; dictionary_predicates.len()];
+            let mut page_outcomes = vec![None; dictionary_predicates.len()];
             for column in &dictionary_columns {
                 let column_predicates = dictionary_predicates
                     .iter()
@@ -542,6 +609,17 @@ pub(super) async fn execute_parquet_scan(
                     dictionary_unsupported_chunks = dictionary_unsupported_chunks.saturating_add(1);
                     continue;
                 };
+                let fully_dictionary_encoded =
+                    crate::parquet_statistics::is_fully_dictionary_encoded(chunk);
+                if !fully_dictionary_encoded
+                    && !crate::parquet_statistics::has_dictionary_encoded_page(
+                    &page_header_result.pages,
+                    row_group_index,
+                    &column.name,
+                )
+                {
+                    continue;
+                }
                 let Some(range) =
                     crate::parquet_statistics::dictionary_page_range(chunk, file_size_bytes)
                 else {
@@ -549,6 +627,16 @@ pub(super) async fn execute_parquet_scan(
                     continue;
                 };
                 dictionary_chunks_eligible = dictionary_chunks_eligible.saturating_add(1);
+                if fully_dictionary_encoded {
+                    dictionary_chunks_fully_encoded =
+                        dictionary_chunks_fully_encoded.saturating_add(1);
+                } else {
+                    dictionary_chunks_page_filtered =
+                        dictionary_chunks_page_filtered.saturating_add(1);
+                }
+                let Some(dictionary_reader) = dictionary_reader.as_mut() else {
+                    continue;
+                };
                 let page_bytes = match dictionary_reader.get_bytes(range.clone()).await {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -580,7 +668,10 @@ pub(super) async fn execute_parquet_scan(
                     &column_predicates,
                 );
                 for (predicate, outcome) in column_predicates.iter().zip(matches) {
-                    outcomes[predicate.index] = outcome;
+                    page_outcomes[predicate.index] = outcome;
+                    if fully_dictionary_encoded {
+                        outcomes[predicate.index] = outcome;
+                    }
                     if outcome.is_none() {
                         dictionary_unsupported_chunks =
                             dictionary_unsupported_chunks.saturating_add(1);
@@ -588,6 +679,7 @@ pub(super) async fn execute_parquet_scan(
                 }
             }
             dictionary_membership.insert(row_group_index, outcomes);
+            dictionary_page_membership.insert(row_group_index, page_outcomes);
         }
         let dictionary_load_us = dictionary_load_started.elapsed().as_micros() as u64;
         let dictionary_pruning_started = Instant::now();
@@ -596,13 +688,32 @@ pub(super) async fn execute_parquet_scan(
             std::mem::take(&mut bloom_pruning.selections),
             &dictionary_membership,
         );
-        dictionary_pruning.selections = attach_header_page_locations(
+        let mut dictionary_page_pruning = crate::parquet_statistics::prune_dictionary_encoded_pages(
             std::mem::take(&mut dictionary_pruning.selections),
+            &page_header_result.pages,
+            &dictionary_predicates,
+            &dictionary_page_membership,
+        );
+        dictionary_page_pruning.selections = attach_header_page_locations(
+            std::mem::take(&mut dictionary_page_pruning.selections),
             &page_header_result.page_locations,
         );
         let page_payload_metrics = page_payload_pruning_metrics(
-            &dictionary_pruning.selections,
+            &dictionary_page_pruning.selections,
             &page_header_result.page_locations,
+        );
+        tracing::info!(
+            target: "vein.parquet_dictionary",
+            event = "parquet_dictionary_data_page_pruning",
+            path = %path,
+            chunks_fully_dictionary_encoded = dictionary_chunks_fully_encoded,
+            chunks_page_filtered = dictionary_chunks_page_filtered,
+            predicate_page_checks = dictionary_page_pruning.predicate_page_checks,
+            dictionary_pages_proven_absent = dictionary_page_pruning.dictionary_pages_proven_absent,
+            rows_skipped = dictionary_page_pruning.rows_skipped,
+            row_groups_emptied = dictionary_page_pruning.row_groups_emptied,
+            estimated_payload_bytes_skipped = page_payload_metrics.skipped_payload_bytes,
+            "dictionary membership applied to dictionary-encoded data pages"
         );
         tracing::debug!(
             target: "vein.audit",
@@ -643,31 +754,31 @@ pub(super) async fn execute_parquet_scan(
             prune_us = dictionary_pruning_us,
             "Parquet dictionary page pruning decisions"
         );
-        let row_groups_selected_after_dictionary = dictionary_pruning.selections.len();
+        let row_groups_selected_after_dictionary = dictionary_page_pruning.selections.len();
         let has_scan_selection = file.scan_unit_range.is_some()
             || row_groups_selected != row_groups_total
             || page_rows_skipped != 0
             || row_groups_skipped_by_bloom != 0
             || row_groups_skipped_by_dictionary != 0
+            || dictionary_page_pruning.rows_skipped != 0
             // Preserve header-derived page locations even when metadata cannot
             // prune rows yet; a runtime filter may produce a selection before
             // later filter stages or projected columns are fetched.
             || !page_header_result.page_locations.is_empty();
         if has_scan_selection {
-            if dictionary_pruning.selections.is_empty() {
+            if dictionary_page_pruning.selections.is_empty() {
                 builder = builder.with_row_groups(Vec::new());
             } else {
-                builder = builder.with_row_group_selections(dictionary_pruning.selections);
+                builder = builder.with_row_group_selections(dictionary_page_pruning.selections);
             }
         }
         let row_group_pruning_us = row_group_pruning_started.elapsed().as_micros() as u64;
 
-        // Stages run before projected columns are materialized. Arrow applies each
-        // predicate to the surviving selection from the preceding stage, so later
-        // VM programs process fewer rows and only decode their own input columns.
-        let predicate_pipeline = build_scan_predicates(ScanPredicateContext {
-            parquet_schema: builder.parquet_schema(),
+        // Parquet evaluates narrow predicates first, then decodes only selected
+        // rows into the final output projection.
+        let mut predicate_pipeline = build_scan_predicates(ScanPredicateContext {
             arrow_schema: builder.schema(),
+            parquet_schema: builder.parquet_schema(),
             path,
             projected,
             pushdown,
@@ -675,11 +786,13 @@ pub(super) async fn execute_parquet_scan(
             detailed_metrics_enabled,
             predicate_metrics: &predicate_metrics,
             runtime_filters,
+            adaptive_order: adaptive_order.clone(),
         })?;
-        let predicates = predicate_pipeline.predicates;
-        let stage_metrics = predicate_pipeline.stage_metrics;
-        if !predicates.is_empty() {
-            builder = builder.with_row_filter(RowFilter::new(predicates));
+        adaptive_order = predicate_pipeline.adaptive_order.clone();
+        let stage_metrics = predicate_pipeline.stage_metrics.clone();
+        let has_row_filter = predicate_pipeline.has_row_filter;
+        if let Some(row_filter) = predicate_pipeline.row_filter.take() {
+            builder = builder.with_row_filter(row_filter);
         }
         let metadata_us = metadata_started.elapsed().as_micros() as u64;
         let file_rows = builder.metadata().file_metadata().num_rows();
@@ -695,6 +808,11 @@ pub(super) async fn execute_parquet_scan(
             event = "scan_ready",
             path = %path,
             format = "parquet",
+            read_projection_roots = ?scan_projection.read_roots,
+            output_projection_positions = ?scan_projection.output_positions,
+            predicate_handoff = "parquet_row_filter_late_materialization",
+            late_materialization = true,
+            post_decode_row_gather = false,
             footer_hit,
             file_size_bytes,
             row_groups_total,
@@ -764,7 +882,8 @@ pub(super) async fn execute_parquet_scan(
             "scan_ready"
         );
 
-        let mut total_rows = 0;
+        let mut total_rows = 0usize;
+        let mut physical_rows_read = 0usize;
         let mut batches = 0u64;
         let mut output_source_array_count = 0u64;
         let mut output_source_array_bytes = 0u64;
@@ -824,18 +943,22 @@ pub(super) async fn execute_parquet_scan(
             if batches == 0 {
                 first_batch_us = scan_started.elapsed().as_micros() as u64;
             }
-            total_rows += batch.num_rows();
+            total_rows = total_rows.saturating_add(batch.num_rows());
+            if !has_row_filter {
+                physical_rows_read = physical_rows_read.saturating_add(batch.num_rows());
+            }
             batches += 1;
 
             if let Some(scan) = statistics_scan {
                 let statistics_started = Instant::now();
+                let statistics_batch = project_batch(&batch, &scan_projection.output_positions)?;
                 let outcome = runtime_statistics.enqueue_batch(
                     scan.scan_id,
                     &scan.table_key,
                     scan.expected_rows,
                     scan.partition_count,
                     scan.row_coverage_candidate,
-                    &batch,
+                    &statistics_batch,
                 );
                 match outcome {
                     common::statistics::runtime::RuntimeStatisticsEnqueue::Queued => {
@@ -855,35 +978,38 @@ pub(super) async fn execute_parquet_scan(
                     .saturating_add(statistics_started.elapsed().as_micros() as u64);
             }
 
-            tracing::trace!(rows = batch.num_rows(), "Pushing batch down pipeline");
-            let chunk = DataChunkView::from_record_batch(batch)?;
-            if detailed_metrics_enabled {
-                let (array_count, array_bytes) = chunk.source_array_footprint();
-                output_source_array_count =
-                    output_source_array_count.saturating_add(array_count as u64);
-                output_source_array_bytes =
-                    output_source_array_bytes.saturating_add(array_bytes as u64);
+            if batch.num_rows() != 0 {
+                let chunk = handoff_view(batch, &scan_projection.output_positions)?;
                 tracing::trace!(
-                    target: "vein.audit",
-                    event = "scan_view_batch_emitted",
                     rows = chunk.num_rows(),
-                    columns = chunk.num_columns(),
-                    source_array_count = array_count,
-                    source_array_bytes = array_bytes,
-                    representation = "DataChunkView",
-                    arrow_array_handles_moved = true,
-                    "scan_view_batch_emitted"
+                    "Pushing selected batch down pipeline"
                 );
-            }
-            let downstream_started = Instant::now();
-            next.push(chunk)?;
-            downstream_time += downstream_started.elapsed();
+                if detailed_metrics_enabled {
+                    let (array_count, array_bytes) = chunk.source_array_footprint();
+                    output_source_array_count =
+                        output_source_array_count.saturating_add(array_count as u64);
+                    output_source_array_bytes =
+                        output_source_array_bytes.saturating_add(array_bytes as u64);
+                    tracing::trace!(
+                        target: "vein.audit",
+                        event = "scan_view_batch_emitted",
+                        rows = chunk.num_rows(),
+                        columns = chunk.num_columns(),
+                        source_array_count = array_count,
+                        source_array_bytes = array_bytes,
+                        representation = "DataChunkView",
+                        arrow_array_handles_moved = true,
+                        "scan_view_batch_emitted"
+                    );
+                }
+                let downstream_started = Instant::now();
+                next.push(chunk)?;
+                downstream_time += downstream_started.elapsed();
 
-            // A limit below the pipeline already has every row it will emit, so
-            // the rest of this file — and every file after it — can only be
-            // discarded. Stop reading, but still report what this file cost.
-            if next.finished() {
-                break;
+                // A limit below the pipeline has every row it will emit.
+                if next.finished() {
+                    break;
+                }
             }
 
             if last_progress.elapsed() >= Duration::from_secs(10) {
@@ -906,6 +1032,11 @@ pub(super) async fn execute_parquet_scan(
             }
         }
 
+        if has_row_filter {
+            physical_rows_read =
+                usize::try_from(predicate_metrics.rows_before_filter.load(Ordering::Relaxed))
+                    .unwrap_or(usize::MAX);
+        }
         let elapsed = scan_started.elapsed();
         let bytes_read_total = bytes_read
             .load(Ordering::Relaxed)
@@ -918,6 +1049,10 @@ pub(super) async fn execute_parquet_scan(
         let io_avg_bytes = bytes_read_total.checked_div(io_ranges).unwrap_or(0);
         let first_poll_offcpu = first_poll_time.saturating_sub(first_poll_thread_cpu);
         let predicate_metrics = predicate_metrics.snapshot();
+        let adaptive_filter_snapshot = adaptive_order.as_ref().map(|policy| policy.snapshot());
+        if let Some(snapshot) = &adaptive_filter_snapshot {
+            snapshot.log(&path);
+        }
         if detailed_metrics_enabled {
             for (stage_index, predicate_count, input_columns, metrics) in stage_metrics {
                 let metrics = metrics.snapshot();
@@ -942,6 +1077,7 @@ pub(super) async fn execute_parquet_scan(
             format = "parquet",
             footer_hit,
             rows = total_rows,
+            rows_decoded = physical_rows_read,
             file_rows,
             batches,
             row_groups_total,
@@ -961,7 +1097,8 @@ pub(super) async fn execute_parquet_scan(
             page_ranges_considered,
             page_ranges_skipped,
             page_rows_skipped,
-            page_header_columns = page_header_columns.len(),
+            page_header_columns = page_header_result.metrics.columns_requested,
+            page_header_column_row_group_pairs = page_header_result.metrics.column_row_group_pairs_requested,
             header_chunks_scanned,
             header_chunks_failed,
             header_chunks_unsupported_row_mapping,
@@ -1005,8 +1142,17 @@ pub(super) async fn execute_parquet_scan(
             dictionary_pruning_us,
             pushed_filter_count = pushdown.map_or(0, |predicate| predicate.predicate_count),
             pushed_filter_stage_count = pushdown.map_or(0, |predicate| predicate.stages.len()),
+            adaptive_filter_active = adaptive_filter_snapshot.is_some(),
+            adaptive_filter_stage_count = adaptive_filter_snapshot.as_ref().map_or(0, |snapshot| snapshot.stage_count),
+            adaptive_filter_observations = adaptive_filter_snapshot.as_ref().map_or(0, |snapshot| snapshot.observations),
+            adaptive_filter_swap_attempts = adaptive_filter_snapshot.as_ref().map_or(0, |snapshot| snapshot.swap_attempts),
+            adaptive_filter_swaps_accepted = adaptive_filter_snapshot.as_ref().map_or(0, |snapshot| snapshot.accepted_swaps),
+            adaptive_filter_swaps_reverted = adaptive_filter_snapshot.as_ref().map_or(0, |snapshot| snapshot.reverted_swaps),
+            adaptive_filter_warmup = adaptive_filter_snapshot.as_ref().is_some_and(|snapshot| snapshot.warmup),
+            adaptive_filter_order = ?adaptive_filter_snapshot.as_ref().map(|snapshot| &snapshot.permutation),
             pushed_filter_columns = ?pushed_filter_columns,
             predicate_metrics_enabled = detailed_metrics_enabled,
+            predicate_rows_before_filter = predicate_metrics.rows_before_filter,
             predicate_batches = predicate_metrics.batches,
             predicate_rows_in = predicate_metrics.rows_in,
             predicate_rows_kept = predicate_metrics.rows_kept,

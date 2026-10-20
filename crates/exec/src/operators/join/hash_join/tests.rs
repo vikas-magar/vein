@@ -1,15 +1,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode};
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use common::Result;
 use common::protocol::{MicroOp, MicroProgram};
-use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode};
 use error::VeinError;
 
-use super::*;
 use super::super::{HashTable, JoinKeys, JoinType, OutputColumn};
+use super::*;
 use crate::pipeline::DataChunk;
 use crate::udf::FunctionRegistry;
 use crate::vm::VectorVmExecutor;
@@ -61,9 +61,11 @@ impl PipelineNode<DataChunkView> for Collect {
             .0
             .lock()
             .map_err(|_| VeinError::internal("collect mutex poisoned"))?;
-        target_chunks.try_reserve(local_chunks.len()).map_err(|error| {
-            VeinError::internal(format!("cannot reserve collected test batches: {error}"))
-        })?;
+        target_chunks
+            .try_reserve(local_chunks.len())
+            .map_err(|error| {
+                VeinError::internal(format!("cannot reserve collected test batches: {error}"))
+            })?;
         target_chunks.extend(std::mem::take(&mut *local_chunks));
         Ok(())
     }
@@ -93,7 +95,9 @@ fn selected_value(chunk: &DataChunk, column: usize, physical_row: usize) -> Opti
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("int64 join output");
-    values.is_valid(physical_row).then(|| values.value(physical_row))
+    values
+        .is_valid(physical_row)
+        .then(|| values.value(physical_row))
 }
 
 fn cells(chunk: &DataChunk, column: usize) -> Vec<Option<i64>> {
@@ -189,8 +193,9 @@ fn run_outer_join_with_residual(join_type: JoinType) -> Vec<[Option<i64>; 4]> {
 /// A built table over one chunk of `values`.
 fn build(values: &[i64]) -> HashTable {
     let mut sink = BuildSink::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
-    sink.push(DataChunkView::from_chunk(DataChunk::from_vectors(vec![ints(values)]))
-        .expect("build view"))
+    sink.push(
+        DataChunkView::from_chunk(DataChunk::from_vectors(vec![ints(values)])).expect("build view"),
+    )
         .expect("build");
     sink.finish()
 }
@@ -279,39 +284,54 @@ fn output_timing_excludes_downstream_on_probe_flush_and_error() {
 }
 
 #[test]
-fn join_reports_build_and_repeated_probe_conversions_without_copying_payloads() {
+fn join_keeps_build_and_probe_payloads_as_views() {
     use common::arrow::SelectionVector;
 
     let build_payload = ints(&[70, 80, 90]);
     let mut build = BuildSink::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
-    build.push(DataChunkView::from_chunk(DataChunk::new(
-        vec![ints(&[7, 8, 9]), Arc::clone(&build_payload)],
-        SelectionVector::new_sparse(vec![2, 0]),
-    )).unwrap()).unwrap();
+    build
+        .push(
+            DataChunkView::from_chunk(DataChunk::new(
+                vec![ints(&[7, 8, 9]), Arc::clone(&build_payload)],
+                SelectionVector::new_sparse(vec![2, 0]),
+            ))
+                .unwrap(),
+        )
+        .unwrap();
     build.flush().unwrap();
     let table = Arc::new(build.finish());
     let build_metrics = table.build_key_materialization();
-    assert_eq!(build_metrics.0.gathered_columns, 1);
-    assert_eq!(build_metrics.0.shared_columns, 0);
-    assert!(build_metrics.0.gathered_output_buffer_bytes > 0);
+    assert_eq!(build_metrics.0, MaterializationReport::default());
     let probe_payload = ints(&[700, 900, 800]);
     let keys = ints(&[7, 9, 8]);
     let sink = ViewCollect::default();
     let mut join = HashJoin::new(
-        Arc::clone(&table), JoinType::Inner,
+        Arc::clone(&table),
+        JoinType::Inner,
         vec![OutputColumn::Probe(1), OutputColumn::Build(1)],
-        vec![DataType::Int64; 2], vec![DataType::Int64; 2], Box::new(sink.clone()),
+        vec![DataType::Int64; 2],
+        vec![DataType::Int64; 2],
+        Box::new(sink.clone()),
     );
-    for selection in [SelectionVector::new_dense(3), SelectionVector::new_sparse(vec![1, 0])] {
-        PipelineNode::<DataChunkView>::push(&mut join, DataChunkView::from_chunk(DataChunk::new(
-            vec![Arc::clone(&keys), Arc::clone(&probe_payload)], selection,
-        )).unwrap()).unwrap();
+    for selection in [
+        SelectionVector::new_dense(3),
+        SelectionVector::new_sparse(vec![1, 0]),
+    ] {
+        PipelineNode::<DataChunkView>::push(
+            &mut join,
+            DataChunkView::from_chunk(DataChunk::new(
+                vec![Arc::clone(&keys), Arc::clone(&probe_payload)],
+                selection,
+            ))
+                .unwrap(),
+        )
+            .unwrap();
     }
     join.flush().unwrap();
-    assert_eq!(join.probe_key_materialization.shared_columns, 1);
-    assert_eq!(join.probe_key_materialization.gathered_columns, 1);
-    assert_eq!(join.probe_key_materialization.empty_columns, 0);
-    assert!(join.probe_key_materialization.gathered_output_buffer_bytes > 0);
+    assert_eq!(
+        join.probe_key_materialization,
+        MaterializationReport::default()
+    );
     assert_eq!(table.build_key_materialization(), build_metrics);
     let views = sink.0.lock().unwrap();
     let mut pairs = Vec::new();
@@ -321,8 +341,18 @@ fn join_reports_build_and_repeated_probe_conversions_without_copying_payloads() 
             let (build, build_row) = view.resolve(1, row).unwrap().unwrap();
             assert!(Arc::ptr_eq(probe, &probe_payload));
             assert!(Arc::ptr_eq(build, &build_payload));
-            pairs.push((probe.as_any().downcast_ref::<Int64Array>().unwrap().value(probe_row),
-                        build.as_any().downcast_ref::<Int64Array>().unwrap().value(build_row)));
+            pairs.push((
+                probe
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(probe_row),
+                build
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(build_row),
+            ));
         }
     }
     assert_eq!(pairs, vec![(700, 70), (900, 90), (900, 90), (700, 70)]);
@@ -371,8 +401,22 @@ fn join_output_view_references_original_probe_and_build_payloads() {
     let (build_array, build_row) = outputs[0].resolve(1, 0).unwrap().unwrap();
     assert!(Arc::ptr_eq(probe_array, &probe_payload));
     assert!(Arc::ptr_eq(build_array, &build_payload));
-    assert_eq!(probe_array.as_any().downcast_ref::<Int64Array>().unwrap().value(probe_row), 800);
-    assert_eq!(build_array.as_any().downcast_ref::<Int64Array>().unwrap().value(build_row), 80);
+    assert_eq!(
+        probe_array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(probe_row),
+        800
+    );
+    assert_eq!(
+        build_array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(build_row),
+        80
+    );
 }
 
 #[test]
@@ -380,23 +424,47 @@ fn multiple_build_batches_preserve_duplicate_output_references() {
     let payloads = [ints(&[100, 101]), ints(&[200, 201])];
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     for payload in &payloads {
-        table.insert_view(DataChunkView::from_chunk(DataChunk::from_vectors(vec![
-            ints(&[7, 7]), Arc::clone(payload),
-        ])).unwrap()).unwrap();
+        table
+            .insert_view(
+                DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+                    ints(&[7, 7]),
+                    Arc::clone(payload),
+                ]))
+                    .unwrap(),
+            )
+            .unwrap();
     }
     let probe_payload = ints(&[700]);
     let sink = ViewCollect::default();
     let mut join = HashJoin::new(
-        Arc::new(table), JoinType::Inner,
-        vec![OutputColumn::Probe(1), OutputColumn::Build(1), OutputColumn::Build(1)],
-        vec![DataType::Int64; 2], vec![DataType::Int64; 2], Box::new(sink.clone()),
+        Arc::new(table),
+        JoinType::Inner,
+        vec![
+            OutputColumn::Probe(1),
+            OutputColumn::Build(1),
+            OutputColumn::Build(1),
+        ],
+        vec![DataType::Int64; 2],
+        vec![DataType::Int64; 2],
+        Box::new(sink.clone()),
     );
-    PipelineNode::<DataChunkView>::push(&mut join, DataChunkView::from_chunk(
-        DataChunk::from_vectors(vec![ints(&[7]), Arc::clone(&probe_payload)])
-    ).unwrap()).unwrap();
+    PipelineNode::<DataChunkView>::push(
+        &mut join,
+        DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+            ints(&[7]),
+            Arc::clone(&probe_payload),
+        ]))
+            .unwrap(),
+    )
+        .unwrap();
     join.flush().unwrap();
     let outputs = sink.0.lock().unwrap();
-    assert_eq!(outputs.len(), 2, "one reference view per retained build batch");
+    assert_eq!(
+        outputs.len(),
+        2,
+        "output is bounded by the larger input batch"
+    );
+    assert!(outputs.iter().all(|view| view.num_rows() <= 2));
     let mut values = Vec::new();
     for view in outputs.iter() {
         for row in 0..view.num_rows() {
@@ -407,7 +475,13 @@ fn multiple_build_batches_preserve_duplicate_output_references() {
             assert!(payloads.iter().any(|payload| Arc::ptr_eq(build, payload)));
             assert!(Arc::ptr_eq(build, duplicate));
             assert_eq!(index, duplicate_index);
-            values.push(build.as_any().downcast_ref::<Int64Array>().unwrap().value(index));
+            values.push(
+                build
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(index),
+            );
         }
     }
     values.sort_unstable();
@@ -418,15 +492,24 @@ fn multiple_build_batches_preserve_duplicate_output_references() {
 fn zero_column_join_views_retain_match_cardinality() {
     let sink = ViewCollect::default();
     let mut join = HashJoin::new(
-        Arc::new(build(&[7, 7])), JoinType::Inner, vec![],
-        vec![DataType::Int64], vec![DataType::Int64], Box::new(sink.clone()),
+        Arc::new(build(&[7, 7])),
+        JoinType::Inner,
+        vec![],
+        vec![DataType::Int64],
+        vec![DataType::Int64],
+        Box::new(sink.clone()),
     );
-    PipelineNode::<DataChunkView>::push(&mut join, DataChunkView::from_chunk(
-        DataChunk::from_vectors(vec![ints(&[7, 8, 7])])
-    ).unwrap()).unwrap();
+    PipelineNode::<DataChunkView>::push(
+        &mut join,
+        DataChunkView::from_chunk(DataChunk::from_vectors(vec![ints(&[7, 8, 7])])).unwrap(),
+    )
+        .unwrap();
     join.flush().unwrap();
     let outputs = sink.0.lock().unwrap();
-    assert_eq!(outputs.iter().map(DataChunkView::num_rows).sum::<usize>(), 4);
+    assert_eq!(
+        outputs.iter().map(DataChunkView::num_rows).sum::<usize>(),
+        4
+    );
     for view in outputs.iter() {
         assert_eq!(view.num_columns(), 0);
         let (chunk, report) = view.to_data_chunk_with_report().unwrap();
@@ -443,27 +526,43 @@ fn outer_join_views_preserve_payloads_with_empty_opposite_sides() {
             let payload = ints(&[10, 20]);
             let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
             if !empty_build {
-                table.insert_view(DataChunkView::from_chunk(DataChunk::from_vectors(
-                    vec![Arc::clone(&payload)]
-                )).unwrap()).unwrap();
+                table
+                    .insert_view(
+                        DataChunkView::from_chunk(DataChunk::from_vectors(vec![Arc::clone(
+                            &payload,
+                        )]))
+                            .unwrap(),
+                    )
+                    .unwrap();
             }
             let sink = ViewCollect::default();
             let mut join = HashJoin::new(
-                Arc::new(table), join_type,
+                Arc::new(table),
+                join_type,
                 vec![OutputColumn::Probe(0), OutputColumn::Build(0)],
-                vec![DataType::Int64], vec![DataType::Int64], Box::new(sink.clone()),
+                vec![DataType::Int64],
+                vec![DataType::Int64],
+                Box::new(sink.clone()),
             );
-            let probe = if empty_build { Arc::clone(&payload) } else { ints(&[]) };
-            PipelineNode::<DataChunkView>::push(&mut join, DataChunkView::from_chunk(
-                DataChunk::from_vectors(vec![probe])
-            ).unwrap()).unwrap();
+            let probe = if empty_build {
+                Arc::clone(&payload)
+            } else {
+                ints(&[])
+            };
+            PipelineNode::<DataChunkView>::push(
+                &mut join,
+                DataChunkView::from_chunk(DataChunk::from_vectors(vec![probe])).unwrap(),
+            )
+                .unwrap();
             join.flush().unwrap();
             let outputs = sink.0.lock().unwrap();
             let emits = join_type == JoinType::Full
                 || (empty_build && join_type == JoinType::Left)
                 || (!empty_build && join_type == JoinType::Right);
-            assert_eq!(outputs.iter().map(DataChunkView::num_rows).sum::<usize>(),
-                       if emits { 2 } else { 0 });
+            assert_eq!(
+                outputs.iter().map(DataChunkView::num_rows).sum::<usize>(),
+                if emits { 2 } else { 0 }
+            );
             for view in outputs.iter() {
                 for row in 0..view.num_rows() {
                     let present = if empty_build { 0 } else { 1 };
@@ -483,14 +582,25 @@ fn outer_join_views_preserve_payloads_with_empty_opposite_sides() {
 fn empty_build_null_extension_requires_declared_output_column() {
     let sink = ViewCollect::default();
     let mut join = HashJoin::new(
-        Arc::new(HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]))),
-        JoinType::Left, vec![OutputColumn::Probe(0), OutputColumn::Build(0)],
-        vec![DataType::Int64], vec![], Box::new(sink.clone()),
+        Arc::new(HashTable::new(
+            JoinKeys::new(vec![0]),
+            JoinKeys::new(vec![0]),
+        )),
+        JoinType::Left,
+        vec![OutputColumn::Probe(0), OutputColumn::Build(0)],
+        vec![DataType::Int64],
+        vec![],
+        Box::new(sink.clone()),
     );
-    let error = PipelineNode::<DataChunkView>::push(&mut join,
-                                                    DataChunkView::from_chunk(DataChunk::from_vectors(vec![ints(&[10])])).unwrap(),
-    ).expect_err("missing build type must reject the output mapping");
-    assert!(error.to_string().contains("missing column 0 in input 1"), "{error}");
+    let error = PipelineNode::<DataChunkView>::push(
+        &mut join,
+        DataChunkView::from_chunk(DataChunk::from_vectors(vec![ints(&[10])])).unwrap(),
+    )
+        .expect_err("missing build type must reject the output mapping");
+    assert!(
+        error.to_string().contains("missing column 0 in input 1"),
+        "{error}"
+    );
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -619,7 +729,10 @@ fn semi_join_emits_a_probe_row_once_despite_duplicate_build_matches() {
     join.flush().expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
-    let rows: Vec<Option<i64>> = chunks.iter().flat_map(|chunk| selected_cells(chunk, 0)).collect();
+    let rows: Vec<Option<i64>> = chunks
+        .iter()
+        .flat_map(|chunk| selected_cells(chunk, 0))
+        .collect();
     assert_eq!(rows, vec![Some(20), Some(30)]);
     assert!(chunks.iter().all(|chunk| chunk.num_columns() == 1));
 }
@@ -711,14 +824,17 @@ fn anti_join_keeps_nonmatching_and_null_probe_keys() {
         Box::new(sink.clone()),
     );
 
-    join.push(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(vec![
-        Some(20), Some(10), None,
-    ]))]))
+    join.push(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(
+        vec![Some(20), Some(10), None],
+    ))]))
         .expect("probe");
     join.flush().expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
-    let rows: Vec<Option<i64>> = chunks.iter().flat_map(|chunk| selected_cells(chunk, 0)).collect();
+    let rows: Vec<Option<i64>> = chunks
+        .iter()
+        .flat_map(|chunk| selected_cells(chunk, 0))
+        .collect();
     assert_eq!(rows, vec![Some(10), None]);
     assert!(chunks.iter().all(|chunk| chunk.num_columns() == 1));
 }
@@ -744,7 +860,11 @@ fn right_join_emits_unmatched_build_rows_at_flush() {
     let chunks = sink.0.lock().expect("collect lock");
     let probe: Vec<Option<i64>> = chunks.iter().flat_map(|c| cells(c, 0)).collect();
     let build: Vec<Option<i64>> = chunks.iter().flat_map(|c| cells(c, 1)).collect();
-    assert_eq!(probe, vec![Some(20), None], "the match, then a null probe row");
+    assert_eq!(
+        probe,
+        vec![Some(20), None],
+        "the match, then a null probe row"
+    );
     assert_eq!(build, vec![Some(20), Some(40)], "build 40 matched nothing");
 }
 
@@ -754,7 +874,10 @@ fn single_join_checks_cardinality_and_keeps_both_input_buffers() {
     let build_keys = ints(&[10, 20]);
     let build_values = ints(&[100, 200]);
     table
-        .insert(DataChunk::from_vectors(vec![build_keys, Arc::clone(&build_values)]))
+        .insert(DataChunk::from_vectors(vec![
+            build_keys,
+            Arc::clone(&build_values),
+        ]))
         .expect("insert single-match build rows");
 
     let probe_keys = ints(&[20, 10]);
@@ -769,15 +892,26 @@ fn single_join_checks_cardinality_and_keeps_both_input_buffers() {
         Box::new(sink.clone()),
     );
 
-    join.push(DataChunk::from_vectors(vec![probe_keys, Arc::clone(&probe_payload)]))
+    join.push(DataChunk::from_vectors(vec![
+        probe_keys,
+        Arc::clone(&probe_payload),
+    ]))
         .expect("single match should not multiply probe rows");
     join.flush().expect("flush single join");
 
     let chunks = sink.0.lock().expect("collect lock");
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].num_rows(), 2);
-    let probe = chunks[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let build = chunks[0].column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let probe = chunks[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let build = chunks[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     let mut pairs: Vec<(i64, i64)> = (0..chunks[0].num_rows())
         .map(|row| (probe.value(row), build.value(row)))
         .collect();
@@ -809,8 +943,12 @@ fn single_join_returns_null_for_an_unmatched_probe_row() {
 #[test]
 fn single_join_errors_on_multiple_matches_across_build_chunks() {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
-    table.insert(DataChunk::from_vectors(vec![ints(&[20])])).expect("first build batch");
-    table.insert(DataChunk::from_vectors(vec![ints(&[20])])).expect("second build batch");
+    table
+        .insert(DataChunk::from_vectors(vec![ints(&[20])]))
+        .expect("first build batch");
+    table
+        .insert(DataChunk::from_vectors(vec![ints(&[20])]))
+        .expect("second build batch");
     let sink = Collect::default();
     let mut join = HashJoin::new(
         Arc::new(table),
@@ -824,17 +962,27 @@ fn single_join_errors_on_multiple_matches_across_build_chunks() {
     let error = join
         .push(DataChunk::from_vectors(vec![ints(&[20])]))
         .expect_err("two inner rows violate scalar cardinality");
-    assert!(error.to_string().contains("scalar subquery returned more than one row"));
+    assert!(
+        error
+            .to_string()
+            .contains("scalar subquery returned more than one row")
+    );
 }
 
 #[test]
-fn inner_join_reuses_output_buckets_across_probe_batches() {
+fn inner_join_preserves_duplicate_output_across_probe_batches() {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     table
-        .insert(DataChunk::from_vectors(vec![ints(&[7, 8]), ints(&[70, 80])]))
+        .insert(DataChunk::from_vectors(vec![
+            ints(&[7, 8]),
+            ints(&[70, 80]),
+        ]))
         .expect("first build batch");
     table
-        .insert(DataChunk::from_vectors(vec![ints(&[7, 9]), ints(&[71, 90])]))
+        .insert(DataChunk::from_vectors(vec![
+            ints(&[7, 9]),
+            ints(&[71, 90]),
+        ]))
         .expect("second build batch");
 
     let sink = Collect::default();
@@ -856,8 +1004,14 @@ fn inner_join_reuses_output_buckets_across_probe_batches() {
     join.flush().expect("flush join");
 
     let chunks = sink.0.lock().expect("collect lock");
-    let probe = chunks.iter().flat_map(|chunk| cells(chunk, 0)).collect::<Vec<_>>();
-    let build = chunks.iter().flat_map(|chunk| cells(chunk, 1)).collect::<Vec<_>>();
+    let probe = chunks
+        .iter()
+        .flat_map(|chunk| cells(chunk, 0))
+        .collect::<Vec<_>>();
+    let build = chunks
+        .iter()
+        .flat_map(|chunk| cells(chunk, 1))
+        .collect::<Vec<_>>();
     let mut pairs = probe.into_iter().zip(build).collect::<Vec<_>>();
     pairs.sort_unstable();
 
@@ -913,16 +1067,14 @@ fn inner_join_worker_local_probe_states_combine_duplicate_matches() {
         .expect("probe first worker batch");
     second
         .push(
-            DataChunkView::from_chunk(DataChunk::from_vectors(vec![
-                ints(&[7]),
-                ints(&[701]),
-            ]))
+            DataChunkView::from_chunk(DataChunk::from_vectors(vec![ints(&[7]), ints(&[701])]))
                 .expect("view second probe batch"),
         )
         .expect("probe second worker batch");
 
     for (local, compose_us, downstream_us) in [(&mut first, 13, 17), (&mut second, 19, 23)] {
-        let local = local.as_mut()
+        let local = local
+            .as_mut()
             .as_any_mut()
             .downcast_mut::<HashJoin>()
             .expect("worker-local hash join");
@@ -938,8 +1090,14 @@ fn inner_join_worker_local_probe_states_combine_duplicate_matches() {
     canonical.flush().expect("flush canonical join");
 
     let chunks = sink.0.lock().expect("collect lock");
-    let probe = chunks.iter().flat_map(|chunk| cells(chunk, 0)).collect::<Vec<_>>();
-    let build = chunks.iter().flat_map(|chunk| cells(chunk, 1)).collect::<Vec<_>>();
+    let probe = chunks
+        .iter()
+        .flat_map(|chunk| cells(chunk, 0))
+        .collect::<Vec<_>>();
+    let build = chunks
+        .iter()
+        .flat_map(|chunk| cells(chunk, 1))
+        .collect::<Vec<_>>();
     let mut pairs = probe.into_iter().zip(build).collect::<Vec<_>>();
     pairs.sort_unstable();
     assert_eq!(
@@ -964,3 +1122,6 @@ mod residual_projection;
 
 #[path = "tests/correlated_semi_anti.rs"]
 mod correlated_semi_anti;
+
+#[path = "tests/output_batching.rs"]
+mod output_batching;

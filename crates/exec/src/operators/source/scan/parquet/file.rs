@@ -11,12 +11,12 @@ use opendal::Operator;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::ParquetMetaData;
 
-use super::PARQUET_FOOTER;
-use super::reader::{IoStats, OpendalParquetReader};
 use super::super::ScanFile;
+use super::PARQUET_FOOTER;
+use super::reader::{IoStats, ParquetFileReader, ParquetIoBackend};
 
 pub(super) struct PreparedParquetFile {
-    pub(super) reader: OpendalParquetReader,
+    pub(super) reader: ParquetFileReader,
     pub(super) metadata: Arc<ParquetMetaData>,
     pub(super) file_size_bytes: u64,
     pub(super) stat_us: u64,
@@ -26,11 +26,12 @@ pub(super) struct PreparedParquetFile {
 
 /// Reuses catalog file metadata when available and opens the scan's Parquet reader.
 ///
-/// The returned reader owns only the OpenDAL handle and shared counters. Footer
-/// metadata stays in an `Arc`, so preparation does not copy file or column data.
+/// The returned reader owns one backend-specific file handle and shared counters.
+/// Footer metadata stays in an `Arc`, so preparation does not copy column data.
 pub(super) async fn prepare_parquet_file(
     operator: &Operator,
     file: &ScanFile,
+    backend: ParquetIoBackend,
     bytes_read: &Arc<AtomicU64>,
     io: Arc<IoStats>,
     metadata_store: &MetadataStore,
@@ -52,13 +53,19 @@ pub(super) async fn prepare_parquet_file(
     };
     let stat_us = stat_started.elapsed().as_micros() as u64;
 
-    let mut reader = OpendalParquetReader::new(
+    let mut reader = ParquetFileReader::new(
         operator,
         path,
+        &file.absolute,
+        backend,
         file_size_bytes,
         Arc::clone(bytes_read),
         io,
-    );
+    )
+        .await
+        .map_err(|error| {
+            VeinError::internal(format!("Failed to open Parquet range reader for '{path}': {error}"))
+        })?;
 
     let metadata_started = Instant::now();
     let cached_footer = footer_key

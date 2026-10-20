@@ -11,6 +11,8 @@ pub mod analysis;
 pub mod runtime;
 /// One query-scoped view of source metadata and lazily collected runtime feedback.
 pub mod context;
+/// Query-lifetime state shared by task-local execution decisions.
+pub mod query_state;
 /// Compact, payload-safe formatting for query statistics diagnostics.
 pub mod logging;
 
@@ -39,13 +41,14 @@ use crate::Result;
 
 mod accumulators;
 mod input;
-pub use input::StatisticsInput;
+pub use input::{SelectedRecordBatch, StatisticsInput};
 pub use accumulators::StatisticsCollector;
 pub use runtime::{RuntimeStatisticsObservation, RuntimeStatisticsStore};
 pub use context::{
     OperatorCounter, OperatorStatisticsHandle, OperatorStatisticsIdentity, OperatorStatisticsSnapshot,
     QuerySourceStatistics, QueryStatisticsContext, QueryStatisticsSnapshot,
 };
+pub use query_state::QueryStateRegistry;
 pub use logging::TableStatisticsLog;
 
 /// Unambiguous synopsis key for a column in a query-local intermediate relation.

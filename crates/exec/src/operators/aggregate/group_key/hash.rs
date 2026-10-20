@@ -3,3 +3,4 @@
 mod batch;
 mod nullable;
 mod row;
+mod view;

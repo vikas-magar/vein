@@ -18,3 +18,12 @@ approval_mode = "approve"
 
 [mcp_servers.rustrover.tools.create_new_file]
 approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_evaluate_expression]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_remove_breakpoints]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_get_value_by_path]
+approval_mode = "approve"
