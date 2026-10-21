@@ -26,9 +26,9 @@ impl RuntimeFilterSet {
                 }
             }
         }
-        // Scan adapters such as Parquet require predicate columns in source
-        // order. Keep each filter's key order in its positional mapping below,
-        // while exposing the narrow input columns in the scan schema's order.
+        // Source adapters may require predicate columns in source order. Keep
+        // each filter's key order in its positional mapping below, while
+        // exposing the narrow input columns in the scan schema's order.
         let columns = schema
             .fields
             .iter()

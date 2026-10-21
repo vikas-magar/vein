@@ -1,6 +1,6 @@
 use super::*;
 use super::test_support::{join, predicate, scan};
-use catalog::{TableFormat, TableMetadata};
+use catalog::TableMetadata;
 use plan::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
 
 #[test]
@@ -63,7 +63,7 @@ fn checkpoint_producer_preserves_projection_and_intermediate_schema() {
     ];
     let schema = Box::new(VeinSchema::new(fields));
     let mut metadata = TableMetadata::new("projected", Arc::new(*schema.clone()))
-        .with_format(TableFormat::Parquet);
+        .with_file_format("parquet");
     metadata.statistics = Some(catalog::TableStatistics {
         num_rows: Some(100),
         ..Default::default()

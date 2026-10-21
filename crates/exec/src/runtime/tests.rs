@@ -4,8 +4,8 @@ use crate::spill::{LocalSpillStorage, SpillStorage};
 use arrow::array::Array;
 use common::identifiers::{QueryId, RequestId, StageId, TaskId};
 use common::protocol::{
-    AggOpCode, AggregatePlan, ExecutionMode, FileFormat, FileScanTask, JoinKind, JoinOutput,
-    BinaryExprOp, ExprKind, ExpressionProgram, ExpressionStep, JoinPlan, LimitSpec,
+    AggOpCode, AggregatePlan,
+    BinaryExprOp, DataFileFormatId, ExecutionMode, ExprKind, ExpressionProgram, ExpressionStep, FileScanTask, JoinKind, JoinOutput, JoinPlan, LimitSpec,
     PhysicalExpr, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator, SortKey, SortPlan,
 };
 use std::sync::atomic::AtomicUsize;
@@ -27,6 +27,7 @@ mod view_contract;
 mod view_streaming;
 mod zero_copy_e2e;
 mod expression_pipeline;
+mod provider_units;
 
 pub(in crate::runtime::tests) use fixtures::*;
 

@@ -4,13 +4,15 @@ use catalog::{
     ColumnStatistics, StatisticsComparison, StatisticsPredicate, TableMetadata, TableStatistics,
 };
 use common::protocol::{
-    BinaryExprOp, ExprKind, ExpressionStep, JoinOutput, PhysicalExpr, SortKey as PhysicalSortKey,
-    SortPlan,
+    ARROW_DICTIONARY_ENCODING,
+    BinaryExprOp, ColumnEncodingHint, ExprKind, ExpressionStep, JoinOutput, PhysicalExpr,
+    SortKey as PhysicalSortKey, SortPlan,
 };
 use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
 use plan::{LogicalExpr, LogicalLiteral, LogicalPlan, SortKey as LogicalSortKey};
 
 use super::PipelineCompiler;
+use crate::test_support::external_scan;
 
 #[path = "tests/expression_assertions.rs"]
 mod expression_assertions;
@@ -230,7 +232,7 @@ fn unsupported_explain_plan() -> LogicalPlan {
     let scan = LogicalPlan::Scan {
         table: Arc::new(
             TableMetadata::new("private_table_marker", Arc::new(schema.clone()))
-                .with_format(plan::TableFormat::Parquet),
+                .with_file_format("parquet"),
         ),
         projection: None,
         filters: Vec::new(),
@@ -255,16 +257,6 @@ fn assert_concise_operator_error(error: &error::VeinError, context: &str) {
         !message.contains("Scan {"),
         "full plan was formatted: {message}"
     );
-}
-
-fn external_scan(schema: &VeinSchema) -> LogicalPlan {
-    LogicalPlan::ExternalScan {
-        url: "memory://sort-test".to_owned(),
-        options: Vec::new(),
-        files: Vec::new(),
-        source_metadata: None,
-        schema: Box::new(schema.clone()),
-    }
 }
 
 #[test]
@@ -456,10 +448,17 @@ fn requests_dictionary_encoding_for_direct_utf8_aggregate_keys() {
 
     let (source, _, _, _) = PipelineCompiler::compile(&aggregate).expect("compile aggregate");
     let common::protocol::DataSource::File(scan) = source else {
-        panic!("aggregate scan should use Parquet");
+        panic!("aggregate should compile to a file scan");
     };
 
-    assert_eq!(scan.dictionary_columns, vec![0]);
+    assert_eq!(
+        scan.column_encoding_hints,
+        vec![ColumnEncodingHint::dictionary(0)]
+    );
+    assert_eq!(
+        scan.column_encoding_hints[0].encoding.as_str(),
+        ARROW_DICTIONARY_ENCODING
+    );
 }
 
 #[test]
@@ -486,10 +485,10 @@ fn does_not_request_dictionary_encoding_for_computed_group_keys() {
 
     let (source, _, _, _) = PipelineCompiler::compile(&aggregate).expect("compile aggregate");
     let common::protocol::DataSource::File(scan) = source else {
-        panic!("aggregate scan should use Parquet");
+        panic!("aggregate should compile to a file scan");
     };
 
-    assert!(scan.dictionary_columns.is_empty());
+    assert!(scan.column_encoding_hints.is_empty());
 }
 
 #[test]
@@ -900,7 +899,7 @@ fn missing_recursive_filter_column_reports_operator_identity_and_input_schema() 
         input: Box::new(LogicalPlan::Scan {
             table: Arc::new(
                 TableMetadata::new("partsupp", Arc::new(VeinSchema::empty()))
-                    .with_format(plan::TableFormat::Parquet),
+                    .with_file_format("parquet"),
             ),
             projection: None,
             filters: Vec::new(),
@@ -936,7 +935,7 @@ fn unsupported_recursive_transform_error_names_operator_concisely() {
         &unsupported_explain_plan(),
         &VeinSchema::empty(),
     )
-    .expect_err("EXPLAIN has no recursive join transform");
+        .expect_err("EXPLAIN has no recursive join transform");
 
     assert_concise_operator_error(&error, "recursive join transform");
 }

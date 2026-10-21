@@ -51,3 +51,6 @@ approval_mode = "approve"
 
 [mcp_servers.rustrover.tools.xdebug_list_breakpoints]
 approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.run_ide_script]
+approval_mode = "approve"

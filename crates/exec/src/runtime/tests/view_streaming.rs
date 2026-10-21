@@ -13,18 +13,20 @@ async fn client_result_stays_reference_backed_through_join_sort_limit() {
             PhysicalPlanOperator::Pipeline {
                 source: Arc::new(DataSource::File(FileScanTask {
                     files: vec!["3.parquet".into(), "1.parquet".into(), "2.parquet".into()],
-                    format: FileFormat::Parquet,
+                    storage_metadata: Vec::new(),
+                    data_file_format: DataFileFormatId::new("parquet"),
+                    format_options: Vec::new(),
+                    column_encoding_hints: Vec::new(),
                     byte_range: None,
                     scan_unit_range: None,
                     projected: Arc::clone(&schema),
-                    dictionary_columns: Vec::new(),
                     pushdown: None,
                     task_id: TaskId::new(),
-            catalog_snapshot: None,
-            runtime_statistics: None,
+                    catalog_snapshot: None,
+                    runtime_statistics: None,
                 })),
                 input_schema: Arc::clone(&schema),
-            program: Arc::new(ExpressionProgram::empty()),
+                program: Arc::new(ExpressionProgram::empty()),
             },
         )
     };
@@ -117,7 +119,7 @@ async fn view_results_stream_without_retention_and_propagate_cancellation_and_ch
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert!(matches!(
-            runner().execute(&task(), cancel).await,
-            Err(VeinError::Cancelled)
-        ));
+        runner().execute(&task(), cancel).await,
+        Err(VeinError::Cancelled)
+    ));
 }

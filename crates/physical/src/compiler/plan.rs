@@ -6,9 +6,9 @@ use catalog::{StatisticsComparison, StatisticsPredicate};
 use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{
-    AggOpCode, AggregatePlan, DataSource, FileFormat, FileScanTask, JoinOutput, JoinResidualPlan,
-    ExpressionProgram, ExpressionStep, LimitSpec, ScanPredicate,
-    ScanPredicateStage, SortKey as PhysicalSortKey, SortPlan,
+    AggOpCode, AggregatePlan, ColumnEncodingHint, DataFileFormatId, DataSource, ExpressionProgram, ExpressionStep,
+    FileScanTask, JoinOutput, JoinResidualPlan, LimitSpec, ScanPredicate, ScanPredicateStage,
+    SortKey as PhysicalSortKey, SortPlan,
 };
 use error::VeinError;
 use plan::schema::VeinSchema;
@@ -192,7 +192,9 @@ impl PipelineCompiler {
     /// Compiles the sort operator at this node without imposing root-pipeline
     /// restrictions on operators below it. Recursive inputs retain the exact
     /// logical order, including a limit that precedes a sort.
-    pub fn recursive_sort(plan: &LogicalPlan) -> Result<Option<(SortPlan, Option<ExpressionProgram>)>> {
+    pub fn recursive_sort(
+        plan: &LogicalPlan,
+    ) -> Result<Option<(SortPlan, Option<ExpressionProgram>)>> {
         let LogicalPlan::Sort {
             sort_keys, schema, ..
         } = plan
@@ -221,21 +223,28 @@ impl PipelineCompiler {
         let mut dictionary_group_ids = Vec::new();
         let (mut source, scan_schema) = Self::collect_leaf_source(plan, &mut dictionary_group_ids)?;
         if let DataSource::File(scan) = &mut source
-            && scan.pushdown.is_none() {
-                scan.dictionary_columns = scan_schema
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, field)| {
-                        field.data_type == plan::schema::VeinDataType::Utf8
-                            && dictionary_group_ids.contains(&field.id)
-                    })
-                    .filter_map(|(index, _)| u32::try_from(index).ok())
-                    .collect();
-            }
+            && scan.pushdown.is_none()
+        {
+            scan.column_encoding_hints = scan_schema
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| {
+                    field.data_type == plan::schema::VeinDataType::Utf8
+                        && dictionary_group_ids.contains(&field.id)
+                })
+                .filter_map(|(index, _)| u32::try_from(index).ok())
+                .map(ColumnEncodingHint::dictionary)
+                .collect();
+        }
         let mut steps = Vec::new();
         let output_schema = Self::compile_node(plan, scan_schema.clone(), &mut steps)?;
-        Ok((source, ExpressionProgram { steps }, scan_schema, output_schema))
+        Ok((
+            source,
+            ExpressionProgram { steps },
+            scan_schema,
+            output_schema,
+        ))
     }
 
     /// Compiles one operator against its recursively produced
@@ -267,28 +276,28 @@ impl PipelineCompiler {
                 &output_schema,
                 &mut steps,
             )
-                .map_err(|error| {
-                    let operator = match *plan {
-                        LogicalPlan::Filter { .. } => "filter",
-                        LogicalPlan::Project { .. } => "projection",
-                        LogicalPlan::Aggregate { .. } => "aggregate",
-                        LogicalPlan::Distinct { .. } => "distinct",
-                        LogicalPlan::SubqueryAlias { .. } => "subquery alias",
-                        _ => "transform",
-                    };
-                    let columns = output_schema
-                        .fields
-                        .iter()
-                        .map(|field| format!("{}#{}", field.name, field.id.0))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    VeinError::context(
-                        format!(
-                            "failed to compile recursive {operator} against input schema [{columns}]"
-                        ),
-                        error,
-                    )
-                })?;
+            .map_err(|error| {
+                let operator = match *plan {
+                    LogicalPlan::Filter { .. } => "filter",
+                    LogicalPlan::Project { .. } => "projection",
+                    LogicalPlan::Aggregate { .. } => "aggregate",
+                    LogicalPlan::Distinct { .. } => "distinct",
+                    LogicalPlan::SubqueryAlias { .. } => "subquery alias",
+                    _ => "transform",
+                };
+                let columns = output_schema
+                    .fields
+                    .iter()
+                    .map(|field| format!("{}#{}", field.name, field.id.0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                VeinError::context(
+                    format!(
+                        "failed to compile recursive {operator} against input schema [{columns}]"
+                    ),
+                    error,
+                )
+            })?;
         }
         Ok((ExpressionProgram { steps }, output_schema))
     }
@@ -388,8 +397,12 @@ impl PipelineCompiler {
         dictionary_group_ids: &mut Vec<plan::schema::ColumnId>,
     ) -> Result<(DataSource, VeinSchema)> {
         match plan {
-            LogicalPlan::Intermediate { source_id, schema, .. } => Ok((
-                DataSource::Intermediate(common::identifiers::IntermediateSourceId::from_raw(*source_id)),
+            LogicalPlan::Intermediate {
+                source_id, schema, ..
+            } => Ok((
+                DataSource::Intermediate(common::identifiers::IntermediateSourceId::from_raw(
+                    *source_id,
+                )),
                 (**schema).clone(),
             )),
             LogicalPlan::Scan {
@@ -398,22 +411,33 @@ impl PipelineCompiler {
                 filters,
                 schema,
             } => {
-                if table
-                    .format
-                    .as_ref()
-                    .is_some_and(|format| format != &plan::TableFormat::Parquet)
-                {
-                    return Err(VeinError::unsupported(
-                        format!("only Parquet tables are supported: '{}'", table.name),
+                let data_file_format = table.data_file_format.clone().ok_or_else(|| {
+                    VeinError::planning(
+                        format!("table '{}' does not declare a data-file format", table.name),
                         None,
-                    ));
-                }
+                    )
+                })?;
                 let files = if !table.files.is_empty() {
                     table.files.clone()
                 } else if let Some(location) = &table.location {
                     vec![location.clone()]
                 } else {
                     vec![table.name.clone()]
+                };
+                let storage_metadata = if table.storage_metadata.is_empty() {
+                    Vec::new()
+                } else if table.storage_metadata.len() == files.len() {
+                    table.storage_metadata.clone()
+                } else {
+                    return Err(VeinError::planning(
+                        format!(
+                            "table '{}' has {} storage snapshots for {} scan files",
+                            table.name,
+                            table.storage_metadata.len(),
+                            files.len()
+                        ),
+                        None,
+                    ));
                 };
                 let scan_schema =
                     Self::projected_scan_schema(schema, projection.as_deref(), filters)?;
@@ -458,7 +482,15 @@ impl PipelineCompiler {
                         partition_count: 1,
                     }
                 });
-                Self::file_source(files, scan_schema, pushdown, runtime_statistics)
+                Self::file_source(
+                    files,
+                    data_file_format,
+                    Vec::new(),
+                    storage_metadata,
+                    scan_schema,
+                    pushdown,
+                    runtime_statistics,
+                )
             }
             LogicalPlan::ExternalScan {
                 url,
@@ -467,20 +499,36 @@ impl PipelineCompiler {
                 schema,
                 ..
             } => {
-                if options.iter().any(|(key, value)| {
-                    key.eq_ignore_ascii_case("format") && !value.eq_ignore_ascii_case("parquet")
-                }) {
-                    return Err(VeinError::unsupported(
-                        "only Parquet external sources are supported",
+                let data_file_format = options
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("format"))
+                    .map(|(_, value)| DataFileFormatId::new(value.as_str()))
+                    .ok_or_else(|| VeinError::planning(
+                        "external scan must declare a data-file format",
                         None,
-                    ));
-                }
+                    ))?;
                 let paths = if files.is_empty() {
                     vec![url.clone()]
                 } else {
                     files.clone()
                 };
-                Self::file_source(paths, (**schema).clone(), None, None)
+                let format_options = options
+                    .iter()
+                    .filter(|(key, _)| !key.eq_ignore_ascii_case("format"))
+                    .map(|(key, value)| common::protocol::KeyValue {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect();
+                Self::file_source(
+                    paths,
+                    data_file_format,
+                    format_options,
+                    Vec::new(),
+                    (**schema).clone(),
+                    None,
+                    None,
+                )
             }
             LogicalPlan::Aggregate {
                 input,
@@ -490,9 +538,10 @@ impl PipelineCompiler {
                 let (keys, _) = grouping_layout(grouping_sets)?;
                 for key in keys {
                     if let LogicalExpr::Column(column) = key
-                        && !dictionary_group_ids.contains(&column.id) {
-                            dictionary_group_ids.push(column.id);
-                        }
+                        && !dictionary_group_ids.contains(&column.id)
+                    {
+                        dictionary_group_ids.push(column.id);
+                    }
                 }
                 Self::collect_leaf_source(input, dictionary_group_ids)
             }
@@ -522,12 +571,15 @@ impl PipelineCompiler {
 
     fn file_source(
         files: Vec<String>,
+        data_file_format: DataFileFormatId,
+        format_options: Vec<common::protocol::KeyValue>,
+        storage_metadata: Vec<catalog::StorageFileMetadata>,
         schema: VeinSchema,
         pushdown: Option<Arc<ScanPredicate>>,
         runtime_statistics: Option<common::protocol::RuntimeStatisticsScan>,
     ) -> Result<(DataSource, VeinSchema)> {
         if files.is_empty() {
-            return Err(VeinError::planning("Parquet scan has no input files", None));
+            return Err(VeinError::planning("file scan has no input files", None));
         }
         // One handle to the projected schema: splitting this scan into
         // per-file tasks then copies a refcount instead of the schema.
@@ -535,11 +587,13 @@ impl PipelineCompiler {
         Ok((
             DataSource::File(FileScanTask {
                 files,
-                format: FileFormat::Parquet,
+                storage_metadata,
+                data_file_format,
+                format_options,
+                column_encoding_hints: Vec::new(),
                 byte_range: None,
                 scan_unit_range: None,
                 projected,
-                dictionary_columns: Vec::new(),
                 pushdown,
                 task_id: TaskId::new(),
                 catalog_snapshot: None,
@@ -1168,7 +1222,13 @@ fn agg_op(name: &str, distinct: bool) -> Result<AggOpCode> {
 
 /// Returns the single input argument for an aggregate expression.
 fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr, bool)> {
-    let LogicalExpr::FunctionCall { name, args, distinct, .. } = agg else {
+    let LogicalExpr::FunctionCall {
+        name,
+        args,
+        distinct,
+        ..
+    } = agg
+    else {
         return Err(VeinError::planning(
             format!(
                 "aggregate expression must be a function call, found expression kind {}",

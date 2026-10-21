@@ -244,7 +244,7 @@ mod tests {
         ]));
         let table = std::sync::Arc::new(
             plan::TableMetadata::new("users", std::sync::Arc::new(*schema.clone()))
-                .with_format(plan::TableFormat::Parquet),
+                .with_file_format("parquet"),
         );
         LogicalPlan::Scan {
             table,
@@ -434,7 +434,7 @@ mod tests {
             let schema = Arc::new(VeinSchema::new(fields));
             let table = Arc::new(
                 plan::TableMetadata::new(name, Arc::clone(&schema))
-                    .with_format(plan::TableFormat::Parquet),
+                    .with_file_format("parquet"),
             );
             LogicalPlan::Scan {
                 table,
@@ -799,7 +799,7 @@ mod tests {
             let schema = Arc::new(VeinSchema::new(fields));
             let table = Arc::new(
                 plan::TableMetadata::new(name, Arc::clone(&schema))
-                    .with_format(plan::TableFormat::Parquet),
+                    .with_file_format("parquet"),
             );
             LogicalPlan::Scan {
                 table,

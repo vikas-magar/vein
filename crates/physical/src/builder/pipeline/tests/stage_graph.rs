@@ -13,7 +13,7 @@ fn multi_file_scan_keeps_one_canonical_task_and_graph_references() {
     let scan = LogicalPlan::Scan {
         table: Arc::new(
             plan::TableMetadata::new("items", Arc::new(schema.clone()))
-                .with_format(plan::TableFormat::Parquet)
+                .with_file_format("parquet")
                 .with_files(vec!["first.parquet".into(), "second.parquet".into()]),
         ),
         projection: None,
@@ -57,7 +57,7 @@ fn write_over_recursive_join_preserves_storage_sink_metadata() {
     let left_scan = LogicalPlan::Scan {
         table: Arc::new(
             plan::TableMetadata::new("left_table", Arc::new(left_schema.clone()))
-                .with_format(plan::TableFormat::Parquet)
+                .with_file_format("parquet")
                 .with_files(vec!["left.parquet".to_string()]),
         ),
         projection: None,
@@ -76,7 +76,7 @@ fn write_over_recursive_join_preserves_storage_sink_metadata() {
     let right_scan = LogicalPlan::Scan {
         table: Arc::new(
             plan::TableMetadata::new("right_table", Arc::new(right_schema.clone()))
-                .with_format(plan::TableFormat::Parquet)
+                .with_file_format("parquet")
                 .with_files(vec!["right.parquet".to_string()]),
         ),
         projection: None,

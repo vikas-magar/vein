@@ -33,3 +33,6 @@ pub use pipeline_graph::{
 };
 pub use stage::Stage;
 pub use task::Task;
+
+#[cfg(test)]
+mod test_support;

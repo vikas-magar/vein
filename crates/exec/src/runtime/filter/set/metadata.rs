@@ -84,7 +84,8 @@ impl RuntimeFilterSet {
         }
 
         // Filters that need the same column set share one decode stage. Other
-        // sets stay separate so Parquet can apply the row selection between them.
+        // sets stay separate so capable readers can apply row selection between
+        // stages.
         let mut groups: Vec<(Vec<ColumnId>, Vec<&Arc<dyn RuntimeFilter>>)> = Vec::new();
         for filter in row_filters {
             let mut columns = filter.required_columns().to_vec();

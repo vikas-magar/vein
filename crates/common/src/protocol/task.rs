@@ -1,25 +1,15 @@
 //! Physical task definitions, execution modes, sources, and sinks.
 
-use catalog::{CatalogSnapshotToken, StatisticsPredicate};
+use catalog::{CatalogSnapshotToken, DataFileFormatId, StatisticsPredicate, StorageFileMetadata};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::sync::Arc;
 use types::VeinSchemaRef;
 
 use super::expression::{ExpressionProgram, PhysicalExpr};
+use super::encoding::ColumnEncodingHint;
 use crate::identifiers::{IntermediateSourceId, QueryId, RequestId, StageId, TaskId};
 use crate::statistics::QueryStatisticsContext;
-
-/// Supported file formats for storage scans.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FileFormat {
-    /// Apache Parquet
-    Parquet,
-    /// Comma-Separated Values
-    Csv,
-    /// JavaScript Object Notation
-    Json,
-}
 
 /// A source predicate plan evaluated before projected rows are materialized.
 ///
@@ -57,8 +47,19 @@ pub struct ScanPredicateStage {
 pub struct FileScanTask {
     /// List of URIs/Paths to the files.
     pub files: Vec<String>,
-    /// The format of the files.
-    pub format: FileFormat,
+    /// Storage snapshots aligned with `files`; empty when unavailable.
+    /// These snapshots let scan providers reuse catalog metadata without
+    /// issuing another storage stat request or reconstructing object identity.
+    #[serde(default)]
+    pub storage_metadata: Vec<StorageFileMetadata>,
+    /// Identifier of the registered reader for these files.
+    pub data_file_format: DataFileFormatId,
+    /// Reader-specific settings. The registered provider validates and interprets these values.
+    #[serde(default)]
+    pub format_options: Vec<KeyValue>,
+    /// Best-effort output encoding requests addressed to projected columns.
+    #[serde(default)]
+    pub column_encoding_hints: Vec<ColumnEncodingHint>,
     /// Optional byte range within the file.
     pub byte_range: Option<Range<u64>>,
     /// Optional range of reader-defined, independently schedulable units in a
@@ -71,12 +72,6 @@ pub struct FileScanTask {
     /// Refcounted so splitting one file scan into per-file tasks copies a
     /// handle rather than the schema.
     pub projected: VeinSchemaRef,
-    /// Projected column positions that may retain Parquet dictionary encoding.
-    ///
-    /// This is an execution hint for consumers that can use dictionary IDs
-    /// directly. An empty list keeps the default decoded Arrow representation.
-    #[serde(default)]
-    pub dictionary_columns: Vec<u32>,
     /// Push-down predicate the source evaluates before materializing rows.
     ///
     /// Refcounted for the same reason as `projected`: splitting a scan into

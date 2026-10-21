@@ -815,7 +815,7 @@ impl DataChunkView {
     /// Array identity deduplicates repeated references to the same Arrow array.
     /// Distinct arrays that internally share buffers may be counted more than
     /// once; these are conservative estimates rather than allocator telemetry.
-    pub(crate) fn source_array_memory_sizes(&self) -> Result<Vec<(usize, usize)>> {
+    pub fn source_array_memory_sizes(&self) -> Result<Vec<(usize, usize)>> {
         let mut seen = HashSet::new();
         self.columns
             .iter()

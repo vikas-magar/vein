@@ -1,7 +1,7 @@
 //! Query-local identity for avoiding duplicate adaptive scans.
 
-use plan::{ColumnId, LogicalExpr, LogicalPlan, ResolvedColumn};
 use parser::ast::expr::BinaryOp;
+use plan::{ColumnId, LogicalExpr, LogicalPlan, ResolvedColumn};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,7 +47,18 @@ pub(super) fn scan_population_signature(plan: &LogicalPlan) -> Option<ScanPopula
         .collect();
     let source = table.catalog_snapshot.as_ref()
         .map(common::statistics::runtime::table_statistics_key)
-        .unwrap_or_else(|| format!("{:?}", (&table.name, &table.location, &table.format, &table.files)));
+        .unwrap_or_else(|| {
+            format!(
+                "{:?}",
+                (
+                    &table.name,
+                    &table.location,
+                    &table.data_file_format,
+                    &table.table_provider,
+                    &table.files,
+                )
+            )
+        });
     Some(ScanPopulationSignature { source, filters, output_columns })
 }
 
@@ -61,7 +72,10 @@ fn normalize_expression(expression: LogicalExpr) -> Option<LogicalExpr> {
                 std::mem::swap(&mut left, &mut right);
             }
             Some(LogicalExpr::BinaryOp {
-                left: Box::new(left), op, right: Box::new(right), return_type,
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+                return_type,
             })
         }
         LogicalExpr::OuterColumn(_)

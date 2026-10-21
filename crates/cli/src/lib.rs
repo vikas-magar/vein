@@ -1,6 +1,6 @@
 //! Reusable local query engine used by the CLI and in-process benchmarks.
 
-mod parquet_catalog;
-mod parquet_storage;
+#[cfg(test)]
+mod test_support;
 
 pub mod local;

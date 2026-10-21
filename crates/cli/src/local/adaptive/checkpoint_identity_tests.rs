@@ -1,7 +1,7 @@
-use super::{scan_population_signature, signature_match_counts};
 use super::super::super::test_support::scan;
-use plan::{ColumnId, LogicalExpr, LogicalPlan, ResolvedColumn, VeinDataType};
+use super::{scan_population_signature, signature_match_counts};
 use parser::ast::expr::BinaryOp;
+use plan::{ColumnId, LogicalExpr, LogicalPlan, ResolvedColumn, VeinDataType};
 use std::sync::Arc;
 
 fn aliased_scan(id: usize, qualifier: &str) -> LogicalPlan {
@@ -49,6 +49,14 @@ fn scan_identity_preserves_filter_semantics_and_source_identity() {
         *table = Arc::new(metadata);
     }
     assert_ne!(first, scan_population_signature(&changed_source).unwrap());
+
+    let mut changed_provider = scan("nation", 25);
+    if let LogicalPlan::Scan { table, .. } = &mut changed_provider {
+        let mut metadata = (**table).clone();
+        metadata.table_provider = Some("provider.snapshot.v1".into());
+        *table = Arc::new(metadata);
+    }
+    assert_ne!(first, scan_population_signature(&changed_provider).unwrap());
 }
 
 #[test]

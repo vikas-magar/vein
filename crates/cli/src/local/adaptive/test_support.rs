@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use catalog::{TableFormat, TableMetadata};
+use catalog::TableMetadata;
 use common::statistics::QueryStatisticsContext;
 use plan::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
 
@@ -37,7 +37,7 @@ pub(super) fn scan(name: &str, rows: u64) -> LogicalPlan {
         VeinDataType::Int64,
     ))]));
     let mut metadata =
-        TableMetadata::new(name, Arc::new(*schema.clone())).with_format(TableFormat::Parquet);
+        TableMetadata::new(name, Arc::new(*schema.clone())).with_file_format("parquet");
     metadata.statistics = Some(catalog::TableStatistics {
         num_rows: Some(rows),
         ..Default::default()

@@ -1,7 +1,7 @@
 //! Stateless executor for Vein.
 //!
 //! Each Executor receives self-contained `ExecuteTask` messages,
-//! reads Parquet files, applies operators, and pushes results to ESS.
+//! reads registered file sources, applies operators, and pushes results to ESS.
 
 #![deny(missing_docs)]
 
@@ -19,8 +19,6 @@ pub mod factory;
 pub mod runtime;
 /// Query-scoped reservation accounting for blocking operator state.
 pub mod memory;
-/// Typed Parquet footer statistics shared by catalog discovery and scan pruning.
-pub mod parquet_statistics;
 /// Query-scoped spill storage, accounting, and Arrow IPC run lifecycle.
 pub mod spill;
 /// Structured execution tracing for canonical plans and batch flow.

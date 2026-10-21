@@ -36,8 +36,8 @@ pub trait ExecutorBuilder: Send + Sync {
 
     /// Decompose a scan into storage-reader work units that can be scheduled
     /// independently. The default uses file boundaries; source adapters may
-    /// expose finer units such as Parquet row groups when cached metadata allows
-    /// it. Returning no units means the adapter proved the scan empty.
+    /// expose finer units when cached source metadata allows it. Returning no
+    /// units means the adapter proved the scan empty.
     fn partition_scan_source(
         &self,
         source: &DataSource,

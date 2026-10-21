@@ -1,3 +1,4 @@
+use crate::test_support::TEST_DATA_FILE_FORMAT;
 use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
 use plan::{ColumnStatistics, LogicalExpr, LogicalPlan, PlanTraversal, TableMetadata, TableStatistics};
 use std::sync::Arc;
@@ -49,7 +50,9 @@ pub(super) fn scan_with_statistics(
     let schema = VeinSchema::new(fields);
     LogicalPlan::Scan {
         table: Arc::new(
-            TableMetadata::new(name, Arc::new(schema.clone())).with_statistics(statistics),
+            TableMetadata::new(name, Arc::new(schema.clone()))
+                .with_file_format(TEST_DATA_FILE_FORMAT)
+                .with_statistics(statistics),
         ),
         projection: None,
         filters: Vec::new(),

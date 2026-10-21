@@ -8,8 +8,8 @@ use common::identifiers::{IntermediateSourceId, QueryId, RequestId};
 use common::protocol::ExecuteTask;
 use common::protocol::{PhysicalPlanNode, PhysicalPlanOperator};
 use common::statistics::QueryStatisticsContext;
-use exec::runtime::{QueryExecutionResources, TaskExecutor};
 use exec::runtime::checkpoint::IntermediateSourceRegistration;
+use exec::runtime::{QueryExecutionResources, TaskExecutor};
 use physical::PhysicalPlanner;
 use plan::{LogicalPlan, PlanTraversal};
 
@@ -18,7 +18,8 @@ use super::{AdaptiveBoundary, AdaptiveCheckpointPolicy};
 mod coordinator;
 #[path = "stage.rs"]
 mod stage;
-use super::super::{PreparedAdaptiveCheckpoint, tasks_from_job};
+use super::super::query::PreparedAdaptiveCheckpoint;
+use super::super::tasks::tasks_from_job;
 
 pub(in crate::local) struct AdaptiveCoordinator {
     pub executor: Arc<dyn TaskExecutor>,

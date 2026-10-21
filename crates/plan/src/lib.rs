@@ -24,7 +24,8 @@ pub mod schema;
 pub use ::catalog::{
     CatalogProvider, CatalogRevision, CatalogSnapshotToken, ColumnGroupStatistics, ColumnSortKey,
     ColumnStatistics, HistogramBucket, HistogramSample, HistogramStatistics, MetadataStore,
-    MostCommonValue, MostCommonValuesStatistics, PlanningSession, TableFormat, TableMetadata,
+    MostCommonValue, MostCommonValuesStatistics, PlanningSession, DataFileFormatId,
+    TableProviderId, TableMetadata,
     TableMetadataRef, TableStatistics, TableType,
 };
 pub use expr::{LogicalExpr, LogicalLiteral, Volatility};

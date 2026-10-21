@@ -54,8 +54,8 @@ pub use resources::QueryExecutionResources;
 mod dependency_guard;
 mod join_utils;
 mod schedule;
+pub(crate) use crate::operators::source::scan::split_scan_by_file;
 use dependency_guard::PipelineDependencyGuard;
-pub(crate) use join_utils::split_scan_by_file;
 use join_utils::{direct_scan_probe_columns, join_keys, join_outputs, join_type, join_types};
 use schedule::PipelineExecutionSchedule;
 

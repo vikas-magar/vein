@@ -11,11 +11,13 @@ async fn parallel_join_probe_combines_worker_local_aggregate_state() {
             PhysicalPlanOperator::Pipeline {
                 source: Arc::new(DataSource::File(FileScanTask {
                     files: files.iter().map(|file| (*file).to_owned()).collect(),
-                    format: FileFormat::Parquet,
+                    storage_metadata: Vec::new(),
+                    data_file_format: DataFileFormatId::new("parquet"),
+                    format_options: Vec::new(),
+                    column_encoding_hints: Vec::new(),
                     byte_range: None,
                     scan_unit_range: None,
                     projected: Arc::clone(&input_schema),
-                    dictionary_columns: Vec::new(),
                     pushdown: None,
                     task_id: TaskId::new(),
             catalog_snapshot: None,
@@ -100,11 +102,13 @@ async fn multi_file_scan_cancellation_releases_workers_and_channel_senders() {
         PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::File(FileScanTask {
                 files: vec!["1.parquet".into(), "2.parquet".into(), "3.parquet".into()],
-                format: FileFormat::Parquet,
+                storage_metadata: Vec::new(),
+                data_file_format: DataFileFormatId::new("parquet"),
+                format_options: Vec::new(),
+                column_encoding_hints: Vec::new(),
                 byte_range: None,
                 scan_unit_range: None,
                 projected: Arc::clone(&schema),
-                dictionary_columns: Vec::new(),
                 pushdown: None,
                 task_id: TaskId::new(),
             catalog_snapshot: None,

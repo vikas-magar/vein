@@ -220,7 +220,7 @@ pub async fn bind_source<'a>(
                 Ok(tbl) => (
                     tbl.schema.clone(),
                     tbl.files.clone(),
-                    tbl.format.as_ref().map(|f| f.to_string()),
+                    tbl.data_file_format.as_ref().map(ToString::to_string),
                     Some(tbl),
                 ),
                 Err(_error)
@@ -258,11 +258,11 @@ pub async fn bind_source<'a>(
 
             if let Some(fmt) = detected_format
                 && !options
-                    .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("format"))
-                {
-                    options.push(("format".to_string(), fmt));
-                }
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("format"))
+            {
+                options.push(("format".to_string(), fmt));
+            }
 
             Ok(LogicalPlan::ExternalScan {
                 url: url.to_string(),

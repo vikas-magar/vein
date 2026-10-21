@@ -472,6 +472,8 @@ dependencies = [
  "async-trait",
  "error",
  "serde",
+ "serde_json",
+ "storage",
  "tempfile",
  "tracing",
  "types",
@@ -540,11 +542,12 @@ dependencies = [
  "futures",
  "optimizer",
  "parquet",
+ "parquet-connector",
  "parser",
  "physical",
  "plan",
- "serde",
  "serde_json",
+ "storage",
  "tempfile",
  "tokio",
  "tracing",
@@ -800,8 +803,7 @@ dependencies = [
  "futures",
  "hashbrown",
  "libc",
- "opendal",
- "parquet",
+ "storage",
  "tempfile",
  "tokio",
  "tracing",
@@ -1861,6 +1863,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-connector"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "catalog",
+ "common",
+ "error",
+ "exec",
+ "functions",
+ "futures",
+ "libc",
+ "parquet",
+ "plan",
+ "serde",
+ "serde_json",
+ "storage",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "types",
+]
+
+[[package]]
 name = "parser"
 version = "0.1.0"
 dependencies = [
@@ -2502,6 +2530,19 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "storage"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "error",
+ "futures",
+ "opendal",
+ "serde",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "strum"

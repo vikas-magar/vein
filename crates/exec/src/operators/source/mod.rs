@@ -6,3 +6,4 @@ pub mod memory;
 pub mod scan;
 pub use memory::MemorySource;
 pub use scan::ScanSource;
+pub use scan::{ScanProvider, ScanProviderRegistry};

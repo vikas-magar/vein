@@ -7,11 +7,13 @@ edition = "2024"
 catalog = { path = "../catalog" }
 common = { path = "../common" }
 exec = { path = "../exec" }
+parquet-connector = { path = "../parquet-connector" }
 error = { path = "../error" }
 binder = { path = "../binder" }
 plan = { path = "../plan" }
 physical = { path = "../physical" }
 functions = { path = "../functions" }
+storage = { path = "../storage" }
 optimizer = { path = "../optimizer" }
 parser = { path = "../parser" }
 async-trait.workspace = true
@@ -19,12 +21,11 @@ arrow = { workspace = true, features = ["json", "prettyprint"] }
 futures = { workspace = true }
 async-stream = "0.3"
 flume = "0.12"
-parquet = { workspace = true }
-serde = { workspace = true }
 serde_json = "1.0"
 tokio = { workspace = true, features = ["full", "rt-multi-thread"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+parquet = { workspace = true }
 tempfile = "3"
