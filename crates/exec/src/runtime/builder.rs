@@ -6,6 +6,7 @@ use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, ExpressionProgram};
 use common::statistics::QueryStatisticsContext;
+use functions::FunctionRegistry;
 use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
 use crate::runtime::split_scan_by_file;
 use crate::runtime::filter::{
@@ -19,6 +20,11 @@ use crate::runtime::filter::{
 /// [`Source`], [`Transform`], and [`Sink`] implementations are selected here
 /// from the self-contained task description a worker receives.
 pub trait ExecutorBuilder: Send + Sync {
+    /// Registry shared by scalar and aggregate execution for this executor.
+    fn function_registry(&self) -> Option<Arc<FunctionRegistry>> {
+        None
+    }
+
     /// Maximum number of file scan workers used by one local pipeline.
     ///
     /// Builders can override this to align scan concurrency with their storage

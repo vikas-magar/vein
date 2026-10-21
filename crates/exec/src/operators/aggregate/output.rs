@@ -1,4 +1,5 @@
 use super::*;
+use super::init::create_aggregate_states;
 
 impl AggregateSink {
     pub(super) fn release_group_state(&mut self) {
@@ -7,17 +8,8 @@ impl AggregateSink {
         self.group_key_batches = Vec::new();
         self.group_key_batch_arrays = Vec::new();
         self.group_key_batch_leases = Vec::new();
-        self.aggregate_states = self
-            .plan
-            .aggs
-            .iter()
-            .zip(self.plan.aggregate_input_types.iter())
-            .zip(self.plan.types.iter().skip(self.plan.groups as usize))
-            .map(|((op, input_type), result_type)| {
-                AggregateStateColumn::new(*op, input_type, result_type)
-            })
-            .collect::<Result<Vec<_>>>()
-            .expect("validated aggregate plan can recreate empty state columns");
+        self.aggregate_states = create_aggregate_states(&self.plan, &self.registry)
+            .expect("validated aggregate plan can recreate empty function states");
         for group_ids in &mut self.group_ids_by_set {
             *group_ids = Vec::new();
         }
@@ -60,6 +52,7 @@ impl AggregateSink {
         Self::finish_spill_partition_view(
             &self.plan,
             &self.tracker,
+            &self.registry,
             &self.spill_schema,
             runs,
             0,

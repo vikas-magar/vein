@@ -3,17 +3,16 @@
 use super::*;
 use crate::pipeline::DataChunkView;
 
+#[path = "input_batch/source.rs"]
+mod source;
+pub(super) use source::AggregateFunctionInputSource;
+
 #[derive(Clone)]
 pub(super) enum AggregateColumn {
     View(DataChunkView),
 }
 
 impl AggregateColumn {
-    pub(super) fn source_arrays(&self) -> Result<Vec<ArrayRef>> {
-        let Self::View(view) = self;
-        Ok(view.source_arrays_for_column(0)?.to_vec())
-    }
-
     pub(super) fn source_row(&self, row: usize) -> Result<Option<(usize, usize)>> {
         let Self::View(view) = self;
         view.source_row(0, row)
@@ -26,24 +25,11 @@ impl AggregateColumn {
             .ok_or_else(|| VeinError::internal("aggregate source array is out of bounds"))
     }
 
-    pub(super) fn is_null(&self, row: usize) -> Result<bool> {
-        let Some((source, physical_row)) = self.source_row(row)? else {
-            return Ok(true);
-        };
-        Ok(self.source_array(source)?.is_null(physical_row))
-    }
-
-    pub(super) fn source_value(&self, row: usize) -> Result<(ArrayRef, usize)> {
-        let Some((source, physical_row)) = self.source_row(row)? else {
-            return Ok((new_null_array(self.data_type()?, 1), 0));
-        };
-        Ok((Arc::clone(self.source_array(source)?), physical_row))
-    }
-
-    fn data_type(&self) -> Result<&arrow::datatypes::DataType> {
+    pub(super) fn data_type(&self) -> Result<&arrow::datatypes::DataType> {
         let Self::View(view) = self;
         view.column_data_type(0)
     }
+
 }
 
 /// Aggregate arguments are Arrow arrays; grouping keys may remain mapped views.

@@ -4,10 +4,9 @@ use std::time::Instant;
 use common::Result;
 use common::protocol::{ExpressionProgram, ExpressionStep};
 use error::VeinError;
+use functions::FunctionRegistry;
 
-use crate::expression::eval::{
-    ExpressionEvaluator, ExpressionKernelProvider, ScalarFunctionProvider,
-};
+use crate::expression::eval::{ExpressionEvaluator, ExpressionKernelProvider};
 use crate::pipeline::{DataChunkView, PipelineNode, Transform};
 
 use super::{filter, projection};
@@ -40,7 +39,7 @@ impl ExecutionMetrics {
 pub(crate) struct ExpressionExecutor<K: ?Sized> {
     program: Arc<ExpressionProgram>,
     kernels: Arc<K>,
-    functions: Arc<dyn ScalarFunctionProvider>,
+    functions: Arc<FunctionRegistry>,
     next: Box<dyn PipelineNode>,
     metrics: ExecutionMetrics,
 }
@@ -52,7 +51,7 @@ where
     pub(crate) fn new(
         program: Arc<ExpressionProgram>,
         kernels: Arc<K>,
-        functions: Arc<dyn ScalarFunctionProvider>,
+        functions: Arc<FunctionRegistry>,
         next: Box<dyn PipelineNode>,
     ) -> Self {
         Self { program, kernels, functions, next, metrics: ExecutionMetrics::default() }

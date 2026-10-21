@@ -11,6 +11,19 @@ impl AggregateSink {
 
     /// An accumulator that charges owned group/index state to `tracker`.
     pub fn with_memory_tracker(plan: AggregatePlan, tracker: QueryMemoryTracker) -> Result<Self> {
+        Self::with_registry_and_memory_tracker(
+            plan,
+            tracker,
+            Arc::new(FunctionRegistry::with_builtins()),
+        )
+    }
+
+    /// Creates an aggregate sink using the query's shared function registry.
+    pub fn with_registry_and_memory_tracker(
+        plan: AggregatePlan,
+        tracker: QueryMemoryTracker,
+        registry: Arc<FunctionRegistry>,
+    ) -> Result<Self> {
         let expected = plan.groups as usize + plan.aggs.len();
         if plan.aggregate_input_types.len() != plan.aggs.len() {
             return Err(VeinError::internal(format!(
@@ -63,15 +76,7 @@ impl AggregateSink {
                 grouping_sets_by_column[column as usize].push(set_id);
             }
         }
-        let aggregate_states = plan
-            .aggs
-            .iter()
-            .zip(plan.aggregate_input_types.iter())
-            .zip(plan.types.iter().skip(groups))
-            .map(|((op, input_type), result_type)| {
-                AggregateStateColumn::new(*op, input_type, result_type)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let aggregate_states = create_aggregate_states(&plan, &registry)?;
         let spill_schema = AggregateSpillSchema::try_new(
             plan.types[..groups].to_vec(),
             grouping_sets
@@ -118,6 +123,7 @@ impl AggregateSink {
             group_ids_by_set,
             groups: Vec::new(),
             aggregate_states,
+            registry,
             memory,
             tracker,
             spill_schema,
@@ -127,4 +133,22 @@ impl AggregateSink {
         sink.initialize_distinct_collectors()?;
         Ok(sink)
     }
+}
+
+pub(super) fn create_aggregate_states(
+    plan: &AggregatePlan,
+    registry: &FunctionRegistry,
+) -> Result<Vec<Box<dyn AggregateAccumulator>>> {
+    plan.aggs
+        .iter()
+        .zip(&plan.aggregate_input_types)
+        .zip(plan.types.iter().skip(plan.groups as usize))
+        .map(|((operation, input_type), output_type)| {
+            registry.create_aggregate_accumulator(
+                operation.name(),
+                &[input_type.to_arrow()],
+                &output_type.to_arrow(),
+            )
+        })
+        .collect()
 }

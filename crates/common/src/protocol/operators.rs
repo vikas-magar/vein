@@ -48,21 +48,5 @@ pub enum JoinKind {
     Cross,
 }
 
-/// Aggregate reduction selected by binding and carried in a physical plan.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum AggOpCode {
-    /// Count non-null input values.
-    Count,
-    /// Count distinct input values.
-    CountDistinct,
-    /// Sum input values.
-    Sum,
-    /// Find the minimum input value.
-    Min,
-    /// Find the maximum input value.
-    Max,
-    /// Compute the average input value.
-    Avg,
-    /// Enforce scalar-subquery cardinality and return its only value.
-    SingleValue,
-}
+/// Aggregate identity registered by the shared function catalog.
+pub use functions::AggregateOperation as AggOpCode;

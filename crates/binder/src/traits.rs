@@ -1,61 +1,8 @@
 use async_trait::async_trait;
 use error::Result;
+pub use functions::{FunctionCatalog as FunctionRegistry, FunctionKind, FunctionSignature, RuntimeKind};
 use parser::ast::query::QueryNode;
-use plan::{CatalogRevision, CatalogProvider, LogicalPlan, VeinDataType, Volatility};
-
-/// Supported runtimes for User-Defined Functions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeKind {
-    /// WebAssembly runtime (Safe, fast user-space logic)
-    Wasm,
-    /// eBPF runtime (Ultra-fast kernel-space extraction)
-    Ebpf,
-    /// Python runtime (Legacy data-science support)
-    Python,
-}
-
-/// The kind of function being resolved.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FunctionKind {
-    /// Standard SQL scalar function
-    Scalar,
-    /// Temporal date/time part extractor with a polymorphic temporal argument.
-    TemporalExtract,
-    /// Temporal shift lowered to the existing interval arithmetic expression.
-    TemporalShift,
-    /// Temporal truncation with a compile-time-selected field.
-    TemporalTruncate,
-    /// Standard SQL aggregate function
-    Aggregate,
-    /// First-Class AI Operator (requires cost estimation)
-    AiOperator,
-    /// Custom User Defined Function targeting a specific runtime
-    UserDefined(RuntimeKind),
-}
-
-/// Represents a resolved function signature from the registry.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FunctionSignature {
-    /// The return type of the function
-    pub return_type: VeinDataType,
-    /// The volatility of the function
-    pub volatility: Volatility,
-    /// The expected argument types
-    pub arg_types: Vec<VeinDataType>,
-    /// Minimum accepted argument count; `arg_types` defines the maximum.
-    /// Optional parameters are restricted to the trailing argument positions.
-    pub min_arg_count: usize,
-    /// The execution kind and runtime of the function
-    pub kind: FunctionKind,
-    /// A reference string/path to the compiled bytecode (if it's a UDF)
-    pub bytecode_ref: Option<String>,
-}
-
-/// Registry for resolving scalar, window, and aggregate functions.
-pub trait FunctionRegistry: Send + Sync {
-    /// Resolves any function (UDF, AI, Scalar) by name.
-    fn resolve(&self, name: &str) -> Result<FunctionSignature>;
-}
+use plan::{CatalogRevision, CatalogProvider, LogicalPlan};
 
 /// A logical plan together with the catalog revision used to bind it.
 #[derive(Debug)]

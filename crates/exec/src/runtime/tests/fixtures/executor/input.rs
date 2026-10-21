@@ -54,7 +54,7 @@ impl MemoryFeedBuilder {
     pub(in crate::runtime::tests) fn with_nullable_values(values: Vec<Option<i64>>) -> Self {
         Self {
             inner: crate::factory::DefaultExecutorBuilder::new(Arc::new(
-                crate::udf::FunctionRegistry::new(),
+                functions::FunctionRegistry::new(),
             )),
             values,
         }

@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Decimal128Array, Decimal256Array, DictionaryArray, Float16Array,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
-    UInt16Array, UInt32Array, UInt64Array, UInt8Array, new_null_array,
+    Array, ArrayRef, Date32Array, Decimal128Array, Decimal256Array, DictionaryArray, Int16Array,
+    Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow::datatypes::{Int32Type, i256};
 use hashbrown::DefaultHashBuilder;
@@ -28,8 +28,6 @@ use hashbrown::DefaultHashBuilder;
 mod group_index;
 mod group_key;
 mod intermediate;
-mod numeric;
-mod state;
 mod spill;
 mod metrics;
 mod init;
@@ -42,15 +40,9 @@ mod output_view;
 mod pipeline;
 mod sink_spill;
 mod spill_finish;
-pub use pipeline::{shared, shared_with_memory_tracker};
-use intermediate::{
-    AggregateGroupKeyRef, AggregateIntermediateGroup, AggregateIntermediateState, NumericPartial,
-};
+pub use pipeline::{shared, shared_with_memory_tracker, shared_with_registry_and_memory_tracker};
+use intermediate::{AggregateGroupKeyRef, AggregateIntermediateGroup};
 use input_batch::AggregateBatch;
-use numeric::{
-    AggregateInput, GroupRows, NumericAccumulator, average_values, numeric_values,
-    update_numeric_states,
-};
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
 use crate::spill::SpillRun;
 use crate::pipeline::{DataChunkView, PipelineNode};
@@ -60,10 +52,10 @@ use common::protocol::{AggOpCode, AggregatePlan};
 use error::VeinError;
 use group_index::{GroupIndex, GroupIndexEntry, ProbeResolution};
 use group_key::{key_column, GroupKeyColumn};
-use state::AggregateStateColumn;
 use spill::AggregateSpillSchema;
 pub(crate) use metrics::AggregateMetrics;
 use types::VeinDataType;
+use functions::{AggregateAccumulator, FunctionRegistry};
 
 type GroupHasher = <DefaultHashBuilder as BuildHasher>::Hasher;
 
@@ -148,7 +140,8 @@ pub struct AggregateSink {
     /// Reusable group IDs for each grouping set in the current input batch.
     group_ids_by_set: Vec<Vec<usize>>,
     groups: Vec<Group>,
-    aggregate_states: Vec<AggregateStateColumn>,
+    aggregate_states: Vec<Box<dyn AggregateAccumulator>>,
+    registry: Arc<FunctionRegistry>,
     memory: MemoryReservation,
     tracker: QueryMemoryTracker,
     spill_schema: AggregateSpillSchema,

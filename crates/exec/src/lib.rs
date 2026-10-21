@@ -8,9 +8,6 @@
 /// Streaming pipeline abstractions and the canonical reference-backed batch view.
 pub mod pipeline;
 
-/// User-Defined Function (UDF) extensibility and registry.
-pub mod udf;
-
 /// Operators for physical execution.
 pub mod operators;
 /// Direct typed expression evaluation over reference-backed pipeline views.

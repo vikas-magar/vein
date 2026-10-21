@@ -19,7 +19,7 @@ use types::{ResolvedColumnRef, VeinSchema};
 
 use crate::expression::eval::{ExpressionEvaluator, ExpressionKernelProvider};
 use crate::runtime::filter::RuntimeFilterSet;
-use crate::udf::FunctionRegistry;
+use functions::FunctionRegistry;
 
 use super::super::metrics::ScanPredicateMetrics;
 use super::super::projection::root_indices;

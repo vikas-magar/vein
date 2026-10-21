@@ -8,14 +8,11 @@ pub mod constant;
 pub mod logic;
 mod mapped_kernel;
 mod mapped_predicate;
-pub mod vector_dist;
 
 pub(crate) use conditional::{eval_case_value, eval_in_list_value};
 pub(crate) use mapped_kernel::{eval_mapped_binary_value, eval_mapped_unary_value};
 pub(crate) use mapped_predicate::{eval_mapped_boolean_binary, eval_mapped_unary_predicate};
 pub(crate) use logic::{eval_and_datum, eval_or_datum};
-pub(crate) use vector_dist::eval_cosine_distance_values;
-
 pub use arithmetic::{eval_add, eval_div, eval_mod, eval_mul, eval_neg, eval_sub};
 pub use cast::eval_cast;
 pub use comparison::{

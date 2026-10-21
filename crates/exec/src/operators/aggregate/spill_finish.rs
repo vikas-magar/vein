@@ -4,6 +4,7 @@ impl AggregateSink {
     pub(super) fn finish_spill_partition_view(
         plan: &AggregatePlan,
         tracker: &QueryMemoryTracker,
+        registry: &Arc<FunctionRegistry>,
         schema: &AggregateSpillSchema,
         runs: Vec<SpillRun>,
         bit: u32,
@@ -15,7 +16,11 @@ impl AggregateSink {
         // Planner estimates describe the original full input and must not
         // preallocate a partition's hash table beyond its actual memory budget.
         partition_plan.estimated_groups = None;
-        let mut sink = AggregateSink::with_memory_tracker(partition_plan, tracker.clone())?;
+        let mut sink = AggregateSink::with_registry_and_memory_tracker(
+            partition_plan,
+            tracker.clone(),
+            Arc::clone(registry),
+        )?;
         let merge_result = (|| {
             for run in &runs {
                 tracker.check_cancelled()?;
@@ -55,6 +60,7 @@ impl AggregateSink {
                     Self::finish_spill_partition_view(
                         plan,
                         tracker,
+                        registry,
                         schema,
                         vec![child],
                         bit + 1,
@@ -98,6 +104,6 @@ impl AggregateSink {
             return key_column(&keys, data_type);
         }
         let offset = column - groups;
-        self.aggregate_states[offset].to_array_range(self.plan.aggs[offset], data_type, range)
+        self.aggregate_states[offset].finalize(range)
     }
 }

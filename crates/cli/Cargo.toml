@@ -11,6 +11,7 @@ error = { path = "../error" }
 binder = { path = "../binder" }
 plan = { path = "../plan" }
 physical = { path = "../physical" }
+functions = { path = "../functions" }
 optimizer = { path = "../optimizer" }
 parser = { path = "../parser" }
 async-trait.workspace = true

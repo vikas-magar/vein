@@ -3,8 +3,8 @@ use common::protocol::{ExprKind, PhysicalExpr};
 use error::VeinError;
 
 use crate::expression::kernels as ops;
-use crate::expression::value::ExpressionValue;
-use crate::udf::FunctionInput;
+use crate::expression::value::{ExpressionFunctionInputSource, ExpressionValue};
+use functions::FunctionInput;
 
 use super::ExpressionEvaluationContext;
 
@@ -70,10 +70,14 @@ pub(super) fn evaluate_call(
     let values = args.iter().map(|argument| context.evaluate(argument))
         .collect::<Result<Vec<_>>>()?;
     let rows = context.input().num_rows();
-    let arguments = values.iter().map(|value| FunctionInput::new(value, rows))
+    let sources = values.iter().map(ExpressionFunctionInputSource::new).collect::<Vec<_>>();
+    let arguments = sources.iter().map(|source| FunctionInput::new(source, rows))
         .collect::<Vec<_>>();
-    Ok(context
-        .functions()
-        .invoke(name, &arguments, rows)?
-        .into_expression_value())
+    let output = context.functions().invoke(
+        name,
+        &arguments,
+        rows,
+        &expression.return_type.to_arrow(),
+    )?;
+    crate::expression::value::into_expression_value(output, &values)
 }

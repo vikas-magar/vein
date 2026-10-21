@@ -30,8 +30,11 @@ impl AggregateSink {
                     aggregate_input_types: Vec::new(),
                     types,
                 };
-                let mut sink =
-                    Self::with_memory_tracker(collector_plan, self.tracker.clone())?;
+                let mut sink = Self::with_registry_and_memory_tracker(
+                    collector_plan,
+                    self.tracker.clone(),
+                    Arc::clone(&self.registry),
+                )?;
                 sink.hash_builder = self.hash_builder.clone();
                 collectors.push(DistinctCollector {
                     aggregate_index,

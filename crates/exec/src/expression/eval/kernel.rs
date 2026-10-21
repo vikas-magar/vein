@@ -1,10 +1,9 @@
 use common::Result;
 use common::protocol::{ExprKind, PhysicalExpr};
+use functions::FunctionRegistry;
 
 use crate::expression::value::ExpressionValue;
 use crate::pipeline::DataChunkView;
-
-use super::functions::ScalarFunctionProvider;
 
 /// Identifies a node in the core typed-expression protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,8 +48,8 @@ impl ExpressionNodeKind {
 pub trait ExpressionEvaluationContext {
     /// Returns the active input view.
     fn input(&self) -> &std::sync::Arc<DataChunkView>;
-    /// Returns the pluggable scalar-function provider.
-    fn functions(&self) -> &dyn ScalarFunctionProvider;
+    /// Returns the shared registry used to dispatch registered scalar functions.
+    fn functions(&self) -> &FunctionRegistry;
     /// Recursively evaluates a child expression with the same providers.
     fn evaluate(&self, expression: &PhysicalExpr) -> Result<ExpressionValue>;
 }
@@ -89,8 +88,8 @@ impl<F> ExpressionKernelFn<F> {
 impl<F> ExpressionKernel for ExpressionKernelFn<F>
 where
     F: Fn(&PhysicalExpr, &dyn ExpressionEvaluationContext) -> Result<ExpressionValue>
-        + Send
-        + Sync,
+    + Send
+    + Sync,
 {
     fn kind(&self) -> ExpressionNodeKind {
         self.kind

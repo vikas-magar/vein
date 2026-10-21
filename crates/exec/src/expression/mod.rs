@@ -11,6 +11,5 @@ pub mod value;
 pub use eval::{
     ExpressionEvaluationContext, ExpressionEvaluator, ExpressionKernel, ExpressionKernelFn,
     ExpressionKernelProvider, ExpressionKernelRegistry, ExpressionNodeKind,
-    ScalarFunctionProvider,
 };
 pub use value::{ExpressionDatum, ExpressionValue, SegmentedArray, ViewColumnValue};

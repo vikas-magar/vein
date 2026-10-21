@@ -1,7 +1,6 @@
 mod binary;
 mod complex;
 mod builtin;
-mod functions;
 mod kernel;
 mod kernel_registry;
 mod predicate;
@@ -12,7 +11,6 @@ pub use kernel::{
     ExpressionKernelProvider, ExpressionNodeKind,
 };
 pub use kernel_registry::ExpressionKernelRegistry;
-pub use functions::ScalarFunctionProvider;
 
 use std::sync::Arc;
 
@@ -20,6 +18,7 @@ use arrow::array::BooleanArray;
 use common::Result;
 use common::protocol::PhysicalExpr;
 use error::VeinError;
+use functions::FunctionRegistry;
 
 use crate::expression::value::ExpressionValue;
 use crate::pipeline::DataChunkView;
@@ -30,15 +29,15 @@ where
     K: ExpressionKernelProvider,
 {
     kernels: &'a K,
-    functions: &'a dyn ScalarFunctionProvider,
+    functions: &'a FunctionRegistry,
 }
 
 impl<'a, K: ?Sized> ExpressionEvaluator<'a, K>
 where
     K: ExpressionKernelProvider,
 {
-    /// Creates an evaluator over the supplied kernel and function providers.
-    pub fn new(kernels: &'a K, functions: &'a dyn ScalarFunctionProvider) -> Self {
+    /// Creates an evaluator over the supplied kernels and shared function registry.
+    pub fn new(kernels: &'a K, functions: &'a FunctionRegistry) -> Self {
         Self { kernels, functions }
     }
 
@@ -69,7 +68,7 @@ where
 {
     input: &'a Arc<DataChunkView>,
     kernels: &'a K,
-    functions: &'a dyn ScalarFunctionProvider,
+    functions: &'a FunctionRegistry,
 }
 
 impl<K: ?Sized> ExpressionEvaluationContext for KernelContext<'_, K>
@@ -78,7 +77,7 @@ where
 {
     fn input(&self) -> &Arc<DataChunkView> { self.input }
 
-    fn functions(&self) -> &dyn ScalarFunctionProvider { self.functions }
+    fn functions(&self) -> &FunctionRegistry { self.functions }
 
     fn evaluate(&self, expression: &PhysicalExpr) -> Result<ExpressionValue> {
         evaluate_inner(expression, self.input, self.kernels, self.functions)
@@ -89,7 +88,7 @@ fn evaluate_inner<K: ?Sized>(
     expression: &PhysicalExpr,
     input: &Arc<DataChunkView>,
     kernels: &K,
-    functions: &dyn ScalarFunctionProvider,
+    functions: &FunctionRegistry,
 ) -> Result<ExpressionValue>
 where
     K: ExpressionKernelProvider,

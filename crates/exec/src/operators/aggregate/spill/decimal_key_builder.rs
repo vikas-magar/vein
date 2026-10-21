@@ -7,7 +7,7 @@ use arrow::datatypes::DataType;
 use common::Result;
 use error::VeinError;
 
-use super::SpillKeyBuilder;
+use super::keys::SpillKeyBuilder;
 
 macro_rules! decimal_key_builder {
     ($builder:ident, $function:ident, $array:ty, $native:ty, $data_type:ident) => {

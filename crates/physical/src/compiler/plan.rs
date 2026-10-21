@@ -1163,29 +1163,7 @@ fn grouping_layout(
 /// Refusing an unknown name here is what keeps the executor from having to
 /// interpret a function it was never told how to fold.
 fn agg_op(name: &str, distinct: bool) -> Result<AggOpCode> {
-    if distinct {
-        if name.eq_ignore_ascii_case("COUNT") {
-            return Ok(AggOpCode::CountDistinct);
-        }
-        return Err(VeinError::unsupported(
-            format!("DISTINCT is currently supported only for COUNT, not {name}"),
-            None,
-        ));
-    }
-    Ok(match name.to_ascii_uppercase().as_str() {
-        "COUNT" => AggOpCode::Count,
-        "SUM" => AggOpCode::Sum,
-        "MIN" => AggOpCode::Min,
-        "MAX" => AggOpCode::Max,
-        "AVG" => AggOpCode::Avg,
-        "SINGLE_VALUE" => AggOpCode::SingleValue,
-        other => {
-            return Err(VeinError::unsupported(
-                format!("aggregate {other} is not implemented; use a supported aggregate function"),
-                None,
-            ));
-        }
-    })
+    functions::aggregate_operation(name, distinct)
 }
 
 /// Returns the single input argument for an aggregate expression.

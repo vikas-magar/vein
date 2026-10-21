@@ -3,10 +3,9 @@ use std::sync::Arc;
 use common::Result;
 use common::arrow::SelectionVector;
 use common::protocol::PhysicalExpr;
+use functions::FunctionRegistry;
 
-use crate::expression::eval::{
-    ExpressionEvaluator, ExpressionKernelProvider, ScalarFunctionProvider,
-};
+use crate::expression::eval::{ExpressionEvaluator, ExpressionKernelProvider};
 use crate::expression::value::ExpressionValue;
 use crate::pipeline::view::DerivedColumnBuilder;
 use crate::pipeline::{DataChunkView, ViewColumn};
@@ -15,7 +14,7 @@ pub(super) fn apply<K>(
     input: &Arc<DataChunkView>,
     expressions: &[PhysicalExpr],
     kernels: &K,
-    functions: &dyn ScalarFunctionProvider,
+    functions: &FunctionRegistry,
 ) -> Result<DataChunkView>
 where
     K: ExpressionKernelProvider + ?Sized,

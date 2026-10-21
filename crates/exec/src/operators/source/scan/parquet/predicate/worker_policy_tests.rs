@@ -10,7 +10,7 @@ use types::{ColumnId, LogicalLiteral, ResolvedColumn, VeinDataType, VeinSchema};
 use crate::expression::eval::{ExpressionKernelProvider, ExpressionKernelRegistry};
 use crate::operators::source::scan::parquet::metrics::ScanPredicateMetrics;
 use crate::runtime::filter::RuntimeFilterSet;
-use crate::udf::FunctionRegistry;
+use functions::FunctionRegistry;
 
 use super::super::adaptive_order::AdaptiveFilterOrder;
 use super::{ScanPredicateContext, ScanPredicatePipeline, build_scan_predicates};

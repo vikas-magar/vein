@@ -27,7 +27,7 @@ fn col(id: usize) -> LogicalExpr {
 #[test]
 fn lifts_and_replaces() {
     let catalog = crate::testing::TestCatalog::default();
-    let registry = crate::BuiltinFunctionRegistry::new();
+    let registry = functions::FunctionRegistry::with_builtins();
     let mut ctx = crate::context::BinderContext::new(&catalog, &registry);
     let mut scopes = ScopeStack::new();
     let items = vec![(call(), Some("total".to_string()))];
@@ -44,7 +44,7 @@ fn lifts_and_replaces() {
 #[test]
 fn keeps_plain_items_untouched() {
     let catalog = crate::testing::TestCatalog::default();
-    let registry = crate::BuiltinFunctionRegistry::new();
+    let registry = functions::FunctionRegistry::with_builtins();
     let mut ctx = crate::context::BinderContext::new(&catalog, &registry);
     let mut scopes = ScopeStack::new();
     let items = vec![(col(7), None), (call(), None), (col(8), None)];

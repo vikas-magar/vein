@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::pipeline::{PipelineNode, Source};
 use crate::expression::eval::ExpressionKernelProvider;
 use crate::runtime::filter::RuntimeFilterSet;
-use crate::udf::FunctionRegistry;
+use functions::FunctionRegistry;
 use catalog::MetadataStore;
 use common::protocol::FileFormat;
 use common::protocol::{RuntimeStatisticsScan, ScanPredicate};

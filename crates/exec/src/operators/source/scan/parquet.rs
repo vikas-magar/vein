@@ -1,7 +1,7 @@
 use crate::pipeline::PipelineNode;
 use crate::expression::eval::ExpressionKernelProvider;
 use crate::runtime::filter::RuntimeFilterSet;
-use crate::udf::FunctionRegistry;
+use functions::FunctionRegistry;
 use common::Result;
 use common::protocol::RuntimeStatisticsScan;
 use common::protocol::ScanPredicate;

@@ -13,7 +13,7 @@ use crate::expression::eval::{ExpressionKernelProvider, ExpressionKernelRegistry
 use crate::operators::source::scan::parquet::metrics::ScanPredicateMetrics;
 use crate::pipeline::DataChunkView;
 use crate::runtime::filter::{RuntimeFilter, RuntimeFilterSet};
-use crate::udf::FunctionRegistry;
+use functions::FunctionRegistry;
 
 use super::{ScanPredicateContext, build_scan_predicates};
 

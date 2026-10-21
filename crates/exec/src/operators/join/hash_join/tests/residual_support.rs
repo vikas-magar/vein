@@ -4,10 +4,10 @@ use common::protocol::{BinaryExprOp, ExprKind, ExpressionProgram, ExpressionStep
 use types::VeinDataType;
 
 use crate::expression::eval::{
-    ExpressionKernelProvider, ExpressionKernelRegistry, ScalarFunctionProvider,
+    ExpressionKernelProvider, ExpressionKernelRegistry,
 };
 use crate::expression::executor::ExpressionExecutor;
-use crate::udf::FunctionRegistry;
+use functions::FunctionRegistry;
 
 use super::*;
 
@@ -45,6 +45,6 @@ pub(super) fn expression_filter(
     });
     let kernels: Arc<dyn ExpressionKernelProvider> =
         Arc::new(ExpressionKernelRegistry::with_builtins());
-    let functions: Arc<dyn ScalarFunctionProvider> = Arc::new(FunctionRegistry::new());
+    let functions = Arc::new(FunctionRegistry::new());
     ExpressionExecutor::new(program, kernels, functions, Box::new(next))
 }

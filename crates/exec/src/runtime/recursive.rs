@@ -514,9 +514,12 @@ impl DefaultTaskExecutor {
                             } else {
                                 "aggregate"
                             };
-                        let (accumulator, handle) = aggregate::shared_with_memory_tracker(
+                        let registry = self.builder.function_registry()
+                            .unwrap_or_else(|| Arc::new(functions::FunctionRegistry::with_builtins()));
+                        let (accumulator, handle) = aggregate::shared_with_registry_and_memory_tracker(
                             plan.clone(),
                             operator_memory,
+                            registry,
                         )?;
                         let bytes = self
                             .execute_input(

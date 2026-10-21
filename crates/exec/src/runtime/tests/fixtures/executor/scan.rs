@@ -13,7 +13,7 @@ impl MultiFileFeedBuilder {
     pub(in crate::runtime::tests) fn new() -> Self {
         Self {
             inner: crate::factory::DefaultExecutorBuilder::new(Arc::new(
-                crate::udf::FunctionRegistry::new(),
+                functions::FunctionRegistry::new(),
             )),
             source_arrays: Arc::new(Mutex::new(Vec::new())),
             active_sources: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

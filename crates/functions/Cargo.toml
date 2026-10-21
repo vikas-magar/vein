@@ -1,0 +1,13 @@
+[package]
+name = "functions"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+missing_docs = "deny"
+
+[dependencies]
+arrow = { workspace = true }
+error = { path = "../error" }
+types = { path = "../types" }
+serde = { workspace = true }

@@ -51,7 +51,11 @@ impl PipelineNode for AggregateHandle {
             .0
             .lock()
             .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
-        let mut local = AggregateSink::with_memory_tracker(sink.plan.clone(), sink.tracker.clone())?;
+        let mut local = AggregateSink::with_registry_and_memory_tracker(
+            sink.plan.clone(),
+            sink.tracker.clone(),
+            Arc::clone(&sink.registry),
+        )?;
         local.inherit_hash_builders(&sink)?;
         Ok(Some(Box::new(LocalAggregateHandle(local))))
     }
@@ -70,7 +74,22 @@ pub fn shared_with_memory_tracker(
     plan: AggregatePlan,
     tracker: QueryMemoryTracker,
 ) -> Result<SharedAggregate> {
-    let sink = Arc::new(Mutex::new(AggregateSink::with_memory_tracker(plan, tracker)?));
+    shared_with_registry_and_memory_tracker(
+        plan,
+        tracker,
+        Arc::new(FunctionRegistry::with_builtins()),
+    )
+}
+
+/// Builds a budgeted aggregate using the same registry as expression execution.
+pub fn shared_with_registry_and_memory_tracker(
+    plan: AggregatePlan,
+    tracker: QueryMemoryTracker,
+    registry: Arc<FunctionRegistry>,
+) -> Result<SharedAggregate> {
+    let sink = Arc::new(Mutex::new(AggregateSink::with_registry_and_memory_tracker(
+        plan, tracker, registry,
+    )?));
     let handle: AggregatePipelineNode = Box::new(AggregateHandle(Arc::clone(&sink)));
     Ok((sink, handle))
 }

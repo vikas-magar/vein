@@ -8,27 +8,27 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::memory::ExecutionResourceLimits;
 use crate::expression::executor::ExpressionExecutor;
-use crate::expression::{ExpressionKernelProvider, ExpressionKernelRegistry, ScalarFunctionProvider};
+use crate::expression::{ExpressionKernelProvider, ExpressionKernelRegistry};
+use crate::memory::ExecutionResourceLimits;
 use crate::operators::join::JoinBloomFilterFactory;
 use crate::operators::sink::{CollectSink, DiscardSink, WriteSink, WriteStorage};
 use crate::operators::source::ScanSource;
 use crate::operators::source::scan::{PARQUET_FOOTER, ScanFile, ScanSourceConfig};
 use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
-use crate::runtime::{ExecutorBuilder, split_scan_by_file};
 use crate::runtime::filter::{
     ConservativeRuntimeFilterPolicy, RuntimeFilterDecisionPolicy, RuntimeFilterFactory,
     RuntimeFilterSet,
 };
+use crate::runtime::{ExecutorBuilder, split_scan_by_file};
 use crate::spill::{LocalSpillStorageFactory, SpillStorageFactory};
-use crate::udf::FunctionRegistry;
 use catalog::{MetadataKey, MetadataStore};
 use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, ExpressionProgram, FileFormat, FileScanTask};
 use common::statistics::{QueryStatisticsContext, RuntimeStatisticsStore};
 use error::VeinError;
+use functions::FunctionRegistry;
 use opendal::Operator;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::file::metadata::ParquetMetaData;
@@ -55,7 +55,7 @@ pub struct TaskExecutorBuilder {
 impl TaskExecutorBuilder {
     /// Builds a task executor with the default stages and expression kernels.
     pub fn new() -> Self {
-        let registry = Arc::new(FunctionRegistry::new());
+        let registry = Arc::new(FunctionRegistry::with_builtins());
         let expression_kernels: Arc<dyn ExpressionKernelProvider> =
             Arc::new(ExpressionKernelRegistry::with_builtins());
         let builder = DefaultExecutorBuilder::new(registry.clone())
@@ -124,8 +124,8 @@ impl TaskExecutorBuilder {
         self
     }
 
-    /// Overrides the UDF function registry used by expression calls.
-    pub fn with_registry(mut self, registry: Arc<FunctionRegistry>) -> Self {
+    /// Sets the registry used by this executor for registered functions.
+    pub fn with_function_registry(mut self, registry: Arc<FunctionRegistry>) -> Self {
         self.registry = registry;
         self.rebuild_default();
         self
@@ -139,10 +139,7 @@ impl TaskExecutorBuilder {
     }
 
     /// Injects a composed expression-kernel provider for all typed expression stages.
-    pub fn with_expression_kernels(
-        mut self,
-        kernels: Arc<dyn ExpressionKernelProvider>,
-    ) -> Self {
+    pub fn with_expression_kernels(mut self, kernels: Arc<dyn ExpressionKernelProvider>) -> Self {
         self.expression_kernels = kernels;
         self.rebuild_default();
         self
@@ -174,7 +171,7 @@ impl TaskExecutorBuilder {
             self.builder,
             self.resource_limits,
         )
-            .with_spill_storage_factory(self.spill_storage_factory)
+        .with_spill_storage_factory(self.spill_storage_factory)
     }
 }
 
@@ -226,10 +223,7 @@ impl DefaultExecutorBuilder {
     }
 
     /// Injects the kernel provider used to dispatch typed expression nodes.
-    pub fn with_expression_kernels(
-        mut self,
-        kernels: Arc<dyn ExpressionKernelProvider>,
-    ) -> Self {
+    pub fn with_expression_kernels(mut self, kernels: Arc<dyn ExpressionKernelProvider>) -> Self {
         self.expression_kernels = kernels;
         self
     }
@@ -350,6 +344,10 @@ impl DefaultExecutorBuilder {
 
 #[async_trait::async_trait]
 impl ExecutorBuilder for DefaultExecutorBuilder {
+    fn function_registry(&self) -> Option<Arc<FunctionRegistry>> {
+        Some(Arc::clone(&self.registry))
+    }
+
     fn partition_scan_source(
         &self,
         source: &DataSource,
@@ -432,11 +430,10 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         program: &Arc<ExpressionProgram>,
         next: Box<dyn PipelineNode>,
     ) -> Result<Box<dyn Transform>> {
-        let functions: Arc<dyn ScalarFunctionProvider> = self.registry.clone();
         Ok(Box::new(ExpressionExecutor::new(
             Arc::clone(program),
             Arc::clone(&self.expression_kernels),
-            functions,
+            Arc::clone(&self.registry),
             next,
         )))
     }
@@ -483,10 +480,10 @@ fn partition_source(
 ) -> Result<Vec<DataSource>> {
     let mut partitions = match source {
         DataSource::File(scan)
-        if scan.format == FileFormat::Parquet && scan.scan_unit_range.is_none() =>
-            {
-                partition_parquet_scan(scan, metadata_store, max_parallelism, runtime_filters)
-            }
+            if scan.format == FileFormat::Parquet && scan.scan_unit_range.is_none() =>
+        {
+            partition_parquet_scan(scan, metadata_store, max_parallelism, runtime_filters)
+        }
         DataSource::File(scan) if scan.scan_unit_range.is_some() => {
             if scan.files.len() != 1 {
                 return Err(VeinError::planning(
@@ -572,8 +569,8 @@ fn partition_parquet_scan(
                         .filter(|column| {
                             scan.projected.fields.is_empty()
                                 || scan.projected.fields.iter().any(|field| {
-                                column.column_path().parts().first() == Some(&field.name)
-                            })
+                                    column.column_path().parts().first() == Some(&field.name)
+                                })
                         })
                         .fold(0_u64, |sum, column| {
                             sum.saturating_add(column.compressed_size().max(1) as u64)
@@ -688,7 +685,7 @@ mod tests {
                 Arc::clone(&schema),
                 vec![Arc::new(Int64Array::from(vec![first, first + 1]))],
             )
-                .expect("valid row-group batch");
+            .expect("valid row-group batch");
             writer.write(&batch).expect("write row group");
             writer.flush().expect("finish row group");
         }
@@ -697,7 +694,7 @@ mod tests {
         let reader = ParquetRecordBatchReaderBuilder::try_new(
             std::fs::File::open(path).expect("open Parquet footer"),
         )
-            .expect("read Parquet footer");
+        .expect("read Parquet footer");
         reader.metadata().as_ref().clone()
     }
 

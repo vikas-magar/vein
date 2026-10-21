@@ -12,7 +12,7 @@ use types::{LogicalLiteral, VeinDataType};
 use crate::expression::eval::ExpressionKernelRegistry;
 use crate::expression::executor::ExpressionExecutor;
 use crate::pipeline::{DataChunkView, PipelineNode};
-use crate::udf::FunctionRegistry;
+use functions::FunctionRegistry;
 
 #[derive(Clone)]
 struct Capture(Arc<Mutex<Vec<DataChunkView>>>);

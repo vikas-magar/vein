@@ -38,7 +38,7 @@ impl AggregateSink {
         let key_columns = (0..distinct_position)
             .map(|column| batch.project(&[column]).and_then(GroupKeyColumn::from_view))
             .collect::<Result<Vec<_>>>()?;
-        let empty_states = self.empty_intermediate_states()?;
+        let aggregate_states = self.count_one_aggregate_states(aggregate_index)?;
 
         for row in 0..batch.num_rows() {
             if batch.is_null(distinct_position, row)? {
@@ -47,7 +47,7 @@ impl AggregateSink {
             let mut hasher = self.hash_builder.build_hasher();
             grouping_set_id.hash(&mut hasher);
             for (&parent_column, key) in parent_columns.iter().zip(&key_columns) {
-                    key.hash_row(parent_column as u32, row, &mut hasher);
+                key.hash_row(parent_column as u32, row, &mut hasher);
             }
             let hash = hasher.finish();
             let mut keys = vec![None; self.plan.groups as usize];
@@ -57,13 +57,11 @@ impl AggregateSink {
                     row,
                 )?);
             }
-            let mut aggregate_states = empty_states.clone();
-            aggregate_states[aggregate_index] = AggregateIntermediateState::Count(1);
             let group = AggregateIntermediateGroup {
                 hash,
                 grouping_set_id,
                 keys,
-                aggregate_states,
+                aggregate_states: aggregate_states.clone(),
             };
             match self.merge_spilled_group(group.clone()) {
                 Ok(()) => {}
@@ -77,16 +75,26 @@ impl AggregateSink {
         Ok(())
     }
 
-    fn empty_intermediate_states(&self) -> Result<Vec<AggregateIntermediateState>> {
+    fn count_one_aggregate_states(&self, count_index: usize) -> Result<Vec<Arc<Vec<u8>>>> {
         self.plan
             .aggs
             .iter()
             .zip(&self.plan.aggregate_input_types)
             .zip(self.plan.types.iter().skip(self.plan.groups as usize))
-            .map(|((&op, input_type), result_type)| {
-                let mut state = AggregateStateColumn::new(op, input_type, result_type)?;
-                state.push_group();
-                state.intermediate_state(0)
+            .enumerate()
+            .map(|(index, ((op, input_type), result_type))| {
+                let mut state = self.registry.create_aggregate_accumulator(
+                    op.name(),
+                    &[input_type.to_arrow()],
+                    &result_type.to_arrow(),
+                )?;
+                state.ensure_groups(1)?;
+                if index == count_index {
+                    state.update_batch(&[], &[0])?;
+                }
+                let mut payload = Vec::new();
+                state.encode_group(0, &mut payload)?;
+                Ok(Arc::new(payload))
             })
             .collect()
     }

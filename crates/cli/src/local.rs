@@ -20,7 +20,7 @@ use common::{Result, VeinError};
 use exec::operators::sink::{WriteReceipt, WriteStorage};
 use exec::pipeline::DataChunkView;
 use exec::runtime::TaskExecutor;
-use exec::udf::{FunctionRegistry, register_builtin_scalars};
+use functions::{FunctionCatalog, FunctionRegistry};
 use futures::Stream;
 use physical::PhysicalPlanner;
 use plan::{CatalogProvider, LogicalPlan, PlanTraversal};
@@ -56,22 +56,20 @@ impl LocalQueryEngine {
         let metadata_store = catalog.metadata_store();
         let statistics_provider: Arc<dyn StatisticsAnalysisProvider> = catalog.clone();
         let catalog: Arc<dyn CatalogProvider> = catalog;
-        let functions = Arc::new(binder::BuiltinFunctionRegistry::new());
-        let functions: Arc<dyn binder::FunctionRegistry> = functions;
-        let mut runtime_functions = FunctionRegistry::new();
-        register_builtin_scalars(&mut runtime_functions);
+        let functions = Arc::new(FunctionRegistry::with_builtins());
+        let function_catalog: Arc<dyn FunctionCatalog> = functions.clone();
         let storage: Arc<dyn WriteStorage> = Arc::new(ParquetStorage::new(data_root));
         let executor = Arc::new(
             exec::factory::TaskExecutorBuilder::new()
                 .with_metadata_store(metadata_store)
                 .with_runtime_statistics_store(runtime_statistics.clone())
-                .with_registry(Arc::new(runtime_functions))
+                .with_function_registry(Arc::clone(&functions))
                 .with_write_storage(Arc::clone(&storage))
                 .build(),
         );
 
         Self {
-            binder: binder::QueryBinder::new(catalog, functions),
+            binder: binder::QueryBinder::new(catalog, function_catalog),
             optimizer: Arc::new(optimizer::OptimizerPipeline::default()),
             planner: Arc::new(physical::DefaultPhysicalPlanner::new()),
             adaptive_policy: Arc::new(StatisticsCheckpointPolicy),
@@ -156,8 +154,14 @@ impl LocalQueryEngine {
 
         let plan_started = Instant::now();
         let request_id = RequestId::new();
-        let adaptive_boundary = self.adaptive_policy.choose_boundary(&optimized, Arc::clone(&statistics_context));
-        let job = self.planner.create_physical_plan_with_statistics(request_id, optimized, Arc::clone(&statistics_context))?;
+        let adaptive_boundary = self
+            .adaptive_policy
+            .choose_boundary(&optimized, Arc::clone(&statistics_context));
+        let job = self.planner.create_physical_plan_with_statistics(
+            request_id,
+            optimized,
+            Arc::clone(&statistics_context),
+        )?;
         let plan_us = plan_started.elapsed().as_micros() as u64;
 
         let task_started = Instant::now();
@@ -198,11 +202,20 @@ impl LocalQueryEngine {
             task.statistics_context = Some(Arc::clone(&statistics_context));
             tasks.push(task);
         }
-        let adaptive_scan = if is_write { None } else {
-            adaptive_boundary.and_then(|boundary| adaptive::prepare_checkpoint(
-                self.planner.as_ref(), boundary, Arc::clone(&statistics_context), request_id, query_id,
-                &tasks, &logical_plan,
-            ))
+        let adaptive_scan = if is_write {
+            None
+        } else {
+            adaptive_boundary.and_then(|boundary| {
+                adaptive::prepare_checkpoint(
+                    self.planner.as_ref(),
+                    boundary,
+                    Arc::clone(&statistics_context),
+                    request_id,
+                    query_id,
+                    &tasks,
+                    &logical_plan,
+                )
+            })
         };
         let task_build_us = task_started.elapsed().as_micros() as u64;
 
@@ -418,7 +431,6 @@ impl LocalQuery {
             }
         })
     }
-
 }
 
 fn tasks_from_job(
@@ -530,12 +542,12 @@ pub type LocalResultStream = Pin<Box<dyn Stream<Item = Result<DataChunkView>> + 
 mod tests {
     use std::fs::File;
 
-    use futures::StreamExt;
     use arrow::array::{
         Array, FixedSizeListArray, Float32Array, Float64Array, Int64Array, StringArray,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use futures::StreamExt;
     use parquet::arrow::ArrowWriter;
 
     use super::*;
@@ -827,7 +839,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["one", "two"])),
             ],
         )
-            .expect("valid left batch");
+        .expect("valid left batch");
         let left_file = File::create(left_dir.join("part.parquet")).expect("create left file");
         let mut left_writer =
             ArrowWriter::try_new(left_file, left_schema, None).expect("create left writer");
@@ -845,7 +857,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["one", "two", "three"])),
             ],
         )
-            .expect("valid right batch");
+        .expect("valid right batch");
         let right_file = File::create(right_dir.join("part.parquet")).expect("create right file");
         let mut right_writer =
             ArrowWriter::try_new(right_file, right_schema, None).expect("create right writer");
@@ -911,7 +923,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![10, 42])),
             ],
         )
-            .expect("valid batch");
+        .expect("valid batch");
         let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
         writer.write(&batch).expect("write batch");
@@ -978,7 +990,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
             ],
         )
-            .expect("valid input batch");
+        .expect("valid input batch");
         let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
         writer.write(&input).expect("write input batch");
@@ -1057,7 +1069,7 @@ mod tests {
                         Arc::new(Float32Array::from(vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0])),
                         Some(vec![true, true, false].into()),
                     )
-                        .expect("valid left vectors"),
+                    .expect("valid left vectors"),
                 ),
                 Arc::new(
                     FixedSizeListArray::try_new(
@@ -1066,11 +1078,11 @@ mod tests {
                         Arc::new(Float32Array::from(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0])),
                         None,
                     )
-                        .expect("valid right vectors"),
+                    .expect("valid right vectors"),
                 ),
             ],
         )
-            .expect("valid batch");
+        .expect("valid batch");
         let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
         writer.write(&batch).expect("write batch");
@@ -1202,7 +1214,7 @@ mod tests {
             schema.clone(),
             vec![Arc::new(Int64Array::from(vec![4, 5, 6]))],
         )
-            .expect("valid source batch");
+        .expect("valid source batch");
         let file =
             File::create(table_dir.join("part.parquet")).expect("create source Parquet file");
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("create source writer");
@@ -1269,7 +1281,7 @@ mod tests {
                 ])),
             ],
         )
-            .expect("valid external batch");
+        .expect("valid external batch");
         let file = File::create(&path).expect("create external Parquet file");
         let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
             .expect("create external Parquet writer");
@@ -1340,7 +1352,7 @@ mod tests {
                 ])),
             ],
         )
-            .expect("valid replacement batch");
+        .expect("valid replacement batch");
         let file = File::create(&path).expect("recreate external Parquet file");
         let mut writer =
             ArrowWriter::try_new(file, schema, None).expect("create replacement Parquet writer");

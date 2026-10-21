@@ -10,8 +10,9 @@ use common::Result;
 
 use crate::memory::QueryMemoryTracker;
 
-use super::{AggregateGroupKeyRef, AggregateIntermediateGroup, AggregateSpillSchema};
-use super::super::intermediate::AggregateIntermediateState;
+use super::super::super::intermediate::{AggregateGroupKeyRef, AggregateIntermediateGroup};
+use super::super::AggregateSpillSchema;
+use super::super::super::intermediate::test_support::count_state;
 use types::VeinDataType;
 
 #[test]
@@ -38,7 +39,7 @@ fn spill_writer_splits_batches_by_decoded_workspace_budget() -> Result<()> {
                 hash: row as u64,
                 grouping_set_id: 0,
                 keys: vec![Some(AggregateGroupKeyRef::from_array(Arc::clone(&keys), row)?)],
-                aggregate_states: vec![AggregateIntermediateState::Count(1)],
+                aggregate_states: vec![count_state(1)?],
             })
         },
     )?;

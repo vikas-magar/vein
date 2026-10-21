@@ -12,7 +12,7 @@ use crate::expression::eval::{
 };
 use crate::expression::value::ExpressionValue;
 use crate::pipeline::DataChunkView;
-use crate::udf::FunctionRegistry;
+use functions::FunctionRegistry;
 
 fn evaluate(
     expression: &PhysicalExpr,
@@ -36,7 +36,7 @@ fn input() -> Arc<DataChunkView> {
         crate::pipeline::arrow_adapter::from_record_batch(
             RecordBatch::try_new(schema, arrays).unwrap(),
         )
-            .unwrap(),
+        .unwrap(),
     )
 }
 
@@ -90,6 +90,25 @@ fn typed_like_preserves_nulls_and_uses_arrow_vector_kernel() {
     assert_eq!(
         result.as_any().downcast_ref::<BooleanArray>().unwrap(),
         &BooleanArray::from(vec![Some(true), None, Some(true)])
+    );
+}
+
+#[test]
+fn registered_scalar_call_uses_shared_function_registry() {
+    let expression = PhysicalExpr {
+        return_type: VeinDataType::Utf8,
+        kind: ExprKind::Call {
+            name: "LOWER".to_owned(),
+            args: vec![column(1, VeinDataType::Utf8)],
+        },
+    };
+    let registry = FunctionRegistry::with_builtins();
+    let value = evaluate(&expression, &input(), &registry).unwrap();
+    let result = value.materialized_array().unwrap();
+
+    assert_eq!(
+        result.as_any().downcast_ref::<StringArray>().unwrap(),
+        &StringArray::from(vec![Some("a"), None, Some("c")])
     );
 }
 
