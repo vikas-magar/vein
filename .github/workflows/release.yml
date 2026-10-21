@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build CLI (${{ matrix.asset }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: linux-x86_64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: macos-x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset: macos-aarch64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build --locked --release --bin cli --target "${{ matrix.target }}"
+      - name: Package release asset
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -eu
+          mkdir -p dist
+          cp "target/${TARGET}/release/cli" dist/vein
+          archive="vein-${ASSET}.tar.gz"
+          tar -C dist -czf "$archive" vein
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.asset }}
+          path: |
+            vein-${{ matrix.asset }}.tar.gz
+            vein-${{ matrix.asset }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Attach assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          --verify-tag
+          --generate-notes
+          --title "$GITHUB_REF_NAME"
+          release-assets/*.tar.gz
+          release-assets/*.sha256
