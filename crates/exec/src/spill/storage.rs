@@ -3,9 +3,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::Result;
@@ -158,14 +158,14 @@ impl Drop for LocalSpillStorage {
         };
         if let Err(error) = fs::remove_dir_all(directory)
             && error.kind() != io::ErrorKind::NotFound {
-                tracing::warn!(
+            tracing::warn!(
                     target: "vein.audit",
                     event = "query_spill_cleanup_failed",
-                    path = %directory.display(),
+                    source_id = %common::logging::LogLocation::from(directory.as_path()),
                     error = %error,
                     "failed to remove query spill directory"
                 );
-            }
+        }
     }
 }
 

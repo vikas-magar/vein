@@ -100,7 +100,7 @@ fn map_read_only(file: &File, size: u64, path: &Path) -> Option<Bytes> {
             tracing::warn!(
                 target: "vein.audit",
                 event = "parquet_mmap_unavailable",
-                path = %path.display(),
+                source_id = %common::logging::LogLocation::from(path),
                 error = %error,
                 fallback = "native_range_buffer",
                 "read-only Parquet mapping unavailable; using bounded range reads"

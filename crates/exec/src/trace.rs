@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use common::protocol::{PhysicalPlanNode, PhysicalPlanOperator};
+use common::protocol::{DataSink, PhysicalPlanNode, PhysicalPlanOperator};
 use common::statistics::{
     OperatorCounter, OperatorStatisticsHandle, OperatorStatisticsIdentity, QueryStatisticsContext,
 };
@@ -322,7 +322,7 @@ impl ExecutionTrace {
             let row_change = i128::from(output_rows) - i128::from(input_rows);
             let output_input_ratio =
                 (input_rows > 0).then_some(output_rows as f64 / input_rows as f64);
-            tracing::info!(
+            tracing::debug!(
                 target: "vein.statistics",
                 event = "physical_operator_metrics",
                 query_id = %self.query_id,
@@ -452,7 +452,7 @@ fn execution_outcome(metrics: &NodeMetrics) -> &'static str {
 
 impl Drop for ExecutionTrace {
     fn drop(&mut self) {
-        if tracing::enabled!(target: "vein.audit", tracing::Level::DEBUG) {
+        if tracing::enabled!(target: "vein.statistics", tracing::Level::DEBUG) {
             self.log_summary();
         }
     }
@@ -597,7 +597,14 @@ fn operator_config(operator: &PhysicalPlanOperator) -> String {
         PhysicalPlanOperator::Limit { spec, .. } => {
             format!("offset={}, count={}", spec.offset, spec.count)
         }
-        PhysicalPlanOperator::Sink { sink, .. } => format!("sink={sink:?}"),
+        PhysicalPlanOperator::Sink { sink, .. } => {
+            let sink = match sink.as_ref() {
+                DataSink::Client { .. } => "client",
+                DataSink::Storage(_) => "storage",
+                DataSink::Discard => "discard",
+            };
+            format!("sink={sink}")
+        }
     }
 }
 

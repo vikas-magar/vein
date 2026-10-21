@@ -64,7 +64,6 @@ impl OptimizerRule for ScanFilterPushdownRule {
                 target: "vein.optimizer",
                 event = "optimizer_scan_filter_pushed",
                 table = %table.name,
-                filter = ?predicate,
                 referenced_columns = ?referenced,
                 scan_filter_count = scan_filters.len(),
                 "optimizer_scan_filter_pushed"

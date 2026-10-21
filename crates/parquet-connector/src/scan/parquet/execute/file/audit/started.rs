@@ -12,7 +12,7 @@ pub(in crate::scan::parquet::execute::file) fn log_started(
     tracing::debug!(
         target: "vein.audit",
         event = "scan_started",
-        path = %path,
+        source_id = %common::logging::LogLocation::from(path),
         format = "parquet",
         io_backend = backend.name(),
         pushed_filter_count = pushdown.map_or(0, |predicate| predicate.predicate_count),

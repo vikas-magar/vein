@@ -124,7 +124,7 @@ pub(super) async fn prepare(
         tracing::debug!(
             target: "vein.scan_batch_size",
             event = "parquet_batch_size_selected",
-            path = %path,
+            source_id = %common::logging::LogLocation::from(path),
             batch_rows = batch_size.rows,
             source = batch_size.source.as_str(),
             assigned_row_groups = assigned_count,

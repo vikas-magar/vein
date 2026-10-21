@@ -78,7 +78,7 @@ pub(super) async fn apply(
                     tracing::debug!(
                         target: "vein.audit",
                         event = "parquet_bloom_filter_unavailable",
-                        path = %context.path,
+                        source_id = %common::logging::LogLocation::from(context.path),
                         row_group = row_group_index,
                         column = %column.name,
                         error = %error,
@@ -157,7 +157,7 @@ fn log_eligibility(
     tracing::info!(
         target: "vein.parquet_bloom",
         event = "parquet_bloom_filter_eligibility",
-        path = %path,
+        source_id = %common::logging::LogLocation::from(path),
         static_equality_columns = ?static_columns,
         runtime_equality_columns = ?runtime_columns,
         mapped_columns,

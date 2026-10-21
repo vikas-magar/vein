@@ -54,20 +54,20 @@ pub(in crate::scan::parquet::execute::file) fn log_completed(scan: CompletedScan
     let predicate_metrics = scan.predicate_metrics.snapshot();
     let adaptive_filter_snapshot = scan.adaptive_order.map(|policy| policy.snapshot());
     if let Some(snapshot) = &adaptive_filter_snapshot {
-        snapshot.log(&scan.path);
+        snapshot.log(scan.path);
     }
     if tracing::enabled!(target: "vein.audit", tracing::Level::DEBUG) {
         for (stage_index, predicate_count, input_columns, metrics) in scan.stage_metrics {
             let metrics = metrics.snapshot();
             tracing::debug!(target: "vein.audit", event = "scan_predicate_stage_completed",
-                path = %scan.path, stage_index, predicate_count, input_columns = ?input_columns,
+                source_id = %common::logging::LogLocation::from(scan.path), stage_index, predicate_count, input_columns = ?input_columns,
                 batches = metrics.batches, rows_in = metrics.rows_in, rows_kept = metrics.rows_kept,
                 eval_wall_us = metrics.eval_wall_us,
                 input_array_bytes_seen = metrics.input_array_bytes,
                 "scan predicate stage completed");
         }
         tracing::debug!(target: "vein.audit", event = "parquet_column_decode_metrics",
-            path = %scan.path, columns = ?scan.reader_metrics.column_metrics(),
+            source_id = %common::logging::LogLocation::from(scan.path), columns = ?scan.reader_metrics.column_metrics(),
             records_decoded = ?scan.reader_metrics.records_read_from_inner(),
             records_reused = ?scan.reader_metrics.records_read_from_cache(),
             timing_scope = "sum_of_leaf_reader_call_elapsed_times;decompression_is_nested",
@@ -77,7 +77,7 @@ pub(in crate::scan::parquet::execute::file) fn log_completed(scan: CompletedScan
     tracing::debug!(
         target: "vein.statistics",
         event = "scan_completed",
-        path = %scan.path,
+        source_id = %common::logging::LogLocation::from(scan.path),
         format = "parquet",
         footer_hit = scan.footer_hit,
         rows = scan.stream.total_rows,

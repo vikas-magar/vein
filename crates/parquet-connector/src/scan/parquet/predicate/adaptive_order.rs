@@ -64,7 +64,8 @@ pub struct AdaptiveFilterSnapshot {
 impl AdaptiveFilterSnapshot {
     pub fn log(&self, path: &str) {
         tracing::info!(target: "vein.parquet_adaptive_filter",
-            event = "parquet_adaptive_filter_summary", path,
+            event = "parquet_adaptive_filter_summary",
+            source_id = %common::logging::LogLocation::from(path),
             stage_count = self.stage_count, observations = self.observations,
             swap_attempts = self.swap_attempts, accepted_swaps = self.accepted_swaps,
             reverted_swaps = self.reverted_swaps, order = ?self.permutation,

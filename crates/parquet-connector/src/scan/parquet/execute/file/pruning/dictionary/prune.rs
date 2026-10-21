@@ -53,7 +53,7 @@ pub(super) fn apply(
     tracing::info!(
         target: "vein.parquet_dictionary",
         event = "parquet_dictionary_data_page_pruning",
-        path = %context.path,
+        source_id = %common::logging::LogLocation::from(context.path),
         chunks_fully_dictionary_encoded = loaded.metrics.fully_encoded_chunks,
         chunks_page_filtered = loaded.metrics.page_filtered_chunks,
         predicate_page_checks = dictionary_page_pruning.predicate_page_checks,
@@ -66,7 +66,7 @@ pub(super) fn apply(
     tracing::debug!(
         target: "vein.audit",
         event = "parquet_page_payload_pruning",
-        path = %context.path,
+        source_id = %common::logging::LogLocation::from(context.path),
         columns_with_locations = payload_metrics.columns_with_locations,
         data_pages_available = payload_metrics.data_pages_available,
         data_pages_selected = payload_metrics.data_pages_selected,
@@ -78,7 +78,7 @@ pub(super) fn apply(
     tracing::debug!(
         target: "vein.audit",
         event = "parquet_dictionary_pruning",
-        path = %context.path,
+        source_id = %common::logging::LogLocation::from(context.path),
         predicates = inputs.dictionary_predicates.len(),
         columns = inputs.dictionary_columns.len(),
         chunks_considered = loaded.metrics.chunks_considered,

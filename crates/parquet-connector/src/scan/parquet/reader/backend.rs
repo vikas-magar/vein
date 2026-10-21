@@ -89,7 +89,7 @@ impl ParquetIoBackend {
                     tracing::debug!(
                         target: "vein.audit",
                         event = "parquet_local_range_source_unavailable",
-                        path = %absolute_path.display(),
+                        source_id = %common::logging::LogLocation::from(absolute_path),
                         error = %error,
                         fallback = "storage",
                         "using the configured storage range reader"
@@ -110,7 +110,7 @@ impl ParquetIoBackend {
             event = "parquet_range_source_selected",
             configured_backend = self.name(),
             representation = source.representation(),
-            path = %relative_path,
+            source_id = %common::logging::LogLocation::from(relative_path),
             "Parquet range source selected"
         );
         Ok(source)

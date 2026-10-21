@@ -26,7 +26,7 @@ pub(in crate::scan::parquet::execute::file) fn log_ready(scan: ReadyScan<'_>) {
     tracing::info!(
         target: "vein.parquet_audit",
         event = "scan_ready",
-        path = %scan.path,
+        source_id = %common::logging::LogLocation::from(scan.path),
         format = "parquet",
         read_projection_roots = ?scan.projection.read_roots,
         output_projection_positions = ?scan.projection.output_positions,
