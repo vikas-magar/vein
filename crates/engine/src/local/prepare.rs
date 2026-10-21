@@ -7,6 +7,7 @@ use common::protocol::{DataSink, PhysicalPlanOperator};
 use common::statistics::TableStatisticsLog;
 use common::{Result, VeinError};
 use plan::LogicalPlan;
+use tracing::Instrument;
 
 use super::adaptive;
 use super::query::query_statistics_context;
@@ -15,6 +16,22 @@ use super::{LocalQuery, LocalQueryEngine};
 impl LocalQueryEngine {
     /// Parses, binds, optimizes, and plans a Pipe query for configured execution.
     pub async fn prepare(&self, query: &str) -> Result<LocalQuery> {
+        let request_id = RequestId::new();
+        let span = tracing::info_span!(
+            target: "vein.audit",
+            "query_prepare",
+            request_id = %request_id,
+        );
+        self.prepare_with_request_id(query, request_id)
+            .instrument(span)
+            .await
+    }
+
+    async fn prepare_with_request_id(
+        &self,
+        query: &str,
+        request_id: RequestId,
+    ) -> Result<LocalQuery> {
         let prepare_started = Instant::now();
 
         let parse_started = Instant::now();
@@ -66,7 +83,6 @@ impl LocalQueryEngine {
         }
 
         let plan_started = Instant::now();
-        let request_id = RequestId::new();
         let adaptive_boundary = self
             .adaptive_policy
             .choose_boundary(&optimized, Arc::clone(&statistics_context));

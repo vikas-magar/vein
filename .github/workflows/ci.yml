@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Build workspace
+        run: cargo build --workspace --locked
+
+  wasm-portable:
+    name: Build portable crates (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install WebAssembly target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Build portable crates
+        run: cargo build --locked --target wasm32-unknown-unknown -p error -p types -p parser -p functions

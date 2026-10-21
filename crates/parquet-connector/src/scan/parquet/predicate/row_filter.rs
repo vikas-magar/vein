@@ -127,13 +127,15 @@ pub fn build_scan_predicates(context: ScanPredicateContext<'_>) -> Result<ScanPr
                     }),
             ));
             tracing::debug!(target: "vein.parquet_runtime_filter",
-                event = "scan_runtime_filter_stage_bound", path = %path,
+                event = "scan_runtime_filter_stage_bound",
+                source_id = %common::logging::LogLocation::from(path),
                 filters = ?stage_filter_names, stage_index = index,
                 stage_count = filter_count, key_columns,
                 "runtime filter installed as an independent Parquet row-filter stage");
         }
         tracing::info!(target: "vein.parquet_runtime_filter",
-            event = "scan_runtime_filters_bound", path = %path,
+            event = "scan_runtime_filters_bound",
+            source_id = %common::logging::LogLocation::from(path),
             filter_names = ?filter_names, stage_count = filter_count,
             filter_bytes = runtime_filters.memory_bytes(),
             execution_stage = "ordered_parquet_row_filter_before_output_decode",

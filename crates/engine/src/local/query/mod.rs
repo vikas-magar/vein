@@ -41,6 +41,16 @@ pub(in crate::local) struct PreparedAdaptiveCheckpoint {
 }
 
 impl LocalQuery {
+    /// Identifier shared by preparation, physical tasks, and completion logs.
+    pub fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Identifier shared by all physical stages of this query.
+    pub fn query_id(&self) -> QueryId {
+        self.query_id
+    }
+
     /// Returns the optimized logical plan retained for adaptive continuations.
     pub fn logical_plan(&self) -> &Arc<LogicalPlan> {
         &self.logical_plan

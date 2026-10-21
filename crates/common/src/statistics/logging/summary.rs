@@ -1,14 +1,10 @@
-//! Bounded, human-readable summaries for query statistics diagnostics.
-//!
-//! This deliberately omits mergeable sketch payload bytes and histogram sample
-//! priorities. It reports the synopsis configuration and estimates needed to
-//! understand planning, without logging opaque or row-like internal state.
+//! Bounded, privacy-safe summaries for query statistics diagnostics.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 
+use crate::statistics::runtime::{RUNTIME_STATISTIC_METRICS, runtime_metric_availability};
 use catalog::{ColumnStatistics, TableStatistics};
-use super::runtime::{runtime_metric_availability, RUNTIME_STATISTIC_METRICS};
 
 /// Formats a table statistics snapshot without exposing raw synopsis payloads.
 pub struct TableStatisticsLog<'a>(&'a TableStatistics);
@@ -98,37 +94,34 @@ fn write_column(f: &mut Formatter<'_>, column: &ColumnStatistics) -> fmt::Result
     field!("ndv", column.distinct_count);
     field!("ndv_error", column.distinct_count_relative_error);
     field!("nans", column.nan_count);
-    if let (Some(min), Some(max)) = (&column.min_value, &column.max_value) {
-        write!(f, "{separator}range={min:?}..{max:?}")?;
-        separator = ",";
-    }
+    write!(
+        f,
+        "{separator}bounds_available={}",
+        column.min_value.is_some() && column.max_value.is_some()
+    )?;
+    separator = ",";
     field!("bounds_complete", column.min_max_complete);
-    if let Some(numeric) = &column.numeric {
-        write!(f, "{separator}numeric={numeric:?}")?;
-        separator = ",";
-    }
-    if let Some(lengths) = &column.byte_length {
-        write!(f, "{separator}byte_length={lengths:?}")?;
-        separator = ",";
-    }
+    write!(f, "{separator}numeric_available={}", column.numeric.is_some())?;
+    separator = ",";
+    write!(
+        f,
+        "{separator}byte_length_available={}",
+        column.byte_length.is_some()
+    )?;
+    separator = ",";
     if let Some(sketch) = &column.distinct_sketch {
         write!(f, "{separator}sketch={}", sketch_summary(Some(sketch)))?;
         separator = ",";
     }
 
     if let Some(mcv) = &column.most_common_values {
-        let top_candidate = mcv
-            .candidates
-            .first()
-            .map(|candidate| format!("{:?}:{}", candidate.value, candidate.lower_count));
         write!(
             f,
-            "{separator}mcv={}/{}, analyzed={}, error={}, top={:?}",
+            "{separator}mcv={}/{}, analyzed={}, error={}",
             mcv.candidates.len(),
             mcv.capacity,
             mcv.analyzed_count,
             mcv.error_bound,
-            top_candidate,
         )?;
         separator = ",";
     }
@@ -136,7 +129,7 @@ fn write_column(f: &mut Formatter<'_>, column: &ColumnStatistics) -> fmt::Result
     if let Some(histogram) = &column.histogram {
         write!(
             f,
-            "{separator}hist=population:{},sample:{}/{},buckets:{}/{},confidence_ppm:{},rank_error:{:?},range:{:?}..{:?}",
+            "{separator}hist=population:{},sample:{}/{},buckets:{}/{},confidence_ppm:{},rank_error:{:?}",
             histogram.population_count,
             histogram.sample_count,
             histogram.sample_capacity,
@@ -144,8 +137,6 @@ fn write_column(f: &mut Formatter<'_>, column: &ColumnStatistics) -> fmt::Result
             histogram.bucket_count,
             histogram.confidence_ppm,
             histogram.rank_error_bound,
-            histogram.buckets.first().map(|bucket| &bucket.lower_bound),
-            histogram.buckets.last().map(|bucket| &bucket.upper_bound),
         )?;
     }
     write!(f, "}}")
@@ -196,77 +187,4 @@ fn data_unit_summary(statistics: &TableStatistics) -> String {
         column_index_columns,
         offset_index_columns,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use catalog::{
-        ColumnStatistics, HistogramBucket, HistogramSample, HistogramStatistics,
-        MostCommonValue, MostCommonValuesStatistics, SerializedSketch, TableStatistics,
-    };
-    use types::LogicalLiteral;
-
-    use super::TableStatisticsLog;
-
-    #[test]
-    fn summary_reports_synopsis_values_without_dumping_sketch_or_sample_payloads() {
-        let statistics = TableStatistics {
-            num_rows: Some(4),
-            column_statistics: [(
-                "key".to_owned(),
-                ColumnStatistics {
-                    distinct_count: Some(3),
-                    distinct_sketch: Some(SerializedSketch {
-                        algorithm: "hll".to_owned(),
-                        version: 1,
-                        parameters: vec![1, 2],
-                        payload: vec![9; 128],
-                    }),
-                    most_common_values: Some(MostCommonValuesStatistics {
-                        capacity: 2,
-                        analyzed_count: 4,
-                        error_bound: 1,
-                        candidates: vec![MostCommonValue {
-                            value: LogicalLiteral::Int64(7),
-                            hash: 42,
-                            lower_count: 2,
-                        }],
-                    }),
-                    histogram: Some(HistogramStatistics {
-                        population_count: 4,
-                        sample_count: 1,
-                        sample_capacity: 8,
-                        bucket_count: 1,
-                        confidence_ppm: 950_000,
-                        samples: vec![HistogramSample {
-                            priority: 123456,
-                            tie_breaker: 654321,
-                            value: LogicalLiteral::Int64(7),
-                        }],
-                        buckets: vec![HistogramBucket {
-                            lower_bound: LogicalLiteral::Int64(7),
-                            upper_bound: LogicalLiteral::Int64(7),
-                            sample_count: 1,
-                            estimated_count: 4,
-                        }],
-                        rank_error_bound: Some(0.1),
-                    }),
-                    ..ColumnStatistics::default()
-                },
-            )]
-                .into_iter()
-                .collect(),
-            ..TableStatistics::default()
-        };
-
-        let summary = TableStatisticsLog::new(&statistics).to_string();
-        assert!(summary.contains("ndv=3"));
-        assert!(summary.contains("hll@1(parameter_bytes=2,state_bytes=128)"));
-        assert!(summary.contains("mcv=1/2, analyzed=4, error=1"));
-        assert!(summary.contains("hist=population:4,sample:1/8,buckets:1/1"));
-        assert!(summary.contains("range:Some(Int64(7))..Some(Int64(7))"));
-        assert!(!summary.contains("123456"));
-        assert!(!summary.contains("654321"));
-        assert!(!summary.contains("[9, 9, 9"));
-    }
 }

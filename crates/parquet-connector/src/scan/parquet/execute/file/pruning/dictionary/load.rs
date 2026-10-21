@@ -63,7 +63,7 @@ pub(super) async fn load(
                 tracing::debug!(
                     target: "vein.audit",
                     event = "parquet_dictionary_reader_unavailable",
-                    path = %context.path,
+                    source_id = %common::logging::LogLocation::from(context.path),
                     backend = context.io_backend.name(),
                     error = %error,
                     "dictionary pruning unavailable; retaining candidate rows"
@@ -128,7 +128,7 @@ pub(super) async fn load(
                     tracing::debug!(
                         target: "vein.audit",
                         event = "parquet_dictionary_page_unavailable",
-                        path = %context.path,
+                        source_id = %common::logging::LogLocation::from(context.path),
                         row_group = row_group_index,
                         column = %column.name,
                         range_start = range.start,

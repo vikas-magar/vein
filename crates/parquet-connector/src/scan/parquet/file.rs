@@ -108,7 +108,7 @@ pub(super) async fn prepare_parquet_file(
         tracing::debug!(
             target: "vein.audit",
             event = "parquet_footer_miss",
-            path = %path,
+            source_id = %common::logging::LogLocation::from(path),
             "parquet_footer_miss"
         );
     }

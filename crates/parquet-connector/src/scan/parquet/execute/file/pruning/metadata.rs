@@ -58,9 +58,9 @@ pub(super) async fn apply(
     tracing::debug!(
         target: "vein.audit",
         event = "parquet_predicate_pruning",
-        path = %context.path,
+        source_id = %common::logging::LogLocation::from(context.path),
         stage = "row_group_footer",
-        predicates = ?row_group_pruning.predicate_diagnostics.predicates,
+        predicate_count = row_group_pruning.predicate_diagnostics.predicates.len(),
         "per-predicate Parquet footer pruning decisions"
     );
 
@@ -83,9 +83,9 @@ pub(super) async fn apply(
     tracing::debug!(
         target: "vein.audit",
         event = "parquet_predicate_pruning",
-        path = %context.path,
+        source_id = %common::logging::LogLocation::from(context.path),
         stage = "page_index",
-        predicates = ?page_index_pruning.predicate_diagnostics.predicates,
+        predicate_count = page_index_pruning.predicate_diagnostics.predicates.len(),
         "per-predicate Parquet page-index pruning decisions"
     );
 

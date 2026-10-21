@@ -32,8 +32,8 @@ pub(super) fn build(
         tracing::info!(
             target: "vein.parquet_runtime_filter",
             event = "parquet_runtime_filter_pruning_path",
-            path = %context.path,
-            filters = ?diagnostics,
+            source_id = %common::logging::LogLocation::from(context.path),
+            filter_diagnostic_count = diagnostics.len(),
             metadata_predicate_count = runtime_predicates.len(),
             row_filter_names = ?context.runtime_filters.row_filter_names(),
             metadata_stage = "footer_and_page_index",

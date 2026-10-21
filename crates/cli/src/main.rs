@@ -29,14 +29,19 @@ async fn main() -> Result<()> {
 
     let query = query_argument(args.collect::<Vec<_>>().join(" "))?;
 
-    let data_root = std::env::var_os("VEIN_DATA_DIR")
+    let configured_data_root = std::env::var_os("VEIN_DATA_DIR");
+    let data_root_source = if configured_data_root.is_some() {
+        "environment"
+    } else {
+        "default"
+    };
+    let data_root = configured_data_root
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("./data"));
     tracing::info!(
         target: "vein.audit",
         event = "cli_started",
-        data_root = %data_root.display(),
-        query = %query,
+        data_root_source,
         "cli_started"
     );
 
@@ -44,6 +49,8 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     let query = engine.prepare(&query).await?;
     let prepare_us = started.elapsed().as_micros() as u64;
+    let request_id = query.request_id();
+    let query_id = query.query_id();
 
     if query.is_write() {
         let write_started = Instant::now();
@@ -53,6 +60,8 @@ async fn main() -> Result<()> {
         tracing::info!(
             target: "vein.audit",
             event = "query_finished",
+            request_id = %request_id,
+            query_id = %query_id,
             mode = "write",
             prepare_us,
             execute_us,
@@ -124,6 +133,8 @@ async fn main() -> Result<()> {
     tracing::info!(
         target: "vein.audit",
         event = "query_finished",
+        request_id = %request_id,
+        query_id = %query_id,
         mode = "read",
         prepare_us,
         execute_us,

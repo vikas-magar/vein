@@ -64,7 +64,7 @@ pub(in crate::scan::parquet) async fn read_page_header_statistics(
             tracing::debug!(
                 target: "vein.audit",
                 event = "parquet_page_header_reader_unavailable",
-                path = %path,
+                source_id = %common::logging::LogLocation::from(path),
                 backend = backend.name(),
                 error = %error,
                 "page-header pruning unavailable; retaining all candidate rows"

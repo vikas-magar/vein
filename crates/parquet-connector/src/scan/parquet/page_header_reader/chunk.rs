@@ -90,7 +90,7 @@ pub(super) async fn read_requested_row_group(
                         tracing::debug!(
                                 target: "vein.audit",
                                 event = "parquet_page_header_unavailable",
-                                path = %path,
+                                source_id = %common::logging::LogLocation::from(path),
                                 row_group = row_group_index,
                                 column = %name,
                                 offset,

@@ -48,7 +48,6 @@ impl OptimizerRule for FilterTransitivityRule {
                     event = "optimizer_ordered_filters_inferred",
                     input_predicate_count = predicates.len(),
                     inferred_filter_count = inferred.len(),
-                    inferred_filters = ?inferred,
                     "optimizer_ordered_filters_inferred"
                 );
 
@@ -81,7 +80,6 @@ impl OptimizerRule for FilterTransitivityRule {
                     table = %table.name,
                     input_predicate_count = filters.len(),
                     inferred_filter_count = inferred.len(),
-                    inferred_filters = ?inferred,
                     "optimizer_ordered_filters_inferred"
                 );
 

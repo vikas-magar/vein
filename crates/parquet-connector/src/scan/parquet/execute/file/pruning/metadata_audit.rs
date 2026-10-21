@@ -17,8 +17,8 @@ pub(super) fn log_page_header_decisions(
         tracing::info!(
             target: "vein.parquet_audit",
             event = "parquet_page_header_audit_summary",
-            path = %path,
-            predicates = ?pruning.predicate_diagnostics.predicates,
+            source_id = %common::logging::LogLocation::from(path),
+            predicate_count = pruning.predicate_diagnostics.predicates.len(),
             page_index_columns = summary.page_index_columns,
             page_bounds_complete = summary.page_bounds_complete,
             page_bounds_incomplete = summary.page_bounds_incomplete,
@@ -40,7 +40,7 @@ pub(super) fn log_page_header_decisions(
     tracing::debug!(
         target: "vein.audit",
         event = "parquet_predicate_pruning",
-        path = %path,
+        source_id = %common::logging::LogLocation::from(path),
         stage = "page_header",
         audit_forced = audit_enabled,
         columns_requested = metrics.columns_requested,
@@ -56,7 +56,7 @@ pub(super) fn log_page_header_decisions(
         probe_overread_bytes = metrics.probe_bytes.saturating_sub(metrics.header_bytes),
         pages_skipped_rows = summary.page_header_rows_skipped,
         row_groups_skipped = summary.row_groups_skipped_by_page_header,
-        predicates = ?pruning.predicate_diagnostics.predicates,
+        predicate_count = pruning.predicate_diagnostics.predicates.len(),
         "Parquet data-page header pruning decisions"
     );
 }
