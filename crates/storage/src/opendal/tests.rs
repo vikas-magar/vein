@@ -49,6 +49,28 @@ async fn filesystem_adapter_stats_reads_ranges_and_streams_objects() {
 }
 
 #[tokio::test]
+async fn listing_prefix_respects_path_component_boundaries() {
+    let directory = tempfile::tempdir().expect("temporary storage root");
+    std::fs::create_dir(directory.path().join("part")).expect("create part table");
+    std::fs::create_dir(directory.path().join("partsupp")).expect("create partsupp table");
+    std::fs::write(directory.path().join("part/part.1.parquet"), b"part")
+        .expect("write part shard");
+    std::fs::write(directory.path().join("partsupp/partsupp.1.parquet"), b"partsupp")
+        .expect("write partsupp shard");
+
+    let storage = OpenDalReadStorageFactory
+        .open(&StorageLocation::local(directory.path().to_path_buf()))
+        .expect("open filesystem storage");
+    let paths = storage
+        .list(&StorageObjectPath::new("part"))
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list part table objects");
+
+    assert_eq!(paths, vec![StorageObjectPath::new("part/part.1.parquet")]);
+}
+
+#[tokio::test]
 async fn filesystem_locations_normalize_before_object_identity_is_reported() {
     let directory = tempfile::tempdir().expect("temporary storage root");
     std::fs::write(directory.path().join("object"), b"value").expect("write object");

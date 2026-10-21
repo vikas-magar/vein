@@ -1,13 +1,15 @@
 use std::time::Instant;
 
-use futures::StreamExt;
 use cli::local::build_local_engine;
 use common::{Result, VeinError};
 use exec::pipeline::DataChunkView;
+use futures::StreamExt;
 
+mod query_timing;
 mod result_format;
 mod view_pretty;
-mod query_timing;
+#[cfg(test)]
+mod tests;
 
 /// Rows the CLI renders before summarising the rest.
 ///
@@ -163,25 +165,5 @@ fn display_row_limit() -> Option<usize> {
             Err(_) => Some(DISPLAY_ROWS),
         },
         Err(_) => Some(DISPLAY_ROWS),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{QUERY_USAGE, query_argument};
-    use common::VeinError;
-
-    #[test]
-    fn empty_query_argument_returns_central_input_error() {
-        assert!(matches!(
-            query_argument(String::new()),
-            Err(VeinError::InvalidInput(message)) if message == QUERY_USAGE
-        ));
-    }
-
-    #[test]
-    fn nonempty_query_argument_is_preserved() {
-        let query = "FROM part |> SELECT *";
-        assert_eq!(query_argument(query.to_owned()).unwrap(), query);
     }
 }

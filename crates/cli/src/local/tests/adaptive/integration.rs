@@ -29,7 +29,7 @@ fn join_fixture() -> tempfile::TempDir {
 fn write_table(root: &std::path::Path, name: &str, values: Vec<i64>) {
     let schema = Arc::new(Schema::new(vec![Field::new(format!("{name}_key"), DataType::Int64, false)]));
     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(values))]).unwrap();
-    crate::test_support::write_parquet_table(root, name, "create", schema, &batch);
+    super::super::support::write_parquet_table(root, name, "create", schema, &batch);
 }
 
 async fn run(engine: &LocalQueryEngine, query: &str) -> (Vec<Vec<i64>>, Arc<QueryStatisticsContext>) {

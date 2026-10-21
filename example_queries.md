@@ -201,13 +201,13 @@ FROM lineitem
 
 ```bash
 VEIN_DATA_DIR=/Users/anvi/Next/vein/data/tpch cargo run -p cli -- "
-FROM part
-|> JOIN partsupp ON p_partkey = ps_partkey
-|> JOIN supplier ON ps_suppkey = s_suppkey
-|> JOIN nation ON s_nationkey = n_nationkey
-|> JOIN region ON n_regionkey = r_regionkey
-|> WHERE p_size = 15 AND p_type LIKE '%BRASS' AND r_name = 'EUROPE'
-|> WHERE ps_supplycost = (FROM partsupp |> WHERE ps_partkey = part.p_partkey |> AGGREGATE min(ps_supplycost))
+FROM part AS p
+|> JOIN partsupp as ps ON p.p_partkey = ps.ps_partkey
+|> JOIN supplier as s ON ps.ps_suppkey = s.s_suppkey
+|> JOIN nation as n ON s.s_nationkey = n.n_nationkey
+|> JOIN region as r ON n.n_regionkey = r.r_regionkey
+|> WHERE p.p_size = 15 AND p.p_type LIKE '%BRASS' AND r.r_name = 'EUROPE'
+|> WHERE ps_supplycost = (FROM partsupp |> WHERE ps_partkey = p.p_partkey |> AGGREGATE min(ps_supplycost))
 |> SELECT s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment
 |> ORDER s_acctbal DESC, n_name, s_name, p_partkey
 "

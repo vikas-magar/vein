@@ -103,7 +103,3 @@ fn normalize_column(column: &ResolvedColumn) -> Arc<ResolvedColumn> {
         nullable: column.nullable,
     })
 }
-
-#[cfg(test)]
-#[path = "checkpoint_identity_tests.rs"]
-mod tests;

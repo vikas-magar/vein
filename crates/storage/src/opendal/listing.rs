@@ -13,6 +13,7 @@ pub(super) fn list<'a>(
 ) -> impl futures::Stream<Item=Result<StorageObjectPath>> + Send + 'a {
     let operator = storage.operator.clone();
     let prefix = prefix.clone();
+    let filter_prefix = prefix.clone();
     let context: Arc<str> = Arc::from(format!("list storage objects under {}", prefix.as_str()));
     let open_context = Arc::clone(&context);
 
@@ -28,8 +29,21 @@ pub(super) fn list<'a>(
             lister.map_err(move |error| storage_error(error, item_context.to_string()))
         })
         .try_flatten()
-        .try_filter_map(|entry| {
-            futures::future::ready(Ok((!entry.metadata().is_dir())
-                .then(|| StorageObjectPath::new(entry.path()))))
+        .try_filter_map(move |entry| {
+            let path = StorageObjectPath::new(entry.path());
+            let is_file = !entry.metadata().is_dir();
+            futures::future::ready(Ok(
+                (is_file && is_within_prefix(&path, &filter_prefix)).then_some(path),
+            ))
         })
+}
+
+fn is_within_prefix(path: &StorageObjectPath, prefix: &StorageObjectPath) -> bool {
+    let prefix = prefix.as_str().trim_end_matches('/');
+    let path = path.as_str();
+    prefix.is_empty()
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|remainder| remainder.starts_with('/'))
 }
