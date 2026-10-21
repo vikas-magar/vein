@@ -68,7 +68,7 @@ async fn filtered_and_complete_scans_publish_only_valid_table_statistics() {
         vec![Arc::new(Int64Array::from(vec![7, 7]))],
     )
         .expect("valid replacement batch");
-    write_parquet_batch(
+    write_parquet_table(
         root.path(),
         "flights",
         "overwrite",

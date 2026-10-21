@@ -14,8 +14,8 @@ async fn runtime_synopsis_uses_complete_rows_with_projected_column_coverage() {
             Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
         ],
     )
-    .expect("valid input batch");
-    write_parquet_batch(root.path(), "events", "create", Arc::clone(&schema), &input);
+        .expect("valid input batch");
+    write_parquet_table(root.path(), "events", "create", Arc::clone(&schema), &input);
 
     let engine = test_engine(root.path());
     let query = engine

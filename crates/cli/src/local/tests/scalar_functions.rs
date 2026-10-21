@@ -36,7 +36,7 @@ async fn executes_lower_and_round_scalar_projections_preserving_nulls() {
                     Arc::new(Float32Array::from(vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0])),
                     Some(vec![true, true, false].into()),
                 )
-                .expect("valid left vectors"),
+                    .expect("valid left vectors"),
             ),
             Arc::new(
                 FixedSizeListArray::try_new(
@@ -45,12 +45,12 @@ async fn executes_lower_and_round_scalar_projections_preserving_nulls() {
                     Arc::new(Float32Array::from(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0])),
                     None,
                 )
-                .expect("valid right vectors"),
+                    .expect("valid right vectors"),
             ),
         ],
     )
-    .expect("valid batch");
-    write_parquet_batch(root.path(), "names", "create", Arc::clone(&schema), &batch);
+        .expect("valid batch");
+    write_parquet_table(root.path(), "names", "create", Arc::clone(&schema), &batch);
 
     let engine = test_engine(root.path());
     let query = engine

@@ -14,6 +14,12 @@ use plan::LogicalPlan;
 
 use super::adaptive::{AdaptiveBoundary, AdaptiveCheckpointPolicy};
 
+mod context;
+pub use context::query_statistics_context;
+
+#[cfg(test)]
+mod tests;
+
 /// A planned local query whose output can be consumed incrementally.
 pub struct LocalQuery {
     pub(in crate::local) tasks: Vec<ExecuteTask>,

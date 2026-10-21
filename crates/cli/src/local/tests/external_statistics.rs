@@ -21,8 +21,8 @@ async fn analyzes_parquet_tables_and_publishes_synopses() {
             ])),
         ],
     )
-    .expect("valid analysis input");
-    write_parquet_batch(
+        .expect("valid analysis input");
+    write_parquet_table(
         root.path(),
         "analyzed_events",
         "create",

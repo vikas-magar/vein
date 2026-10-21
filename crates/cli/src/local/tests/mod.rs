@@ -6,18 +6,16 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use plan::LogicalPlan;
 
-use engine::local::query_statistics_context;
 use super::*;
 
 mod support;
+use crate::test_support::{parquet_catalog, write_parquet_table};
 use support::{
     contains_sort, create_flights_table, find_file_scan, materialized_result_column,
-    parquet_catalog, parquet_catalog_with_runtime, write_parquet_batch,
+    parquet_catalog_with_runtime,
 };
 
-mod query_statistics;
 mod query_execution;
 mod runtime_synopsis;
 mod adaptive;

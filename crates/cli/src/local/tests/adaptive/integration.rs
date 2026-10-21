@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
+use crate::local::{
+    AdaptiveBoundary, AdaptiveCheckpointPolicy, LocalQueryEngine, test_engine,
+};
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::statistics::QueryStatisticsContext;
 use futures::StreamExt;
-use super::{AdaptiveBoundary, AdaptiveCheckpointPolicy};
-use crate::local::{LocalQueryEngine, test_engine};
 
 struct NoCheckpoints;
 impl AdaptiveCheckpointPolicy for NoCheckpoints {

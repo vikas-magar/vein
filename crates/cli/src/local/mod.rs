@@ -62,7 +62,3 @@ pub fn build_local_engine(data_root: impl Into<PathBuf>) -> Result<LocalQueryEng
     };
     Ok(LocalEngineBuilder::new(components).build())
 }
-
-#[cfg(test)]
-#[path = "adaptive/integration_tests.rs"]
-mod adaptive_integration_tests;

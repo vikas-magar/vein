@@ -1,12 +1,18 @@
-use super::*;
+//! Tests for query-scoped statistics context registration.
+
+use std::sync::Arc;
+
+use plan::{LogicalPlan, TableMetadata, TableStatistics, VeinSchema};
+
+use super::query_statistics_context;
 
 #[test]
 fn query_statistics_context_registers_catalog_resolved_external_sources() {
     let metadata = Arc::new(
-        plan::TableMetadata::new("external_events", Arc::new(plan::VeinSchema::empty()))
-            .with_statistics(plan::TableStatistics {
+        TableMetadata::new("external_events", Arc::new(VeinSchema::empty()))
+            .with_statistics(TableStatistics {
                 num_rows: Some(23),
-                ..plan::TableStatistics::default()
+                ..TableStatistics::default()
             }),
     );
     let external = LogicalPlan::ExternalScan {

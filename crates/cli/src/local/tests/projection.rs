@@ -17,7 +17,7 @@ async fn parquet_projection_keeps_filter_columns_and_compacts_predicate_input() 
         ],
     )
         .expect("valid batch");
-    write_parquet_batch(root.path(), "wide", "create", Arc::clone(&schema), &batch);
+    write_parquet_table(root.path(), "wide", "create", Arc::clone(&schema), &batch);
 
     let engine = test_engine(root.path());
     let query = engine

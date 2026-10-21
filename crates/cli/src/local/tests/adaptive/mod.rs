@@ -1,5 +1,7 @@
 use super::*;
 
+mod integration;
+
 #[tokio::test]
 async fn skips_redundant_checkpoint_when_join_already_builds_filtered_input() {
     let root = tempfile::tempdir().expect("temporary data root");
@@ -14,8 +16,8 @@ async fn skips_redundant_checkpoint_when_join_already_builds_filtered_input() {
             Arc::new(StringArray::from(vec!["one", "two"])),
         ],
     )
-    .expect("valid left batch");
-    write_parquet_batch(
+        .expect("valid left batch");
+    write_parquet_table(
         root.path(),
         "lefts",
         "create",
@@ -34,8 +36,8 @@ async fn skips_redundant_checkpoint_when_join_already_builds_filtered_input() {
             Arc::new(StringArray::from(vec!["one", "two", "three"])),
         ],
     )
-    .expect("valid right batch");
-    write_parquet_batch(
+        .expect("valid right batch");
+    write_parquet_table(
         root.path(),
         "rights",
         "create",

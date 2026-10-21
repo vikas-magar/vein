@@ -9,7 +9,7 @@ use common::{Result, VeinError};
 use plan::LogicalPlan;
 
 use super::adaptive;
-use super::query_context::query_statistics_context;
+use super::query::query_statistics_context;
 use super::{LocalQuery, LocalQueryEngine};
 
 impl LocalQueryEngine {

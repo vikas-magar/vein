@@ -4,23 +4,13 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use common::protocol::{DataSource, FileScanTask, PhysicalPlanNode, PhysicalPlanOperator};
 use common::statistics::RuntimeStatisticsStore;
 use exec::pipeline::DataChunkView;
 use parquet_connector::catalog::ParquetCatalog;
 
-pub(super) fn write_parquet_batch(
-    root: &Path,
-    table: &str,
-    mode: &str,
-    schema: Arc<Schema>,
-    batch: &RecordBatch,
-) {
-    crate::test_support::write_parquet_table(root, table, mode, schema, batch);
-}
-
-pub(super) fn parquet_catalog(root: impl Into<PathBuf>) -> ParquetCatalog {
-    crate::test_support::parquet_catalog(root)
-}
+#[cfg(test)]
+mod traversal_tests;
 
 pub(super) fn parquet_catalog_with_runtime(
     root: impl Into<PathBuf>,
@@ -40,7 +30,7 @@ pub(super) fn create_flights_table(root: &Path) -> (PathBuf, Arc<Schema>) {
             vec![Arc::new(Int64Array::from(values))],
         )
             .expect("valid batch");
-        write_parquet_batch(root, "flights", mode, Arc::clone(&schema), &batch);
+        crate::test_support::write_parquet_table(root, "flights", mode, Arc::clone(&schema), &batch);
     }
     (root.join("flights"), schema)
 }
@@ -50,39 +40,54 @@ pub(super) fn materialized_result_column(view: &DataChunkView, column: usize) ->
         .expect("materialize result column for assertion")
 }
 
-pub(super) fn contains_sort(node: &common::protocol::PhysicalPlanNode) -> bool {
-    use common::protocol::PhysicalPlanOperator;
-    match &node.operator {
-        PhysicalPlanOperator::Sort { .. } => true,
-        PhysicalPlanOperator::Transform { input, .. }
-        | PhysicalPlanOperator::Aggregate { input, .. }
-        | PhysicalPlanOperator::Distinct { input, .. }
-        | PhysicalPlanOperator::Limit { input, .. }
-        | PhysicalPlanOperator::Sink { input, .. } => contains_sort(input),
-        PhysicalPlanOperator::Join { probe, build, .. } => {
-            contains_sort(probe) || contains_sort(build)
-        }
-        PhysicalPlanOperator::Pipeline { .. } => false,
-    }
+pub(super) fn contains_sort(node: &PhysicalPlanNode) -> bool {
+    find_first_plan_node(node, &|node| {
+        matches!(&node.operator, PhysicalPlanOperator::Sort { .. })
+    })
+        .is_some()
 }
 
-pub(super) fn find_file_scan(
-    node: &common::protocol::PhysicalPlanNode,
-) -> Option<&common::protocol::FileScanTask> {
-    use common::protocol::{DataSource, PhysicalPlanOperator};
+pub(super) fn find_file_scan(node: &PhysicalPlanNode) -> Option<&FileScanTask> {
+    let matching_node = find_first_plan_node(node, &|node| match &node.operator {
+        PhysicalPlanOperator::Pipeline { source, .. } => {
+            matches!(source.as_ref(), DataSource::File(_))
+        }
+        _ => false,
+    })?;
+    let PhysicalPlanOperator::Pipeline { source, .. } = &matching_node.operator else {
+        return None;
+    };
+    let DataSource::File(scan) = source.as_ref() else {
+        return None;
+    };
+    Some(scan)
+}
+
+fn find_first_plan_node<'a>(
+    node: &'a PhysicalPlanNode,
+    predicate: &impl Fn(&PhysicalPlanNode) -> bool,
+) -> Option<&'a PhysicalPlanNode> {
+    if predicate(node) {
+        return Some(node);
+    }
+
+    child_nodes(node)
+        .into_iter()
+        .flatten()
+        .find_map(|child| find_first_plan_node(child, predicate))
+}
+
+fn child_nodes(node: &PhysicalPlanNode) -> [Option<&PhysicalPlanNode>; 2] {
     match &node.operator {
-        PhysicalPlanOperator::Pipeline { source, .. } => match source.as_ref() {
-            DataSource::File(scan) => Some(scan),
-            DataSource::Memory | DataSource::Stream(_) | DataSource::Intermediate(_) => None,
-        },
         PhysicalPlanOperator::Transform { input, .. }
         | PhysicalPlanOperator::Aggregate { input, .. }
         | PhysicalPlanOperator::Distinct { input, .. }
         | PhysicalPlanOperator::Sort { input, .. }
         | PhysicalPlanOperator::Limit { input, .. }
-        | PhysicalPlanOperator::Sink { input, .. } => find_file_scan(input),
+        | PhysicalPlanOperator::Sink { input, .. } => [Some(input.as_ref()), None],
         PhysicalPlanOperator::Join { probe, build, .. } => {
-            find_file_scan(probe).or_else(|| find_file_scan(build))
+            [Some(probe.as_ref()), Some(build.as_ref())]
         }
+        PhysicalPlanOperator::Pipeline { .. } => [None, None],
     }
 }

@@ -9,7 +9,7 @@ async fn executes_pipe_write_and_exposes_only_committed_rows() {
         vec![Arc::new(Int64Array::from(vec![4, 5, 6]))],
     )
         .expect("valid source batch");
-    write_parquet_batch(root.path(), "source", "create", Arc::clone(&schema), &batch);
+    write_parquet_table(root.path(), "source", "create", Arc::clone(&schema), &batch);
 
     let engine = test_engine(root.path());
     let error = match engine
