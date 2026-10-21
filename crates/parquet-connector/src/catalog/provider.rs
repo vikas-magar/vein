@@ -120,7 +120,7 @@ impl ParquetCatalog {
             };
             return self.apply_analysis(metadata, &statistics, None);
         };
-        self.apply_analysis(metadata, &statistics, manifest.map(|manifest| manifest.revision))
+        self.apply_analysis(metadata, statistics, manifest.map(|manifest| manifest.revision))
     }
 
     fn apply_analysis(

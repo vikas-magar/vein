@@ -56,9 +56,7 @@ impl AggregateBatch {
                 let key_view = view.project(&[column])?.compact_active_rows()?;
                 batch.key_arrays[column] = key_view
                     .source_arrays_for_column(0)?
-                    .iter()
-                    .cloned()
-                    .collect();
+                    .to_vec();
                 batch.key_columns[column] = Some(GroupKeyColumn::from_view(key_view)?);
             }
         }

@@ -7,7 +7,10 @@ fn empty_scan_units_produce_no_ranges() {
 
 #[test]
 fn adjacent_units_share_one_unbounded_range() {
-    assert_eq!(coalesce_scan_units([(2, 10), (3, 20), (4, 30)], None), [2..5]);
+    assert_eq!(
+        coalesce_scan_units([(2, 10), (3, 20), (4, 30)], None),
+        std::iter::once(2..5).collect::<Vec<_>>()
+    );
 }
 
 #[test]

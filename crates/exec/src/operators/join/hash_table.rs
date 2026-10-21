@@ -834,7 +834,7 @@ impl HashTable {
         for position in 0..row_count {
             let row = position as u32;
             let Some((hash, _)) = self.keys_by_chunk[chunk_index as usize]
-                .hash_and_single_i64(position as usize, &self.chunks[chunk_index as usize])?
+                .hash_and_single_i64(position, &self.chunks[chunk_index as usize])?
             else {
                 self.null_keyed.push((chunk_index, row));
                 continue;

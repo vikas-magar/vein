@@ -84,14 +84,14 @@ where
     }
 }
 
-fn evaluate_inner<K: ?Sized>(
+fn evaluate_inner<K>(
     expression: &PhysicalExpr,
     input: &Arc<DataChunkView>,
     kernels: &K,
     functions: &FunctionRegistry,
 ) -> Result<ExpressionValue>
 where
-    K: ExpressionKernelProvider,
+    K: ExpressionKernelProvider + ?Sized,
 {
     let kind = ExpressionNodeKind::of(expression);
     let kernel = kernels.kernel(kind).ok_or_else(|| {

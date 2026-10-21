@@ -67,15 +67,16 @@ impl ScanBatchSizePolicy for RowGroupBatchSizePolicy {
             .filter_map(|rows| usize::try_from(rows).ok().filter(|rows| *rows > 0))
             .max();
 
-        if let Some(rows) = override_rows.and_then(|value| value.trim().parse::<usize>().ok()) {
-            if rows > 0 {
-                return BatchSizeSelection {
-                    rows,
-                    source: BatchSizeSource::EnvironmentOverride,
-                    largest_assigned_row_group,
-                    invalid_override: false,
-                };
-            }
+        if let Some(rows) = override_rows
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|rows| *rows > 0)
+        {
+            return BatchSizeSelection {
+                rows,
+                source: BatchSizeSource::EnvironmentOverride,
+                largest_assigned_row_group,
+                invalid_override: false,
+            };
         }
 
         let invalid_override = override_rows.is_some();

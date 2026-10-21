@@ -56,7 +56,7 @@ impl OptimizerRule for ExistsDecorrelationRule {
             .into_iter()
             .filter(|term| !matches!(term, LogicalExpr::Exists { .. }))
             .map(|term| {
-                if contains_volatile_expression(&term) {
+                if contains_volatile_expression(term) {
                     Err(VeinError::planning(
                         "EXISTS decorrelation cannot move a filter containing volatile expressions across the existence check",
                         None,

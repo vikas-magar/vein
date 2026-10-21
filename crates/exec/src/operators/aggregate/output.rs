@@ -49,16 +49,14 @@ impl AggregateSink {
         }
         self.flush_current_run()?;
         let runs = std::mem::take(&mut self.spill_runs);
-        Self::finish_spill_partition_view(
-            &self.plan,
-            &self.tracker,
-            &self.registry,
-            &self.spill_schema,
-            runs,
-            0,
+        let context = super::spill_finish::SpillFinishContext {
+            plan: &self.plan,
+            tracker: &self.tracker,
+            registry: &self.registry,
+            schema: &self.spill_schema,
             batch_rows,
-            &mut emit,
-        )
+        };
+        Self::finish_spill_partition_view(&context, runs, 0, &mut emit)
     }
 
     pub(super) fn ensure_empty_groups(&mut self) -> Result<()> {

@@ -72,7 +72,8 @@ impl AdaptiveCheckpointPolicy for StatisticsCheckpointPolicy {
                     // later join work instead of materializing a large subtree.
                     let score = (!contains_blocking_relation(node), work);
                     let better_candidate = best.as_ref().is_none_or(|(current, _, _)| {
-                        score.0 > current.0 || (score.0 == current.0 && score.1 < current.1)
+                        (score.0 && !current.0)
+                            || (score.0 == current.0 && score.1 < current.1)
                     });
                     if better_candidate {
                         let mut schema = node.schema().clone();

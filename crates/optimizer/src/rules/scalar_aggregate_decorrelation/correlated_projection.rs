@@ -79,7 +79,7 @@ fn contains_aggregate_call(expression: &LogicalExpr) -> bool {
         || expression
         .children()
         .into_iter()
-        .any(|child| contains_aggregate_call(&child))
+        .any(contains_aggregate_call)
 }
 
 #[cfg(test)]

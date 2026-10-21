@@ -12,7 +12,7 @@ use crate::pipeline::DataChunkView;
 #[cfg(test)]
 use crate::pipeline::MaterializationReport;
 
-/// Reference-backed or materialized value produced by expression evaluation.
+/// Reference-backed or materialized result produced by expression evaluation.
 #[derive(Debug, Clone)]
 pub enum ExpressionValue {
     /// Dense Arrow array produced by a scan or an expression kernel.

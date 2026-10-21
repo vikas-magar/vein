@@ -141,7 +141,7 @@ fn is_dictionary_encoding(encoding: Encoding) -> bool {
 
 fn selection_from_excluded_ranges(
     total_rows: usize,
-    excluded: &mut Vec<(usize, usize)>,
+    excluded: &mut [(usize, usize)],
 ) -> RowSelection {
     excluded.sort_unstable();
     let mut selectors = Vec::with_capacity(excluded.len().saturating_mul(2).saturating_add(1));

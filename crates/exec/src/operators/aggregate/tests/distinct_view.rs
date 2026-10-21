@@ -52,7 +52,7 @@ fn count_distinct_view_keeps_source_buffers_and_ignores_null_values() {
         .flatten()
         .filter_map(Option::as_ref)
         .any(|column| {
-            matches!(column, GroupKeyColumn::View(view)
+            matches!(column.as_ref(), GroupKeyColumn::View(view)
                 if view.source_arrays_for_column(0).is_ok_and(|arrays| {
                     arrays.iter().any(|array| Arc::ptr_eq(array, &values))
                 }))

@@ -26,7 +26,7 @@ impl ScanProvider for UnevenProvider {
     }
 
     fn plan_work_units(&self, request: ScanPlanningRequest<'_>) -> common::Result<Vec<DataSource>> {
-        let ranges = [vec![0..1, 1..4], vec![0..2]];
+        let ranges = [vec![0..1, 1..4], std::iter::once(0..2).collect()];
         Ok(ranges
             .into_iter()
             .enumerate()

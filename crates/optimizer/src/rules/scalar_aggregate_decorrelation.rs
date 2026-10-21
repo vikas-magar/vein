@@ -42,10 +42,8 @@ fn distinct_inner_keys(correlations: &[CorrelationPair]) -> Vec<ResolvedColumnRe
     let mut seen = std::collections::HashSet::with_capacity(correlations.len());
     correlations
         .iter()
-        .filter_map(|pair| {
-            seen.insert(pair.inner.id)
-                .then(|| ResolvedColumnRef::clone(&pair.inner))
-        })
+        .filter(|pair| seen.insert(pair.inner.id))
+        .map(|pair| ResolvedColumnRef::clone(&pair.inner))
         .collect()
 }
 

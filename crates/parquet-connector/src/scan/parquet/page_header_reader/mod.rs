@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Schema};
 use parquet::file::metadata::ParquetMetaData;
 use storage::ReadStorage;
 
-use super::reader::{IoStats, ParquetIoBackend};
+use super::reader::{IoStats, ParquetFileReader, ParquetIoBackend};
 
 mod chunk;
 mod header;
@@ -44,6 +44,17 @@ pub(super) struct PageHeaderReadResult {
 
 pub(super) type HeaderPageLocations =
 HashMap<usize, HashMap<usize, Vec<parquet::file::page_index::offset_index::PageLocation>>>;
+
+/// Per-row-group inputs for page-header inspection.
+pub(super) struct RowGroupPageReadRequest<'a> {
+    pub(super) reader: &'a mut ParquetFileReader,
+    pub(super) path: &'a str,
+    pub(super) file_size_bytes: u64,
+    pub(super) row_group_index: usize,
+    pub(super) row_group: &'a parquet::file::metadata::RowGroupMetaData,
+    pub(super) requested_columns: &'a std::collections::BTreeSet<String>,
+    pub(super) columns: &'a [PredicateColumn],
+}
 
 /// Inputs needed to inspect data-page headers for selected predicate columns.
 pub(super) struct PageHeaderReadRequest<'a> {

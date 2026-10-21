@@ -49,7 +49,7 @@ fn spill_writer_splits_batches_by_decoded_workspace_budget() -> Result<()> {
         .expect("open generated aggregate spill run");
     let mut rows = 0;
     let mut batches = 0;
-    while let Some(batch) = reader.reader.next() {
+    for batch in reader.reader.by_ref() {
         let view = crate::pipeline::arrow_adapter::from_record_batch(
             batch.expect("read generated aggregate spill batch"),
         )?;

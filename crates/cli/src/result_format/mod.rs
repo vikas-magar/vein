@@ -169,12 +169,12 @@ fn contiguous_run_batch(
     }
 
     let mut columns = Vec::with_capacity(view.num_columns());
-    for column in 0..view.num_columns() {
+    for (column, base) in bases.iter().enumerate() {
         let field = schema
             .fields()
             .get(column)
             .ok_or_else(|| VeinError::internal("JSON result schema is narrower than its view"))?;
-        let array = match &bases[column] {
+        let array = match base {
             Some((array, source_row)) => array.slice(*source_row, run_len),
             None => new_null_array(field.data_type(), run_len),
         };

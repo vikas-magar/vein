@@ -4,7 +4,7 @@ use arrow::array::ArrayRef;
 use common::Result;
 use error::VeinError;
 
-use super::value::{ExpressionValue, ViewColumnValue};
+use super::expression_value::{ExpressionValue, ViewColumnValue};
 use super::ExpressionDatum;
 
 /// One kernel input run; a missing array denotes an outer-join NULL run.

@@ -112,14 +112,14 @@ impl AggregateSink {
             }
             for array in key_arrays.iter().flatten() {
                 let identity = Arc::as_ptr(array) as *const () as usize;
-                if !leases.contains_key(&identity) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = leases.entry(identity) {
                     match self.tracker.lease_retained_array(
                         identity,
                         array.get_array_memory_size(),
                         "aggregate spill merge keys",
                     ) {
                         Ok(lease) => {
-                            leases.insert(identity, lease);
+                            entry.insert(lease);
                         }
                         Err(error) => {
                             self.memory.shrink(self.memory.bytes() - before);
@@ -151,7 +151,12 @@ impl AggregateSink {
                 batch: self.group_key_batches.len(),
                 row,
             });
-            self.group_key_batches.push(key_columns);
+            self.group_key_batches.push(
+                key_columns
+                    .into_iter()
+                    .map(|column| column.map(Arc::new))
+                    .collect(),
+            );
             self.group_key_batch_arrays.push(key_arrays);
             self.group_key_batch_leases.push(leases);
             let slot = Self::push_group(

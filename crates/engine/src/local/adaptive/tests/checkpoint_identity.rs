@@ -89,21 +89,21 @@ fn signature_match_counts_locate_source_filter_and_projection_differences() {
         1,
     ))
         .unwrap();
-    let counts = signature_match_counts(&different_filter, &[first.clone()]);
+    let counts = signature_match_counts(&different_filter, std::slice::from_ref(&first));
     assert_eq!(counts.same_source, 1);
     assert_eq!(counts.same_filters, 0);
     assert_eq!(counts.same_projection, 1);
     assert_eq!(counts.exact, 0);
 
-    let counts = signature_match_counts(&first, &[first.clone()]);
+    let counts = signature_match_counts(&first, std::slice::from_ref(&first));
     assert_eq!(counts.exact, 1);
 }
 
 fn with_filter_bound(mut plan: LogicalPlan, bound: i64) -> LogicalPlan {
-    if let LogicalPlan::Scan { filters, .. } = &mut plan {
-        if let LogicalExpr::BinaryOp { right, .. } = &mut filters[0] {
-            *right = Box::new(LogicalExpr::Literal(plan::LogicalLiteral::Int64(bound)));
-        }
+    if let LogicalPlan::Scan { filters, .. } = &mut plan
+        && let LogicalExpr::BinaryOp { right, .. } = &mut filters[0]
+    {
+        **right = LogicalExpr::Literal(plan::LogicalLiteral::Int64(bound));
     }
     plan
 }

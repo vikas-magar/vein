@@ -79,13 +79,15 @@ pub(in crate::scan::parquet) async fn read_page_header_statistics(
             continue;
         };
         chunk::read_requested_row_group(
-            &mut reader,
-            path,
-            file_size_bytes,
-            *row_group_index,
-            row_group,
-            requested_columns,
-            &columns,
+            super::RowGroupPageReadRequest {
+                reader: &mut reader,
+                path,
+                file_size_bytes,
+                row_group_index: *row_group_index,
+                row_group,
+                requested_columns,
+                columns: &columns,
+            },
             &mut result,
         )
             .await;

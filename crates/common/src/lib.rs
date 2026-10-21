@@ -8,9 +8,6 @@ pub mod identifiers;
 /// Cooperative cancellation for async tasks.
 pub mod cancellation;
 
-/// System initialization and node primitives.
-pub mod system;
-
 /// Shared structured logging initialization.
 pub mod logging;
 /// Execution program and task types shared with the local runtime.

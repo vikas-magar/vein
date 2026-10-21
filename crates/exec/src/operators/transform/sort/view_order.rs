@@ -6,7 +6,7 @@ use std::mem::size_of;
 
 use arrow::compute::SortOptions;
 use arrow_cmp::{DynComparator, make_comparator};
-use common::protocol::SortPlan;
+use common::protocol::{SortKey, SortPlan};
 use error::VeinError;
 
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
@@ -80,12 +80,9 @@ impl<'a> ViewRowOrder<'a> {
                 (Some((left_array, left_index)), Some((right_array, right_index))) => {
                     self.compare_arrays(
                         key_index,
-                        key.ascending,
-                        key.nulls_first,
-                        left_array,
-                        left_index,
-                        right_array,
-                        right_index,
+                        key,
+                        (left_array, left_index),
+                        (right_array, right_index),
                     )?
                 }
             };
@@ -99,13 +96,12 @@ impl<'a> ViewRowOrder<'a> {
     fn compare_arrays(
         &mut self,
         key_index: usize,
-        ascending: bool,
-        nulls_first: bool,
-        left: &arrow::array::ArrayRef,
-        left_index: usize,
-        right: &arrow::array::ArrayRef,
-        right_index: usize,
+        key: &SortKey,
+        left: (&arrow::array::ArrayRef, usize),
+        right: (&arrow::array::ArrayRef, usize),
     ) -> common::Result<Ordering> {
+        let (left, left_index) = left;
+        let (right, right_index) = right;
         let left_identity = std::sync::Arc::as_ptr(left) as *const () as usize;
         let right_identity = std::sync::Arc::as_ptr(right) as *const () as usize;
         let cache_key = (key_index, left_identity, right_identity);
@@ -116,8 +112,8 @@ impl<'a> ViewRowOrder<'a> {
                 left.as_ref(),
                 right.as_ref(),
                 SortOptions {
-                    descending: !ascending,
-                    nulls_first,
+                    descending: !key.ascending,
+                    nulls_first: key.nulls_first,
                 },
             )
                 .map_err(|error| {

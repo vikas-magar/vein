@@ -101,7 +101,7 @@ impl AggregateSink {
         let key = self.group_key_batches[location.batch][column]
             .as_ref()
             .ok_or_else(|| VeinError::internal("aggregate output group key is missing"))?;
-        match key {
+        match key.as_ref() {
             GroupKeyColumn::View(view) => view.resolve(0, location.row),
             _ => self.group_key_batch_arrays[location.batch][column]
                 .first()

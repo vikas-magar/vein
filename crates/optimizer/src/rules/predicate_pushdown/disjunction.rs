@@ -8,16 +8,29 @@ use plan::{LogicalExpr, LogicalPlan, PlanTraversal, ResolvedColumnRef, VeinDataT
 
 use super::super::predicate_utils::referenced_columns;
 
+pub(super) struct InnerJoinContext<'a> {
+    pub(super) left: &'a LogicalPlan,
+    pub(super) right: &'a LogicalPlan,
+    pub(super) on: &'a Option<LogicalExpr>,
+    pub(super) using: &'a [ResolvedColumnRef],
+    pub(super) schema: &'a VeinSchema,
+    pub(super) left_columns: &'a HashSet<plan::ColumnId>,
+    pub(super) right_columns: &'a HashSet<plan::ColumnId>,
+}
+
 pub(super) fn pushdown_inner_join(
-    left: &LogicalPlan,
-    right: &LogicalPlan,
-    on: &Option<LogicalExpr>,
-    using: &[ResolvedColumnRef],
-    schema: &VeinSchema,
+    join: InnerJoinContext<'_>,
     residual: &LogicalExpr,
-    left_columns: &HashSet<plan::ColumnId>,
-    right_columns: &HashSet<plan::ColumnId>,
 ) -> Option<LogicalPlan> {
+    let InnerJoinContext {
+        left,
+        right,
+        on,
+        using,
+        schema,
+        left_columns,
+        right_columns,
+    } = join;
     if !residual.is_reorder_safe() {
         return None;
     }

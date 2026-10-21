@@ -10,6 +10,11 @@ use super::super::policy::RuntimeFilterPruningDiagnostic;
 use super::evaluation::{RuntimeFilterBinding, RuntimeFilterStatisticsRole};
 use super::RuntimeFilterSet;
 
+struct FilterGroup<'a> {
+    columns: Vec<ColumnId>,
+    filters: Vec<&'a Arc<dyn RuntimeFilter>>,
+}
+
 impl RuntimeFilterSet {
     /// Collect safe format-neutral predicates for source-level metadata
     /// pruning. These predicates are additional necessary conditions and are
@@ -86,15 +91,15 @@ impl RuntimeFilterSet {
         // Filters that need the same column set share one decode stage. Other
         // sets stay separate so capable readers can apply row selection between
         // stages.
-        let mut groups: Vec<(Vec<ColumnId>, Vec<&Arc<dyn RuntimeFilter>>)> = Vec::new();
+        let mut groups: Vec<FilterGroup<'_>> = Vec::new();
         for filter in row_filters {
             let mut columns = filter.required_columns().to_vec();
             columns.sort_unstable();
             columns.dedup();
-            if let Some((_, group)) = groups.iter_mut().find(|(existing, _)| *existing == columns) {
-                group.push(filter);
+            if let Some(group) = groups.iter_mut().find(|group| group.columns == columns) {
+                group.filters.push(filter);
             } else {
-                groups.push((columns, vec![filter]));
+                groups.push(FilterGroup { columns, filters: vec![filter] });
             }
         }
 
@@ -102,14 +107,14 @@ impl RuntimeFilterSet {
         groups
             .into_iter()
             .enumerate()
-            .map(|(index, (_, filters))| {
+            .map(|(index, group)| {
                 let role = match (index == 0, index + 1 == count) {
                     (true, true) => RuntimeFilterStatisticsRole::BOTH,
                     (true, false) => RuntimeFilterStatisticsRole::FIRST,
                     (false, true) => RuntimeFilterStatisticsRole::LAST,
                     (false, false) => RuntimeFilterStatisticsRole::NONE,
                 };
-                self.bind_filters(schema, &filters, role)
+                self.bind_filters(schema, &group.filters, role)
             })
             .collect()
     }

@@ -53,7 +53,7 @@ pub(super) fn retain_new_groups(
         }
         for array in batch.key_arrays.iter().flatten() {
             let identity = Arc::as_ptr(array) as *const () as usize;
-            if !key_leases.contains_key(&identity) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = key_leases.entry(identity) {
                 let lease = sink.tracker.lease_retained_array(
                     identity,
                     array.get_array_memory_size(),
@@ -61,7 +61,7 @@ pub(super) fn retain_new_groups(
                 );
                 match lease {
                     Ok(lease) => {
-                        key_leases.insert(identity, lease);
+                        entry.insert(lease);
                     }
                     Err(error) => {
                         rollback_new_groups(
@@ -117,7 +117,13 @@ pub(super) fn retain_new_groups(
             )));
         }
         let key_batch_index = sink.group_key_batches.len();
-        sink.group_key_batches.push(key_columns.to_vec());
+        sink.group_key_batches.push(
+            key_columns
+                .iter()
+                .cloned()
+                .map(|column| column.map(Arc::new))
+                .collect(),
+        );
         sink.group_key_batch_arrays.push(batch.key_arrays.clone());
         sink.group_key_batch_leases.push(key_leases);
         Some(key_batch_index)

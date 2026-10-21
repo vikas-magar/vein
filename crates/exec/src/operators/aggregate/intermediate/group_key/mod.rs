@@ -11,7 +11,7 @@ use crate::operators::aggregate::group_key::GroupKeyColumn;
 #[derive(Clone)]
 pub(in crate::operators::aggregate) enum AggregateGroupKeyRef {
     Arrow { array: ArrayRef, row: usize },
-    Column { column: GroupKeyColumn, row: usize },
+    Column { column: Arc<GroupKeyColumn>, row: usize },
 }
 
 impl AggregateGroupKeyRef {
@@ -22,7 +22,7 @@ impl AggregateGroupKeyRef {
         Ok(Self::Arrow { array, row })
     }
 
-    pub(in crate::operators::aggregate) fn from_column(column: GroupKeyColumn, row: usize) -> Result<Self> {
+    pub(in crate::operators::aggregate) fn from_column(column: Arc<GroupKeyColumn>, row: usize) -> Result<Self> {
         if row >= column.len() {
             return Err(VeinError::internal("aggregate key row is outside its key column"));
         }
@@ -38,7 +38,7 @@ impl AggregateGroupKeyRef {
     pub(in crate::operators::aggregate) fn group_key_column(&self) -> Result<GroupKeyColumn> {
         match self {
             Self::Arrow { array, .. } => GroupKeyColumn::new(array),
-            Self::Column { column, .. } => Ok(column.clone()),
+            Self::Column { column, .. } => Ok((**column).clone()),
         }
     }
 
