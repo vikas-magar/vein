@@ -7,6 +7,14 @@
 
 /// Generic streaming analysis orchestration and source/publisher contracts.
 pub mod analysis;
+/// Shared, query-time statistics observations collected from borrowed batches.
+pub mod runtime;
+/// One query-scoped view of source metadata and lazily collected runtime feedback.
+pub mod context;
+/// Query-lifetime state shared by task-local execution decisions.
+pub mod query_state;
+/// Compact, payload-safe formatting for query statistics diagnostics.
+pub mod logging;
 
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
@@ -18,7 +26,6 @@ use arrow::array::{
     UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use arrow::record_batch::RecordBatch;
 use catalog::{
     ByteLengthStatistics, ColumnGroupStatistics, ColumnStatistics, HistogramBucket,
     HistogramSample, HistogramStatistics, MostCommonValue, MostCommonValuesStatistics,
@@ -32,7 +39,22 @@ use std::collections::BinaryHeap;
 use crate::Result;
 
 mod accumulators;
+mod input;
+pub use input::StatisticsInput;
+#[cfg(test)]
+pub(crate) use input::OwnedSelectedRecordBatch;
 pub use accumulators::StatisticsCollector;
+pub use runtime::{RuntimeStatisticsObservation, RuntimeStatisticsStore};
+pub use context::{
+    OperatorCounter, OperatorStatisticsHandle, OperatorStatisticsIdentity, OperatorStatisticsSnapshot,
+    QuerySourceStatistics, QueryStatisticsContext, QueryStatisticsSnapshot,
+};
+pub use query_state::QueryStateRegistry;
+pub use logging::TableStatisticsLog;
+
+/// Unambiguous synopsis key for a column in a query-local intermediate relation.
+/// Display names can repeat after joins; bound identities cannot alias inputs.
+pub fn intermediate_column_key(id: types::ColumnId) -> String { id.0.to_string() }
 #[cfg(test)]
 mod tests;
 

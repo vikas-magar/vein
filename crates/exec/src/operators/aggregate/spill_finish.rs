@@ -1,21 +1,26 @@
 use super::*;
 
 impl AggregateSink {
-    pub(super) fn finish_spill_partition(
+    pub(super) fn finish_spill_partition_view(
         plan: &AggregatePlan,
         tracker: &QueryMemoryTracker,
+        registry: &Arc<FunctionRegistry>,
         schema: &AggregateSpillSchema,
         runs: Vec<SpillRun>,
         bit: u32,
         batch_rows: NonZeroUsize,
-        emit: &mut impl FnMut(DataChunk) -> Result<()>,
+        emit: &mut impl FnMut(DataChunkView) -> Result<()>,
     ) -> Result<()> {
         tracker.check_cancelled()?;
         let mut partition_plan = plan.clone();
         // Planner estimates describe the original full input and must not
         // preallocate a partition's hash table beyond its actual memory budget.
         partition_plan.estimated_groups = None;
-        let mut sink = AggregateSink::with_memory_tracker(partition_plan, tracker.clone())?;
+        let mut sink = AggregateSink::with_registry_and_memory_tracker(
+            partition_plan,
+            tracker.clone(),
+            Arc::clone(registry),
+        )?;
         let merge_result = (|| {
             for run in &runs {
                 tracker.check_cancelled()?;
@@ -32,7 +37,7 @@ impl AggregateSink {
 
         match merge_result {
             Ok(()) => {
-                let finish_result = sink.finish_in_memory_with(batch_rows, emit);
+                let finish_result = sink.finish_in_memory_view_with(batch_rows, emit);
                 drop(sink);
                 finish_result?;
                 drop(runs);
@@ -52,9 +57,10 @@ impl AggregateSink {
                     "aggregate spill partition exceeded memory and was repartitioned"
                 );
                 for child in children.into_iter().flatten() {
-                    Self::finish_spill_partition(
+                    Self::finish_spill_partition_view(
                         plan,
                         tracker,
+                        registry,
                         schema,
                         vec![child],
                         bit + 1,
@@ -98,6 +104,6 @@ impl AggregateSink {
             return key_column(&keys, data_type);
         }
         let offset = column - groups;
-        self.aggregate_states[offset].to_array_range(self.plan.aggs[offset], data_type, range)
+        self.aggregate_states[offset].finalize(range)
     }
 }

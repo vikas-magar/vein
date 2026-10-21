@@ -30,20 +30,15 @@ pub(in crate::runtime::tests) fn task() -> ExecuteTask {
         PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram {
-                register_count: 3,
-                instructions: vec![
-                    MicroOp::LoadConstant {
-                        dst: 1,
-                        value: types::LogicalLiteral::Int64(2),
-                    },
-                    MicroOp::CmpGt {
-                        dst: 2,
-                        src1: 0,
-                        src2: 1,
-                    },
-                    MicroOp::FilterMask { bool_reg: 2 },
-                    MicroOp::ProjectRegisters { out_regs: vec![0] },
+            program: Arc::new(ExpressionProgram {
+                steps: vec![
+                    ExpressionStep::Filter(binary_expr(
+                        BinaryExprOp::Greater,
+                        column_expr(0, VeinDataType::Int64),
+                        literal_expr(LogicalLiteral::Int64(2), VeinDataType::Int64),
+                        VeinDataType::Boolean,
+                    )),
+                    ExpressionStep::Projection(vec![column_expr(0, VeinDataType::Int64)]),
                 ],
             }),
         },
@@ -55,6 +50,7 @@ pub(in crate::runtime::tests) fn task() -> ExecuteTask {
         attempt: 0,
         query_id: QueryId::new(),
         stage_id: StageId::new(),
+        statistics_context: None,
 
         plan: PhysicalPlan {
             root: plan_node(
@@ -78,10 +74,7 @@ pub(in crate::runtime::tests) fn aggregate_task_with_post_filter(threshold: i64)
         PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram {
-                register_count: 1,
-                instructions: vec![MicroOp::ProjectRegisters { out_regs: vec![0] }],
-            }),
+            program: projection_program(vec![column_expr(0, VeinDataType::Int64)]),
         },
     );
     let aggregate = plan_node(
@@ -103,28 +96,17 @@ pub(in crate::runtime::tests) fn aggregate_task_with_post_filter(threshold: i64)
         Arc::clone(&schema),
         PhysicalPlanOperator::Transform {
             input: aggregate,
-            program: Arc::new(MicroProgram {
-                register_count: 3,
-                instructions: vec![
-                    MicroOp::LoadConstant {
-                        dst: 1,
-                        value: types::LogicalLiteral::Int64(threshold),
-                    },
-                    MicroOp::CmpGt {
-                        dst: 2,
-                        src1: 0,
-                        src2: 1,
-                    },
-                    MicroOp::FilterMask { bool_reg: 2 },
-                ],
-            }),
+            program: filter_program(binary_expr(
+                BinaryExprOp::Greater,
+                column_expr(0, VeinDataType::Int64),
+                literal_expr(LogicalLiteral::Int64(threshold), VeinDataType::Int64),
+                VeinDataType::Boolean,
+            )),
         },
     );
     task.plan = plan_with_input(&task, filtered);
     task
 }
-
-
 
 
 

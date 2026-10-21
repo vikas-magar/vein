@@ -23,7 +23,7 @@ impl JoinFilterCollector {
     }
 }
 
-impl PipelineNode<DataChunkView> for JoinFilterCollector {
+impl PipelineNode for JoinFilterCollector {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         *self.output.lock().map_err(|_| VeinError::internal("join filter collector poisoned"))? = Some(view);
         Ok(())

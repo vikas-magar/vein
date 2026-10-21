@@ -1,30 +1,20 @@
 //! Physical task definitions, execution modes, sources, and sinks.
 
-use catalog::{CatalogSnapshotToken, StatisticsPredicate};
+use catalog::{CatalogSnapshotToken, DataFileFormatId, StatisticsPredicate, StorageFileMetadata};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::sync::Arc;
 use types::VeinSchemaRef;
 
-use super::ir::{MicroProgram, RegId};
-use crate::identifiers::{QueryId, RequestId, StageId, TaskId};
-
-/// Supported file formats for storage scans.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FileFormat {
-    /// Apache Parquet
-    Parquet,
-    /// Comma-Separated Values
-    Csv,
-    /// JavaScript Object Notation
-    Json,
-}
+use super::expression::{ExpressionProgram, PhysicalExpr};
+use super::encoding::ColumnEncodingHint;
+use crate::identifiers::{IntermediateSourceId, QueryId, RequestId, StageId, TaskId};
+use crate::statistics::QueryStatisticsContext;
 
 /// A source predicate plan evaluated before projected rows are materialized.
 ///
-/// It is held as compiled Micro-IR so a source uses the same VM as the residual
-/// pipeline. Stages are applied in order, allowing a selective safe predicate to
-/// reduce the input to later stages without materializing conjunction arrays.
+/// Stages are applied in order, allowing a selective safe predicate to reduce
+/// the input to later stages without materializing conjunction arrays.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanPredicate {
     /// Number of logical conjuncts in the source predicate.
@@ -42,13 +32,14 @@ pub struct ScanPredicate {
 pub struct ScanPredicateStage {
     /// Number of logical conjuncts combined in this stage.
     pub predicate_count: usize,
-    /// Stage input columns, in register order: input column `i` is mounted into
-    /// VM register `i`.
+    /// Whether evaluating this stage in a different order is semantics-safe.
+    /// A missing value defaults to false so older serialized plans stay conservative.
+    #[serde(default)]
+    pub reorder_safe: bool,
+    /// Stage input columns in the order addressed by its expression tree.
     pub input: VeinSchemaRef,
-    /// Program computing this stage's boolean for one input batch.
-    pub program: Arc<MicroProgram>,
-    /// Register holding the boolean result.
-    pub result: RegId,
+    /// Boolean expression evaluated for one source batch.
+    pub predicate: PhysicalExpr,
 }
 
 /// Self-contained file scan instruction for an Executor.
@@ -56,8 +47,19 @@ pub struct ScanPredicateStage {
 pub struct FileScanTask {
     /// List of URIs/Paths to the files.
     pub files: Vec<String>,
-    /// The format of the files.
-    pub format: FileFormat,
+    /// Storage snapshots aligned with `files`; empty when unavailable.
+    /// These snapshots let scan providers reuse catalog metadata without
+    /// issuing another storage stat request or reconstructing object identity.
+    #[serde(default)]
+    pub storage_metadata: Vec<StorageFileMetadata>,
+    /// Identifier of the registered reader for these files.
+    pub data_file_format: DataFileFormatId,
+    /// Reader-specific settings. The registered provider validates and interprets these values.
+    #[serde(default)]
+    pub format_options: Vec<KeyValue>,
+    /// Best-effort output encoding requests addressed to projected columns.
+    #[serde(default)]
+    pub column_encoding_hints: Vec<ColumnEncodingHint>,
     /// Optional byte range within the file.
     pub byte_range: Option<Range<u64>>,
     /// Optional range of reader-defined, independently schedulable units in a
@@ -70,12 +72,6 @@ pub struct FileScanTask {
     /// Refcounted so splitting one file scan into per-file tasks copies a
     /// handle rather than the schema.
     pub projected: VeinSchemaRef,
-    /// Projected column positions that may retain Parquet dictionary encoding.
-    ///
-    /// This is an execution hint for consumers that can use dictionary IDs
-    /// directly. An empty list keeps the default decoded Arrow representation.
-    #[serde(default)]
-    pub dictionary_columns: Vec<u32>,
     /// Push-down predicate the source evaluates before materializing rows.
     ///
     /// Refcounted for the same reason as `projected`: splitting a scan into
@@ -87,6 +83,27 @@ pub struct FileScanTask {
     pub task_id: TaskId,
     /// Catalog snapshot pinned by the planning session.
     pub catalog_snapshot: Option<CatalogSnapshotToken>,
+    /// Runtime synopsis collection context, when the planner identified a table scan.
+    #[serde(default)]
+    pub runtime_statistics: Option<RuntimeStatisticsScan>,
+}
+
+/// Stable identity and coverage information for lazy runtime statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeStatisticsScan {
+    /// Identity shared by all independently scheduled pieces of this scan.
+    pub scan_id: u128,
+    /// Source revision key used to prevent cross-snapshot statistics reuse.
+    pub table_key: String,
+    /// Exact row count from the catalog, when available.
+    pub expected_rows: Option<u64>,
+    /// Whether the plan can prove complete source-row coverage. Column
+    /// coverage is independent: projected-column synopses may still be useful.
+    pub row_coverage_candidate: bool,
+    /// Ordinal of this independently scheduled work unit.
+    pub partition_index: usize,
+    /// Number of work units that must finish before the synopsis is finalized.
+    pub partition_count: usize,
 }
 
 /// Read from an infinite stream.
@@ -98,6 +115,9 @@ pub struct StreamSource {
 
 /// Source of data for a stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Physical plan nodes retain this enum behind an Arc. Keeping the file task
+// inline avoids a second allocation for its already heap-backed metadata.
+#[allow(clippy::large_enum_variant)]
 pub enum DataSource {
     /// Read from static storage (e.g., Parquet).
     File(FileScanTask),
@@ -105,6 +125,11 @@ pub enum DataSource {
     Stream(StreamSource),
     /// A source that generates data directly (e.g. VALUES).
     Memory,
+    /// A query-local relation produced by an earlier adaptive stage.
+    ///
+    /// The identifier is resolved by the in-process executor registry. The
+    /// relation payload itself is deliberately not serialized into the plan.
+    Intermediate(IntermediateSourceId),
 }
 
 /// Immutable, schema-aware physical plan tree shared by planning and execution.
@@ -120,6 +145,173 @@ pub struct PhysicalPlan {
     pub root: Arc<PhysicalPlanNode>,
 }
 
+/// The two physical fragments produced by cutting a plan at a checkpoint.
+pub struct CheckpointPlanFragments {
+    /// Upstream subtree that materializes the checkpoint relation.
+    pub producer: PhysicalPlan,
+    /// Remaining downstream operators reading the registered relation.
+    pub continuation: PhysicalPlan,
+}
+
+impl PhysicalPlan {
+    /// Split this canonical plan at one node for adaptive execution.
+    ///
+    /// The producer retains the selected subtree and writes its output through a
+    /// client-shaped sink, which can be replaced by the checkpoint sink by the
+    /// coordinator. The continuation preserves the surrounding immutable
+    /// operator tree and replaces the selected subtree with an intermediate
+    /// source. It returns `None` if the node is absent, is the output sink, or is
+    /// referenced more than once in the plan.
+    pub fn split_at_checkpoint(
+        &self,
+        target: &Arc<PhysicalPlanNode>,
+        source_id: IntermediateSourceId,
+    ) -> Option<CheckpointPlanFragments> {
+        if Arc::ptr_eq(&self.root, target)
+            || matches!(target.operator, PhysicalPlanOperator::Sink { .. })
+        {
+            return None;
+        }
+
+        let source = Arc::new(PhysicalPlanNode {
+            output_schema: Arc::clone(&target.output_schema),
+            operator: PhysicalPlanOperator::Pipeline {
+                source: Arc::new(DataSource::Intermediate(source_id)),
+                input_schema: Arc::clone(&target.output_schema),
+                program: Arc::new(ExpressionProgram::empty()),
+            },
+        });
+        let (continuation_root, replacements) = replace_plan_node(&self.root, target, &source);
+        if replacements != 1 {
+            return None;
+        }
+
+        let producer = PhysicalPlan {
+            root: Arc::new(PhysicalPlanNode {
+                output_schema: Arc::clone(&target.output_schema),
+                operator: PhysicalPlanOperator::Sink {
+                    input: Arc::clone(target),
+                    sink: Arc::new(DataSink::Client {
+                        schema: Arc::clone(&target.output_schema),
+                    }),
+                },
+            }),
+        };
+        Some(CheckpointPlanFragments {
+            producer,
+            continuation: PhysicalPlan {
+                root: continuation_root,
+            },
+        })
+    }
+}
+
+fn replace_plan_node(
+    current: &Arc<PhysicalPlanNode>,
+    target: &Arc<PhysicalPlanNode>,
+    replacement: &Arc<PhysicalPlanNode>,
+) -> (Arc<PhysicalPlanNode>, usize) {
+    if Arc::ptr_eq(current, target) {
+        return (Arc::clone(replacement), 1);
+    }
+
+    let (operator, replacements) = match &current.operator {
+        PhysicalPlanOperator::Pipeline {
+            source,
+            input_schema,
+            program,
+        } => (
+            PhysicalPlanOperator::Pipeline {
+                source: Arc::clone(source),
+                input_schema: Arc::clone(input_schema),
+                program: Arc::clone(program),
+            },
+            0,
+        ),
+        PhysicalPlanOperator::Transform { input, program } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (
+                PhysicalPlanOperator::Transform {
+                    input,
+                    program: Arc::clone(program),
+                },
+                count,
+            )
+        }
+        PhysicalPlanOperator::Join { probe, build, plan } => {
+            let (probe, probe_count) = replace_plan_node(probe, target, replacement);
+            let (build, build_count) = replace_plan_node(build, target, replacement);
+            (
+                PhysicalPlanOperator::Join {
+                    probe,
+                    build,
+                    plan: plan.clone(),
+                },
+                probe_count + build_count,
+            )
+        }
+        PhysicalPlanOperator::Aggregate { input, plan } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (
+                PhysicalPlanOperator::Aggregate {
+                    input,
+                    plan: plan.clone(),
+                },
+                count,
+            )
+        }
+        PhysicalPlanOperator::Distinct { input, plan } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (
+                PhysicalPlanOperator::Distinct {
+                    input,
+                    plan: plan.clone(),
+                },
+                count,
+            )
+        }
+        PhysicalPlanOperator::Sort {
+            input,
+            plan,
+            key_program,
+            output_columns,
+        } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (
+                PhysicalPlanOperator::Sort {
+                    input,
+                    plan: plan.clone(),
+                    key_program: key_program.clone(),
+                    output_columns: *output_columns,
+                },
+                count,
+            )
+        }
+        PhysicalPlanOperator::Limit { input, spec } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (PhysicalPlanOperator::Limit { input, spec: *spec }, count)
+        }
+        PhysicalPlanOperator::Sink { input, sink } => {
+            let (input, count) = replace_plan_node(input, target, replacement);
+            (
+                PhysicalPlanOperator::Sink {
+                    input,
+                    sink: Arc::clone(sink),
+                },
+                count,
+            )
+        }
+    };
+
+    (
+        Arc::new(PhysicalPlanNode {
+            output_schema: Arc::clone(&current.output_schema),
+            operator,
+        }),
+        replacements,
+    )
+}
+
 /// One immutable operator node in a [`PhysicalPlan`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhysicalPlanNode {
@@ -133,21 +325,21 @@ pub struct PhysicalPlanNode {
 /// Physical operator semantics stored in the canonical plan tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PhysicalPlanOperator {
-    /// A data source and its source-local vector program.
+    /// A data source and its source-local expression pipeline.
     Pipeline {
         /// Source descriptor.
         source: Arc<DataSource>,
         /// Ordered columns emitted by the source before the program runs.
         input_schema: VeinSchemaRef,
-        /// Program applied to each source batch.
-        program: Arc<MicroProgram>,
+        /// Expressions applied to each source batch.
+        program: Arc<ExpressionProgram>,
     },
-    /// A vector program applied to a recursively produced input.
+    /// Expressions applied to a recursively produced input.
     Transform {
         /// Child input.
         input: Arc<PhysicalPlanNode>,
-        /// Program applied to the child batches.
-        program: Arc<MicroProgram>,
+        /// Expressions applied to the child batches.
+        program: Arc<ExpressionProgram>,
     },
     /// A hash join over probe and build inputs.
     Join {
@@ -178,8 +370,8 @@ pub enum PhysicalPlanOperator {
         input: Arc<PhysicalPlanNode>,
         /// Sort keys and their ordering semantics.
         plan: SortPlan,
-        /// Optional program that appends computed sort keys.
-        key_program: Option<Arc<MicroProgram>>,
+        /// Optional expression pipeline that appends computed sort keys.
+        key_program: Option<Arc<ExpressionProgram>>,
         /// Number of child columns to retain after removing helper keys.
         output_columns: u32,
     },
@@ -246,10 +438,11 @@ pub struct OperatorDataFlow {
 impl PhysicalPlanOperator {
     /// Derives the view/materialization contract from this canonical operator.
     ///
-    /// Kernel conversions are conditional: direct VM projections do not need
+    /// Kernel conversions are conditional: direct column projections do not need
     /// arrays, and Cross joins with no residual do not need hash-key conversion.
-    /// Sort includes any computed-key program. Aggregate/storage boundaries need
-    /// arrays; clients choose their result format and discard consumes references.
+    /// Sort includes any computed-key program. Aggregate and DISTINCT kernels
+    /// read only their required columns; grouping keys remain reference-backed.
+    /// Storage and client boundaries decide when complete arrays are required.
     pub fn data_flow(&self) -> OperatorDataFlow {
         use InputMaterialization::{ConsumerBoundary, KernelColumns, None, WholeBatch};
         use OutputRepresentation::{References, ReferencesAndComputed, ResultArrays, Sink};
@@ -260,15 +453,23 @@ impl PhysicalPlanOperator {
             Self::Join { .. } => ("join", KernelColumns, References),
             Self::Sort { .. } => ("sort", KernelColumns, References),
             Self::Limit { .. } => ("limit", None, References),
-            Self::Aggregate { .. } => ("aggregate", WholeBatch, ResultArrays),
-            Self::Distinct { .. } => ("distinct", WholeBatch, ResultArrays),
-            Self::Sink { sink, .. } => ("sink", match sink.as_ref() {
-                DataSink::Client { .. } => ConsumerBoundary,
-                DataSink::Storage(_) => WholeBatch,
-                DataSink::Discard => None,
-            }, Sink),
+            Self::Aggregate { .. } => ("aggregate", KernelColumns, ResultArrays),
+            Self::Distinct { .. } => ("distinct", KernelColumns, ResultArrays),
+            Self::Sink { sink, .. } => (
+                "sink",
+                match sink.as_ref() {
+                    DataSink::Client { .. } => ConsumerBoundary,
+                    DataSink::Storage(_) => WholeBatch,
+                    DataSink::Discard => None,
+                },
+                Sink,
+            ),
         };
-        OperatorDataFlow { operator, input_materialization, output }
+        OperatorDataFlow {
+            operator,
+            input_materialization,
+            output,
+        }
     }
 }
 
@@ -389,6 +590,13 @@ pub struct ExecuteTask {
     pub stage_id: StageId,
     /// The authoritative physical operator tree for this task.
     pub plan: PhysicalPlan,
+    /// In-process query statistics shared by planning and local execution.
+    ///
+    /// This is deliberately excluded from the serialized task payload. A local
+    /// coordinator attaches the context after planning; remote executors receive
+    /// the self-contained plan and can provide their own local context.
+    #[serde(skip)]
+    pub statistics_context: Option<Arc<QueryStatisticsContext>>,
 }
 
 use super::{AggOpCode, JoinKind};
@@ -433,8 +641,8 @@ pub struct JoinPlan {
 pub struct JoinResidualPlan {
     /// Columns gathered from the probe and build rows for predicate evaluation.
     pub input_columns: Vec<JoinOutput>,
-    /// VM program that filters candidate pairs in place through its selection.
-    pub program: Arc<MicroProgram>,
+    /// Typed expression steps that filter candidate pairs through a selection.
+    pub program: Arc<ExpressionProgram>,
 }
 
 /// The row window a task emits: skip `offset` rows, then emit at most `count`.
@@ -513,10 +721,11 @@ fn default_emit_empty_group() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AggOpCode, AggregatePlan, DataSink, DataSource, JoinKind, JoinOutput, JoinPlan, LimitSpec,
-        MicroProgram, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator, SortKey, SortPlan,
-        InputMaterialization, OutputRepresentation,
+        AggOpCode, AggregatePlan, DataSink, DataSource, InputMaterialization, JoinKind, JoinOutput,
+        JoinPlan, LimitSpec, ExpressionProgram, OutputRepresentation, PhysicalPlan, PhysicalPlanNode,
+        PhysicalPlanOperator, SortKey, SortPlan,
     };
+    use crate::identifiers::IntermediateSourceId;
     use std::sync::Arc;
     use types::VeinSchema;
 
@@ -583,17 +792,29 @@ mod tests {
         let input = node(PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::new(VeinSchema::empty()),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         });
         for (sink, expected) in [
             (DataSink::Discard, InputMaterialization::None),
-            (DataSink::Client { schema: Arc::new(VeinSchema::empty()) },
-                InputMaterialization::ConsumerBoundary),
-            (DataSink::Storage(super::StorageTarget::new(
-                "test", Vec::new(), Arc::new(VeinSchema::empty()),
-            )), InputMaterialization::WholeBatch),
+            (
+                DataSink::Client {
+                    schema: Arc::new(VeinSchema::empty()),
+                },
+                InputMaterialization::ConsumerBoundary,
+            ),
+            (
+                DataSink::Storage(super::StorageTarget::new(
+                    "test",
+                    Vec::new(),
+                    Arc::new(VeinSchema::empty()),
+                )),
+                InputMaterialization::WholeBatch,
+            ),
         ] {
-            let operator = PhysicalPlanOperator::Sink { input: Arc::clone(&input), sink: Arc::new(sink) };
+            let operator = PhysicalPlanOperator::Sink {
+                input: Arc::clone(&input),
+                sink: Arc::new(sink),
+            };
             let contract = operator.data_flow();
             assert_eq!(contract.input_materialization, expected);
             assert_eq!(contract.output, OutputRepresentation::Sink);
@@ -605,20 +826,33 @@ mod tests {
         // Exhaustive against the operator enum: a new variant requires both a
         // production contract and regression expectations, without a wildcard.
         let (input, output) = match &node.operator {
-            PhysicalPlanOperator::Pipeline { .. } | PhysicalPlanOperator::Transform { .. } =>
-                (InputMaterialization::KernelColumns, OutputRepresentation::ReferencesAndComputed),
-            PhysicalPlanOperator::Join { .. } | PhysicalPlanOperator::Sort { .. } =>
-                (InputMaterialization::KernelColumns, OutputRepresentation::References),
-            PhysicalPlanOperator::Limit { .. } =>
-                (InputMaterialization::None, OutputRepresentation::References),
-            PhysicalPlanOperator::Aggregate { .. } | PhysicalPlanOperator::Distinct { .. } =>
-                (InputMaterialization::WholeBatch, OutputRepresentation::ResultArrays),
-            PhysicalPlanOperator::Sink { sink, .. } =>
-                (match sink.as_ref() {
+            PhysicalPlanOperator::Pipeline { .. } | PhysicalPlanOperator::Transform { .. } => (
+                InputMaterialization::KernelColumns,
+                OutputRepresentation::ReferencesAndComputed,
+            ),
+            PhysicalPlanOperator::Join { .. } | PhysicalPlanOperator::Sort { .. } => (
+                InputMaterialization::KernelColumns,
+                OutputRepresentation::References,
+            ),
+            PhysicalPlanOperator::Limit { .. } => {
+                (InputMaterialization::None, OutputRepresentation::References)
+            }
+            PhysicalPlanOperator::Aggregate { .. } => (
+                InputMaterialization::KernelColumns,
+                OutputRepresentation::ResultArrays,
+            ),
+            PhysicalPlanOperator::Distinct { .. } => (
+                InputMaterialization::KernelColumns,
+                OutputRepresentation::ResultArrays,
+            ),
+            PhysicalPlanOperator::Sink { sink, .. } => (
+                match sink.as_ref() {
                     DataSink::Client { .. } => InputMaterialization::ConsumerBoundary,
                     DataSink::Storage(_) => InputMaterialization::WholeBatch,
                     DataSink::Discard => InputMaterialization::None,
-                }, OutputRepresentation::Sink),
+                },
+                OutputRepresentation::Sink,
+            ),
         };
         assert_eq!(contract.input_materialization, input);
         assert_eq!(contract.output, output);
@@ -663,7 +897,7 @@ mod tests {
             node(PhysicalPlanOperator::Pipeline {
                 source: Arc::new(DataSource::Memory),
                 input_schema: Arc::new(VeinSchema::empty()),
-                program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
             })
         };
         let join = node(PhysicalPlanOperator::Join {
@@ -681,7 +915,7 @@ mod tests {
         });
         let transformed = node(PhysicalPlanOperator::Transform {
             input: join,
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         });
         let aggregated = node(PhysicalPlanOperator::Aggregate {
             input: transformed,
@@ -763,7 +997,7 @@ mod tests {
         let child = node(PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::new(VeinSchema::empty()),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         });
         let plan = PhysicalPlan {
             root: node(PhysicalPlanOperator::Limit {
@@ -777,11 +1011,80 @@ mod tests {
         let cloned = plan.clone();
 
         assert!(Arc::ptr_eq(&plan.root, &cloned.root));
-        let (PhysicalPlanOperator::Limit { input, .. }, PhysicalPlanOperator::Limit { input: cloned_input, .. }) =
-            (&plan.root.operator, &cloned.root.operator)
+        let (
+            PhysicalPlanOperator::Limit { input, .. },
+            PhysicalPlanOperator::Limit {
+                input: cloned_input,
+                ..
+            },
+        ) = (&plan.root.operator, &cloned.root.operator)
         else {
             panic!("cloned plan should retain its root node");
         };
         assert!(Arc::ptr_eq(input, cloned_input));
+    }
+
+    #[test]
+    fn checkpoint_split_preserves_producer_and_replaces_only_the_continuation_input() {
+        let schema = Arc::new(VeinSchema::empty());
+        let source = node(PhysicalPlanOperator::Pipeline {
+            source: Arc::new(DataSource::Memory),
+            input_schema: Arc::clone(&schema),
+            program: Arc::new(ExpressionProgram::empty()),
+        });
+        let boundary = Arc::new(PhysicalPlanNode {
+            output_schema: Arc::clone(&schema),
+            operator: PhysicalPlanOperator::Transform {
+                input: source,
+            program: Arc::new(ExpressionProgram::empty()),
+            },
+        });
+        let plan = PhysicalPlan {
+            root: Arc::new(PhysicalPlanNode {
+                output_schema: Arc::clone(&schema),
+                operator: PhysicalPlanOperator::Sink {
+                    input: Arc::clone(&boundary),
+                    sink: Arc::new(DataSink::Client {
+                        schema: Arc::clone(&schema),
+                    }),
+                },
+            }),
+        };
+        let source_id = IntermediateSourceId::new();
+
+        let fragments = plan
+            .split_at_checkpoint(&boundary, source_id)
+            .expect("selected subplan should split into two fragments");
+        let PhysicalPlanOperator::Sink {
+            input: producer_input,
+            ..
+        } = &fragments.producer.root.operator
+        else {
+            panic!("producer fragment must end at a checkpoint sink");
+        };
+        assert!(Arc::ptr_eq(producer_input, &boundary));
+
+        let PhysicalPlanOperator::Sink {
+            input: continuation_input,
+            ..
+        } = &fragments.continuation.root.operator
+        else {
+            panic!("continuation must preserve the original output sink");
+        };
+        // The selected transform runs in the producer. Its entire subtree is
+        // replaced in the continuation so it cannot be executed a second time.
+        let PhysicalPlanOperator::Pipeline { source, .. } = &continuation_input.operator
+        else {
+            panic!("boundary should be replaced by an intermediate source");
+        };
+        let DataSource::Intermediate(actual) = source.as_ref() else {
+            panic!("continuation must read the checkpoint relation");
+        };
+        assert_eq!(*actual, source_id);
+
+        assert!(
+            plan.split_at_checkpoint(&plan.root, source_id).is_none(),
+            "the terminal sink cannot be used as a checkpoint boundary"
+        );
     }
 }

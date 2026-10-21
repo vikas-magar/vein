@@ -2,7 +2,7 @@
 //!
 //! Organizes execution stages by streaming role:
 //! - [`source`]: Generates data chunks ([`ScanSource`](source::ScanSource), [`MemorySource`](source::MemorySource)).
-//! - [`transform`]: Processes data chunks ([`LimitTransform`](transform::LimitTransform), [`VectorVmExecutor`](crate::vm::VectorVmExecutor)).
+//! - [`transform`]: Applies streaming row-window and ordering operators.
 //! - [`sink`]: Terminates data streams ([`CollectSink`](sink::CollectSink), [`DiscardSink`](sink::DiscardSink)).
 
 /// Aggregate operators that consume their whole input before emitting

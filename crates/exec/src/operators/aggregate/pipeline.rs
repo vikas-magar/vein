@@ -1,23 +1,26 @@
 use super::*;
+use crate::pipeline::DataChunkView;
 
-/// Forwards pushes into the shared accumulator so the runtime can take the
-/// groups once the source has been drained.
-struct AggregateHandle(Arc<Mutex<AggregateSink>>);
+type SharedAggregateSink = Arc<Mutex<AggregateSink>>;
+type AggregatePipelineNode = Box<dyn PipelineNode>;
+type SharedAggregate = (SharedAggregateSink, AggregatePipelineNode);
 
-/// A worker-owned aggregate state. Unlike [`AggregateHandle`], this node has no
-/// shared lock in its batch path; its sink is consumed once at fan-in combine.
+/// Pushes aggregate inputs into the shared state used by the recursive runtime.
+struct AggregateHandle(SharedAggregateSink);
+
+/// Worker-owned aggregate state, combined into its matching canonical handle.
 struct LocalAggregateHandle(AggregateSink);
 
-impl PipelineNode<DataChunk> for LocalAggregateHandle {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
-        self.0.accumulate(chunk)
+impl PipelineNode for LocalAggregateHandle {
+    fn push(&mut self, batch: DataChunkView) -> Result<()> {
+        self.0.accumulate(batch)
     }
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 
-    fn combine_local(self: Box<Self>, canonical: &mut dyn PipelineNode<DataChunk>) -> Result<()> {
+    fn combine_local(self: Box<Self>, canonical: &mut dyn PipelineNode) -> Result<()> {
         let target = canonical
             .as_any_mut()
             .downcast_mut::<AggregateHandle>()
@@ -30,54 +33,63 @@ impl PipelineNode<DataChunk> for LocalAggregateHandle {
     }
 }
 
-impl PipelineNode<DataChunk> for AggregateHandle {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
-        self.0
+impl PipelineNode for AggregateHandle {
+    fn push(&mut self, batch: DataChunkView) -> Result<()> {
+        let mut sink = self
+            .0
             .lock()
-            .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?
-            .accumulate(chunk)
+            .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
+        sink.accumulate(batch)
     }
 
-    /// Nothing to do: the runtime asks for the groups explicitly, because it
-    /// has to push them into the sink itself.
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 
-    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunk>>>> {
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
         let sink = self
             .0
             .lock()
             .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
-        let mut local = AggregateSink::with_memory_tracker(
+        let mut local = AggregateSink::with_registry_and_memory_tracker(
             sink.plan.clone(),
             sink.tracker.clone(),
+            Arc::clone(&sink.registry),
         )?;
-        // Group hashes are stored in each local index and reused by the
-        // canonical index during merge, so every worker must share its seed.
-        local.hash_builder = sink.hash_builder.clone();
+        local.inherit_hash_builders(&sink)?;
         Ok(Some(Box::new(LocalAggregateHandle(local))))
     }
 }
 
-/// Builds the accumulator and the node that feeds it.
-pub fn shared(
-    plan: AggregatePlan,
-) -> Result<(Arc<Mutex<AggregateSink>>, Box<dyn PipelineNode<DataChunk>>)> {
+/// Builds the accumulator and node for a view-backed aggregate input.
+pub fn shared(plan: AggregatePlan) -> Result<SharedAggregate> {
     shared_with_memory_tracker(
         plan,
         QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new()),
     )
 }
 
-/// Builds a budgeted accumulator and the node that feeds it.
+/// Builds a budgeted accumulator and node for a view-backed aggregate input.
 pub fn shared_with_memory_tracker(
     plan: AggregatePlan,
     tracker: QueryMemoryTracker,
-) -> Result<(Arc<Mutex<AggregateSink>>, Box<dyn PipelineNode<DataChunk>>)> {
-    let sink = Arc::new(Mutex::new(AggregateSink::with_memory_tracker(
-        plan, tracker,
+) -> Result<SharedAggregate> {
+    shared_with_registry_and_memory_tracker(
+        plan,
+        tracker,
+        Arc::new(FunctionRegistry::with_builtins()),
+    )
+}
+
+/// Builds a budgeted aggregate using the same registry as expression execution.
+pub fn shared_with_registry_and_memory_tracker(
+    plan: AggregatePlan,
+    tracker: QueryMemoryTracker,
+    registry: Arc<FunctionRegistry>,
+) -> Result<SharedAggregate> {
+    let sink = Arc::new(Mutex::new(AggregateSink::with_registry_and_memory_tracker(
+        plan, tracker, registry,
     )?));
-    let handle: Box<dyn PipelineNode<DataChunk>> = Box::new(AggregateHandle(Arc::clone(&sink)));
+    let handle: AggregatePipelineNode = Box::new(AggregateHandle(Arc::clone(&sink)));
     Ok((sink, handle))
 }

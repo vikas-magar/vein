@@ -3,19 +3,24 @@ use super::*;
 #[tokio::test]
 async fn full_join_spill_matches_in_memory_result_under_configured_budgets() {
     let task = full_join_spill_task();
+    let spill_factory_calls = Arc::new(AtomicUsize::new(0));
     let in_memory = DefaultTaskExecutor::new(full_join_feed())
         .execute(&task, CancellationToken::new())
         .await
         .expect("in-memory full join");
     let spilling = DefaultTaskExecutor::with_resource_limits(
         full_join_feed(),
-        ExecutionResourceLimits::new(20_000, 1_000_000),
+        ExecutionResourceLimits::new(48_000, 1_000_000),
     )
+        .with_spill_storage_factory(Arc::new(CountingSpillStorageFactory(Arc::clone(
+            &spill_factory_calls,
+        ))))
         .execute(&task, CancellationToken::new())
         .await
         .expect("full join spills within configured disk quota");
 
-    assert_eq!(in_memory.row_count, 133);
+    assert_eq!(spill_factory_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(in_memory.row_count, 1_029);
     assert_eq!(spilling.row_count, in_memory.row_count);
     assert_eq!(
         join_result_pairs(&spilling.output),
@@ -30,7 +35,7 @@ async fn full_join_spill_respects_query_disk_quota() {
     let factory_calls = Arc::new(AtomicUsize::new(0));
     let executor = DefaultTaskExecutor::with_resource_limits(
         full_join_feed(),
-        ExecutionResourceLimits::new(20_000, 0),
+        ExecutionResourceLimits::new(40_000, 0),
     )
         .with_spill_storage_factory(Arc::new(CountingSpillStorageFactory(Arc::clone(
             &factory_calls,

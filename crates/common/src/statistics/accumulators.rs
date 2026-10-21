@@ -272,7 +272,9 @@ impl MostCommonAccumulator {
                 candidate.lower_count > 0
             });
         }
-        self.summary.candidates.sort_by(|left, right| right.lower_count.cmp(&left.lower_count));
+        self.summary
+            .candidates
+            .sort_by_key(|candidate| std::cmp::Reverse(candidate.lower_count));
         Ok(())
     }
 
@@ -456,4 +458,3 @@ fn literals_equal(left: &LogicalLiteral, right: &LogicalLiteral) -> bool {
         _ => left == right,
     }
 }
-

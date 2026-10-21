@@ -128,54 +128,52 @@ where
         })
     }
 
-    /// Add one batch by borrowing its existing Arrow arrays.
-    pub fn update(&mut self, batch: &RecordBatch) -> Result<()> {
-        if batch.schema().as_ref() != self.schema.as_ref() {
-            return Err(VeinError::internal(
-                "statistics batch schema differs from the collector schema",
-            ));
+    /// Observe active values from a reference-backed statistics input.
+    /// Column names belong to the collector schema; inputs are matched by
+    /// position and type, allowing query-local column identities as keys.
+    pub fn update_input<I: super::super::StatisticsInput + ?Sized>(
+        &mut self,
+        batch: &I,
+    ) -> Result<()> {
+        if batch.num_columns() != self.columns.len() {
+            return Err(VeinError::internal("statistics input column count changed"));
+        }
+        for (index, column) in self.columns.iter().enumerate() {
+            if column.data_type != *batch.column_type(index)? {
+                return Err(VeinError::internal("statistics input column type changed"));
+            }
         }
         let next_rows = self
             .rows
             .checked_add(batch.num_rows() as u64)
             .ok_or_else(|| VeinError::internal("statistics row count overflow"))?;
 
-        for (column, array) in self.columns.iter_mut().zip(batch.columns()) {
-            if column.data_type != *array.data_type() {
-                return Err(VeinError::internal(format!(
-                    "statistics type changed for column '{}'",
-                    column.name
-                )));
-            }
-            let nulls = u64::try_from(array.null_count())
-                .map_err(|_| VeinError::internal("Arrow null count does not fit u64"))?;
-            column.null_count = column
-                .null_count
-                .checked_add(nulls)
-                .ok_or_else(|| VeinError::internal("statistics null count overflow"))?;
-
-            for row in 0..array.len() {
-                if array.is_null(row) {
+        for (index, column) in self.columns.iter_mut().enumerate() {
+            for logical_row in 0..batch.num_rows() {
+                let value = batch.value(index, logical_row)?;
+                if value.is_none_or(|(array, row)| array.is_null(row)) {
+                    column.null_count = column.null_count.checked_add(1)
+                        .ok_or_else(|| VeinError::internal("statistics null count overflow"))?;
                     continue;
                 }
+                let (array, row) = value.expect("non-null source value was checked");
 
-                let is_nan = self.encoder.is_nan(array.as_ref(), row);
+                let is_nan = self.encoder.is_nan(array, row);
                 if is_nan {
                     column.nan_count = column.nan_count.checked_add(1)
                         .ok_or_else(|| VeinError::internal("statistics NaN count overflow"))?;
                 }
 
-                if let Some(sketch) = &mut column.sketch {
-                    if column.distinct_complete {
-                        if let Some(hash) = self.encoder.hash_value(array.as_ref(), row) {
-                            sketch.update_hash(hash);
-                        } else {
-                            column.distinct_complete = false;
-                        }
+                if let Some(sketch) = &mut column.sketch
+                    && column.distinct_complete {
+                    if let Some(hash) = self.encoder.hash_value(array, row) {
+                        sketch.update_hash(hash);
+                    } else {
+                        column.distinct_complete = false;
                     }
                 }
 
-                let numeric_value = self.encoder.numeric_value(array.as_ref(), row);
+                let numeric_value = self.encoder.numeric_value(array, row);
                 if let Some(numeric) = &mut column.numeric {
                     if let Some(value) = numeric_value {
                         numeric.update(value)?;
@@ -184,10 +182,10 @@ where
                     }
                 }
 
-                let byte_length_value = self.encoder.byte_length(array.as_ref(), row);
+                let byte_length_value = self.encoder.byte_length(array, row);
                 if let Some(byte_length) = &mut column.byte_length {
                     if let Some(length) = byte_length_value {
-                        byte_length.update(length, self.encoder.contains_non_ascii(array.as_ref(), row))?;
+                        byte_length.update(length, self.encoder.contains_non_ascii(array, row))?;
                     } else {
                         column.byte_length = None;
                     }
@@ -201,26 +199,24 @@ where
                 }
 
                 if !is_nan {
-                    if let Some(most_common) = &mut column.most_common {
-                        if !most_common.update(
-                            &self.encoder,
-                            array.as_ref(),
+                    if let Some(most_common) = &mut column.most_common
+                        && !most_common.update(
+                        &self.encoder,
+                        array,
+                        row,
+                        self.config.max_synopsis_value_bytes,
+                    )? {
+                        column.most_common = None;
+                    }
+                    if let Some(histogram) = &mut column.histogram
+                        && !histogram.update(|| {
+                        self.encoder.bound_value(
+                            array,
                             row,
                             self.config.max_synopsis_value_bytes,
-                        )? {
-                            column.most_common = None;
-                        }
-                    }
-                    if let Some(histogram) = &mut column.histogram {
-                        if !histogram.update(|| {
-                            self.encoder.bound_value(
-                                array.as_ref(),
-                                row,
-                                self.config.max_synopsis_value_bytes,
-                            )
-                        })? {
-                            column.histogram = None;
-                        }
+                        )
+                    })? {
+                        column.histogram = None;
                     }
                 }
 
@@ -228,15 +224,15 @@ where
                     let comparison = match (&column.min_value, &column.max_value) {
                         (None, None) => None,
                         (Some(min), Some(max)) => Some((
-                            self.encoder.compare_bound(array.as_ref(), row, min),
-                            self.encoder.compare_bound(array.as_ref(), row, max),
+                            self.encoder.compare_bound(array, row, min),
+                            self.encoder.compare_bound(array, row, max),
                         )),
                         _ => Some((None, None)),
                     };
                     match comparison {
                         None => {
                             let bound = self.encoder.bound_value(
-                                array.as_ref(), row, self.config.max_bound_value_bytes,
+                                array, row, self.config.max_bound_value_bytes,
                             );
                             if let Some(bound) = bound {
                                 column.min_value = Some(bound.clone());
@@ -248,12 +244,12 @@ where
                         Some((Some(min_order), Some(max_order))) => {
                             if min_order.is_lt() {
                                 column.min_value = self.encoder.bound_value(
-                                    array.as_ref(), row, self.config.max_bound_value_bytes,
+                                    array, row, self.config.max_bound_value_bytes,
                                 );
                             }
                             if max_order.is_gt() {
                                 column.max_value = self.encoder.bound_value(
-                                    array.as_ref(), row, self.config.max_bound_value_bytes,
+                                    array, row, self.config.max_bound_value_bytes,
                                 );
                             }
                             if column.min_value.is_none() || column.max_value.is_none() {
@@ -275,14 +271,14 @@ where
             for row in 0..batch.num_rows() {
                 let mut tuple_hash = stable_hash(0xfc, &(group.columns.len() as u64).to_le_bytes());
                 for (ordinal, column_index) in group.columns.iter().copied().enumerate() {
-                    let array = batch.column(column_index);
-                    let Some(tag) = type_tag(array.data_type()) else {
+                    let Some(tag) = type_tag(batch.column_type(column_index)?) else {
                         group_complete = false;
                         break;
                     };
-                    let value_hash = if array.is_null(row) {
+                    let value = batch.value(column_index, row)?;
+                    let value_hash = if value.is_none_or(|(array, index)| array.is_null(index)) {
                         stable_hash(0xfb, &[tag, 0])
-                    } else if let Some(hash) = self.encoder.hash_value(array.as_ref(), row) {
+                    } else if let Some(hash) = value.and_then(|(array, index)| self.encoder.hash_value(array, index)) {
                         let mut tagged_hash = [0_u8; 9];
                         tagged_hash[0] = tag;
                         tagged_hash[1..].copy_from_slice(&hash.to_le_bytes());
@@ -581,11 +577,12 @@ where
                 byte_length: column.byte_length.map(|byte_length| byte_length.finish()),
                 most_common_values: column.most_common.map(|most_common| {
                     let mut summary = most_common.summary;
-                    summary.candidates.sort_by(|left, right| right.lower_count.cmp(&left.lower_count));
+                    summary
+                        .candidates
+                        .sort_by_key(|candidate| std::cmp::Reverse(candidate.lower_count));
                     summary
                 }),
                 histogram: column.histogram.and_then(HistogramAccumulator::finish),
-                ..ColumnStatistics::default()
             };
             statistics.column_statistics.insert(column.name, summary);
         }

@@ -322,15 +322,26 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         }
         let is_aggregate = signature.kind == FunctionKind::Aggregate;
 
-        if is_aggregate && distinct {
+        if is_aggregate && distinct && !name.eq_ignore_ascii_case("count") {
             return Err(VeinError::semantic(
-                format!("DISTINCT inside aggregate function '{name}' is not supported yet"),
+                "DISTINCT is currently supported only for COUNT",
                 Some(span),
             ));
         }
         if is_aggregate && args.len() != 1 {
             return Err(VeinError::semantic(
                 format!("aggregate function '{name}' expects exactly one argument"),
+                Some(span),
+            ));
+        }
+        if is_aggregate
+            && distinct
+            && args
+            .iter()
+            .any(|argument| matches!(argument.node, Expr::Wildcard { .. }))
+        {
+            return Err(VeinError::semantic(
+                "COUNT(DISTINCT *) is not valid; provide one expression",
                 Some(span),
             ));
         }
@@ -350,7 +361,13 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
         }
 
         if signature.kind == FunctionKind::Scalar {
-            bound_args = bind_scalar_arguments(name, bound_args, &signature.arg_types, span)?;
+            bound_args = bind_scalar_arguments(
+                name,
+                bound_args,
+                &signature.arg_types,
+                signature.min_arg_count,
+                span,
+            )?;
         }
 
         match signature.kind {
@@ -718,13 +735,24 @@ fn bind_scalar_arguments(
     name: &str,
     args: Vec<LogicalExpr>,
     expected_types: &[VeinDataType],
+    min_arg_count: usize,
     span: parser::token::Span,
 ) -> Result<Vec<LogicalExpr>> {
-    if args.len() != expected_types.len() {
+    if min_arg_count > expected_types.len() {
+        return Err(VeinError::internal(format!(
+            "scalar function '{name}' has invalid argument bounds: minimum {min_arg_count}, maximum {}",
+            expected_types.len()
+        )));
+    }
+    if args.len() < min_arg_count || args.len() > expected_types.len() {
+        let expected_count = if min_arg_count == expected_types.len() {
+            format!("exactly {}", expected_types.len())
+        } else {
+            format!("between {min_arg_count} and {}", expected_types.len())
+        };
         return Err(VeinError::semantic(
             format!(
-                "scalar function '{name}' expects {} argument(s), got {}",
-                expected_types.len(),
+                "scalar function '{name}' expects {expected_count} argument(s), got {}",
                 args.len()
             ),
             Some(span),

@@ -8,7 +8,7 @@ async fn aggregates_recursive_input_before_forwarding_batches() {
         InputPlanFixture::Aggregate {
             input: Box::new(InputPlanFixture::Pipeline {
                 source: DataSource::Memory,
-                program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
             }),
             plan: AggregatePlan {
                 groups: 0,
@@ -28,19 +28,14 @@ async fn aggregates_recursive_input_before_forwarding_batches() {
         .expect("recursive aggregate should execute");
 
     assert_eq!(result.row_count, 1);
-    let count = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("count result should be int64");
-    assert_eq!(count.value(0), 5);
+    assert_eq!(view_int64_values(&result.output[0], 0), vec![5]);
 }
 
 #[tokio::test]
 async fn distinct_operator_removes_duplicate_rows_from_recursive_join() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
     };
     let mut task = task();
     set_input_plan(
@@ -77,18 +72,11 @@ async fn distinct_operator_removes_duplicate_rows_from_recursive_join() {
         .expect("distinct operator should consume duplicate recursive join rows");
 
     assert_eq!(result.row_count, 2);
-    let left = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("left distinct key");
-    let right = result.output[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("right distinct key");
-    let rows: Vec<_> = (0..result.output[0].num_rows())
-        .map(|row| (left.value(row), right.value(row)))
+    let left = view_int64_values(&result.output[0], 0);
+    let right = view_int64_values(&result.output[0], 1);
+    let rows: Vec<_> = left
+        .into_iter()
+        .zip(right)
         .collect();
     assert_eq!(rows, vec![(1, 1), (2, 2)]);
 }
@@ -97,7 +85,7 @@ async fn distinct_operator_removes_duplicate_rows_from_recursive_join() {
 async fn recursive_chained_joins_wait_for_each_build_pipeline() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
     };
     let join = || InputPlanFixture::Join {
         probe: Box::new(leaf()),
@@ -136,15 +124,8 @@ async fn recursive_chained_joins_wait_for_each_build_pipeline() {
         .expect("chained joins should complete their build dependencies before probing");
 
     assert_eq!(result.row_count, 3);
-    let values = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("chained join output");
     assert_eq!(
-        (0..values.len())
-            .map(|row| values.value(row))
-            .collect::<Vec<_>>(),
+        view_int64_values(&result.output[0], 0),
         vec![3, 1, 2]
     );
 }

@@ -37,6 +37,8 @@ pub mod metadata;
 pub mod pruning;
 /// Catalog snapshot identity pinned by a query plan.
 pub mod snapshot;
+/// Open identifiers separating logical table providers from physical file encodings.
+pub mod formats;
 /// Bounded, self-invalidating store of parsed file metadata.
 pub mod store;
 
@@ -45,12 +47,14 @@ pub use metadata::{
     AnalyzedTableStatistics, ByteLengthStatistics, ColumnGroupStatistics, ColumnSortKey, ColumnStatistics,
     ColumnStorageStatistics, DataUnitStatistics, NumericStatistics, SerializedSketch,
     HistogramBucket, HistogramSample, HistogramStatistics, MostCommonValue,
-    MostCommonValuesStatistics, StatisticsSourceIdentity, StatisticsUnitKind, TableFormat, TableMetadata,
+    MostCommonValuesStatistics, StatisticsSourceIdentity, StatisticsUnitKind, TableMetadata,
     TableMetadataRef, TableStatistics, TableType,
 };
+pub use formats::{DataFileFormatId, TableProviderId};
 pub use pruning::{
     StatisticsComparison, StatisticsPredicate, comparison_may_match_bounds,
     may_match_data_unit,
 };
 pub use snapshot::CatalogSnapshotToken;
 pub use store::{DEFAULT_CAPACITY, MetadataKey, MetadataKind, MetadataStore};
+pub use storage::{StorageFileMetadata, StorageObjectIdentity, StorageObjectVersion};

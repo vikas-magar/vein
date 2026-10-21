@@ -1,6 +1,6 @@
 use super::*;
 use crate::protocol::{
-    DataSink, DataSource, JoinKind, JoinPlan, MicroProgram, PhysicalPlanNode, SortPlan,
+    DataSink, DataSource, ExpressionProgram, JoinKind, JoinPlan, PhysicalPlanNode, SortPlan,
     AggregatePlan,
 };
 use std::sync::Arc;
@@ -17,7 +17,7 @@ fn source() -> Arc<PhysicalPlanNode> {
     node(PhysicalPlanOperator::Pipeline {
         source: Arc::new(DataSource::Memory),
         input_schema: Arc::new(VeinSchema::empty()),
-        program: Arc::new(MicroProgram::empty()),
+        program: Arc::new(ExpressionProgram::empty()),
     })
 }
 

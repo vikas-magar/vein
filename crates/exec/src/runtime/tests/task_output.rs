@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn filters_aggregate_output_in_the_post_aggregate_vm() {
+async fn filters_aggregate_output_in_the_post_aggregate_expression_pipeline() {
     let task = aggregate_task_with_post_filter(4);
     let result = runner()
         .execute(&task, CancellationToken::new())
@@ -9,12 +9,7 @@ async fn filters_aggregate_output_in_the_post_aggregate_vm() {
         .expect("post-aggregate filter should execute");
 
     assert_eq!(result.row_count, 1);
-    let count = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("aggregate count output");
-    assert_eq!(count.value(0), 5);
+    assert_eq!(view_int64_values(&result.output[0], 0), vec![5]);
 }
 
 #[tokio::test]
@@ -38,10 +33,7 @@ async fn sorts_task_output_before_applying_limit() {
         PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram {
-                register_count: 1,
-                instructions: vec![MicroOp::ProjectRegisters { out_regs: vec![0] }],
-            }),
+            program: projection_program(vec![column_expr(0, types::VeinDataType::Int64)]),
         },
     );
     let sorted = plan_node(
@@ -77,12 +69,7 @@ async fn sorts_task_output_before_applying_limit() {
         .expect("sort before limit");
 
     assert_eq!(result.row_count, 2);
-    let values = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("sorted int64 output");
-    assert_eq!(values.values(), &[3, 2]);
+    assert_eq!(view_int64_values(&result.output[0], 0), vec![3, 2]);
 }
 
 #[tokio::test]
@@ -93,12 +80,7 @@ async fn runs_memory_filter_to_client() {
         .unwrap();
     assert_eq!(result.row_count, 3);
     assert_eq!(result.output.len(), 1);
-    let col = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(col.values(), &[3, 4, 5]);
+    assert_eq!(view_int64_values(&result.output[0], 0), vec![3, 4, 5]);
     assert!(result.metrics.duration_ns > 0);
 }
 
@@ -111,10 +93,7 @@ async fn runs_empty_global_count_as_one_zero_row() {
         PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram {
-                register_count: 1,
-                instructions: vec![MicroOp::ProjectRegisters { out_regs: vec![0] }],
-            }),
+            program: projection_program(vec![column_expr(0, types::VeinDataType::Int64)]),
         },
     );
     let aggregate = plan_node(
@@ -141,12 +120,7 @@ async fn runs_empty_global_count_as_one_zero_row() {
 
     assert_eq!(result.row_count, 1);
     assert_eq!(result.output.len(), 1);
-    let count = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("count output");
-    assert_eq!(count.values(), &[0]);
+    assert_eq!(view_int64_values(&result.output[0], 0), vec![0]);
 }
 
 #[tokio::test]

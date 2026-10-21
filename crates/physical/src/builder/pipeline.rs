@@ -7,7 +7,7 @@ use crate::pipeline_graph::DerivedPipelineGraph;
 use common::Result;
 use common::identifiers::{PartitionId, StageId, TaskId};
 use common::protocol::{
-    DataSink, DataSource, MicroProgram, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator,
+    DataSink, DataSource, ExpressionProgram, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator,
 };
 use error::VeinError;
 use plan::schema::VeinSchema;
@@ -18,6 +18,7 @@ mod join_keys;
 mod join_layout;
 mod join_lowering;
 mod node_lowering;
+mod statistics;
 
 use join_keys::{extract_equi_join_keys, flatten_conjunction, join_kind};
 use join_layout::{available_join_outputs, position};
@@ -28,22 +29,36 @@ use join_keys::equality_keys;
 pub trait PipelineStageBuilder: Send + Sync {
     /// Lowers a logical plan into a stage with an explicit physical sink.
     fn build(&self, plan: &LogicalPlan) -> Result<Stage>;
+    /// Scope physical estimates to the current query and its completed stages.
+    fn build_with_statistics(&self, plan: &LogicalPlan,
+                             _statistics: Arc<common::statistics::QueryStatisticsContext>) -> Result<Stage> {
+        self.build(plan)
+    }
 
     /// Compiles a fused source segment and returns its source and schemas.
     fn compile_pipeline(
         &self,
         plan: &LogicalPlan,
-    ) -> Result<(DataSource, MicroProgram, VeinSchema, VeinSchema)>;
+    ) -> Result<(DataSource, ExpressionProgram, VeinSchema, VeinSchema)>;
 }
 
 /// Default recursive stage builder with fused scan pipelines.
-#[derive(Debug, Default, Clone)]
-pub struct DefaultPipelineStageBuilder;
+#[derive(Default, Clone)]
+pub struct DefaultPipelineStageBuilder {
+    statistics: Option<Arc<dyn optimizer::StatisticsProvider>>,
+}
+
+impl std::fmt::Debug for DefaultPipelineStageBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("DefaultPipelineStageBuilder")
+            .field("query_statistics", &self.statistics.is_some()).finish()
+    }
+}
 
 impl DefaultPipelineStageBuilder {
     /// Creates a new default recursive stage builder.
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -51,6 +66,7 @@ pub(super) fn logical_node_name(plan: &LogicalPlan) -> &'static str {
     match plan {
         LogicalPlan::Scan { .. } => "scan",
         LogicalPlan::ExternalScan { .. } => "external scan",
+        LogicalPlan::Intermediate { .. } => "intermediate relation",
         LogicalPlan::Filter { .. } => "filter",
         LogicalPlan::Project { .. } => "projection",
         LogicalPlan::Aggregate { .. } => "aggregate",
@@ -78,6 +94,10 @@ pub(super) fn logical_node_name(plan: &LogicalPlan) -> &'static str {
 
 
 impl PipelineStageBuilder for DefaultPipelineStageBuilder {
+    fn build_with_statistics(&self, plan: &LogicalPlan,
+                             statistics: Arc<common::statistics::QueryStatisticsContext>) -> Result<Stage> {
+        Self { statistics: Some(Arc::new(optimizer::QueryStatisticsProvider::new(statistics))) }.build(plan)
+    }
     fn build(&self, plan: &LogicalPlan) -> Result<Stage> {
         let (input, sink) = match plan {
             LogicalPlan::Write {
@@ -161,7 +181,7 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
     fn compile_pipeline(
         &self,
         plan: &LogicalPlan,
-    ) -> Result<(DataSource, MicroProgram, VeinSchema, VeinSchema)> {
+    ) -> Result<(DataSource, ExpressionProgram, VeinSchema, VeinSchema)> {
         PipelineCompiler::compile(plan)
     }
 }

@@ -19,17 +19,13 @@ fn single_value_retains_the_only_arrow_scalar_without_copying() {
     let input = Arc::new(Int64Array::from(vec![42]));
     let input_values = input.values().as_ptr();
     let mut sink = AggregateSink::new(single_value_plan()).expect("create scalar aggregate");
-    sink.accumulate(DataChunk::from_vectors(
+    sink.accumulate(crate::pipeline::test_support::dense_view(
         vec![Arc::clone(&input) as ArrayRef],
     ))
         .expect("accumulate scalar row");
 
     let output = sink.finish().expect("finish scalar aggregate");
-    let values = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("scalar output is int64");
+    let values = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0);
     assert_eq!(values.value(0), 42);
     assert_eq!(values.values().as_ptr(), input_values);
 }
@@ -37,17 +33,13 @@ fn single_value_retains_the_only_arrow_scalar_without_copying() {
 #[test]
 fn single_value_returns_typed_null_for_empty_input() {
     let mut sink = AggregateSink::new(single_value_plan()).expect("create scalar aggregate");
-    sink.accumulate(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(Int64Array::from(
         Vec::<i64>::new(),
     ))]))
         .expect("accumulate empty input");
 
     let output = sink.finish().expect("finish empty scalar aggregate");
-    let values = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("scalar output retains its declared type");
+    let values = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0);
     assert_eq!(values.len(), 1);
     assert!(values.is_null(0));
 }
@@ -55,12 +47,12 @@ fn single_value_returns_typed_null_for_empty_input() {
 #[test]
 fn single_value_errors_when_input_has_multiple_rows_across_batches() {
     let mut sink = AggregateSink::new(single_value_plan()).expect("create scalar aggregate");
-    sink.accumulate(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(Int64Array::from(
         vec![1],
     ))]))
         .expect("first row is valid");
     let error = sink
-        .accumulate(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(
+        .accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(Int64Array::from(
             vec![2],
         ))]))
         .expect_err("second row must violate scalar cardinality");

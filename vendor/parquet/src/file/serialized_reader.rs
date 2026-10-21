@@ -18,7 +18,7 @@
 //! Contains implementations of the reader traits FileReader, RowGroupReader and PageReader
 //! Also contains implementations of the ChunkReader for files (with buffering) and byte arrays (RAM)
 
-use crate::basic::{PageType, Type};
+use crate::basic::{Encoding, PageType, Type};
 use crate::bloom_filter::Sbbf;
 use crate::column::page::{Page, PageMetadata, PageReader};
 use crate::compression::{Codec, create_codec};
@@ -423,7 +423,7 @@ pub(crate) fn decode_page(
             if header_v2.definition_levels_byte_length < 0
                 || header_v2.repetition_levels_byte_length < 0
                 || header_v2.definition_levels_byte_length + header_v2.repetition_levels_byte_length
-                    > page_header.uncompressed_page_size
+                > page_header.uncompressed_page_size
             {
                 return Err(general_err!(
                     "DataPage v2 header contains implausible values \
@@ -616,6 +616,8 @@ pub struct DataPageHeaderInfo {
     /// Parquet `num_rows` from a V2 page header; V1 requires a flat column to
     /// interpret `num_values` as rows.
     pub num_rows: Option<usize>,
+    /// Value encoding declared by this data page.
+    pub encoding: Encoding,
     /// Typed Parquet statistics, when written by the producer.
     pub statistics: Option<statistics::Statistics>,
 }
@@ -659,6 +661,7 @@ pub fn read_page_header<R: Read>(input: &mut R, physical_type: Type) -> Result<P
             Some(DataPageHeaderInfo {
                 num_values: usize::try_from(page.num_values)?,
                 num_rows: None,
+                encoding: page.encoding,
                 statistics: statistics::from_thrift_page_stats(physical_type, page.statistics)
                     .ok()
                     .flatten(),
@@ -671,6 +674,7 @@ pub fn read_page_header<R: Read>(input: &mut R, physical_type: Type) -> Result<P
             Some(DataPageHeaderInfo {
                 num_values: usize::try_from(page.num_values)?,
                 num_rows: Some(usize::try_from(page.num_rows)?),
+                encoding: page.encoding,
                 statistics: statistics::from_thrift_page_stats(physical_type, page.statistics)
                     .ok()
                     .flatten(),
@@ -3000,5 +3004,39 @@ mod tests {
             num_rows += 1;
         }
         assert_eq!(num_rows, reader.metadata().file_metadata().num_rows());
+    }
+
+    #[test]
+    fn page_header_exposes_data_page_encoding() {
+        use crate::parquet_thrift::WriteThrift;
+
+        let header = PageHeader {
+            r#type: PageType::DATA_PAGE,
+            uncompressed_page_size: 1,
+            compressed_page_size: 1,
+            crc: None,
+            data_page_header: Some(crate::file::metadata::thrift::DataPageHeader {
+                num_values: 1,
+                encoding: Encoding::RLE_DICTIONARY,
+                definition_level_encoding: Encoding::RLE,
+                repetition_level_encoding: Encoding::RLE,
+                statistics: None,
+            }),
+            index_page_header: None,
+            dictionary_page_header: None,
+            data_page_header_v2: None,
+        };
+        let mut bytes = Vec::new();
+        {
+            let mut writer = crate::parquet_thrift::ThriftCompactOutputProtocol::new(&mut bytes);
+            header.write_thrift(&mut writer).expect("page header should serialize");
+        }
+
+        let parsed = read_page_header(&mut std::io::Cursor::new(bytes), Type::INT32)
+            .expect("page header should parse");
+        assert_eq!(
+            parsed.data_page.expect("data page metadata").encoding,
+            Encoding::RLE_DICTIONARY
+        );
     }
 }

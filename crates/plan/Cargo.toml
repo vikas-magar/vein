@@ -14,3 +14,4 @@ arrow = { workspace = true }
 types = { path = "../types" }
 serde = { workspace = true }
 async-trait = { workspace = true }
+functions = { path = "../functions" }

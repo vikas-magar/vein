@@ -1,13 +1,12 @@
 //! Testing utilities (mock function registry, catalog, and end-to-end bind helper).
 
 mod catalog;
-mod functions;
 
 pub(crate) use catalog::TestCatalog;
-pub use functions::MockFunctionRegistry;
 
 use crate::pipe::query::QueryBinder;
 use crate::traits::LogicalBinder;
+use functions::FunctionRegistry;
 use error::VeinError;
 use parser::parser::Parser;
 use plan::LogicalPlan;
@@ -23,7 +22,7 @@ pub async fn plan(sql: &str) -> error::Result<LogicalPlan> {
 
     QueryBinder::new(
         Arc::new(TestCatalog::with_fixtures()),
-        Arc::new(MockFunctionRegistry::new()),
+        Arc::new(FunctionRegistry::with_builtins()),
     )
         .bind(&node)
         .await

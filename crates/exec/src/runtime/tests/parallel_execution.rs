@@ -11,17 +11,20 @@ async fn parallel_join_probe_combines_worker_local_aggregate_state() {
             PhysicalPlanOperator::Pipeline {
                 source: Arc::new(DataSource::File(FileScanTask {
                     files: files.iter().map(|file| (*file).to_owned()).collect(),
-                    format: FileFormat::Parquet,
+                    storage_metadata: Vec::new(),
+                    data_file_format: DataFileFormatId::new("parquet"),
+                    format_options: Vec::new(),
+                    column_encoding_hints: Vec::new(),
                     byte_range: None,
                     scan_unit_range: None,
                     projected: Arc::clone(&input_schema),
-                    dictionary_columns: Vec::new(),
                     pushdown: None,
                     task_id: TaskId::new(),
-                    catalog_snapshot: None,
+            catalog_snapshot: None,
+            runtime_statistics: None,
                 })),
                 input_schema: Arc::clone(&input_schema),
-                program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
             },
         )
     };
@@ -77,19 +80,12 @@ async fn parallel_join_probe_combines_worker_local_aggregate_state() {
     assert_eq!(builder.max_parallelism(), 2);
     assert_eq!(builder.peak_sources.load(Ordering::Relaxed), 2);
     let mut counts = std::collections::BTreeMap::new();
-    for batch in &result.output {
-        let keys = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("aggregate key");
-        let values = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("aggregate count");
-        for row in 0..batch.num_rows() {
-            counts.insert(keys.value(row), values.value(row));
+    for view in &result.output {
+        for (key, value) in view_int64_values(view, 0)
+            .into_iter()
+            .zip(view_int64_values(view, 1))
+        {
+            counts.insert(key, value);
         }
     }
     assert_eq!(counts, std::collections::BTreeMap::from([(1, 1), (2, 4), (3, 1)]));
@@ -106,17 +102,20 @@ async fn multi_file_scan_cancellation_releases_workers_and_channel_senders() {
         PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::File(FileScanTask {
                 files: vec!["1.parquet".into(), "2.parquet".into(), "3.parquet".into()],
-                format: FileFormat::Parquet,
+                storage_metadata: Vec::new(),
+                data_file_format: DataFileFormatId::new("parquet"),
+                format_options: Vec::new(),
+                column_encoding_hints: Vec::new(),
                 byte_range: None,
                 scan_unit_range: None,
                 projected: Arc::clone(&schema),
-                dictionary_columns: Vec::new(),
                 pushdown: None,
                 task_id: TaskId::new(),
-                catalog_snapshot: None,
+            catalog_snapshot: None,
+            runtime_statistics: None,
             })),
             input_schema: Arc::clone(&schema),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         },
     );
     task.plan = plan_with_input(&task, input);

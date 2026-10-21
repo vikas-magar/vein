@@ -18,17 +18,20 @@ use std::time::Instant;
 
 use error::{Result, VeinError};
 use plan::{LogicalPlan, PlanTraversal};
+use common::statistics::QueryStatisticsContext;
 
 use crate::context::{CatalogStatisticsProvider, OptimizationDiagnostics, OptimizerConfig,
-                     OptimizerContext, RuleExecution, StatisticsProvider};
+                     OptimizerContext, QueryStatisticsProvider, RuleExecution, StatisticsProvider};
 use crate::rule::{OptimizerRule, RuleType};
 use crate::rules::{
     ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule, FilterNormalizationRule,
+    InSubqueryJoinRule,
     FilterTransitivityRule,
     JoinPredicateTransitivityRule, PredicatePushdownRule, ScanFilterPushdownRule,
     ScanStatisticsPruningRule, ScalarAggregateDecorrelationRule,
 };
 use crate::rules::join_order::JoinOrderRule;
+use crate::rules::CheckpointJoinFilterRule;
 
 /// The engine-facing optimizer seam.
 ///
@@ -91,6 +94,8 @@ impl OptimizerPipeline {
             Arc::new(FilterTransitivityRule),
             Arc::new(ScanStatisticsPruningRule),
             Arc::new(JoinPredicateTransitivityRule),
+            Arc::new(CheckpointJoinFilterRule),
+            Arc::new(InSubqueryJoinRule),
             Arc::new(ExistsDecorrelationRule),
             Arc::new(ScalarAggregateDecorrelationRule),
             Arc::new(PredicatePushdownRule),
@@ -114,8 +119,28 @@ impl OptimizerPipeline {
         &self,
         plan: LogicalPlan,
     ) -> Result<(LogicalPlan, OptimizationDiagnostics)> {
+        self.optimize_with_statistics_provider(plan, Arc::clone(&self.statistics))
+    }
+
+    /// Optimizes using the query-scoped metadata and runtime statistics context.
+    pub fn optimize_with_statistics_context(
+        &self,
+        plan: LogicalPlan,
+        statistics: Arc<QueryStatisticsContext>,
+    ) -> Result<(LogicalPlan, OptimizationDiagnostics)> {
+        self.optimize_with_statistics_provider(
+            plan,
+            Arc::new(QueryStatisticsProvider::new(statistics)),
+        )
+    }
+
+    fn optimize_with_statistics_provider(
+        &self,
+        plan: LogicalPlan,
+        statistics: Arc<dyn StatisticsProvider>,
+    ) -> Result<(LogicalPlan, OptimizationDiagnostics)> {
         let context = OptimizerContext::with_statistics_provider(
-            self.config.clone(), Arc::clone(&self.statistics));
+            self.config.clone(), statistics);
         let rules: Vec<_> = self
             .rules
             .iter()
@@ -181,11 +206,13 @@ impl OptimizerPipeline {
             diagnostics.sweeps = sweep;
             if !changed {
                 let mut optimized = next;
+                let mut cost_rewrite_changed_plan = false;
                 for rule in &cost_rules {
                     let started = Instant::now();
                     let (result, any_changed, join_decisions) =
                         apply_rule(rule.as_ref(), optimized, &context)?;
                     optimized = result;
+                    cost_rewrite_changed_plan |= any_changed;
                     diagnostics.join_order_decisions.extend(join_decisions);
                     let elapsed = started.elapsed();
                     tracing::debug!(
@@ -203,6 +230,28 @@ impl OptimizerPipeline {
                         phase: rule.phase(),
                         sweep,
                         changed: any_changed,
+                        elapsed,
+                    });
+                }
+                if cost_rewrite_changed_plan {
+                    let pruning_rule = ColumnPruningRule;
+                    let started = Instant::now();
+                    let (result, changed, _) =
+                        apply_rule(&pruning_rule, optimized, &context)?;
+                    optimized = result;
+                    let elapsed = started.elapsed();
+                    tracing::info!(
+                        target: "vein.audit",
+                        event = "optimizer_post_cost_column_pruning",
+                        changed,
+                        duration_us = elapsed.as_micros() as u64,
+                        "required columns refreshed after cost-based plan rewrite"
+                    );
+                    diagnostics.rule_executions.push(RuleExecution {
+                        rule_name: format!("{} (post-cost)", pruning_rule.name()),
+                        phase: pruning_rule.phase(),
+                        sweep,
+                        changed,
                         elapsed,
                     });
                 }

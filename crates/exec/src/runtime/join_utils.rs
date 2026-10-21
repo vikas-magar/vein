@@ -1,10 +1,9 @@
 use arrow::datatypes::DataType;
 
+use common::Result;
 use common::protocol::{
     DataSource, JoinKind, JoinOutput, JoinPlan, PhysicalPlanNode, PhysicalPlanOperator,
 };
-use common::identifiers::TaskId;
-use common::Result;
 
 use crate::operators::join::{JoinKeys, JoinType, OutputColumn};
 use types::VeinDataType;
@@ -22,7 +21,7 @@ pub(super) fn direct_scan_probe_columns<'a>(
     else {
         return None;
     };
-    if !program.instructions.is_empty() {
+    if !program.is_empty() {
         return None;
     }
     let DataSource::File(scan) = source.as_ref() else {
@@ -64,30 +63,6 @@ pub(super) fn join_keys(columns: &[u32]) -> JoinKeys {
     JoinKeys::new(columns.iter().map(|column| *column as usize).collect())
 }
 
-/// One source per file, so a join's build side can be read in parallel.
-///
-/// An ordinary scan spreads a table's files across the worker pool; the build
-/// side of a join was read as a single source, so its files were walked one
-/// after another — the largest serial cost in a join. The split mirrors the
-/// physical builder's, which is `pub(crate)` there.
-pub(crate) fn split_scan_by_file(source: &DataSource) -> Vec<DataSource> {
-    let DataSource::File(scan) = source else {
-        return vec![source.clone()];
-    };
-    if scan.files.len() <= 1 {
-        return vec![source.clone()];
-    }
-    scan.files
-        .iter()
-        .map(|file| {
-            let mut one = scan.clone();
-            one.files = vec![file.clone()];
-            one.task_id = TaskId::new();
-            DataSource::File(one)
-        })
-        .collect()
-}
-
 /// A plan's join flavour as the operator's.
 ///
 /// Semi and anti emit each qualifying probe row once and expose no build columns.
@@ -99,6 +74,7 @@ pub(super) fn join_type(kind: JoinKind) -> Result<JoinType> {
         JoinKind::Full => JoinType::Full,
         JoinKind::Semi => JoinType::Semi,
         JoinKind::Anti => JoinType::Anti,
+        JoinKind::NullAwareAnti => JoinType::NullAwareAnti,
         JoinKind::Single => JoinType::Single,
         JoinKind::Cross => JoinType::Cross,
     })

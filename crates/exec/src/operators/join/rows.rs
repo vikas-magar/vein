@@ -25,6 +25,8 @@ pub enum JoinType {
     Semi,
     /// Each unmatched probe row once, without build-side columns.
     Anti,
+    /// `NOT IN` anti join, with NULL handling supplied by the hash table.
+    NullAwareAnti,
     /// One build row per probe row, or a cardinality error for multiple matches.
     Single,
     /// Every probe row paired with every build row.
@@ -64,9 +66,14 @@ pub fn output_rows(
         Vec::new()
     };
 
-    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+    if matches!(join_type, JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti) {
+        let existence_type = if join_type == JoinType::NullAwareAnti {
+            JoinType::Anti
+        } else {
+            join_type
+        };
         rows.extend(
-            existence_probe_rows(join_type, probe_rows, matches)
+            existence_probe_rows(existence_type, probe_rows, matches)
                 .into_iter()
                 .map(|probe| OutputRow {
                     probe: Some(probe),
@@ -117,12 +124,40 @@ pub fn existence_probe_rows(
     let matched: std::collections::HashSet<u32> =
         matches.iter().map(|(probe, _)| *probe).collect();
     probe_rows
-        .filter_map(|probe| {
-            let has_match = matched.contains(&probe);
-            (has_match == (join_type == JoinType::Semi)).then_some(probe)
+        .filter(|probe| matched.contains(probe) == (join_type == JoinType::Semi))
+        .collect()
+}
+
+/// Applies SQL `NOT IN` truth semantics to an anti-join's row references.
+/// Empty build input makes even NULL probes true; otherwise NULL probes are
+/// unknown, and any NULL build key makes every non-matching probe unknown.
+pub fn null_aware_anti_rows(
+    probe_rows: impl Iterator<Item = u32>,
+    matches: &[(u32, (u32, u32))],
+    null_probe_rows: &[u32],
+    build_is_empty: bool,
+    build_has_null: bool,
+) -> Vec<OutputRow> {
+    if build_has_null {
+        return Vec::new();
+    }
+
+    let matched: std::collections::HashSet<u32> =
+        matches.iter().map(|(probe, _)| *probe).collect();
+    probe_rows
+        .filter(|probe| {
+            !matched.contains(probe)
+                && (build_is_empty || null_probe_rows.binary_search(probe).is_err())
+        })
+        .map(|probe| OutputRow {
+            probe: Some(probe),
+            build: None,
         })
         .collect()
 }
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "rows/null_aware_tests.rs"]
+mod null_aware_tests;

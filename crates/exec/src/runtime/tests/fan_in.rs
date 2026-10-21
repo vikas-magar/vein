@@ -24,20 +24,14 @@ fn shared_build_sink_combines_unlimited_worker_tables_without_copying_payloads()
 
     let first_payload: arrow::array::ArrayRef = Arc::new(Int64Array::from(vec![10, 20]));
     let second_payload: arrow::array::ArrayRef = Arc::new(Int64Array::from(vec![21, 30]));
-    let first_view = DataChunkView::from_chunk(
-        DataChunk::from_vectors(vec![
-            Arc::new(Int64Array::from(vec![1, 2])),
-            Arc::clone(&first_payload),
-        ]),
-    )
-        .expect("view first worker build chunk");
-    let second_view = DataChunkView::from_chunk(
-        DataChunk::from_vectors(vec![
-            Arc::new(Int64Array::from(vec![2, 3])),
-            Arc::clone(&second_payload),
-        ]),
-    )
-        .expect("view second worker build chunk");
+    let first_view = crate::pipeline::test_support::dense_view(vec![
+        Arc::new(Int64Array::from(vec![1, 2])),
+        Arc::clone(&first_payload),
+    ]);
+    let second_view = crate::pipeline::test_support::dense_view(vec![
+        Arc::new(Int64Array::from(vec![2, 3])),
+        Arc::clone(&second_payload),
+    ]);
 
     first.push(first_view).expect("insert first worker chunk");
     second.push(second_view).expect("insert second worker chunk");
@@ -62,7 +56,7 @@ fn shared_build_sink_combines_unlimited_worker_tables_without_copying_payloads()
         panic!("unlimited build should not spill");
     };
 
-    let probe = DataChunk::from_vectors(vec![Arc::new(Int64Array::from(vec![2]))]);
+    let probe = crate::pipeline::test_support::dense_view(vec![Arc::new(Int64Array::from(vec![2]))]);
     let mut matches = Vec::new();
     table.probe(&probe, &mut matches).expect("probe merged worker tables");
     assert_eq!(matches.len(), 2, "duplicate keys from both workers are retained");

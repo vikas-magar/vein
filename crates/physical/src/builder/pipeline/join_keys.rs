@@ -6,6 +6,8 @@ use parser::ast::pipe_op::JoinType;
 use plan::schema::VeinSchema;
 use plan::LogicalExpr;
 
+type JoinKeyOrdinals = (Vec<u32>, Vec<u32>);
+
 pub(super) fn flatten_conjunction<'a>(
     expression: &'a LogicalExpr,
     output: &mut Vec<&'a LogicalExpr>,
@@ -46,14 +48,14 @@ pub(super) fn extract_equi_join_keys(
     conjuncts: &[&LogicalExpr],
     probe: &VeinSchema,
     build: &VeinSchema,
-) -> Result<((Vec<u32>, Vec<u32>), Vec<LogicalExpr>)> {
+) -> Result<(JoinKeyOrdinals, Vec<LogicalExpr>)> {
     let mut probe_keys = Vec::new();
     let mut build_keys = Vec::new();
     let mut residual = Vec::new();
 
     for conjunct in conjuncts {
-        if is_column_equality(conjunct) {
-            if let Ok((probe_key, build_key)) = equality_keys(Some(conjunct), probe, build) {
+        if is_column_equality(conjunct)
+            && let Ok((probe_key, build_key)) = equality_keys(Some(conjunct), probe, build) {
                 let probe_type = probe.fields[probe_key as usize].data_type.hash_join_key_type();
                 let build_type = build.fields[build_key as usize].data_type.hash_join_key_type();
                 if probe_type.is_some() && probe_type == build_type {
@@ -62,7 +64,6 @@ pub(super) fn extract_equi_join_keys(
                     continue;
                 }
             }
-        }
         residual.push((*conjunct).clone());
     }
 
@@ -85,6 +86,7 @@ pub(super) fn join_kind(join_type: &JoinType) -> JoinKind {
         JoinType::Full => JoinKind::Full,
         JoinType::Semi => JoinKind::Semi,
         JoinType::Anti => JoinKind::Anti,
+        JoinType::NullAwareAnti => JoinKind::NullAwareAnti,
         JoinType::Single => JoinKind::Single,
         JoinType::Cross => JoinKind::Cross,
     }

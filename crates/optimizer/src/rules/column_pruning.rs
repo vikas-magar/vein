@@ -75,13 +75,19 @@ fn prune_plan(plan: LogicalPlan, required: &RequiredColumns) -> LogicalPlan {
             url,
             options,
             files,
+            source_metadata,
             schema,
         } => LogicalPlan::ExternalScan {
             url,
             options,
             files,
+            source_metadata,
             schema,
         },
+        // Intermediate relations are immutable checkpoint boundaries. Keep
+        // their complete schema here; downstream operators may still refer to
+        // any field, and the source replays the original arrays by reference.
+        LogicalPlan::Intermediate { .. } => plan,
         LogicalPlan::Filter { input, predicate } => {
             let mut child_required = required.clone();
             collect_columns(&predicate, &mut child_required);
@@ -607,6 +613,7 @@ fn collect_plan_columns(plan: &LogicalPlan, output: &mut RequiredColumns) {
         }
         LogicalPlan::Call { args, .. } => collect_exprs(args, output),
         LogicalPlan::ExternalScan { .. }
+        | LogicalPlan::Intermediate { .. }
         | LogicalPlan::Limit { .. }
         | LogicalPlan::Distinct { .. }
         | LogicalPlan::SubqueryAlias { .. }
@@ -1226,5 +1233,30 @@ mod tests {
                 .is_none_or(|columns| columns.contains(&ColumnId(12))),
             "filter-only ps_supplycost must survive scan pruning: {projection:?}"
         );
+    }
+
+    #[test]
+    fn external_scan_column_pruning_retains_shared_source_metadata() {
+        let source_metadata = Arc::new(TableMetadata::new(
+            "external_source",
+            Arc::new(VeinSchema::empty()),
+        ));
+        let external = LogicalPlan::ExternalScan {
+            url: "file:///external_source".into(),
+            options: vec![],
+            files: vec![],
+            source_metadata: Some(Arc::clone(&source_metadata)),
+            schema: Box::new(VeinSchema::empty()),
+        };
+
+        let pruned = prune_plan(external, &HashSet::new());
+        let LogicalPlan::ExternalScan {
+            source_metadata: Some(retained),
+            ..
+        } = pruned
+        else {
+            panic!("column pruning must retain resolved external source metadata");
+        };
+        assert!(Arc::ptr_eq(&source_metadata, &retained));
     }
 }

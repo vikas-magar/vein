@@ -239,7 +239,6 @@ impl VeinError {
     ///
     /// The iterator borrows the typed source chain and allocates nothing. It is
     /// useful for structured logging while callers retain the original errors.
-    #[must_use]
     pub fn causes(&self) -> impl Iterator<Item=&(dyn std::error::Error + 'static)> {
         std::iter::successors(
             std::error::Error::source(self),
@@ -541,7 +540,7 @@ mod tests {
             "lowering a recursive filter",
             VeinError::external(
                 ErrorCategory::Unsupported,
-                "VM expression lowering",
+                "typed expression lowering",
                 std::io::Error::other("expression opcode unavailable"),
             ),
         );

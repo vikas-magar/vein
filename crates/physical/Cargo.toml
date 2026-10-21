@@ -14,6 +14,7 @@ error = { path = "../error" }
 optimizer = { path = "../optimizer" }
 parser = { path = "../parser" }
 plan = { path = "../plan" }
+functions = { path = "../functions" }
 tracing = { workspace = true }
 
 [dev-dependencies]

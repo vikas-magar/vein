@@ -4,7 +4,7 @@ use super::*;
 async fn recursive_left_join_applies_residual_before_preserving_unmatched_probe_rows() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+        program: Arc::new(ExpressionProgram::empty()),
     };
     let mut task = task();
     set_input_plan(
@@ -18,20 +18,11 @@ async fn recursive_left_join_applies_residual_before_preserving_unmatched_probe_
                 build_keys: vec![0],
                 residual: Some(common::protocol::JoinResidualPlan {
                     input_columns: vec![JoinOutput::Build(0)],
-                    program: Arc::new(MicroProgram::new(
-                        3,
-                        vec![
-                            common::protocol::MicroOp::LoadConstant {
-                                dst: 1,
-                                value: types::LogicalLiteral::Int64(3),
-                            },
-                            common::protocol::MicroOp::CmpLt {
-                                dst: 2,
-                                src1: 0,
-                                src2: 1,
-                            },
-                            common::protocol::MicroOp::FilterMask { bool_reg: 2 },
-                        ],
+                    program: filter_program(binary_expr(
+                        BinaryExprOp::Less,
+                        column_expr(0, types::VeinDataType::Int64),
+                        literal_expr(LogicalLiteral::Int64(3), types::VeinDataType::Int64),
+                        types::VeinDataType::Boolean,
                     )),
                 }),
                 outputs: vec![JoinOutput::Probe(0), JoinOutput::Build(0)],
@@ -50,20 +41,8 @@ async fn recursive_left_join_applies_residual_before_preserving_unmatched_probe_
     let mut probe_rows = Vec::new();
     let mut build_rows = Vec::new();
     for batch in &result.output {
-        let probe = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("probe output");
-        let build = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("build output");
-        for row in 0..batch.num_rows() {
-            probe_rows.push(probe.value(row));
-            build_rows.push(build.is_valid(row).then(|| build.value(row)));
-        }
+        probe_rows.extend(view_int64_values(batch, 0));
+        build_rows.extend(view_nullable_int64_values(batch, 1));
     }
     assert_eq!(probe_rows, vec![1, 2, 3, 4, 5]);
     assert_eq!(build_rows, vec![Some(1), Some(2), None, None, None]);
@@ -73,7 +52,7 @@ async fn recursive_left_join_applies_residual_before_preserving_unmatched_probe_
 async fn recursive_right_join_does_not_mark_residual_rejections_as_matches() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+        program: Arc::new(ExpressionProgram::empty()),
     };
     let mut task = task();
     set_input_plan(
@@ -87,20 +66,11 @@ async fn recursive_right_join_does_not_mark_residual_rejections_as_matches() {
                 build_keys: vec![0],
                 residual: Some(common::protocol::JoinResidualPlan {
                     input_columns: vec![JoinOutput::Build(0)],
-                    program: Arc::new(MicroProgram::new(
-                        3,
-                        vec![
-                            common::protocol::MicroOp::LoadConstant {
-                                dst: 1,
-                                value: types::LogicalLiteral::Int64(3),
-                            },
-                            common::protocol::MicroOp::CmpLt {
-                                dst: 2,
-                                src1: 0,
-                                src2: 1,
-                            },
-                            common::protocol::MicroOp::FilterMask { bool_reg: 2 },
-                        ],
+                    program: filter_program(binary_expr(
+                        BinaryExprOp::Less,
+                        column_expr(0, types::VeinDataType::Int64),
+                        literal_expr(LogicalLiteral::Int64(3), types::VeinDataType::Int64),
+                        types::VeinDataType::Boolean,
                     )),
                 }),
                 outputs: vec![JoinOutput::Probe(0), JoinOutput::Build(0)],
@@ -119,28 +89,12 @@ async fn recursive_right_join_does_not_mark_residual_rejections_as_matches() {
     let probe_rows = result
         .output
         .iter()
-        .flat_map(|batch| {
-            let probe = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("probe output");
-            (0..probe.len())
-                .map(|i| probe.is_valid(i).then(|| probe.value(i)))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|view| view_nullable_int64_values(view, 0))
         .collect::<Vec<_>>();
     let build_rows = result
         .output
         .iter()
-        .flat_map(|batch| {
-            let build = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("build output");
-            (0..build.len()).map(|i| build.value(i)).collect::<Vec<_>>()
-        })
+        .flat_map(|view| view_int64_values(view, 1))
         .collect::<Vec<_>>();
     assert_eq!(probe_rows, vec![Some(1), Some(2), None, None, None]);
     assert_eq!(build_rows, vec![1, 2, 3, 4, 5]);

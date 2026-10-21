@@ -3,23 +3,23 @@ use super::*;
 /// A [`PipelineNode`] wrapper that aborts the pipeline if cancellation has been
 /// requested. Placed just above the sink, it is invoked once per batch that
 /// reaches the end of the chain, letting a long-running source stop promptly.
-pub(super) struct CancelGuard<B: 'static> {
-    inner: Box<dyn PipelineNode<B>>,
+pub(super) struct CancelGuard {
+    inner: Box<dyn PipelineNode>,
     cancel: CancellationToken,
 }
 
-impl<B: 'static> CancelGuard<B> {
-    pub(super) fn new(inner: Box<dyn PipelineNode<B>>, cancel: CancellationToken) -> Self {
+impl CancelGuard {
+    pub(super) fn new(inner: Box<dyn PipelineNode>, cancel: CancellationToken) -> Self {
         Self { inner, cancel }
     }
 }
 
-impl<B: 'static> PipelineNode<B> for CancelGuard<B> {
-    fn push(&mut self, batch: B) -> Result<()> {
+impl PipelineNode for CancelGuard {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
         if self.cancel.is_cancelled() {
             return Err(VeinError::cancelled());
         }
-        self.inner.push(batch)
+        self.inner.push(view)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -32,14 +32,14 @@ impl<B: 'static> PipelineNode<B> for CancelGuard<B> {
 
 /// A [`PipelineNode`] adapter that forwards pushes into a shared sink, so the
 /// runner can retrieve the sink's result via [`Sink::collect`] after execution.
-pub(super) struct SinkHandle<B: 'static, O: 'static = RecordBatch>(pub(super) Arc<Mutex<Box<dyn Sink<B, O>>>>);
+pub(super) struct SinkHandle(pub(super) Arc<Mutex<Box<dyn Sink>>>);
 
-impl<B: 'static, O: 'static> PipelineNode<B> for SinkHandle<B, O> {
-    fn push(&mut self, batch: B) -> Result<()> {
+impl PipelineNode for SinkHandle {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0
             .lock()
             .map_err(|_| VeinError::internal("sink mutex poisoned"))?
-            .push(batch)
+            .push(view)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -51,9 +51,9 @@ impl<B: 'static, O: 'static> PipelineNode<B> for SinkHandle<B, O> {
 }
 
 /// Adapts an already-built transform so another pipeline stage can own it as a node.
-pub(super) struct TransformHandle(pub(super) Box<dyn Transform<DataChunkView>>);
+pub(super) struct TransformHandle(pub(super) Box<dyn Transform>);
 
-impl PipelineNode<DataChunkView> for TransformHandle {
+impl PipelineNode for TransformHandle {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0.push(view)
     }
@@ -66,7 +66,7 @@ impl PipelineNode<DataChunkView> for TransformHandle {
         self.0.finished()
     }
 
-    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
         let Some(transform) = self.0.fork_transform()? else {
             return Ok(None);
         };
@@ -75,7 +75,7 @@ impl PipelineNode<DataChunkView> for TransformHandle {
 
     fn combine_local(
         self: Box<Self>,
-        canonical: &mut dyn PipelineNode<DataChunkView>,
+        canonical: &mut dyn PipelineNode,
     ) -> Result<()> {
         let target = canonical
             .as_any_mut()
@@ -90,7 +90,7 @@ pub(super) struct ChannelPipelineNode {
 }
 
 
-impl PipelineNode<DataChunkView> for ChannelPipelineNode {
+impl PipelineNode for ChannelPipelineNode {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.sender.send(view).map_err(|_| VeinError::cancelled())
     }
@@ -101,19 +101,19 @@ impl PipelineNode<DataChunkView> for ChannelPipelineNode {
         self.finished.load(Ordering::Acquire)
     }
 }
-pub(super) struct SuppressFlush<B: 'static> {
-    inner: Box<dyn PipelineNode<B>>,
+pub(super) struct SuppressFlush {
+    inner: Box<dyn PipelineNode>,
 }
 
-impl<B: 'static> SuppressFlush<B> {
-    pub(super) fn new(inner: Box<dyn PipelineNode<B>>) -> Self {
+impl SuppressFlush {
+    pub(super) fn new(inner: Box<dyn PipelineNode>) -> Self {
         Self { inner }
     }
 }
 
-impl<B: 'static> PipelineNode<B> for SuppressFlush<B> {
-    fn push(&mut self, batch: B) -> Result<()> {
-        self.inner.push(batch)
+impl PipelineNode for SuppressFlush {
+    fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.inner.push(view)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -122,7 +122,7 @@ impl<B: 'static> PipelineNode<B> for SuppressFlush<B> {
 
     fn combine_local(
         self: Box<Self>,
-        canonical: &mut dyn PipelineNode<B>,
+        canonical: &mut dyn PipelineNode,
     ) -> Result<()> {
         self.inner.combine_local(canonical)
     }

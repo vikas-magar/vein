@@ -37,7 +37,24 @@ pub enum LogicalPlan {
         options: Vec<(String, String)>,
         /// Physical files to scan from the catalog.
         files: Vec<String>,
+        /// Catalog metadata for this source when discovery resolved it.
+        /// Retaining the shared handle keeps its statistics and revision
+        /// available to planning and the query-scoped statistics context.
+        source_metadata: Option<std::sync::Arc<catalog::TableMetadata>>,
         /// The resulting schema.
+        schema: Box<VeinSchema>,
+    },
+    /// A query-local relation produced by an earlier adaptive execution stage.
+    ///
+    /// Unlike a table scan, this source has no catalog identity or storage
+    /// revision. Its row count is an observation of this query's materialized
+    /// relation and is used only as a planning estimate.
+    Intermediate {
+        /// Query-local handle resolved by the execution source registry.
+        source_id: u128,
+        /// Rows observed when the producer stage sealed the relation.
+        row_count: u64,
+        /// Stable columns exposed to remaining logical operators.
         schema: Box<VeinSchema>,
     },
 
@@ -312,6 +329,7 @@ impl LogicalPlan {
         match self {
             LogicalPlan::Scan { .. } => "Scan",
             LogicalPlan::ExternalScan { .. } => "ExternalScan",
+            LogicalPlan::Intermediate { .. } => "Intermediate",
             LogicalPlan::Filter { .. } => "Filter",
             LogicalPlan::Project { .. } => "Project",
             LogicalPlan::Aggregate { .. } => "Aggregate",

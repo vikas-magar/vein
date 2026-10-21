@@ -14,19 +14,20 @@ fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
     let mut sink = AggregateSink::new(plan).unwrap();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![1])),
         Arc::new(Int64Array::from(vec![10])),
     ]))
         .unwrap();
     assert_eq!(sink.metrics().grouping_probes, 1);
 
-    let colliding_chunk = DataChunk::from_vectors(vec![
+    let colliding_chunk = crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![2, 2])),
         Arc::new(Int64Array::from(vec![20, 30])),
     ]);
-    let colliding_key_column = GroupKeyColumn::new(colliding_chunk.column(0)).unwrap();
-    let mut colliding_hashers: Vec<_> = (0..colliding_chunk.selection.size())
+    let colliding_sources = colliding_chunk.source_arrays_for_column(0).unwrap();
+    let colliding_key_column = GroupKeyColumn::new(&colliding_sources[0]).unwrap();
+    let mut colliding_hashers: Vec<_> = (0..colliding_chunk.num_rows())
         .map(|_| sink.hash_builder.build_hasher())
         .collect();
     for hasher in &mut colliding_hashers {
@@ -34,7 +35,7 @@ fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
     }
     colliding_key_column.hash_batch(
         0,
-        &colliding_chunk.selection,
+        colliding_chunk.selection(),
         &[0],
         1,
         &mut colliding_hashers,
@@ -62,16 +63,8 @@ fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
 
     let output = sink.finish().unwrap();
     let batch = &output[0];
-    let keys = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
-    let sums = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let keys = materialized_column::<Int64Array>(batch, 0);
+    let sums = materialized_column::<Int64Array>(batch, 1);
 
     assert_eq!(batch.num_rows(), 2);
     assert_eq!((keys.value(0), sums.value(0)), (1, 10));
@@ -95,15 +88,21 @@ fn retained_group_keys_share_input_arrow_buffers() {
     let keys = Arc::new(Int64Array::from(vec![10, 20, 30]));
     let source_values = keys.values().as_ptr();
     let source_bytes = keys.get_array_memory_size();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         keys,
         Arc::new(Int64Array::from(vec![1, 1, 1])),
     ]))
         .expect("accumulate keys");
 
-    let Some(GroupKeyColumn::Int64(retained)) = &sink.group_key_batches[0][0] else {
-        panic!("retained key batch should contain the int64 Arrow array");
-    };
+    let retained_sources = sink.group_key_batches[0][0]
+        .as_ref()
+        .expect("retained grouping key")
+        .source_arrays()
+        .expect("retained key sources are available");
+    let retained = retained_sources
+        .iter()
+        .find_map(|array| array.as_any().downcast_ref::<Int64Array>())
+        .expect("retained source is an int64 Arrow array");
     assert_eq!(retained.values().as_ptr(), source_values);
     assert_eq!(sink.metrics().string_key_bytes_copied, 0);
     assert!(
@@ -132,7 +131,7 @@ fn duplicate_only_batch_does_not_retain_or_charge_its_key_array() {
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let mut sink = AggregateSink::with_memory_tracker(plan, tracker.clone())
         .expect("create aggregate sink");
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![10])),
         Arc::new(Int64Array::from(vec![1])),
     ]))
@@ -140,7 +139,7 @@ fn duplicate_only_batch_does_not_retain_or_charge_its_key_array() {
     let retained_bytes = tracker.used();
     let retained_batches = sink.group_key_batches.len();
 
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![10, 10, 10])),
         Arc::new(Int64Array::from(vec![1, 1, 1])),
     ]))

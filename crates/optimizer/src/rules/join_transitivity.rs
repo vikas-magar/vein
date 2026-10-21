@@ -149,7 +149,7 @@ impl OptimizerRule for JoinPredicateTransitivityRule {
     }
 }
 
-fn equi_join_keys(
+pub(super) fn equi_join_keys(
     expr: &LogicalExpr,
     left_ids: &HashSet<plan::ColumnId>,
     right_ids: &HashSet<plan::ColumnId>,
@@ -191,7 +191,7 @@ fn equi_join_keys(
     }
 }
 
-fn schema_ids(schema: &VeinSchema) -> HashSet<plan::ColumnId> {
+pub(super) fn schema_ids(schema: &VeinSchema) -> HashSet<plan::ColumnId> {
     schema.fields.iter().map(|field| field.id).collect()
 }
 

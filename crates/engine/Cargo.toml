@@ -1,0 +1,27 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+binder = { path = "../binder" }
+catalog = { path = "../catalog" }
+common = { path = "../common" }
+error = { path = "../error" }
+exec = { path = "../exec" }
+functions = { path = "../functions" }
+optimizer = { path = "../optimizer" }
+parser = { path = "../parser" }
+physical = { path = "../physical" }
+plan = { path = "../plan" }
+storage = { path = "../storage" }
+async-stream = "0.3"
+flume = "0.12"
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+arrow = { workspace = true }
+async-trait.workspace = true
+tempfile = "3"

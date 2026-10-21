@@ -57,6 +57,7 @@ id_newtype!(TaskId, u128, pub);
 id_newtype!(StageId, u64, pub);
 id_newtype!(PartitionId, u16, pub);
 id_newtype!(NodeId, u128, pub);
+id_newtype!(IntermediateSourceId, u128, pub);
 
 #[cfg(test)]
 #[allow(missing_docs)]

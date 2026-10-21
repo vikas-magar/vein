@@ -4,7 +4,7 @@ use super::*;
 async fn recursive_sort_and_limit_run_in_logical_order_over_join_output() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
     };
     let join = || InputPlanFixture::Join {
         probe: Box::new(leaf()),
@@ -49,15 +49,8 @@ async fn recursive_sort_and_limit_run_in_logical_order_over_join_output() {
         .expect("recursive sort then limit should execute");
 
     assert_eq!(result.row_count, 2);
-    let values = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("sorted output column");
     assert_eq!(
-        (0..values.len())
-            .map(|row| values.value(row))
-            .collect::<Vec<_>>(),
+        view_int64_values(&result.output[0], 0),
         vec![2, 3]
     );
 
@@ -77,15 +70,8 @@ async fn recursive_sort_and_limit_run_in_logical_order_over_join_output() {
         .execute(&task, CancellationToken::new())
         .await
         .expect("recursive limit then sort should execute");
-    let values = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("limited sorted output column");
     assert_eq!(
-        (0..values.len())
-            .map(|row| values.value(row))
-            .collect::<Vec<_>>(),
+        view_int64_values(&result.output[0], 0),
         vec![1, 4]
     );
 }
@@ -94,7 +80,7 @@ async fn recursive_sort_and_limit_run_in_logical_order_over_join_output() {
 async fn recursive_aggregate_filter_sort_limit_execute_once_in_order() {
     let leaf = || InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+                program: Arc::new(ExpressionProgram::empty()),
     };
     let join = InputPlanFixture::Join {
         probe: Box::new(leaf()),
@@ -123,20 +109,11 @@ async fn recursive_aggregate_filter_sort_limit_execute_once_in_order() {
     };
     let filtered = InputPlanFixture::Transform {
         input: Box::new(aggregate),
-        program: Arc::new(MicroProgram::new(
-            4,
-            vec![
-                MicroOp::LoadConstant {
-                    dst: 2,
-                    value: types::LogicalLiteral::Int64(1),
-                },
-                MicroOp::CmpGt {
-                    dst: 3,
-                    src1: 1,
-                    src2: 2,
-                },
-                MicroOp::FilterMask { bool_reg: 3 },
-            ],
+        program: filter_program(binary_expr(
+            BinaryExprOp::Greater,
+            column_expr(1, VeinDataType::Int64),
+            literal_expr(LogicalLiteral::Int64(1), VeinDataType::Int64),
+            VeinDataType::Boolean,
         )),
     };
     let sorted = InputPlanFixture::Sort {
@@ -169,16 +146,6 @@ async fn recursive_aggregate_filter_sort_limit_execute_once_in_order() {
         .expect("recursive aggregate, filter, sort, and limit should execute");
 
     assert_eq!(result.row_count, 1);
-    let key = result.output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("group key");
-    let count = result.output[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("group count");
-    assert_eq!(key.value(0), 1);
-    assert_eq!(count.value(0), 4);
+    assert_eq!(view_int64_values(&result.output[0], 0), vec![1]);
+    assert_eq!(view_int64_values(&result.output[0], 1), vec![4]);
 }

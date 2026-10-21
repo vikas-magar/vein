@@ -24,30 +24,51 @@ fn missing_statistics_and_missing_rows_stay_unknown() {
 }
 
 #[test]
-fn stale_statistics_are_rejected_and_current_statistics_are_used() {
+fn stale_statistics_supply_only_a_low_confidence_population_prior() {
     let plan = scan(1, Some(200), Some(10), Some(0));
     let stale = MarkedProvider(StatisticsFreshness::Stale);
     let current = MarkedProvider(StatisticsFreshness::Current);
     let result = StatisticsEstimator::new(&stale).estimate_plan(&plan);
     assert_eq!(result[0].rows.source, EstimateSource::StaleStatistics);
-    assert_eq!(result[0].rows.value(), None);
+    assert_eq!(result[0].rows.value(), Some(200.0));
+    assert_eq!(result[0].rows.confidence, EstimateConfidence::Model);
     assert_eq!(StatisticsEstimator::new(&current).estimate_plan(&plan)[0].rows.value(), Some(200.0));
 }
 
 #[test]
-fn contradictory_populations_and_bounds_are_rejected() {
+fn contradictory_column_statistics_fall_back_without_losing_population_rows() {
     for (distinct, nulls) in [(Some(101), Some(0)), (Some(81), Some(20)),
         (Some(1), Some(101)), (Some(0), Some(0))]
     {
         let plan = scan(1, Some(100), distinct, nulls);
-        assert_eq!(root(&plan).rows.source, EstimateSource::InvalidStatistics);
-        assert_eq!(rows(&plan), None);
+        assert_eq!(root(&plan).rows.value(), Some(100.0));
     }
     let mut plan = scan(1, Some(100), Some(10), Some(0));
     bounds(&mut plan, LogicalLiteral::Int64(20), LogicalLiteral::Int64(10));
-    assert_eq!(root(&plan).rows.source, EstimateSource::InvalidStatistics);
+    assert_eq!(rows(&plan), Some(100.0));
     bounds(&mut plan, LogicalLiteral::Float64(f64::NAN), LogicalLiteral::Float64(10.0));
-    assert_eq!(rows(&plan), None);
+    assert_eq!(rows(&plan), Some(100.0));
+}
+
+#[test]
+fn unestimated_pushed_filter_preserves_known_selectivity_and_population() {
+    let mut plan = scan(1, Some(100), Some(10), Some(0));
+    let LogicalPlan::Scan { filters, schema, .. } = &mut plan else { unreachable!(); };
+    filters.push(predicate(
+        &schema.fields[0],
+        BinaryOp::Eq,
+        LogicalLiteral::Int64(7),
+    ));
+    filters.push(predicate(
+        &schema.fields[0],
+        BinaryOp::Lt,
+        LogicalLiteral::Int64(50),
+    ));
+
+    let estimate = root(&plan).rows;
+    assert_eq!(estimate.value(), Some(10.0));
+    assert_eq!(estimate.source, EstimateSource::SelectivityFallback);
+    assert_eq!(estimate.confidence, EstimateConfidence::Model);
 }
 
 #[test]

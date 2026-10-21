@@ -7,13 +7,15 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use common::protocol::{PhysicalPlanNode, PhysicalPlanOperator};
+use common::statistics::{
+    OperatorCounter, OperatorStatisticsHandle, OperatorStatisticsIdentity, QueryStatisticsContext,
+};
 
 use crate::memory::{OperatorResourceMetrics, QueryMemoryTracker};
-use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode};
+use crate::pipeline::{DataChunkView, PipelineNode};
 
 #[derive(Debug)]
 struct NodeMetrics {
@@ -22,46 +24,56 @@ struct NodeMetrics {
     operator: &'static str,
     operator_config: String,
     child_ids: OnceLock<Vec<u32>>,
-    output_rows: AtomicU64,
-    output_batches: AtomicU64,
-    source_bytes_read: AtomicU64,
-    source_array_count_seen: AtomicU64,
-    source_array_bytes_seen: AtomicU64,
-    downstream_push_ns: AtomicU64,
-    inclusive_elapsed_ns: AtomicU64,
-    execution_outcome: AtomicU8,
-    materialized_batches: AtomicU64,
-    materialized_rows: AtomicU64,
-    materialized_shared_columns: AtomicU64,
-    materialized_gathered_columns: AtomicU64,
-    materialized_empty_columns: AtomicU64,
-    materialized_output_buffer_bytes: AtomicU64,
-    materialization_ns: AtomicU64,
+    statistics: Arc<OperatorStatisticsHandle>,
+    source_array_count_seen: OperatorCounter,
+    source_array_bytes_seen: OperatorCounter,
+    downstream_push_ns: OperatorCounter,
+    execution_completed: OperatorCounter,
+    execution_cancelled: OperatorCounter,
+    execution_failed: OperatorCounter,
+    execution_dropped: OperatorCounter,
     resources: Arc<OperatorResourceMetrics>,
 }
 
 /// Stable identifiers and aggregate flow observations for one canonical plan.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ExecutionTrace {
     nodes: Vec<Arc<NodeMetrics>>,
     node_ids: HashMap<usize, u32>,
     query_id: String,
     task_id: String,
+    task_identity: u128,
+    statistics_context: Arc<QueryStatisticsContext>,
     memory: Option<QueryMemoryTracker>,
     completed: bool,
 }
 
 impl ExecutionTrace {
-    pub(crate) fn new(
+    #[cfg(test)]
+    pub(crate) fn new(root: &Arc<PhysicalPlanNode>, query_id: String, task_id: String) -> Self {
+        Self::new_with_query_context(
+            root,
+            query_id,
+            task_id,
+            0,
+            Arc::new(QueryStatisticsContext::new([])),
+        )
+    }
+
+    pub(crate) fn new_with_query_context(
         root: &Arc<PhysicalPlanNode>,
         query_id: String,
         task_id: String,
+        task_identity: u128,
+        statistics_context: Arc<QueryStatisticsContext>,
     ) -> Self {
         let mut trace = Self {
             nodes: Vec::new(),
             node_ids: HashMap::new(),
             query_id,
             task_id,
+            task_identity,
+            statistics_context,
             memory: None,
             completed: false,
         };
@@ -76,27 +88,27 @@ impl ExecutionTrace {
         }
 
         let id = u32::try_from(self.nodes.len()).unwrap_or(u32::MAX);
+        let statistics = self.statistics_context.register_operator(
+            OperatorStatisticsIdentity {
+                node_id: id,
+                task_id: self.task_identity,
+            },
+            operator_name(&node.operator),
+        );
         let metrics = Arc::new(NodeMetrics {
             node: Arc::clone(node),
             id,
             operator: operator_name(&node.operator),
             operator_config: operator_config(&node.operator),
+            statistics: Arc::clone(&statistics),
             child_ids: OnceLock::new(),
-            output_rows: AtomicU64::new(0),
-            output_batches: AtomicU64::new(0),
-            source_bytes_read: AtomicU64::new(0),
-            source_array_count_seen: AtomicU64::new(0),
-            source_array_bytes_seen: AtomicU64::new(0),
-            downstream_push_ns: AtomicU64::new(0),
-            inclusive_elapsed_ns: AtomicU64::new(0),
-            execution_outcome: AtomicU8::new(0),
-            materialized_batches: AtomicU64::new(0),
-            materialized_rows: AtomicU64::new(0),
-            materialized_shared_columns: AtomicU64::new(0),
-            materialized_gathered_columns: AtomicU64::new(0),
-            materialized_empty_columns: AtomicU64::new(0),
-            materialized_output_buffer_bytes: AtomicU64::new(0),
-            materialization_ns: AtomicU64::new(0),
+            source_array_count_seen: statistics.register_counter("source_array_count_seen"),
+            source_array_bytes_seen: statistics.register_counter("source_array_bytes_seen"),
+            downstream_push_ns: statistics.register_counter("downstream_push_ns"),
+            execution_completed: statistics.register_counter("execution_completed"),
+            execution_cancelled: statistics.register_counter("execution_cancelled"),
+            execution_failed: statistics.register_counter("execution_failed"),
+            execution_dropped: statistics.register_counter("execution_dropped"),
             resources: Arc::new(OperatorResourceMetrics::default()),
         });
         self.node_ids.insert(identity, id);
@@ -119,9 +131,23 @@ impl ExecutionTrace {
             .unwrap_or(u32::MAX)
     }
 
+    pub(crate) fn query_statistics_context(&self) -> Arc<QueryStatisticsContext> {
+        Arc::clone(&self.statistics_context)
+    }
+
+    /// Returns the shared statistics handle registered for a physical node.
+    pub(crate) fn operator_statistics_handle(
+        &self,
+        node_id: u32,
+    ) -> Option<Arc<OperatorStatisticsHandle>> {
+        self.nodes
+            .get(node_id as usize)
+            .map(|node| Arc::clone(&node.statistics))
+    }
+
     pub(crate) fn record_source_bytes(&self, node_id: u32, bytes: u64) {
         if let Some(node) = self.nodes.get(node_id as usize) {
-            node.source_bytes_read.fetch_add(bytes, Ordering::Relaxed);
+            node.statistics.record_source_bytes(bytes);
         }
     }
 
@@ -129,7 +155,11 @@ impl ExecutionTrace {
         self.memory = Some(memory);
     }
 
-    pub(crate) fn operator_memory(&self, node_id: u32, query_memory: &QueryMemoryTracker) -> QueryMemoryTracker {
+    pub(crate) fn operator_memory(
+        &self,
+        node_id: u32,
+        query_memory: &QueryMemoryTracker,
+    ) -> QueryMemoryTracker {
         self.nodes.get(node_id as usize).map_or_else(
             || query_memory.clone(),
             |node| query_memory.for_operator(Arc::clone(&node.resources)),
@@ -144,21 +174,13 @@ impl ExecutionTrace {
         }
     }
 
-    pub(crate) fn materialization_handle(&self, node_id: u32) -> Option<MaterializationTrace> {
-        self.nodes.get(node_id as usize).map(|node| MaterializationTrace {
-            metrics: Arc::clone(node),
-            query_id: self.query_id.clone(),
-            task_id: self.task_id.clone(),
-        })
-    }
-
     pub(crate) fn observer(
         &self,
         node_id: u32,
-        next: Box<dyn PipelineNode<DataChunkView>>,
+        next: Box<dyn PipelineNode>,
         query_id: String,
         task_id: String,
-    ) -> Box<dyn PipelineNode<DataChunkView>> {
+    ) -> Box<dyn PipelineNode> {
         let Some(metrics) = self.nodes.get(node_id as usize).cloned() else {
             return next;
         };
@@ -181,11 +203,19 @@ impl ExecutionTrace {
             "physical_plan_explain"
         );
         for metrics in &self.nodes {
-            let schema = metrics.node
+            let schema = metrics
+                .node
                 .output_schema
                 .fields
                 .iter()
-                .map(|field| format!("{}:{:?}{}", field.name, field.data_type, if field.nullable { "?" } else { "" }))
+                .map(|field| {
+                    format!(
+                        "{}:{:?}{}",
+                        field.name,
+                        field.data_type,
+                        if field.nullable { "?" } else { "" }
+                    )
+                })
                 .collect::<Vec<_>>();
             tracing::debug!(
                 target: "vein.audit",
@@ -207,57 +237,93 @@ impl ExecutionTrace {
     /// Deterministic compact explain text over the canonical plan-node graph.
     /// The stable preorder IDs and child references preserve DAG sharing.
     fn format_explain(&self) -> String {
-        self.nodes.iter().map(|metrics| {
-            let children = metrics.child_ids.get().map(Vec::as_slice).unwrap_or_default();
-            let schema = metrics.node.output_schema.fields.iter().map(|field| {
-                let qualifier = field.qualifier.as_deref().map(|name| format!("{name}.")).unwrap_or_default();
-                format!("{qualifier}{}:{:?}{}", field.name, field.data_type, if field.nullable { "?" } else { "" })
-            }).collect::<Vec<_>>().join(", ");
-            let flow = metrics.node.operator.data_flow();
-            let boundary = match flow.input_materialization {
-                common::protocol::InputMaterialization::WholeBatch => "materialize-input",
-                common::protocol::InputMaterialization::ConsumerBoundary => "consumer-boundary",
-                common::protocol::InputMaterialization::KernelColumns => "kernel-columns",
-                common::protocol::InputMaterialization::None => "reference-input",
-            };
-            format!(
-                "#{} {} children={:?} [{}] flow={}->{:?} schema=[{}]",
-                metrics.id,
-                metrics.operator,
-                children,
-                metrics.operator_config,
-                boundary,
-                flow.output,
-                schema,
-            )
-        }).collect::<Vec<_>>().join("\n")
+        self.nodes
+            .iter()
+            .map(|metrics| {
+                let children = metrics
+                    .child_ids
+                    .get()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let schema = metrics
+                    .node
+                    .output_schema
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        let qualifier = field
+                            .qualifier
+                            .as_deref()
+                            .map(|name| format!("{name}."))
+                            .unwrap_or_default();
+                        format!(
+                            "{qualifier}{}:{:?}{}",
+                            field.name,
+                            field.data_type,
+                            if field.nullable { "?" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let flow = metrics.node.operator.data_flow();
+                let boundary = match flow.input_materialization {
+                    common::protocol::InputMaterialization::WholeBatch => "materialize-input",
+                    common::protocol::InputMaterialization::ConsumerBoundary => "consumer-boundary",
+                    common::protocol::InputMaterialization::KernelColumns => "kernel-columns",
+                    common::protocol::InputMaterialization::None => "reference-input",
+                };
+                format!(
+                    "#{} {} children={:?} [{}] flow={}->{:?} schema=[{}]",
+                    metrics.id,
+                    metrics.operator,
+                    children,
+                    metrics.operator_config,
+                    boundary,
+                    flow.output,
+                    schema,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn log_summary(&self) {
         for node in &self.nodes {
-            let output_rows = node.output_rows.load(Ordering::Relaxed);
+            let output_rows = node.statistics.output_rows();
             let input_rows = node
-                .child_ids.get().into_iter().flatten()
+                .child_ids
+                .get()
+                .into_iter()
+                .flatten()
                 .filter_map(|id| self.nodes.get(*id as usize))
-                .map(|child| child.output_rows.load(Ordering::Relaxed))
+                .map(|child| child.statistics.output_rows())
                 .fold(0u64, u64::saturating_add);
-            let input_array_count_seen = node.child_ids.get().into_iter().flatten()
+            let input_array_count_seen = node
+                .child_ids
+                .get()
+                .into_iter()
+                .flatten()
                 .filter_map(|id| self.nodes.get(*id as usize))
-                .map(|child| child.source_array_count_seen.load(Ordering::Relaxed))
+                .map(|child| child.source_array_count_seen.value())
                 .fold(0u64, u64::saturating_add);
-            let input_array_footprint_bytes_seen = node.child_ids.get().into_iter().flatten()
+            let input_array_footprint_bytes_seen = node
+                .child_ids
+                .get()
+                .into_iter()
+                .flatten()
                 .filter_map(|id| self.nodes.get(*id as usize))
-                .map(|child| child.source_array_bytes_seen.load(Ordering::Relaxed))
+                .map(|child| child.source_array_bytes_seen.value())
                 .fold(0u64, u64::saturating_add);
-            let execution_outcome = match node.execution_outcome.load(Ordering::Relaxed) {
-                1 => "complete",
-                2 => "cancelled",
-                3 => "failed",
-                4 => "cancelled_or_dropped",
-                _ => "not_started",
-            };
-            tracing::debug!(
-                target: "vein.audit",
+            let execution_outcome = execution_outcome(node);
+            let operator_statistics = node.statistics.snapshot(OperatorStatisticsIdentity {
+                node_id: node.id,
+                task_id: self.task_identity,
+            });
+            let row_change = i128::from(output_rows) - i128::from(input_rows);
+            let output_input_ratio =
+                (input_rows > 0).then_some(output_rows as f64 / input_rows as f64);
+            tracing::info!(
+                target: "vein.statistics",
                 event = "physical_operator_metrics",
                 query_id = %self.query_id,
                 task_id = %self.task_id,
@@ -268,26 +334,22 @@ impl ExecutionTrace {
                 input_array_count_seen,
                 input_array_footprint_bytes_seen,
                 output_rows,
-                output_batches = node.output_batches.load(Ordering::Relaxed),
-                source_bytes_read = node.source_bytes_read.load(Ordering::Relaxed),
-                output_array_count_seen = node.source_array_count_seen.load(Ordering::Relaxed),
-                output_array_footprint_bytes_seen = node.source_array_bytes_seen.load(Ordering::Relaxed),
+                row_change,
+                output_input_ratio = ?output_input_ratio,
+                output_batches = node.statistics.output_batches(),
+                operator_counters = ?operator_statistics.metrics,
+                source_bytes_read = node.statistics.source_bytes_read(),
+                output_array_count_seen = node.source_array_count_seen.value(),
+                output_array_footprint_bytes_seen = node.source_array_bytes_seen.value(),
                 array_footprint_scope = "arrow_reported_sizes_seen_at_operator_boundaries; shared_buffers_and_repeated_flow_are_counted_again",
-                inclusive_elapsed_ns = node.inclusive_elapsed_ns.load(Ordering::Relaxed),
+                inclusive_elapsed_ns = node.statistics.elapsed_ns(),
                 execution_outcome,
-                downstream_push_ns = node.downstream_push_ns.load(Ordering::Relaxed),
+                downstream_push_ns = node.downstream_push_ns.value(),
                 operator_memory_reserved_bytes = node.resources.memory_used(),
                 operator_memory_peak_reserved_bytes = node.resources.memory_peak(),
                 operator_spill_disk_bytes = node.resources.spill_used(),
                 operator_spill_disk_peak_bytes = node.resources.spill_peak(),
                 operator_spill_bytes_written = node.resources.spill_written(),
-                materialized_batches = node.materialized_batches.load(Ordering::Relaxed),
-                materialized_rows = node.materialized_rows.load(Ordering::Relaxed),
-                materialized_shared_columns = node.materialized_shared_columns.load(Ordering::Relaxed),
-                materialized_gathered_columns = node.materialized_gathered_columns.load(Ordering::Relaxed),
-                materialized_empty_columns = node.materialized_empty_columns.load(Ordering::Relaxed),
-                materialized_output_buffer_bytes_estimated = node.materialized_output_buffer_bytes.load(Ordering::Relaxed),
-                materialization_ns = node.materialization_ns.load(Ordering::Relaxed),
                 "physical_operator_metrics"
             );
         }
@@ -304,9 +366,13 @@ impl ExecutionTrace {
             let (source_bytes_read, source_array_count_seen, source_array_footprint_bytes_seen) =
                 self.nodes.iter().fold((0u64, 0u64, 0u64), |totals, node| {
                     (
-                        totals.0.saturating_add(node.source_bytes_read.load(Ordering::Relaxed)),
-                        totals.1.saturating_add(node.source_array_count_seen.load(Ordering::Relaxed)),
-                        totals.2.saturating_add(node.source_array_bytes_seen.load(Ordering::Relaxed)),
+                        totals.0.saturating_add(node.statistics.source_bytes_read()),
+                        totals
+                            .1
+                            .saturating_add(node.source_array_count_seen.value()),
+                        totals
+                            .2
+                            .saturating_add(node.source_array_bytes_seen.value()),
                     )
                 });
             tracing::debug!(
@@ -337,27 +403,6 @@ impl ExecutionTrace {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct MaterializationTrace {
-    metrics: Arc<NodeMetrics>,
-    query_id: String,
-    task_id: String,
-}
-
-impl MaterializationTrace {
-    pub(crate) fn node_id(&self) -> u32 {
-        self.metrics.id
-    }
-
-    pub(crate) fn query_id(&self) -> &str {
-        &self.query_id
-    }
-
-    pub(crate) fn task_id(&self) -> &str {
-        &self.task_id
-    }
-}
-
 /// Records inclusive wall time even when a runtime future is cancelled by its caller.
 pub(crate) struct NodeExecutionGuard {
     metrics: Option<Arc<NodeMetrics>>,
@@ -369,7 +414,7 @@ impl NodeExecutionGuard {
     pub(crate) fn finish(&mut self, result: &common::Result<u64>) {
         self.outcome = match result {
             Ok(_) => 1,
-            Err(error) if matches!(error, error::VeinError::Cancelled) => 2,
+            Err(error::VeinError::Cancelled) => 2,
             Err(_) => 3,
         };
     }
@@ -378,40 +423,30 @@ impl NodeExecutionGuard {
 impl Drop for NodeExecutionGuard {
     fn drop(&mut self) {
         if let Some(metrics) = &self.metrics {
-            metrics.inclusive_elapsed_ns.fetch_add(
+            metrics.statistics.record_elapsed_ns(
                 u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
             );
-            metrics.execution_outcome.store(self.outcome, Ordering::Relaxed);
+            match self.outcome {
+                1 => metrics.execution_completed.add(1),
+                2 => metrics.execution_cancelled.add(1),
+                3 => metrics.execution_failed.add(1),
+                _ => metrics.execution_dropped.add(1),
+            }
         }
     }
 }
 
-impl MaterializationTrace {
-    pub(crate) fn record(&self, rows: usize, report: MaterializationReport, elapsed: Duration) {
-        self.metrics.materialized_batches.fetch_add(1, Ordering::Relaxed);
-        self.metrics.materialized_rows.fetch_add(rows as u64, Ordering::Relaxed);
-        self.metrics.materialized_shared_columns.fetch_add(report.shared_columns as u64, Ordering::Relaxed);
-        self.metrics.materialized_gathered_columns.fetch_add(report.gathered_columns as u64, Ordering::Relaxed);
-        self.metrics.materialized_empty_columns.fetch_add(report.empty_columns as u64, Ordering::Relaxed);
-        self.metrics.materialized_output_buffer_bytes.fetch_add(report.gathered_output_buffer_bytes as u64, Ordering::Relaxed);
-        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        self.metrics.materialization_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-        tracing::debug!(
-            target: "vein.audit",
-            event = "physical_operator_materialization",
-            query_id = %self.query_id,
-            task_id = %self.task_id,
-            node_id = self.metrics.id,
-            operator = self.metrics.operator,
-            rows,
-            shared_columns = report.shared_columns,
-            gathered_columns = report.gathered_columns,
-            empty_columns = report.empty_columns,
-            materialized_output_buffer_bytes_estimated = report.gathered_output_buffer_bytes,
-            materialization_ns = elapsed_ns,
-            "physical_operator_materialization"
-        );
+fn execution_outcome(metrics: &NodeMetrics) -> &'static str {
+    if metrics.execution_completed.value() > 0 {
+        "complete"
+    } else if metrics.execution_cancelled.value() > 0 {
+        "cancelled"
+    } else if metrics.execution_failed.value() > 0 {
+        "failed"
+    } else if metrics.execution_dropped.value() > 0 {
+        "cancelled_or_dropped"
+    } else {
+        "not_started"
     }
 }
 
@@ -424,26 +459,21 @@ impl Drop for ExecutionTrace {
 }
 
 struct ObservedOutputNode {
-    next: Box<dyn PipelineNode<DataChunkView>>,
+    next: Box<dyn PipelineNode>,
     metrics: Arc<NodeMetrics>,
     query_id: String,
     task_id: String,
 }
 
-impl PipelineNode<DataChunkView> for ObservedOutputNode {
+impl PipelineNode for ObservedOutputNode {
     fn push(&mut self, view: DataChunkView) -> common::Result<()> {
         let rows = view.num_rows() as u64;
-        self.metrics.output_rows.fetch_add(rows, Ordering::Relaxed);
-        self.metrics.output_batches.fetch_add(1, Ordering::Relaxed);
+        self.metrics.statistics.record_output(rows);
 
         if tracing::enabled!(target: "vein.audit", tracing::Level::DEBUG) {
             let (array_count, array_bytes) = view.source_array_footprint();
-            self.metrics
-                .source_array_count_seen
-                .fetch_add(array_count as u64, Ordering::Relaxed);
-            self.metrics
-                .source_array_bytes_seen
-                .fetch_add(array_bytes as u64, Ordering::Relaxed);
+            self.metrics.source_array_count_seen.add(array_count as u64);
+            self.metrics.source_array_bytes_seen.add(array_bytes as u64);
             tracing::debug!(
                 target: "vein.audit",
                 event = "physical_operator_batch",
@@ -461,10 +491,9 @@ impl PipelineNode<DataChunkView> for ObservedOutputNode {
 
         let started = Instant::now();
         let result = self.next.push(view);
-        self.metrics.downstream_push_ns.fetch_add(
-            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        self.metrics
+            .downstream_push_ns
+            .add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         result
     }
 
@@ -476,7 +505,7 @@ impl PipelineNode<DataChunkView> for ObservedOutputNode {
         self.next.finished()
     }
 
-    fn fork_local(&self) -> common::Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+    fn fork_local(&self) -> common::Result<Option<Box<dyn PipelineNode>>> {
         let Some(next) = self.next.fork_local()? else {
             return Ok(None);
         };
@@ -490,12 +519,14 @@ impl PipelineNode<DataChunkView> for ObservedOutputNode {
 
     fn combine_local(
         self: Box<Self>,
-        canonical: &mut dyn PipelineNode<DataChunkView>,
+        canonical: &mut dyn PipelineNode,
     ) -> common::Result<()> {
         let target = canonical
             .as_any_mut()
             .downcast_mut::<ObservedOutputNode>()
-            .ok_or_else(|| error::VeinError::internal("trace local state has a mismatched target"))?;
+            .ok_or_else(|| {
+                error::VeinError::internal("trace local state has a mismatched target")
+            })?;
         if !Arc::ptr_eq(&self.metrics, &target.metrics)
             || self.query_id != target.query_id
             || self.task_id != target.task_id
@@ -523,16 +554,22 @@ fn operator_name(operator: &PhysicalPlanOperator) -> &'static str {
 
 fn operator_config(operator: &PhysicalPlanOperator) -> String {
     match operator {
-        PhysicalPlanOperator::Pipeline { source, program, .. } => {
+        PhysicalPlanOperator::Pipeline {
+            source, program, ..
+        } => {
             let source_kind = match source.as_ref() {
                 common::protocol::DataSource::File(_) => "file",
                 common::protocol::DataSource::Stream(_) => "stream",
                 common::protocol::DataSource::Memory => "memory",
+                common::protocol::DataSource::Intermediate(_) => "intermediate",
             };
-            format!("source={source_kind}, program_instructions={}", program.instructions.len())
+            format!(
+                "source={source_kind}, expression_steps={}",
+                program.steps.len()
+            )
         }
         PhysicalPlanOperator::Transform { program, .. } => {
-            format!("program_instructions={}", program.instructions.len())
+            format!("expression_steps={}", program.steps.len())
         }
         PhysicalPlanOperator::Join { plan, .. } => format!(
             "join_type={:?}, probe_keys={:?}, build_keys={:?}, outputs={:?}",
@@ -545,10 +582,17 @@ fn operator_config(operator: &PhysicalPlanOperator) -> String {
             plan.aggs.len(),
             plan.grouping_sets.as_ref().map_or(0, Vec::len)
         ),
-        PhysicalPlanOperator::Sort { plan, key_program, output_columns, .. } => format!(
-            "keys={:?}, computed_key_instructions={}, output_columns={output_columns}",
+        PhysicalPlanOperator::Sort {
+            plan,
+            key_program,
+            output_columns,
+            ..
+        } => format!(
+            "keys={:?}, computed_key_steps={}, output_columns={output_columns}",
             plan.keys,
-            key_program.as_ref().map_or(0, |program| program.instructions.len())
+            key_program
+                .as_ref()
+                .map_or(0, |program| program.steps.len())
         ),
         PhysicalPlanOperator::Limit { spec, .. } => {
             format!("offset={}, count={}", spec.offset, spec.count)
@@ -576,8 +620,8 @@ mod tests {
     use arrow::array::{ArrayRef, Int64Array};
     use common::Result;
     use common::protocol::{
-        AggOpCode, AggregatePlan, DataSource, JoinKind, JoinOutput, JoinPlan, LimitSpec,
-        MicroProgram, SortKey, SortPlan,
+        AggOpCode, AggregatePlan, DataSource, ExpressionProgram, JoinKind, JoinOutput, JoinPlan,
+        LimitSpec, SortKey, SortPlan,
     };
     use std::io::Write;
     use std::sync::Arc;
@@ -594,7 +638,7 @@ mod tests {
         node(PhysicalPlanOperator::Pipeline {
             source: Arc::new(DataSource::Memory),
             input_schema: Arc::new(VeinSchema::empty()),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         })
     }
 
@@ -602,10 +646,13 @@ mod tests {
         expected: ArrayRef,
     }
 
-    impl PipelineNode<DataChunkView> for Discard {
+    impl PipelineNode for Discard {
         fn push(&mut self, batch: DataChunkView) -> Result<()> {
             let (array, _) = batch.resolve(0, 0)?.expect("source row remains present");
-            assert!(Arc::ptr_eq(array, &self.expected), "observer must preserve source arrays");
+            assert!(
+                Arc::ptr_eq(array, &self.expected),
+                "observer must preserve source arrays"
+            );
             Ok(())
         }
 
@@ -619,7 +666,10 @@ mod tests {
         let leaf = source();
         let root = node(PhysicalPlanOperator::Limit {
             input: Arc::clone(&leaf),
-            spec: LimitSpec { offset: 1, count: 3 },
+            spec: LimitSpec {
+                offset: 1,
+                count: 3,
+            },
         });
 
         let first = ExecutionTrace::new(&root, "q".into(), "t".into());
@@ -630,9 +680,15 @@ mod tests {
         assert_eq!(first.node_id(&root), second.node_id(&root));
         assert_eq!(first.nodes[0].child_ids.get().unwrap(), &[1]);
         let explain = first.format_explain();
-        assert_eq!(explain, second.format_explain(), "explain IDs and ordering are stable");
+        assert_eq!(
+            explain,
+            second.format_explain(),
+            "explain IDs and ordering are stable"
+        );
         assert!(explain.contains("#0 limit children=[1] [offset=1, count=3]"));
-        assert!(explain.contains("#1 pipeline children=[] [source=memory, program_instructions=0]"));
+        assert!(
+            explain.contains("#1 pipeline children=[] [source=memory, expression_steps=0]")
+        );
         assert!(explain.contains("flow=reference-input->References"));
     }
 
@@ -640,7 +696,7 @@ mod tests {
     fn stable_explain_describes_chained_joins_aggregate_sort_and_boundaries() {
         let filtered = node(PhysicalPlanOperator::Transform {
             input: source(),
-            program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
         });
         let join_plan = || JoinPlan {
             join_type: JoinKind::Inner,
@@ -689,13 +745,19 @@ mod tests {
         let trace = ExecutionTrace::new(&root, "query".into(), "task".into());
         let explain = trace.format_explain();
 
-        assert_eq!(trace.nodes.len(), 8, "shared canonical nodes are visited once");
+        assert_eq!(
+            trace.nodes.len(),
+            8,
+            "shared canonical nodes are visited once"
+        );
         assert_eq!(explain.matches(" join children=").count(), 2);
         assert!(explain.contains("probe_keys=[0], build_keys=[0]"));
         assert!(explain.contains("aggregate children="));
         assert!(explain.contains("sort children="));
-        assert!(explain.contains("flow=materialize-input->ResultArrays"));
-        assert!(explain.contains("keys=[SortKey { column: 0, ascending: false, nulls_first: false }]"));
+        assert!(explain.contains("flow=kernel-columns->ResultArrays"));
+        assert!(
+            explain.contains("keys=[SortKey { column: 0, ascending: false, nulls_first: false }]")
+        );
     }
 
     #[test]
@@ -704,8 +766,7 @@ mod tests {
         let trace = ExecutionTrace::new(&source, "q".into(), "t".into());
         let node_id = trace.node_id(&source);
         let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
-        let view = DataChunkView::from_chunk(crate::pipeline::DataChunk::from_vectors(vec![values]))
-            .expect("reference-backed source view");
+        let view = crate::pipeline::test_support::dense_view(vec![values]);
         let (array, _) = view.resolve(0, 0).expect("resolve source array").unwrap();
         let original = Arc::clone(array);
         let mut observed = trace.observer(
@@ -718,10 +779,14 @@ mod tests {
         observed.push(view).expect("observe output batch");
 
         let metrics = &trace.nodes[node_id as usize];
-        assert_eq!(metrics.output_batches.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.output_rows.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.statistics.output_batches(), 1);
+        assert_eq!(metrics.statistics.output_rows(), 3);
         trace.record_source_bytes(node_id, 128);
-        assert_eq!(metrics.source_bytes_read.load(Ordering::Relaxed), 128);
+        assert_eq!(metrics.statistics.source_bytes_read(), 128);
+        assert_eq!(
+            trace.statistics_context.operator_statistics()[0].output_rows,
+            3
+        );
     }
 
     #[test]
@@ -740,55 +805,58 @@ mod tests {
     }
 
     #[test]
-    fn node_trace_attributes_time_memory_spill_and_materialization() {
+    fn node_trace_attributes_time_memory_and_spill() {
         let root = source();
         let trace = ExecutionTrace::new(&root, "query".into(), "task".into());
         let node_id = trace.node_id(&root);
         let metrics = &trace.nodes[node_id as usize];
-        let query_memory = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
+        let query_memory =
+            QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
         let operator_memory = trace.operator_memory(node_id, &query_memory);
 
-        let reservation = operator_memory.reserve(64, "trace test state").expect("reserve operator state");
-        assert_eq!(query_memory.used(), 64, "query-wide limit still accounts scoped reservations");
+        let reservation = operator_memory
+            .reserve(64, "trace test state")
+            .expect("reserve operator state");
+        assert_eq!(
+            query_memory.used(),
+            64,
+            "query-wide limit still accounts scoped reservations"
+        );
         assert_eq!(metrics.resources.memory_used(), 64);
         assert_eq!(metrics.resources.memory_peak(), 64);
 
         let manager = operator_memory.spill_manager();
         let mut pending = manager.create_run().expect("create scoped spill run");
         let mut writer = pending.writer().expect("open scoped spill writer");
-        writer.write_all(b"spill").expect("write scoped spill bytes");
+        writer
+            .write_all(b"spill")
+            .expect("write scoped spill bytes");
         let run = pending.commit(writer).expect("commit scoped spill run");
         assert_eq!(metrics.resources.spill_used(), 5);
         assert_eq!(metrics.resources.spill_peak(), 5);
         assert_eq!(metrics.resources.spill_written(), 5);
 
-        let report = MaterializationReport {
-            shared_columns: 1,
-            gathered_columns: 2,
-            empty_columns: 0,
-            gathered_output_buffer_bytes: 128,
-        };
-        trace.materialization_handle(node_id).expect("node trace handle")
-            .record(3, report, Duration::from_nanos(20));
-        assert_eq!(metrics.materialized_rows.load(Ordering::Relaxed), 3);
-        assert_eq!(metrics.materialized_gathered_columns.load(Ordering::Relaxed), 2);
-        assert_eq!(metrics.materialized_output_buffer_bytes.load(Ordering::Relaxed), 128);
-        assert_eq!(metrics.materialization_ns.load(Ordering::Relaxed), 20);
-
         let mut guard = trace.execution_guard(node_id);
         // An immediately dropped timer may share the same clock tick. Give the
         // guard a known start interval without sleeping or changing runtime time.
-        guard.started = Instant::now().checked_sub(Duration::from_millis(1))
+        guard.started = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
             .expect("clock supports the test interval");
         guard.finish(&Ok(1));
         drop(guard);
-        assert!(metrics.inclusive_elapsed_ns.load(Ordering::Relaxed) > 0);
-        assert_eq!(metrics.execution_outcome.load(Ordering::Relaxed), 1);
+        assert!(metrics.statistics.elapsed_ns() > 0);
+        assert_eq!(metrics.execution_completed.value(), 1);
+        let snapshot = trace.statistics_context.operator_statistics();
+        assert_eq!(snapshot[0].metrics["execution_completed"], 1);
 
         drop(run);
         drop(reservation);
         assert_eq!(metrics.resources.spill_used(), 0);
-        assert_eq!(metrics.resources.spill_written(), 5, "cumulative writes survive run cleanup");
+        assert_eq!(
+            metrics.resources.spill_written(),
+            5,
+            "cumulative writes survive run cleanup"
+        );
         assert_eq!(metrics.resources.memory_used(), 0);
         assert_eq!(query_memory.used(), 0);
     }
@@ -803,8 +871,8 @@ mod tests {
         drop(guard);
 
         let metrics = &trace.nodes[node_id as usize];
-        assert!(metrics.inclusive_elapsed_ns.load(Ordering::Relaxed) > 0);
-        assert_eq!(metrics.execution_outcome.load(Ordering::Relaxed), 4);
+        assert!(metrics.statistics.elapsed_ns() > 0);
+        assert_eq!(metrics.execution_dropped.value(), 1);
     }
 
     #[test]
@@ -817,6 +885,6 @@ mod tests {
         drop(guard);
 
         let metrics = &trace.nodes[node_id as usize];
-        assert_eq!(metrics.execution_outcome.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.execution_cancelled.value(), 1);
     }
 }

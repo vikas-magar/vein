@@ -26,15 +26,13 @@ pub(super) fn estimate(column: ColumnEstimate<'_>, value: &LogicalLiteral, op: B
     let less_than = |inclusive: bool| {
         if lower == Some(Less) || (!inclusive && lower == Some(Equal)) { return Some(0.0); }
         if upper == Some(Greater) || (inclusive && upper == Some(Equal)) { return non_null; }
-        if let Some(histogram) = column.synopsis.and_then(|stats| stats.histogram.as_ref()) {
-            if let Some(population) = column.synopsis_population.filter(|count| {
+        if let Some(histogram) = column.synopsis.and_then(|stats| stats.histogram.as_ref())
+            && let Some(population) = column.synopsis_population.filter(|count| {
                 histogram.population_count == *count && *count > 0
-            }) {
-                if let Some(rank) = histogram_rank(histogram, value, inclusive) {
+            })
+                && let Some(rank) = histogram_rank(histogram, value, inclusive) {
                     return non_null.map(|n| n * (rank / population as f64).clamp(0.0, 1.0));
                 }
-            }
-        }
         let (min, max) = column.min.zip(column.max)?;
         let width = distance(max, min)?;
         if width <= 0.0 { return None; }

@@ -44,7 +44,7 @@ fn int8_and_int16_aggregates_share_int64_state() {
     };
     let mut sink = AggregateSink::new(plan).unwrap();
 
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         int8_values.clone(),
         int8_values.clone(),
         int8_values.clone(),
@@ -58,74 +58,42 @@ fn int8_and_int16_aggregates_share_int64_state() {
     let output = sink.finish().unwrap();
 
     assert_eq!(
-        output[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0)
             .value(0),
         90
     );
     assert_eq!(
-        output[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int8Array>(&output[0], 1)
             .value(0),
         -10
     );
     assert_eq!(
-        output[0]
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int8Array>(&output[0], 2)
             .value(0),
         100
     );
     assert_eq!(
-        output[0]
-            .column(3)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 3)
             .value(0),
         45.0
     );
     assert_eq!(
-        output[0]
-            .column(4)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 4)
             .value(0),
         990
     );
     assert_eq!(
-        output[0]
-            .column(5)
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int16Array>(&output[0], 5)
             .value(0),
         -10
     );
     assert_eq!(
-        output[0]
-            .column(6)
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int16Array>(&output[0], 6)
             .value(0),
         1_000
     );
     assert_eq!(
-        output[0]
-            .column(7)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 7)
             .value(0),
         495.0
     );

@@ -11,11 +11,13 @@ use super::{
 };
 
 impl DefaultPipelineStageBuilder {
-    /// A scan and its adjacent row-wise operators form one source VM segment.
+    /// A scan and its adjacent row-wise operators form one source pipeline segment.
     /// Keeping this segment fused avoids materializing intermediate batches.
     fn is_source_pipeline(plan: &LogicalPlan) -> bool {
         match plan {
-            LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. } => true,
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::ExternalScan { .. }
+            | LogicalPlan::Intermediate { .. } => true,
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::SubqueryAlias { input, .. } => Self::is_source_pipeline(input),
@@ -49,7 +51,7 @@ impl DefaultPipelineStageBuilder {
                 let (child, child_schema) = self.lower_node(input)?;
                 let (program, output_schema) =
                     PipelineCompiler::compile_recursive_transform(plan, &child_schema)?;
-                let aggregate = PipelineCompiler::aggregate(plan)?.ok_or_else(|| {
+                let aggregate = self.aggregate_plan(plan)?.ok_or_else(|| {
                     VeinError::planning("aggregate did not produce an aggregate plan", None)
                 })?;
                 let output_schema = Arc::new(output_schema);
@@ -75,7 +77,7 @@ impl DefaultPipelineStageBuilder {
                 let (child, child_schema) = self.lower_node(input)?;
                 let (program, output_schema) =
                     PipelineCompiler::compile_recursive_transform(plan, &child_schema)?;
-                let distinct = PipelineCompiler::aggregate(plan)?.ok_or_else(|| {
+                let distinct = self.aggregate_plan(plan)?.ok_or_else(|| {
                     VeinError::planning("DISTINCT did not produce a distinct plan", None)
                 })?;
                 let output_schema = Arc::new(output_schema);
@@ -144,16 +146,12 @@ impl DefaultPipelineStageBuilder {
             | LogicalPlan::SubqueryAlias { .. } => {
                 let mut chain = Vec::new();
                 let mut base = plan;
-                loop {
-                    match base {
-                        LogicalPlan::Filter { input, .. }
-                        | LogicalPlan::Project { input, .. }
-                        | LogicalPlan::SubqueryAlias { input, .. } => {
-                            chain.push(base);
-                            base = input;
-                        }
-                        _ => break,
-                    }
+                while let LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Project { input, .. }
+                | LogicalPlan::SubqueryAlias { input, .. } = base
+                {
+                    chain.push(base);
+                    base = input;
                 }
                 let (child, child_schema) = self.lower_node(base)?;
                 chain.reverse();

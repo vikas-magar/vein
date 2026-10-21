@@ -2,8 +2,8 @@
 //!
 //! A join is a **pipeline breaker**: the build side is consumed completely
 //! before the probe side emits anything, and it needs a second input. That is
-//! why it is an operator rather than a VM instruction — the VM interprets one
-//! chunk at a time and has no notion of a second stream.
+//! why it is a first-class pipeline operator: it builds state from one stream,
+//! then probes that state with a second stream.
 //!
 //! Zero copy is the constraint the implementation is built around; see
 //! [`hash_table`].

@@ -1,16 +1,15 @@
 //! Hash aggregation: the pipeline breaker that groups rows and folds them.
 //!
 //! Like a join, an aggregate needs the whole input before it can emit anything,
-//! so it is not a VM instruction: the runtime drains the program into
-//! [`AggregateSink`] and then takes the groups. The columns it receives are the
-//! program's output registers — the group keys first, then one argument column
-//! per aggregate — so a key or an argument like `sum(price * quantity)` is an
-//! ordinary register and this module never interprets an expression.
+//! so the runtime drains its input view into [`AggregateSink`] and then takes
+//! the groups. Input columns are ordered with group keys first, followed by one
+//! argument per aggregate. Scalar expressions such as `sum(price * quantity)`
+//! are evaluated before this operator; it only consumes their result columns.
 //!
 //! A `DISTINCT` arrives here as the same shape with every column a key and no
 //! aggregates, which is why it has no operator of its own.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::size_of;
 use std::num::NonZeroUsize;
@@ -19,47 +18,44 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arrow::array::{
-    Array, ArrayRef, Decimal128Array, Decimal256Array, DictionaryArray, Float16Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
-    UInt16Array, UInt32Array, UInt64Array, UInt8Array, new_null_array,
+    Array, ArrayRef, Date32Array, Decimal128Array, Decimal256Array, DictionaryArray, Int16Array,
+    Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
-use arrow::buffer::NullBuffer;
 use arrow::datatypes::{Int32Type, i256};
 use hashbrown::DefaultHashBuilder;
 
 mod group_index;
 mod group_key;
 mod intermediate;
-mod numeric;
-mod state;
 mod spill;
 mod metrics;
 mod init;
 mod input;
+mod input_batch;
+mod distinct;
 mod intermediate_merge;
 mod output;
+mod output_view;
 mod pipeline;
 mod sink_spill;
 mod spill_finish;
-pub use pipeline::{shared, shared_with_memory_tracker};
-use intermediate::{AggregateIntermediateGroup, AggregateIntermediateState, NumericPartial};
-use numeric::{
-    AggregateInput, GroupRows, NumericAccumulator, average_values, numeric_values,
-    update_numeric_states,
-};
+pub use pipeline::{shared, shared_with_memory_tracker, shared_with_registry_and_memory_tracker};
+use intermediate::{AggregateGroupKeyRef, AggregateIntermediateGroup};
+use input_batch::AggregateBatch;
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
 use crate::spill::SpillRun;
-use crate::pipeline::{DataChunk, PipelineNode};
+use crate::pipeline::{DataChunkView, PipelineNode};
 use common::Result;
 use common::arrow::SelectionVector;
 use common::protocol::{AggOpCode, AggregatePlan};
 use error::VeinError;
 use group_index::{GroupIndex, GroupIndexEntry, ProbeResolution};
 use group_key::{key_column, GroupKeyColumn};
-use state::AggregateStateColumn;
 use spill::AggregateSpillSchema;
 pub(crate) use metrics::AggregateMetrics;
 use types::VeinDataType;
+use functions::{AggregateAccumulator, FunctionRegistry};
 
 type GroupHasher = <DefaultHashBuilder as BuildHasher>::Hasher;
 
@@ -71,8 +67,11 @@ pub(crate) const AGGREGATE_BATCH_ROWS: NonZeroUsize =
 #[derive(Clone, Copy, Hash, PartialEq)]
 enum KeyValueRef<'a> {
     Null,
+    Date32(i32),
     Int64(i64),
     UInt64(u64),
+    Decimal128(i128),
+    Decimal256(i256),
     Utf8(&'a str),
 }
 
@@ -134,17 +133,22 @@ pub struct AggregateSink {
     batch_new_groups: Vec<usize>,
     /// Arrow-backed grouping columns for batches that contributed new groups.
     group_key_batches: Vec<Vec<Option<GroupKeyColumn>>>,
+    /// Original arrays used by each grouping column, retained by source identity.
+    group_key_batch_arrays: Vec<Vec<Vec<ArrayRef>>>,
     /// Memory leases for the distinct source arrays retained by each key batch.
-    group_key_batch_leases: Vec<Vec<Arc<MemoryReservation>>>,
+    group_key_batch_leases: Vec<HashMap<usize, Arc<MemoryReservation>>>,
     /// Reusable group IDs for each grouping set in the current input batch.
     group_ids_by_set: Vec<Vec<usize>>,
     groups: Vec<Group>,
-    aggregate_states: Vec<AggregateStateColumn>,
+    aggregate_states: Vec<Box<dyn AggregateAccumulator>>,
+    registry: Arc<FunctionRegistry>,
     memory: MemoryReservation,
     tracker: QueryMemoryTracker,
     spill_schema: AggregateSpillSchema,
     spill_runs: Vec<SpillRun>,
     metrics: AggregateMetrics,
+    /// One spillable typed-key collector per distinct aggregate and grouping set.
+    distinct_collectors: Vec<distinct::DistinctCollector>,
 }
 
 

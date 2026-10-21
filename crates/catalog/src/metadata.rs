@@ -9,9 +9,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use storage::StorageFileMetadata;
 use types::{LogicalLiteral, ResolvedColumnRef, VeinSchemaRef};
 
 use crate::snapshot::CatalogSnapshotToken;
+use crate::formats::{DataFileFormatId, TableProviderId};
 
 /// The kind of table represented in the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -25,66 +27,6 @@ pub enum TableType {
     Temporary,
     /// An unmanaged external table pointing to external storage paths.
     External,
-}
-
-/// The physical storage format of a table.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum TableFormat {
-    /// Apache Parquet columnar format.
-    Parquet,
-    /// Comma-separated values format.
-    Csv,
-    /// JSON text format.
-    Json,
-    /// Apache Arrow IPC / Feather streaming format.
-    Arrow,
-    /// Apache Iceberg open table format.
-    Iceberg,
-    /// Delta Lake open table format.
-    Delta,
-    /// Custom or external table format.
-    Custom(String),
-}
-
-impl TableFormat {
-    /// Returns the canonical string representation of this format.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Parquet => "parquet",
-            Self::Csv => "csv",
-            Self::Json => "json",
-            Self::Arrow => "arrow",
-            Self::Iceberg => "iceberg",
-            Self::Delta => "delta",
-            Self::Custom(s) => s.as_str(),
-        }
-    }
-}
-
-impl std::fmt::Display for TableFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl From<&str> for TableFormat {
-    fn from(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "parquet" => Self::Parquet,
-            "csv" => Self::Csv,
-            "json" => Self::Json,
-            "arrow" | "feather" => Self::Arrow,
-            "iceberg" => Self::Iceberg,
-            "delta" => Self::Delta,
-            other => Self::Custom(other.to_string()),
-        }
-    }
-}
-
-impl From<String> for TableFormat {
-    fn from(s: String) -> Self {
-        TableFormat::from(s.as_str())
-    }
 }
 
 /// Statistics for an individual column, used by the optimizer for selectivity estimation,
@@ -155,8 +97,8 @@ impl ColumnStatistics {
             _ => return false,
         }
 
-        if let Some(numeric) = &self.numeric {
-            if numeric.finite_count.checked_add(numeric.non_finite_count) != Some(non_nulls)
+        if let Some(numeric) = &self.numeric
+            && (numeric.finite_count.checked_add(numeric.non_finite_count) != Some(non_nulls)
                 || numeric.sum.is_some_and(|sum| !sum.is_finite())
                 || numeric.mean.is_some_and(|mean| !mean.is_finite())
                 || numeric.m2.is_some_and(|m2| !m2.is_finite() || m2 < 0.0)
@@ -166,14 +108,13 @@ impl ColumnStatistics {
                 || numeric.mean.is_some()
                 || numeric.m2.is_some()))
                 || (numeric.finite_count > 0
-                && (numeric.mean.is_none() || numeric.m2.is_none()))
+                && (numeric.mean.is_none() || numeric.m2.is_none())))
             {
                 return false;
             }
-        }
 
-        if let Some(lengths) = &self.byte_length {
-            if lengths.value_count != non_nulls
+        if let Some(lengths) = &self.byte_length
+            && (lengths.value_count != non_nulls
                 || (lengths.value_count == 0
                 && (lengths.total_bytes != Some(0)
                 || lengths.min_bytes.is_some()
@@ -201,11 +142,10 @@ impl ColumnStatistics {
                         && max
                         .checked_mul(lengths.value_count)
                         .is_some_and(|upper| total > upper)
-                })
+                }))
             {
                 return false;
             }
-        }
 
         if let Some(most_common) = &self.most_common_values {
             let lower_count_sum = most_common
@@ -222,17 +162,17 @@ impl ColumnStatistics {
                 || most_common.candidates.len() > most_common.capacity
                 || most_common.analyzed_count > non_nulls
                 || self.nan_count.is_some_and(|nans| {
-                    most_common.analyzed_count != non_nulls.saturating_sub(nans)
-                })
+                most_common.analyzed_count != non_nulls.saturating_sub(nans)
+            })
                 || most_common.error_bound > most_common.analyzed_count
                 || lower_count_sum.is_none_or(|sum| sum > most_common.analyzed_count)
                 || has_duplicate_candidates
                 || most_common.candidates.windows(2).any(|pair| {
-                    pair[0].lower_count < pair[1].lower_count
-                })
+                pair[0].lower_count < pair[1].lower_count
+            })
                 || most_common.candidates.iter().any(|candidate| {
-                    candidate.lower_count == 0 || candidate.lower_count > most_common.analyzed_count
-                })
+                candidate.lower_count == 0 || candidate.lower_count > most_common.analyzed_count
+            })
             {
                 return false;
             }
@@ -294,8 +234,8 @@ impl ColumnStatistics {
                 || !buckets_match_sample
                 || histogram.rank_error_bound != expected_rank_error
                 || histogram.rank_error_bound.is_some_and(|error| {
-                    !error.is_finite() || !(0.0..=1.0).contains(&error)
-                })
+                !error.is_finite() || !(0.0..=1.0).contains(&error)
+            })
             {
                 return false;
             }
@@ -575,6 +515,48 @@ pub struct TableStatistics {
     pub data_units: Vec<DataUnitStatistics>,
 }
 
+impl TableStatistics {
+    /// Returns the table population from the exact total or complete unit counts.
+    ///
+    /// Unit counts are summed only when the catalog's declared file or row-group
+    /// count matches the enumerated units and every unit has a row count. This
+    /// avoids treating partial metadata as a complete table population.
+    pub fn population_rows(&self) -> Option<u64> {
+        if let Some(rows) = self.num_rows {
+            return Some(rows);
+        }
+
+        let file_rows = self.complete_unit_rows(self.file_count, |unit| {
+            matches!(unit.kind, StatisticsUnitKind::File)
+        });
+        let row_group_rows = self.complete_unit_rows(self.row_group_count, |unit| {
+            matches!(unit.kind, StatisticsUnitKind::RowGroup)
+        });
+
+        match (file_rows, row_group_rows) {
+            (Some(files), Some(groups)) if files != groups => None,
+            (Some(rows), _) | (_, Some(rows)) => Some(rows),
+            (None, None) => None,
+        }
+    }
+
+    fn complete_unit_rows(
+        &self,
+        expected_count: Option<u64>,
+        matches_kind: impl Fn(&DataUnitStatistics) -> bool,
+    ) -> Option<u64> {
+        let expected_count = usize::try_from(expected_count?).ok()?;
+        let (sum, count) = self
+            .data_units
+            .iter()
+            .filter(|unit| matches_kind(unit))
+            .try_fold((0u64, 0usize), |(sum, count), unit| {
+                Some((sum.checked_add(unit.num_rows?)?, count + 1))
+            })?;
+        (count == expected_count).then_some(sum)
+    }
+}
+
 /// Opaque identity for one source object included in analyzed statistics.
 ///
 /// The identifier is a stable catalog URI or path. Version is supplied by the
@@ -635,10 +617,16 @@ pub struct TableMetadata {
     pub table_type: TableType,
     /// Storage root location or base URI (e.g. "vfs://input", "s3://bucket/path").
     pub location: Option<String>,
-    /// Physical table format (e.g. `TableFormat::Exo`, `TableFormat::Parquet`).
-    pub format: Option<TableFormat>,
+    /// Registered reader identifier for the encoding used by the table's data files.
+    pub data_file_format: Option<DataFileFormatId>,
+    /// Logical table provider, when the table format is not described by its files alone.
+    pub table_provider: Option<TableProviderId>,
     /// Explicit physical file paths or partition URIs to scan.
     pub files: Vec<String>,
+    /// Storage snapshots aligned with `files`; empty when the catalog has no
+    /// versioned storage metadata for these objects.
+    #[serde(default)]
+    pub storage_metadata: Vec<StorageFileMetadata>,
     /// Partition column names used for partition pruning in the optimizer.
     pub partition_columns: Vec<String>,
     /// Physical sort or clustering order for sort elimination and streaming execution.
@@ -664,8 +652,10 @@ impl TableMetadata {
             schema,
             table_type: TableType::Base,
             location: None,
-            format: None,
+            data_file_format: None,
+            table_provider: None,
             files: Vec::new(),
+            storage_metadata: Vec::new(),
             partition_columns: Vec::new(),
             sort_order: Vec::new(),
             statistics: None,
@@ -693,15 +683,28 @@ impl TableMetadata {
         self
     }
 
-    /// Sets the physical storage format.
-    pub fn with_format(mut self, format: impl Into<TableFormat>) -> Self {
-        self.format = Some(format.into());
+    /// Sets the physical encoding used by the table's data files.
+    pub fn with_file_format(mut self, format: impl Into<DataFileFormatId>) -> Self {
+        self.data_file_format = Some(format.into());
+        self
+    }
+
+    /// Sets the provider responsible for interpreting the logical table.
+    pub fn with_table_provider(mut self, provider: impl Into<TableProviderId>) -> Self {
+        self.table_provider = Some(provider.into());
         self
     }
 
     /// Sets the physical files or partitions.
     pub fn with_files(mut self, files: Vec<String>) -> Self {
         self.files = files;
+        self.storage_metadata.clear();
+        self
+    }
+
+    /// Sets storage snapshots in the same order as the table's files.
+    pub fn with_storage_metadata(mut self, metadata: Vec<StorageFileMetadata>) -> Self {
+        self.storage_metadata = metadata;
         self
     }
 

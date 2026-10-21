@@ -22,18 +22,22 @@ fn null_checks_and_comparison_to_null_follow_sql_truth() {
 }
 
 #[test]
-fn unsupported_expressions_and_absent_column_stats_stay_unknown() {
+fn unsupported_expressions_and_absent_column_stats_use_explicit_fallbacks() {
     let mut plan = scan(1, Some(100), None, Some(0));
     let c = plan.schema().fields[0].clone();
     let eq = predicate(&c, BinaryOp::Eq, LogicalLiteral::Int64(4));
-    assert_eq!(rows(&filter(plan.clone(), eq)), None);
+    let equality_estimate = root(&filter(plan.clone(), eq)).rows;
+    assert_eq!(equality_estimate.value(), Some(1.0));
+    assert_eq!(equality_estimate.confidence, EstimateConfidence::Model);
     with_stats(&mut plan, |s| s.column_statistics.clear());
     let like = LogicalExpr::Like {
         expr: Box::new(LogicalExpr::Column(c)),
         pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String("%".into()))),
         negated: false,
     };
-    assert_eq!(root(&filter(plan, like)).rows.source, EstimateSource::UnsupportedExpression);
+    let like_estimate = root(&filter(plan, like)).rows;
+    assert_eq!(like_estimate.value(), Some(100.0));
+    assert_eq!(like_estimate.source, EstimateSource::SelectivityFallback);
 }
 
 #[test]

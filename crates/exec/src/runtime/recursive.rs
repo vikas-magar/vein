@@ -1,21 +1,24 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct RecursiveExecutionContext<'a> {
+    pub(super) task: &'a ExecuteTask,
+    pub(super) cancel: &'a CancellationToken,
+    pub(super) memory: &'a QueryMemoryTracker,
+    pub(super) span: &'a tracing::Span,
+    pub(super) schedule: &'a PipelineExecutionSchedule,
+    pub(super) trace: &'a ExecutionTrace,
+}
+
 impl DefaultTaskExecutor {
     pub(super) fn execute_input<'a>(
         &'a self,
         input: &'a Arc<PhysicalPlanNode>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
-        task: &'a ExecuteTask,
-        cancel: &'a CancellationToken,
-        memory: &'a QueryMemoryTracker,
-        span: &'a tracing::Span,
-        schedule: &'a PipelineExecutionSchedule,
-        trace: &'a ExecutionTrace,
+        next: Box<dyn PipelineNode>,
+        context: &'a RecursiveExecutionContext<'a>,
         depth: usize,
-    ) -> Pin<Box<dyn Future<Output=Result<u64>> + Send + 'a>> {
-        self.execute_input_with_runtime_filters(
-            input, next, task, cancel, memory, span, schedule, trace, None, depth,
-        )
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
+        self.execute_input_with_runtime_filters(input, next, context, None, depth)
     }
 
     /// Execute one input node with filters scoped to its direct source.
@@ -24,16 +27,19 @@ impl DefaultTaskExecutor {
     fn execute_input_with_runtime_filters<'a>(
         &'a self,
         input: &'a Arc<PhysicalPlanNode>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
-        task: &'a ExecuteTask,
-        cancel: &'a CancellationToken,
-        memory: &'a QueryMemoryTracker,
-        span: &'a tracing::Span,
-        schedule: &'a PipelineExecutionSchedule,
-        trace: &'a ExecutionTrace,
+        next: Box<dyn PipelineNode>,
+        context: &'a RecursiveExecutionContext<'a>,
         runtime_filters: Option<Arc<RuntimeFilterSet>>,
         depth: usize,
-    ) -> Pin<Box<dyn Future<Output=Result<u64>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
+        let RecursiveExecutionContext {
+            task,
+            cancel,
+            memory,
+            span,
+            schedule,
+            trace,
+        } = *context;
         let node_id = trace.node_id(input);
         let operator = input.operator.data_flow().operator;
         let node_span = tracing::debug_span!(
@@ -75,6 +81,27 @@ impl DefaultTaskExecutor {
                         program,
                         ..
                     } => {
+                        if let DataSource::Intermediate(source_id) = data_source.as_ref() {
+                            let mut source = self
+                                .intermediate_sources
+                                .source(task.query_id, *source_id)?;
+                            let mut pipeline = if program.is_empty() {
+                                next
+                            } else {
+                                self.builder.build_expression_executor(program, next)?
+                            };
+                            tracing::info!(
+                                target: "vein.audit",
+                                event = "intermediate_source_started",
+                                query_id = %task.query_id,
+                                source_id = %source_id,
+                                task_id = %task.task_id,
+                                "replaying query-local checkpoint"
+                            );
+                            source.execute(pipeline.as_mut()).await?;
+                            trace.record_source_bytes(node_id, 0);
+                            return Ok(0);
+                        }
                         let max_parallelism = self.builder.max_parallelism().max(1);
                         let sources = self
                             .builder
@@ -91,10 +118,10 @@ impl DefaultTaskExecutor {
                                 worker_count = 0,
                                 "scan has no candidate storage units"
                             );
-                            let mut empty_pipeline = if program.instructions.is_empty() {
+                            let mut empty_pipeline = if program.is_empty() {
                                 next
                             } else {
-                                self.builder.build_view_vm(program, next)?
+                                self.builder.build_expression_executor(program, next)?
                             };
                             empty_pipeline.flush()?;
                             trace.record_source_bytes(node_id, 0);
@@ -137,12 +164,12 @@ impl DefaultTaskExecutor {
                                 }
                             }
                             if local_nodes.len() == worker_count && fan_in_fallback.is_none() {
-                                let mut canonical: Box<dyn PipelineNode<DataChunkView>> =
-                                    if program.instructions.is_empty() {
+                                let mut canonical: Box<dyn PipelineNode> =
+                                    if program.is_empty() {
                                         next
                                     } else {
                                         Box::new(TransformHandle(
-                                            self.builder.build_view_vm(program, next)?,
+                                            self.builder.build_expression_executor(program, next)?,
                                         ))
                                     };
                                 tracing::debug!(
@@ -156,6 +183,7 @@ impl DefaultTaskExecutor {
                                 let pending = Arc::new(Mutex::new(VecDeque::from(sources)));
                                 let runtime = tokio::runtime::Handle::current();
                                 let mut workers = tokio::task::JoinSet::new();
+                                let query_statistics = trace.query_statistics_context();
                                 for local in local_nodes {
                                     let builder = Arc::clone(&self.builder);
                                     let pending = Arc::clone(&pending);
@@ -166,19 +194,20 @@ impl DefaultTaskExecutor {
                                     let span = span.clone();
                                     let runtime = runtime.clone();
                                     let runtime_filters = runtime_filters.clone();
+                                    let query_statistics = Arc::clone(&query_statistics);
                                     workers.spawn_blocking(move || {
                                         let worker_started = std::time::Instant::now();
                                         let mut bytes = 0u64;
                                         let mut work_units = 0u64;
                                         let mut source_elapsed = std::time::Duration::ZERO;
-                                        let worker_tail: Box<dyn PipelineNode<DataChunkView>> =
+                                        let worker_tail: Box<dyn PipelineNode> =
                                             Box::new(SuppressFlush::new(local));
-                                        let mut pipeline: Box<dyn PipelineNode<DataChunkView>> =
-                                            if program.instructions.is_empty() {
+                                        let mut pipeline: Box<dyn PipelineNode> =
+                                            if program.is_empty() {
                                                 worker_tail
                                             } else {
                                                 Box::new(TransformHandle(
-                                                    builder.build_view_vm(&program, worker_tail)?,
+                                                    builder.build_expression_executor(&program, worker_tail)?,
                                                 ))
                                             };
                                         loop {
@@ -196,20 +225,13 @@ impl DefaultTaskExecutor {
                                             let Some(source_spec) = source_spec else {
                                                 break;
                                             };
-                                            let mut source = match runtime_filters.as_deref() {
-                                                Some(filters) if !filters.is_empty() => builder
-                                                    .build_source_with_runtime_filters(
-                                                        &source_spec,
-                                                        task_id,
-                                                        attempt,
-                                                        filters,
-                                                    )?,
-                                                _ => builder.build_source(
-                                                    &source_spec,
-                                                    task_id,
-                                                    attempt,
-                                                )?,
-                                            };
+                                            let mut source = builder.build_source_with_query_context(
+                                                &source_spec,
+                                                task_id,
+                                                attempt,
+                                                runtime_filters.as_deref(),
+                                                Some(Arc::clone(&query_statistics)),
+                                            )?;
                                             let source_started = std::time::Instant::now();
                                             runtime.block_on(async {
                                                 tokio::select! {
@@ -341,13 +363,13 @@ impl DefaultTaskExecutor {
                                                 )?,
                                             _ => builder.build_source(&source_spec, task_id, attempt)?,
                                         };
-                                        let channel: Box<dyn PipelineNode<DataChunkView>> = Box::new(
+                                        let channel: Box<dyn PipelineNode> = Box::new(
                                             SuppressFlush::new(Box::new(ChannelPipelineNode {
                                                 sender: sender.clone(),
                                                 finished: Arc::clone(&finished),
                                             })),
                                         );
-                                        let result = if program.instructions.is_empty() {
+                                        let result = if program.is_empty() {
                                             let mut next = channel;
                                             runtime.block_on(async {
                                                 tokio::select! {
@@ -357,8 +379,8 @@ impl DefaultTaskExecutor {
                                             }
                                             })
                                         } else {
-                                            let vm = builder.build_view_vm(&program, channel)?;
-                                            let mut next = vm;
+                                            let expression_executor = builder.build_expression_executor(&program, channel)?;
+                                            let mut next = expression_executor;
                                             runtime.block_on(async {
                                                 tokio::select! {
                                                 biased;
@@ -437,20 +459,14 @@ impl DefaultTaskExecutor {
                             return Ok(bytes);
                         }
                         let source_spec = &sources[0];
-                        let mut source = match runtime_filters.as_deref() {
-                            Some(filters) if !filters.is_empty() => self
-                                .builder
-                                .build_source_with_runtime_filters(
-                                    source_spec,
-                                    task.task_id,
-                                    task.attempt,
-                                    filters,
-                                )?,
-                            _ => self
-                                .builder
-                                .build_source(source_spec, task.task_id, task.attempt)?,
-                        };
-                        let bytes_read = if program.instructions.is_empty() {
+                        let mut source = self.builder.build_source_with_query_context(
+                            source_spec,
+                            task.task_id,
+                            task.attempt,
+                            runtime_filters.as_deref(),
+                            Some(trace.query_statistics_context()),
+                        )?;
+                        let bytes_read = if program.is_empty() {
                             let mut source_next = next;
                             tokio::select! {
                             biased;
@@ -461,8 +477,8 @@ impl DefaultTaskExecutor {
                             }
                         }
                         } else {
-                            let vm = self.builder.build_view_vm(program, next)?;
-                            let mut source_next = vm;
+                            let expression_executor = self.builder.build_expression_executor(program, next)?;
+                            let mut source_next = expression_executor;
                             tokio::select! {
                             biased;
                             _ = cancel.cancelled() => Err(VeinError::cancelled()),
@@ -478,17 +494,12 @@ impl DefaultTaskExecutor {
                         bytes_read
                     }
                     PhysicalPlanOperator::Transform { input, program } => {
-                        let transform = self.builder.build_view_vm(program, next)?;
+                        let transform = self.builder.build_expression_executor(program, next)?;
                         let bytes = self
                             .execute_input(
                                 input,
                                 Box::new(TransformHandle(transform)),
-                                task,
-                                cancel,
-                                memory,
-                                span,
-                                schedule,
-                                trace,
+                                context,
                                 depth + 1,
                             )
                             .await?;
@@ -503,21 +514,18 @@ impl DefaultTaskExecutor {
                             } else {
                                 "aggregate"
                             };
-                        let (accumulator, handle) =
-                            aggregate::shared_with_memory_tracker(plan.clone(), operator_memory)?;
-                        let handle: Box<dyn PipelineNode<DataChunkView>> =
-                            Box::new(MaterializeViewNode::for_operator(handle, &input.operator)?
-                                .with_trace(trace.materialization_handle(node_id)));
+                        let registry = self.builder.function_registry()
+                            .unwrap_or_else(|| Arc::new(functions::FunctionRegistry::with_builtins()));
+                        let (accumulator, handle) = aggregate::shared_with_registry_and_memory_tracker(
+                            plan.clone(),
+                            operator_memory,
+                            registry,
+                        )?;
                         let bytes = self
                             .execute_input(
                                 child,
                                 handle,
-                                task,
-                                cancel,
-                                memory,
-                                span,
-                                schedule,
-                                trace,
+                                context,
                                 depth + 1,
                             )
                             .await?;
@@ -533,7 +541,7 @@ impl DefaultTaskExecutor {
                                 .lock()
                                 .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
                             accumulator.finish_with(aggregate::AGGREGATE_BATCH_ROWS, |batch| {
-                                next.push(DataChunkView::from_chunk(batch)?)
+                                next.push(batch)
                             })?;
                             (accumulator.metrics(), accumulator.group_count())
                         };
@@ -586,21 +594,21 @@ impl DefaultTaskExecutor {
                         let output_columns = usize::try_from(*output_columns).map_err(|_| {
                             VeinError::planning("recursive sort output width is invalid", None)
                         })?;
-                        let sort: Box<dyn PipelineNode<DataChunkView>> =
+                        let sort: Box<dyn PipelineNode> =
                             Box::new(SortTransform::with_memory_tracker(
                                 plan.clone(),
                                 Some(output_columns),
                                 operator_memory,
                                 next,
                             )?);
-                        let next: Box<dyn PipelineNode<DataChunkView>> = match key_program {
+                        let next: Box<dyn PipelineNode> = match key_program {
                             Some(program) => {
-                                Box::new(TransformHandle(self.builder.build_view_vm(program, sort)?))
+                                Box::new(TransformHandle(self.builder.build_expression_executor(program, sort)?))
                             }
                             None => sort,
                         };
                         let bytes = self
-                            .execute_input(child, next, task, cancel, memory, span, schedule, trace, depth + 1)
+                            .execute_input(child, next, context, depth + 1)
                             .await?;
                         schedule.complete_boundary(input, PipelineBoundaryKind::SortInput)?;
                         Ok(bytes)
@@ -610,12 +618,7 @@ impl DefaultTaskExecutor {
                         self.execute_input(
                             input,
                             Box::new(limit),
-                            task,
-                            cancel,
-                            memory,
-                            span,
-                            schedule,
-                            trace,
+                            context,
                             depth + 1,
                         )
                             .await
@@ -637,12 +640,7 @@ impl DefaultTaskExecutor {
                             .execute_input(
                                 build,
                                 Box::new(SharedBuildSink(Arc::clone(&build_sink))),
-                                task,
-                                cancel,
-                                memory,
-                                span,
-                                schedule,
-                                trace,
+                                context,
                                 depth + 1,
                             )
                             .await?;
@@ -678,16 +676,17 @@ impl DefaultTaskExecutor {
                             plan,
                             &build_result,
                             &operator_memory,
+                            trace,
                             node_id,
                         )?;
                         let probe_rows = Arc::new(AtomicU64::new(0));
                         let probe_batches = Arc::new(AtomicU64::new(0));
                         let probe_started = Instant::now();
                         let dependencies = schedule.dependencies_for_operator(input)?;
-                        let join: Box<dyn PipelineNode<DataChunkView>> = match build_result {
+                        let join: Box<dyn PipelineNode> = match build_result {
                             BuildResult::InMemory(table) => {
                                 let join = HashJoin::new(
-                                    Arc::new(table),
+                                    table,
                                     join_type(plan.join_type)?,
                                     join_outputs(&plan.outputs),
                                     join_types(&plan.probe_types),
@@ -726,12 +725,7 @@ impl DefaultTaskExecutor {
                                     rows: Arc::clone(&probe_rows),
                                     batches: Arc::clone(&probe_batches),
                                 }),
-                                task,
-                                cancel,
-                                memory,
-                                span,
-                                schedule,
-                                trace,
+                                context,
                                 runtime_filters.clone(),
                                 depth + 1,
                             )
@@ -741,7 +735,7 @@ impl DefaultTaskExecutor {
                             let rows_seen = filters.rows_seen();
                             let rows_kept = filters.rows_kept();
                             tracing::info!(
-                                target: "vein.audit",
+                                target: "vein.statistics",
                                 event = "join_runtime_filter_completed",
                                 node_id,
                                 filter_names = ?filters.names(),

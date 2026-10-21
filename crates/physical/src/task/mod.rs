@@ -46,6 +46,7 @@ impl Task {
             query_id,
             stage_id,
             plan,
+            statistics_context: None,
         }
     }
 }
@@ -78,7 +79,7 @@ mod tests {
     use super::{plan_with_partition_sink, Task};
     use common::identifiers::{PartitionId, QueryId, RequestId, StageId, TaskId};
     use common::protocol::{
-        DataSink, DataSource, ExecutionMode, MicroProgram, PhysicalPlan, PhysicalPlanNode,
+        DataSink, DataSource, ExecutionMode, ExpressionProgram, PhysicalPlan, PhysicalPlanNode,
         PhysicalPlanOperator, SortKey, SortPlan,
     };
     use plan::schema::VeinSchema;
@@ -99,7 +100,7 @@ mod tests {
             operator: PhysicalPlanOperator::Pipeline {
                 source: Arc::new(DataSource::Memory),
                 input_schema: Arc::clone(&schema),
-                program: Arc::new(MicroProgram::empty()),
+                program: Arc::new(ExpressionProgram::empty()),
             },
         });
         let plan = PhysicalPlan {
@@ -145,7 +146,7 @@ mod tests {
             operator: PhysicalPlanOperator::Pipeline {
                 source: Arc::new(DataSource::Memory),
                 input_schema: Arc::clone(&schema),
-                program: Arc::new(MicroProgram::empty()),
+                program: Arc::new(ExpressionProgram::empty()),
             },
         });
         let plan = PhysicalPlan {

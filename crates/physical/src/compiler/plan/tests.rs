@@ -1,15 +1,22 @@
 use std::sync::Arc;
 
 use catalog::{
-    ColumnStatistics, StatisticsComparison, StatisticsPredicate, TableMetadata,
-    TableStatistics,
+    ColumnStatistics, StatisticsComparison, StatisticsPredicate, TableMetadata, TableStatistics,
 };
-use common::protocol::{JoinOutput, MicroOp, SortKey as PhysicalSortKey, SortPlan};
+use common::protocol::{
+    ARROW_DICTIONARY_ENCODING,
+    BinaryExprOp, ColumnEncodingHint, ExprKind, ExpressionStep, JoinOutput, PhysicalExpr,
+    SortKey as PhysicalSortKey, SortPlan,
+};
 use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
 use plan::{LogicalExpr, LogicalLiteral, LogicalPlan, SortKey as LogicalSortKey};
 
-use crate::compiler::BytecodeCompiler;
 use super::PipelineCompiler;
+use crate::test_support::external_scan;
+
+#[path = "tests/expression_assertions.rs"]
+mod expression_assertions;
+use expression_assertions::{binary_count, contains_binary, contains_filter};
 
 fn schema() -> (VeinSchema, Arc<ResolvedColumn>) {
     let first = Arc::new(ResolvedColumn::new(
@@ -77,7 +84,13 @@ fn compiled_scan_predicate_reports_filter_count_and_narrow_input_columns() {
     assert_eq!(compiled.stages[0].predicate_count, 2);
     assert_eq!(compiled.stages[0].input.fields.len(), 1);
     assert_eq!(compiled.stages[0].input.fields[0].name, "price");
-    assert!(!compiled.stages[0].program.instructions.is_empty());
+    assert!(matches!(
+        compiled.stages[0].predicate.kind,
+        ExprKind::Binary {
+            op: BinaryExprOp::And,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -139,7 +152,9 @@ fn scan_predicate_stages_literal_filters_before_column_correlations() {
 
     let unknown = LogicalExpr::Like {
         expr: Box::new(LogicalExpr::Column(label)),
-        pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String("%urgent%".into()))),
+        pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String(
+            "%urgent%".into(),
+        ))),
         negated: false,
     };
     let conservative = PipelineCompiler::scan_predicate(&[correlated, unknown], &schema)
@@ -178,7 +193,9 @@ fn scan_statistics_preserve_safe_ranges_and_fail_open_for_like() {
     };
     let like = LogicalExpr::Like {
         expr: Box::new(LogicalExpr::Column(name)),
-        pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String("%urgent%".into()))),
+        pattern: Box::new(LogicalExpr::Literal(LogicalLiteral::String(
+            "%urgent%".into(),
+        ))),
         negated: false,
     };
     let range = LogicalExpr::BinaryOp {
@@ -215,7 +232,7 @@ fn unsupported_explain_plan() -> LogicalPlan {
     let scan = LogicalPlan::Scan {
         table: Arc::new(
             TableMetadata::new("private_table_marker", Arc::new(schema.clone()))
-                .with_format(plan::TableFormat::Parquet),
+                .with_file_format("parquet"),
         ),
         projection: None,
         filters: Vec::new(),
@@ -236,16 +253,10 @@ fn assert_concise_operator_error(error: &error::VeinError, context: &str) {
         !message.contains("private_table_marker"),
         "nested scan metadata leaked into the error: {message}"
     );
-    assert!(!message.contains("Scan {"), "full plan was formatted: {message}");
-}
-
-fn external_scan(schema: &VeinSchema) -> LogicalPlan {
-    LogicalPlan::ExternalScan {
-        url: "memory://sort-test".to_owned(),
-        options: Vec::new(),
-        files: Vec::new(),
-        schema: Box::new(schema.clone()),
-    }
+    assert!(
+        !message.contains("Scan {"),
+        "full plan was formatted: {message}"
+    );
 }
 
 #[test]
@@ -297,10 +308,7 @@ fn compiles_only_the_project_above_an_already_built_join_filter() {
 
     assert_eq!(output_schema.fields.len(), 1);
     assert!(
-        !program.instructions.iter().any(|instruction| matches!(
-                instruction,
-                common::protocol::MicroOp::FilterMask { .. }
-            )),
+        !contains_filter(&program),
         "the child filter must not be compiled a second time"
     );
 }
@@ -363,7 +371,7 @@ fn compiles_recursive_sort_after_a_limit_without_reordering_the_nodes() {
 }
 
 #[test]
-fn compiles_computed_sort_keys_as_temporary_vm_columns() {
+fn compiles_computed_sort_keys_as_temporary_projection_columns() {
     let (schema, column) = schema();
     let expression = LogicalExpr::BinaryOp {
         left: Box::new(LogicalExpr::Column(column)),
@@ -382,27 +390,26 @@ fn compiles_computed_sort_keys_as_temporary_vm_columns() {
     };
 
     assert_eq!(
-            PipelineCompiler::sort(&plan)
-                .expect("sort metadata")
-                .expect("sort exists")
-                .keys[0]
-                .column,
-            2,
-        );
+        PipelineCompiler::sort(&plan)
+            .expect("sort metadata")
+            .expect("sort exists")
+            .keys[0]
+            .column,
+        2,
+    );
     let program = PipelineCompiler::sort_key_program(&plan)
         .expect("sort key program")
         .expect("computed key needs a program");
-    assert!(
-        program
-            .instructions
-            .iter()
-            .any(|instruction| matches!(instruction, common::protocol::MicroOp::Add { .. }))
-    );
-    assert!(matches!(
-            program.instructions.last(),
-            Some(common::protocol::MicroOp::ProjectRegisters { out_regs })
-                if out_regs.len() == 3
-        ));
+    let expressions = program
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            ExpressionStep::Projection(expressions) => Some(expressions),
+            ExpressionStep::Filter(_) => None,
+        })
+        .expect("computed sort keys are projected");
+    assert_eq!(expressions.len(), 3);
+    assert!(contains_binary(&expressions[2], BinaryExprOp::Add));
 }
 
 #[test]
@@ -441,10 +448,17 @@ fn requests_dictionary_encoding_for_direct_utf8_aggregate_keys() {
 
     let (source, _, _, _) = PipelineCompiler::compile(&aggregate).expect("compile aggregate");
     let common::protocol::DataSource::File(scan) = source else {
-        panic!("aggregate scan should use Parquet");
+        panic!("aggregate should compile to a file scan");
     };
 
-    assert_eq!(scan.dictionary_columns, vec![0]);
+    assert_eq!(
+        scan.column_encoding_hints,
+        vec![ColumnEncodingHint::dictionary(0)]
+    );
+    assert_eq!(
+        scan.column_encoding_hints[0].encoding.as_str(),
+        ARROW_DICTIONARY_ENCODING
+    );
 }
 
 #[test]
@@ -471,10 +485,10 @@ fn does_not_request_dictionary_encoding_for_computed_group_keys() {
 
     let (source, _, _, _) = PipelineCompiler::compile(&aggregate).expect("compile aggregate");
     let common::protocol::DataSource::File(scan) = source else {
-        panic!("aggregate scan should use Parquet");
+        panic!("aggregate should compile to a file scan");
     };
 
-    assert!(scan.dictionary_columns.is_empty());
+    assert!(scan.column_encoding_hints.is_empty());
 }
 
 #[test]
@@ -494,8 +508,7 @@ fn aggregate_uses_single_key_ndv_as_a_capped_capacity_hint() {
         ..TableStatistics::default()
     };
     let table = Arc::new(
-        TableMetadata::new("orders", Arc::new(input_schema.clone()))
-            .with_statistics(statistics),
+        TableMetadata::new("orders", Arc::new(input_schema.clone())).with_statistics(statistics),
     );
     let input = LogicalPlan::Scan {
         table,
@@ -548,11 +561,10 @@ fn aggregate_capacity_hint_requires_unfiltered_input_and_row_count() {
         schema: Box::new(VeinSchema::empty()),
     };
 
-    let filtered = PipelineCompiler::aggregate(&aggregate_for(vec![LogicalExpr::Column(
-        Arc::clone(&key),
-    )]))
-        .expect("plan filtered aggregate")
-        .expect("aggregate plan");
+    let filtered =
+        PipelineCompiler::aggregate(&aggregate_for(vec![LogicalExpr::Column(Arc::clone(&key))]))
+            .expect("plan filtered aggregate")
+            .expect("aggregate plan");
     assert_eq!(filtered.estimated_groups, None);
 
     let mut no_ndv = (*table).clone();
@@ -713,29 +725,59 @@ fn compiles_project_above_aggregate_after_grouping_with_having_order_and_limit()
         PipelineCompiler::compile(&limited).expect("compile aggregate input program");
     assert_eq!(output_schema.fields[1].name, "adjusted_count");
     assert!(
-        !input_program
-            .instructions
-            .iter()
-            .any(|instruction| matches!(instruction, MicroOp::Add { .. })),
+        !expression_assertions::program_contains_binary(&input_program, BinaryExprOp::Add),
         "computed projection must not execute before aggregate groups are built"
     );
 
     let post_aggregate = PipelineCompiler::post_aggregate_program(&limited)
         .expect("compile post-aggregate operators")
         .expect("project and HAVING require a post-aggregate program");
-    assert!(
-        post_aggregate
-            .instructions
-            .iter()
-            .any(|instruction| matches!(instruction, MicroOp::Add { .. }))
-    );
-    assert!(
-        post_aggregate
-            .instructions
-            .iter()
-            .any(|instruction| matches!(instruction, MicroOp::FilterMask { .. }))
-    );
-    assert!(post_aggregate.instructions.iter().any(|instruction| matches!(instruction, MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 2)));
+    assert!(expression_assertions::program_contains_binary(
+        &post_aggregate,
+        BinaryExprOp::Add,
+    ));
+    assert!(contains_filter(&post_aggregate));
+    assert!(post_aggregate.steps.iter().any(|step| matches!(
+        step,
+        ExpressionStep::Projection(expressions) if expressions.len() == 2
+    )));
+}
+
+#[test]
+fn count_distinct_compiles_to_its_per_aggregate_opcode() {
+    let (input_schema, value) = schema();
+    let group = Arc::clone(&input_schema.fields[0]);
+    let output_schema = Box::new(VeinSchema::new(vec![
+        Arc::new(ResolvedColumn::new(
+            ColumnId(30),
+            "group_name",
+            None,
+            VeinDataType::Utf8,
+        )),
+        Arc::new(ResolvedColumn::new(
+            ColumnId(31),
+            "supplier_count",
+            None,
+            VeinDataType::Int64,
+        )),
+    ]));
+    let aggregate = LogicalPlan::Aggregate {
+        input: Box::new(external_scan(&input_schema)),
+        grouping_sets: vec![vec![LogicalExpr::Column(group)]],
+        aggs: vec![LogicalExpr::FunctionCall {
+            name: "count".to_owned(),
+            args: vec![LogicalExpr::Column(value)],
+            is_aggregate: true,
+            distinct: true,
+            return_type: VeinDataType::Int64,
+        }],
+        schema: output_schema,
+    };
+
+    let plan = PipelineCompiler::aggregate(&aggregate)
+        .expect("lower COUNT DISTINCT")
+        .expect("aggregate plan");
+    assert_eq!(plan.aggs, vec![common::protocol::AggOpCode::CountDistinct]);
 }
 
 #[test]
@@ -773,20 +815,13 @@ fn compiles_join_residual_against_only_referenced_build_columns() {
         .expect("predicate should produce a residual plan");
 
     assert_eq!(residual.input_columns, vec![JoinOutput::Build(1)]);
-    assert!(
-        residual
-            .program
-            .instructions
-            .iter()
-            .any(|op| matches!(op, MicroOp::Like { negated: true, .. }))
-    );
-    assert!(
-        residual
-            .program
-            .instructions
-            .iter()
-            .any(|op| matches!(op, MicroOp::FilterMask { .. }))
-    );
+    assert!(matches!(
+        residual.program.steps.as_slice(),
+        [ExpressionStep::Filter(PhysicalExpr {
+            kind: ExprKind::Like { negated: true, .. },
+            ..
+        })]
+    ));
 }
 
 #[test]
@@ -838,25 +873,11 @@ fn compiles_expression_equality_as_a_join_residual_without_copying_unreferenced_
         residual.input_columns,
         vec![JoinOutput::Probe(1), JoinOutput::Build(1)]
     );
-    assert_eq!(
-        residual
-            .program
-            .instructions
-            .iter()
-            .filter(|instruction| matches!(instruction, MicroOp::Add { .. }))
-            .count(),
-        2
-    );
-    assert!(residual
-        .program
-        .instructions
-        .iter()
-        .any(|instruction| matches!(instruction, MicroOp::CmpEq { .. })));
-    assert!(residual
-        .program
-        .instructions
-        .iter()
-        .any(|instruction| matches!(instruction, MicroOp::FilterMask { .. })));
+    let [ExpressionStep::Filter(predicate)] = residual.program.steps.as_slice() else {
+        panic!("join residual is a single typed filter expression");
+    };
+    assert_eq!(binary_count(predicate, BinaryExprOp::Add), 2);
+    assert!(contains_binary(predicate, BinaryExprOp::Equal));
 }
 
 #[test]
@@ -878,7 +899,7 @@ fn missing_recursive_filter_column_reports_operator_identity_and_input_schema() 
         input: Box::new(LogicalPlan::Scan {
             table: Arc::new(
                 TableMetadata::new("partsupp", Arc::new(VeinSchema::empty()))
-                    .with_format(plan::TableFormat::Parquet),
+                    .with_file_format("parquet"),
             ),
             projection: None,
             filters: Vec::new(),
@@ -898,10 +919,7 @@ fn missing_recursive_filter_column_reports_operator_identity_and_input_schema() 
 
 #[test]
 fn unsupported_source_error_names_operator_without_dumping_nested_scan() {
-    let error = PipelineCompiler::collect_leaf_source(
-        &unsupported_explain_plan(),
-        &mut Vec::new(),
-    )
+    let error = PipelineCompiler::collect_leaf_source(&unsupported_explain_plan(), &mut Vec::new())
         .expect_err("EXPLAIN cannot be used as a Parquet source");
 
     assert_concise_operator_error(&error, "source operator");
@@ -920,26 +938,4 @@ fn unsupported_recursive_transform_error_names_operator_concisely() {
         .expect_err("EXPLAIN has no recursive join transform");
 
     assert_concise_operator_error(&error, "recursive join transform");
-}
-
-#[test]
-fn unsupported_pipeline_operator_error_names_operator_concisely() {
-    let mut compiler = BytecodeCompiler::new(0);
-    let error = PipelineCompiler::compile_node(
-        &unsupported_explain_plan(),
-        VeinSchema::empty(),
-        &mut compiler,
-    )
-        .expect_err("EXPLAIN has no Parquet pipeline lowering");
-
-    assert_concise_operator_error(&error, "pipeline");
-}
-
-#[test]
-fn unsupported_post_aggregate_operator_error_names_operator_concisely() {
-    let mut compiler = BytecodeCompiler::new(0);
-    let error = super::compile_post_aggregate_node(&unsupported_explain_plan(), &mut compiler)
-        .expect_err("EXPLAIN has no post-aggregate lowering");
-
-    assert_concise_operator_error(&error, "post-aggregate");
 }

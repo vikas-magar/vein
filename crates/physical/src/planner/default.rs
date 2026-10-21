@@ -52,6 +52,19 @@ impl std::fmt::Debug for DefaultPhysicalPlanner {
 
 impl PhysicalPlanner for DefaultPhysicalPlanner {
     fn create_physical_plan(&self, request_id: RequestId, logical_plan: LogicalPlan) -> Result<Job> {
+        self.create_plan(request_id, logical_plan, None)
+    }
+
+    fn create_physical_plan_with_statistics(&self, request_id: RequestId, logical_plan: LogicalPlan,
+                                            statistics: Arc<common::statistics::QueryStatisticsContext>) -> Result<Job> {
+        self.create_plan(request_id, logical_plan, Some(statistics))
+    }
+}
+
+impl DefaultPhysicalPlanner {
+    fn create_plan(&self, request_id: RequestId, logical_plan: LogicalPlan,
+                   statistics: Option<Arc<common::statistics::QueryStatisticsContext>>) -> Result<Job> {
+        let logical_plan = Arc::new(logical_plan);
         let query_id = QueryId::new();
         tracing::info!(
             target: "vein.audit",
@@ -63,9 +76,10 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
         // Keep every fallible lowering and validation step inside this closure
         // so the single failure path below records all planner errors.
         let result = (|| -> Result<Job> {
-            match &logical_plan {
+            match logical_plan.as_ref() {
                 LogicalPlan::Scan { .. }
                 | LogicalPlan::ExternalScan { .. }
+                | LogicalPlan::Intermediate { .. }
                 | LogicalPlan::Filter { .. }
                 | LogicalPlan::Project { .. }
                 | LogicalPlan::Join { .. }
@@ -75,7 +89,10 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 | LogicalPlan::Aggregate { .. }
                 | LogicalPlan::Distinct { .. }
                 | LogicalPlan::Write { .. } => {
-                    let stage = self.pipeline_builder.build(&logical_plan)?;
+                    let stage = match statistics {
+                        Some(statistics) => self.pipeline_builder.build_with_statistics(&logical_plan, statistics)?,
+                        None => self.pipeline_builder.build(&logical_plan)?,
+                    };
                     let graph = stage.pipeline_graph();
                     tracing::info!(
                     target: "vein.audit",
@@ -92,7 +109,13 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                     for task in stage.tasks() {
                         task.plan.validate()?;
                     }
-                    Ok(Job::new(request_id, query_id, stage, ExecutionMode::Batch))
+                    Ok(Job::new(
+                        request_id,
+                        query_id,
+                        Arc::clone(&logical_plan),
+                        stage,
+                        ExecutionMode::Batch,
+                    ))
                 }
                 other => Err(VeinError::unsupported(
                     format!(
@@ -155,7 +178,7 @@ mod tests {
             _plan: &LogicalPlan,
         ) -> Result<(
             common::protocol::DataSource,
-            common::protocol::MicroProgram,
+            common::protocol::ExpressionProgram,
             plan::schema::VeinSchema,
             plan::schema::VeinSchema,
         )> {
@@ -221,7 +244,7 @@ mod tests {
         ]));
         let table = std::sync::Arc::new(
             plan::TableMetadata::new("users", std::sync::Arc::new(*schema.clone()))
-                .with_format(plan::TableFormat::Parquet),
+                .with_file_format("parquet"),
         );
         LogicalPlan::Scan {
             table,
@@ -235,18 +258,25 @@ mod tests {
     fn test_create_physical_plan_for_linear_scan() {
         let planner = DefaultPhysicalPlanner::new();
         let plan = mock_scan_plan();
+        let expected_logical_plan = plan.clone();
         let job = planner
             .create_physical_plan(RequestId::new(), plan)
             .expect("plan should succeed");
+        assert_eq!(job.logical_plan().as_ref(), &expected_logical_plan);
 
         let stage = job.stage();
         assert_eq!(stage.tasks().len(), 1);
 
         let input = task_input(&stage.tasks()[0]);
-        let common::protocol::PhysicalPlanOperator::Pipeline { program, .. } = &input.operator else {
+        let common::protocol::PhysicalPlanOperator::Pipeline {
+            input_schema,
+            program,
+            ..
+        } = &input.operator else {
             panic!("scan-only plan should lower to a pipeline");
         };
-        assert_eq!(program.register_count, 2);
+        assert_eq!(input_schema.fields.len(), 2);
+        assert!(program.is_empty(), "a full scan must not add an identity projection");
     }
 
     #[test]
@@ -404,7 +434,7 @@ mod tests {
             let schema = Arc::new(VeinSchema::new(fields));
             let table = Arc::new(
                 plan::TableMetadata::new(name, Arc::clone(&schema))
-                    .with_format(plan::TableFormat::Parquet),
+                    .with_file_format("parquet"),
             );
             LogicalPlan::Scan {
                 table,
@@ -524,11 +554,24 @@ mod tests {
             common::protocol::PhysicalPlanOperator::Aggregate { .. }
         ));
         assert!(
-            program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::Add { .. })),
+            program.steps.iter().any(|step| matches!(
+                step,
+                common::protocol::ExpressionStep::Projection(expressions)
+                    if expressions.iter().any(|expression| matches!(
+                        expression.kind,
+                        common::protocol::ExprKind::Binary {
+                            op: common::protocol::BinaryExprOp::Add,
+                            ..
+                        }
+                    ))
+            )),
             "computed projection must run against aggregate output"
         );
         assert!(
-            program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 2)),
+            program.steps.iter().any(|step| matches!(
+                step,
+                common::protocol::ExpressionStep::Projection(expressions) if expressions.len() == 2
+            )),
             "projection must preserve both aliased output columns"
         );
 
@@ -558,7 +601,7 @@ mod tests {
             common::protocol::PhysicalPlanOperator::Aggregate { .. }
         ));
         assert!(
-            program.instructions.iter().any(|op| matches!(op, common::protocol::MicroOp::FilterMask { .. })),
+            program.steps.iter().any(|step| matches!(step, common::protocol::ExpressionStep::Filter(_))),
             "HAVING transform must contain its filter instruction"
         );
     }
@@ -607,9 +650,9 @@ mod tests {
         let common::protocol::PhysicalPlanOperator::Transform { input, program } = &input.operator else {
             panic!("post-aggregate filter should be a transform node");
         };
-        assert!(program.instructions.iter().any(|op| matches!(
-            op,
-            common::protocol::MicroOp::FilterMask { .. }
+        assert!(program.steps.iter().any(|step| matches!(
+            step,
+            common::protocol::ExpressionStep::Filter(_)
         )));
         let common::protocol::PhysicalPlanOperator::Aggregate { input, .. } = &input.operator else {
             panic!("post-aggregate filter should follow an aggregate node");
@@ -620,9 +663,9 @@ mod tests {
         let common::protocol::PhysicalPlanOperator::Pipeline { program, .. } = &input.operator else {
             panic!("the aggregate input transform should consume the scan pipeline");
         };
-        assert!(program.instructions.iter().all(|op| !matches!(
-            op,
-            common::protocol::MicroOp::FilterMask { .. }
+        assert!(program.steps.iter().all(|step| !matches!(
+            step,
+            common::protocol::ExpressionStep::Filter(_)
         )));
     }
 
@@ -756,7 +799,7 @@ mod tests {
             let schema = Arc::new(VeinSchema::new(fields));
             let table = Arc::new(
                 plan::TableMetadata::new(name, Arc::clone(&schema))
-                    .with_format(plan::TableFormat::Parquet),
+                    .with_file_format("parquet"),
             );
             LogicalPlan::Scan {
                 table,
@@ -950,9 +993,9 @@ mod tests {
             &input.operator,
             common::protocol::PhysicalPlanOperator::Join { .. }
         ));
-        assert!(program.instructions.iter().any(|op| matches!(
-            op,
-            common::protocol::MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 2
+        assert!(program.steps.iter().any(|step| matches!(
+            step,
+            common::protocol::ExpressionStep::Projection(expressions) if expressions.len() == 2
         )));
     }
 

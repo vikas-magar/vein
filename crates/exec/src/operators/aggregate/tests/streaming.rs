@@ -14,7 +14,7 @@ fn aggregate_finish_streams_ordered_groups_in_bounded_chunks() {
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
     let mut sink = AggregateSink::new(plan).expect("create grouped sum");
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![Some(1), None, Some(1), Some(3), None])) as ArrayRef,
         Arc::new(Int64Array::from(vec![10, 20, 15, 30, 25])) as ArrayRef,
     ]))
@@ -30,22 +30,16 @@ fn aggregate_finish_streams_ordered_groups_in_bounded_chunks() {
     assert_eq!(
         chunks
             .iter()
-            .map(|chunk| chunk.selection.size())
+            .map(|chunk| chunk.num_rows())
             .collect::<Vec<_>>(),
         vec![2, 1],
         "each output chunk must respect the requested group row bound"
     );
     let mut actual = Vec::new();
     for chunk in &chunks {
-        let keys = chunk.vectors[0]
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("group key output");
-        let sums = chunk.vectors[1]
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("sum output");
-        for row in 0..chunk.selection.size() {
+        let keys = crate::pipeline::test_support::materialized_column::<Int64Array>(chunk, 0);
+        let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(chunk, 1);
+        for row in 0..chunk.num_rows() {
             actual.push((
                 (!keys.is_null(row)).then(|| keys.value(row)),
                 sums.value(row),
@@ -67,7 +61,7 @@ fn aggregate_finish_callback_error_stops_emission_without_losing_groups() {
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
     let mut sink = AggregateSink::new(plan).expect("create grouped count");
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
         Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
     ]))
@@ -84,7 +78,7 @@ fn aggregate_finish_callback_error_stops_emission_without_losing_groups() {
     assert_eq!(emitted, 1, "stop after the first failed push");
 
     let output = sink.finish().expect("groups remain available for retry");
-    assert_eq!(output.iter().map(|chunk| chunk.selection.size()).sum::<usize>(), 3);
+    assert_eq!(output.iter().map(|chunk| chunk.num_rows()).sum::<usize>(), 3);
 }
 
 #[test]
@@ -126,10 +120,10 @@ fn aggregate_finish_streaming_preserves_empty_group_semantics() {
         })
         .expect("finish empty global aggregate");
     assert_eq!(global_batches.len(), 1);
-    assert_eq!(global_batches[0].selection.size(), 1);
-    let count = global_batches[0].vectors[0]
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("global COUNT output");
+    assert_eq!(global_batches[0].num_rows(), 1);
+    let count = crate::pipeline::test_support::materialized_column::<Int64Array>(
+        &global_batches[0],
+        0,
+    );
     assert_eq!(count.value(0), 0);
 }

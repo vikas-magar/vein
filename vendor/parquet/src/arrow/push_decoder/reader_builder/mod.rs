@@ -17,6 +17,7 @@
 
 mod data;
 mod filter;
+mod filter_window;
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::{ArrayReaderBuilder, CacheOptions, RowGroupCache};
@@ -29,6 +30,7 @@ use crate::arrow::arrow_reader::{
 use crate::arrow::in_memory_row_group::ColumnChunkData;
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
 use crate::arrow::push_decoder::reader_builder::filter::CacheInfo;
+use crate::arrow::push_decoder::reader_builder::filter_window::FilterWindowProgress;
 use crate::arrow::schema::ParquetField;
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
@@ -51,6 +53,7 @@ struct RowGroupInfo {
     plan_builder: ReadPlanBuilder,
     page_locations: Arc<HashMap<usize, Vec<PageLocation>>>,
     budget: RowBudget,
+    filter_progress: Option<FilterWindowProgress>,
 }
 
 /// This is the inner state machine for reading a single row group.
@@ -425,6 +428,7 @@ impl RowGroupReaderBuilder {
             plan_builder,
             page_locations: Arc::new(page_locations),
             budget,
+            filter_progress: None,
         };
 
         self.state = Some(RowGroupDecoderState::Start { row_group_info });
@@ -485,7 +489,7 @@ impl RowGroupReaderBuilder {
 
                 let column_chunks = None; // no prior column chunks
 
-                let Some(filter) = self.filter.take() else {
+                let Some(mut filter) = self.filter.take() else {
                     // no filter, start trying to read data immediately
                     return Ok(NextState::again(RowGroupDecoderState::StartData {
                         row_group_info,
@@ -514,6 +518,29 @@ impl RowGroupReaderBuilder {
                     ))),
                 );
 
+                let mut filter_progress = FilterWindowProgress::new(
+                    row_group_info.row_count,
+                    self.batch_size,
+                    row_group_info.plan_builder.selection().cloned(),
+                );
+                let Some(window_selection) = filter_progress.next_window() else {
+                    self.filter = Some(filter);
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::Finished,
+                        RowGroupBuildResult::Finished {
+                            remaining_budget: row_group_info.budget,
+                        },
+                    ));
+                };
+                filter.reorder_for_filter_window();
+                let row_group_info = RowGroupInfo {
+                    plan_builder: row_group_info
+                        .plan_builder
+                        .with_selection(Some(window_selection)),
+                    filter_progress: Some(filter_progress),
+                    ..row_group_info
+                };
+
                 let filter_info = FilterInfo::new(filter, cache_info);
                 NextState::again(RowGroupDecoderState::Filters {
                     row_group_info,
@@ -533,10 +560,12 @@ impl RowGroupReaderBuilder {
                     plan_builder,
                     page_locations,
                     budget,
+                    filter_progress,
                 } = row_group_info;
 
-                // If nothing is selected, we are done with this row group
-                if !plan_builder.selects_any() {
+                // Empty selections continue through this vector's stages so the
+                // window can be finalized and the following window can proceed.
+                if !plan_builder.selects_any() && filter_progress.is_none() {
                     // ruled out entire row group
                     self.filter = Some(filter_info.into_filter());
                     return Ok(NextState::result(
@@ -574,6 +603,7 @@ impl RowGroupReaderBuilder {
                     plan_builder,
                     page_locations,
                     budget,
+                    filter_progress,
                 };
 
                 NextState::again(RowGroupDecoderState::WaitingOnFilterData {
@@ -602,12 +632,14 @@ impl RowGroupReaderBuilder {
                 }
 
                 // otherwise we have all the data we need to evaluate the predicate
+                filter_info.start_filter_evaluation();
                 let RowGroupInfo {
                     row_group_idx,
                     row_count,
                     mut plan_builder,
                     page_locations,
                     budget,
+                    filter_progress,
                 } = row_group_info;
 
                 let predicate = filter_info.current();
@@ -647,7 +679,15 @@ impl RowGroupReaderBuilder {
                 // matching rows have been accumulated.
                 let predicate_limit = filter_info
                     .is_last()
-                    .then(|| budget.selected_row_limit())
+                    .then(|| {
+                        budget.selected_row_limit().map(|limit| {
+                            limit.saturating_sub(
+                                filter_progress
+                                    .as_ref()
+                                    .map_or(0, FilterWindowProgress::selected_rows),
+                            )
+                        })
+                    })
                     .flatten();
 
                 // Evaluate the filter via `with_predicate_options`, opting into
@@ -656,16 +696,19 @@ impl RowGroupReaderBuilder {
                 let mut predicate_options =
                     PredicateOptions::new(array_reader, filter_info.current_mut());
                 if let Some(limit) = predicate_limit {
-                    predicate_options = predicate_options.with_limit(limit, row_count);
+                    let rows_in_window = plan_builder.num_rows_selected().unwrap_or(row_count);
+                    predicate_options = predicate_options.with_limit(limit, rows_in_window);
                 }
                 plan_builder = plan_builder.with_predicate_options(predicate_options)?;
+                filter_info.finish_filter_evaluation();
 
-                let row_group_info = RowGroupInfo {
+                let mut row_group_info = RowGroupInfo {
                     row_group_idx,
                     row_count,
                     plan_builder,
                     page_locations,
                     budget,
+                    filter_progress,
                 };
 
                 // Take back the column chunks that were read
@@ -681,15 +724,65 @@ impl RowGroupReaderBuilder {
                         })
                     }
                     // done with predicates, proceed to reading data
-                    AdvanceResult::Done(filter, cache_info) => {
-                        // remember we need to put back the filter
-                        assert!(self.filter.is_none());
-                        self.filter = Some(filter);
-                        NextState::again(RowGroupDecoderState::StartData {
-                            row_group_info,
-                            column_chunks,
-                            cache_info: Some(cache_info),
-                        })
+                    AdvanceResult::Done(mut filter, cache_info) => {
+                        if let Some(mut progress) = row_group_info.filter_progress.take() {
+                            let selection = row_group_info.plan_builder.selection().ok_or_else(|| {
+                                ParquetError::General(
+                                    "vector filter window completed without a row selection".into(),
+                                )
+                            })?;
+                            progress.record_completed_window(selection);
+
+                            let limit_reached = row_group_info
+                                .budget
+                                .selected_row_limit()
+                                .is_some_and(|limit| progress.selected_rows() >= limit);
+                            let next_window = if limit_reached {
+                                progress.stop_after_current_window();
+                                None
+                            } else {
+                                progress.next_window()
+                            };
+
+                            if let Some(window_selection) = next_window {
+                                filter.reorder_for_filter_window();
+                                let row_group_info = RowGroupInfo {
+                                    plan_builder: row_group_info
+                                        .plan_builder
+                                        .with_selection(Some(window_selection)),
+                                    filter_progress: Some(progress),
+                                    ..row_group_info
+                                };
+                                return Ok(NextState::again(RowGroupDecoderState::Filters {
+                                    row_group_info,
+                                    column_chunks,
+                                    filter_info: FilterInfo::new(filter, cache_info),
+                                }));
+                            }
+
+                            let row_group_info = RowGroupInfo {
+                                plan_builder: row_group_info
+                                    .plan_builder
+                                    .with_selection(Some(progress.output_selection())),
+                                filter_progress: None,
+                                ..row_group_info
+                            };
+                            assert!(self.filter.is_none());
+                            self.filter = Some(filter);
+                            NextState::again(RowGroupDecoderState::StartData {
+                                row_group_info,
+                                column_chunks,
+                                cache_info: Some(cache_info),
+                            })
+                        } else {
+                            assert!(self.filter.is_none());
+                            self.filter = Some(filter);
+                            NextState::again(RowGroupDecoderState::StartData {
+                                row_group_info,
+                                column_chunks,
+                                cache_info: Some(cache_info),
+                            })
+                        }
                     }
                 }
             }
@@ -704,6 +797,7 @@ impl RowGroupReaderBuilder {
                     plan_builder,
                     page_locations,
                     budget,
+                    filter_progress: _,
                 } = row_group_info;
 
                 let BudgetedReadPlan {
@@ -760,6 +854,7 @@ impl RowGroupReaderBuilder {
                     plan_builder,
                     page_locations,
                     budget: remaining_budget,
+                    filter_progress: None,
                 };
 
                 NextState::again(RowGroupDecoderState::WaitingOnData {

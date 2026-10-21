@@ -1,14 +1,17 @@
-//! Decorrelation of equality-correlated EXISTS predicates into semi/anti joins.
+//! Decorrelation of hash-keyed correlated EXISTS predicates into semi/anti joins.
 //!
 //! Keeping this rewrite in the optimizer makes existence checks set based: the
 //! inner relation is built once and each outer row is emitted at most once.
+mod volatility;
+
 use error::{Result, VeinError};
 use parser::ast::expr::BinaryOp;
 use parser::ast::pipe_op::JoinType;
-use plan::{LogicalExpr, LogicalPlan, PlanTraversal, ResolvedColumnRef, VeinDataType};
+use plan::{LogicalExpr, LogicalPlan, PlanTraversal, ResolvedColumnRef, VeinDataType, VeinSchema};
 
 use crate::context::{OptimizerContext, OptimizerPhase};
 use crate::rule::{OptimizerRule, RuleType};
+use volatility::contains_volatile_expression;
 
 /// Rewrites supported correlated existence filters into semi/anti joins.
 pub struct ExistsDecorrelationRule;
@@ -53,7 +56,7 @@ impl OptimizerRule for ExistsDecorrelationRule {
             .into_iter()
             .filter(|term| !matches!(term, LogicalExpr::Exists { .. }))
             .map(|term| {
-                if term.is_volatile() {
+                if contains_volatile_expression(&term) {
                     Err(VeinError::planning(
                         "EXISTS decorrelation cannot move a filter containing volatile expressions across the existence check",
                         None,
@@ -88,13 +91,14 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
         ));
     }
     let mut keys = Vec::new();
+    let mut correlated_residuals = Vec::new();
     let mut local_filters = Vec::new();
 
     for predicate in &filters {
         let mut terms = Vec::new();
-        split_conjunction(&predicate, &mut terms);
+        split_conjunction(predicate, &mut terms);
         for term in terms {
-            if let Some((inner, outer)) = equality_correlation(&term) {
+            if let Some((inner, outer)) = equality_correlation(term) {
                 if inner_base.schema().position_of_id(inner.id).is_none()
                     || input.schema().position_of_id(outer.id).is_none()
                 {
@@ -104,11 +108,18 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
                     ));
                 }
                 keys.push((inner, outer));
-            } else if contains_outer_column(&term) {
-                return Err(VeinError::planning(
-                    "correlated EXISTS currently requires outer references to be direct equality keys between inner and outer columns",
-                    None,
-                ));
+            } else if contains_outer_column(term) {
+                if term.is_volatile() {
+                    return Err(VeinError::planning(
+                        "EXISTS decorrelation cannot move volatile correlated predicates into a shared hash join",
+                        None,
+                    ));
+                }
+                correlated_residuals.push(lower_correlated_predicate(
+                    term.clone(),
+                    inner_base.schema(),
+                    input.schema(),
+                )?);
             } else {
                 if term.is_volatile() {
                     return Err(VeinError::planning(
@@ -124,7 +135,7 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
     if keys.is_empty() {
         if filters.iter().any(predicate_contains_outer_column) {
             return Err(VeinError::planning(
-                "correlated EXISTS requires at least one inner-to-outer equality key",
+                "correlated EXISTS requires at least one hashable equality key; non-equality correlations are residuals when a hash key is present",
                 None,
             ));
         }
@@ -144,7 +155,9 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
         };
     }
 
-    let key_exprs = keys
+    let key_count = keys.len();
+    let residual_count = correlated_residuals.len();
+    let mut on_terms = keys
         .into_iter()
         .map(|(inner, outer)| LogicalExpr::BinaryOp {
             left: Box::new(LogicalExpr::Column(outer)),
@@ -153,18 +166,9 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
             return_type: VeinDataType::Boolean,
         })
         .collect::<Vec<_>>();
-    let mut key_exprs = key_exprs.into_iter();
-    let mut on = key_exprs
-        .next()
+    on_terms.extend(correlated_residuals);
+    let on = make_conjunction(on_terms)
         .ok_or_else(|| VeinError::planning("correlated EXISTS requires an equality key", None))?;
-    for right in key_exprs {
-        on = LogicalExpr::BinaryOp {
-            left: Box::new(on),
-            op: BinaryOp::And,
-            right: Box::new(right),
-            return_type: VeinDataType::Boolean,
-        };
-    }
 
     let join = LogicalPlan::Join {
         join_type: if negated { JoinType::Anti } else { JoinType::Semi },
@@ -180,10 +184,8 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
             target: "vein.audit",
             event = "exists_decorrelated",
             negated,
-            key_count = match &join {
-                LogicalPlan::Join { on: Some(on), .. } => conjunction_count(on),
-                _ => 0,
-            },
+            key_count,
+            residual_count,
             "exists_decorrelated"
         );
     Ok(join)
@@ -262,11 +264,36 @@ fn predicate_contains_outer_column(expr: &LogicalExpr) -> bool {
     contains_outer_column(expr)
 }
 
-fn conjunction_count(expr: &LogicalExpr) -> usize {
-    let mut terms = Vec::new();
-    split_conjunction(expr, &mut terms);
-    terms.len()
+fn lower_correlated_predicate(
+    expression: LogicalExpr,
+    inner_schema: &VeinSchema,
+    outer_schema: &VeinSchema,
+) -> Result<LogicalExpr> {
+    let mut lower_child = |child| {
+        lower_correlated_predicate(child, inner_schema, outer_schema)
+    };
+    match expression.map_children(&mut lower_child)? {
+        LogicalExpr::Column(column) if inner_schema.position_of_id(column.id).is_none() => {
+            Err(VeinError::planning(
+                "correlated EXISTS predicate references a column outside the inner input schema",
+                None,
+            ))
+        }
+        LogicalExpr::Column(column) => Ok(LogicalExpr::Column(column)),
+        LogicalExpr::OuterColumn(column) if outer_schema.position_of_id(column.id).is_none() => {
+            Err(VeinError::planning(
+                "correlated EXISTS predicate references a column outside the outer input schema",
+                None,
+            ))
+        }
+        LogicalExpr::OuterColumn(column) => Ok(LogicalExpr::Column(column)),
+        expression => Ok(expression),
+    }
 }
+
+#[cfg(test)]
+#[path = "exists_decorrelation_tests.rs"]
+mod correlated_tests;
 
 #[cfg(test)]
 mod tests {
@@ -602,7 +629,7 @@ mod tests {
         let error = ExistsDecorrelationRule
             .apply(&exists, &OptimizerContext::default())
             .expect_err("range correlation must not be silently changed");
-        assert!(error.to_string().contains("direct equality keys"));
+        assert!(error.to_string().contains("hashable equality key"));
     }
 
     #[test]
@@ -623,3 +650,7 @@ mod tests {
         assert!(error.to_string().contains("uncorrelated EXISTS"));
     }
 }
+
+#[cfg(test)]
+#[path = "exists_decorrelation/q22_volatility_tests.rs"]
+mod q22_volatility_tests;

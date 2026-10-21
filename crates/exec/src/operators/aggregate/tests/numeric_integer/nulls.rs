@@ -28,7 +28,7 @@ fn null_inputs_are_ignored_and_count_only_counts_non_null_values() {
     };
     let mut sink = AggregateSink::new(plan).unwrap();
 
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![Some(1), None, Some(1)])),
         values.clone(),
         values.clone(),
@@ -40,42 +40,27 @@ fn null_inputs_are_ignored_and_count_only_counts_non_null_values() {
     let row = &output[0];
 
     assert_eq!(
-        row.column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int64Array>(row, 0)
             .value(0),
         2
     );
     assert_eq!(
-        row.column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int64Array>(row, 1)
             .value(0),
         8
     );
     assert_eq!(
-        row.column(2)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int64Array>(row, 2)
             .value(0),
         3
     );
     assert_eq!(
-        row.column(3)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Int64Array>(row, 3)
             .value(0),
         5
     );
     assert_eq!(
-        row.column(4)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
+        crate::pipeline::test_support::materialized_column::<Float64Array>(row, 4)
             .value(0),
         4.0
     );

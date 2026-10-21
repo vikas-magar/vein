@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::pin::Pin;
 
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use catalog::{AnalyzedTableStatistics, StatisticsSourceIdentity, TableStatistics};
 use futures::{Stream, StreamExt};
@@ -15,13 +14,14 @@ use types::VeinSchema;
 
 use super::{
     ArrowScalarEncoder, ArrowValueEncoder, HyperLogLog, MergeableDistinctSketch,
-    StatisticsCollector, StatisticsConfig, stable_hash,
+    StatisticsCollector, StatisticsConfig, StatisticsInput, stable_hash,
 };
 use crate::{Result, VeinError};
 
-/// A back-pressured stream of batches from one stable source snapshot.
-pub type StatisticsBatchStream =
-    Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send + 'static>>;
+/// A back-pressured stream of owned execution inputs from one stable snapshot.
+pub type StatisticsInputStream = Pin<
+    Box<dyn Stream<Item=Result<Box<dyn StatisticsInput + Send>>> + Send + 'static>,
+>;
 
 /// Source metadata and batches pinned to one table snapshot for analysis.
 pub struct StatisticsAnalysisSnapshot {
@@ -35,8 +35,8 @@ pub struct StatisticsAnalysisSnapshot {
     pub source_identities: Vec<StatisticsSourceIdentity>,
     /// Exact row count supplied by storage metadata, when available.
     pub expected_num_rows: Option<u64>,
-    /// Incremental source batches. Implementations should apply backpressure.
-    pub batches: StatisticsBatchStream,
+    /// Incremental reference-backed inputs. Implementations should apply backpressure.
+    pub inputs: StatisticsInputStream,
 }
 
 /// Catalog/storage boundary for generic table analysis.
@@ -72,7 +72,7 @@ pub async fn analyze_table(
         config,
         ArrowScalarEncoder,
     )
-    .await
+        .await
 }
 
 /// Analyze a table with pluggable mergeable distinct sketches and scalar encoding.
@@ -110,8 +110,8 @@ where
         encoder,
     )?;
     let mut batch_count = 0_u64;
-    while let Some(batch) = snapshot.batches.next().await {
-        collector.update(&batch?)?;
+    while let Some(input) = snapshot.inputs.next().await {
+        collector.update_input(input?.as_ref())?;
         batch_count = batch_count
             .checked_add(1)
             .ok_or_else(|| VeinError::internal("analysis batch count overflow"))?;
@@ -168,7 +168,7 @@ pub fn revision_from_identities(identities: &[StatisticsSourceIdentity]) -> u64 
     stable_hash(0xfd, &bytes)
 }
 
-fn canonicalize_identities(identities: &mut Vec<StatisticsSourceIdentity>) -> Result<()> {
+fn canonicalize_identities(identities: &mut [StatisticsSourceIdentity]) -> Result<()> {
     identities.sort_by(|left, right| left.identifier.cmp(&right.identifier));
     if identities.iter().any(|identity| identity.identifier.is_empty())
         || identities.windows(2).any(|pair| pair[0].identifier == pair[1].identifier)
@@ -221,13 +221,13 @@ fn validate_statistics(schema: &VeinSchema, statistics: &TableStatistics, rows: 
         if group.columns.len() < 2
             || group.columns.iter().collect::<HashSet<_>>().len() != group.columns.len()
             || positions.as_ref().is_none_or(|positions| {
-                positions.windows(2).any(|pair| pair[0] >= pair[1])
-            })
+            positions.windows(2).any(|pair| pair[0] >= pair[1])
+        })
             || group.distinct_count.is_none_or(|count| count > rows)
             || group.distinct_sketch.is_none()
             || group.distinct_count_relative_error.is_none_or(|error| {
-                !error.is_finite() || !(0.0..=1.0).contains(&error)
-            })
+            !error.is_finite() || !(0.0..=1.0).contains(&error)
+        })
             || !groups.insert(group.columns.iter().map(String::as_str).collect::<Vec<_>>())
         {
             return Err(VeinError::internal(
@@ -267,7 +267,9 @@ mod tests {
             batch_size: usize,
         ) -> Result<StatisticsAnalysisSnapshot> {
             *self.requested_batch_size.lock().unwrap() = Some(batch_size);
-            let batches = self.batches.clone().into_iter().map(Ok);
+            let inputs = self.batches.clone().into_iter().map(|batch| {
+                Ok(Box::new(batch) as Box<dyn StatisticsInput + Send>)
+            });
             Ok(StatisticsAnalysisSnapshot {
                 arrow_schema: Arc::clone(&self.schema),
                 logical_schema: self.logical_schema.clone(),
@@ -277,7 +279,7 @@ mod tests {
                     version: "v1".to_owned(),
                 }],
                 expected_num_rows: self.expected_num_rows,
-                batches: Box::pin(stream::iter(batches)),
+                inputs: Box::pin(stream::iter(inputs)),
             })
         }
 
@@ -303,7 +305,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(5), Some(5), Some(6), Some(5)])),
             ],
         )
-        .unwrap();
+            .unwrap();
         MemoryProvider {
             logical_schema: VeinSchema::try_from(schema.as_ref()).unwrap(),
             schema,

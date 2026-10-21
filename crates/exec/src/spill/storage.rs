@@ -156,8 +156,8 @@ impl Drop for LocalSpillStorage {
         let Some(Ok(directory)) = self.directory.get() else {
             return;
         };
-        if let Err(error) = fs::remove_dir_all(directory) {
-            if error.kind() != io::ErrorKind::NotFound {
+        if let Err(error) = fs::remove_dir_all(directory)
+            && error.kind() != io::ErrorKind::NotFound {
                 tracing::warn!(
                     target: "vein.audit",
                     event = "query_spill_cleanup_failed",
@@ -166,7 +166,12 @@ impl Drop for LocalSpillStorage {
                     "failed to remove query spill directory"
                 );
             }
-        }
+    }
+}
+
+impl Default for LocalSpillStorage {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

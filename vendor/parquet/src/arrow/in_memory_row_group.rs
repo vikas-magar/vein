@@ -23,11 +23,14 @@ use crate::errors::ParquetError;
 use crate::file::metadata::page_index::RowGroupPageIndex;
 use crate::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use crate::file::page_index::offset_index::PageLocation;
-use crate::file::reader::{ChunkReader, Length, SerializedPageReader};
-use bytes::{Buf, Bytes};
+use crate::file::reader::SerializedPageReader;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+
+mod column_chunk;
+pub(crate) use column_chunk::ColumnChunkData;
 
 /// An in-memory collection of column chunks
 #[derive(Debug)]
@@ -85,9 +88,12 @@ impl InMemoryRowGroup<'_> {
                 .zip(metadata.columns())
                 .enumerate()
                 .filter(|&(idx, (chunk, _chunk_meta))| {
-                    chunk.is_none() && projection.leaf_included(idx)
+                    projection.leaf_included(idx)
+                        && chunk
+                        .as_deref()
+                        .is_none_or(ColumnChunkData::can_fetch_more)
                 })
-                .flat_map(|(idx, (_chunk, chunk_meta))| {
+                .flat_map(|(idx, (chunk, chunk_meta))| {
                     // If the first page does not start at the beginning of the column,
                     // then we need to also fetch a dictionary page.
                     let mut ranges: Vec<Range<u64>> = vec![];
@@ -135,6 +141,11 @@ impl InMemoryRowGroup<'_> {
                     } else {
                         ranges.extend(selection.scan_ranges(locations));
                     }
+
+                    let ranges = match chunk.as_deref() {
+                        Some(chunk) => chunk.missing_ranges(ranges),
+                        None => ColumnChunkData::coalesce_ranges(ranges),
+                    };
                     page_start_offsets.push(Some(ranges.iter().map(|range| range.start).collect()));
 
                     ranges
@@ -149,7 +160,12 @@ impl InMemoryRowGroup<'_> {
                 .column_chunks
                 .iter()
                 .enumerate()
-                .filter(|&(idx, chunk)| chunk.is_none() && projection.leaf_included(idx))
+                .filter(|&(idx, chunk)| {
+                    projection.leaf_included(idx)
+                        && chunk
+                        .as_deref()
+                        .is_none_or(ColumnChunkData::can_fetch_more)
+                })
                 .map(|(idx, _chunk)| {
                     let column = metadata.column(idx);
                     let (start, length) = column.byte_range();
@@ -172,7 +188,8 @@ impl InMemoryRowGroup<'_> {
         projection: &ProjectionMask,
         page_start_offsets: Option<Vec<Option<Vec<u64>>>>,
         chunk_data: I,
-    ) where
+    ) -> Result<(), ParquetError>
+    where
         I: IntoIterator<Item=Bytes>,
     {
         let mut chunk_data = chunk_data.into_iter();
@@ -183,50 +200,82 @@ impl InMemoryRowGroup<'_> {
             let mut page_start_offsets = page_start_offsets.into_iter();
 
             for (idx, chunk) in self.column_chunks.iter_mut().enumerate() {
-                if chunk.is_some() || !projection.leaf_included(idx) {
+                if !projection.leaf_included(idx)
+                    || chunk
+                    .as_deref()
+                    .is_some_and(|chunk| !chunk.can_fetch_more())
+                {
                     continue;
                 }
 
-                match page_start_offsets.next().flatten() {
+                let offsets = page_start_offsets.next().ok_or_else(|| {
+                    ParquetError::General("missing page offsets for requested column".into())
+                })?;
+                match offsets {
                     Some(offsets) => {
+                        let has_additions = !offsets.is_empty();
                         let mut chunks = Vec::with_capacity(offsets.len());
                         for _ in 0..offsets.len() {
-                            chunks.push(chunk_data.next().unwrap());
+                            chunks.push(chunk_data.next().ok_or_else(|| {
+                                ParquetError::General("missing fetched page range".into())
+                            })?);
                         }
 
-                        *chunk = Some(Arc::new(ColumnChunkData::Sparse {
-                            length: metadata.column(idx).byte_range().1 as usize,
-                            data: offsets
-                                .into_iter()
-                                .map(|x| x as usize)
-                                .zip(chunks)
-                                .collect(),
-                        }))
+                        let additions = offsets
+                            .iter()
+                            .copied()
+                            .map(|offset| {
+                                usize::try_from(offset)
+                                    .map_err(|_| ParquetError::General("page offset exceeds platform size".into()))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .zip(chunks)
+                            .collect();
+                        let length = usize::try_from(metadata.column(idx).byte_range().1)
+                            .map_err(|_| ParquetError::General("column chunk exceeds platform size".into()))?;
+                        let updated = match chunk.as_deref() {
+                            Some(existing) => existing.merge_sparse_pages(additions)?,
+                            None => ColumnChunkData::sparse(length, additions),
+                        };
+                        if has_additions || chunk.is_none() {
+                            *chunk = Some(Arc::new(updated));
+                        }
                     }
                     None => {
-                        if let Some(data) = chunk_data.next() {
-                            *chunk = Some(Arc::new(ColumnChunkData::Dense {
-                                offset: metadata.column(idx).byte_range().0 as usize,
-                                data,
-                            }));
-                        }
+                        let data = chunk_data.next().ok_or_else(|| {
+                            ParquetError::General("missing fetched column chunk".into())
+                        })?;
+                        let offset = usize::try_from(metadata.column(idx).byte_range().0)
+                            .map_err(|_| ParquetError::General("column offset exceeds platform size".into()))?;
+                        *chunk = Some(Arc::new(ColumnChunkData::dense(offset, data)));
                     }
                 }
             }
         } else {
             for (idx, chunk) in self.column_chunks.iter_mut().enumerate() {
-                if chunk.is_some() || !projection.leaf_included(idx) {
+                if !projection.leaf_included(idx)
+                    || chunk
+                    .as_deref()
+                    .is_some_and(|chunk| !chunk.can_fetch_more())
+                {
                     continue;
                 }
 
-                if let Some(data) = chunk_data.next() {
-                    *chunk = Some(Arc::new(ColumnChunkData::Dense {
-                        offset: metadata.column(idx).byte_range().0 as usize,
-                        data,
-                    }));
-                }
+                let data = chunk_data.next().ok_or_else(|| {
+                    ParquetError::General("missing fetched column chunk".into())
+                })?;
+                let offset = usize::try_from(metadata.column(idx).byte_range().0)
+                    .map_err(|_| ParquetError::General("column offset exceeds platform size".into()))?;
+                *chunk = Some(Arc::new(ColumnChunkData::dense(offset, data)));
             }
         }
+        if chunk_data.next().is_some() {
+            return Err(ParquetError::General(
+                "fetched data contains ranges that were not assigned to columns".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -276,71 +325,6 @@ impl RowGroups for InMemoryRowGroup<'_> {
 
     fn metadata(&self) -> &ParquetMetaData {
         self.metadata
-    }
-}
-
-/// An in-memory column chunk.
-/// This allows us to hold either dense column chunks or sparse column chunks and easily
-/// access them by offset.
-#[derive(Clone, Debug)]
-pub(crate) enum ColumnChunkData {
-    /// Column chunk data representing only a subset of data pages.
-    /// For example if a row selection (possibly caused by a filter in a query) causes us to read only
-    /// a subset of the rows in the column.
-    Sparse {
-        /// Length of the full column chunk
-        length: usize,
-        /// Subset of data pages included in this sparse chunk.
-        ///
-        /// Each element is a tuple of (page offset within file, page data).
-        /// Each entry is a complete page and the list is ordered by offset.
-        data: Vec<(usize, Bytes)>,
-    },
-    /// Full column chunk and the offset within the original file
-    Dense { offset: usize, data: Bytes },
-}
-
-impl ColumnChunkData {
-    /// Return the data for this column chunk at the given offset
-    fn get(&self, start: u64) -> crate::errors::Result<Bytes> {
-        match &self {
-            ColumnChunkData::Sparse { data, .. } => data
-                .binary_search_by_key(&start, |(offset, _)| *offset as u64)
-                .map(|idx| data[idx].1.clone())
-                .map_err(|_| {
-                    ParquetError::General(format!(
-                        "Invalid offset in sparse column chunk data: {start}, no matching page found.\
-                         If you are using a `SelectionStrategyPolicy::Mask`, ensure that the OffsetIndex is provided when \
-                         creating the InMemoryRowGroup."
-                    ))
-                }),
-            ColumnChunkData::Dense { offset, data } => {
-                let start = start as usize - *offset;
-                Ok(data.slice(start..))
-            }
-        }
-    }
-}
-
-impl Length for ColumnChunkData {
-    /// Return the total length of the full column chunk
-    fn len(&self) -> u64 {
-        match &self {
-            ColumnChunkData::Sparse { length, .. } => *length as u64,
-            ColumnChunkData::Dense { data, .. } => data.len() as u64,
-        }
-    }
-}
-
-impl ChunkReader for ColumnChunkData {
-    type T = bytes::buf::Reader<Bytes>;
-
-    fn get_read(&self, start: u64) -> crate::errors::Result<Self::T> {
-        Ok(self.get(start)?.reader())
-    }
-
-    fn get_bytes(&self, start: u64, length: usize) -> crate::errors::Result<Bytes> {
-        Ok(self.get(start)?.slice(..length))
     }
 }
 

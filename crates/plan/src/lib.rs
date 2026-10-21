@@ -24,12 +24,14 @@ pub mod schema;
 pub use ::catalog::{
     CatalogProvider, CatalogRevision, CatalogSnapshotToken, ColumnGroupStatistics, ColumnSortKey,
     ColumnStatistics, HistogramBucket, HistogramSample, HistogramStatistics, MetadataStore,
-    MostCommonValue, MostCommonValuesStatistics, PlanningSession, TableFormat, TableMetadata,
+    MostCommonValue, MostCommonValuesStatistics, PlanningSession, DataFileFormatId,
+    TableProviderId, TableMetadata,
     TableMetadataRef, TableStatistics, TableType,
 };
 pub use expr::{LogicalExpr, LogicalLiteral, Volatility};
 pub use plan::display;
 pub use plan::{LogicalPlan, PlanTraversal, SortKey, WindowExpr};
+pub use types::literal_type;
 pub use schema::{
     ColumnId, ResolvedColumn, ResolvedColumnRef, VeinDataType, VeinSchema, VeinSchemaRef,
 };

@@ -1,9 +1,10 @@
-use super::support::{equality, test_column};
 use super::super::{DefaultPipelineStageBuilder, PipelineStageBuilder};
-use common::protocol::PhysicalPlanOperator;
+use super::support::{equality, test_column};
+use crate::test_support::external_scan;
+use common::protocol::{ExpressionStep, PhysicalPlanOperator};
 use plan::schema::VeinDataType;
-use plan::{LogicalExpr, LogicalPlan, SortKey as LogicalSortKey};
 use plan::schema::VeinSchema;
+use plan::{LogicalExpr, LogicalPlan, SortKey as LogicalSortKey};
 use std::sync::Arc;
 
 #[test]
@@ -14,16 +15,10 @@ fn builds_recursive_sort_and_limit_nodes_without_duplicate_task_windows() {
     let build_schema = VeinSchema::new(vec![Arc::clone(&build_column)]);
     let output_schema =
         VeinSchema::new(vec![Arc::clone(&probe_column), Arc::clone(&build_column)]);
-    let scan = |url: &str, schema: &VeinSchema| LogicalPlan::ExternalScan {
-        url: url.to_owned(),
-        options: Vec::new(),
-        files: Vec::new(),
-        schema: Box::new(schema.clone()),
-    };
     let join = LogicalPlan::Join {
         join_type: parser::ast::pipe_op::JoinType::Inner,
-        left: Box::new(scan("probe", &probe_schema)),
-        right: Box::new(scan("build", &build_schema)),
+        left: Box::new(external_scan(&probe_schema)),
+        right: Box::new(external_scan(&build_schema)),
         on: Some(equality(
             Arc::clone(&probe_column),
             Arc::clone(&build_column),
@@ -75,16 +70,10 @@ fn recursive_lowering_fuses_adjacent_transforms_above_join() {
     let probe_schema = VeinSchema::new(vec![Arc::clone(&probe)]);
     let build_schema = VeinSchema::new(vec![Arc::clone(&build)]);
     let joined_schema = VeinSchema::new(vec![Arc::clone(&probe), Arc::clone(&build)]);
-    let scan = |name: &str, schema: &VeinSchema| LogicalPlan::ExternalScan {
-        url: name.to_owned(),
-        options: Vec::new(),
-        files: Vec::new(),
-        schema: Box::new(schema.clone()),
-    };
     let join = LogicalPlan::Join {
         join_type: parser::ast::pipe_op::JoinType::Inner,
-        left: Box::new(scan("probe", &probe_schema)),
-        right: Box::new(scan("build", &build_schema)),
+        left: Box::new(external_scan(&probe_schema)),
+        right: Box::new(external_scan(&build_schema)),
         on: Some(equality(Arc::clone(&probe), Arc::clone(&build))),
         using: Vec::new(),
         schema: Box::new(joined_schema.clone()),
@@ -119,26 +108,21 @@ fn recursive_lowering_fuses_adjacent_transforms_above_join() {
         panic!("adjacent filter and projection should fuse into one transform");
     };
     assert!(matches!(join.operator, PhysicalPlanOperator::Join { .. }));
-    assert!(program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            common::protocol::MicroOp::FilterMask { .. }
-        )));
-    assert!(program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            common::protocol::MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 1
-        )));
+    assert!(program
+        .steps
+        .iter()
+        .any(|step| matches!(step, ExpressionStep::Filter(_))));
+    assert!(program.steps.iter().any(|step| matches!(
+        step,
+        ExpressionStep::Projection(expressions) if expressions.len() == 1
+    )));
 }
 
 #[test]
 fn recursive_lowering_fuses_source_filter_and_projection_into_pipeline() {
     let value = test_column(1, "value");
     let input_schema = VeinSchema::new(vec![Arc::clone(&value)]);
-    let scan = LogicalPlan::ExternalScan {
-        url: "memory://source".to_owned(),
-        options: Vec::new(),
-        files: Vec::new(),
-        schema: Box::new(input_schema.clone()),
-    };
+    let scan = external_scan(&input_schema);
     let filter = LogicalPlan::Filter {
         input: Box::new(scan),
         predicate: LogicalExpr::BinaryOp {
@@ -164,26 +148,21 @@ fn recursive_lowering_fuses_source_filter_and_projection_into_pipeline() {
     let PhysicalPlanOperator::Pipeline { program, .. } = &input.operator else {
         panic!("source row-wise operators should remain fused with the scan");
     };
-    assert!(program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            common::protocol::MicroOp::FilterMask { .. }
-        )));
-    assert!(program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            common::protocol::MicroOp::ProjectRegisters { out_regs } if out_regs.len() == 1
-        )));
+    assert!(program
+        .steps
+        .iter()
+        .any(|step| matches!(step, ExpressionStep::Filter(_))));
+    assert!(program.steps.iter().any(|step| matches!(
+        step,
+        ExpressionStep::Projection(expressions) if expressions.len() == 1
+    )));
 }
 
 #[test]
 fn recursive_lowering_names_unsupported_logical_operators() {
     let schema = VeinSchema::empty();
     let call = LogicalPlan::Call {
-        input: Box::new(LogicalPlan::ExternalScan {
-            url: "memory://source".to_owned(),
-            options: Vec::new(),
-            files: Vec::new(),
-            schema: Box::new(schema.clone()),
-        }),
+        input: Box::new(external_scan(&schema)),
         name: "custom_call".to_owned(),
         args: Vec::new(),
         schema: Box::new(schema),

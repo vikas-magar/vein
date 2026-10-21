@@ -18,3 +18,39 @@ approval_mode = "approve"
 
 [mcp_servers.rustrover.tools.create_new_file]
 approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_evaluate_expression]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_remove_breakpoints]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_get_value_by_path]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.open_file_in_editor]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.execute_terminal_command]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_set_breakpoints]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_start_debugger_session]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_control_session]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_get_stack]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_get_frame_values]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_list_breakpoints]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.run_ide_script]
+approval_mode = "approve"

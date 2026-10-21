@@ -11,6 +11,7 @@ plan = { path = "../plan" }
 error = { path = "../error" }
 parser = { path = "../parser" }
 types = { path = "../types" }
+functions = { path = "../functions" }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 

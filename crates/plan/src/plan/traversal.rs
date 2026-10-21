@@ -88,6 +88,7 @@ impl PlanTraversal for LogicalPlan {
             }
             LogicalPlan::Call { args, .. } => expressions(args, "Call.args", visitor),
             LogicalPlan::ExternalScan { .. }
+            | LogicalPlan::Intermediate { .. }
             | LogicalPlan::Join { on: None, .. }
             | LogicalPlan::Limit { .. }
             | LogicalPlan::Distinct { .. }
@@ -109,6 +110,7 @@ impl PlanTraversal for LogicalPlan {
         match self {
             LogicalPlan::Scan { schema, .. }
             | LogicalPlan::ExternalScan { schema, .. }
+            | LogicalPlan::Intermediate { schema, .. }
             | LogicalPlan::Project { schema, .. }
             | LogicalPlan::Aggregate { schema, .. }
             | LogicalPlan::Window { schema, .. }
@@ -138,6 +140,7 @@ impl PlanTraversal for LogicalPlan {
         match self {
             LogicalPlan::Scan { .. } => vec![],
             LogicalPlan::ExternalScan { .. } => vec![],
+            LogicalPlan::Intermediate { .. } => vec![],
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Aggregate { input, .. }
@@ -169,7 +172,8 @@ impl PlanTraversal for LogicalPlan {
         F: FnMut(Box<LogicalPlan>) -> Result<Box<LogicalPlan>, VeinError>,
     {
         match self {
-            node @ (LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. }) => Ok(node),
+            node @ (LogicalPlan::Scan { .. } | LogicalPlan::ExternalScan { .. }
+            | LogicalPlan::Intermediate { .. }) => Ok(node),
             LogicalPlan::Filter { input, predicate } => Ok(LogicalPlan::Filter {
                 input: f(input)?,
                 predicate,

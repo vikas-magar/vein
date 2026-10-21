@@ -8,16 +8,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
-use arrow::compute::take;
+use arrow::array::{Array, ArrayRef, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::reader::FileReader;
-use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use common::Result;
+use common::arrow::SelectionVector;
 use error::VeinError;
 
 use crate::memory::QueryMemoryTracker;
-use crate::pipeline::{DataChunk, DataChunkView};
+use crate::pipeline::DataChunkView;
 use crate::pipeline::view::ViewMemoryLease;
 use crate::spill::{IpcRunWriter, PendingSpillRun, SpillRun, SpillStream, SpillWriteHandle};
 
@@ -109,26 +108,27 @@ impl JoinSpillWriter {
         }
 
         let hashes = HashTable::hashes_for_view(view, keys)?;
-        let chunk = view.to_data_chunk()?;
-        let mut columns = chunk.vectors;
-        columns.push(Arc::new(UInt64Array::from(hashes)) as ArrayRef);
-        let batch = RecordBatch::try_new_with_options(
-            Arc::clone(self.schema.run_schema()),
-            columns,
-            &RecordBatchOptions::new().with_row_count(Some(view.num_rows())),
-        )
-            .map_err(|error| spill_error("build join spill batch", error))?;
-        self.write_batch(&batch)
+        let compacted = view.compact_active_rows()?;
+        let mut projection = (0..compacted.num_columns())
+            .map(Some)
+            .collect::<Vec<_>>();
+        projection.push(None);
+        let run_view = compacted.project_with_arrays(
+            &projection,
+            vec![Arc::new(UInt64Array::from(hashes)) as ArrayRef],
+            SelectionVector::new_dense(compacted.num_rows()),
+        )?;
+        self.write_view(&run_view)
     }
 
     pub(crate) fn rows(&self) -> u64 {
         self.rows
     }
 
-    fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    fn write_view(&mut self, view: &DataChunkView) -> Result<()> {
         self.tracker.check_cancelled()?;
-        self.writer.write_batch(batch, "write join IPC batch")?;
-        self.rows = self.rows.saturating_add(batch.num_rows() as u64);
+        self.writer.write_view(view, "write join IPC batch")?;
+        self.rows = self.rows.saturating_add(view.num_rows() as u64);
         Ok(())
     }
 
@@ -165,36 +165,37 @@ pub(crate) fn partition_runs(
 
     for run in runs {
         tracker.check_cancelled()?;
-        let mut reader = open_reader(run)
+        let reader = open_reader(run)
             .map_err(|error| spill_error("read join IPC run", error))?;
-        while let Some(batch) = reader.next() {
+        for batch in reader {
             tracker.check_cancelled()?;
             let batch = batch.map_err(|error| spill_error("decode join IPC batch", error))?;
-            let hashes = batch
-                .column(schema.payload_columns())
+            let view = crate::pipeline::arrow_adapter::from_record_batch(batch)?;
+            let hash_array = view.materialize_column(schema.payload_columns())?;
+            let hashes = hash_array
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .ok_or_else(|| VeinError::internal("join spill hash column is not UInt64"))?;
             let mut zero_rows = Vec::new();
             let mut one_rows = Vec::new();
-            zero_rows.try_reserve(batch.num_rows()).map_err(|error| {
+            zero_rows.try_reserve(view.num_rows()).map_err(|error| {
                 VeinError::internal(format!("cannot reserve join spill row indexes: {error}"))
             })?;
-            one_rows.try_reserve(batch.num_rows()).map_err(|error| {
+            one_rows.try_reserve(view.num_rows()).map_err(|error| {
                 VeinError::internal(format!("cannot reserve join spill row indexes: {error}"))
             })?;
-            for row in 0..batch.num_rows() {
+            for row in 0..view.num_rows() {
                 if hashes.value(row) & (1_u64 << bit) == 0 {
-                    zero_rows.push(row as u32);
+                    zero_rows.push(row);
                 } else {
-                    one_rows.push(row as u32);
+                    one_rows.push(row);
                 }
             }
             if !zero_rows.is_empty() {
-                zero.write_batch(&select_rows(&batch, &zero_rows, schema)?)?;
+                zero.write_view(&select_rows(&view, &zero_rows, schema)?)?;
             }
             if !one_rows.is_empty() {
-                one.write_batch(&select_rows(&batch, &one_rows, schema)?)?;
+                one.write_view(&select_rows(&view, &one_rows, schema)?)?;
             }
         }
     }
@@ -210,22 +211,10 @@ pub(crate) fn partition_runs(
     Ok([zero, one])
 }
 
-fn select_rows(batch: &RecordBatch, rows: &[u32], schema: &JoinSpillSchema) -> Result<RecordBatch> {
-    let indices = UInt32Array::from(rows.to_vec());
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|column| {
-            take(column.as_ref(), &indices, None)
-                .map_err(|error| spill_error("select join spill partition rows", error))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    RecordBatch::try_new_with_options(
-        Arc::clone(schema.run_schema()),
-        columns,
-        &RecordBatchOptions::new().with_row_count(Some(rows.len())),
-    )
-        .map_err(|error| spill_error("build join spill partition batch", error))
+fn select_rows(batch: &DataChunkView, rows: &[usize], schema: &JoinSpillSchema) -> Result<DataChunkView> {
+    batch
+        .select_logical_rows(rows)?
+        .with_schema(Arc::clone(schema.run_schema()))
 }
 
 pub(crate) fn remove_run(run: JoinSpillRun) -> Result<()> {
@@ -237,23 +226,13 @@ pub(crate) fn remove_run(run: JoinSpillRun) -> Result<()> {
 /// decoded arrays are leased to the query tracker and remain charged when
 /// composed output views keep them alive.
 pub(crate) fn payload_view(
-    batch: RecordBatch,
+    batch: DataChunkView,
     schema: &JoinSpillSchema,
     tracker: &QueryMemoryTracker,
 ) -> Result<DataChunkView> {
-    let payload_columns = batch
-        .columns()
-        .iter()
-        .take(schema.payload_columns())
-        .cloned()
-        .collect::<Vec<_>>();
-    let payload = RecordBatch::try_new_with_options(
-        Arc::clone(schema.payload_schema()),
-        payload_columns,
-        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-    )
-        .map_err(|error| spill_error("build join payload batch", error))?;
-    let mut view = DataChunkView::from_chunk(DataChunk::from_record_batch(payload))?;
+    let mut view = batch
+        .project(&(0..schema.payload_columns()).collect::<Vec<_>>())?
+        .with_schema(Arc::clone(schema.payload_schema()))?;
     let leases = view
         .source_array_memory_sizes()?
         .into_iter()
@@ -284,19 +263,18 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::pipeline::DataChunk;
+    use crate::pipeline::DataChunkView;
 
     fn view(values: &[i64]) -> DataChunkView {
-        DataChunkView::from_chunk(DataChunk::from_vectors(vec![
+        crate::pipeline::test_support::dense_view(vec![
             Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
-        ]))
-            .expect("construct test view")
+        ])
     }
 
     fn hashes(run: &JoinSpillRun, schema: &JoinSpillSchema) -> Vec<u64> {
-        let mut reader = open_reader(run).expect("open run");
+        let reader = open_reader(run).expect("open run");
         let mut values = Vec::new();
-        while let Some(batch) = reader.next() {
+        for batch in reader {
             let batch = batch.expect("read batch");
             let hashes = batch
                 .column(schema.payload_columns())

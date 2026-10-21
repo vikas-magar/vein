@@ -13,6 +13,7 @@ tracing-subscriber = { workspace = true }
 catalog = { path = "../catalog" }
 error   = { path = "../error" }
 types   = { path = "../types" }
+functions = { path = "../functions" }
 rand    = { workspace = true }
 serde   = { workspace = true }
 futures = { workspace = true }

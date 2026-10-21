@@ -162,11 +162,10 @@ pub fn may_match_data_unit(
             let Some(rows) = unit.num_rows else {
                 return true;
             };
-            !unit
+            unit
                 .column_statistics
                 .get(column)
-                .and_then(|statistics| statistics.null_count)
-                .is_some_and(|nulls| nulls == rows)
+                .and_then(|statistics| statistics.null_count).is_none_or(|nulls| nulls != rows)
         }
         StatisticsPredicate::Unknown => true,
     }

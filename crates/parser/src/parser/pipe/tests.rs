@@ -78,7 +78,7 @@ fn test_tablesample() {
     let q = parse_query("FROM t |> TABLESAMPLE bernoulli(25.0)").expect("test should succeed");
     if let PipeOperator::TableSample { method, percent } = &q.pipes[0] {
         assert_eq!(*method, "bernoulli");
-        assert_eq!(*percent, 25.0);
+        assert!((*percent - 25.0).abs() < f64::EPSILON);
     } else {
         panic!("expected TableSample");
     }

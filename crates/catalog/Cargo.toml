@@ -12,6 +12,8 @@ error = { path = "../error" }
 serde = { workspace = true }
 tracing = { workspace = true }
 types = { path = "../types" }
+storage = { path = "../storage" }
 
 [dev-dependencies]
 tempfile = "3"
+serde_json = "1.0"

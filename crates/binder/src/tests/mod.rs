@@ -51,6 +51,7 @@ pub fn node_kind(plan: &LogicalPlan) -> &'static str {
     match plan {
         LogicalPlan::Scan { .. } => "Scan",
         LogicalPlan::ExternalScan { .. } => "ExternalScan",
+        LogicalPlan::Intermediate { .. } => "Intermediate",
         LogicalPlan::Filter { .. } => "Filter",
         LogicalPlan::Project { .. } => "Project",
         LogicalPlan::Aggregate { .. } => "Aggregate",
@@ -627,6 +628,22 @@ mod call_and_external {
         let plan = bind("FROM 's3://bucket/data' WITH (format = 'parquet') |> SELECT 1").await;
         assert_chain(&plan, &["Project", "ExternalScan"]);
     }
+
+    #[tokio::test]
+    async fn catalog_resolved_external_source_retains_shared_metadata() {
+        let plan = bind("FROM 'users' |> SELECT 1").await;
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected project over external scan");
+        };
+        let LogicalPlan::ExternalScan {
+            source_metadata: Some(metadata),
+            ..
+        } = *input
+        else {
+            panic!("resolved external source must retain its catalog metadata");
+        };
+        assert_eq!(metadata.name, "users");
+    }
 }
 
 #[cfg(test)]
@@ -681,6 +698,19 @@ mod pivot_unpivot {
         assert_eq!(schema.fields[2].name, "amount");
     }
 }
+
+#[cfg(test)]
+#[path = "subquery_projection.rs"]
+mod subquery_projection;
+mod substring;
+
+#[cfg(test)]
+#[path = "aggregate_projection.rs"]
+mod aggregate_projection;
+
+#[cfg(test)]
+#[path = "numeric_coercion.rs"]
+mod numeric_coercion;
 
 #[cfg(test)]
 mod cte_binding {
@@ -936,22 +966,30 @@ mod extended_features {
         }
     }
 
-    /// Until distinct state is carried to execution, reject it instead of
-    /// silently executing a regular aggregate.
     #[tokio::test]
-    async fn aggregate_distinct_is_rejected() {
-        for query in [
-            "FROM users |> AGGREGATE COUNT(DISTINCT age)",
-            "FROM users |> AGGREGATE SUM(DISTINCT age)",
-            "FROM users |> AGGREGATE COUNT(DISTINCT *)",
+    async fn count_distinct_binds_its_distinct_metadata_and_rejects_unsupported_forms() {
+        let plan = bind("FROM users |> AGGREGATE COUNT(DISTINCT age) AS n GROUP BY name").await;
+        let LogicalPlan::Aggregate { aggs, .. } = plan else {
+            panic!("expected aggregate plan");
+        };
+        assert!(matches!(
+            &aggs[0],
+            LogicalExpr::FunctionCall { name, distinct: true, args, .. }
+                if name.eq_ignore_ascii_case("count") && args.len() == 1
+        ));
+
+        for (query, message) in [
+            (
+                "FROM users |> AGGREGATE SUM(DISTINCT age)",
+                "supported only for COUNT",
+            ),
+            (
+                "FROM users |> AGGREGATE COUNT(DISTINCT *)",
+                "COUNT(DISTINCT *) is not valid",
+            ),
         ] {
             let error = bind_err(query).await;
-            assert!(
-                error
-                    .to_string()
-                    .contains("DISTINCT inside aggregate function"),
-                "got {error} for {query}"
-            );
+            assert!(error.to_string().contains(message), "got {error} for {query}");
         }
     }
 

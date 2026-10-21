@@ -25,7 +25,7 @@ macro_rules! assert_unsigned_layout {
             ],
         };
         let mut sink = AggregateSink::new(plan).unwrap();
-        sink.accumulate(DataChunk::from_vectors(vec![
+        sink.accumulate(crate::pipeline::test_support::dense_view(vec![
             input.clone(),
             input.clone(),
             input.clone(),
@@ -34,38 +34,22 @@ macro_rules! assert_unsigned_layout {
         .unwrap();
         let output = sink.finish().unwrap();
         assert_eq!(
-            output[0]
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
+            crate::pipeline::test_support::materialized_column::<UInt64Array>(&output[0], 0)
                 .value(0),
             $sum
         );
         assert_eq!(
-            output[0]
-                .column(1)
-                .as_any()
-                .downcast_ref::<$array>()
-                .unwrap()
+            crate::pipeline::test_support::materialized_column::<$array>(&output[0], 1)
                 .value(0),
             $min
         );
         assert_eq!(
-            output[0]
-                .column(2)
-                .as_any()
-                .downcast_ref::<$array>()
-                .unwrap()
+            crate::pipeline::test_support::materialized_column::<$array>(&output[0], 2)
                 .value(0),
             $max
         );
         assert_eq!(
-            output[0]
-                .column(3)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
+            crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 3)
                 .value(0),
             3.5
         );
@@ -121,7 +105,7 @@ fn uint64_sum_checks_overflow_and_average_uses_wide_exact_state() {
     };
     let mut sum_sink = AggregateSink::new(sum_plan).unwrap();
     let overflow = sum_sink
-        .accumulate(DataChunk::from_vectors(vec![Arc::new(UInt64Array::from(
+        .accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(UInt64Array::from(
             vec![u64::MAX, 1],
         ))]))
         .unwrap_err();
@@ -142,20 +126,16 @@ fn uint64_sum_checks_overflow_and_average_uses_wide_exact_state() {
     };
     let mut avg_sink = AggregateSink::new(avg_plan).unwrap();
     avg_sink
-        .accumulate(DataChunk::from_vectors(vec![Arc::new(UInt64Array::from(
+        .accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(UInt64Array::from(
             vec![u64::MAX],
         ))]))
         .unwrap();
     avg_sink
-        .accumulate(DataChunk::from_vectors(vec![Arc::new(UInt64Array::from(
+        .accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(UInt64Array::from(
             vec![u64::MAX],
         ))]))
         .unwrap();
     let output = avg_sink.finish().unwrap();
-    let average = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
+    let average = crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0);
     assert_eq!(average.value(0), u64::MAX as f64);
 }

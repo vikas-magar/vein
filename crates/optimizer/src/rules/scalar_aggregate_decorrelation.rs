@@ -1,5 +1,8 @@
 //! Decorrelation for scalar aggregate subqueries.
 
+mod global_projection;
+mod correlated_projection;
+
 use error::Result;
 use parser::ast::expr::BinaryOp;
 use plan::{
@@ -17,10 +20,33 @@ pub struct ScalarAggregateDecorrelationRule;
 
 struct Decorrelation {
     right: LogicalPlan,
-    correlation: Option<(ResolvedColumnRef, ResolvedColumnRef)>,
-    single_correlation: Option<Vec<(ResolvedColumnRef, ResolvedColumnRef)>>,
+    correlations: Vec<CorrelationPair>,
+    join_kind: ScalarJoinKind,
     value: ResolvedColumnRef,
     aggregate_name: String,
+}
+
+struct CorrelationPair {
+    outer: ResolvedColumnRef,
+    inner: ResolvedColumnRef,
+}
+
+#[derive(Clone, Copy)]
+enum ScalarJoinKind {
+    Cross,
+    Left,
+    Single,
+}
+
+fn distinct_inner_keys(correlations: &[CorrelationPair]) -> Vec<ResolvedColumnRef> {
+    let mut seen = std::collections::HashSet::with_capacity(correlations.len());
+    correlations
+        .iter()
+        .filter_map(|pair| {
+            seen.insert(pair.inner.id)
+                .then(|| ResolvedColumnRef::clone(&pair.inner))
+        })
+        .collect()
 }
 
 impl OptimizerRule for ScalarAggregateDecorrelationRule {
@@ -172,27 +198,25 @@ fn attach_scalar_joins(mut input: LogicalPlan, decorrelations: Vec<Decorrelation
     for decorrelation in decorrelations {
         let mut fields = input.schema().fields.clone();
         fields.extend(decorrelation.right.schema().fields.iter().map(|field| {
-            if decorrelation.correlation.is_some() || decorrelation.single_correlation.is_some() {
+            if !matches!(decorrelation.join_kind, ScalarJoinKind::Cross) {
                 nullable_column(field)
             } else {
                 ResolvedColumnRef::clone(field)
             }
         }));
         let schema = VeinSchema::new(fields);
-        let (join_type, on) = if let Some(keys) = decorrelation.single_correlation {
-            let predicates = keys
-                .into_iter()
-                .map(|(outer, inner)| equality_expr(outer, inner))
-                .collect();
-            (parser::ast::pipe_op::JoinType::Single, conjunction(predicates))
-        } else if let Some((inner_key, outer_key)) = decorrelation.correlation {
-            (
-                parser::ast::pipe_op::JoinType::Left,
-                Some(equality_expr(outer_key, inner_key)),
-            )
-        } else {
-            (parser::ast::pipe_op::JoinType::Cross, None)
+        let join_type = match decorrelation.join_kind {
+            ScalarJoinKind::Cross => parser::ast::pipe_op::JoinType::Cross,
+            ScalarJoinKind::Left => parser::ast::pipe_op::JoinType::Left,
+            ScalarJoinKind::Single => parser::ast::pipe_op::JoinType::Single,
         };
+        let on = conjunction(
+            decorrelation
+                .correlations
+                .into_iter()
+                .map(|pair| equality_expr(pair.outer, pair.inner))
+                .collect(),
+        );
         tracing::debug!(
             target: "vein.audit",
             event = "scalar_subquery_decorrelated",
@@ -267,8 +291,8 @@ fn decorrelate_uncorrelated_scalar(subquery: &LogicalPlan) -> Option<Decorrelati
     };
     Some(Decorrelation {
         right: aggregate,
-        correlation: None,
-        single_correlation: None,
+        correlations: Vec::new(),
+        join_kind: ScalarJoinKind::Cross,
         value,
         aggregate_name: "SINGLE_VALUE".to_string(),
     })
@@ -301,6 +325,13 @@ fn decorrelate_scalar_aggregate(
     subquery: &LogicalPlan,
     outer_schema: &VeinSchema,
 ) -> Option<Decorrelation> {
+    if let Some(decorrelation) = global_projection::decorrelate(subquery) {
+        return Some(decorrelation);
+    }
+    if let Some(decorrelation) = correlated_projection::decorrelate(subquery, outer_schema) {
+        return Some(decorrelation);
+    }
+
     let LogicalPlan::Aggregate {
         input,
         grouping_sets,
@@ -341,24 +372,28 @@ fn decorrelate_scalar_aggregate(
         base = input;
     }
 
-    let mut correlation = None;
+    let mut correlations = Vec::new();
     let mut residual = Vec::new();
     for term in terms {
         if let Some((inner, outer)) = equality_correlation(&term) {
-            if correlation.is_some()
-                || base.schema().position_of_id(inner.id).is_none()
+            if base.schema().position_of_id(inner.id).is_none()
                 || outer_schema.position_of_id(outer.id).is_none()
             {
                 return None;
             }
-            correlation = Some((inner, outer));
+            if !correlations
+                .iter()
+                .any(|pair: &CorrelationPair| pair.inner.id == inner.id && pair.outer.id == outer.id)
+            {
+                correlations.push(CorrelationPair { outer, inner });
+            }
         } else if contains_outer_column(&term) {
             return None;
         } else {
             residual.push(term);
         }
     }
-    if name.eq_ignore_ascii_case("count") && correlation.is_some() {
+    if name.eq_ignore_ascii_case("count") && !correlations.is_empty() {
         // A missing grouped COUNT is zero, but a LEFT JOIN represents it as
         // NULL. Keep correlated COUNT unchanged until that default is modeled.
         return None;
@@ -392,14 +427,13 @@ fn decorrelate_scalar_aggregate(
         return None;
     }
 
-    let grouping_sets = match &correlation {
-        Some((inner_key, _)) => vec![vec![LogicalExpr::Column(ResolvedColumnRef::clone(inner_key))]],
-        None => vec![Vec::new()],
+    let inner_keys = distinct_inner_keys(&correlations);
+    let grouping_sets = if inner_keys.is_empty() {
+        vec![Vec::new()]
+    } else {
+        vec![inner_keys.iter().cloned().map(LogicalExpr::Column).collect()]
     };
-    let mut aggregate_fields = Vec::with_capacity(2);
-    if let Some((inner_key, _)) = &correlation {
-        aggregate_fields.push(ResolvedColumnRef::clone(inner_key));
-    }
+    let mut aggregate_fields = inner_keys;
     aggregate_fields.push(Arc::clone(&aggregate_value));
     let aggregate = LogicalPlan::Aggregate {
         input: Box::new(grouped_input),
@@ -407,14 +441,14 @@ fn decorrelate_scalar_aggregate(
         aggs: grouped_aggs,
         schema: Box::new(VeinSchema::new(aggregate_fields)),
     };
-    let (right, projected_value) = if &rewritten_value == &LogicalExpr::Column(Arc::clone(&aggregate_value)) {
+    let (right, projected_value) = if rewritten_value == LogicalExpr::Column(Arc::clone(&aggregate_value)) {
         (aggregate, aggregate_value)
     } else {
         let mut exprs = Vec::with_capacity(2);
         let mut fields = Vec::with_capacity(2);
-        if let Some((inner_key, _)) = &correlation {
-            exprs.push(LogicalExpr::Column(ResolvedColumnRef::clone(inner_key)));
-            fields.push(ResolvedColumnRef::clone(inner_key));
+        for inner_key in distinct_inner_keys(&correlations) {
+            exprs.push(LogicalExpr::Column(ResolvedColumnRef::clone(&inner_key)));
+            fields.push(inner_key);
         }
         exprs.push(rewritten_value);
         fields.push(ResolvedColumnRef::clone(&value));
@@ -428,8 +462,12 @@ fn decorrelate_scalar_aggregate(
 
     Some(Decorrelation {
         right,
-        correlation,
-        single_correlation: None,
+        join_kind: if correlations.is_empty() {
+            ScalarJoinKind::Cross
+        } else {
+            ScalarJoinKind::Left
+        },
+        correlations,
         value: projected_value,
         aggregate_name: name.clone(),
     })
@@ -497,13 +535,12 @@ fn decorrelate_correlated_scalar_row(
     if correlations.is_empty() {
         return None;
     }
-    if let LogicalExpr::Column(source_value) = value_expression {
-        if let Some((_, key)) = correlations.iter().find(|(_, key)| key.id == source_value.id) {
-            // The joined relation already carries this array as its key column.
-            // Reuse that column ID for the scalar reference instead of emitting a
-            // duplicate schema field for an aliased projection.
-            value = nullable_column(key);
-        }
+    if let LogicalExpr::Column(source_value) = value_expression
+        && let Some((_, key)) = correlations.iter().find(|(_, key)| key.id == source_value.id) {
+        // The joined relation already carries this array as its key column.
+        // Reuse that column ID for the scalar reference instead of emitting a
+        // duplicate schema field for an aliased projection.
+        value = nullable_column(key);
     }
 
     // Reapply deterministic local filters once above the scan, while removing
@@ -547,8 +584,11 @@ fn decorrelate_correlated_scalar_row(
 
     Some(Decorrelation {
         right,
-        correlation: None,
-        single_correlation: Some(correlations),
+        correlations: correlations
+            .into_iter()
+            .map(|(outer, inner)| CorrelationPair { outer, inner })
+            .collect(),
+        join_kind: ScalarJoinKind::Single,
         value,
         aggregate_name: "SINGLE_ROW".to_string(),
     })
@@ -690,7 +730,7 @@ mod tests {
         ))
     }
 
-    fn scan(name: &str, fields: Vec<ResolvedColumnRef>) -> LogicalPlan {
+    pub(super) fn scan(name: &str, fields: Vec<ResolvedColumnRef>) -> LogicalPlan {
         let schema = VeinSchema::new(fields);
         LogicalPlan::Scan {
             table: Arc::new(TableMetadata::new(name, Arc::new(schema.clone()))),
@@ -1514,3 +1554,7 @@ mod tests {
             .is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "scalar_aggregate_decorrelation/composite_key_tests.rs"]
+mod composite_key_tests;

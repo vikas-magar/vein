@@ -6,11 +6,11 @@ use crate::pipeline::{DataChunkView, RowMapping, SourceRow, ViewColumn};
 use std::sync::{Arc, Mutex};
 
 struct TestCollector(Arc<Mutex<Vec<u32>>>);
-impl PipelineNode<DataChunk> for TestCollector {
-    fn push(&mut self, chunk: DataChunk) -> Result<()> {
+impl PipelineNode for TestCollector {
+    fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         let mut out = self.0.lock().unwrap();
-        for i in 0..chunk.selection.size() {
-            out.push(chunk.selection.get_index(i) as u32);
+        for i in 0..chunk.selection().size() {
+            out.push(chunk.selection().get_index(i) as u32);
         }
         Ok(())
     }
@@ -26,7 +26,8 @@ fn test_limit_single_chunk() {
     let mut limit = LimitTransform::new(2, 3, sink);
 
     let array = Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60, 70])) as arrow::array::ArrayRef;
-    let chunk = DataChunk::new(vec![array], SelectionVector::new_dense(7));
+    let chunk = DataChunkView::from_arrays(vec![array], 7, SelectionVector::new_dense(7))
+        .expect("view from arrays");
 
     limit.push(chunk).unwrap();
 
@@ -43,33 +44,39 @@ fn test_limit_spanning_multiple_chunks() {
     let mut limit = LimitTransform::new(3, 4, sink);
 
     // Chunk 1: indices [0, 1, 2] (all skipped because offset is 3)
-    let c1 = DataChunk::new(
+    let c1 = DataChunkView::from_arrays(
         vec![Arc::new(Int64Array::from(vec![1, 2, 3])) as _],
+        3,
         SelectionVector::new_dense(3),
-    );
+    )
+    .expect("view from arrays");
     limit.push(c1).unwrap();
     assert!(collected.lock().unwrap().is_empty());
 
     // Chunk 2: indices [0, 1, 2] (all 3 taken)
-    let c2 = DataChunk::new(
+    let c2 = DataChunkView::from_arrays(
         vec![Arc::new(Int64Array::from(vec![4, 5, 6])) as _],
+        3,
         SelectionVector::new_dense(3),
-    );
+    )
+    .expect("view from arrays");
     limit.push(c2).unwrap();
     assert_eq!(collected.lock().unwrap().len(), 3);
 
     // Chunk 3: indices [0, 1, 2] (only 1 taken to reach count = 4)
-    let c3 = DataChunk::new(
+    let c3 = DataChunkView::from_arrays(
         vec![Arc::new(Int64Array::from(vec![7, 8, 9])) as _],
+        3,
         SelectionVector::new_dense(3),
-    );
+    )
+    .expect("view from arrays");
     limit.push(c3).unwrap();
     assert_eq!(collected.lock().unwrap().len(), 4);
 }
 
 struct ViewCollector(Arc<Mutex<Option<DataChunkView>>>, arrow::array::ArrayRef);
 
-impl PipelineNode<DataChunkView> for ViewCollector {
+impl PipelineNode for ViewCollector {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         assert_eq!(view.num_rows(), 1);
         let (array, physical_row) = view.resolve(0, 0)?.expect("selected value");
@@ -108,7 +115,7 @@ fn limit_preserves_reference_backed_view_and_slices_only_selection() {
         .expect("valid reference-backed view");
     let output = Arc::new(Mutex::new(None::<DataChunkView>));
     let sink = Box::new(ViewCollector(Arc::clone(&output), Arc::clone(&source)));
-    let mut limit = LimitTransform::<DataChunkView>::new(1, 1, sink);
+    let mut limit = LimitTransform::new(1, 1, sink);
 
     limit
         .push(view)

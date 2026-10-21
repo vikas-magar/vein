@@ -30,8 +30,8 @@ impl DefaultPipelineStageBuilder {
             return self.lower_node(plan);
         };
 
-        let (probe, probe_schema) = self.lower_node(left)?;
-        let (build, build_schema) = self.lower_node(right)?;
+        let (mut probe, probe_schema) = self.lower_node(left)?;
+        let (mut build, build_schema) = self.lower_node(right)?;
 
         let mut probe_keys = Vec::new();
         let mut build_keys = Vec::new();
@@ -77,7 +77,7 @@ impl DefaultPipelineStageBuilder {
 
         let (outputs, output_schema) =
             available_join_outputs(schema, &probe_schema, &build_schema)?;
-        let join = JoinPlan {
+        let mut join = JoinPlan {
             join_type: join_kind(join_type),
             probe_keys,
             build_keys,
@@ -94,6 +94,21 @@ impl DefaultPipelineStageBuilder {
                 .map(|field| field.data_type.clone())
                 .collect(),
         };
+        if matches!(join_type, JoinType::Inner | JoinType::Cross)
+            && let Some((left_rows, right_rows)) = self.observed_rows(left).zip(self.observed_rows(right)) {
+                if left_rows < right_rows {
+                    std::mem::swap(&mut probe, &mut build);
+                    std::mem::swap(&mut join.probe_keys, &mut join.build_keys);
+                    std::mem::swap(&mut join.probe_types, &mut join.build_types);
+                    for output in &mut join.outputs { swap_output(output); }
+                    if let Some(residual) = &mut join.residual {
+                        for input in &mut residual.input_columns { swap_output(input); }
+                    }
+                }
+                tracing::debug!(target: "vein.adaptive", event = "physical_join_build_orientation",
+                    left_rows, right_rows, swapped = left_rows < right_rows,
+                    "physical join builds the smaller estimated population");
+            }
         let output_schema = Arc::new(output_schema);
         Ok((
             Arc::new(PhysicalPlanNode {
@@ -107,4 +122,11 @@ impl DefaultPipelineStageBuilder {
             (*output_schema).clone(),
         ))
     }
+}
+
+fn swap_output(output: &mut common::protocol::JoinOutput) {
+    *output = match *output {
+        common::protocol::JoinOutput::Probe(index) => common::protocol::JoinOutput::Build(index),
+        common::protocol::JoinOutput::Build(index) => common::protocol::JoinOutput::Probe(index),
+    };
 }

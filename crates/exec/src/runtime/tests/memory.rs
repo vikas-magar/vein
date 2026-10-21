@@ -4,7 +4,7 @@ use super::*;
 async fn configured_memory_limit_reaches_recursive_aggregate_state() {
     let input = InputPlanFixture::Pipeline {
         source: DataSource::Memory,
-        program: Arc::new(MicroProgram::empty()),
+            program: Arc::new(ExpressionProgram::empty()),
     };
     let aggregate = InputPlanFixture::Aggregate {
         input: Box::new(input),

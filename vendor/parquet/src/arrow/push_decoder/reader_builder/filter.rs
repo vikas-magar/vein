@@ -22,6 +22,7 @@ use crate::arrow::array_reader::{CacheOptionsBuilder, RowGroupCache};
 use crate::arrow::arrow_reader::{ArrowPredicate, RowFilter};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 /// State machine for evaluating a sequence of predicates.
 ///
@@ -39,6 +40,33 @@ pub(super) struct FilterInfo {
     next_predicate: NonZeroUsize,
     /// Previously computed filter results
     cache_info: CacheInfo,
+    /// Wall time spent requesting, reading, and evaluating this window’s predicate chain.
+    filter_timing: FilterTiming,
+}
+
+#[derive(Debug, Default)]
+struct FilterTiming {
+    started_at: Option<Instant>,
+    elapsed_nanos: u64,
+}
+
+impl FilterTiming {
+    fn start(&mut self, now: Instant) {
+        self.started_at.get_or_insert(now);
+    }
+
+    fn finish(&mut self, now: Instant) {
+        if let Some(started_at) = self.started_at.take() {
+            self.elapsed_nanos = self.elapsed_nanos.saturating_add(
+                u64::try_from(now.saturating_duration_since(started_at).as_nanos())
+                    .unwrap_or(u64::MAX),
+            );
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        Duration::from_nanos(self.elapsed_nanos)
+    }
 }
 
 /// Predicate cache
@@ -84,7 +112,26 @@ impl FilterInfo {
             filter,
             next_predicate: NonZeroUsize::new(1).expect("1 is always non-zero"),
             cache_info,
+            filter_timing: FilterTiming::default(),
         }
+    }
+
+    /// Start measuring predicate work once its required bytes are available.
+    ///
+    /// The async reader may yield while those bytes are fetched. Keeping that
+    /// wait outside the adaptive-filter sample avoids attributing scheduler or
+    /// storage latency to the predicate's CPU cost.
+    pub(super) fn start_filter_evaluation(&mut self) {
+        self.filter_timing.start(Instant::now());
+    }
+
+    /// Finish timing predicate decoding and evaluation for this window.
+    pub(super) fn finish_filter_evaluation(&mut self) {
+        self.filter_timing.finish(Instant::now());
+    }
+
+    fn observe_filter(&self) {
+        self.filter.observe_filter_duration(self.filter_timing.elapsed());
     }
 
     /// Advance to the next predicate
@@ -96,6 +143,7 @@ impl FilterInfo {
     ///   if there are no more predicates
     pub(super) fn advance(mut self) -> AdvanceResult {
         if self.next_predicate.get() >= self.filter.predicates.len() {
+            self.observe_filter();
             AdvanceResult::Done(self.filter, self.cache_info)
         } else {
             self.next_predicate = self
@@ -108,12 +156,15 @@ impl FilterInfo {
 
     /// Return a mutable reference to the current predicate
     pub(super) fn current_mut(&mut self) -> &mut dyn ArrowPredicate {
-        self.filter
+        let current_index = self.next_predicate.get() - 1;
+        let predicate = self.filter
             .predicates
-            .get_mut(self.next_predicate.get() - 1)
+            .get_mut(current_index)
             // advance ensures next_predicate is always in bounds
             .unwrap()
-            .as_mut()
+            .as_mut();
+        predicate.set_first_filter(current_index == 0);
+        predicate
     }
 
     /// Return the current predicate to evaluate
@@ -145,6 +196,11 @@ impl FilterInfo {
 
     /// Returns the inner filter, consuming this FilterInfo
     pub(super) fn into_filter(self) -> RowFilter {
+        self.observe_filter();
         self.filter
     }
 }
+
+#[cfg(test)]
+#[path = "filter_timing_tests.rs"]
+mod timing_tests;

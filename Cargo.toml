@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/types", "crates/catalog", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/cli", "crates/plan", "crates/optimizer", "crates/physical"]
+members = ["crates/common", "crates/types", "crates/catalog", "crates/parquet-connector", "crates/exec", "crates/error", "crates/parser", "crates/binder", "crates/cli", "crates/plan", "crates/optimizer", "crates/physical", "crates/functions", "crates/storage", "crates/engine"]
 exclude = ["vendor/parquet"]
 default-members = ["crates/cli"]
 
@@ -8,6 +8,7 @@ default-members = ["crates/cli"]
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["full"] }
 arrow = "60.0.0"
+arrow-cmp = "60.0.0"
 arrow-row = "60.0.0"
 parquet = { version = "60.0.0", features = ["async", "arrow"] }
 opendal = { version = "0.59.3", features = ["services-fs"] }

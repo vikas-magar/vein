@@ -12,6 +12,7 @@ impl AggregateSink {
         let mut pending = self.tracker.spill_manager().create_run()?;
         let output = self.spill_schema.write_run_with(
             pending.writer()?,
+            &self.tracker,
             self.groups.len(),
             |slot| self.intermediate_group_state(slot),
         )?;
@@ -44,6 +45,7 @@ impl AggregateSink {
         let mut pending = self.tracker.spill_manager().create_run()?;
         let output = self.spill_schema.write_run_with(
             pending.writer()?,
+            &self.tracker,
             group_count,
             |offset| self.intermediate_group_state(first_group + offset),
         )?;
@@ -62,10 +64,16 @@ impl AggregateSink {
             || self.plan.types != local.plan.types
             || self.grouping_sets != local.grouping_sets
             || self.tracker.identity() != local.tracker.identity()
+            || !self.distinct_layout_matches(&local)
         {
             return Err(VeinError::internal(
                 "cannot combine aggregate states from different plans or memory trackers",
             ));
+        }
+
+        let local_collectors = std::mem::take(&mut local.distinct_collectors);
+        for (target, source) in self.distinct_collectors.iter_mut().zip(local_collectors) {
+            target.sink.combine_local_state(*source.sink)?;
         }
 
         self.spill_runs

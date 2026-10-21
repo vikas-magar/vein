@@ -15,28 +15,20 @@ macro_rules! assert_unsigned_group_key_layout {
         };
         let mut sink = AggregateSink::new(plan).unwrap();
 
-        sink.accumulate(DataChunk::from_vectors(vec![
+        sink.accumulate(crate::pipeline::test_support::dense_view(vec![
             Arc::new(<$array>::from(vec![Some(2), None])),
             Arc::new(Int64Array::from(vec![1, 2])),
         ]))
         .unwrap();
-        sink.accumulate(DataChunk::from_vectors(vec![
+        sink.accumulate(crate::pipeline::test_support::dense_view(vec![
             Arc::new(<$array>::from(vec![Some(2), Some(5)])),
             Arc::new(Int64Array::from(vec![3, 4])),
         ]))
         .unwrap();
 
         let output = sink.finish().unwrap();
-        let keys = output[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<$array>()
-            .unwrap();
-        let sums = output[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let keys = crate::pipeline::test_support::materialized_column::<$array>(&output[0], 0);
+        let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
 
         assert_eq!(keys.len(), 3);
         assert_eq!(keys.value(0), 2);
@@ -77,7 +69,7 @@ fn dictionary_utf8_grouping_handles_nulls_unused_values_and_batch_local_ids() {
         ])),
     )
         .unwrap();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(first_dictionary),
         Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60])),
     ]))
@@ -88,23 +80,15 @@ fn dictionary_utf8_grouping_handles_nulls_unused_values_and_batch_local_ids() {
         Arc::new(StringArray::from(vec![Some("F"), Some("O")])),
     )
         .unwrap();
-    sink.accumulate(DataChunk::from_vectors(vec![
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(second_dictionary),
         Arc::new(Int64Array::from(vec![60, 70])),
     ]))
         .unwrap();
 
     let output = sink.finish().unwrap();
-    let keys = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let sums = output[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let keys = crate::pipeline::test_support::materialized_column::<StringArray>(&output[0], 0);
+    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
     let actual = (0..output[0].num_rows())
         .map(|row| {
             (
@@ -124,7 +108,11 @@ fn dictionary_utf8_grouping_handles_nulls_unused_values_and_batch_local_ids() {
         "unused dictionary values must not form groups"
     );
     assert_eq!(metrics.input_rows, 8);
-    assert_eq!(metrics.grouping_probes, 7);
+    assert_eq!(
+        metrics.grouping_probes,
+        8,
+        "view-backed keys probe input rows while preserving NULL grouping semantics"
+    );
     assert_eq!(metrics.new_groups, 3);
     assert_eq!(metrics.string_key_bytes_copied, 0);
 }

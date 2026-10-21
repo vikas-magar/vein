@@ -22,7 +22,7 @@ use arrow_array::{BooleanArray, RecordBatch, RecordBatchReader};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
-pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
+pub use filter::{ArrowPredicate, ArrowPredicateFn, PredicateOrder, PredicateOrderPolicy, RowFilter};
 use selection::MaskCursor;
 pub use selection::{
     MaskRunIter, RowSelection, RowSelectionCursor, RowSelectionPolicy, RowSelector,
@@ -49,9 +49,9 @@ use crate::file::metadata::{
     ParquetStatisticsPolicy, RowGroupMetaData,
 };
 use crate::file::page_index::offset_index::PageLocation;
-use std::collections::HashMap;
 use crate::file::reader::{ChunkReader, SerializedPageReader};
 use crate::schema::types::SchemaDescriptor;
+use std::collections::HashMap;
 
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 // Exposed so integration tests and benchmarks can temporarily override the threshold.
@@ -64,7 +64,7 @@ pub(crate) mod selection;
 pub mod statistics;
 
 /// Default batch size for reading parquet files
-pub const DEFAULT_BATCH_SIZE: usize = 1024;
+pub const DEFAULT_BATCH_SIZE: usize = 8000;
 
 /// A row group and its optional row-group-local [`RowSelection`].
 ///
@@ -1443,7 +1443,7 @@ impl<T: ChunkReader + 'static> RowGroups for ReaderRowGroups<T> {
         }))
     }
 
-    fn row_groups(&self) -> Box<dyn Iterator<Item=&RowGroupMetaData> + '_> {
+    fn row_groups(&self) -> Box<dyn Iterator<Item = &RowGroupMetaData> + '_> {
         Box::new(
             self.row_groups
                 .iter()
@@ -2025,7 +2025,7 @@ pub(crate) mod tests {
             file.try_clone().unwrap(),
             arrow_options,
         )
-            .unwrap();
+        .unwrap();
 
         let row_group_metadata = builder.metadata.row_group(0);
         for column in row_group_metadata.columns() {
@@ -2043,7 +2043,7 @@ pub(crate) mod tests {
             file.try_clone().unwrap(),
             arrow_options,
         )
-            .unwrap();
+        .unwrap();
 
         let row_group_metadata = builder.metadata.row_group(0);
         for (idx, column) in row_group_metadata.columns().iter().enumerate() {
@@ -2066,7 +2066,7 @@ pub(crate) mod tests {
             file.try_clone().unwrap(),
             arrow_options,
         )
-            .unwrap();
+        .unwrap();
 
         let row_group_metadata = builder.metadata.row_group(0);
         for column in row_group_metadata.columns() {
@@ -2083,7 +2083,7 @@ pub(crate) mod tests {
             file.try_clone().unwrap(),
             arrow_options,
         )
-            .unwrap();
+        .unwrap();
 
         let row_group_metadata = builder.metadata.row_group(0);
         for (idx, column) in row_group_metadata.columns().iter().enumerate() {
@@ -2143,7 +2143,7 @@ pub(crate) mod tests {
             Some(Field::new("int32", ArrowDataType::Null, true)),
             &Default::default(),
         )
-            .unwrap();
+        .unwrap();
 
         file.rewind().unwrap();
 
@@ -2265,7 +2265,7 @@ pub(crate) mod tests {
                 ])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         writer.write(&original).unwrap();
         writer.close().unwrap();
@@ -2354,19 +2354,19 @@ pub(crate) mod tests {
                 ArrowDataType::Time32(TimeUnit::Millisecond),
                 true,
             )
-                .with_metadata(HashMap::from_iter(vec![(
-                    "adjusted_to_utc".to_string(),
-                    String::new(),
-                )])),
+            .with_metadata(HashMap::from_iter(vec![(
+                "adjusted_to_utc".to_string(),
+                String::new(),
+            )])),
             Field::new(
                 "time_micros",
                 ArrowDataType::Time64(TimeUnit::Microsecond),
                 true,
             )
-                .with_metadata(HashMap::from_iter(vec![(
-                    "adjusted_to_utc".to_string(),
-                    String::new(),
-                )])),
+            .with_metadata(HashMap::from_iter(vec![(
+                "adjusted_to_utc".to_string(),
+                String::new(),
+            )])),
         ]));
 
         let mut buf = Vec::with_capacity(1024);
@@ -2581,7 +2581,7 @@ pub(crate) mod tests {
         let encodings = &[Encoding::PLAIN, Encoding::RLE_DICTIONARY];
 
         type TypeHintAndConversionFunction =
-        (Option<ArrowDataType>, fn(&[Option<Int96>]) -> ArrayRef);
+            (Option<ArrowDataType>, fn(&[Option<Int96>]) -> ArrayRef);
 
         let resolutions: Vec<TypeHintAndConversionFunction> = vec![
             // Test without a specified ArrowType hint.
@@ -2634,7 +2634,7 @@ pub(crate) mod tests {
                         TimestampSecondArray::from_iter(
                             vals.iter().map(|x| x.map(|x| x.to_seconds())),
                         )
-                            .with_timezone("-05:00"),
+                        .with_timezone("-05:00"),
                     ) as ArrayRef
                 },
             ),
@@ -2787,11 +2787,11 @@ pub(crate) mod tests {
             decimals.data_type().clone(),
             false,
         )])))
-            .len(8)
-            .null_bit_buffer(Some(Buffer::from(&[0b11101111])))
-            .child_data(vec![decimals.into_data()])
-            .build()
-            .unwrap();
+        .len(8)
+        .null_bit_buffer(Some(Buffer::from(&[0b11101111])))
+        .child_data(vec![decimals.into_data()])
+        .build()
+        .unwrap();
 
         let written =
             RecordBatch::try_from_iter([("struct", Arc::new(StructArray::from(data)) as ArrayRef)])
@@ -2820,11 +2820,11 @@ pub(crate) mod tests {
             int32.data_type().clone(),
             false,
         )])))
-            .len(8)
-            .null_bit_buffer(Some(Buffer::from(&[0b11101111])))
-            .child_data(vec![int32.into_data()])
-            .build()
-            .unwrap();
+        .len(8)
+        .null_bit_buffer(Some(Buffer::from(&[0b11101111])))
+        .child_data(vec![int32.into_data()])
+        .build()
+        .unwrap();
 
         let written =
             RecordBatch::try_from_iter([("struct", Arc::new(StructArray::from(data)) as ArrayRef)])
@@ -2854,12 +2854,12 @@ pub(crate) mod tests {
             decimals.data_type().clone(),
             false,
         ))))
-            .len(7)
-            .add_buffer(Buffer::from_iter([0_i32, 0, 1, 3, 3, 4, 5, 8]))
-            .null_bit_buffer(Some(Buffer::from(&[0b01010111])))
-            .child_data(vec![decimals.into_data()])
-            .build()
-            .unwrap();
+        .len(7)
+        .add_buffer(Buffer::from_iter([0_i32, 0, 1, 3, 3, 4, 5, 8]))
+        .null_bit_buffer(Some(Buffer::from(&[0b01010111])))
+        .child_data(vec![decimals.into_data()])
+        .build()
+        .unwrap();
 
         let written =
             RecordBatch::try_from_iter([("list", Arc::new(ListArray::from(data)) as ArrayRef)])
@@ -3138,9 +3138,9 @@ pub(crate) mod tests {
                 (0u8..8u8).collect::<Vec<u8>>(),
                 (24u8..32u8).collect::<Vec<u8>>(),
             ]
-                .into_iter(),
+            .into_iter(),
         )
-            .unwrap();
+        .unwrap();
         let arr = UInt8DictionaryArray::new(keys, Arc::new(values));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
 
@@ -3580,8 +3580,8 @@ pub(crate) mod tests {
                         std::iter::from_fn(|| {
                             Some((rng.next_u32() as usize % 100 >= *null_percent) as i16)
                         })
-                            .take(opts.num_rows)
-                            .collect()
+                        .take(opts.num_rows)
+                        .collect()
                     })
                     .collect();
                 (Repetition::OPTIONAL, Some(def_levels))
@@ -3634,7 +3634,7 @@ pub(crate) mod tests {
             arrow_field,
             &opts,
         )
-            .unwrap();
+        .unwrap();
 
         file.rewind().unwrap();
 
@@ -4106,7 +4106,7 @@ pub(crate) mod tests {
             Some(arrow_field),
             &opts,
         )
-            .unwrap();
+        .unwrap();
 
         file.rewind().unwrap();
 
@@ -4243,7 +4243,7 @@ pub(crate) mod tests {
 
     fn write_parquet_from_iter<I, F>(value: I) -> File
     where
-        I: IntoIterator<Item=(F, ArrayRef)>,
+        I: IntoIterator<Item = (F, ArrayRef)>,
         F: AsRef<str>,
     {
         let batch = RecordBatch::try_from_iter(value).unwrap();
@@ -4257,7 +4257,7 @@ pub(crate) mod tests {
 
     fn run_schema_test_with_error<I, F>(value: I, schema: SchemaRef, expected_error: &str)
     where
-        I: IntoIterator<Item=(F, ArrayRef)>,
+        I: IntoIterator<Item = (F, ArrayRef)>,
         F: AsRef<str>,
     {
         let file = write_parquet_from_iter(value);
@@ -4350,7 +4350,7 @@ pub(crate) mod tests {
             ],
             None,
         )
-            .expect("struct array");
+        .expect("struct array");
         let supplied_nested_fields = Fields::from(vec![
             Field::new("nested1_valid", ArrowDataType::Utf8, false),
             Field::new("nested1_invalid", ArrowDataType::Int32, false),
@@ -4478,9 +4478,9 @@ pub(crate) mod tests {
             file.try_clone().unwrap(),
             options,
         )
-            .expect("reader builder with schema")
-            .build()
-            .expect("reader with schema");
+        .expect("reader builder with schema")
+        .build()
+        .expect("reader with schema");
 
         let batch = arrow_reader.next().unwrap().unwrap();
         assert_eq!(batch.num_columns(), 3);
@@ -4531,9 +4531,9 @@ pub(crate) mod tests {
             file.try_clone().unwrap(),
             options,
         )
-            .expect("reader builder with schema")
-            .build()
-            .expect("reader with schema");
+        .expect("reader builder with schema")
+        .build()
+        .expect("reader with schema");
         arrow_reader.next().unwrap().unwrap_err();
     }
 
@@ -4601,9 +4601,9 @@ pub(crate) mod tests {
             file.try_clone().unwrap(),
             options,
         )
-            .expect("reader builder with schema")
-            .build()
-            .expect("reader with schema");
+        .expect("reader builder with schema")
+        .build()
+        .expect("reader with schema");
 
         assert_eq!(arrow_reader.schema(), supplied_schema);
         let batch = arrow_reader.next().unwrap().unwrap();
@@ -4719,7 +4719,7 @@ pub(crate) mod tests {
                     .build(),
             ),
         )
-            .unwrap();
+        .unwrap();
         for _ in 0..2 {
             let mut list_builder = ListBuilder::new(Int32Builder::with_capacity(batch_size));
             for _ in 0..(batch_size) {
@@ -4928,7 +4928,7 @@ pub(crate) mod tests {
                 test_file,
                 ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
             )
-                .unwrap();
+            .unwrap();
             let row_group_page_index = builder.metadata().page_index_for_row_group(0);
             assert!(row_group_page_index.offset_index(0).is_some());
             assert!(row_group_page_index.column_index(0).is_some());
@@ -4947,7 +4947,7 @@ pub(crate) mod tests {
                 test_file,
                 ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
             )
-                .unwrap();
+            .unwrap();
             // Although `Vec<Vec<PageLocation>>` of each row group is empty,
             // we should read the file successfully.
             assert!(builder.metadata().page_index().is_none());
@@ -5168,7 +5168,7 @@ pub(crate) mod tests {
             ("decimal_values_12_0", Arc::new(decimals_12_0) as ArrayRef),
             ("decimal_values_17_10", Arc::new(decimals_17_10) as ArrayRef),
         ])
-            .unwrap();
+        .unwrap();
 
         let mut buffer = Vec::with_capacity(1024);
         let mut writer = ArrowWriter::try_new(&mut buffer, written.schema(), None).unwrap();
@@ -5261,7 +5261,7 @@ pub(crate) mod tests {
             ("d2", Arc::new(d2) as ArrayRef),
             ("d3", Arc::new(d3) as ArrayRef),
         ])
-            .unwrap();
+        .unwrap();
 
         let mut buffer = Vec::with_capacity(1024);
         let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
@@ -5306,7 +5306,7 @@ pub(crate) mod tests {
             ("d3", Arc::new(d3) as ArrayRef),
             ("d4", Arc::new(d4) as ArrayRef),
         ])
-            .unwrap();
+        .unwrap();
 
         let mut buffer = Vec::with_capacity(1024);
         let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
@@ -5538,11 +5538,11 @@ pub(crate) mod tests {
             DataType::Int32,
             false,
         ))))
-            .len(2)
-            .add_buffer(a_value_offsets)
-            .add_child_data(a_values.into_data())
-            .build()
-            .unwrap();
+        .len(2)
+        .add_buffer(a_value_offsets)
+        .add_child_data(a_values.into_data())
+        .build()
+        .unwrap();
         let a = ListArray::from(a_list_data);
 
         let builder = ParquetRecordBatchReaderBuilder::try_new(test_file).unwrap();
@@ -5579,9 +5579,9 @@ pub(crate) mod tests {
             file.try_clone().unwrap(),
             options,
         )
-            .expect("reader builder with schema")
-            .build()
-            .expect("reader with schema");
+        .expect("reader builder with schema")
+        .build()
+        .expect("reader with schema");
 
         let batch = arrow_reader.next().unwrap().unwrap();
         let schema = Arc::new(Schema::new(vec![

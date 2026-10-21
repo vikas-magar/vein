@@ -2,19 +2,19 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use catalog::{StatisticsComparison, StatisticsPredicate};
 use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{
-    AggOpCode, AggregatePlan, DataSource, FileFormat, FileScanTask, JoinOutput, JoinResidualPlan,
-    LimitSpec, MicroProgram, RegId, ScanPredicate, ScanPredicateStage,
+    AggOpCode, AggregatePlan, ColumnEncodingHint, DataFileFormatId, DataSource, ExpressionProgram, ExpressionStep,
+    FileScanTask, JoinOutput, JoinResidualPlan, LimitSpec, ScanPredicate, ScanPredicateStage,
     SortKey as PhysicalSortKey, SortPlan,
 };
-use catalog::{StatisticsComparison, StatisticsPredicate};
 use error::VeinError;
 use plan::schema::VeinSchema;
 use plan::{LogicalExpr, LogicalPlan, SortKey as LogicalSortKey};
 
-use super::expr::BytecodeCompiler;
+use super::expr_tree::ExpressionCompiler;
 
 /// Compiles Parquet scans with filters and projections into an executable pipeline.
 pub struct PipelineCompiler;
@@ -72,16 +72,14 @@ impl PipelineCompiler {
             input_columns.push(JoinOutput::Probe(probe_key));
         }
 
-        let register_count = RegId::try_from(input_schema.fields.len())
-            .map_err(|_| VeinError::planning("join residual has too many input columns", None))?;
-        let mut compiler = BytecodeCompiler::new(register_count);
-        compiler.set_input_schema(&input_schema);
-        for predicate in predicates {
-            compiler.compile_filter(predicate, &input_schema)?;
-        }
+        let compiler = ExpressionCompiler::new(&input_schema)?;
+        let steps = predicates
+            .iter()
+            .map(|predicate| compiler.filter(predicate))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Some(JoinResidualPlan {
             input_columns,
-            program: Arc::new(compiler.finish()),
+            program: Arc::new(ExpressionProgram { steps }),
         }))
     }
 
@@ -120,7 +118,8 @@ impl PipelineCompiler {
     /// The aggregate a plan describes, for the executor.
     ///
     /// An aggregate is a pipeline breaker the executor drives, not a program the
-    /// VM runs, so the executor needs the key and argument columns in one piece.
+    /// expression kernels run, so the executor needs key and argument columns
+    /// in one input view.
     ///
     /// Filters and projections above it are compiled separately to run after
     /// the groups exist.
@@ -141,8 +140,8 @@ impl PipelineCompiler {
                 let (aggs, aggregate_input_types): (Vec<_>, Vec<_>) = aggs
                     .iter()
                     .map(|agg| {
-                        let (name, argument) = aggregate_argument(agg)?;
-                        Ok((agg_op(name)?, argument.data_type()))
+                        let (name, argument, distinct) = aggregate_argument(agg)?;
+                        Ok((agg_op(name, distinct)?, argument.data_type()))
                     })
                     .collect::<Result<Vec<_>>>()?
                     .into_iter()
@@ -193,7 +192,9 @@ impl PipelineCompiler {
     /// Compiles the sort operator at this node without imposing root-pipeline
     /// restrictions on operators below it. Recursive inputs retain the exact
     /// logical order, including a limit that precedes a sort.
-    pub fn recursive_sort(plan: &LogicalPlan) -> Result<Option<(SortPlan, Option<MicroProgram>)>> {
+    pub fn recursive_sort(
+        plan: &LogicalPlan,
+    ) -> Result<Option<(SortPlan, Option<ExpressionProgram>)>> {
         let LogicalPlan::Sort {
             sort_keys, schema, ..
         } = plan
@@ -208,98 +209,103 @@ impl PipelineCompiler {
 
     /// Evaluates computed ORDER expressions once and appends them as temporary
     /// columns after the visible pipeline output.
-    pub fn sort_key_program(plan: &LogicalPlan) -> Result<Option<MicroProgram>> {
+    pub fn sort_key_program(plan: &LogicalPlan) -> Result<Option<ExpressionProgram>> {
         let Some((sort_keys, schema)) = root_sort(plan)? else {
             return Ok(None);
         };
         compile_sort_key_program(sort_keys, schema)
     }
 
-    /// Compiles a linear logical plan into its Parquet source and vector program.
+    /// Compiles a linear logical plan into a source and typed expression pipeline.
     pub fn compile(
         plan: &LogicalPlan,
-    ) -> Result<(DataSource, MicroProgram, VeinSchema, VeinSchema)> {
+    ) -> Result<(DataSource, ExpressionProgram, VeinSchema, VeinSchema)> {
         let mut dictionary_group_ids = Vec::new();
         let (mut source, scan_schema) = Self::collect_leaf_source(plan, &mut dictionary_group_ids)?;
-        if let DataSource::File(scan) = &mut source {
-            if scan.pushdown.is_none() {
-                scan.dictionary_columns = scan_schema
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, field)| {
-                        field.data_type == plan::schema::VeinDataType::Utf8
-                            && dictionary_group_ids.contains(&field.id)
-                    })
-                    .filter_map(|(index, _)| u32::try_from(index).ok())
-                    .collect();
-            }
+        if let DataSource::File(scan) = &mut source
+            && scan.pushdown.is_none()
+        {
+            scan.column_encoding_hints = scan_schema
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| {
+                    field.data_type == plan::schema::VeinDataType::Utf8
+                        && dictionary_group_ids.contains(&field.id)
+                })
+                .filter_map(|(index, _)| u32::try_from(index).ok())
+                .map(ColumnEncodingHint::dictionary)
+                .collect();
         }
-        // `RegId` is wide enough for any schema, so the scan no longer has a
-        // column-count ceiling (`02-execution-and-vir-lld.md` §2).
-        let register_count = scan_schema.fields.len() as RegId;
-        let mut compiler = BytecodeCompiler::new(register_count);
-        compiler.set_input_schema(&scan_schema);
-        let output_schema = Self::compile_node(plan, scan_schema.clone(), &mut compiler)?;
-        Ok((source, compiler.finish(), scan_schema, output_schema))
+        let mut steps = Vec::new();
+        let output_schema = Self::compile_node(plan, scan_schema.clone(), &mut steps)?;
+        Ok((
+            source,
+            ExpressionProgram { steps },
+            scan_schema,
+            output_schema,
+        ))
     }
 
-    /// Compiles the VM portion of one operator against its recursively produced
+    /// Compiles one operator against its recursively produced
     /// input. Unlike `compile`, this does not search for a Parquet leaf: the
     /// physical child supplies the batches at runtime.
     pub fn compile_recursive_transform(
         plan: &LogicalPlan,
         input_schema: &VeinSchema,
-    ) -> Result<(MicroProgram, VeinSchema)> {
+    ) -> Result<(ExpressionProgram, VeinSchema)> {
         Self::compile_recursive_transforms(&[plan], input_schema)
     }
 
-    /// Compiles adjacent VM-expressible operators into one program over a
+    /// Compiles adjacent scalar operators into one expression pipeline over a
     /// recursively produced input. The nodes must be ordered from the child
     /// toward the root so each operator sees the preceding node's output schema.
     pub fn compile_recursive_transforms(
         plans: &[&LogicalPlan],
         input_schema: &VeinSchema,
-    ) -> Result<(MicroProgram, VeinSchema)> {
-        let mut compiler = BytecodeCompiler::new(input_schema.fields.len() as RegId);
-        compiler.set_input_schema(input_schema);
+    ) -> Result<(ExpressionProgram, VeinSchema)> {
+        let mut steps = Vec::new();
         let mut output_schema = input_schema.clone();
         for plan in plans {
             // Recursive lowering already compiled the child into a canonical
             // physical node. Compile only each operator against its immediate
             // input schema; walking its logical child again can lose columns
             // that a preceding operator has intentionally narrowed.
-            output_schema = Self::compile_recursive_transform_node(plan, &output_schema, &mut compiler)
-                .map_err(|error| {
-                    let operator = match *plan {
-                        LogicalPlan::Filter { .. } => "filter",
-                        LogicalPlan::Project { .. } => "projection",
-                        LogicalPlan::Aggregate { .. } => "aggregate",
-                        LogicalPlan::Distinct { .. } => "distinct",
-                        LogicalPlan::SubqueryAlias { .. } => "subquery alias",
-                        _ => "transform",
-                    };
-                    let columns = output_schema
-                        .fields
-                        .iter()
-                        .map(|field| format!("{}#{}", field.name, field.id.0))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    VeinError::context(
-                        format!(
-                            "failed to compile recursive {operator} against input schema [{columns}]"
-                        ),
-                        error,
-                    )
-                })?;
+            output_schema = Self::compile_recursive_transform_node(
+                plan,
+                &output_schema,
+                &mut steps,
+            )
+            .map_err(|error| {
+                let operator = match *plan {
+                    LogicalPlan::Filter { .. } => "filter",
+                    LogicalPlan::Project { .. } => "projection",
+                    LogicalPlan::Aggregate { .. } => "aggregate",
+                    LogicalPlan::Distinct { .. } => "distinct",
+                    LogicalPlan::SubqueryAlias { .. } => "subquery alias",
+                    _ => "transform",
+                };
+                let columns = output_schema
+                    .fields
+                    .iter()
+                    .map(|field| format!("{}#{}", field.name, field.id.0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                VeinError::context(
+                    format!(
+                        "failed to compile recursive {operator} against input schema [{columns}]"
+                    ),
+                    error,
+                )
+            })?;
         }
-        Ok((compiler.finish(), output_schema))
+        Ok((ExpressionProgram { steps }, output_schema))
     }
 
     fn compile_recursive_transform_node(
         plan: &LogicalPlan,
         input_schema: &VeinSchema,
-        compiler: &mut BytecodeCompiler,
+        steps: &mut Vec<ExpressionStep>,
     ) -> Result<VeinSchema> {
         match plan {
             LogicalPlan::Filter {
@@ -309,12 +315,12 @@ impl PipelineCompiler {
                 // Recursive input plans execute this transform immediately
                 // after its child. For a filter above an aggregate, the child
                 // schema is the aggregate output, so compile the predicate here
-                // instead of relying on the linear task's post-aggregate VM.
-                compiler.compile_filter(predicate, input_schema)?;
+                // instead of relying on a post-aggregate expression transform.
+                steps.push(ExpressionCompiler::new(input_schema)?.filter(predicate)?);
                 Ok(input_schema.clone())
             }
             LogicalPlan::Project { exprs, schema, .. } => {
-                compiler.compile_projection_with_schema(exprs, input_schema, schema)?;
+                steps.push(ExpressionCompiler::new(input_schema)?.projection(exprs)?);
                 Ok((**schema).clone())
             }
             LogicalPlan::Aggregate {
@@ -326,11 +332,11 @@ impl PipelineCompiler {
                 let (keys, _) = grouping_layout(grouping_sets)?;
                 let mut projected = keys;
                 for agg in aggs {
-                    let (name, argument) = aggregate_argument(agg)?;
-                    agg_op(name)?;
+                    let (name, argument, distinct) = aggregate_argument(agg)?;
+                    agg_op(name, distinct)?;
                     projected.push(argument.clone());
                 }
-                compiler.compile_projection_with_schema(&projected, input_schema, schema)?;
+                steps.push(ExpressionCompiler::new(input_schema)?.projection(&projected)?);
                 Ok((**schema).clone())
             }
             LogicalPlan::Distinct { schema, .. } => {
@@ -340,7 +346,7 @@ impl PipelineCompiler {
                     .cloned()
                     .map(LogicalExpr::Column)
                     .collect::<Vec<_>>();
-                compiler.compile_projection_with_schema(&projected, input_schema, schema)?;
+                steps.push(ExpressionCompiler::new(input_schema)?.projection(&projected)?);
                 Ok((**schema).clone())
             }
             LogicalPlan::Join { schema, .. }
@@ -363,7 +369,7 @@ impl PipelineCompiler {
                     .cloned()
                     .map(LogicalExpr::Column)
                     .collect::<Vec<_>>();
-                compiler.compile_projection_with_schema(&projection, input_schema, schema)?;
+                steps.push(ExpressionCompiler::new(input_schema)?.projection(&projection)?);
                 Ok((**schema).clone())
             }
             other => Err(VeinError::unsupported(
@@ -377,14 +383,13 @@ impl PipelineCompiler {
     }
 
     /// Compiles row filters above an aggregate against the aggregate's output schema.
-    pub fn post_aggregate_program(plan: &LogicalPlan) -> Result<Option<MicroProgram>> {
-        let Some(schema) = aggregate_output_schema(plan) else {
+    pub fn post_aggregate_program(plan: &LogicalPlan) -> Result<Option<ExpressionProgram>> {
+        let Some(_schema) = aggregate_output_schema(plan) else {
             return Ok(None);
         };
-        let mut compiler = BytecodeCompiler::new(schema.fields.len() as RegId);
-        compile_post_aggregate_node(plan, &mut compiler)?;
-        let program = compiler.finish();
-        Ok((!program.instructions.is_empty()).then_some(program))
+        let mut steps = Vec::new();
+        compile_post_aggregate_node(plan, &mut steps)?;
+        Ok((!steps.is_empty()).then_some(ExpressionProgram { steps }))
     }
 
     fn collect_leaf_source(
@@ -392,22 +397,26 @@ impl PipelineCompiler {
         dictionary_group_ids: &mut Vec<plan::schema::ColumnId>,
     ) -> Result<(DataSource, VeinSchema)> {
         match plan {
+            LogicalPlan::Intermediate {
+                source_id, schema, ..
+            } => Ok((
+                DataSource::Intermediate(common::identifiers::IntermediateSourceId::from_raw(
+                    *source_id,
+                )),
+                (**schema).clone(),
+            )),
             LogicalPlan::Scan {
                 table,
                 projection,
                 filters,
                 schema,
             } => {
-                if table
-                    .format
-                    .as_ref()
-                    .is_some_and(|format| format != &plan::TableFormat::Parquet)
-                {
-                    return Err(VeinError::unsupported(
-                        format!("only Parquet tables are supported: '{}'", table.name),
+                let data_file_format = table.data_file_format.clone().ok_or_else(|| {
+                    VeinError::planning(
+                        format!("table '{}' does not declare a data-file format", table.name),
                         None,
-                    ));
-                }
+                    )
+                })?;
                 let files = if !table.files.is_empty() {
                     table.files.clone()
                 } else if let Some(location) = &table.location {
@@ -415,35 +424,111 @@ impl PipelineCompiler {
                 } else {
                     vec![table.name.clone()]
                 };
+                let storage_metadata = if table.storage_metadata.is_empty() {
+                    Vec::new()
+                } else if table.storage_metadata.len() == files.len() {
+                    table.storage_metadata.clone()
+                } else {
+                    return Err(VeinError::planning(
+                        format!(
+                            "table '{}' has {} storage snapshots for {} scan files",
+                            table.name,
+                            table.storage_metadata.len(),
+                            files.len()
+                        ),
+                        None,
+                    ));
+                };
                 let scan_schema =
                     Self::projected_scan_schema(schema, projection.as_deref(), filters)?;
-                let statistics = optimizer::estimation::ScanStatistics::new(schema, table.statistics.as_ref());
+                let statistics =
+                    optimizer::estimation::ScanStatistics::new(schema, table.statistics.as_ref());
                 let pushdown = Self::scan_predicate_with_estimator(filters, schema, |predicate| {
                     use optimizer::estimation::{SelectivityEstimator, StatisticsSelectivity};
-                    StatisticsSelectivity.estimate(predicate, &statistics).true_fraction.value()
+                    let estimate = StatisticsSelectivity
+                        .estimate(predicate, &statistics)
+                        .true_fraction
+                        .value();
+                    tracing::debug!(
+                        target: "vein.optimizer",
+                        event = "scan_filter_selectivity_estimate",
+                        table = %table.name,
+                        predicate_kind = predicate.kind_name(),
+                        estimated_pass_fraction = ?estimate,
+                        estimate_used_for_ordering = estimate.is_some(),
+                        table_rows = ?table.statistics.as_ref().and_then(|statistics| statistics.num_rows),
+                        statistics_column_count = table.statistics
+                            .as_ref()
+                            .map_or(0, |statistics| statistics.column_statistics.len()),
+                        source_snapshot_pinned = table.catalog_snapshot.is_some(),
+                        "scan filter selectivity estimated"
+                    );
+                    estimate
                 })?;
-                Self::file_source(files, scan_schema, pushdown)
+                // Full row coverage does not require reading every table
+                // column. The synopsis records only columns it observed, while
+                // the pinned row count validates complete source-row coverage.
+                let row_coverage_candidate = pushdown.is_none();
+                let runtime_statistics = table.catalog_snapshot.as_ref().map(|snapshot| {
+                    common::protocol::RuntimeStatisticsScan {
+                        scan_id: TaskId::new().into_raw(),
+                        table_key: common::statistics::runtime::table_statistics_key(snapshot),
+                        expected_rows: table
+                            .statistics
+                            .as_ref()
+                            .and_then(|statistics| statistics.num_rows),
+                        row_coverage_candidate,
+                        partition_index: 0,
+                        partition_count: 1,
+                    }
+                });
+                Self::file_source(
+                    files,
+                    data_file_format,
+                    Vec::new(),
+                    storage_metadata,
+                    scan_schema,
+                    pushdown,
+                    runtime_statistics,
+                )
             }
             LogicalPlan::ExternalScan {
                 url,
                 options,
                 files,
                 schema,
+                ..
             } => {
-                if options.iter().any(|(key, value)| {
-                    key.eq_ignore_ascii_case("format") && !value.eq_ignore_ascii_case("parquet")
-                }) {
-                    return Err(VeinError::unsupported(
-                        "only Parquet external sources are supported",
+                let data_file_format = options
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("format"))
+                    .map(|(_, value)| DataFileFormatId::new(value.as_str()))
+                    .ok_or_else(|| VeinError::planning(
+                        "external scan must declare a data-file format",
                         None,
-                    ));
-                }
+                    ))?;
                 let paths = if files.is_empty() {
                     vec![url.clone()]
                 } else {
                     files.clone()
                 };
-                Self::file_source(paths, (**schema).clone(), None)
+                let format_options = options
+                    .iter()
+                    .filter(|(key, _)| !key.eq_ignore_ascii_case("format"))
+                    .map(|(key, value)| common::protocol::KeyValue {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect();
+                Self::file_source(
+                    paths,
+                    data_file_format,
+                    format_options,
+                    Vec::new(),
+                    (**schema).clone(),
+                    None,
+                    None,
+                )
             }
             LogicalPlan::Aggregate {
                 input,
@@ -452,10 +537,10 @@ impl PipelineCompiler {
             } => {
                 let (keys, _) = grouping_layout(grouping_sets)?;
                 for key in keys {
-                    if let LogicalExpr::Column(column) = key {
-                        if !dictionary_group_ids.contains(&column.id) {
-                            dictionary_group_ids.push(column.id);
-                        }
+                    if let LogicalExpr::Column(column) = key
+                        && !dictionary_group_ids.contains(&column.id)
+                    {
+                        dictionary_group_ids.push(column.id);
                     }
                 }
                 Self::collect_leaf_source(input, dictionary_group_ids)
@@ -486,11 +571,15 @@ impl PipelineCompiler {
 
     fn file_source(
         files: Vec<String>,
+        data_file_format: DataFileFormatId,
+        format_options: Vec<common::protocol::KeyValue>,
+        storage_metadata: Vec<catalog::StorageFileMetadata>,
         schema: VeinSchema,
         pushdown: Option<Arc<ScanPredicate>>,
+        runtime_statistics: Option<common::protocol::RuntimeStatisticsScan>,
     ) -> Result<(DataSource, VeinSchema)> {
         if files.is_empty() {
-            return Err(VeinError::planning("Parquet scan has no input files", None));
+            return Err(VeinError::planning("file scan has no input files", None));
         }
         // One handle to the projected schema: splitting this scan into
         // per-file tasks then copies a refcount instead of the schema.
@@ -498,14 +587,17 @@ impl PipelineCompiler {
         Ok((
             DataSource::File(FileScanTask {
                 files,
-                format: FileFormat::Parquet,
+                storage_metadata,
+                data_file_format,
+                format_options,
+                column_encoding_hints: Vec::new(),
                 byte_range: None,
                 scan_unit_range: None,
                 projected,
-                dictionary_columns: Vec::new(),
                 pushdown,
                 task_id: TaskId::new(),
                 catalog_snapshot: None,
+                runtime_statistics,
             }),
             schema,
         ))
@@ -515,7 +607,7 @@ impl PipelineCompiler {
     /// materializing rows, over only the columns those filters read.
     ///
     /// The predicate is compiled against its own narrow input schema — input
-    /// column `i` lands in VM register `i` — so the reader mounts a batch of just
+    /// column `i` maps to expression input column `i` — so the reader loads only
     /// those columns and never touches the wider projected schema.
     #[cfg(test)]
     fn scan_predicate(
@@ -575,10 +667,8 @@ impl PipelineCompiler {
                     None,
                 ));
             }
-            let register_count = input.fields.len() as RegId;
-            let mut compiler = BytecodeCompiler::new(register_count);
-            let result = compiler.compile_predicate(&predicates, &input)?;
-            let program = Arc::new(compiler.finish());
+            let predicate = ExpressionCompiler::new(&input)?.predicate(&predicates)?;
+            let reorder_safe = predicates.iter().all(super::scan_stages::reorder_safe);
             let input_columns = input
                 .fields
                 .iter()
@@ -591,15 +681,15 @@ impl PipelineCompiler {
                 predicate_count = predicates.len(),
                 input_columns = ?input_columns,
                 input_column_count = input.fields.len(),
-                register_count,
-                instruction_count = program.instructions.len(),
+                expression_count = predicates.len(),
+                reorder_safe,
                 "scan_predicate_stage_compiled"
             );
             stages.push(ScanPredicateStage {
                 predicate_count: predicates.len(),
+                reorder_safe,
                 input: Arc::new(input),
-                program,
-                result,
+                predicate,
             });
         }
 
@@ -614,22 +704,20 @@ impl PipelineCompiler {
         Ok(Some(Arc::new(ScanPredicate {
             predicate_count: conjuncts.len(),
             stages,
-            statistics: conjuncts
-                .iter()
-                .map(Self::statistics_predicate)
-                .collect(),
+            statistics: conjuncts.iter().map(Self::statistics_predicate).collect(),
         })))
     }
 
-    pub(super) fn scan_predicate_correlation_class(predicate: &StatisticsPredicate) -> Option<bool> {
+    pub(super) fn scan_predicate_correlation_class(
+        predicate: &StatisticsPredicate,
+    ) -> Option<bool> {
         match predicate {
             StatisticsPredicate::Unknown => None,
             StatisticsPredicate::ColumnComparison { .. } => Some(true),
             StatisticsPredicate::And(children) | StatisticsPredicate::Or(children) => {
                 let mut contains_column_comparison = false;
                 for child in children {
-                    contains_column_comparison |=
-                        Self::scan_predicate_correlation_class(child)?;
+                    contains_column_comparison |= Self::scan_predicate_correlation_class(child)?;
                 }
                 Some(contains_column_comparison)
             }
@@ -646,10 +734,7 @@ impl PipelineCompiler {
 
         match expression {
             LogicalExpr::BinaryOp {
-                left,
-                op,
-                right,
-                ..
+                left, op, right, ..
             } => {
                 use parser::ast::expr::BinaryOp as Op;
                 match op {
@@ -766,7 +851,10 @@ impl PipelineCompiler {
         Ok(VeinSchema { fields })
     }
 
-    pub(super) fn collect_column_ids(expression: &LogicalExpr, output: &mut HashSet<plan::schema::ColumnId>) {
+    pub(super) fn collect_column_ids(
+        expression: &LogicalExpr,
+        output: &mut HashSet<plan::schema::ColumnId>,
+    ) {
         match expression {
             LogicalExpr::Column(column) | LogicalExpr::OuterColumn(column) => {
                 output.insert(column.id);
@@ -782,7 +870,7 @@ impl PipelineCompiler {
     fn compile_node(
         plan: &LogicalPlan,
         input_schema: VeinSchema,
-        compiler: &mut BytecodeCompiler,
+        steps: &mut Vec<ExpressionStep>,
     ) -> Result<VeinSchema> {
         match plan {
             // The recursive physical input builder executes the join and
@@ -791,63 +879,62 @@ impl PipelineCompiler {
             LogicalPlan::Join { schema, .. } => Ok((**schema).clone()),
             LogicalPlan::Scan { filters, .. } => {
                 for filter in filters {
-                    compiler.compile_filter(filter, &input_schema)?;
+                    steps.push(ExpressionCompiler::new(&input_schema)?.filter(filter)?);
                 }
                 Ok(input_schema)
             }
             LogicalPlan::ExternalScan { .. } => Ok(input_schema),
-            LogicalPlan::Write { input, .. } => Self::compile_node(input, input_schema, compiler),
+            LogicalPlan::Intermediate { .. } => Ok(input_schema),
+            LogicalPlan::Write { input, .. } => Self::compile_node(input, input_schema, steps),
             // A limit changes no column, only how many rows come out: the window
             // is applied by the executor, so the program sees straight through.
-            LogicalPlan::Limit { input, .. } => Self::compile_node(input, input_schema, compiler),
+            LogicalPlan::Limit { input, .. } => Self::compile_node(input, input_schema, steps),
             LogicalPlan::Sort { input, schema, .. } => {
-                Self::compile_node(input, input_schema, compiler)?;
+                Self::compile_node(input, input_schema, steps)?;
                 Ok((**schema).clone())
             }
             // An alias compiles its input but reports *its own* schema: the
             // columns are the same, and it is the alias's field ids and
             // qualifiers that everything above it was resolved against.
             LogicalPlan::SubqueryAlias { input, schema, .. } => {
-                Self::compile_node(input, input_schema, compiler)?;
+                Self::compile_node(input, input_schema, steps)?;
                 Ok((**schema).clone())
             }
-            // The program's *output* registers become the aggregate's input
-            // columns: the keys first, then one argument column per aggregate,
-            // which is what lets `sum(price * quantity)` be an ordinary register
-            // instead of an expression the executor would have to interpret.
+            // Evaluate aggregate keys and arguments into one reference-backed
+            // projection before the aggregate consumes them.
             LogicalPlan::Aggregate {
                 input,
                 grouping_sets,
                 aggs,
                 schema,
             } => {
-                let input_schema = Self::compile_node(input, input_schema, compiler)?;
+                let input_schema = Self::compile_node(input, input_schema, steps)?;
                 let (keys, _) = grouping_layout(grouping_sets)?;
                 let mut projected = keys;
                 for agg in aggs {
-                    let (name, argument) = aggregate_argument(agg)?;
-                    agg_op(name)?;
+                    let (name, argument, distinct) = aggregate_argument(agg)?;
+                    agg_op(name, distinct)?;
                     projected.push(argument.clone());
                 }
-                compiler.compile_projection_with_schema(&projected, &input_schema, schema)?;
+                steps.push(ExpressionCompiler::new(&input_schema)?.projection(&projected)?);
                 Ok((**schema).clone())
             }
             // Distinct is a group by every column with nothing to fold.
             LogicalPlan::Distinct { input, schema } => {
-                let input_schema = Self::compile_node(input, input_schema, compiler)?;
+                let input_schema = Self::compile_node(input, input_schema, steps)?;
                 let projected: Vec<LogicalExpr> = input_schema
                     .fields
                     .iter()
                     .cloned()
                     .map(LogicalExpr::Column)
                     .collect();
-                compiler.compile_projection_with_schema(&projected, &input_schema, schema)?;
+                steps.push(ExpressionCompiler::new(&input_schema)?.projection(&projected)?);
                 Ok((**schema).clone())
             }
             LogicalPlan::Filter { input, predicate } => {
-                let schema = Self::compile_node(input, input_schema, compiler)?;
+                let schema = Self::compile_node(input, input_schema, steps)?;
                 if Self::aggregate(input)?.is_none() {
-                    compiler.compile_filter(predicate, &schema)?;
+                    steps.push(ExpressionCompiler::new(&schema)?.filter(predicate)?);
                 }
                 Ok(schema)
             }
@@ -856,13 +943,13 @@ impl PipelineCompiler {
                 exprs,
                 schema,
             } => {
-                let input_schema = Self::compile_node(input, input_schema, compiler)?;
+                let input_schema = Self::compile_node(input, input_schema, steps)?;
                 // Aggregate state is built after this input program runs. A
                 // projection above that boundary belongs to the post-aggregate
                 // program, not the program that produces grouping keys and
                 // aggregate arguments.
                 if Self::aggregate(input)?.is_none() {
-                    compiler.compile_projection_with_schema(exprs, &input_schema, schema)?;
+                    steps.push(ExpressionCompiler::new(&input_schema)?.projection(exprs)?);
                 }
                 Ok((**schema).clone())
             }
@@ -920,23 +1007,23 @@ fn aggregate_output_schema(plan: &LogicalPlan) -> Option<VeinSchema> {
 /// Compiles supported operators above the aggregate, in execution order.
 fn compile_post_aggregate_node(
     plan: &LogicalPlan,
-    compiler: &mut BytecodeCompiler,
+    steps: &mut Vec<ExpressionStep>,
 ) -> Result<VeinSchema> {
     match plan {
         LogicalPlan::Aggregate { schema, .. } | LogicalPlan::Distinct { schema, .. } => {
             Ok((**schema).clone())
         }
         LogicalPlan::Filter { input, predicate } => {
-            let schema = compile_post_aggregate_node(input, compiler)?;
-            compiler.compile_filter(predicate, &schema)?;
+            let schema = compile_post_aggregate_node(input, steps)?;
+            steps.push(ExpressionCompiler::new(&schema)?.filter(predicate)?);
             Ok(schema)
         }
         LogicalPlan::Limit { input, .. } | LogicalPlan::Write { input, .. } => {
-            compile_post_aggregate_node(input, compiler)
+            compile_post_aggregate_node(input, steps)
         }
-        LogicalPlan::Sort { input, .. } => compile_post_aggregate_node(input, compiler),
+        LogicalPlan::Sort { input, .. } => compile_post_aggregate_node(input, steps),
         LogicalPlan::SubqueryAlias { input, schema, .. } => {
-            compile_post_aggregate_node(input, compiler)?;
+            compile_post_aggregate_node(input, steps)?;
             Ok((**schema).clone())
         }
         LogicalPlan::Project {
@@ -944,8 +1031,8 @@ fn compile_post_aggregate_node(
             exprs,
             schema,
         } => {
-            let input_schema = compile_post_aggregate_node(input, compiler)?;
-            compiler.compile_projection_with_schema(exprs, &input_schema, schema)?;
+            let input_schema = compile_post_aggregate_node(input, steps)?;
+            steps.push(ExpressionCompiler::new(&input_schema)?.projection(exprs)?);
             Ok((**schema).clone())
         }
         other => Err(VeinError::unsupported(
@@ -1008,7 +1095,7 @@ fn compile_sort_plan(sort_keys: &[LogicalSortKey], schema: &VeinSchema) -> Resul
 fn compile_sort_key_program(
     sort_keys: &[LogicalSortKey],
     schema: &VeinSchema,
-) -> Result<Option<MicroProgram>> {
+) -> Result<Option<ExpressionProgram>> {
     if sort_keys
         .iter()
         .all(|key| matches!(&key.expr, LogicalExpr::Column(_)))
@@ -1016,17 +1103,19 @@ fn compile_sort_key_program(
         return Ok(None);
     }
 
-    let mut compiler = BytecodeCompiler::new(schema.fields.len() as RegId);
-    let mut output_registers = (0..schema.fields.len())
-        .map(|index| index as RegId)
+    let mut expressions = schema
+        .fields
+        .iter()
+        .cloned()
+        .map(LogicalExpr::Column)
         .collect::<Vec<_>>();
     for key in sort_keys {
         if !matches!(&key.expr, LogicalExpr::Column(_)) {
-            output_registers.push(compiler.compile_expr(&key.expr, schema)?);
+            expressions.push(key.expr.clone());
         }
     }
-    compiler.compile_projection_registers(output_registers);
-    Ok(Some(compiler.finish()))
+    let step = ExpressionCompiler::new(schema)?.projection(&expressions)?;
+    Ok(Some(ExpressionProgram { steps: vec![step] }))
 }
 
 fn contains_sort(plan: &LogicalPlan) -> bool {
@@ -1087,9 +1176,8 @@ fn contains_limit(plan: &LogicalPlan) -> bool {
     }
 }
 
-/// Flattens the grouping columns into one VM projection and records each set as
-/// positions into that projection. The output schema uses this same first-seen
-/// union of keys.
+/// Flattens grouping columns into one shared input layout and records each set
+/// as positions in that layout. The output schema uses the same union of keys.
 fn grouping_layout(
     grouping_sets: &[Vec<LogicalExpr>],
 ) -> Result<(Vec<LogicalExpr>, Vec<Vec<u32>>)> {
@@ -1128,26 +1216,19 @@ fn grouping_layout(
 ///
 /// Refusing an unknown name here is what keeps the executor from having to
 /// interpret a function it was never told how to fold.
-fn agg_op(name: &str) -> Result<AggOpCode> {
-    Ok(match name.to_ascii_uppercase().as_str() {
-        "COUNT" => AggOpCode::Count,
-        "SUM" => AggOpCode::Sum,
-        "MIN" => AggOpCode::Min,
-        "MAX" => AggOpCode::Max,
-        "AVG" => AggOpCode::Avg,
-        "SINGLE_VALUE" => AggOpCode::SingleValue,
-        other => {
-            return Err(VeinError::unsupported(
-                format!("aggregate {other} is not implemented; use a supported aggregate function"),
-                None,
-            ));
-        }
-    })
+fn agg_op(name: &str, distinct: bool) -> Result<AggOpCode> {
+    functions::aggregate_operation(name, distinct)
 }
 
 /// Returns the single input argument for an aggregate expression.
-fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr)> {
-    let LogicalExpr::FunctionCall { name, args, .. } = agg else {
+fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr, bool)> {
+    let LogicalExpr::FunctionCall {
+        name,
+        args,
+        distinct,
+        ..
+    } = agg
+    else {
         return Err(VeinError::planning(
             format!(
                 "aggregate expression must be a function call, found expression kind {}",
@@ -1162,7 +1243,7 @@ fn aggregate_argument(agg: &LogicalExpr) -> Result<(&str, &LogicalExpr)> {
             None,
         ));
     };
-    Ok((name, argument))
+    Ok((name, argument, *distinct))
 }
 
 /// Uses a catalog NDV only when it describes the unfiltered single-key input

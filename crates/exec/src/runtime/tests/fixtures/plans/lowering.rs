@@ -47,27 +47,30 @@ pub(in crate::runtime::tests) fn canonical_input(input: InputPlanFixture) -> Arc
         }
         InputPlanFixture::Transform { input, program } => {
             let input = canonical_input(*input);
-            let projected = program.instructions.iter().rev().find_map(|instruction| {
-                if let MicroOp::ProjectRegisters { out_regs } = instruction {
-                    Some(out_regs)
+            let projected = program.steps.iter().rev().find_map(|step| {
+                if let ExpressionStep::Projection(expressions) = step {
+                    Some(expressions)
                 } else {
                     None
                 }
             });
-            let output_schema = if let Some(out_regs) = projected {
+            let output_schema = if let Some(expressions) = projected {
                 Arc::new(types::VeinSchema::new(
-                    out_regs
+                    expressions
                         .iter()
-                        .map(|&register| {
-                            let column = usize::try_from(register)
-                                .expect("test projection register fits address space");
-                            Arc::clone(
-                                input
-                                    .output_schema
-                                    .fields
-                                    .get(column)
-                                    .expect("test projection selects an input column"),
-                            )
+                        .enumerate()
+                        .map(|(index, expression)| {
+                            if let ExprKind::Column { index: column } = expression.kind {
+                                let column = usize::try_from(column)
+                                    .expect("test projection column fits address space");
+                                Arc::clone(input.output_schema.fields.get(column)
+                                    .expect("test projection selects an input column"))
+                            } else {
+                                Arc::new(types::ResolvedColumn::new(
+                                    types::ColumnId(index), format!("expression_{index}"), None,
+                                    expression.return_type.clone(),
+                                ))
+                            }
                         })
                         .collect(),
                 ))

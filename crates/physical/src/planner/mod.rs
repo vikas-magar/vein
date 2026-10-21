@@ -16,4 +16,9 @@ use plan::LogicalPlan;
 pub trait PhysicalPlanner: Send + Sync {
     /// Lower a logical plan into a physical [`Job`].
     fn create_physical_plan(&self, request_id: RequestId, logical_plan: LogicalPlan) -> Result<Job>;
+    /// Lower against the same query-local statistics snapshot used by the CBO.
+    fn create_physical_plan_with_statistics(&self, request_id: RequestId, logical_plan: LogicalPlan,
+                                            _statistics: std::sync::Arc<common::statistics::QueryStatisticsContext>) -> Result<Job> {
+        self.create_physical_plan(request_id, logical_plan)
+    }
 }

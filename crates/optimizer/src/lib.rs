@@ -24,7 +24,7 @@ pub mod optimizer;
 pub mod rules;
 
 pub use context::{
-    CatalogStatisticsProvider, JoinCardinalityAssumption, JoinCostBreakdown,
+    CatalogStatisticsProvider, QueryStatisticsProvider, JoinCardinalityAssumption, JoinCostBreakdown,
     JoinOrderAlternative, JoinOrderConfig, JoinOrderDecision, JoinOrderOutcome,
     OptimizationDiagnostics, OptimizerConfig, OptimizerContext, OptimizerPhase, RuleExecution,
     StatisticsFreshness, StatisticsProvider, StatisticsSnapshot,

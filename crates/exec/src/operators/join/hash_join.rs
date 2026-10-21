@@ -2,12 +2,12 @@
 //!
 //! A join is a pipeline breaker, so it is two nodes rather than one. [`BuildSink`]
 //! absorbs the build side; the finished [`HashTable`] is handed to [`HashJoin`],
-//! which probes. The runtime sequences them — drive the build side to
-//! completion, then probe — which is precisely why a join cannot be a VM
-//! instruction: the VM sees one chunk at a time and has no second input.
+//! which probes. The runtime sequences them by draining the build input before
+//! it drives the probe input.
 
 mod build;
 mod collector;
+mod output;
 mod probe;
 
 pub use build::BuildSink;

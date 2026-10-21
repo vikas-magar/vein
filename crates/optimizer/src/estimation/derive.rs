@@ -16,9 +16,26 @@ fn scan<'a, P: StatisticsProvider + ?Sized>(
     let mut input = table::table_estimate(table, schema, provider);
     // Evaluate all pushed predicates against the same pre-filter population.
     let mut fraction = super::PredicateEstimate::logical(1.0, 0.0);
+    let mut fallback_predicates = 0usize;
     for (index, predicate) in filters.iter().enumerate() {
         if filters[..index].contains(predicate) { continue; }
-        fraction = fraction.and(model.estimate(predicate, &input.columns));
+        let estimate = model.estimate(predicate, &input.columns);
+        let (selectivity, used_fallback) = conservative_filter_selectivity(estimate.true_fraction);
+        if used_fallback {
+            fallback_predicates += 1;
+        }
+        fraction = fraction.and(super::PredicateEstimate {
+            true_fraction: selectivity,
+            false_fraction: estimate.false_fraction,
+        });
+    }
+    if fallback_predicates > 0 {
+        let value = fraction.true_fraction.value().unwrap_or(1.0);
+        fraction.true_fraction = Estimate::model(value, EstimateSource::SelectivityFallback);
+        tracing::info!(target: "vein.optimizer", event = "optimizer_filter_selectivity_fallback",
+            table = %table.name, predicate_count = filters.len(), fallback_predicates,
+            fallback = "pass_through_for_unestimated_predicates",
+            "filter rows remain estimable using a low-confidence pass-through prior");
     }
     if !filters.is_empty() {
         filter(&mut input, fraction.true_fraction);
@@ -48,12 +65,17 @@ fn filter(input: &mut RelationEstimate<'_>, fraction: Estimate) {
     let fraction = if fraction.value().is_some_and(|v| v > 1.0) {
         Estimate::unknown(EstimateSource::InvalidStatistics)
     } else { fraction };
+    let source = if fraction.source == EstimateSource::SelectivityFallback {
+        EstimateSource::SelectivityFallback
+    } else {
+        EstimateSource::Filter
+    };
     let rows = if input.rows.value() == Some(0.0) {
         input.rows
     } else if fraction.value() == Some(0.0) {
         fraction
     } else {
-        input.rows.combine(fraction, EstimateSource::Filter, |r, f| r * f)
+        input.rows.combine(fraction, source, |r, f| r * f)
     };
     input.subset(rows);
     input.selectivity = Some(fraction);
@@ -68,10 +90,41 @@ pub(super) fn derive<'a, P: StatisticsProvider + ?Sized>(
     input.selectivity = None;
     match node {
         LogicalPlan::Scan { .. } => scan(node, provider, model),
+        LogicalPlan::Intermediate { source_id, row_count, schema } => {
+            if let Some(statistics) = provider.intermediate_statistics(*source_id) {
+                if statistics.num_rows == Some(*row_count) {
+                    return table::statistics_estimate(statistics, schema,
+                                                      |column| common::statistics::intermediate_column_key(column.id), EstimateSource::RuntimeFeedback);
+                }
+                tracing::warn!(target: "vein.optimizer", event = "adaptive_statistics_rejected",
+                    source_id, expected_rows = row_count, synopsis_rows = ?statistics.num_rows,
+                    reason = "population_mismatch", "checkpoint statistics rejected");
+            }
+            let mut relation = RelationEstimate::new(Estimate::known(
+                *row_count as f64,
+                EstimateSource::RuntimeFeedback,
+                super::EstimateConfidence::Statistics,
+            ));
+            for column in &schema.fields {
+                relation.add_cardinality_prior(column.id, *row_count);
+            }
+            relation
+        }
+        LogicalPlan::ExternalScan {
+            source_metadata: Some(table),
+            schema,
+            ..
+        } => table::table_estimate(table, schema, provider),
         LogicalPlan::ExternalScan { .. } => RelationEstimate::new(
             Estimate::unknown(EstimateSource::MissingStatistics)),
         LogicalPlan::Filter { predicate, .. } => {
-            let fraction = model.estimate(predicate, &input.columns).true_fraction;
+            let estimate = model.estimate(predicate, &input.columns);
+            let (fraction, used_fallback) = conservative_filter_selectivity(estimate.true_fraction);
+            if used_fallback {
+                tracing::info!(target: "vein.optimizer", event = "optimizer_filter_selectivity_fallback",
+                    operator = node.operator_name(), fallback = "pass_through_for_unestimated_predicate",
+                    "filter rows remain estimable using a low-confidence pass-through prior");
+            }
             filter(&mut input, fraction);
             input.restrict(predicate);
             input
@@ -136,5 +189,16 @@ pub(super) fn derive<'a, P: StatisticsProvider + ?Sized>(
         | LogicalPlan::Tee { .. } | LogicalPlan::SemanticFilter { .. }
         | LogicalPlan::SemanticJoin { .. } | LogicalPlan::SemanticCalibrate { .. }
         | LogicalPlan::Write { .. } | LogicalPlan::Call { .. } => RelationEstimate::unknown(),
+    }
+}
+
+/// A filter's unknown selectivity uses the identity prior: assume it retains
+/// every input row. This is an upper bound for a row filter and never a pruning
+/// proof. Invalid extension estimates take the same safe planning path.
+fn conservative_filter_selectivity(estimate: Estimate) -> (Estimate, bool) {
+    if estimate.value().is_some_and(|fraction| (0.0..=1.0).contains(&fraction)) {
+        (estimate, false)
+    } else {
+        (Estimate::model(1.0, EstimateSource::SelectivityFallback), true)
     }
 }

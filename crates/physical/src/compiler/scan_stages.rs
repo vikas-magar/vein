@@ -89,5 +89,16 @@ pub(super) fn group_predicates(
     }).collect()
 }
 
+/// Only pure, bounded column/literal predicates may move across other stages.
+/// Arithmetic, casts, functions, and correlated expressions can fail or depend
+/// on evaluation order, so they retain the optimizer's existing order.
+pub(crate) fn reorder_safe(expression: &LogicalExpr) -> bool {
+    expression.is_reorder_safe()
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "scan_stages/reorder_tests.rs"]
+mod reorder_tests;

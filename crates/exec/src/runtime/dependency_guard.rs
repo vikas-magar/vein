@@ -11,14 +11,14 @@ use crate::pipeline::{DataChunkView, PipelineNode};
 
 /// Guards the first probe push (or empty-input flush) with graph prerequisites.
 pub(super) struct PipelineDependencyGuard {
-    inner: Box<dyn PipelineNode<DataChunkView>>,
+    inner: Box<dyn PipelineNode>,
     dependencies: Vec<(PipelineId, Arc<AtomicBool>)>,
     checked: bool,
 }
 
 impl PipelineDependencyGuard {
     pub(super) fn new(
-        inner: Box<dyn PipelineNode<DataChunkView>>,
+        inner: Box<dyn PipelineNode>,
         dependencies: Vec<(PipelineId, Arc<AtomicBool>)>,
     ) -> Self {
         Self {
@@ -47,7 +47,7 @@ impl PipelineDependencyGuard {
     }
 }
 
-impl PipelineNode<DataChunkView> for PipelineDependencyGuard {
+impl PipelineNode for PipelineDependencyGuard {
     fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.ensure_ready()?;
         self.inner.push(view)
@@ -62,7 +62,7 @@ impl PipelineNode<DataChunkView> for PipelineDependencyGuard {
         self.inner.finished()
     }
 
-    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<DataChunkView>>>> {
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
         let Some(inner) = self.inner.fork_local()? else {
             return Ok(None);
         };
@@ -74,7 +74,7 @@ impl PipelineNode<DataChunkView> for PipelineDependencyGuard {
 
     fn combine_local(
         self: Box<Self>,
-        canonical: &mut dyn PipelineNode<DataChunkView>,
+        canonical: &mut dyn PipelineNode,
     ) -> Result<()> {
         let target = canonical
             .as_any_mut()

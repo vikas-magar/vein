@@ -1,32 +1,33 @@
 use super::*;
 use crate::ast::expr::{BinaryOp, Literal};
+use error::SourceSpan;
 
 #[test]
 fn test_column_collector_recursive() {
     use crate::ast::expr::SpannedExpr;
     let c = SpannedExpr {
-        span: Default::default(),
+        span: SourceSpan::default(),
         node: Expr::Column {
             table: None,
             column: "c",
         },
     };
     let b = SpannedExpr {
-        span: Default::default(),
+        span: SourceSpan::default(),
         node: Expr::Column {
             table: None,
             column: "b",
         },
     };
     let a = SpannedExpr {
-        span: Default::default(),
+        span: SourceSpan::default(),
         node: Expr::Column {
             table: None,
             column: "a",
         },
     };
     let ab = SpannedExpr {
-        span: Default::default(),
+        span: SourceSpan::default(),
         node: Expr::BinaryOp {
             left: Box::new(a),
             op: BinaryOp::Plus,
@@ -34,7 +35,7 @@ fn test_column_collector_recursive() {
         },
     };
     let abc = SpannedExpr {
-        span: Default::default(),
+        span: SourceSpan::default(),
         node: Expr::BinaryOp {
             left: Box::new(ab),
             op: BinaryOp::Plus,
@@ -57,25 +58,25 @@ fn test_column_collector_recursive() {
 fn test_inlist_visits_children() {
     use crate::ast::expr::SpannedExpr;
     let x = SpannedExpr {
-        span: Default::default(),
+        span: SourceSpan::default(),
         node: Expr::Column {
             table: None,
             column: "x",
         },
     };
     let y = SpannedExpr {
-        span: Default::default(),
+        span: SourceSpan::default(),
         node: Expr::Column {
             table: None,
             column: "y",
         },
     };
     let one = SpannedExpr {
-        span: Default::default(),
+        span: SourceSpan::default(),
         node: Expr::Literal(Literal::Int(1)),
     };
     let inlist = SpannedExpr {
-        span: Default::default(),
+        span: SourceSpan::default(),
         node: Expr::InList {
             expr: Box::new(x),
             list: vec![one, y],

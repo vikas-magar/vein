@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn view_and_arrow_results_share_execution_for_join_sort_limit() {
+async fn client_result_stays_reference_backed_through_join_sort_limit() {
     use arrow::array::Int64Array;
 
     let builder = Arc::new(MultiFileFeedBuilder::new());
@@ -13,17 +13,20 @@ async fn view_and_arrow_results_share_execution_for_join_sort_limit() {
             PhysicalPlanOperator::Pipeline {
                 source: Arc::new(DataSource::File(FileScanTask {
                     files: vec!["3.parquet".into(), "1.parquet".into(), "2.parquet".into()],
-                    format: FileFormat::Parquet,
+                    storage_metadata: Vec::new(),
+                    data_file_format: DataFileFormatId::new("parquet"),
+                    format_options: Vec::new(),
+                    column_encoding_hints: Vec::new(),
                     byte_range: None,
                     scan_unit_range: None,
                     projected: Arc::clone(&schema),
-                    dictionary_columns: Vec::new(),
                     pushdown: None,
                     task_id: TaskId::new(),
                     catalog_snapshot: None,
+                    runtime_statistics: None,
                 })),
                 input_schema: Arc::clone(&schema),
-                program: Arc::new(MicroProgram::empty()),
+                program: Arc::new(ExpressionProgram::empty()),
             },
         )
     };
@@ -70,48 +73,35 @@ async fn view_and_arrow_results_share_execution_for_join_sort_limit() {
     );
     let mut task = task();
     task.plan = plan_with_input(&task, input);
-    let views = runner
-        .execute_views(&task, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(views.row_count, 2);
-    let mut actual = Vec::new();
-    let source_arrays = builder.source_arrays.lock().unwrap();
-    for batch in &views.output {
-        for row in 0..batch.num_rows() {
-            let (array, source_row) = batch.view().resolve(0, row).unwrap().unwrap();
-            let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            assert!(
-                source_arrays
-                    .iter()
-                    .any(|source| std::ptr::eq(source.as_ref(), values))
-            );
-            actual.push(values.value(source_row));
-        }
-    }
-    assert_eq!(actual, vec![2, 3]);
-    drop(source_arrays);
-    let arrow = runner
+    let result = runner
         .execute(&task, CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(arrow.row_count, views.row_count);
-    assert_eq!(arrow.output.len(), views.output.len());
-    for (batch, view) in arrow.output.iter().zip(&views.output) {
-        let (converted, report) = view.to_record_batch_with_report().unwrap();
-        assert_eq!(&converted, batch);
-        assert_eq!(
-            report.gathered_columns, 1,
-            "payloads gather only at the Arrow boundary"
-        );
+    assert_eq!(result.row_count, 2);
+    let mut actual = Vec::new();
+    {
+        let source_arrays = builder.source_arrays.lock().unwrap();
+        for view in &result.output {
+            for row in 0..view.num_rows() {
+                let (array, source_row) = view.resolve(0, row).unwrap().unwrap();
+                let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                assert!(
+                    source_arrays
+                        .iter()
+                        .any(|source| std::ptr::eq(source.as_ref(), values))
+                );
+                actual.push(values.value(source_row));
+            }
+        }
     }
+    assert_eq!(actual, vec![2, 3]);
 }
 
 #[tokio::test]
 async fn view_results_stream_without_retention_and_propagate_cancellation_and_channel_errors() {
     let (sender, receiver) = flume::bounded(1);
     let result = runner()
-        .execute_views_streaming(&task(), CancellationToken::new(), sender)
+        .execute_streaming(&task(), CancellationToken::new(), sender)
         .await
         .unwrap();
     let batch = receiver.recv().unwrap();
@@ -122,14 +112,14 @@ async fn view_results_stream_without_retention_and_propagate_cancellation_and_ch
     let (sender, receiver) = flume::bounded(1);
     drop(receiver);
     let error = runner()
-        .execute_views_streaming(&task(), CancellationToken::new(), sender)
+        .execute_streaming(&task(), CancellationToken::new(), sender)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("client result channel closed"));
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert!(matches!(
-            runner().execute_views(&task(), cancel).await,
-            Err(VeinError::Cancelled)
-        ));
+        runner().execute(&task(), cancel).await,
+        Err(VeinError::Cancelled)
+    ));
 }

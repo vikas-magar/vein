@@ -3,11 +3,11 @@ use super::*;
 pub(in crate::runtime::tests) enum InputPlanFixture {
     Pipeline {
         source: DataSource,
-        program: Arc<MicroProgram>,
+        program: Arc<ExpressionProgram>,
     },
     Transform {
         input: Box<InputPlanFixture>,
-        program: Arc<MicroProgram>,
+        program: Arc<ExpressionProgram>,
     },
     Aggregate {
         input: Box<InputPlanFixture>,
@@ -20,7 +20,7 @@ pub(in crate::runtime::tests) enum InputPlanFixture {
     Sort {
         input: Box<InputPlanFixture>,
         plan: SortPlan,
-        key_program: Option<Arc<MicroProgram>>,
+        key_program: Option<Arc<ExpressionProgram>>,
         output_columns: u32,
     },
     Limit {
@@ -54,7 +54,7 @@ impl MemoryFeedBuilder {
     pub(in crate::runtime::tests) fn with_nullable_values(values: Vec<Option<i64>>) -> Self {
         Self {
             inner: crate::factory::DefaultExecutorBuilder::new(Arc::new(
-                crate::udf::FunctionRegistry::new(),
+                functions::FunctionRegistry::new(),
             )),
             values,
         }
@@ -67,43 +67,42 @@ impl ExecutorBuilder for MemoryFeedBuilder {
         source: &DataSource,
         task_id: TaskId,
         attempt: u32,
-    ) -> Result<Box<dyn Source<DataChunkView>>> {
+    ) -> Result<Box<dyn Source>> {
         if !matches!(source, DataSource::Memory) {
             return self.inner.build_source(source, task_id, attempt);
         }
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("dummy", arrow::datatypes::DataType::Int64, true),
         ]));
-        let values = Arc::new(arrow::array::Int64Array::from(self.values.clone()));
-        let batch = RecordBatch::try_new(schema, vec![values]).expect("valid test batch");
-        Ok(Box::new(MemorySource::new(batch)))
+        let values = Arc::new(arrow::array::Int64Array::from(self.values.clone()))
+            as arrow::array::ArrayRef;
+        let row_count = self.values.len();
+        let view = DataChunkView::from_arrays(
+            vec![values],
+            row_count,
+            common::arrow::SelectionVector::new_dense(row_count),
+        )?
+        .with_schema(schema)?;
+        Ok(Box::new(MemorySource::new(view)))
     }
 
-    fn build_vm(
+    fn build_expression_executor(
         &self,
-        program: &Arc<MicroProgram>,
-        next: Box<dyn PipelineNode<DataChunk>>,
-    ) -> Result<Box<dyn Transform<DataChunk>>> {
-        self.inner.build_vm(program, next)
+        program: &Arc<ExpressionProgram>,
+        next: Box<dyn PipelineNode>,
+    ) -> Result<Box<dyn Transform>> {
+        self.inner.build_expression_executor(program, next)
     }
 
-    fn build_view_vm(
-        &self,
-        program: &Arc<MicroProgram>,
-        next: Box<dyn PipelineNode<DataChunkView>>,
-    ) -> Result<Box<dyn Transform<DataChunkView>>> {
-        self.inner.build_view_vm(program, next)
-    }
-
-    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink<DataChunkView>>> {
+    fn build_sink(&self, sink: &DataSink) -> Result<Box<dyn Sink>> {
         self.inner.build_sink(sink)
     }
 
     fn build_streaming_sink(
         &self,
         sink: &DataSink,
-        output: flume::Sender<RecordBatch>,
-    ) -> Result<Box<dyn Sink<DataChunkView>>> {
+        output: flume::Sender<DataChunkView>,
+    ) -> Result<Box<dyn Sink>> {
         self.inner.build_streaming_sink(sink, output)
     }
 }

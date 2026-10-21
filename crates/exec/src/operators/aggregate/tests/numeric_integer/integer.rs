@@ -17,26 +17,14 @@ fn integer_sum_preserves_values_above_f64_precision() {
         9_007_199_254_740_992,
         9_007_199_254_740_993,
     ]));
-    let input = DataChunk::from_vectors(vec![values.clone(), values.clone(), values]);
+    let input = crate::pipeline::test_support::dense_view(vec![values.clone(), values.clone(), values]);
     let mut sink = AggregateSink::new(plan).unwrap();
 
     sink.accumulate(input).unwrap();
     let output = sink.finish().unwrap();
-    let sums = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
-    let minimum = output[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
-    let maximum = output[0]
-        .column(2)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0);
+    let minimum = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
+    let maximum = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 2);
 
     assert_eq!(sums.value(0), 18_014_398_509_481_985);
     assert_eq!(minimum.value(0), 9_007_199_254_740_992);
@@ -56,21 +44,17 @@ fn int64_average_accumulates_exactly_across_batches() {
     };
     let mut sink = AggregateSink::new(plan).unwrap();
 
-    sink.accumulate(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(Int64Array::from(
         vec![9_007_199_254_740_993_i64],
     ))]))
         .unwrap();
-    sink.accumulate(DataChunk::from_vectors(vec![Arc::new(Int64Array::from(
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(Int64Array::from(
         vec![-9_007_199_254_740_992_i64],
     ))]))
         .unwrap();
 
     let output = sink.finish().unwrap();
-    let average = output[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
+    let average = crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0);
     assert_eq!(average.value(0), 0.5);
 }
 
@@ -85,7 +69,7 @@ fn integer_sum_reports_overflow() {
         aggregate_input_types: vec![VeinDataType::Int64],
         types: vec![VeinDataType::Int64],
     };
-    let input = DataChunk::from_vectors(vec![Arc::new(Int64Array::from(vec![i64::MAX, 1]))]);
+    let input = crate::pipeline::test_support::dense_view(vec![Arc::new(Int64Array::from(vec![i64::MAX, 1]))]);
     let mut sink = AggregateSink::new(plan).unwrap();
 
     let error = sink.accumulate(input).unwrap_err();

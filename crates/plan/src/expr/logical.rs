@@ -609,7 +609,8 @@ impl LogicalExpr {
             return true;
         }
         match expr {
-            LogicalExpr::FunctionCall { name, .. } => is_volatile_builtin(name),
+            LogicalExpr::FunctionCall { name, .. } => is_volatile_builtin(name)
+                || expr.children().iter().any(|child| Self::is_volatile_depth(child, depth + 1)),
             // Window calls span a frame/partition and are not constant-foldable.
             LogicalExpr::WindowCall { .. } => true,
             // AI operators and UDFs have unknown volatility without a registry.
@@ -698,6 +699,14 @@ mod tests {
             return_type: VeinDataType::Float64,
         };
         assert!(inner.is_volatile());
+        let wrapped = LogicalExpr::FunctionCall {
+            name: "abs".into(),
+            args: vec![func("random")],
+            is_aggregate: false,
+            distinct: false,
+            return_type: VeinDataType::Float64,
+        };
+        assert!(wrapped.is_volatile(), "an immutable wrapper cannot hide a volatile argument");
     }
 
     #[test]

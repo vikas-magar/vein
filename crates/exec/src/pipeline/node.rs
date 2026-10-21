@@ -2,7 +2,7 @@
 
 use std::any::Any;
 
-use arrow::record_batch::RecordBatch;
+use super::DataChunkView;
 use common::Result;
 use error::VeinError;
 
@@ -37,13 +37,12 @@ impl<T: Any + Send + Sync> PipelineNodeDowncast for T {
 /// The synchronous trait implemented by all CPU-bound operators (Transforms
 /// and Sinks).
 ///
-/// Generic over the batch unit `B` so a pipeline can process either materialized
-/// chunks or reference-backed views. Implementations must NEVER yield to an
-/// asynchronous scheduler; they process the batch and immediately return or
-/// push to the next operator.
-pub trait PipelineNode<B: 'static>: PipelineNodeDowncast + Send + Sync {
-    /// Pushes a chunk of data into the operator.
-    fn push(&mut self, batch: B) -> Result<()>;
+/// Every pipeline operator consumes and emits the engine's canonical
+/// reference-backed view. Implementations must NEVER yield to an asynchronous
+/// scheduler; they process the view and immediately return or push it onward.
+pub trait PipelineNode: PipelineNodeDowncast + Send + Sync {
+    /// Pushes a view of columnar data into the operator.
+    fn push(&mut self, view: DataChunkView) -> Result<()>;
 
     /// Signals that no more data will be pushed.
     fn flush(&mut self) -> Result<()>;
@@ -63,7 +62,7 @@ pub trait PipelineNode<B: 'static>: PipelineNodeDowncast + Send + Sync {
     /// Builds independent worker-local state when this operator can be safely
     /// partitioned. `None` is an explicit serial fallback for operators whose
     /// semantics or resources cannot currently be combined.
-    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode<B>>>> {
+    fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
         Ok(None)
     }
 
@@ -72,7 +71,7 @@ pub trait PipelineNode<B: 'static>: PipelineNodeDowncast + Send + Sync {
     /// The local node is consumed so operators can transfer owned state and
     /// reservations instead of copying batch payloads. Implementations must
     /// validate that both nodes describe the same operation.
-    fn combine_local(self: Box<Self>, _canonical: &mut dyn PipelineNode<B>) -> Result<()> {
+    fn combine_local(self: Box<Self>, _canonical: &mut dyn PipelineNode) -> Result<()> {
         Err(VeinError::internal(
             "pipeline node does not support local-state combination",
         ))
@@ -82,15 +81,12 @@ pub trait PipelineNode<B: 'static>: PipelineNodeDowncast + Send + Sync {
 
 /// The trait implemented by all data sources.
 ///
-/// Generic over the batch unit `B` it produces. Sources read data and push it
-/// into the execution pipeline.
-///
 /// Sources are `Send`: a task's whole pipeline must be movable across threads
 /// so independent tasks can be executed concurrently.
 #[async_trait::async_trait]
-pub trait Source<B: 'static>: Send {
-    /// Execute the source, pushing all batches into the `next` pipeline node.
-    async fn execute(&mut self, next: &mut dyn PipelineNode<B>) -> Result<()>;
+pub trait Source: Send {
+    /// Execute the source, pushing views into the next pipeline node.
+    async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()>;
 
     /// Number of bytes read from the underlying storage, for execution metrics.
     /// Sources that track this should override the default.
@@ -100,15 +96,15 @@ pub trait Source<B: 'static>: Send {
 }
 
 /// A marker trait for middle operations that transform data and pass it on.
-pub trait Transform<B: 'static>: PipelineNode<B> {
+pub trait Transform: PipelineNode {
     /// Builds a worker-local transform when its mutable execution state can be
     /// recreated independently and combined after its input is drained.
-    fn fork_transform(&self) -> Result<Option<Box<dyn Transform<B>>>> {
+    fn fork_transform(&self) -> Result<Option<Box<dyn Transform>>> {
         Ok(None)
     }
 
     /// Combines a completed transform worker into its canonical counterpart.
-    fn combine_transform(self: Box<Self>, _canonical: &mut dyn Transform<B>) -> Result<()> {
+    fn combine_transform(self: Box<Self>, _canonical: &mut dyn Transform) -> Result<()> {
         Err(VeinError::internal(
             "transform does not support local-state combination",
         ))
@@ -120,9 +116,9 @@ pub trait Transform<B: 'static>: PipelineNode<B> {
 /// A sink is the terminal stage of a pipeline. A sink that must hand its result
 /// back to the caller (e.g. `DataSink::Client`) overrides [`Sink::collect`] to
 /// return the produced batches — analogous to Spark's `collect()`.
-pub trait Sink<B: 'static, O: 'static = RecordBatch>: PipelineNode<B> {
+pub trait Sink: PipelineNode {
     /// Retrieve the sink's produced output, if any. Defaults to no output.
-    fn collect(&mut self) -> Vec<O> {
+    fn collect(&mut self) -> Vec<DataChunkView> {
         Vec::new()
     }
 

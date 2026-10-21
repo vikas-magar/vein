@@ -18,6 +18,8 @@ pub enum JoinType {
     Semi,
     /// Internal optimizer join that emits left rows with no match.
     Anti,
+    /// Internal anti join implementing SQL `NOT IN` NULL semantics.
+    NullAwareAnti,
     /// Internal optimizer join that emits at most one build row per left row.
     Single,
 }

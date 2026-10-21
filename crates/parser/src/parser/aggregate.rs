@@ -113,7 +113,6 @@ impl<'a> Parser<'a> {
 }
 
 #[cfg(test)]
-
 mod tests {
     use crate::ast::pipe_op::PipeOperator;
     use crate::parser::Parser;
