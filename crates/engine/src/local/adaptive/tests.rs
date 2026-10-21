@@ -1,5 +1,5 @@
-use super::*;
 use super::test_support::{join, predicate, scan};
+use super::*;
 use catalog::TableMetadata;
 use plan::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
 
@@ -177,24 +177,4 @@ fn inferred_filters_over_completed_relations_do_not_create_repeated_checkpoints(
     let mut other = scan("b", 100);
     if let LogicalPlan::Scan { filters, .. } = &mut other { filters.clear(); }
     assert!(StatisticsCheckpointPolicy.choose_for_test(&join(filtered, other)).is_none());
-}
-
-#[test]
-fn volatile_expressions_are_not_replayed_across_adaptive_boundaries() {
-    let mut input = scan("a", 100);
-    if let LogicalPlan::Scan { filters, .. } = &mut input {
-        filters.push(plan::LogicalExpr::BinaryOp {
-            left: Box::new(plan::LogicalExpr::FunctionCall {
-                name: "random".into(),
-                args: vec![],
-                is_aggregate: false,
-                distinct: false,
-                return_type: VeinDataType::Float64,
-            }),
-            op: parser::ast::expr::BinaryOp::Gt,
-            right: Box::new(plan::LogicalExpr::Literal(plan::LogicalLiteral::Float64(0.5))),
-            return_type: VeinDataType::Boolean,
-        });
-    }
-    assert!(StatisticsCheckpointPolicy.choose_for_test(&join(input, scan("b", 10))).is_none());
 }

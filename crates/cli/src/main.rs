@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use futures::StreamExt;
-use cli::local::LocalQueryEngine;
+use cli::local::build_local_engine;
 use common::{Result, VeinError};
 use exec::pipeline::DataChunkView;
 
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         "cli_started"
     );
 
-    let engine = LocalQueryEngine::new(data_root);
+    let engine = build_local_engine(data_root)?;
     let started = Instant::now();
     let query = engine.prepare(&query).await?;
     let prepare_us = started.elapsed().as_micros() as u64;

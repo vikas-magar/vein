@@ -530,20 +530,16 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "async-stream",
  "async-trait",
- "binder",
  "catalog",
  "common",
- "error",
+ "engine",
  "exec",
  "flume",
  "functions",
  "futures",
  "optimizer",
- "parquet",
  "parquet-connector",
- "parser",
  "physical",
  "plan",
  "serde_json",
@@ -551,7 +547,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -759,6 +754,31 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-stream",
+ "async-trait",
+ "binder",
+ "catalog",
+ "common",
+ "error",
+ "exec",
+ "flume",
+ "functions",
+ "futures",
+ "optimizer",
+ "parser",
+ "physical",
+ "plan",
+ "storage",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "equivalent"

@@ -1,6 +1,6 @@
 # Catalog, Storage, and Connector Refactor Plan
 
-Status: implementation in progress — T1 through T6 complete; T7 writer migration is next
+Status: implementation in progress — T1 through T9 complete; T10 end-to-end validation remains
 Scope: the catalog-to-storage-to-scan path and its engine/CLI composition.
 
 ## Goal
@@ -14,38 +14,34 @@ requirement is that Vein does not add batch/column copies between decoding, scan
 
 ## Current source analysis
 
-- The workspace has `catalog`, `storage`, `exec`, and `cli`, but no generic `engine` or Parquet connector crate.
-  See [Cargo.toml](/Users/anvi/Next/vein/Cargo.toml:1).
-- `catalog` already has format-neutral table/statistics contracts, catalog sessions, snapshots, and a typed metadata
-  cache. Its docs say format implementations should live above it.
-  See [catalog/src/lib.rs](/Users/anvi/Next/vein/crates/catalog/src/lib.rs:3)
-  and [catalog/src/contract.rs](/Users/anvi/Next/vein/crates/catalog/src/contract.rs:61).
-- The cache payload is format-neutral. `MetadataKey` uses the storage-provided object identity, size, version facts, and
-  metadata kind; it declines caching when storage supplies no version validator.
-  See [catalog metadata key](/Users/anvi/Next/vein/crates/catalog/src/store/key.rs:7).
-- `storage` exposes typed locations, object paths and identities, optional object-version facts, and streaming listing
-  alongside stat and range reads. The OpenDAL filesystem adapter implements those contracts, and the catalog cache
-  consumes the supplied snapshot rather than doing filesystem canonicalization or stat calls.
-  See [storage read contracts](/Users/anvi/Next/vein/crates/storage/src/read/contracts.rs:15), [typed locations](/Users/anvi/Next/vein/crates/storage/src/read/location.rs:4),
-  and [metadata](/Users/anvi/Next/vein/crates/storage/src/read/metadata.rs:5).
-- `exec` has a provider registry and borrowed `ScanRequest`. Providers own scan-unit planning through
-  `ScanPlanningRequest`; the default registry still installs `ArrowParquetScanProvider`.
-  See [scan/provider.rs](/Users/anvi/Next/vein/crates/exec/src/operators/source/scan/provider.rs:11)
-  and [scan/registry.rs](/Users/anvi/Next/vein/crates/exec/src/operators/source/scan/registry.rs:12).
-- Parquet scan and catalog behavior now live in `parquet-connector`; catalog binding and execution share its storage-backed
-  metadata service and the same `MetadataStore`. `cli` still owns the transactional Parquet writer, which is the T7
-  migration. See [connector catalog](/Users/anvi/Next/vein/crates/parquet-connector/src/catalog/provider.rs:17),
+- The workspace now includes `catalog`, `storage`, `exec`, `engine`, `parquet-connector`, and `cli`.
+  See [workspace members](/Users/anvi/Next/vein/Cargo.toml:1).
+- `catalog` owns format-neutral table/statistics contracts, catalog sessions, snapshots, and the typed metadata cache.
+  `MetadataKey` uses storage-provided object identity and version facts; it declines caching without a source validator.
+  See [catalog contract](/Users/anvi/Next/vein/crates/catalog/src/contract.rs:61)
+  and [metadata key](/Users/anvi/Next/vein/crates/catalog/src/store/key.rs:7).
+- `storage` exposes typed locations, object paths/identities, streaming listing, stat, and range reads. Its OpenDAL
+  adapter supplies source snapshots to the cache; catalog performs no local filesystem identity probing.
+  See [read contracts](/Users/anvi/Next/vein/crates/storage/src/read/contracts.rs:15)
+  and [object metadata](/Users/anvi/Next/vein/crates/storage/src/read/metadata.rs:5).
+- `exec` owns the generic provider registry and multi-file scan coordinator. It has no implicit format provider;
+  callers register the provider implementation they need.
+  See [scan provider](/Users/anvi/Next/vein/crates/exec/src/operators/source/scan/provider.rs:11)
+  and [scan registry](/Users/anvi/Next/vein/crates/exec/src/operators/source/scan/registry.rs:12).
+- `parquet-connector` is the sole owner of Parquet catalog/scan/analysis/statistics/pruning/writer code. Its catalog and
+  scan adapters reuse one storage-backed metadata service and `MetadataStore`.
+  See [connector catalog](/Users/anvi/Next/vein/crates/parquet-connector/src/catalog/provider.rs:17),
   [connector analysis](/Users/anvi/Next/vein/crates/parquet-connector/src/catalog/analysis.rs:17),
-  [generic scan dispatch](/Users/anvi/Next/vein/crates/exec/src/factory/scan_partition.rs:10),
-  and [CLI writer](/Users/anvi/Next/vein/crates/cli/src/parquet_storage.rs:1).
-- The connector catalog adapter uses storage discovery and the shared metadata service for schema/footer loading,
-  snapshot identities, manifest handling, and external statistics. Its ANALYZE provider reads through the connector scan
-  path and publishes only after source revision and identity validation. The CLI currently supplies a narrow publisher
-  adapter to the existing writer; T7 will move the writer implementation.
-- `LocalQueryEngine` constructs concrete Parquet catalog/storage implementations and orchestrates the query inside
-  `cli`. The CLI main also reads configuration and renders results.
-  See [cli/local/mod.rs](/Users/anvi/Next/vein/crates/cli/src/local/mod.rs:29)
-  and [cli/main.rs](/Users/anvi/Next/vein/crates/cli/src/main.rs:21).
+  and [Parquet scan provider](/Users/anvi/Next/vein/crates/parquet-connector/src/scan/provider.rs:1).
+- `engine` owns generic query binding, optimization, physical planning, execution, query statistics, and adaptive
+  checkpoints. `LocalEngineBuilder` requires its catalog, scan providers, storage, writer, optimizer, planner, and policy
+  to be injected; it does not construct a concrete connector.
+  See [engine builder](/Users/anvi/Next/vein/crates/engine/src/local/builder.rs:1)
+  and [engine components](/Users/anvi/Next/vein/crates/engine/src/local/components.rs:1).
+- `cli` is the composition root: it wires the Parquet connector, OpenDAL reader, built-in functions, optimizer, and
+  planner, then handles configuration and output. It contains no duplicate catalog, reader, or writer implementation.
+  See [CLI composition](/Users/anvi/Next/vein/crates/cli/src/local/mod.rs:30)
+  and [CLI entry point](/Users/anvi/Next/vein/crates/cli/src/main.rs:21).
 
 ## DuckDB reference and design consequence
 
@@ -263,8 +259,8 @@ covered, then delete the old path in that same migration step.
   validation, footer-stat conversion, and statistics application into `parquet-connector/src/catalog`. Catalog and scan
   share the connector metadata service and the same typed metadata cache.
 - Completed: implemented the connector's `StatisticsAnalysisProvider` over the connector Parquet scan stream. It validates
-  source revision/schema/identities before publication. CLI retains only a `ParquetStatisticsPublisher` adapter that
-  delegates to the existing writer, pending T7.
+  source revision/schema/identities before publication. The temporary CLI publisher adapter was removed in T7; CLI now
+  injects the connector writer as both the generic write backend and statistics publisher.
 - Removed `cli/src/parquet_catalog.rs` and its analysis module, and deleted obsolete read-side catalog helpers from the
   CLI writer. The CLI no longer contains a second catalog or metadata-loading implementation.
 - Regression coverage: connector catalog tests verify deterministic discovery, shared footer caching, schema mismatch
@@ -290,8 +286,8 @@ covered, then delete the old path in that same migration step.
   filesystem operations remain inside the Parquet connector instead of duplicating an unsupported storage abstraction.
 - Removed the CLI-local `parquet_storage`, `parquet_statistics_publisher`, and `local/statistics` implementations.
   CLI composition injects the connector writer as both the generic write backend and statistics publisher. The generic
-  query statistics-context collector was moved to `local/query_context.rs`; it is not Parquet-specific and will move
-  with query orchestration in T8. CLI's Parquet dependency is now test-only for existing Parquet fixtures.
+  query statistics-context collector moved to `engine/src/local/query_context.rs` during T8 because it is format-neutral.
+  CLI composes the `parquet-connector` crate and has no direct dependency on the Parquet format crate.
 - Writer regression coverage includes empty schema-only writes, create/append/overwrite, commit and abort cleanup,
   stale concurrent writers, manifest path validation, statistics freshness/source identities, and `DataChunkView`
   input. The view remains the writer input; conversion is reported at the Arrow/Parquet writer boundary where the
@@ -300,15 +296,24 @@ covered, then delete the old path in that same migration step.
   incremental `build_project(rebuild: false)` succeeded. The existing Query configuration successfully ran
   `FROM lineitem |> AGGREGATE count(*) AS n` against the configured TPCH data root.
 
-### T8 — Extract generic query orchestration into engine
+### T8 — Extract generic query orchestration into engine (Complete)
 
 - Move `LocalQueryEngine` preparation/execution orchestration out of `cli` into a generic engine builder with injected
   catalog, function registry, scan providers, storage, writer, optimizer, and planner.
 - Do not let engine construction silently install a concrete Parquet provider.
 - Acceptance tests: prepare and execute with fake catalog/provider implementations; verify dependency injection and
   query statistics sharing.
+- Completed: added `crates/engine` with `LocalEngineBuilder` and required injected components. Engine construction does
+  not install a Parquet provider implicitly. Query binding, optimization, planning, execution, statistics context, and
+  adaptive checkpoint orchestration now live in the engine crate.
+- Regression coverage: the injected-provider test in
+  [engine local tests](/Users/anvi/Next/vein/crates/engine/src/local/tests.rs:95) executes a query against an in-memory
+  catalog and fake scan provider, and verifies the same query statistics context is attached to its execution task.
+  Adaptive checkpoint unit tests moved with the orchestration into the engine crate.
+- Validation: workspace Test and Check pass; incremental `build_project(rebuild: false)` passes. The existing Build
+  configuration failed to start in RustRover, so the IDE incremental build tool was used.
 
-### T9 — Make CLI the composition root and remove legacy paths
+### T9 — Make CLI the composition root and remove legacy paths (Complete)
 
 - Wire the generic engine, local storage backend, Parquet catalog adapter, Parquet scan provider, and Parquet writer
   from CLI configuration.
@@ -316,6 +321,19 @@ covered, then delete the old path in that same migration step.
   connector owns the Parquet dependency.
 - Acceptance: searches show one Parquet metadata loader, one Parquet scan provider, one multi-file scheduler, and no
   Parquet imports or format-name branches in `catalog`/generic `exec`.
+- Completed: `cli/local/mod.rs` is the concrete composition root; it injects the Parquet catalog, scan provider, writer,
+  OpenDAL reader, function registry, optimizer, planner, and adaptive policy into the generic engine. CLI owns no second
+  catalog, scan-reader, or writer implementation. Legacy Parquet storage/statistics paths and the old local engine
+  implementation have been removed from CLI.
+- Dependency cleanup: removed unused direct `binder`, `parser`, `async-stream`, `error`, and
+  `tracing-subscriber` dependencies from CLI; `async-trait` is retained as a dev dependency for its integration tests.
+  CLI depends on `parquet-connector` as the provider it composes, not on the Parquet format crate itself.
+- Architecture audit: no `parquet::` imports remain in CLI, engine, exec, catalog, or storage. `catalog` and generic
+  `exec` contain no Parquet format branches; connector-specific catalog, scan, statistics, and writer implementations
+  remain under `parquet-connector`.
+- Regression coverage: CLI integration tests exercise concrete provider wiring; engine tests exercise generic injected
+  providers. Full workspace Test and Check pass; the incremental project build passes. The named Build configuration
+  still fails to start in RustRover, so `build_project(rebuild: false)` was used.
 
 ### T10 — End-to-end validation and completion
 

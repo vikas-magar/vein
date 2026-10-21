@@ -10,7 +10,7 @@ use super::tasks::run_task;
 const OUTPUT_BUFFER_BATCHES: usize = 2;
 
 impl LocalQuery {
-    /// Runs the query and yields reference-backed batches through bounded channels.
+    /// Runs the query and yields reference-backed views through bounded channels.
     ///
     /// Tasks execute concurrently, yet their batches are drained in planning
     /// order, so the result is identical to sequential execution. Every task owns

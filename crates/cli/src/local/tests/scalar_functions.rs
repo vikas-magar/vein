@@ -3,9 +3,6 @@ use super::*;
 #[tokio::test]
 async fn executes_lower_and_round_scalar_projections_preserving_nulls() {
     let root = tempfile::tempdir().expect("temporary data root");
-    let table_dir = root.path().join("names");
-    std::fs::create_dir_all(&table_dir).expect("create table directory");
-
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, true),
         Field::new("amount", DataType::Float64, true),
@@ -53,12 +50,9 @@ async fn executes_lower_and_round_scalar_projections_preserving_nulls() {
         ],
     )
     .expect("valid batch");
-    let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
+    write_parquet_batch(root.path(), "names", "create", Arc::clone(&schema), &batch);
 
-    let engine = LocalQueryEngine::new(root.path());
+    let engine = test_engine(root.path());
     let query = engine
         .prepare("FROM names |> SELECT LOWER(name) AS lowered")
         .await

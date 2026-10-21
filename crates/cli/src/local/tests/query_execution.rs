@@ -5,25 +5,26 @@ async fn executes_ordered_local_parquet_query_across_files() {
     let root = tempfile::tempdir().expect("temporary data root");
     create_flights_table(root.path());
 
-    let engine = LocalQueryEngine::new(root.path());
+    let engine = test_engine(root.path());
     let query = engine
         .prepare("FROM flights |> WHERE id > 1 |> SELECT id |> ORDER id DESC")
         .await
         .expect("prepare ordered local query");
     assert_eq!(
-        query.tasks.len(),
+        query.task_count(),
         1,
         "a global sort must read all files in one task"
     );
-    assert!(contains_sort(&query.tasks[0].plan.root));
+    assert!(contains_sort(
+        &query.physical_plan(0).expect("first physical task").root
+    ));
     let statistics_context = Arc::clone(query.statistics_context());
     assert_eq!(statistics_context.sources().len(), 1);
     assert_eq!(statistics_context.sources()[0].table_name, "flights");
     assert!(Arc::ptr_eq(
         &statistics_context,
-        query.tasks[0]
-            .statistics_context
-            .as_ref()
+        query
+            .task_statistics_context(0)
             .expect("task shares query context"),
     ));
 
@@ -56,7 +57,7 @@ async fn executes_ordered_local_parquet_query_across_files() {
 async fn computed_order_and_aggregate_queries_preserve_order() {
     let root = tempfile::tempdir().expect("temporary data root");
     create_flights_table(root.path());
-    let engine = LocalQueryEngine::new(root.path());
+    let engine = test_engine(root.path());
 
     let query = engine
         .prepare("FROM flights |> SELECT id |> ORDER id + 1 DESC")

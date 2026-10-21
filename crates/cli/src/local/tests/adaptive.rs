@@ -3,11 +3,6 @@ use super::*;
 #[tokio::test]
 async fn skips_redundant_checkpoint_when_join_already_builds_filtered_input() {
     let root = tempfile::tempdir().expect("temporary data root");
-    let left_dir = root.path().join("lefts");
-    let right_dir = root.path().join("rights");
-    std::fs::create_dir_all(&left_dir).expect("create left table directory");
-    std::fs::create_dir_all(&right_dir).expect("create right table directory");
-
     let left_schema = Arc::new(Schema::new(vec![
         Field::new("left_key", DataType::Int64, false),
         Field::new("left_value", DataType::Utf8, false),
@@ -20,11 +15,13 @@ async fn skips_redundant_checkpoint_when_join_already_builds_filtered_input() {
         ],
     )
     .expect("valid left batch");
-    let left_file = File::create(left_dir.join("part.parquet")).expect("create left file");
-    let mut left_writer =
-        ArrowWriter::try_new(left_file, left_schema, None).expect("create left writer");
-    left_writer.write(&left_batch).expect("write left batch");
-    left_writer.close().expect("close left writer");
+    write_parquet_batch(
+        root.path(),
+        "lefts",
+        "create",
+        Arc::clone(&left_schema),
+        &left_batch,
+    );
 
     let right_schema = Arc::new(Schema::new(vec![
         Field::new("right_key", DataType::Int64, false),
@@ -38,13 +35,15 @@ async fn skips_redundant_checkpoint_when_join_already_builds_filtered_input() {
         ],
     )
     .expect("valid right batch");
-    let right_file = File::create(right_dir.join("part.parquet")).expect("create right file");
-    let mut right_writer =
-        ArrowWriter::try_new(right_file, right_schema, None).expect("create right writer");
-    right_writer.write(&right_batch).expect("write right batch");
-    right_writer.close().expect("close right writer");
+    write_parquet_batch(
+        root.path(),
+        "rights",
+        "create",
+        Arc::clone(&right_schema),
+        &right_batch,
+    );
 
-    let engine = LocalQueryEngine::new(root.path());
+    let engine = test_engine(root.path());
     let query = engine
         .prepare(
             "FROM lefts |> WHERE left_key > 0 |> JOIN rights ON left_key = right_key |> SELECT left_value, right_value",
@@ -52,7 +51,7 @@ async fn skips_redundant_checkpoint_when_join_already_builds_filtered_input() {
         .await
         .expect("prepare join with adaptive checkpoint");
     assert!(
-        query.adaptive_checkpoint.is_none(),
+        !query.has_adaptive_checkpoint(),
         "the physical join already builds this filtered input before probing"
     );
 

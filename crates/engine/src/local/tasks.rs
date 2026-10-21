@@ -26,7 +26,7 @@ pub(super) fn tasks_from_job(
         .collect()
 }
 
-/// Executes one task into its own channel and records the outcome.
+/// Executes one task into its output channel and records the outcome.
 ///
 /// The channel's last sender is dropped only after the outcome is recorded, so
 /// the consumer never observes a disconnected channel whose outcome is unset.

@@ -3,9 +3,10 @@ use super::*;
 #[tokio::test]
 async fn filtered_and_complete_scans_publish_only_valid_table_statistics() {
     let root = tempfile::tempdir().expect("temporary data root");
-    let (table_dir, schema) = create_flights_table(root.path());
-    let engine = LocalQueryEngine::new(root.path());
-    let catalog = parquet_catalog_with_runtime(root.path(), engine.runtime_statistics.clone());
+    let (_, schema) = create_flights_table(root.path());
+    let engine = test_engine(root.path());
+    let catalog =
+        parquet_catalog_with_runtime(root.path(), engine.runtime_statistics().clone());
     let table = CatalogProvider::get_table(&catalog, "flights")
         .await
         .expect("read scan table metadata");
@@ -28,7 +29,7 @@ async fn filtered_and_complete_scans_publish_only_valid_table_statistics() {
     assert_eq!(filtered_rows, 4);
     assert!(
         engine
-            .runtime_statistics
+            .runtime_statistics()
             .complete_table_statistics(&runtime_key)
             .is_none(),
         "filtered scans must not become full-table optimizer statistics"
@@ -46,7 +47,7 @@ async fn filtered_and_complete_scans_publish_only_valid_table_statistics() {
     assert_eq!(scanned_rows, 5);
 
     let runtime = engine
-        .runtime_statistics
+        .runtime_statistics()
         .complete_table_statistics(&runtime_key)
         .expect("complete scan publishes runtime synopsis");
     assert_eq!(runtime.num_rows, Some(5));
@@ -62,14 +63,18 @@ async fn filtered_and_complete_scans_publish_only_valid_table_statistics() {
     assert_eq!(planner_statistics.num_rows, Some(5));
     assert_eq!(planner_statistics.column_statistics["id"].distinct_count, Some(5));
 
-    let replaced_path = table_dir.join("part-1.parquet");
-    std::fs::remove_file(&replaced_path).expect("remove old source file");
     let replacement = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![Arc::new(Int64Array::from(vec![7, 7]))],
     )
         .expect("valid replacement batch");
-    write_parquet_batch(&replaced_path, schema, &replacement);
+    write_parquet_batch(
+        root.path(),
+        "flights",
+        "overwrite",
+        schema,
+        &replacement,
+    );
 
     let changed_table = CatalogProvider::get_table(&catalog, "flights")
         .await
@@ -87,15 +92,15 @@ async fn filtered_and_complete_scans_publish_only_valid_table_statistics() {
         common::statistics::runtime::table_statistics_key(changed_snapshot);
     assert!(
         engine
-            .runtime_statistics
+            .runtime_statistics()
             .complete_table_statistics(&changed_runtime_key)
             .is_none(),
         "a complete synopsis for the old source revision must not be reused"
     );
-    assert_eq!(changed_table.statistics.as_ref().unwrap().num_rows, Some(5));
+    assert_eq!(changed_table.statistics.as_ref().unwrap().num_rows, Some(2));
     assert_eq!(
         changed_table.statistics.as_ref().unwrap().column_statistics["id"].distinct_count,
-        None,
-        "the old five-distinct-value synopsis must not leak into the replacement"
+        Some(1),
+        "replacement metadata must use its fresh one-distinct-value synopsis"
     );
 }

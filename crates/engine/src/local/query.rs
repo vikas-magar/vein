@@ -24,7 +24,7 @@ pub struct LocalQuery {
     pub(in crate::local) adaptive_checkpoint: Option<PreparedAdaptiveCheckpoint>,
     pub(in crate::local) adaptive_policy: Arc<dyn AdaptiveCheckpointPolicy>,
     pub(in crate::local) optimizer: Arc<optimizer::OptimizerPipeline>,
-    pub(in crate::local) planner: Arc<physical::DefaultPhysicalPlanner>,
+    pub(in crate::local) planner: Arc<dyn physical::PhysicalPlanner>,
     pub(in crate::local) request_id: RequestId,
     pub(in crate::local) query_id: QueryId,
 }
@@ -50,6 +50,29 @@ impl LocalQuery {
         self.is_write
     }
 
+    /// Whether runtime feedback selected a checkpoint before execution.
+    pub fn has_adaptive_checkpoint(&self) -> bool {
+        self.adaptive_checkpoint.is_some()
+    }
+
+    /// Number of physical tasks prepared for this query stage.
+    pub fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// Physical plan for one prepared task, for diagnostics and explain tooling.
+    pub fn physical_plan(&self, index: usize) -> Option<&common::protocol::PhysicalPlan> {
+        self.tasks.get(index).map(|task| &task.plan)
+    }
+
+    /// Query statistics attached to a prepared task, when task metadata exists.
+    pub fn task_statistics_context(
+        &self,
+        index: usize,
+    ) -> Option<&Arc<QueryStatisticsContext>> {
+        self.tasks.get(index)?.statistics_context.as_ref()
+    }
+
     /// Execute a storage write and return only after its commit is confirmed.
     pub async fn execute_write(self) -> Result<WriteReceipt> {
         if !self.is_write || self.tasks.len() != 1 {
@@ -68,4 +91,5 @@ impl LocalQuery {
     }
 }
 
+/// A bounded, incremental stream of reference-backed query result batches.
 pub type LocalResultStream = Pin<Box<dyn Stream<Item = Result<DataChunkView>> + Send>>;

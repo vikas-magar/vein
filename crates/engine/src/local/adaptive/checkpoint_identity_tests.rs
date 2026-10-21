@@ -1,3 +1,5 @@
+//! Regressions for stable adaptive scan-population identity.
+
 use super::super::super::test_support::scan;
 use super::{scan_population_signature, signature_match_counts};
 use parser::ast::expr::BinaryOp;

@@ -1,3 +1,5 @@
+//! Shared logical-plan fixtures for adaptive checkpoint tests.
+
 use std::sync::Arc;
 
 use catalog::TableMetadata;

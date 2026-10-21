@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,18 +6,16 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::statistics::RuntimeStatisticsStore;
 use exec::pipeline::DataChunkView;
-use parquet::arrow::ArrowWriter;
 use parquet_connector::catalog::ParquetCatalog;
 
 pub(super) fn write_parquet_batch(
-    path: &Path,
+    root: &Path,
+    table: &str,
+    mode: &str,
     schema: Arc<Schema>,
     batch: &RecordBatch,
 ) {
-    let file = File::create(path).expect("create Parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create Parquet writer");
-    writer.write(batch).expect("write Parquet batch");
-    writer.close().expect("close Parquet writer");
+    crate::test_support::write_parquet_table(root, table, mode, schema, batch);
 }
 
 pub(super) fn parquet_catalog(root: impl Into<PathBuf>) -> ParquetCatalog {
@@ -33,21 +30,19 @@ pub(super) fn parquet_catalog_with_runtime(
 }
 
 pub(super) fn create_flights_table(root: &Path) -> (PathBuf, Arc<Schema>) {
-    let table_dir = root.join("flights");
-    std::fs::create_dir_all(&table_dir).expect("create table directory");
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-    for (part, values) in [
-        ("part-1.parquet", vec![1, 4]),
-        ("part-2.parquet", vec![5, 2, 3]),
+    for (mode, values) in [
+        ("create", vec![1, 4]),
+        ("append", vec![5, 2, 3]),
     ] {
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(Int64Array::from(values))],
         )
             .expect("valid batch");
-        write_parquet_batch(&table_dir.join(part), Arc::clone(&schema), &batch);
+        write_parquet_batch(root, "flights", mode, Arc::clone(&schema), &batch);
     }
-    (table_dir, schema)
+    (root.join("flights"), schema)
 }
 
 pub(super) fn materialized_result_column(view: &DataChunkView, column: usize) -> arrow::array::ArrayRef {

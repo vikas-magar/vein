@@ -3,9 +3,6 @@ use super::*;
 #[tokio::test]
 async fn parquet_projection_keeps_filter_columns_and_compacts_predicate_input() {
     let root = tempfile::tempdir().expect("temporary data root");
-    let table_dir = root.path().join("wide");
-    std::fs::create_dir_all(&table_dir).expect("create table directory");
-
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("unused", DataType::Utf8, false),
@@ -20,17 +17,14 @@ async fn parquet_projection_keeps_filter_columns_and_compacts_predicate_input() 
         ],
     )
         .expect("valid batch");
-    let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
+    write_parquet_batch(root.path(), "wide", "create", Arc::clone(&schema), &batch);
 
-    let engine = LocalQueryEngine::new(root.path());
+    let engine = test_engine(root.path());
     let query = engine
         .prepare("FROM wide |> WHERE id = 2 |> SELECT value")
         .await
         .expect("prepare projected scan");
-    let scan = find_file_scan(&query.tasks[0].plan.root)
+    let scan = find_file_scan(&query.physical_plan(0).expect("first task").root)
         .expect("expected a Parquet file scan in the physical plan");
     assert_eq!(
         scan.projected

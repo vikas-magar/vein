@@ -1,3 +1,5 @@
+//! Regressions for policy candidate selection and safe checkpoint placement.
+
 use super::test_support::{join, scan};
 use super::{LogicalPlan, StatisticsCheckpointPolicy};
 use common::statistics::QueryStatisticsContext;

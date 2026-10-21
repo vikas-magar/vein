@@ -8,6 +8,11 @@ use checkpoint_identity::{
 };
 use optimizer::context::QueryStatisticsProvider;
 use optimizer::estimation::{CardinalityEstimator, EstimateConfidence, StatisticsEstimator};
+#[path = "policy_helpers.rs"]
+mod helpers;
+use helpers::{
+    contains_blocking_relation, known_input_rows, missing_synopses, needs_feedback, safe_subtree,
+};
 
 /// Measures uncertain join inputs, including joins and aggregates, while
 /// leaving already observed inputs and fully described populations streaming.
@@ -106,100 +111,5 @@ impl AdaptiveCheckpointPolicy for StatisticsCheckpointPolicy {
             }
             boundary
         })
-    }
-}
-
-fn contains_blocking_relation(plan: &LogicalPlan) -> bool {
-    matches!(
-        plan,
-        LogicalPlan::Join { .. } | LogicalPlan::Aggregate { .. } | LogicalPlan::Distinct { .. }
-    ) || plan.children().into_iter().any(contains_blocking_relation)
-}
-
-/// Only relational, side-effect-free subtrees can be replayed after a failure.
-/// Subqueries and semantic/opaque calls require separate dependency handling.
-fn safe_subtree(plan: &LogicalPlan) -> bool {
-    if !matches!(
-        plan,
-        LogicalPlan::Scan { .. }
-            | LogicalPlan::ExternalScan { .. }
-            | LogicalPlan::Intermediate { .. }
-            | LogicalPlan::Filter { .. }
-            | LogicalPlan::Project { .. }
-            | LogicalPlan::Join { .. }
-            | LogicalPlan::Aggregate { .. }
-            | LogicalPlan::Distinct { .. }
-            | LogicalPlan::Sort { .. }
-            | LogicalPlan::Limit { .. }
-            | LogicalPlan::SubqueryAlias { .. }
-    ) {
-        return false;
-    }
-    let mut has_unsafe_expression = false;
-    plan.for_each_expression(&mut |_, expression| {
-        has_unsafe_expression |=
-            expression.is_volatile() || !expression.subquery_plans().is_empty();
-    });
-    !has_unsafe_expression && plan.children().into_iter().all(safe_subtree)
-}
-
-fn needs_feedback(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Intermediate { .. } => false,
-        // A known, unfiltered source population is already described by its
-        // cardinality. Missing NDV alone does not justify retaining that whole
-        // table and delaying useful downstream runtime filters.
-        LogicalPlan::Scan { filters, table, .. } => {
-            !filters.is_empty()
-                || table
-                .statistics
-                .as_ref()
-                .and_then(|stats| stats.num_rows)
-                .is_none()
-        }
-        LogicalPlan::Join { .. } | LogicalPlan::Aggregate { .. } | LogicalPlan::Distinct { .. } => {
-            true
-        }
-        LogicalPlan::Filter { input, .. } => contains_pending_operator(input),
-        _ => plan.children().into_iter().any(needs_feedback),
-    }
-}
-
-fn contains_pending_operator(plan: &LogicalPlan) -> bool {
-    matches!(
-        plan,
-        LogicalPlan::Scan { .. }
-            | LogicalPlan::ExternalScan { .. }
-            | LogicalPlan::Join { .. }
-            | LogicalPlan::Aggregate { .. }
-            | LogicalPlan::Distinct { .. }
-    ) || plan.children().into_iter().any(contains_pending_operator)
-}
-
-fn known_input_rows(plan: &LogicalPlan) -> Option<u64> {
-    match plan {
-        LogicalPlan::Scan { table, .. } => table.statistics.as_ref()?.num_rows,
-        LogicalPlan::Intermediate { row_count, .. } => Some(*row_count),
-        _ => {
-            let mut rows = 0_u64;
-            for child in plan.children() {
-                rows = rows.checked_add(known_input_rows(child)?)?;
-            }
-            Some(rows)
-        }
-    }
-}
-
-fn missing_synopses(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Intermediate { .. } => false,
-        LogicalPlan::Scan { table, schema, .. } => schema.fields.iter().any(|column| {
-            table
-                .statistics
-                .as_ref()
-                .and_then(|stats| stats.column_statistics.get(&column.name))
-                .is_none_or(|stats| stats.distinct_count.is_none())
-        }),
-        _ => plan.children().into_iter().any(missing_synopses),
     }
 }

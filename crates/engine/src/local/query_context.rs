@@ -4,7 +4,8 @@ use std::sync::Arc;
 use common::statistics::{QuerySourceStatistics, QueryStatisticsContext};
 use plan::{LogicalPlan, PlanTraversal};
 
-pub(super) fn query_statistics_context(plan: &LogicalPlan) -> QueryStatisticsContext {
+/// Builds one query-scoped statistics context from all source nodes in a plan.
+pub fn query_statistics_context(plan: &LogicalPlan) -> QueryStatisticsContext {
     fn collect(plan: &LogicalPlan, sources: &mut Vec<QuerySourceStatistics>, seen: &mut HashSet<String>) {
         fn register_source(
             table: &plan::TableMetadata,

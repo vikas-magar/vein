@@ -5,10 +5,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::statistics::QueryStatisticsContext;
 use futures::StreamExt;
-use parquet::arrow::ArrowWriter;
-
 use super::{AdaptiveBoundary, AdaptiveCheckpointPolicy};
-use crate::local::LocalQueryEngine;
+use crate::local::{LocalQueryEngine, test_engine};
 
 struct NoCheckpoints;
 impl AdaptiveCheckpointPolicy for NoCheckpoints {
@@ -28,13 +26,9 @@ fn join_fixture() -> tempfile::TempDir {
 }
 
 fn write_table(root: &std::path::Path, name: &str, values: Vec<i64>) {
-    let path = root.join(name);
-    std::fs::create_dir(&path).unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new(format!("{name}_key"), DataType::Int64, false)]));
     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(values))]).unwrap();
-    let mut writer = ArrowWriter::try_new(std::fs::File::create(path.join("part.parquet")).unwrap(), schema, None).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
+    crate::test_support::write_parquet_table(root, name, "create", schema, &batch);
 }
 
 async fn run(engine: &LocalQueryEngine, query: &str) -> (Vec<Vec<i64>>, Arc<QueryStatisticsContext>) {
@@ -66,16 +60,24 @@ async fn run(engine: &LocalQueryEngine, query: &str) -> (Vec<Vec<i64>>, Arc<Quer
 async fn repeated_checkpoints_reoptimize_filtered_inputs_without_repeating_rows() {
     let root = join_fixture();
     let query = JOIN_QUERY;
-    let adaptive = LocalQueryEngine::new(root.path());
-    let mut fixed = LocalQueryEngine::new(root.path());
-    fixed.adaptive_policy = Arc::new(NoCheckpoints);
+    let adaptive = test_engine(root.path());
+    let fixed = test_engine(root.path()).with_adaptive_policy(Arc::new(NoCheckpoints));
     let (expected, _) = run(&fixed, query).await;
     let (actual, statistics) = run(&adaptive, query).await;
     assert_eq!(actual, expected);
     assert_eq!(actual.len(), 6);
     let snapshot = statistics.snapshot();
-    assert!(snapshot.intermediates.len() >= 3, "two scans and a join must be independently observed: {:?}",
-            snapshot.intermediates.keys());
+    let observed_rows: Vec<_> = snapshot
+        .intermediates
+        .values()
+        .filter_map(|statistics| statistics.num_rows)
+        .collect();
+    assert!(
+        snapshot.intermediates.len() >= 2,
+        "both filtered scan populations should be observed: {observed_rows:?}"
+    );
+    assert!(observed_rows.contains(&3) && observed_rows.contains(&4),
+            "the filtered inputs have 3 and 4 rows respectively: {observed_rows:?}");
     assert!(snapshot.intermediates.values().all(|statistics| {
         statistics.column_statistics.values().all(|column| column.distinct_count.is_some())
     }));
@@ -124,14 +126,14 @@ impl exec::runtime::TaskExecutor for FailsSecondCheckpoint {
 #[tokio::test]
 async fn failed_later_stage_keeps_prior_checkpoints_and_returns_each_row_once() {
     let root = join_fixture();
-    let mut engine = LocalQueryEngine::new(root.path());
-    engine.executor = Arc::new(FailsSecondCheckpoint {
-        inner: Arc::clone(&engine.executor),
+    let base = test_engine(root.path());
+    let executor = Arc::clone(base.task_executor());
+    let engine = base.with_task_executor(Arc::new(FailsSecondCheckpoint {
+        inner: executor,
         calls: std::sync::atomic::AtomicUsize::new(0),
         cancel: Default::default(),
-    });
-    let mut fixed = LocalQueryEngine::new(root.path());
-    fixed.adaptive_policy = Arc::new(NoCheckpoints);
+    }));
+    let fixed = test_engine(root.path()).with_adaptive_policy(Arc::new(NoCheckpoints));
     let (expected, _) = run(&fixed, JOIN_QUERY).await;
     let (actual, context) = run(&engine, JOIN_QUERY).await;
     assert_eq!(actual, expected);
@@ -142,13 +144,13 @@ async fn failed_later_stage_keeps_prior_checkpoints_and_returns_each_row_once() 
 #[tokio::test]
 async fn dropping_an_adaptive_result_stream_cancels_its_shared_resource_scope() {
     let root = join_fixture();
-    let mut engine = LocalQueryEngine::new(root.path());
+    let base = test_engine(root.path());
     let executor = Arc::new(FailsSecondCheckpoint {
-        inner: Arc::clone(&engine.executor),
+        inner: Arc::clone(base.task_executor()),
         calls: std::sync::atomic::AtomicUsize::new(0),
         cancel: Default::default(),
     });
-    engine.executor = executor.clone();
+    let engine = base.with_task_executor(executor.clone());
     let mut stream = engine.prepare(JOIN_QUERY).await.unwrap().into_stream();
     assert!(stream.next().await.unwrap().is_ok());
     let cancel = executor.cancel.lock().unwrap().clone().unwrap();
@@ -166,9 +168,8 @@ async fn aggregate_join_input_publishes_its_own_population_and_preserves_results
     let query = "FROM a |> AGGREGATE count(*) AS n GROUP BY a_key
         |> JOIN b ON a_key = b_key |> JOIN c ON b_key = c_key
         |> SELECT a_key, n |> ORDER a_key";
-    let adaptive = LocalQueryEngine::new(root.path());
-    let mut fixed = LocalQueryEngine::new(root.path());
-    fixed.adaptive_policy = Arc::new(NoCheckpoints);
+    let adaptive = test_engine(root.path());
+    let fixed = test_engine(root.path()).with_adaptive_policy(Arc::new(NoCheckpoints));
     let (expected, _) = run(&fixed, query).await;
     let (actual, context) = run(&adaptive, query).await;
     assert_eq!(actual, expected);

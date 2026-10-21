@@ -3,8 +3,6 @@ use super::*;
 #[tokio::test]
 async fn runtime_synopsis_uses_complete_rows_with_projected_column_coverage() {
     let root = tempfile::tempdir().expect("temporary data root");
-    let table_dir = root.path().join("events");
-    std::fs::create_dir_all(&table_dir).expect("create table directory");
     let schema = Arc::new(Schema::new(vec![
         Field::new("key", DataType::Int64, false),
         Field::new("payload", DataType::Utf8, false),
@@ -17,17 +15,15 @@ async fn runtime_synopsis_uses_complete_rows_with_projected_column_coverage() {
         ],
     )
     .expect("valid input batch");
-    let file = File::create(table_dir.join("part.parquet")).expect("create Parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create writer");
-    writer.write(&input).expect("write input batch");
-    writer.close().expect("close writer");
+    write_parquet_batch(root.path(), "events", "create", Arc::clone(&schema), &input);
 
-    let engine = LocalQueryEngine::new(root.path());
+    let engine = test_engine(root.path());
     let query = engine
         .prepare("FROM events |> SELECT key")
         .await
         .expect("prepare query");
-    let scan = find_file_scan(&query.tasks[0].plan.root).expect("find file scan");
+    let scan = find_file_scan(&query.physical_plan(0).expect("first task").root)
+        .expect("find file scan");
     let statistics_scan = scan
         .runtime_statistics
         .as_ref()
@@ -48,7 +44,7 @@ async fn runtime_synopsis_uses_complete_rows_with_projected_column_coverage() {
     assert_eq!(row_count, 4);
 
     let statistics = engine
-        .runtime_statistics
+        .runtime_statistics()
         .complete_table_statistics(&table_key)
         .expect("background synopsis is visible to the next plan");
     assert_eq!(statistics.num_rows, Some(4));

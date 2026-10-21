@@ -24,7 +24,7 @@ use super::super::tasks::tasks_from_job;
 pub(in crate::local) struct AdaptiveCoordinator {
     pub executor: Arc<dyn TaskExecutor>,
     pub optimizer: Arc<optimizer::OptimizerPipeline>,
-    pub planner: Arc<physical::DefaultPhysicalPlanner>,
+    pub planner: Arc<dyn PhysicalPlanner>,
     pub policy: Arc<dyn AdaptiveCheckpointPolicy>,
     pub statistics: Arc<QueryStatisticsContext>,
     pub request_id: RequestId,
@@ -44,7 +44,7 @@ impl Drop for AdaptiveExecution {
 }
 
 pub(in crate::local) fn prepare_checkpoint(
-    planner: &physical::DefaultPhysicalPlanner,
+    planner: &dyn PhysicalPlanner,
     mut boundary: AdaptiveBoundary,
     statistics: Arc<QueryStatisticsContext>,
     request_id: RequestId,

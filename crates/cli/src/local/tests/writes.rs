@@ -3,21 +3,15 @@ use super::*;
 #[tokio::test]
 async fn executes_pipe_write_and_exposes_only_committed_rows() {
     let root = tempfile::tempdir().expect("temporary data root");
-    let table_dir = root.path().join("source");
-    std::fs::create_dir_all(&table_dir).expect("create source directory");
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int64Array::from(vec![4, 5, 6]))],
     )
         .expect("valid source batch");
-    let file =
-        File::create(table_dir.join("part.parquet")).expect("create source Parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create source writer");
-    writer.write(&batch).expect("write source batch");
-    writer.close().expect("close source writer");
+    write_parquet_batch(root.path(), "source", "create", Arc::clone(&schema), &batch);
 
-    let engine = LocalQueryEngine::new(root.path());
+    let engine = test_engine(root.path());
     let error = match engine
         .prepare("FROM source |> SELECT id |> WRITE archived (compression='zstd')")
         .await

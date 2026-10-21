@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -7,10 +6,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use parquet::arrow::ArrowWriter;
 use plan::LogicalPlan;
 
-use super::query_context::query_statistics_context;
+use engine::local::query_statistics_context;
 use super::*;
 
 mod support;

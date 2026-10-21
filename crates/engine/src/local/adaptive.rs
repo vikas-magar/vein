@@ -9,12 +9,8 @@ use plan::{LogicalPlan, PlanTraversal};
 
 mod execution;
 mod policy;
-pub(super) use policy::StatisticsCheckpointPolicy;
+pub use policy::StatisticsCheckpointPolicy;
 pub(super) use execution::{AdaptiveCoordinator, prepare_checkpoint};
-
-#[cfg(test)]
-#[path = "adaptive/integration_tests.rs"]
-mod integration_tests;
 
 /// Chooses one complete input to an unexecuted join. Implementations can use
 /// source metadata and prior checkpoint observations from the same query.
@@ -120,3 +116,7 @@ mod test_support;
 #[cfg(test)]
 #[path = "adaptive/policy_selection_tests.rs"]
 mod policy_selection_tests;
+
+#[cfg(test)]
+#[path = "adaptive/replay_safety_tests.rs"]
+mod replay_safety_tests;

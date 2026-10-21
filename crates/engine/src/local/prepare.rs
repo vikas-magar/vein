@@ -6,7 +6,6 @@ use common::identifiers::RequestId;
 use common::protocol::{DataSink, PhysicalPlanOperator};
 use common::statistics::TableStatisticsLog;
 use common::{Result, VeinError};
-use physical::PhysicalPlanner;
 use plan::LogicalPlan;
 
 use super::adaptive;
@@ -14,7 +13,7 @@ use super::query_context::query_statistics_context;
 use super::{LocalQuery, LocalQueryEngine};
 
 impl LocalQueryEngine {
-    /// Parses, binds, optimizes, and plans a Pipe query for local execution.
+    /// Parses, binds, optimizes, and plans a Pipe query for configured execution.
     pub async fn prepare(&self, query: &str) -> Result<LocalQuery> {
         let prepare_started = Instant::now();
 
