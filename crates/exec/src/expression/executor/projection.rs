@@ -40,11 +40,11 @@ fn projected_columns(
     let mut columns = Vec::with_capacity(values.len());
     let mut computed = Vec::new();
     for value in values {
-        if let ExpressionValue::ViewColumn(column) = value {
-            if let Some(index) = column.column_in_view(input) {
-                columns.push(Some(index));
-                continue;
-            }
+        if let ExpressionValue::ViewColumn(column) = value
+            && let Some(index) = column.column_in_view(input)
+        {
+            columns.push(Some(index));
+            continue;
         }
         columns.push(None);
         computed.push(derived_column(value, input.num_rows())?);

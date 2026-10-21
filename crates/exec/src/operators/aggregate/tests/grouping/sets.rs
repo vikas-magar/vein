@@ -33,9 +33,9 @@ fn grouping_sets_keep_set_identity_and_null_omitted_keys() {
 
     let output = sink.finish().unwrap();
     let batch = &output[0];
-    let first_key = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 0);
-    let second_key = crate::pipeline::test_support::materialized_column::<StringArray>(&batch, 1);
-    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 2);
+    let first_key = crate::pipeline::test_support::materialized_column::<Int64Array>(batch, 0);
+    let second_key = crate::pipeline::test_support::materialized_column::<StringArray>(batch, 1);
+    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(batch, 2);
 
     assert_eq!(batch.num_rows(), 5);
     let mut actual = (0..batch.num_rows())

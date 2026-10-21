@@ -36,7 +36,12 @@ impl AggregateSink {
     ) -> Result<()> {
         let distinct_position = parent_columns.len();
         let key_columns = (0..distinct_position)
-            .map(|column| batch.project(&[column]).and_then(GroupKeyColumn::from_view))
+            .map(|column| {
+                batch
+                    .project(&[column])
+                    .and_then(GroupKeyColumn::from_view)
+                    .map(Arc::new)
+            })
             .collect::<Result<Vec<_>>>()?;
         let aggregate_states = self.count_one_aggregate_states(aggregate_index)?;
 
@@ -53,7 +58,7 @@ impl AggregateSink {
             let mut keys = vec![None; self.plan.groups as usize];
             for (child_column, &parent_column) in parent_columns.iter().enumerate() {
                 keys[parent_column] = Some(AggregateGroupKeyRef::from_column(
-                    key_columns[child_column].clone(),
+                    Arc::clone(&key_columns[child_column]),
                     row,
                 )?);
             }

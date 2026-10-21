@@ -158,7 +158,7 @@ mod tests {
         let view = builder.finish().unwrap();
 
         assert_eq!(view.source_arrays_for_column(0).unwrap().len(), 1);
-        assert!(Arc::ptr_eq(&view.columns[0].memory_leases[0].as_ref().unwrap(), &lease));
+        assert!(Arc::ptr_eq(view.columns[0].memory_leases[0].as_ref().unwrap(), &lease));
         assert_eq!(view.source_row(0, 0).unwrap(), Some((0, 1)));
         assert_eq!(view.source_row(0, 1).unwrap(), Some((0, 0)));
     }

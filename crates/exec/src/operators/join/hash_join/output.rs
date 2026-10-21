@@ -81,13 +81,13 @@ impl JoinOutputComposer {
         self.source_rows.clear();
 
         for row in rows {
-            if let Some((chunk, _)) = row.build {
-                if !self.build_positions.contains_key(&chunk) {
-                    let position = self.build_views.len();
-                    self.build_positions.insert(chunk, position);
-                    self.build_views
-                        .push(table.build_chunk(chunk).project(&self.build_projection)?);
-                }
+            if let Some((chunk, _)) = row.build
+                && !self.build_positions.contains_key(&chunk)
+            {
+                let position = self.build_views.len();
+                self.build_positions.insert(chunk, position);
+                self.build_views
+                    .push(table.build_chunk(chunk).project(&self.build_projection)?);
             }
         }
         let null_build = rows.iter().any(|row| row.build.is_none());

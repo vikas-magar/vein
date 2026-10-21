@@ -59,7 +59,7 @@ fn grouped_rows(sink: &mut AggregateSink) -> BTreeMap<Option<i64>, i64> {
             (0..batch.num_rows())
                 .map(|row| {
                     (
-                        keys.is_null(row).then_some(None).unwrap_or(Some(keys.value(row))),
+                        if keys.is_null(row) { None } else { Some(keys.value(row)) },
                         sums.value(row),
                     )
                 })
@@ -77,7 +77,7 @@ fn aggregate_view_groups_mapped_duplicate_and_null_extended_keys_without_gatheri
 
     sink.accumulate(view).expect("aggregate mapped view");
 
-    let Some(GroupKeyColumn::View(retained)) = &sink.group_key_batches[0][0] else {
+    let Some(GroupKeyColumn::View(retained)) = sink.group_key_batches[0][0].as_deref() else {
         panic!("aggregate must retain the grouping key as a view");
     };
     let retained_sources = retained
@@ -137,7 +137,7 @@ fn combining_view_backed_local_groups_preserves_keys_and_merges_duplicates() {
     assert_eq!(target.group_count(), 3, "equal materialized and view keys share a group");
 
     assert!(target.group_key_batches.iter().flatten().any(|column| {
-        matches!(column, Some(GroupKeyColumn::View(view))
+        matches!(column.as_deref(), Some(GroupKeyColumn::View(view))
             if view.source_arrays_for_column(0).is_ok_and(|arrays| {
                 arrays.iter().any(|array| Arc::ptr_eq(array, &source_keys))
             }))
@@ -158,7 +158,7 @@ fn spilling_view_backed_groups_resolves_source_rows_and_null_extensions() {
         .expect("aggregate sink");
     sink.accumulate(view).expect("aggregate mapped view");
     assert!(matches!(
-        &sink.group_key_batches[0][0],
+        sink.group_key_batches[0][0].as_deref(),
         Some(GroupKeyColumn::View(_))
     ));
 

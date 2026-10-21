@@ -24,6 +24,9 @@ pub trait StatisticsInput {
 }
 
 #[cfg(test)]
+pub(crate) use tests_support::OwnedSelectedRecordBatch;
+
+#[cfg(test)]
 mod tests_support {
     use super::*;
     use arrow::datatypes::SchemaRef;
@@ -116,6 +119,3 @@ mod tests_support {
         }
     }
 }
-
-#[cfg(test)]
-pub(crate) use tests_support::OwnedSelectedRecordBatch;

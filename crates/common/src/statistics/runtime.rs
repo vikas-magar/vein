@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
 use catalog::{CatalogSnapshotToken, TableStatistics};
+use crate::protocol::RuntimeStatisticsScan;
 
 use super::{
     ArrowScalarEncoder, HyperLogLog, StatisticsCollector, StatisticsConfig, StatisticsInput,
@@ -108,6 +109,21 @@ pub enum RuntimeStatisticsEnqueue {
     WorkerUnavailable,
 }
 
+/// A batch and the scan metadata that gives its observations provenance.
+///
+/// The input is moved into the bounded worker queue without gathering or
+/// copying its Arrow column buffers.
+pub struct RuntimeStatisticsInputBatch<I> {
+    /// Pinned scan identity and coverage metadata.
+    pub scan: RuntimeStatisticsScan,
+    /// Logical schema corresponding to the input's columns.
+    pub schema: SchemaRef,
+    /// Borrowed or view-backed values to observe asynchronously.
+    pub input: I,
+    /// Source-array bytes retained while the queued input is alive.
+    pub retained_bytes: usize,
+}
+
 /// Work-unit completion data needed to publish scan feedback asynchronously.
 pub struct RuntimeStatisticsPartitionCompletion<'a> {
     /// Stable identity for the scan across all its work units.
@@ -134,11 +150,7 @@ struct RuntimeStatisticsWorker {
 
 enum StatisticsWork {
     Batch {
-        scan_id: u128,
-        table_key: String,
-        expected_rows: Option<u64>,
-        expected_partitions: usize,
-        table_scan_candidate: bool,
+        scan: RuntimeStatisticsScan,
         schema: SchemaRef,
         input: Box<dyn StatisticsInput + Send>,
     },
@@ -197,39 +209,28 @@ struct ScanObservation {
 }
 
 impl ScanObservation {
-    fn new(
-        table_key: String,
-        expected_rows: Option<u64>,
-        expected_partitions: usize,
-        table_scan_candidate: bool,
-    ) -> Result<Self> {
-        if expected_partitions == 0 {
+    fn new(scan: &RuntimeStatisticsScan) -> Result<Self> {
+        if scan.partition_count == 0 {
             return Err(VeinError::internal(
                 "runtime statistics scan must contain at least one partition",
             ));
         }
         Ok(Self {
-            table_key,
-            expected_rows,
-            expected_partitions,
-            table_scan_candidate,
-            completed_partitions: HashSet::with_capacity(expected_partitions),
+            table_key: scan.table_key.clone(),
+            expected_rows: scan.expected_rows,
+            expected_partitions: scan.partition_count,
+            table_scan_candidate: scan.row_coverage_candidate,
+            completed_partitions: HashSet::with_capacity(scan.partition_count),
             collector: None,
             finalized: false,
         })
     }
 
-    fn validate_context(
-        &self,
-        table_key: &str,
-        expected_rows: Option<u64>,
-        expected_partitions: usize,
-        table_scan_candidate: bool,
-    ) -> Result<()> {
-        if self.table_key != table_key
-            || self.expected_rows != expected_rows
-            || self.expected_partitions != expected_partitions
-            || self.table_scan_candidate != table_scan_candidate
+    fn validate_context(&self, scan: &RuntimeStatisticsScan) -> Result<()> {
+        if self.table_key != scan.table_key
+            || self.expected_rows != scan.expected_rows
+            || self.expected_partitions != scan.partition_count
+            || self.table_scan_candidate != scan.row_coverage_candidate
         {
             return Err(VeinError::internal(
                 "runtime statistics scan context changed between partitions",
@@ -317,15 +318,9 @@ impl RuntimeStatisticsStore {
     /// queue while preserving its active-row mapping and source arrays.
     pub fn enqueue_input<I: StatisticsInput + Send + 'static>(
         &self,
-        scan_id: u128,
-        table_key: &str,
-        expected_rows: Option<u64>,
-        expected_partitions: usize,
-        table_scan_candidate: bool,
-        schema: SchemaRef,
-        input: I,
-        retained_bytes: usize,
+        batch: RuntimeStatisticsInputBatch<I>,
     ) -> RuntimeStatisticsEnqueue {
+        let RuntimeStatisticsInputBatch { scan, schema, input, retained_bytes } = batch;
         let Some(worker) = &self.worker else {
             return RuntimeStatisticsEnqueue::WorkerUnavailable;
         };
@@ -333,11 +328,7 @@ impl RuntimeStatisticsStore {
             return RuntimeStatisticsEnqueue::BatchTooLarge;
         }
         let work = StatisticsWork::Batch {
-            scan_id,
-            table_key: table_key.to_owned(),
-            expected_rows,
-            expected_partitions,
-            table_scan_candidate,
+            scan,
             schema,
             input: Box::new(input),
         };
@@ -385,11 +376,7 @@ impl RuntimeStatisticsStore {
 
     fn observe_input<I: StatisticsInput + ?Sized>(
         &self,
-        scan_id: u128,
-        table_key: &str,
-        expected_rows: Option<u64>,
-        expected_partitions: usize,
-        table_scan_candidate: bool,
+        scan: &RuntimeStatisticsScan,
         schema: &SchemaRef,
         input: &I,
     ) -> Result<()> {
@@ -398,15 +385,10 @@ impl RuntimeStatisticsStore {
                 .state
                 .lock()
                 .map_err(|_| VeinError::internal("runtime statistics store mutex poisoned"))?;
-            match state.scans.entry(scan_id) {
+            match state.scans.entry(scan.scan_id) {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
                 Entry::Vacant(entry) => {
-                    let observation = ScanObservation::new(
-                        table_key.to_owned(),
-                        expected_rows,
-                        expected_partitions,
-                        table_scan_candidate,
-                    )?;
+                    let observation = ScanObservation::new(scan)?;
                     Arc::clone(entry.insert(Arc::new(Mutex::new(observation))))
                 }
             }
@@ -415,12 +397,7 @@ impl RuntimeStatisticsStore {
         let mut observation = entry
             .lock()
             .map_err(|_| VeinError::internal("runtime scan statistics mutex poisoned"))?;
-        observation.validate_context(
-            table_key,
-            expected_rows,
-            expected_partitions,
-            table_scan_candidate,
-        )?;
+        observation.validate_context(scan)?;
         if observation.collector.is_none() {
             observation.collector = Some(StatisticsCollector::new(
                 Arc::clone(schema),
@@ -446,12 +423,20 @@ impl RuntimeStatisticsStore {
         table_scan_candidate: bool,
         partition_index: usize,
     ) -> Result<Option<RuntimeStatisticsObservation>> {
+        let scan = RuntimeStatisticsScan {
+            scan_id,
+            table_key: table_key.to_owned(),
+            expected_rows,
+            row_coverage_candidate: table_scan_candidate,
+            partition_index,
+            partition_count: expected_partitions,
+        };
         let entry = {
             let state = self
                 .state
                 .lock()
                 .map_err(|_| VeinError::internal("runtime statistics store mutex poisoned"))?;
-            state.scans.get(&scan_id).cloned()
+            state.scans.get(&scan.scan_id).cloned()
         };
         let Some(entry) = entry else {
             return Ok(None);
@@ -460,12 +445,7 @@ impl RuntimeStatisticsStore {
         let mut observation = entry
             .lock()
             .map_err(|_| VeinError::internal("runtime scan statistics mutex poisoned"))?;
-        observation.validate_context(
-            table_key,
-            expected_rows,
-            expected_partitions,
-            table_scan_candidate,
-        )?;
+        observation.validate_context(&scan)?;
         if observation.finalized {
             return Ok(None);
         }
@@ -525,19 +505,9 @@ impl RuntimeStatisticsStore {
 }
 
 fn process_statistics_batch(store: &RuntimeStatisticsStore, work: StatisticsWork) {
-    let StatisticsWork::Batch {
-        scan_id, table_key, expected_rows, expected_partitions,
-        table_scan_candidate, schema, input,
-    } = work;
-    let result = store.observe_input(
-        scan_id,
-        &table_key,
-        expected_rows,
-        expected_partitions,
-        table_scan_candidate,
-        &schema,
-        input.as_ref(),
-    );
+    let StatisticsWork::Batch { scan, schema, input } = work;
+    let scan_id = scan.scan_id;
+    let result = store.observe_input(&scan, &schema, input.as_ref());
     if let Err(error) = result {
         tracing::warn!(target: "vein.audit", event = "runtime_statistics_batch_failed", scan_id, error = %error, "runtime statistics batch was discarded");
     }
@@ -602,6 +572,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use crate::arrow::SelectionVector;
+    use crate::protocol::RuntimeStatisticsScan;
     use crate::statistics::OwnedSelectedRecordBatch;
 
     use super::*;
@@ -612,16 +583,33 @@ mod tests {
             .expect("valid test batch")
     }
 
+    fn scan_context(
+        scan_id: u128,
+        expected_rows: Option<u64>,
+        partition_count: usize,
+        row_coverage_candidate: bool,
+        partition_index: usize,
+    ) -> RuntimeStatisticsScan {
+        RuntimeStatisticsScan {
+            scan_id,
+            table_key: "table@revision".to_owned(),
+            expected_rows,
+            row_coverage_candidate,
+            partition_index,
+            partition_count,
+        }
+    }
+
     #[test]
     fn complete_unfiltered_scan_publishes_merged_partition_statistics() {
         let store = RuntimeStatisticsStore::default();
         let first = batch(&[1, 2]);
         let second = batch(&[3, 4]);
         store
-            .observe_input(7, "table@revision", Some(4), 2, true, &first.schema(), &first)
+            .observe_input(&scan_context(7, Some(4), 2, true, 0), &first.schema(), &first)
             .expect("observe first partition");
         store
-            .observe_input(7, "table@revision", Some(4), 2, true, &second.schema(), &second)
+            .observe_input(&scan_context(7, Some(4), 2, true, 1), &second.schema(), &second)
             .expect("observe second partition");
 
         assert!(store
@@ -649,7 +637,11 @@ mod tests {
         let store = RuntimeStatisticsStore::default();
         let filtered_input = batch(&[1]);
         store
-            .observe_input(8, "table@revision", Some(4), 1, false, &filtered_input.schema(), &filtered_input)
+            .observe_input(
+                &scan_context(8, Some(4), 1, false, 0),
+                &filtered_input.schema(),
+                &filtered_input,
+            )
             .expect("observe filtered output");
         let filtered = store
             .complete_partition(8, "table@revision", Some(4), 1, false, 0)
@@ -660,7 +652,7 @@ mod tests {
 
         let truncated_input = batch(&[1, 2]);
         store
-            .observe_input(9, "table@revision", Some(4), 1, true, &truncated_input.schema(), &truncated_input)
+            .observe_input(&scan_context(9, Some(4), 1, true, 0), &truncated_input.schema(), &truncated_input)
             .expect("observe truncated output");
         let truncated = store
             .complete_partition(9, "table@revision", Some(4), 1, true, 0)
@@ -678,7 +670,12 @@ mod tests {
         let retained_bytes = input.retained_bytes();
         let schema = input.schema();
         assert_eq!(
-            store.enqueue_input(17, "table@revision", Some(4), 1, true, schema, input, retained_bytes),
+            store.enqueue_input(RuntimeStatisticsInputBatch {
+                scan: scan_context(17, Some(4), 1, true, 0),
+                schema,
+                input,
+                retained_bytes,
+            }),
             RuntimeStatisticsEnqueue::Queued,
         );
         assert!(store.enqueue_partition_completion(RuntimeStatisticsPartitionCompletion {
@@ -717,7 +714,12 @@ mod tests {
         let retained_bytes = input.retained_bytes();
         let schema = input.schema();
         assert_eq!(
-            store.enqueue_input(23, "table@revision", Some(4), 1, false, schema, input, retained_bytes),
+            store.enqueue_input(RuntimeStatisticsInputBatch {
+                scan: scan_context(23, Some(4), 1, false, 0),
+                schema,
+                input,
+                retained_bytes,
+            }),
             RuntimeStatisticsEnqueue::Queued,
         );
         assert!(store.enqueue_partition_completion(RuntimeStatisticsPartitionCompletion {
@@ -751,7 +753,12 @@ mod tests {
         let retained_bytes = input.retained_bytes();
         let schema = input.schema();
         assert_eq!(
-            store.enqueue_input(18, "table@revision", Some(4), 1, true, schema, input, retained_bytes),
+            store.enqueue_input(RuntimeStatisticsInputBatch {
+                scan: scan_context(18, Some(4), 1, true, 0),
+                schema,
+                input,
+                retained_bytes,
+            }),
             RuntimeStatisticsEnqueue::BatchTooLarge,
         );
         assert!(store.enqueue_partition_completion(RuntimeStatisticsPartitionCompletion {

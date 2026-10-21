@@ -1,5 +1,5 @@
 use std::fmt::{self, Display, Formatter};
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::{collections::hash_map::RandomState, ffi::OsStr};
@@ -40,10 +40,9 @@ impl<'a> From<&'a PathBuf> for LogLocation<'a> {
 
 impl Display for LogLocation<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let mut hasher = LOCATION_HASHER
+        let hash = LOCATION_HASHER
             .get_or_init(RandomState::new)
-            .build_hasher();
-        self.0.hash(&mut hasher);
-        write!(f, "loc:{:016x}", hasher.finish())
+            .hash_one(self.0);
+        write!(f, "loc:{hash:016x}")
     }
 }

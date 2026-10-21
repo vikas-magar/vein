@@ -132,7 +132,7 @@ pub struct AggregateSink {
     /// Candidate indexes that will become new groups after this batch resolves.
     batch_new_groups: Vec<usize>,
     /// Arrow-backed grouping columns for batches that contributed new groups.
-    group_key_batches: Vec<Vec<Option<GroupKeyColumn>>>,
+    group_key_batches: Vec<Vec<Option<Arc<GroupKeyColumn>>>>,
     /// Original arrays used by each grouping column, retained by source identity.
     group_key_batch_arrays: Vec<Vec<Vec<ArrayRef>>>,
     /// Memory leases for the distinct source arrays retained by each key batch.

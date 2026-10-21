@@ -1,16 +1,22 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct SpillFinishContext<'a> {
+    pub(super) plan: &'a AggregatePlan,
+    pub(super) tracker: &'a QueryMemoryTracker,
+    pub(super) registry: &'a Arc<FunctionRegistry>,
+    pub(super) schema: &'a AggregateSpillSchema,
+    pub(super) batch_rows: NonZeroUsize,
+}
+
 impl AggregateSink {
     pub(super) fn finish_spill_partition_view(
-        plan: &AggregatePlan,
-        tracker: &QueryMemoryTracker,
-        registry: &Arc<FunctionRegistry>,
-        schema: &AggregateSpillSchema,
+        context: &SpillFinishContext<'_>,
         runs: Vec<SpillRun>,
         bit: u32,
-        batch_rows: NonZeroUsize,
         emit: &mut impl FnMut(DataChunkView) -> Result<()>,
     ) -> Result<()> {
+        let SpillFinishContext { plan, tracker, registry, schema, batch_rows } = *context;
         tracker.check_cancelled()?;
         let mut partition_plan = plan.clone();
         // Planner estimates describe the original full input and must not
@@ -58,13 +64,9 @@ impl AggregateSink {
                 );
                 for child in children.into_iter().flatten() {
                     Self::finish_spill_partition_view(
-                        plan,
-                        tracker,
-                        registry,
-                        schema,
+                        context,
                         vec![child],
                         bit + 1,
-                        batch_rows,
                         emit,
                     )?;
                 }

@@ -45,7 +45,7 @@ pub(super) fn eval_case_mapped(
         };
         output.push(source)?;
     }
-    Ok(ExpressionValue::view_column(Arc::new(output.finish()?), 0)?)
+    ExpressionValue::view_column(Arc::new(output.finish()?), 0)
 }
 
 fn condition_is_true(condition: &ExpressionValue, row: usize, rows: usize) -> Result<bool> {

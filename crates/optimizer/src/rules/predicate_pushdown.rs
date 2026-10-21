@@ -244,7 +244,16 @@ fn push_through_join(
 
     if join_type == JoinType::Inner {
         return disjunction::pushdown_inner_join(
-            left, right, on, using, schema, predicate, &left_ids, &right_ids,
+            disjunction::InnerJoinContext {
+                left,
+                right,
+                on,
+                using,
+                schema,
+                left_columns: &left_ids,
+                right_columns: &right_ids,
+            },
+            predicate,
         );
     }
 

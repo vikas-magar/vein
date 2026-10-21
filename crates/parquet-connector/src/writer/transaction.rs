@@ -28,24 +28,32 @@ pub(super) struct ParquetWriteTransaction {
     pub(super) statistics: Option<StatisticsCollector>,
 }
 
+pub(super) struct ParquetWriteTransactionConfig {
+    pub(super) storage: ParquetWriteStorage,
+    pub(super) table: String,
+    pub(super) mode: String,
+    pub(super) base_manifest: Option<TableManifest>,
+    pub(super) staging_dir: PathBuf,
+    pub(super) generation: String,
+    pub(super) schema: SchemaRef,
+    pub(super) schema_fingerprint: String,
+    pub(super) statistics: Option<StatisticsCollector>,
+}
+
 impl ParquetWriteTransaction {
-    pub(super) fn new(
-        storage: ParquetWriteStorage, table: String, mode: String,
-        base_manifest: Option<TableManifest>, staging_dir: PathBuf, generation: String,
-        schema: SchemaRef, schema_fingerprint: String, statistics: Option<StatisticsCollector>,
-    ) -> Self {
+    pub(super) fn new(config: ParquetWriteTransactionConfig) -> Self {
         Self {
-            storage,
-            table,
-            mode,
-            base_manifest,
-            staging_dir,
-            generation,
+            storage: config.storage,
+            table: config.table,
+            mode: config.mode,
+            base_manifest: config.base_manifest,
+            staging_dir: config.staging_dir,
+            generation: config.generation,
             writer: None,
-            schema,
+            schema: config.schema,
             rows: 0,
-            schema_fingerprint,
-            statistics,
+            schema_fingerprint: config.schema_fingerprint,
+            statistics: config.statistics,
         }
     }
 

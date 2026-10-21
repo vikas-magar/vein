@@ -56,12 +56,10 @@ pub(in crate::runtime::tests) fn view_nullable_int64_values(
 ) -> Vec<Option<i64>> {
     (0..view.num_rows())
         .map(|row| {
-            let Some((array, physical_row)) = view
+            let (array, physical_row) = view
                 .resolve(column, row)
                 .expect("resolve view column")
-            else {
-                return None;
-            };
+                ?;
             let values = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()

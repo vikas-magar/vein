@@ -29,7 +29,7 @@ impl SegmentedArray {
     pub(crate) fn new(arrays: Vec<ArrayRef>) -> Result<Self> {
         let arrays = arrays
             .into_iter()
-            .filter(|array| array.len() > 0)
+            .filter(|array| !array.is_empty())
             .collect::<Vec<_>>();
         let data_type = arrays
             .first()

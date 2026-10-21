@@ -11,7 +11,7 @@ use plan::VeinSchema;
 use super::filesystem;
 use super::options;
 use super::schema::decode_schema;
-use super::transaction::ParquetWriteTransaction;
+use super::transaction::{ParquetWriteTransaction, ParquetWriteTransactionConfig};
 
 /// Local filesystem-backed Parquet writer and managed manifest publisher.
 #[derive(Debug, Clone)]
@@ -57,8 +57,17 @@ impl WriteStorage for ParquetWriteStorage {
         })?;
 
         Ok(Box::new(ParquetWriteTransaction::new(
-            self.clone(), table, mode, base_manifest, staging_dir, generation,
-            schema, fingerprint, statistics,
+            ParquetWriteTransactionConfig {
+                storage: self.clone(),
+                table,
+                mode,
+                base_manifest,
+                staging_dir,
+                generation,
+                schema,
+                schema_fingerprint: fingerprint,
+                statistics,
+            },
         )))
     }
 }

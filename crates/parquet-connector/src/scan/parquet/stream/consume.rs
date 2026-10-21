@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use common::Result;
+use common::statistics::runtime::{RuntimeStatisticsEnqueue, RuntimeStatisticsInputBatch};
 use error::VeinError;
 use exec::pipeline::arrow_adapter::from_record_batch;
 use futures::Stream;
@@ -59,7 +60,7 @@ where
         if context.next.finished() {
             break;
         }
-        log_progress(&mut metrics, &context, &mut last_progress);
+        log_progress(&metrics, &context, &mut last_progress);
     }
     if context.has_row_filter {
         metrics.physical_rows_read = usize::try_from(
@@ -108,21 +109,17 @@ fn queue_runtime_statistics(
                 VeinError::internal("runtime statistics retained-byte count overflow")
             })
         })?;
-    let outcome = context.runtime_statistics.enqueue_input(
-        scan.scan_id,
-        &scan.table_key,
-        scan.expected_rows,
-        scan.partition_count,
-        scan.row_coverage_candidate,
+    let outcome = context.runtime_statistics.enqueue_input(RuntimeStatisticsInputBatch {
+        scan: scan.clone(),
         schema,
-        statistics_view,
+        input: statistics_view,
         retained_bytes,
-    );
+    });
     match outcome {
-        common::statistics::runtime::RuntimeStatisticsEnqueue::Queued => metrics.statistics_batches_queued += 1,
-        common::statistics::runtime::RuntimeStatisticsEnqueue::QueueFull => metrics.statistics_batches_queue_full += 1,
-        common::statistics::runtime::RuntimeStatisticsEnqueue::BatchTooLarge => metrics.statistics_batches_too_large += 1,
-        common::statistics::runtime::RuntimeStatisticsEnqueue::WorkerUnavailable => metrics.statistics_batches_worker_unavailable += 1,
+        RuntimeStatisticsEnqueue::Queued => metrics.statistics_batches_queued += 1,
+        RuntimeStatisticsEnqueue::QueueFull => metrics.statistics_batches_queue_full += 1,
+        RuntimeStatisticsEnqueue::BatchTooLarge => metrics.statistics_batches_too_large += 1,
+        RuntimeStatisticsEnqueue::WorkerUnavailable => metrics.statistics_batches_worker_unavailable += 1,
     }
     metrics.statistics_enqueue_us += started.elapsed().as_micros() as u64;
     Ok(())

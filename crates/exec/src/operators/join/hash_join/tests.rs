@@ -74,7 +74,7 @@ fn nullable_ints(values: &[Option<i64>]) -> ArrayRef {
 }
 
 fn selected_value(chunk: &DataChunkView, column: usize, physical_row: usize) -> Option<i64> {
-    let values = crate::pipeline::test_support::materialized_column::<Int64Array>(&chunk, column);
+    let values = crate::pipeline::test_support::materialized_column::<Int64Array>(chunk, column);
     values
         .is_valid(physical_row)
         .then(|| values.value(physical_row))

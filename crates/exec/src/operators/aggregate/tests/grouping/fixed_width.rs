@@ -158,9 +158,9 @@ fn assert_key_hashes_match(array: &ArrayRef) {
     let builder = DefaultHashBuilder::default();
     let mut batch_hashers = (0..array.len()).map(|_| builder.build_hasher()).collect::<Vec<_>>();
     key.hash_batch(0, &selection, &[0], 1, &mut batch_hashers);
-    for row in 0..array.len() {
+    for (row, batch_hasher) in batch_hashers.iter().enumerate() {
         let mut spill_hasher = builder.build_hasher();
         key.hash_row(0, row, &mut spill_hasher);
-        assert_eq!(spill_hasher.finish(), batch_hashers[row].finish(), "hash mismatch at row {row}");
+        assert_eq!(spill_hasher.finish(), batch_hasher.finish(), "hash mismatch at row {row}");
     }
 }

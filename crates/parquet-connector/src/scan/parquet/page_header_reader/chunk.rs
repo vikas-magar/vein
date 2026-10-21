@@ -1,21 +1,21 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
-use parquet::file::metadata::RowGroupMetaData;
-
-use super::super::reader::ParquetFileReader;
 use super::header::read_page_header_at;
-use super::{PageHeaderReadResult, PredicateColumn};
+use super::{PageHeaderReadResult, RowGroupPageReadRequest};
 
 pub(super) async fn read_requested_row_group(
-    reader: &mut ParquetFileReader,
-    path: &str,
-    file_size_bytes: u64,
-    row_group_index: usize,
-    row_group: &RowGroupMetaData,
-    requested_columns: &BTreeSet<String>,
-    columns: &[PredicateColumn],
+    request: RowGroupPageReadRequest<'_>,
     result: &mut PageHeaderReadResult,
 ) {
+    let RowGroupPageReadRequest {
+        reader,
+        path,
+        file_size_bytes,
+        row_group_index,
+        row_group,
+        requested_columns,
+        columns,
+    } = request;
     let Some(row_count) = usize::try_from(row_group.num_rows()).ok() else {
         return;
     };

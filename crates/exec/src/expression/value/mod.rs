@@ -3,12 +3,12 @@
 mod segment;
 mod segmented;
 mod datum;
-mod value;
+mod expression_value;
 mod function_input;
 
 pub use datum::ExpressionDatum;
 pub use segmented::SegmentedArray;
-pub use value::{ExpressionValue, ViewColumnValue};
+pub use expression_value::{ExpressionValue, ViewColumnValue};
 pub use function_input::ExpressionFunctionInputSource;
 pub(crate) use function_input::into_expression_value;
 

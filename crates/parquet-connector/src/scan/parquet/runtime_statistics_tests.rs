@@ -4,8 +4,10 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use catalog::ColumnStatistics;
 use common::arrow::SelectionVector;
+use common::protocol::RuntimeStatisticsScan;
 use common::statistics::runtime::{
-    RuntimeStatisticsEnqueue, RuntimeStatisticsPartitionCompletion, RuntimeStatisticsStore,
+    RuntimeStatisticsEnqueue, RuntimeStatisticsInputBatch,
+    RuntimeStatisticsPartitionCompletion, RuntimeStatisticsStore,
 };
 use common::statistics::QueryStatisticsContext;
 
@@ -65,7 +67,19 @@ fn background_statistics_queue_consumes_selected_view_without_compaction() {
     let store = RuntimeStatisticsStore::default();
 
     assert_eq!(
-        store.enqueue_input(41, "table@revision", Some(4), 1, false, schema, view, retained_bytes),
+        store.enqueue_input(RuntimeStatisticsInputBatch {
+            scan: RuntimeStatisticsScan {
+                scan_id: 41,
+                table_key: "table@revision".to_owned(),
+                expected_rows: Some(4),
+                row_coverage_candidate: false,
+                partition_index: 0,
+                partition_count: 1,
+            },
+            schema,
+            input: view,
+            retained_bytes,
+        }),
         RuntimeStatisticsEnqueue::Queued,
     );
     assert!(store.enqueue_partition_completion(RuntimeStatisticsPartitionCompletion {

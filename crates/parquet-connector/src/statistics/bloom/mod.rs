@@ -135,7 +135,6 @@ pub struct BloomPruning {
 ///
 /// Unsupported nested/schema mappings are omitted and therefore remain
 /// conservative: they cannot cause a row group to be skipped.
-
 pub use planning::{bloom_filter_columns, equality_predicate_columns, prune_row_groups_with_bloom};
 #[cfg(test)]
 pub(super) use values::predicate_may_match_bloom;

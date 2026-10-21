@@ -29,7 +29,7 @@ impl ScanProvider for UnevenUnitProvider {
         let mut work = Vec::new();
         for (file, ranges) in [
             ("a.data", vec![0..1, 1..4]),
-            ("b.data", vec![0..2]),
+            ("b.data", std::iter::once(0..2).collect()),
         ] {
             for range in ranges {
                 let mut scan = request.scan.clone();

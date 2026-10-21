@@ -11,7 +11,7 @@ pub struct TaskMetrics {
 }
 
 /// The outcome of running a single task to completion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TaskResult {
     /// Number of rows produced by the pipeline.
     pub row_count: u64,
@@ -21,15 +21,4 @@ pub struct TaskResult {
     pub metrics: TaskMetrics,
     /// Present only after a storage sink has committed successfully.
     pub write_receipt: Option<WriteReceipt>,
-}
-
-impl Default for TaskResult {
-    fn default() -> Self {
-        Self {
-            row_count: 0,
-            output: Vec::new(),
-            metrics: TaskMetrics::default(),
-            write_receipt: None,
-        }
-    }
 }

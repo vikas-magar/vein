@@ -18,7 +18,9 @@ use functions::FunctionRegistry;
 
 #[path = "row_filter/expression.rs"]
 mod expression;
-use expression::{as_arrow_error, expression_predicate, predicate_projection};
+use expression::{
+    ExpressionPredicateRequest, as_arrow_error, expression_predicate, predicate_projection,
+};
 
 use super::super::metrics::ScanPredicateMetrics;
 use super::adaptive_order::{AdaptiveFilterConfig, AdaptiveFilterOrder};
@@ -80,19 +82,19 @@ pub fn build_scan_predicates(context: ScanPredicateContext<'_>) -> Result<ScanPr
                     .collect(),
                 Arc::clone(&metrics),
             ));
-            predicates.push(expression_predicate(
+            predicates.push(expression_predicate(ExpressionPredicateRequest {
                 arrow_schema,
                 parquet_schema,
-                &stage.input.fields,
+                fields: &stage.input.fields,
                 stage,
                 path,
-                Arc::clone(registry),
-                detailed_metrics_enabled,
-                Arc::clone(expression_kernels),
-                Arc::clone(predicate_metrics),
-                metrics,
-                index == 0,
-            )?);
+                registry: Arc::clone(registry),
+                detailed: detailed_metrics_enabled,
+                expression_kernels: Arc::clone(expression_kernels),
+                total_metrics: Arc::clone(predicate_metrics),
+                stage_metrics: metrics,
+                record_source_rows: index == 0,
+            })?);
         }
     }
 

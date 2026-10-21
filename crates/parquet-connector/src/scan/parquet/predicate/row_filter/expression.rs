@@ -21,19 +21,36 @@ use functions::FunctionRegistry;
 use super::super::super::metrics::ScanPredicateMetrics;
 use super::super::super::projection::root_indices;
 
+pub(super) struct ExpressionPredicateRequest<'a> {
+    pub(super) arrow_schema: &'a Schema,
+    pub(super) parquet_schema: &'a SchemaDescriptor,
+    pub(super) fields: &'a [ResolvedColumnRef],
+    pub(super) stage: &'a ScanPredicateStage,
+    pub(super) path: &'a str,
+    pub(super) registry: Arc<FunctionRegistry>,
+    pub(super) detailed: bool,
+    pub(super) expression_kernels: Arc<dyn ExpressionKernelProvider>,
+    pub(super) total_metrics: Arc<ScanPredicateMetrics>,
+    pub(super) stage_metrics: Arc<ScanPredicateMetrics>,
+    pub(super) record_source_rows: bool,
+}
+
 pub(super) fn expression_predicate(
-    arrow_schema: &Schema,
-    parquet_schema: &SchemaDescriptor,
-    fields: &[ResolvedColumnRef],
-    stage: &ScanPredicateStage,
-    path: &str,
-    registry: Arc<FunctionRegistry>,
-    detailed: bool,
-    expression_kernels: Arc<dyn ExpressionKernelProvider>,
-    total_metrics: Arc<ScanPredicateMetrics>,
-    stage_metrics: Arc<ScanPredicateMetrics>,
-    record_source_rows: bool,
+    request: ExpressionPredicateRequest<'_>,
 ) -> Result<Box<dyn ArrowPredicate>> {
+    let ExpressionPredicateRequest {
+        arrow_schema,
+        parquet_schema,
+        fields,
+        stage,
+        path,
+        registry,
+        detailed,
+        expression_kernels,
+        total_metrics,
+        stage_metrics,
+        record_source_rows,
+    } = request;
     let (mask, positions) = predicate_projection(arrow_schema, parquet_schema, fields, path)?;
     let expression = stage.predicate.clone();
     let first_filter = Arc::new(AtomicBool::new(record_source_rows));
@@ -43,13 +60,13 @@ pub(super) fn expression_predicate(
             if record_first_filter.load(Ordering::Relaxed) {
                 total_metrics.record_source_rows(batch.num_rows());
             }
-            let array_bytes = detailed
-                .then(|| {
-                    positions.iter().fold(0usize, |bytes, &position| {
-                        bytes.saturating_add(batch.column(position).get_array_memory_size())
-                    })
+            let array_bytes = if detailed {
+                positions.iter().fold(0usize, |bytes, &position| {
+                    bytes.saturating_add(batch.column(position).get_array_memory_size())
                 })
-                .unwrap_or_default();
+            } else {
+                0
+            };
             let started = detailed.then(Instant::now);
             let view = exec::pipeline::arrow_adapter::from_record_batch_ref(&batch)
                 .and_then(|view| view.project(&positions))

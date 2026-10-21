@@ -42,10 +42,10 @@ fn same_source_population_is_checkpointed_only_once_per_query() {
 #[test]
 fn a_different_filter_on_the_same_source_remains_checkpoint_eligible() {
     let mut different = scan("same_source", 25);
-    if let LogicalPlan::Scan { filters, .. } = &mut different {
-        if let plan::LogicalExpr::BinaryOp { right, .. } = &mut filters[0] {
-            *right = Box::new(plan::LogicalExpr::Literal(plan::LogicalLiteral::Int64(10)));
-        }
+    if let LogicalPlan::Scan { filters, .. } = &mut different
+        && let plan::LogicalExpr::BinaryOp { right, .. } = &mut filters[0]
+    {
+        **right = plan::LogicalExpr::Literal(plan::LogicalLiteral::Int64(10));
     }
     let plan = join(scan("same_source", 25), different);
     let statistics = Arc::new(QueryStatisticsContext::new([]));

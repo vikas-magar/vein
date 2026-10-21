@@ -87,9 +87,9 @@ impl AggregateSpillSchema {
         let mut identities = HashSet::with_capacity(self.key_types.len());
         for column in first_key..end_key {
             for array in batch.source_arrays_for_column(column)? {
-                let identity = Arc::as_ptr(&array) as *const () as usize;
+                let identity = Arc::as_ptr(array) as *const () as usize;
                 if identities.insert(identity) {
-                    visit(identity, &array)?;
+                    visit(identity, array)?;
                 }
             }
         }
@@ -109,7 +109,7 @@ impl AggregateSpillSchema {
             let array_bytes = array.get_array_memory_size();
             let lease = tracker
                 .lease_retained_array(identity, array_bytes, "aggregate retained spill keys")
-                .map_err(|error| {
+                .inspect_err(|error| {
                     tracing::warn!(
                         target: "vein.audit",
                         event = "aggregate_spill_key_reservation_failed",
@@ -121,9 +121,9 @@ impl AggregateSpillSchema {
                         available_bytes = tracker.limit().saturating_sub(tracker.used()),
                         limit_bytes = tracker.limit(),
                         prior_used_bytes = used_before_keys,
+                        error = %error,
                         "could not reserve retained aggregate spill key memory"
                     );
-                    error
                 })?;
             retained_key_bytes = retained_key_bytes
                 .checked_add(array_bytes)
@@ -134,7 +134,7 @@ impl AggregateSpillSchema {
 
         let used_before_workspace = tracker.used();
         let workspace = tracker.reserve(workspace_bytes, "aggregate spill decode workspace")
-            .map_err(|error| {
+            .inspect_err(|error| {
                 tracing::warn!(
                     target: "vein.audit",
                     event = "aggregate_spill_workspace_reservation_failed",
@@ -145,9 +145,9 @@ impl AggregateSpillSchema {
                     available_bytes = tracker.limit().saturating_sub(used_before_workspace),
                     limit_bytes = tracker.limit(),
                     prior_used_bytes = used_before_keys,
+                    error = %error,
                     "could not reserve aggregate spill decode workspace"
                 );
-                error
             })?;
         Ok((workspace, key_leases))
     }

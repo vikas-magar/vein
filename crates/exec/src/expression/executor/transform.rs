@@ -132,7 +132,7 @@ where
     fn combine_local(self: Box<Self>, canonical: &mut dyn PipelineNode) -> Result<()> {
         let target = canonical.as_any_mut().downcast_mut::<Self>()
             .ok_or_else(|| VeinError::internal("expression executor local state type mismatch"))?;
-        combine_state(self, target)
+        combine_state(*self, target)
     }
 }
 
@@ -151,11 +151,11 @@ where
     ) -> Result<()> {
         let target = canonical.as_any_mut().downcast_mut::<Self>()
             .ok_or_else(|| VeinError::internal("expression executor transform type mismatch"))?;
-        combine_state(self, target)
+        combine_state(*self, target)
     }
 }
 
-fn combine_state<K>(local: Box<ExpressionExecutor<K>>, canonical: &mut ExpressionExecutor<K>) -> Result<()>
+fn combine_state<K>(local: ExpressionExecutor<K>, canonical: &mut ExpressionExecutor<K>) -> Result<()>
 where
     K: ExpressionKernelProvider + ?Sized + 'static,
 {
@@ -165,7 +165,7 @@ where
     {
         return Err(VeinError::internal("cannot combine different expression executor configurations"));
     }
-    let ExpressionExecutor { next, metrics, .. } = *local;
+    let ExpressionExecutor { next, metrics, .. } = local;
     next.combine_local(canonical.next.as_mut())?;
     canonical.metrics.combine(metrics);
     Ok(())
