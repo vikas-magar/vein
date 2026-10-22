@@ -140,6 +140,13 @@ impl<K> Transform for ExpressionExecutor<K>
 where
     K: ExpressionKernelProvider + ?Sized + 'static,
 {
+    fn fork_with_output(
+        &self,
+        output: Box<dyn PipelineNode>,
+    ) -> Result<Option<Box<dyn Transform>>> {
+        Ok(Some(Box::new(self.fork_with_next(output))))
+    }
+
     fn fork_transform(&self) -> Result<Option<Box<dyn Transform>>> {
         let Some(next) = self.next.fork_local()? else { return Ok(None) };
         Ok(Some(Box::new(self.fork_with_next(next))))

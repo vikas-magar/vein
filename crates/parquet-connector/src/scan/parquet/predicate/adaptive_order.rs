@@ -6,6 +6,8 @@ use std::sync::Mutex;
 
 #[path = "adaptive_order/observe.rs"]
 mod observe;
+#[path = "adaptive_order/identity/mod.rs"]
+mod identity;
 
 /// Window sizes mirror DuckDB's adaptive filter defaults and remain configurable.
 #[derive(Clone, Debug)]
@@ -76,6 +78,7 @@ impl AdaptiveFilterSnapshot {
 
 /// Adaptive order state shared by partitions of one logical scan.
 pub struct AdaptiveFilterOrder {
+    identity: Option<identity::ScanIdentity>,
     stage_count: usize,
     config: AdaptiveFilterConfig,
     right_random_border: u64,
@@ -100,6 +103,7 @@ impl AdaptiveFilterOrder {
             trial_samples = config.trial_samples,
             "adaptive Parquet filter ordering initialized");
         Some(Self {
+            identity: None,
             stage_count,
             config,
             right_random_border,

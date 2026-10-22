@@ -97,6 +97,16 @@ pub trait Source: Send {
 
 /// A marker trait for middle operations that transform data and pass it on.
 pub trait Transform: PipelineNode {
+    /// Recreates independent evaluation state with a caller-owned output node.
+    /// This lets nested operators retain their own collector without sharing it
+    /// across workers. Unsupported transforms retain the serial fallback.
+    fn fork_with_output(
+        &self,
+        _output: Box<dyn PipelineNode>,
+    ) -> Result<Option<Box<dyn Transform>>> {
+        Ok(None)
+    }
+
     /// Builds a worker-local transform when its mutable execution state can be
     /// recreated independently and combined after its input is drained.
     fn fork_transform(&self) -> Result<Option<Box<dyn Transform>>> {

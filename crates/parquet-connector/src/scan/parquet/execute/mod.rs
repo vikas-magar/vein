@@ -1,6 +1,7 @@
 //! Parquet scan execution over provider-assigned files and row-group ranges.
 
 mod file;
+mod worker;
 
 use common::Result;
 use exec::operators::source::scan::ScanRequest;
@@ -14,7 +15,15 @@ pub(in crate::scan) async fn execute_parquet_scan(
     let io_backend = crate::scan::parquet::reader::ParquetIoBackend::configured();
     let batch_size_policy = crate::scan::parquet::batch_size::RowGroupBatchSizePolicy::default();
     let batch_rows_override = std::env::var("VEIN_SCAN_BATCH_ROWS").ok();
-    let mut adaptive_order = None;
+    let mut adaptive_order = request.worker_state.with::<worker::AdaptiveWorkerState, _>(
+        |state| state.order.clone(),
+    )?;
+    tracing::debug!(target: "vein.parquet_adaptive_filter",
+        event = "parquet_adaptive_filter_work_unit_started",
+        worker_id = request.worker_state.diagnostic_id(),
+        scan_id = ?request.statistics_scan.map(|scan| scan.scan_id),
+        prior_observations = adaptive_order.as_ref().map_or(0, |order| order.snapshot().observations),
+        "scan work unit reuses only its owning worker's predicate observations");
     for file in request.files {
         file::execute(file::FileExecution {
             request: &request,
@@ -26,6 +35,9 @@ pub(in crate::scan) async fn execute_parquet_scan(
             batch_rows_override: batch_rows_override.as_deref(),
         })
             .await?;
+        request.worker_state.with::<worker::AdaptiveWorkerState, _>(|state| {
+            state.order.clone_from(&adaptive_order);
+        })?;
         if next.finished() {
             break;
         }

@@ -45,6 +45,7 @@ impl LogFormat {
 
 /// Initializes the process-wide structured subscriber.
 ///
+/// Diagnostics go to stderr so stdout remains available for query results.
 /// `RUST_LOG` controls event levels. `VEIN_LOG_FORMAT` accepts `pretty` or
 /// `json`. `VEIN_AUDIT_LOG_PATH` appends JSONL events whose targets begin with
 /// `vein.`; this is an event export, not a rotating log-management service.
@@ -57,23 +58,25 @@ pub fn init(service: &'static str) -> io::Result<()> {
 
     match format {
         LogFormat::Json => {
-            let stdout = fmt::layer()
+            let diagnostics = fmt::layer()
+                .with_writer(io::stderr)
                 .json()
                 .with_target(true)
                 .with_thread_ids(true)
                 .with_thread_names(true)
                 .with_current_span(true)
                 .with_span_list(true);
-            install(filter, stdout, audit_file)?;
+            install(filter, diagnostics, audit_file)?;
         }
         LogFormat::Pretty => {
-            let stdout = fmt::layer()
+            let diagnostics = fmt::layer()
+                .with_writer(io::stderr)
                 .compact()
                 .with_target(true)
                 .with_thread_ids(true)
                 .with_thread_names(true)
                 .with_ansi(ansi);
-            install(filter, stdout, audit_file)?;
+            install(filter, diagnostics, audit_file)?;
         }
     }
 
@@ -88,11 +91,13 @@ pub fn init(service: &'static str) -> io::Result<()> {
     Ok(())
 }
 
-fn install<L>(filter: EnvFilter, stdout: L, audit_file: Option<File>) -> io::Result<()>
+fn install<L>(filter: EnvFilter, diagnostics: L, audit_file: Option<File>) -> io::Result<()>
 where
     L: Layer<Layered<EnvFilter, Registry>> + Send + Sync + 'static,
 {
-    let subscriber = tracing_subscriber::registry().with(filter).with(stdout);
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(diagnostics);
     if let Some(file) = audit_file {
         subscriber
             .with(
@@ -155,7 +160,10 @@ fn open_audit_file() -> io::Result<Option<File>> {
         return Ok(None);
     };
     let path = Path::new(&path);
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
     OpenOptions::new()

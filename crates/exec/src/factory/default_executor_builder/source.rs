@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::operators::source::ScanSource;
 use crate::operators::source::scan::{
-    ScanFile, ScanSourceConfig, validate_file_scan,
+    ScanFile, ScanSourceConfig, ScanWorkerState, validate_file_scan,
 };
 use crate::pipeline::Source;
 use crate::runtime::filter::RuntimeFilterSet;
@@ -21,6 +21,7 @@ impl DefaultExecutorBuilder {
         source: &DataSource,
         runtime_filters: &RuntimeFilterSet,
         query_statistics: Option<Arc<QueryStatisticsContext>>,
+        worker_state: Arc<ScanWorkerState>,
     ) -> Result<Box<dyn Source>> {
         match source {
             DataSource::Memory => Err(VeinError::internal(
@@ -44,7 +45,7 @@ impl DefaultExecutorBuilder {
                     .collect();
                 let storage = self.local_storage(&root)?;
                 let provider = self.scan_providers.resolve(&scan.data_file_format)?;
-                let source = ScanSource::new(ScanSourceConfig {
+                let source = ScanSource::new_with_worker_state(ScanSourceConfig {
                     storage,
                     files,
                     projected: scan.projected.clone(),
@@ -56,7 +57,7 @@ impl DefaultExecutorBuilder {
                     expression_kernels: Arc::clone(&self.expression_kernels),
                     runtime_statistics: self.runtime_statistics.clone(),
                     statistics_scan: scan.runtime_statistics.clone(),
-                }, provider);
+                }, provider, worker_state);
                 let source = match query_statistics {
                     Some(context) => source.with_query_statistics_context(context),
                     None => source,

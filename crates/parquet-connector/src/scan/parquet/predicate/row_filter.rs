@@ -23,7 +23,7 @@ use expression::{
 };
 
 use super::super::metrics::ScanPredicateMetrics;
-use super::adaptive_order::{AdaptiveFilterConfig, AdaptiveFilterOrder};
+use super::adaptive_order::AdaptiveFilterOrder;
 
 pub type PredicateStageMetrics = (usize, usize, Vec<String>, Arc<ScanPredicateMetrics>);
 
@@ -160,14 +160,7 @@ pub fn build_scan_predicates(context: ScanPredicateContext<'_>) -> Result<ScanPr
         }
         None
     } else {
-        adaptive_order
-            .filter(|policy| policy.stage_count() == stage_count)
-            .or_else(|| {
-                tracing::debug!(target: "vein.parquet_adaptive_filter",
-                    event = "parquet_adaptive_filter_state_worker_local", stage_count,
-                    "creating adaptive filter state for this scan worker");
-                AdaptiveFilterOrder::new(stage_count, AdaptiveFilterConfig::default()).map(Arc::new)
-            })
+        AdaptiveFilterOrder::for_scan(adaptive_order, stage_count, pushdown, projected, runtime_filters)
     };
     let row_filter = if has_row_filter {
         let row_filter = RowFilter::new(predicates);

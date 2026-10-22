@@ -7,8 +7,8 @@ use common::protocol::{
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 use types::{ColumnId, LogicalLiteral, ResolvedColumn, VeinDataType, VeinSchema};
 
-use exec::expression::eval::{ExpressionKernelProvider, ExpressionKernelRegistry};
 use crate::scan::parquet::metrics::ScanPredicateMetrics;
+use exec::expression::eval::{ExpressionKernelProvider, ExpressionKernelRegistry};
 use exec::runtime::filter::RuntimeFilterSet;
 use functions::FunctionRegistry;
 
@@ -155,4 +155,20 @@ fn worker_policy_is_recreated_when_predicate_stage_count_changes() {
 
     assert_eq!(next_file.stage_count(), 3);
     assert!(!Arc::ptr_eq(&first, &next_file));
+}
+
+#[test]
+fn same_stage_count_does_not_reuse_observations_for_different_predicates() {
+    let (schema, descriptor, projected, pushdown, registry) = setup();
+    let first = pipeline(&schema, &descriptor, &projected, &pushdown, &registry, None)
+        .adaptive_order.expect("original worker policy");
+    let mut changed = pushdown.clone();
+    changed.stages[1].predicate = PhysicalExpr {
+        return_type: VeinDataType::Boolean,
+        kind: ExprKind::Literal(LogicalLiteral::Boolean(false)),
+    };
+    let next = pipeline(&schema, &descriptor, &projected, &changed,
+                        &registry, Some(Arc::clone(&first))).adaptive_order.expect("replacement policy");
+    assert_eq!(first.stage_count(), next.stage_count());
+    assert!(!Arc::ptr_eq(&first, &next));
 }

@@ -1080,3 +1080,9 @@ mod correlated_semi_anti;
 
 #[path = "tests/output_batching.rs"]
 mod output_batching;
+
+#[path = "tests/bounded/mod.rs"]
+mod bounded;
+
+#[path = "tests/parallel_probe/mod.rs"]
+mod parallel_probe;

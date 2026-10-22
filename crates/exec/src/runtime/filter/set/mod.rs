@@ -34,6 +34,14 @@ impl Debug for RuntimeFilterSet {
 }
 
 impl RuntimeFilterSet {
+    /// Whether both sets retain the same immutable evaluators in the same order.
+    /// Used to invalidate learned reader policy when runtime predicates change.
+    pub fn same_filter_instances(&self, other: &Self) -> bool {
+        self.filters.len() == other.filters.len()
+            && self.filters.iter().zip(other.filters.iter())
+                .all(|(left, right)| Arc::ptr_eq(left, right))
+    }
+
     /// Create a shareable set from filters built for the same probe input.
     pub fn new(filters: Vec<Arc<dyn RuntimeFilter>>) -> Self {
         Self::with_optional_statistics(filters, None)

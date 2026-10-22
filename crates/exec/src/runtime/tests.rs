@@ -28,6 +28,7 @@ mod view_streaming;
 mod zero_copy_e2e;
 mod expression_pipeline;
 mod provider_units;
+mod scan_worker;
 
 pub(in crate::runtime::tests) use fixtures::*;
 

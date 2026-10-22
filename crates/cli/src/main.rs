@@ -83,10 +83,11 @@ async fn main() -> Result<()> {
     let mut row_count = 0u64;
     let mut batch_count = 0u64;
     let display_rows = display_row_limit();
+    // Keep only the handle: a stdout guard must never span query execution awaits.
     let stdout = std::io::stdout();
     let mut json_writer = output_format
         .is_json_lines()
-        .then(|| result_format::JsonRowsWriter::new(stdout.lock()));
+        .then(|| result_format::JsonRowsWriter::new(stdout));
     let mut format_us = 0u64;
 
     // Keep the rendered prefix as row mappings into the original Arrow buffers.
