@@ -84,6 +84,22 @@ impl OptimizerRule for PredicatePushdownRule {
                 using,
                 schema,
             } => push_through_join(JoinType::Left, left, right, on, using, schema, predicate),
+            LogicalPlan::Join {
+                join_type: JoinType::Semi,
+                left,
+                right,
+                on,
+                using,
+                schema,
+            } => push_through_join(JoinType::Semi, left, right, on, using, schema, predicate),
+            LogicalPlan::Join {
+                join_type: JoinType::Anti,
+                left,
+                right,
+                on,
+                using,
+                schema,
+            } => push_through_join(JoinType::Anti, left, right, on, using, schema, predicate),
             LogicalPlan::SetOp {
                 kind,
                 all,
@@ -597,3 +613,7 @@ mod join_tests;
 #[cfg(test)]
 #[path = "predicate_pushdown/disjunction_tests.rs"]
 mod disjunction_tests;
+
+#[cfg(test)]
+#[path = "predicate_pushdown/semi_anti_tests.rs"]
+mod semi_anti_tests;

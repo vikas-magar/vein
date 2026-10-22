@@ -8,6 +8,7 @@ use error::{Result, VeinError};
 use parser::ast::expr::BinaryOp;
 use parser::ast::pipe_op::JoinType;
 use plan::{LogicalExpr, LogicalPlan, PlanTraversal, ResolvedColumnRef, VeinDataType, VeinSchema};
+use std::collections::HashSet;
 
 use crate::context::{OptimizerContext, OptimizerPhase};
 use crate::rule::{OptimizerRule, RuleType};
@@ -91,6 +92,8 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
         ));
     }
     let mut keys = Vec::new();
+    let mut seen_keys = HashSet::new();
+    let mut duplicate_key_count = 0;
     let mut correlated_residuals = Vec::new();
     let mut local_filters = Vec::new();
 
@@ -107,7 +110,11 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
                         None,
                     ));
                 }
-                keys.push((inner, outer));
+                if !seen_keys.insert((inner.id, outer.id)) {
+                    duplicate_key_count += 1;
+                } else {
+                    keys.push((inner, outer));
+                }
             } else if contains_outer_column(term) {
                 if term.is_volatile() {
                     return Err(VeinError::planning(
@@ -185,6 +192,7 @@ fn decorrelate_one(input: LogicalPlan, subquery: &LogicalPlan, negated: bool) ->
             event = "exists_decorrelated",
             negated,
             key_count,
+            duplicate_key_count,
             residual_count,
             "exists_decorrelated"
         );

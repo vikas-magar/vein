@@ -18,7 +18,7 @@ impl HashJoin {
             return Ok(());
         }
         if self.join_type == JoinType::NullAwareAnti && self.table.has_null_keys() { return Ok(()); }
-        if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+        if self.join_type.tracks_build_matches() {
             self.ensure_build_match_bitmap()?;
         }
         let table = Arc::clone(&self.table);
@@ -36,6 +36,9 @@ impl HashJoin {
             self.probe_us = self.probe_us.saturating_add(started.elapsed().as_micros() as u64);
             if !has_candidates { break; }
             self.max_candidate_batch_rows = self.max_candidate_batch_rows.max(candidates.len());
+            if self.join_type.build_existence() {
+                self.retain_unmatched_build_candidates(&mut candidates)?;
+            }
             if self.residual_transform.is_some() {
                 let elapsed = self.filter_residual_matches(&chunk, &mut candidates)?;
                 self.residual_us = self.residual_us.saturating_add(elapsed);
@@ -45,11 +48,11 @@ impl HashJoin {
                     return Err(VeinError::stage("join", "scalar subquery returned more than one row"));
                 }
             }
-            if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+            if self.join_type.tracks_build_matches() {
                 self.record_build_matches(&candidates)?;
             }
             self.matched_rows = self.matched_rows.saturating_add(candidates.len() as u64);
-            if !existence {
+            if !existence && !self.join_type.build_existence() {
                 self.forward_rows(Some(&chunk), candidates.iter().map(|&(probe, build)| OutputRow {
                     probe: Some(probe),
                     build: Some(build),

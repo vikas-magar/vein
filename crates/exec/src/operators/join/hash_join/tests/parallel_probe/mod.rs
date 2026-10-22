@@ -1,6 +1,7 @@
 use super::*;
 
 mod memory;
+mod build_existence;
 
 fn parallel_join(kind: JoinType, residual: bool) -> (HashJoin, Collect, ArrayRef) {
     let payload = ints(&[5, 15, 7, 9, 11]);
@@ -10,9 +11,12 @@ fn parallel_join(kind: JoinType, residual: bool) -> (HashJoin, Collect, ArrayRef
         Arc::clone(&payload),
     ])).unwrap();
     let sink = Collect::default();
-    let mut join = HashJoin::new(Arc::new(table), kind,
-                                 vec![OutputColumn::Probe(0), OutputColumn::Probe(1),
-                                      OutputColumn::Build(0), OutputColumn::Build(1)],
+    let columns = if kind.build_existence() {
+        vec![OutputColumn::Build(0), OutputColumn::Build(1)]
+    } else {
+        vec![OutputColumn::Probe(0), OutputColumn::Probe(1), OutputColumn::Build(0), OutputColumn::Build(1)]
+    };
+    let mut join = HashJoin::new(Arc::new(table), kind, columns,
                                  vec![DataType::Int64; 2], vec![DataType::Int64; 2], Box::new(sink.clone()));
     if residual {
         let (transform, collector) = residual_greater_than_filter();

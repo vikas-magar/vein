@@ -8,6 +8,11 @@ use common::statistics::QueryStatisticsContext;
 use plan::{TableMetadata, TableStatistics};
 
 mod diagnostics;
+mod predicates;
+pub use predicates::{PredicateLocation, PredicatePlacement, PredicateRetention};
+pub(crate) use predicates::PredicateLineage;
+mod filter_placement;
+pub(crate) use filter_placement::FilterPlacementVisibility;
 pub use diagnostics::{
     JoinCardinalityAssumption, JoinCostBreakdown, JoinOrderAlternative, JoinOrderDecision,
     JoinOrderOutcome, OptimizationDiagnostics, OptimizerPhase, RuleExecution,
@@ -34,7 +39,7 @@ impl Default for OptimizerConfig {
 /// Resource limits for exact join-order enumeration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinOrderConfig {
-    /// Maximum number of relations in an exact-search region.
+    /// Maximum relations for exact search; larger safe regions use bounded greedy search.
     pub max_relations: usize,
     /// Maximum number of subset splits examined by one region.
     pub max_candidate_splits: usize,

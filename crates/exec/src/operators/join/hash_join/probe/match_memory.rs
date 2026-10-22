@@ -37,6 +37,9 @@ impl HashJoin {
     }
 
     pub(super) fn combine_build_matches(&mut self, other: &mut Self) -> Result<()> {
+        // Empty workers have no matches and therefore contribute an all-zero
+        // bitmap without requiring an allocation or a capacity mismatch.
+        if other.matched_build.is_empty() { return Ok(()); }
         if self.matched_build.is_empty() {
             self.matched_build = std::mem::take(&mut other.matched_build);
             self.matched_build_memory = other.matched_build_memory.take();
@@ -48,6 +51,19 @@ impl HashJoin {
         for (target, source) in self.matched_build.iter_mut().zip(&other.matched_build) {
             *target |= *source;
         }
+        Ok(())
+    }
+
+    pub(super) fn retain_unmatched_build_candidates(&self, candidates: &mut Vec<JoinMatch>) -> Result<()> {
+        let mut retained = 0;
+        for index in 0..candidates.len() {
+            let candidate = candidates[index];
+            if !self.build_row_matched(candidate.1.0, candidate.1.1)? {
+                candidates[retained] = candidate;
+                retained += 1;
+            }
+        }
+        candidates.truncate(retained);
         Ok(())
     }
 

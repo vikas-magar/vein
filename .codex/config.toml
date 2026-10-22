@@ -54,3 +54,9 @@ approval_mode = "approve"
 
 [mcp_servers.rustrover.tools.run_ide_script]
 approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.optimize_imports]
+approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_get_debugger_status]
+approval_mode = "approve"

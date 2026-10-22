@@ -80,6 +80,7 @@ fn filter_visibility_counts_scan_filters_and_residual_filters() {
             scan_count: 1,
             scan_filter_count: 1,
             residual_filter_count: 1,
+            ..FilterPlacementVisibility::default()
         }
     );
 }

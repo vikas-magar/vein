@@ -32,7 +32,7 @@ use crate::trace::ExecutionTrace;
 use common::Result;
 use common::cancellation::CancellationToken;
 use common::protocol::{
-    DataSink, DataSource, ExecuteTask, JoinKind, JoinPlan, PhysicalPlanNode, PhysicalPlanOperator,
+    DataSink, DataSource, ExecuteTask, JoinPlan, PhysicalPlanNode, PhysicalPlanOperator,
     PipelineBoundaryKind,
 };
 use common::statistics::QueryStatisticsContext;

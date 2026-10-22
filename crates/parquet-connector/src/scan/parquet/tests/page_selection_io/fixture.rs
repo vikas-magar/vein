@@ -1,24 +1,7 @@
-use std::ops::Range;
-use std::sync::{Arc, Mutex};
-
-use arrow::array::{AsArray, Int32Array};
-use arrow::datatypes::{Field, Schema};
-use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
-use futures::future::{BoxFuture, FutureExt};
-use futures::TryStreamExt;
-use parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, RowSelection, RowSelector,
-};
-use parquet::arrow::async_reader::{
-    AsyncFileReader, ParquetRecordBatchStreamBuilder, RowGroupSelection,
-};
-use parquet::arrow::ArrowWriter;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
-use parquet::file::properties::WriterProperties;
+use super::*;
 
 #[derive(Clone)]
-struct RecordingReader {
+pub(super) struct RecordingReader {
     bytes: Bytes,
     ranges: Arc<Mutex<Vec<Range<usize>>>>,
 }
@@ -41,9 +24,12 @@ impl AsyncFileReader for RecordingReader {
         futures::future::ready(metadata).boxed()
     }
 }
-
-#[tokio::test]
-async fn reader_does_not_request_skipped_data_page_bytes() {
+pub(super) async fn indexed_file() -> (
+    ParquetRecordBatchStreamBuilder<RecordingReader>,
+    Arc<Mutex<Vec<Range<usize>>>>,
+    Vec<parquet::file::page_index::offset_index::PageLocation>,
+    usize,
+) {
     let schema = Arc::new(Schema::new(vec![Field::new("value", arrow::datatypes::DataType::Int32, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -77,31 +63,5 @@ async fn reader_does_not_request_skipped_data_page_bytes() {
         .clone();
     assert!(locations.len() > 1, "test data must span multiple pages");
 
-    let skipped = &locations[0];
-    let skipped_start = usize::try_from(skipped.offset).unwrap();
-    let skipped_end = skipped_start + usize::try_from(skipped.compressed_page_size).unwrap();
-    let skipped_rows = usize::try_from(locations[1].first_row_index).unwrap();
-    let selection = RowSelection::from(vec![
-        RowSelector::skip(skipped_rows),
-        RowSelector::select(row_count - skipped_rows),
-    ]);
-    let row_group = RowGroupSelection::new(0, Some(selection)).with_page_locations(0, locations);
-
-    requested_ranges.lock().unwrap().clear();
-    let stream = builder
-        .with_row_group_selections(vec![row_group])
-        .build()
-        .unwrap();
-    let batches = stream.try_collect::<Vec<_>>().await.unwrap();
-    let values = batches
-        .iter()
-        .flat_map(|batch| batch.column(0).as_primitive::<arrow::datatypes::Int32Type>().values())
-        .copied()
-        .collect::<Vec<_>>();
-    assert_eq!(values, (skipped_rows as i32..row_count as i32).collect::<Vec<_>>());
-
-    let requests = requested_ranges.lock().unwrap();
-    assert!(requests.iter().all(|range| {
-        range.end <= skipped_start || range.start >= skipped_end
-    }), "skipped page bytes were requested: {requests:?}");
+    (builder, requested_ranges, locations, row_count)
 }

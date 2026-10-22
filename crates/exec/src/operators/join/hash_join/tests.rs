@@ -141,17 +141,17 @@ fn run_outer_join_with_residual(join_type: JoinType) -> Vec<[Option<i64>; 4]> {
         vec![DataType::Int64, DataType::Int64],
         Box::new(sink.clone()),
     )
-    .with_residual_filter(
-        vec![OutputColumn::Probe(1), OutputColumn::Build(1)],
-        Box::new(residual_transform),
-        collector,
-    );
+        .with_residual_filter(
+            vec![OutputColumn::Probe(1), OutputColumn::Build(1)],
+            Box::new(residual_transform),
+            collector,
+        );
 
     join.push(crate::pipeline::test_support::dense_view(vec![
         ints(&[1, 1, 1, 2]),
         nullable_ints(&[Some(1), Some(10), None, Some(9)]),
     ]))
-    .expect("probe rows");
+        .expect("probe rows");
     join.flush().expect("flush outer join");
 
     let chunks = sink.0.lock().expect("collect lock");
@@ -166,7 +166,7 @@ fn build(values: &[i64]) -> HashTable {
     sink.push(crate::pipeline::test_support::dense_view(vec![ints(
         values,
     )]))
-    .expect("build");
+        .expect("build");
     sink.finish()
 }
 
@@ -291,7 +291,7 @@ fn join_keeps_build_and_probe_payloads_as_views() {
                 selection,
             ),
         )
-        .unwrap();
+            .unwrap();
     }
     join.flush().unwrap();
     assert_eq!(
@@ -351,7 +351,7 @@ fn join_output_view_references_original_probe_and_build_payloads() {
         &mut join,
         crate::pipeline::test_support::dense_view(vec![probe_key, Arc::clone(&probe_payload)]),
     )
-    .expect("probe join");
+        .expect("probe join");
     PipelineNode::flush(&mut join).expect("flush join");
 
     let outputs = sink.0.lock().expect("view collector lock");
@@ -408,7 +408,7 @@ fn multiple_build_batches_preserve_duplicate_output_references() {
         &mut join,
         crate::pipeline::test_support::dense_view(vec![ints(&[7]), Arc::clone(&probe_payload)]),
     )
-    .unwrap();
+        .unwrap();
     join.flush().unwrap();
     let outputs = sink.0.lock().unwrap();
     assert_eq!(
@@ -455,7 +455,7 @@ fn zero_column_join_views_retain_match_cardinality() {
         &mut join,
         crate::pipeline::test_support::dense_view(vec![ints(&[7, 8, 7])]),
     )
-    .unwrap();
+        .unwrap();
     join.flush().unwrap();
     let outputs = sink.0.lock().unwrap();
     assert_eq!(
@@ -468,7 +468,7 @@ fn zero_column_join_views_retain_match_cardinality() {
             view,
             Arc::new(arrow::datatypes::Schema::empty()),
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(batch.num_rows(), view.num_rows());
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(report, MaterializationReport::default());
@@ -506,7 +506,7 @@ fn outer_join_views_preserve_payloads_with_empty_opposite_sides() {
                 &mut join,
                 crate::pipeline::test_support::dense_view(vec![probe]),
             )
-            .unwrap();
+                .unwrap();
             join.flush().unwrap();
             let outputs = sink.0.lock().unwrap();
             let emits = join_type == JoinType::Full
@@ -549,7 +549,7 @@ fn empty_build_null_extension_requires_declared_output_column() {
         &mut join,
         crate::pipeline::test_support::dense_view(vec![ints(&[10])]),
     )
-    .expect_err("missing build type must reject the output mapping");
+        .expect_err("missing build type must reject the output mapping");
     assert!(
         error.to_string().contains("missing column 0 in input 1"),
         "{error}"
@@ -573,7 +573,7 @@ fn inner_join_end_to_end() {
     join.push(crate::pipeline::test_support::dense_view(vec![ints(&[
         10, 20,
     ])]))
-    .expect("probe");
+        .expect("probe");
     join.flush().expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
@@ -605,7 +605,7 @@ fn cross_join_emits_cartesian_product_with_empty_key_vectors() {
     join.push(crate::pipeline::test_support::dense_view(vec![Arc::clone(
         &probe_values,
     )]))
-    .expect("probe cross join rows");
+        .expect("probe cross join rows");
     join.flush().expect("flush cross join");
 
     let chunks = sink.0.lock().expect("collect lock");
@@ -686,7 +686,7 @@ fn semi_join_emits_a_probe_row_once_despite_duplicate_build_matches() {
     join.push(crate::pipeline::test_support::dense_view(vec![ints(&[
         20, 10, 30,
     ])]))
-    .expect("probe");
+        .expect("probe");
     join.flush().expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
@@ -769,7 +769,7 @@ fn semi_join_emits_no_chunk_when_no_probe_key_matches() {
     join.push(crate::pipeline::test_support::dense_view(vec![ints(&[
         10, 30,
     ])]))
-    .expect("probe");
+        .expect("probe");
     join.flush().expect("flush");
 
     assert!(sink.0.lock().expect("collect lock").is_empty());
@@ -790,7 +790,7 @@ fn anti_join_keeps_nonmatching_and_null_probe_keys() {
     join.push(crate::pipeline::test_support::dense_view(vec![Arc::new(
         Int64Array::from(vec![Some(20), Some(10), None]),
     )]))
-    .expect("probe");
+        .expect("probe");
     join.flush().expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
@@ -859,7 +859,7 @@ fn single_join_checks_cardinality_and_keeps_both_input_buffers() {
         probe_keys,
         Arc::clone(&probe_payload),
     ]))
-    .expect("single match should not multiply probe rows");
+        .expect("single match should not multiply probe rows");
     join.flush().expect("flush single join");
 
     let chunks = sink.0.lock().expect("collect lock");
@@ -953,12 +953,12 @@ fn inner_join_preserves_duplicate_output_across_probe_batches() {
         ints(&[7]),
         ints(&[700]),
     ]))
-    .expect("first probe batch");
+        .expect("first probe batch");
     join.push(crate::pipeline::test_support::dense_view(vec![
         ints(&[9, 7]),
         ints(&[900, 701]),
     ]))
-    .expect("second probe batch");
+        .expect("second probe batch");
     join.flush().expect("flush join");
 
     let chunks = sink.0.lock().expect("collect lock");
@@ -1074,6 +1074,7 @@ fn inner_join_worker_local_probe_states_combine_duplicate_matches() {
 
 #[path = "tests/residual_projection.rs"]
 mod residual_projection;
+
 
 #[path = "tests/correlated_semi_anti.rs"]
 mod correlated_semi_anti;

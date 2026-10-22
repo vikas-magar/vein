@@ -25,12 +25,27 @@ pub enum JoinType {
     Semi,
     /// Each unmatched probe row once, without build-side columns.
     Anti,
+    /// Each matching build row once, without probe-side columns.
+    RightSemi,
+    /// Each unmatched build row once, without probe-side columns.
+    RightAnti,
     /// `NOT IN` anti join, with NULL handling supplied by the hash table.
     NullAwareAnti,
     /// One build row per probe row, or a cardinality error for multiple matches.
     Single,
     /// Every probe row paired with every build row.
     Cross,
+}
+
+impl JoinType {
+    /// Whether output depends on accumulated build-row match flags.
+    pub(crate) fn tracks_build_matches(self) -> bool {
+        matches!(self, Self::Right | Self::Full | Self::RightSemi | Self::RightAnti)
+    }
+
+    pub(crate) fn build_existence(self) -> bool {
+        matches!(self, Self::RightSemi | Self::RightAnti)
+    }
 }
 
 /// One output row, as references into the probe chunk and the retained build
@@ -60,6 +75,13 @@ pub fn output_rows(
     matches: &[(u32, (u32, u32))],
     unmatched_build: &[(u32, u32)],
 ) -> Vec<OutputRow> {
+    if join_type.build_existence() {
+        let mut seen = std::collections::HashSet::new();
+        let builds: Vec<_> = if join_type == JoinType::RightSemi {
+            matches.iter().filter_map(|(_, build)| seen.insert(*build).then_some(*build)).collect()
+        } else { unmatched_build.to_vec() };
+        return builds.into_iter().map(|build| OutputRow { probe: None, build: Some(build) }).collect();
+    }
     let mut rows = if matches!(join_type, JoinType::Inner | JoinType::Cross) {
         Vec::with_capacity(matches.len())
     } else {
