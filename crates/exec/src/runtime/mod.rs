@@ -56,7 +56,8 @@ mod join_utils;
 mod schedule;
 pub(crate) use crate::operators::source::scan::split_scan_by_file;
 use dependency_guard::PipelineDependencyGuard;
-use join_utils::{direct_scan_probe_columns, join_keys, join_outputs, join_type, join_types};
+use join_utils::{join_keys, join_outputs, join_type, join_types};
+use filter::lineage::direct_scan_probe_columns;
 use schedule::PipelineExecutionSchedule;
 
 mod builder;

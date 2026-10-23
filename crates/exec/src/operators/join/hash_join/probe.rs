@@ -10,6 +10,7 @@ use common::Result;
 use error::VeinError;
 
 use super::super::hash_table::HashTable;
+use super::super::hash_table::probe::metrics::ProbeMetrics;
 use super::super::rows::{JoinType, OutputRow};
 use super::super::spec::OutputColumn;
 use super::JoinFilterCollector;
@@ -65,6 +66,7 @@ pub struct HashJoin {
     pub(super) max_output_batch_rows: usize,
     pub(super) max_candidate_batch_rows: usize,
     pub(super) candidate_rows_examined: u64,
+    pub(super) probe_metrics: ProbeMetrics,
     residual_us: u64,
     /// Probe key conversions; residual predicate time is tracked separately.
     pub(super) probe_key_materialization: MaterializationReport,
@@ -143,6 +145,7 @@ impl HashJoin {
             max_output_batch_rows: 0,
             max_candidate_batch_rows: 0,
             candidate_rows_examined: 0,
+            probe_metrics: ProbeMetrics::default(),
             residual_us: 0,
             probe_key_materialization: MaterializationReport::default(),
             probe_key_materialize_us: 0,

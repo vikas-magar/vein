@@ -4,10 +4,13 @@ use std::collections::HashMap;
 use plan::{ColumnId, ColumnStatistics, LogicalExpr, LogicalLiteral, VeinSchema};
 use parser::ast::expr::BinaryOp;
 use super::{Estimate, EstimateSource};
+mod prior;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ColumnEstimate<'a> {
     pub distinct: Option<f64>,
+    /// A cost-model prior is not measured NDV and must not imply unique-value filtering.
+    pub distinct_is_prior: bool,
     pub null_fraction: Option<f64>,
     pub min: Option<&'a LogicalLiteral>,
     pub max: Option<&'a LogicalLiteral>,
@@ -18,6 +21,15 @@ pub(crate) struct ColumnEstimate<'a> {
 }
 
 impl<'a> ColumnEstimate<'a> {
+    /// Distribution priors may guide filters only when bounds constrain their domain.
+    /// An unconstrained population-size prior must never imply a unique lookup.
+    pub(super) fn filter_distinct(&self) -> Option<f64> {
+        if !self.distinct_is_prior || self.min.zip(self.max)
+            .and_then(|(min, max)| prior::bounded_domain(min, max)).is_some() {
+            self.distinct
+        } else { None }
+    }
+
     pub fn from_statistics(
         stats: &'a ColumnStatistics,
         rows: u64,
@@ -39,7 +51,9 @@ impl<'a> ColumnEstimate<'a> {
         Ok(Self {
             // Missing per-column values use explicit model priors while retaining
             // every independently validated field from the supplied synopsis.
-            distinct: Some(stats.distinct_count.unwrap_or(rows - nulls.unwrap_or(0)) as f64),
+            distinct: Some(stats.distinct_count.map_or_else(
+                || prior::distinct_upper_bound(stats, rows), |count| count as f64)),
+            distinct_is_prior: stats.distinct_count.is_none(),
             null_fraction: Some(nulls.map_or(0.0, |n| {
                 if rows == 0 { 0.0 } else { n as f64 / rows as f64 }
             })),
@@ -99,6 +113,7 @@ impl<'a> RelationEstimate<'a> {
     pub fn add_cardinality_prior(&mut self, id: ColumnId, rows: u64) {
         self.columns.entry(id).or_insert(ColumnEstimate {
             distinct: Some(rows as f64),
+            distinct_is_prior: true,
             null_fraction: Some(0.0),
             min: None,
             max: None,
@@ -145,6 +160,7 @@ impl<'a> RelationEstimate<'a> {
                     if !matches!(value, LogicalLiteral::Null(_))
                         && let Some(stats) = self.columns.get_mut(&column.id) {
                             stats.distinct = Some(self.rows.value().unwrap_or(1.0).min(1.0));
+                            stats.distinct_is_prior = false;
                             stats.null_fraction = Some(0.0);
                             stats.min = Some(value);
                             stats.max = Some(value);
@@ -177,39 +193,5 @@ impl<'a> RelationEstimate<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use plan::ColumnId;
-
-    use super::*;
-    use crate::estimation::EstimateConfidence;
-
-    fn relation(distinct: f64) -> RelationEstimate<'static> {
-        let mut relation = RelationEstimate::new(Estimate::known(
-            50.0,
-            EstimateSource::Join,
-            EstimateConfidence::Model,
-        ));
-        relation.columns.insert(
-            ColumnId(1),
-            ColumnEstimate {
-                distinct: Some(distinct),
-                null_fraction: Some(0.0),
-                min: None,
-                max: None,
-                synopsis: None,
-                synopsis_population: None,
-            },
-        );
-        relation
-    }
-
-    #[test]
-    fn join_summary_comparison_includes_column_distributions() {
-        let first = relation(20.0);
-        let equivalent = relation(20.0);
-        let different_distribution = relation(10.0);
-
-        assert!(first.has_same_join_summary(&equivalent));
-        assert!(!first.has_same_join_summary(&different_distribution));
-    }
-}
+#[path = "columns/tests/mod.rs"]
+mod tests;

@@ -15,11 +15,14 @@ pub(super) fn is_reorderable_join(plan: &LogicalPlan) -> bool {
     if *join_type != JoinType::Inner || !using.is_empty() {
         return false;
     }
-    let Some(atoms) = equi_atoms(on) else {
+    let atoms = crate::rules::predicate_analysis::conjuncts(on);
+    if atoms.iter().any(|expression| !expression.is_reorder_safe() || expression.is_volatile()) {
         return false;
-    };
-    !atoms.is_empty()
-        && atoms.iter().all(|expression| {
+    }
+    atoms.iter().any(|expression| {
+        if !matches!(expression, LogicalExpr::BinaryOp { op: BinaryOp::Eq, .. }) {
+            return false;
+        }
         let LogicalExpr::BinaryOp { left: a, right: b, .. } = expression else {
             return false;
         };
@@ -40,6 +43,7 @@ pub(super) fn is_reorderable_join(plan: &LogicalPlan) -> bool {
     })
 }
 
+#[cfg(test)]
 pub(super) fn equi_atoms(expression: &LogicalExpr) -> Option<Vec<&LogicalExpr>> {
     let mut pending = vec![expression];
     let mut atoms = Vec::new();

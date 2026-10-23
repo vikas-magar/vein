@@ -41,7 +41,10 @@ fn selective_connected_inner_joins_choose_smaller_intermediate_and_preserve_sche
         2
     );
     assert!(decision.alternatives.iter().any(|alternative| {
-        alternative.cost.local_cost == Some(alternative.output_rows)
+            alternative.cost.local_cost == Some(
+                2.0 * alternative.left_rows.min(alternative.right_rows)
+                    + alternative.left_rows.max(alternative.right_rows)
+                    + alternative.output_rows)
             && (alternative.cost.left_subtree_cost
             + alternative.cost.right_subtree_cost
             + alternative.cost.local_cost.unwrap()
@@ -50,7 +53,7 @@ fn selective_connected_inner_joins_choose_smaller_intermediate_and_preserve_sche
 }
 
 #[test]
-fn inconsistent_decomposition_estimates_preserve_original_join_tree() {
+fn inconsistent_decomposition_estimates_use_a_complete_costed_greedy_tree() {
     let a = scan("a", 1_000, &[(1, "a_ab", 100), (2, "a_ac", 1_000)]);
     let b = scan("b", 1_000, &[(3, "b_ab", 100), (4, "b_bc", 10)]);
     let c = scan("c", 1_000, &[(5, "c_bc", 10), (6, "c_ac", 1_000)]);
@@ -66,12 +69,15 @@ fn inconsistent_decomposition_estimates_preserve_original_join_tree() {
         .optimize_with_diagnostics(plan)
         .expect("ambiguous estimates should safely fall back");
 
-    assert_eq!(optimized, original);
+    assert_ne!(optimized, original);
+    assert_eq!(optimized.schema(), original.schema());
     assert_eq!(join_equality_count(&optimized), 3);
     assert_eq!(
         diagnostics.join_order_decisions[0].outcome,
-        JoinOrderOutcome::AmbiguousEstimates
+        JoinOrderOutcome::Reordered
     );
+    let decision = &diagnostics.join_order_decisions[0];
+    assert!(decision.selected_cost < decision.original_cost);
 }
 
 #[test]

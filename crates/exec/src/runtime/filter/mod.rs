@@ -8,6 +8,7 @@ mod policy;
 mod set;
 mod join_runtime_filter;
 mod join_runtime_filter_context;
+pub(in crate::runtime) mod lineage;
 
 pub use contract::{RuntimeFilter, RuntimeFilterBuildInput, RuntimeFilterFactory};
 pub use policy::{

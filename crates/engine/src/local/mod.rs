@@ -8,7 +8,8 @@ mod query;
 mod stream;
 mod tasks;
 mod adaptive;
-pub use adaptive::{AdaptiveBoundary, AdaptiveCheckpointPolicy, StatisticsCheckpointPolicy};
+pub use adaptive::{AdaptiveBoundary, AdaptiveCheckpointPolicy, CheckpointCostModel,
+    CheckpointWork, CostedCheckpointPolicy, InputDominanceCost, StatisticsCheckpointPolicy};
 pub use builder::LocalEngineBuilder;
 pub use components::LocalEngineComponents;
 pub use engine::LocalQueryEngine;

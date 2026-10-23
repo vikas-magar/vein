@@ -26,7 +26,7 @@ pub(crate) use columns::RelationEstimate;
 
 impl ColumnStatisticsLookup for std::collections::HashMap<plan::ColumnId, ColumnEstimate<'_>> {
     fn distribution(&self, id: plan::ColumnId) -> Option<(Option<f64>, Option<f64>)> {
-        self.get(&id).map(|c| (c.distinct, c.null_fraction))
+        self.get(&id).map(|c| (c.filter_distinct(), c.null_fraction))
     }
 
     fn bounds(&self, id: plan::ColumnId) -> Option<(Option<&plan::LogicalLiteral>, Option<&plan::LogicalLiteral>)> {

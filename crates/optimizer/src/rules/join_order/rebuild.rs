@@ -56,12 +56,7 @@ fn build_subset(
     let predicates = prepared
         .predicates
         .iter()
-        .filter(|predicate| {
-            let first = 1usize << predicate.left_relation;
-            let second = 1usize << predicate.right_relation;
-            (left_mask & first != 0 && right_mask & second != 0)
-                || (left_mask & second != 0 && right_mask & first != 0)
-        })
+        .filter(|predicate| predicates::crosses(predicate.relations, left_mask, right_mask))
         .map(|predicate| predicate.expression.clone())
         .collect::<Vec<_>>();
     let on = predicates

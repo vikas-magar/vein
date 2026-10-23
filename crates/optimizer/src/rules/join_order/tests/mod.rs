@@ -17,3 +17,4 @@ mod checkpoints;
 mod costing;
 mod boundaries;
 mod greedy;
+mod residuals;

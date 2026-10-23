@@ -10,7 +10,7 @@ use plan::{LogicalPlan, PlanTraversal};
 mod checkpoint_identity;
 mod execution;
 mod policy;
-pub use policy::StatisticsCheckpointPolicy;
+pub use policy::{CheckpointCostModel, CheckpointWork, CostedCheckpointPolicy, InputDominanceCost, StatisticsCheckpointPolicy};
 pub(super) use execution::{AdaptiveCoordinator, prepare_checkpoint};
 
 /// Chooses one complete input to an unexecuted join. Implementations can use

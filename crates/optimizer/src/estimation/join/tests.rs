@@ -17,6 +17,7 @@ fn relation(column_id: usize) -> RelationEstimate<'static> {
         ColumnId(column_id),
         ColumnEstimate {
             distinct: Some(10.0),
+            distinct_is_prior: false,
             null_fraction: Some(0.0),
             min: None,
             max: None,

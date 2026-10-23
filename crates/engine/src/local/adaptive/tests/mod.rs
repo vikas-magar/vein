@@ -5,6 +5,7 @@ mod policy_eligibility;
 mod policy_selection;
 mod replay_safety;
 mod support;
+mod cost;
 
 use super::*;
 use catalog::TableMetadata;

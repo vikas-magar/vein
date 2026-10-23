@@ -142,6 +142,7 @@ fn estimate(expr: &LogicalExpr, columns: &dyn ColumnStatisticsLookup, depth: usi
             super::comparison::estimate(
                 ColumnEstimate {
                     distinct,
+                    distinct_is_prior: false,
                     null_fraction,
                     min,
                     max,

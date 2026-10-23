@@ -120,58 +120,16 @@ impl JoinGraph<'_> {
             let Some(on) = on.as_ref() else {
                 unreachable!("join eligibility requires a predicate");
             };
-            let Some(atoms) = equi_atoms(on) else {
+            let Some(predicates) = predicates::collect(
+                on, &column_relations, left_mask | right_mask, &mut adjacency,
+            ) else {
                 return Err(GraphFailure {
                     relation_count,
                     relation_labels: labels,
                     outcome: JoinOrderOutcome::UnsupportedShape,
                 });
             };
-            for expression in atoms {
-                let LogicalExpr::BinaryOp { left: a, right: b, .. } = expression else {
-                    unreachable!("equi_atoms returns equality expressions");
-                };
-                let (LogicalExpr::Column(a), LogicalExpr::Column(b)) =
-                    (a.as_ref(), b.as_ref())
-                else {
-                    unreachable!("equi_atoms validates column operands");
-                };
-                let (Some(&a_relation), Some(&b_relation)) = (
-                    column_relations.get(&a.id),
-                    column_relations.get(&b.id),
-                ) else {
-                    return Err(GraphFailure {
-                        relation_count,
-                        relation_labels: labels,
-                        outcome: JoinOrderOutcome::UnsupportedShape,
-                    });
-                };
-                if a_relation == b_relation {
-                    return Err(GraphFailure {
-                        relation_count,
-                        relation_labels: labels,
-                        outcome: JoinOrderOutcome::UnsupportedShape,
-                    });
-                }
-                let a_bit = 1usize << a_relation;
-                let b_bit = 1usize << b_relation;
-                let crosses_children = (left_mask & a_bit != 0 && right_mask & b_bit != 0)
-                    || (left_mask & b_bit != 0 && right_mask & a_bit != 0);
-                if !crosses_children {
-                    return Err(GraphFailure {
-                        relation_count,
-                        relation_labels: labels,
-                        outcome: JoinOrderOutcome::UnsupportedShape,
-                    });
-                }
-                adjacency[a_relation] |= b_bit;
-                adjacency[b_relation] |= a_bit;
-                graph_predicates.push(JoinPredicate {
-                    expression,
-                    left_relation: a_relation,
-                    right_relation: b_relation,
-                });
-            }
+            graph_predicates.extend(predicates);
         }
 
         Ok(JoinGraph {

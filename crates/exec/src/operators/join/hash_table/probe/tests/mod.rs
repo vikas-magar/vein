@@ -3,6 +3,9 @@ use crate::operators::join::JoinKeys;
 use crate::pipeline::test_support::dense_view;
 use arrow::array::{ArrayRef, Int64Array};
 use std::sync::Arc;
+mod metrics;
+mod control;
+mod windows;
 
 fn view(values: Vec<Option<i64>>) -> DataChunkView {
     dense_view(vec![Arc::new(Int64Array::from(values)) as ArrayRef])

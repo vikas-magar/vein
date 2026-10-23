@@ -19,10 +19,12 @@ use crate::rule::{OptimizerRule, RuleType};
 
 
 mod cost;
+mod work_cost;
 mod diagnostics;
 mod eligibility;
 mod exact;
 mod graph;
+mod predicates;
 mod greedy;
 mod search_state;
 mod helpers;
@@ -30,9 +32,12 @@ mod rebuild;
 mod rule;
 
 pub use cost::{CumulativeCardinalityCost, JoinCostInput, JoinCostModel};
+pub use work_cost::HashJoinWorkCost;
 pub use rule::JoinOrderRule;
 use diagnostics::log_decision;
-use eligibility::{equi_atoms, is_reorderable_join};
+use eligibility::is_reorderable_join;
+#[cfg(test)]
+use eligibility::equi_atoms;
 use exact::enumerate;
 use helpers::*;
 use rebuild::rebuild;
@@ -54,14 +59,12 @@ struct GraphFailure {
 
 struct JoinPredicate<'a> {
     expression: &'a LogicalExpr,
-    left_relation: usize,
-    right_relation: usize,
+    relations: usize,
 }
 
 struct OwnedPredicate {
     expression: LogicalExpr,
-    left_relation: usize,
-    right_relation: usize,
+    relations: usize,
 }
 
 struct PreparedJoinOrder {

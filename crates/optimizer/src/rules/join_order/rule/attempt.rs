@@ -48,9 +48,10 @@ impl<C: JoinCostModel> JoinOrderRule<C> {
             greedy::enumerate(&graph, context, config, &self.cost_model)
         } else {
             match enumerate(&graph, context, config, &self.cost_model) {
-                SearchResult::Fallback { outcome: JoinOrderOutcome::SearchBudgetExceeded, .. } => {
+                SearchResult::Fallback { outcome, .. } if matches!(outcome,
+                    JoinOrderOutcome::SearchBudgetExceeded | JoinOrderOutcome::AmbiguousEstimates) => {
                     tracing::debug!(target: "vein.optimizer", event = "optimizer_join_search_strategy",
-                        strategy = "greedy", reason = "exact_search_budget", relations = graph.leaves.len());
+                        strategy = "greedy", reason = ?outcome, relations = graph.leaves.len());
                     greedy::enumerate(&graph, context, config, &self.cost_model)
                 }
                 result => result,
@@ -77,8 +78,7 @@ impl<C: JoinCostModel> JoinOrderRule<C> {
                     .predicates
                     .iter()
                     .map(|predicate| OwnedPredicate {
-                        left_relation: predicate.left_relation,
-                        right_relation: predicate.right_relation,
+                        relations: predicate.relations,
                         expression: predicate.expression.clone(),
                     })
                     .collect();

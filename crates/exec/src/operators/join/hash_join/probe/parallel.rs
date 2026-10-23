@@ -55,6 +55,7 @@ impl HashJoin {
         target.probed_rows = target.probed_rows.saturating_add(self.probed_rows);
         target.matched_rows = target.matched_rows.saturating_add(self.matched_rows);
         target.candidate_rows_examined = target.candidate_rows_examined.saturating_add(self.candidate_rows_examined);
+        target.probe_metrics.accumulate(self.probe_metrics);
         target.max_candidate_batch_rows = target.max_candidate_batch_rows.max(self.max_candidate_batch_rows);
         target.output_batches = target.output_batches.saturating_add(self.output_batches);
         target.output_rows = target.output_rows.saturating_add(self.output_rows);

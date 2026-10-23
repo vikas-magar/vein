@@ -82,15 +82,11 @@ pub(super) fn crossing_predicates<'a>(
     left: usize,
     right: usize,
 ) -> Vec<&'a LogicalExpr> {
+    if !predicates::has_edge(left, right, &graph.adjacency) { return Vec::new(); }
     graph
         .predicates
         .iter()
-        .filter(|predicate| {
-            let first = 1usize << predicate.left_relation;
-            let second = 1usize << predicate.right_relation;
-            (left & first != 0 && right & second != 0)
-                || (left & second != 0 && right & first != 0)
-        })
+        .filter(|predicate| predicates::crosses(predicate.relations, left, right))
         .map(|predicate| predicate.expression)
         .collect()
 }

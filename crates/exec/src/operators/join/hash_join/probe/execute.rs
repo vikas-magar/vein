@@ -61,6 +61,7 @@ impl HashJoin {
             if self.next.finished() { break; }
         }
         self.candidate_rows_examined = self.candidate_rows_examined.saturating_add(cursor.examined);
+        self.probe_metrics.accumulate(cursor.metrics);
         if self.next.finished() { return Ok(()); }
         if !existence && !matches!(self.join_type, JoinType::Left | JoinType::Full | JoinType::Single) { return Ok(()); }
         let mut remaining = Vec::new();

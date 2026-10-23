@@ -1,13 +1,12 @@
 //! Adapts compiled Vein and runtime predicates to Parquet's late materializer.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::datatypes::Schema;
 use common::Result;
 use common::protocol::ScanPredicate;
 use parquet::arrow::arrow_reader::{
-    ArrowPredicate, ArrowPredicateFn, PredicateOrderPolicy, RowFilter,
+    ArrowPredicate, PredicateOrderPolicy, RowFilter,
 };
 use parquet::schema::types::SchemaDescriptor;
 use types::VeinSchema;
@@ -18,8 +17,10 @@ use functions::FunctionRegistry;
 
 #[path = "row_filter/expression.rs"]
 mod expression;
+#[path = "row_filter/runtime.rs"]
+mod runtime;
 use expression::{
-    ExpressionPredicateRequest, as_arrow_error, expression_predicate, predicate_projection,
+    ExpressionPredicateRequest, expression_predicate,
 };
 
 use super::super::metrics::ScanPredicateMetrics;
@@ -62,7 +63,7 @@ pub fn build_scan_predicates(context: ScanPredicateContext<'_>) -> Result<ScanPr
         runtime_filters,
         adaptive_order,
         expression_kernels,
-    } = context;
+    } = &context;
     let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
     let mut stage_metrics = Vec::new();
     let mut reorder_safe = true;
@@ -89,7 +90,7 @@ pub fn build_scan_predicates(context: ScanPredicateContext<'_>) -> Result<ScanPr
                 stage,
                 path,
                 registry: Arc::clone(registry),
-                detailed: detailed_metrics_enabled,
+                detailed: *detailed_metrics_enabled,
                 expression_kernels: Arc::clone(expression_kernels),
                 total_metrics: Arc::clone(predicate_metrics),
                 stage_metrics: metrics,
@@ -104,44 +105,32 @@ pub fn build_scan_predicates(context: ScanPredicateContext<'_>) -> Result<ScanPr
             .flat_map(|binding| binding.filter_names())
             .collect::<Vec<_>>();
         let filter_count = bindings.len();
+        let runtime_start = predicates.len();
         for (index, binding) in bindings.into_iter().enumerate() {
             reorder_safe &= binding.reorder_safe();
             let stage_filter_names = binding.filter_names();
             let key_columns = binding.columns().len();
-            let (mask, positions) =
-                predicate_projection(arrow_schema, parquet_schema, binding.columns(), path)?;
-            let record_source_rows = predicates.is_empty() && index == 0;
-            let metrics = Arc::clone(predicate_metrics);
-            let first_filter = Arc::new(AtomicBool::new(record_source_rows));
-            let record_first_filter = Arc::clone(&first_filter);
-            predicates.push(Box::new(
-                ArrowPredicateFn::new(mask, move |batch| {
-                    if record_first_filter.load(Ordering::Relaxed) {
-                        metrics.record_source_rows(batch.num_rows());
-                    }
-                    let view = exec::pipeline::arrow_adapter::from_record_batch_ref(&batch)
-                        .and_then(|view| view.project(&positions))
-                        .map_err(as_arrow_error)?;
-                    binding.evaluate(&Arc::new(view)).map_err(as_arrow_error)
-                })
-                    .with_first_filter_callback(move |first| {
-                        first_filter.store(first, Ordering::Relaxed);
-                    }),
-            ));
+            let metrics = Arc::new(ScanPredicateMetrics::default());
+            stage_metrics.push((runtime_start + index, stage_filter_names.len(),
+                binding.columns().iter().map(|column| column.name.clone()).collect(),
+                Arc::clone(&metrics)));
+            predicates.push(runtime::predicate(&context, binding, metrics,
+                predicates.is_empty() && index == 0)?);
             tracing::debug!(target: "vein.parquet_runtime_filter",
                 event = "scan_runtime_filter_stage_bound",
-                source_id = %common::logging::LogLocation::from(path),
+                source_id = %common::logging::LogLocation::from(*path),
                 filters = ?stage_filter_names, stage_index = index,
                 stage_count = filter_count, key_columns,
                 "runtime filter installed as an independent Parquet row-filter stage");
         }
         tracing::info!(target: "vein.parquet_runtime_filter",
             event = "scan_runtime_filters_bound",
-            source_id = %common::logging::LogLocation::from(path),
+            source_id = %common::logging::LogLocation::from(*path),
             filter_names = ?filter_names, stage_count = filter_count,
             filter_bytes = runtime_filters.memory_bytes(),
             execution_stage = "ordered_parquet_row_filter_before_output_decode",
-            participates_in_parquet_page_pruning = false,
+            metadata_pruning = "supported_runtime_statistics_predicates",
+            membership_stage = "row_filter",
             "runtime filters bound as separate scan predicates");
     }
 
@@ -160,7 +149,7 @@ pub fn build_scan_predicates(context: ScanPredicateContext<'_>) -> Result<ScanPr
         }
         None
     } else {
-        AdaptiveFilterOrder::for_scan(adaptive_order, stage_count, pushdown, projected, runtime_filters)
+        AdaptiveFilterOrder::for_scan(adaptive_order.clone(), stage_count, *pushdown, projected, runtime_filters)
     };
     let row_filter = if has_row_filter {
         let row_filter = RowFilter::new(predicates);

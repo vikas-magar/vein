@@ -3,14 +3,14 @@ use super::*;
 mod attempt;
 
 /// Statistics-driven join-order rule using a bounded exact subset search.
-pub struct JoinOrderRule<C = CumulativeCardinalityCost> {
+pub struct JoinOrderRule<C = HashJoinWorkCost> {
     cost_model: C,
 }
 
-impl Default for JoinOrderRule<CumulativeCardinalityCost> {
+impl Default for JoinOrderRule<HashJoinWorkCost> {
     fn default() -> Self {
         Self {
-            cost_model: CumulativeCardinalityCost,
+            cost_model: HashJoinWorkCost::default(),
         }
     }
 }

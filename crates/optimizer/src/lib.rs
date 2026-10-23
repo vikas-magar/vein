@@ -41,7 +41,7 @@ pub use rules::{
     scan_statistics_pruning::ScanStatisticsPruningRule,
 };
 
-/// Join-order cost model extension point and default cumulative-cardinality model.
+/// Join-order cost models and their extension point.
 pub use rules::join_order::{
-    CumulativeCardinalityCost, JoinCostInput, JoinCostModel, JoinOrderRule,
+    CumulativeCardinalityCost, HashJoinWorkCost, JoinCostInput, JoinCostModel, JoinOrderRule,
 };

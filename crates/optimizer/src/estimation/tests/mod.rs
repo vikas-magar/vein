@@ -6,6 +6,7 @@ mod joins;
 mod operators;
 mod integration;
 mod edges;
+mod missing_ndv;
 
 use std::sync::Arc;
 use parser::ast::{expr::BinaryOp, pipe_op::JoinType};

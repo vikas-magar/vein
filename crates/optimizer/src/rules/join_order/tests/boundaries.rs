@@ -44,7 +44,7 @@ fn outer_join_is_a_reordering_boundary() {
 }
 
 #[test]
-fn residual_inner_join_predicate_is_a_reordering_boundary() {
+fn safe_residual_inner_join_predicate_participates_in_search() {
     let a = scan("a", 100, &[(1, "a_key", 10)]);
     let b = scan("b", 100, &[(2, "b_key", 10)]);
     let c = scan("c", 100, &[(3, "c_key", 10)]);
@@ -77,12 +77,12 @@ fn residual_inner_join_predicate_is_a_reordering_boundary() {
 
     let (optimized, diagnostics) = optimizer(JoinOrderConfig::default())
         .optimize_with_diagnostics(plan)
-        .expect("residual predicates must not be reassociated");
+        .expect("safe residual predicates may be reassociated");
 
     assert_eq!(optimized, original);
     assert_eq!(diagnostics.join_order_decisions.len(), 1);
     let decision = &diagnostics.join_order_decisions[0];
-    assert_eq!(decision.relation_count, 2);
+    assert_eq!(decision.relation_count, 3);
     assert_eq!(decision.outcome, JoinOrderOutcome::NoImprovement);
     assert!(decision.original_cost.is_some());
     assert_eq!(decision.original_order, decision.selected_order);

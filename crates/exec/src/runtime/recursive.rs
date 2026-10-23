@@ -500,10 +500,11 @@ impl DefaultTaskExecutor {
                     PhysicalPlanOperator::Transform { input, program } => {
                         let transform = self.builder.build_expression_executor(program, next)?;
                         let bytes = self
-                            .execute_input(
+                            .execute_input_with_runtime_filters(
                                 input,
                                 Box::new(TransformHandle(transform)),
                                 context,
+                                runtime_filters,
                                 depth + 1,
                             )
                             .await?;
