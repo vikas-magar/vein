@@ -2,7 +2,7 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 use error::{Result, VeinError};
 
-use crate::{FunctionInput, FunctionInputSegment, FunctionOutput};
+use crate::{FunctionInput, FunctionInputSegment, FunctionOutput, OutputSegment};
 
 /// Applies a vector kernel to aligned source runs without gathering columns.
 pub(crate) fn invoke_segments<F>(
@@ -31,16 +31,21 @@ where
         let segments = arguments.iter()
             .map(|argument| argument.segment(offset, row_count - offset))
             .collect::<Result<Vec<_>>>()?;
-        let length = segments.iter().filter(|segment| !segment.is_scalar())
+        let length = segments.iter()
             .map(FunctionInputSegment::len).min()
-            .ok_or_else(|| VeinError::internal("function has no column input segment"))?;
+            .ok_or_else(|| VeinError::internal("function has no input segment"))?;
         if length == 0 {
             return Err(VeinError::internal("function received an empty input segment"));
         }
-        outputs.push(validate(evaluate(&segments, length)?, length, return_type)?);
+        let scalar = segments.iter().all(FunctionInputSegment::is_scalar);
+        let physical_rows = if scalar { 1 } else { length };
+        let segments = segments.into_iter().map(|segment| segment.prefix(physical_rows))
+            .collect::<Result<Vec<_>>>()?;
+        let output = validate(evaluate(&segments, physical_rows)?, physical_rows, return_type)?;
+        outputs.push(OutputSegment::new(output, length, scalar)?);
         offset += length;
     }
-    FunctionOutput::from_segments(outputs)
+    FunctionOutput::from_runs(outputs)
 }
 
 fn validate(array: ArrayRef, rows: usize, data_type: &DataType) -> Result<ArrayRef> {
@@ -52,3 +57,6 @@ fn validate(array: ArrayRef, rows: usize, data_type: &DataType) -> Result<ArrayR
     }
     Ok(array)
 }
+
+#[cfg(test)]
+mod tests;

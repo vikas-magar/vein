@@ -45,6 +45,17 @@ impl FunctionInputSegment {
     /// Shared Arrow handle for kernels that use Arrow APIs directly.
     pub fn array_ref(&self) -> Option<&ArrayRef> { self.array.as_ref() }
 
+    /// Restricts the logical run using Arrow slices or a shared scalar handle.
+    pub fn prefix(self, len: usize) -> Result<Self> {
+        if len == 0 || len > self.len {
+            return Err(VeinError::internal("function segment prefix is outside its range"));
+        }
+        let array = self.array.map(|array| {
+            if self.scalar { array } else { array.slice(0, len) }
+        });
+        Self::new(array, self.scalar, len, self.data_type)
+    }
+
     /// Resolves a segment-local row, preserving scalar broadcasting.
     pub fn row(&self, row: usize) -> Result<Option<FunctionInputRow>> {
         if row >= self.len {

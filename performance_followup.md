@@ -10,21 +10,26 @@
 - [x] Introduce an injectable build/probe/output work cost model.
 - [ ] General delimiter-domain/dependent execution: design approval pending.
 - [x] Execute Q1–Q22 once and compare all successful results with DuckDB.
-- [ ] Fix six execution failures exposed by the full query pass; approval pending.
-- [ ] Rerun the failed queries and repeat the full suite after their fixes.
+- [x] Fix six execution failures through shared scalar-run output semantics.
+- [x] Rerun all 22 queries after the fix and compare complete result values.
+- [x] Run the workspace suite after the fix: 1,308 passed, zero failed.
 - [ ] Repeat paired performance measurements; current timings are individual observations.
 
 ## Validation
 
-Latest completed workspace Test: 1,295 tests passed, zero failed.
+Latest completed workspace Test: 1,308 tests passed, zero failed.
 Check and incremental build passed after the latest formatting changes.
-All 16 successful TPC-H queries matched DuckDB values.
-Q1 has output type differences despite matching numeric results within the comparison tolerance.
-Q7, Q8, Q9, Q11, Q12, and Q16 failed execution and have no correctness comparison.
+RustRover's named Build configuration failed to launch; its incremental build tool passed.
+All 22 TPC-H queries now execute and match DuckDB result values.
+Q1, Q7, Q8, Q9, Q11, and Q12 have output type differences despite matching numeric values.
+The former Q7/Q8/Q9/Q11/Q12/Q16 scalar-run execution failures are repaired.
 
 ## Timing observations
 
-Current development build; OS cache uncontrolled; one run per query.
+Latest complete validation pass: all Q1–Q22 queries, run sequentially.
+Current development build; OS cache uncontrolled; one run per query in this pass.
+This pass follows the shared repeated-run expression fix. The six affected queries were
+validated first, followed by the other 16; each query completed before the next started.
 Vein time is its reported execution phase, excluding preparation and JSON output formatting.
 DuckDB time is its CLI timer for the result-producing SQL, including result presentation.
 These scopes differ and are not a fair repeated engine-only benchmark.
@@ -32,36 +37,36 @@ JSON output is unlimited so complete rows can be checked.
 
 | Query | Vein execution ms | DuckDB CLI timer ms | Result |
 |---|---:|---:|---|
-| Q1 | 966.5 | 104.0 | Values match; output types differ |
-| Q2 | 630.2 | 25.0 | Values match |
-| Q3 | 279.1 | 76.0 | Values match |
-| Q4 | 169.8 | 42.0 | Values match |
-| Q5 | 260.2 | 60.0 | Values match |
-| Q6 | 118.2 | 36.0 | Values match |
-| Q7 | — | — | Execution error: mapped expression kernel returned 1 rows for a 2-row segment |
-| Q8 | — | — | Execution error: mapped expression kernel returned 1 rows for a 2-row segment |
-| Q9 | — | — | Execution error: function has no column input segment |
-| Q10 | 973.9 | 212.0 | Values match |
-| Q11 | — | — | Execution error: mapped expression kernel returned 1 rows for a 1024-row segment |
-| Q12 | — | — | Execution error: mapped expression kernel returned 1 rows for a 2-row segment |
-| Q13 | 866.0 | 107.0 | Values match |
-| Q14 | 150.0 | 54.0 | Values match |
-| Q15 | 410.6 | 38.0 | Values match |
-| Q16 | — | — | Execution error: mapped expression kernel returned 1 rows for a 4-row segment |
-| Q17 | 4878.6 | 68.0 | Values match |
-| Q18 | 8574.9 | 89.0 | Values match |
-| Q19 | 291.2 | 73.0 | Values match |
-| Q20 | 3195.1 | 52.0 | Values match |
-| Q21 | 518.0 | 165.0 | Values match |
-| Q22 | 452.0 | 19.0 | Values match |
+| Q1 | 915.6 | 103.0 | Values match; output types differ |
+| Q2 | 623.3 | 25.0 | Values match |
+| Q3 | 267.8 | 76.0 | Values match |
+| Q4 | 168.6 | 42.0 | Values match |
+| Q5 | 248.8 | 58.0 | Values match |
+| Q6 | 115.1 | 34.0 | Values match |
+| Q7 | 342.7 | 65.0 | Values match; output types differ |
+| Q8 | 369.3 | 76.0 | Values match; output types differ |
+| Q9 | 1499.5 | 128.0 | Values match; output types differ |
+| Q10 | 988.4 | 210.0 | Values match |
+| Q11 | 114.1 | 12.0 | Values match; output types differ |
+| Q12 | 226.7 | 45.0 | Values match; output types differ |
+| Q13 | 786.7 | 104.0 | Values match |
+| Q14 | 137.5 | 49.0 | Values match |
+| Q15 | 374.3 | 39.0 | Values match |
+| Q16 | 1374.0 | 44.0 | Values match |
+| Q17 | 4724.6 | 60.0 | Values match |
+| Q18 | 8543.9 | 86.0 | Values match |
+| Q19 | 325.6 | 71.0 | Values match |
+| Q20 | 3169.6 | 49.0 | Values match |
+| Q21 | 577.9 | 162.0 | Values match |
+| Q22 | 460.5 | 18.0 | Values match |
 
 Q13: 43 rows; exact typed multiset match.
 Q21: 650 rows; exact typed multiset match.
 The comparator preserves duplicates; this pass does not establish ORDER BY correctness.
 Floating comparisons use 8 ULP-scaled epsilons; decimal comparison is exact.
 
-Q10 additionally spent 13,050.7 ms formatting its 60,971 rows.
-Q3 additionally spent 1,220.7 ms formatting its 18,431 rows.
+Q10 additionally spent 2,526.9 ms formatting its 60,971 rows.
+Q3 additionally spent 148.5 ms formatting its 18,431 rows.
 Output conversion must be investigated separately from operator execution.
 
 ## Runtime-filter diagnosis
@@ -85,13 +90,13 @@ A diagnostic Q21 run showed:
 - 1,661 considered page-range visits; zero skipped ranges.
 - About 220.2 MB reported read across scan visits.
 These are aggregate visits across repeated scans, not distinct table populations.
-Verbose tracing execution was 1,412.3 ms; low-logging execution was 518.0 ms.
+Verbose tracing execution was 1,412.3 ms; earlier low-logging execution was 518.0 ms (latest rerun: 496.1 ms).
 Do not attribute that entire difference to logging without controlled repeated measurements.
 
 The runtime-bounds regression confirms that rejected page payload ranges are not read
 when metadata proves exclusion. This Q21 run offered no such exclusion.
 
-## Shared repeated-run expression bug
+## Shared repeated-run expression bug — fixed
 
 Source:
 - crates/exec/src/expression/value/segment.rs
@@ -101,18 +106,28 @@ Source:
 A view may resolve consecutive logical rows to one physical source row.
 Its segment is correctly represented as a scalar with a larger logical length.
 Unary and binary kernels may consequently return one physical result.
-The output segment collector incorrectly requires physical length equal to logical length.
-Function invocation also rejects a mapped input whose current runs are all scalar,
-even though the logical function arguments are column inputs.
+Previously the output collector incorrectly required physical length equal to logical length.
+Function invocation also rejected mapped column inputs whose current runs were all scalar.
+The fix preserves physical/logical lengths and aligns all arguments to the shortest run.
 
-Proposed fix:
-- One shared output-run contract containing the retained Arrow array and logical length.
+Implemented fix:
+- One shared functions::OutputSegment contract containing the retained Arrow array,
+  logical length, and explicit scalar flag.
 - Explicit dense versus repeated semantics; no copied broadcast array.
 - Preserve scalar-run semantics through chained expressions and function calls.
 - Validate kernel shape against whether inputs were scalar, rather than accepting
   every unexpected single-row output as a broadcast.
 - Cover arithmetic, comparisons, temporal functions, NULL runs, mixed dense/scalar
   runs, malformed outputs, and Arrow buffer identity.
+
+## Remaining output type differences
+
+- Q1: sum_charge decimal scale 8 in Vein versus 6 in DuckDB.
+- Q7/Q8/Q9: YEAR returns Int32 in Vein versus BIGINT in DuckDB.
+- Q11: total_value decimal scale 4 versus 2.
+- Q12: conditional SUM returns Int64 versus HUGEINT.
+- Arrow/SQL aliases such as Utf8/VARCHAR and Float64/DOUBLE are normalized by the comparator.
+These differences are separate from the repaired execution failure; type parity is not complete.
 
 ## General correlated execution design awaiting approval
 

@@ -116,8 +116,12 @@ impl ExpressionValue {
             Self::Scalar(array) => Ok(ExpressionSegment::scalar(Arc::clone(array), max_len)),
             Self::ViewColumn(column) => column.segment(start, max_len, row_count),
             Self::Segments(segments) => {
-                let (array, len) = segments.segment(start, max_len, row_count)?;
-                Ok(ExpressionSegment::array(array, len))
+                let run = segments.segment(start, max_len, row_count)?;
+                let scalar = run.is_scalar();
+                let len = run.len();
+                let array = run.into_array();
+                Ok(if scalar { ExpressionSegment::scalar(array, len) }
+                   else { ExpressionSegment::array(array, len) })
             }
         }
     }

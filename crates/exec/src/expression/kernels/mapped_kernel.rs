@@ -3,6 +3,7 @@
 use arrow::array::{Array, ArrayRef, Datum, new_empty_array, new_null_array};
 use common::Result;
 use error::VeinError;
+use functions::OutputSegment;
 
 use crate::expression::value::{ExpressionDatum, ExpressionValue, SegmentedArray};
 
@@ -13,7 +14,9 @@ pub(crate) fn eval_mapped_unary_value(
     mut kernel: impl FnMut(&dyn Array) -> Result<ArrayRef>,
 ) -> Result<ExpressionValue> {
     if !value.is_mapped() {
-        return Ok(ExpressionValue::Array(kernel(value.array()?.as_ref())?));
+        let array = kernel(value.array()?.as_ref())?;
+        return Ok(if value.is_scalar() { ExpressionValue::Scalar(array) }
+                  else { ExpressionValue::Array(array) });
     }
     if row_count == 0 {
         let empty = new_empty_array(value.data_type());
@@ -37,7 +40,7 @@ pub(crate) fn eval_mapped_unary_value(
                 .ok_or_else(|| VeinError::internal("missing unary kernel input"))?;
             kernel(input.get().0)?
         };
-        push_output(&mut outputs, output, run.len())?;
+        push_output(&mut outputs, output, run.len(), run.is_scalar())?;
         offset += run.len();
     }
     finish_outputs(outputs)
@@ -52,7 +55,9 @@ pub(crate) fn eval_mapped_binary_value(
     if !lhs.is_mapped() && !rhs.is_mapped() {
         let left = lhs.dense_datum()?;
         let right = rhs.dense_datum()?;
-        return Ok(ExpressionValue::Array(kernel(&left, &right)?));
+        let array = kernel(&left, &right)?;
+        return Ok(if lhs.is_scalar() && rhs.is_scalar() { ExpressionValue::Scalar(array) }
+                  else { ExpressionValue::Array(array) });
     }
     if row_count == 0 {
         let left = new_empty_array(lhs.data_type());
@@ -91,7 +96,8 @@ pub(crate) fn eval_mapped_binary_value(
             .map(|array| ExpressionDatum::from_array(array, false))
             .or_else(|| right_run.datum())
             .ok_or_else(|| VeinError::internal("missing right binary kernel input"))?;
-        push_output(&mut outputs, kernel(&left_input, &right_input)?, len)?;
+        push_output(&mut outputs, kernel(&left_input, &right_input)?, len,
+                    left_run.is_scalar() && right_run.is_scalar())?;
         offset += len;
         if offset < row_count {
             if left.len() == 0 {
@@ -106,11 +112,12 @@ pub(crate) fn eval_mapped_binary_value(
 }
 
 pub(crate) fn push_output(
-    outputs: &mut Vec<ArrayRef>,
+    outputs: &mut Vec<OutputSegment>,
     output: ArrayRef,
     expected_len: usize,
+    scalar: bool,
 ) -> Result<()> {
-    if output.len() != expected_len {
+    if output.len() != if scalar { 1 } else { expected_len } {
         return Err(VeinError::internal(format!(
             "mapped expression kernel returned {} rows for a {expected_len}-row segment",
             output.len()
@@ -124,16 +131,20 @@ pub(crate) fn push_output(
             "mapped expression kernel returned inconsistent segment types",
         ));
     }
-    outputs.push(output);
+    outputs.push(OutputSegment::new(output, expected_len, scalar)?);
     Ok(())
 }
 
-pub(crate) fn finish_outputs(mut outputs: Vec<ArrayRef>) -> Result<ExpressionValue> {
+pub(crate) fn finish_outputs(mut outputs: Vec<OutputSegment>) -> Result<ExpressionValue> {
     match outputs.len() {
         0 => Err(VeinError::internal("mapped expression kernel produced no output")),
-        1 => Ok(ExpressionValue::Array(
-            outputs.pop().expect("one output was checked"),
+        1 if !outputs[0].is_scalar() => Ok(ExpressionValue::Array(
+            outputs.pop().expect("one output was checked").into_array(),
         )),
-        _ => Ok(ExpressionValue::Segments(SegmentedArray::new(outputs)?)),
+        _ => Ok(ExpressionValue::Segments(SegmentedArray::from_runs(outputs)?)),
     }
 }
+
+#[cfg(test)]
+#[path = "mapped_kernel/tests/mod.rs"]
+mod tests;

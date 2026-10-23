@@ -7,6 +7,9 @@ use functions::{FunctionInput, FunctionOutput, FunctionRegistry};
 use super::{ExpressionFunctionInputSource, ExpressionValue, into_expression_value};
 use crate::pipeline::test_support;
 
+#[path = "function_input/tests/repeated.rs"]
+mod repeated;
+
 #[test]
 fn temporal_function_reads_reference_backed_view_and_preserves_nulls() {
     let source = Arc::new(Date32Array::from(vec![Some(0), Some(19_723), None])) as ArrayRef;
