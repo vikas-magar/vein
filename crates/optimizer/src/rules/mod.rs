@@ -46,6 +46,10 @@ pub mod exists_decorrelation;
 /// Rewrite filter-level IN/NOT IN subqueries to relational joins.
 pub mod in_subquery;
 
+/// Place semi joins before independent inner-join work.
+pub mod semi_join_placement;
+pub use semi_join_placement::SemiJoinPlacementRule;
+
 /// Equality-based predicate propagation across inner joins.
 pub mod join_transitivity;
 
@@ -55,6 +59,10 @@ pub mod join_order;
 /// Exact checkpoint key bounds propagated to unread inner-join inputs.
 pub mod checkpoint_filters;
 pub use checkpoint_filters::CheckpointJoinFilterRule;
+
+/// Restrict grouped join inputs using retained query-local key tuples.
+pub mod checkpoint_domain;
+pub use checkpoint_domain::CheckpointAggregateDomainRule;
 
 pub use column_pruning::ColumnPruningRule;
 pub use constant_fold::ConstantFoldingRule;

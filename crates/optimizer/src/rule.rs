@@ -76,6 +76,20 @@ pub trait OptimizerRule: Send + Sync {
         }
     }
 
+    /// Rewrites a node while allowing implementations to move its existing children.
+    /// The default retains the borrowed rule contract; owned implementations avoid
+    /// cloning an entire subtree when inserting or moving relational operators.
+    fn apply_owned(
+        &self,
+        plan: LogicalPlan,
+        context: &OptimizerContext,
+    ) -> Result<(LogicalPlan, bool)> {
+        match self.apply(&plan, context)? {
+            Some(rewritten) => Ok((rewritten, true)),
+            None => Ok((plan, false)),
+        }
+    }
+
     /// Attempts to rewrite a single plan node.
     ///
     /// Returns Some(rewritten) if the node was changed and None otherwise.

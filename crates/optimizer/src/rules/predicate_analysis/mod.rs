@@ -56,5 +56,15 @@ pub(crate) fn conjunction(terms: impl IntoIterator<Item=LogicalExpr>) -> Option<
     })
 }
 
+/// Construct a typed column equality without copying column metadata.
+pub(crate) fn equality_expr(left: plan::ResolvedColumnRef, right: plan::ResolvedColumnRef) -> LogicalExpr {
+    LogicalExpr::BinaryOp {
+        left: Box::new(LogicalExpr::Column(left)),
+        op: BinaryOp::Eq,
+        right: Box::new(LogicalExpr::Column(right)),
+        return_type: VeinDataType::Boolean,
+    }
+}
+
 #[cfg(test)]
 mod tests;

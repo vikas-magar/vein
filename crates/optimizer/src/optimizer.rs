@@ -25,14 +25,14 @@ use crate::context::{
     OptimizerContext, QueryStatisticsProvider, RuleExecution, StatisticsProvider,
 };
 use crate::rule::{OptimizerRule, RuleType};
-use crate::rules::CheckpointJoinFilterRule;
+use crate::rules::{CheckpointAggregateDomainRule, CheckpointJoinFilterRule};
 use crate::rules::join_order::JoinOrderRule;
 use crate::rules::{
     ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule,
     FilterNormalizationRule, FilterTransitivityRule, InSubqueryJoinRule,
     JoinOnPredicatePushdownRule, JoinPredicateTransitivityRule, OuterJoinSimplificationRule,
     PredicatePushdownRule, ScalarAggregateDecorrelationRule, ScanFilterPushdownRule,
-    ScanStatisticsPruningRule,
+    ScanStatisticsPruningRule, SemiJoinPlacementRule,
 };
 
 /// The engine-facing optimizer seam.
@@ -97,10 +97,12 @@ impl OptimizerPipeline {
             Arc::new(ScanStatisticsPruningRule),
             Arc::new(JoinPredicateTransitivityRule),
             Arc::new(CheckpointJoinFilterRule),
+            Arc::new(CheckpointAggregateDomainRule),
             Arc::new(InSubqueryJoinRule),
             Arc::new(ExistsDecorrelationRule),
             Arc::new(ScalarAggregateDecorrelationRule),
             Arc::new(OuterJoinSimplificationRule::default()),
+            Arc::new(SemiJoinPlacementRule::default()),
             Arc::new(PredicatePushdownRule),
             Arc::new(JoinOnPredicatePushdownRule),
             Arc::new(ScanFilterPushdownRule),
@@ -345,13 +347,9 @@ fn apply_rule(
 
     let changed = Cell::new(false);
     let result = rewrite_bottom_up(plan, &mut |node| {
-        Ok(match rule.apply(&node, context)? {
-            Some(rewritten) => {
-                changed.set(true);
-                rewritten
-            }
-            None => node,
-        })
+        let (rewritten, any_changed) = rule.apply_owned(node, context)?;
+        changed.set(changed.get() || any_changed);
+        Ok(rewritten)
     })?;
     Ok((result, changed.get(), Vec::new()))
 }

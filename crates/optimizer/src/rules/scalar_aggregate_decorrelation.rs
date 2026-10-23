@@ -12,6 +12,7 @@ use plan::{
 use std::sync::Arc;
 use crate::context::{OptimizerContext, OptimizerPhase};
 use crate::rule::{OptimizerRule, RuleType};
+use crate::rules::predicate_analysis::equality_expr;
 
 /// Rewrites a supported correlated scalar aggregate into a grouped aggregate
 /// and a left join. This keeps evaluation set based and avoids per-row
@@ -614,15 +615,6 @@ fn references_column(expr: &LogicalExpr, id: plan::ColumnId) -> bool {
     match expr {
         LogicalExpr::Column(column) | LogicalExpr::OuterColumn(column) => column.id == id,
         _ => expr.children().into_iter().any(|child| references_column(child, id)),
-    }
-}
-
-fn equality_expr(left: ResolvedColumnRef, right: ResolvedColumnRef) -> LogicalExpr {
-    LogicalExpr::BinaryOp {
-        left: Box::new(LogicalExpr::Column(left)),
-        op: BinaryOp::Eq,
-        right: Box::new(LogicalExpr::Column(right)),
-        return_type: VeinDataType::Boolean,
     }
 }
 

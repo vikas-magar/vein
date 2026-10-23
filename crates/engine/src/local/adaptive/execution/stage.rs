@@ -51,10 +51,11 @@ impl AdaptiveCoordinator {
             .iter()
             .filter(|decision| outcome_needs_more_statistics(decision.outcome))
             .count();
-        let schedule_followup = statistics_blocked_decisions > 0;
+        let (schedule_followup, pending_domain_inputs) = followup_needed(statistics_blocked_decisions, &optimized);
         tracing::info!(target: "vein.adaptive", event = "adaptive_checkpoint_continuation_decision", stage,
             join_order_decision_count = diagnostics.join_order_decisions.len(),
             statistics_blocked_decision_count = statistics_blocked_decisions,
+            pending_domain_inputs,
             schedule_followup, "decided whether additional runtime statistics can inform remaining joins");
         let plan_changed = optimized != before;
         let job = self.planner.create_physical_plan_with_statistics(self.request_id, optimized.clone(), Arc::clone(&self.statistics))?;
@@ -70,6 +71,7 @@ impl AdaptiveCoordinator {
             observed_rows = rows,
             join_order_decisions = diagnostics.join_order_decisions.len(),
             statistics_blocked_decisions,
+            pending_domain_inputs,
             logical_plan_changed = plan_changed,
             schedule_followup,
             reoptimization_us,
@@ -86,4 +88,9 @@ impl AdaptiveCoordinator {
         "remaining physical plan replaced using completed population statistics");
         Ok::<_, common::VeinError>((tasks, optimized, registration, schedule_followup))
     }
+}
+
+pub(in crate::local::adaptive) fn followup_needed(statistics_blocked: usize, plan: &LogicalPlan) -> (bool, usize) {
+    let domains = optimizer::rules::CheckpointAggregateDomainRule::pending_checkpoints(plan);
+    (statistics_blocked > 0 || domains > 0, domains)
 }

@@ -54,8 +54,8 @@ impl AdaptiveCoordinator {
                     } else {
                         pending = None;
                         tracing::info!(target: "vein.adaptive", event = "adaptive_checkpoint_skipped",
-                            stage, reason = "no_statistics_blocked_join_order_decisions",
-                            "optimizer found no remaining join-order decision that needs more statistics");
+                            stage, reason = "no_pending_adaptive_decisions",
+                            "no unresolved join statistics or tuple-domain requests remain");
                     }
                 }
                 Err(error) => {

@@ -1,5 +1,7 @@
 //! Local engine composition and execution tests.
 
+mod checkpoint_domain;
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
