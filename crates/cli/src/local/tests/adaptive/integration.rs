@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::local::{
-    AdaptiveBoundary, AdaptiveCheckpointPolicy, LocalQueryEngine, test_engine,
+    LocalQueryEngine, test_engine,
 };
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -9,10 +9,7 @@ use arrow::record_batch::RecordBatch;
 use common::statistics::QueryStatisticsContext;
 use futures::StreamExt;
 
-struct NoCheckpoints;
-impl AdaptiveCheckpointPolicy for NoCheckpoints {
-    fn choose_boundary(&self, _: &plan::LogicalPlan, _: Arc<QueryStatisticsContext>) -> Option<AdaptiveBoundary> { None }
-}
+use super::support::{NoCheckpoints, adaptive_engine};
 
 const JOIN_QUERY: &str = "FROM a |> WHERE a_key < 4 |> JOIN b ON a_key = b_key
     |> JOIN c ON b_key = c_key |> WHERE c_key < 5
@@ -58,10 +55,10 @@ async fn run(engine: &LocalQueryEngine, query: &str) -> (Vec<Vec<i64>>, Arc<Quer
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repeated_checkpoints_reoptimize_filtered_inputs_without_repeating_rows() {
+async fn resolved_join_search_stops_checkpointing_without_repeating_rows() {
     let root = join_fixture();
     let query = JOIN_QUERY;
-    let adaptive = test_engine(root.path());
+    let adaptive = adaptive_engine(root.path());
     let fixed = test_engine(root.path()).with_adaptive_policy(Arc::new(NoCheckpoints));
     let (expected, _) = run(&fixed, query).await;
     let (actual, statistics) = run(&adaptive, query).await;
@@ -73,12 +70,9 @@ async fn repeated_checkpoints_reoptimize_filtered_inputs_without_repeating_rows(
         .values()
         .filter_map(|statistics| statistics.num_rows)
         .collect();
-    assert!(
-        snapshot.intermediates.len() >= 2,
-        "both filtered scan populations should be observed: {observed_rows:?}"
-    );
-    assert!(observed_rows.contains(&3) && observed_rows.contains(&4),
-            "the filtered inputs have 3 and 4 rows respectively: {observed_rows:?}");
+    assert_eq!(snapshot.intermediates.len(), 1,
+               "resolved join search must not request redundant checkpoints");
+    assert_eq!(observed_rows, vec![4]);
     assert!(snapshot.intermediates.values().all(|statistics| {
         statistics.column_statistics.values().all(|column| column.distinct_count.is_some())
     }));
@@ -127,7 +121,7 @@ impl exec::runtime::TaskExecutor for FailsSecondCheckpoint {
 #[tokio::test]
 async fn failed_later_stage_keeps_prior_checkpoints_and_returns_each_row_once() {
     let root = join_fixture();
-    let base = test_engine(root.path());
+    let base = adaptive_engine(root.path());
     let executor = Arc::clone(base.task_executor());
     let engine = base.with_task_executor(Arc::new(FailsSecondCheckpoint {
         inner: executor,
@@ -145,7 +139,7 @@ async fn failed_later_stage_keeps_prior_checkpoints_and_returns_each_row_once() 
 #[tokio::test]
 async fn dropping_an_adaptive_result_stream_cancels_its_shared_resource_scope() {
     let root = join_fixture();
-    let base = test_engine(root.path());
+    let base = adaptive_engine(root.path());
     let executor = Arc::new(FailsSecondCheckpoint {
         inner: Arc::clone(base.task_executor()),
         calls: std::sync::atomic::AtomicUsize::new(0),
@@ -169,7 +163,7 @@ async fn aggregate_join_input_publishes_its_own_population_and_preserves_results
     let query = "FROM a |> AGGREGATE count(*) AS n GROUP BY a_key
         |> JOIN b ON a_key = b_key |> JOIN c ON b_key = c_key
         |> SELECT a_key, n |> ORDER a_key";
-    let adaptive = test_engine(root.path());
+    let adaptive = adaptive_engine(root.path());
     let fixed = test_engine(root.path()).with_adaptive_policy(Arc::new(NoCheckpoints));
     let (expected, _) = run(&fixed, query).await;
     let (actual, context) = run(&adaptive, query).await;

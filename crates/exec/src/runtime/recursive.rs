@@ -200,6 +200,7 @@ impl DefaultTaskExecutor {
                                         let mut bytes = 0u64;
                                         let mut work_units = 0u64;
                                         let mut source_elapsed = std::time::Duration::ZERO;
+                                        let worker_state = Arc::new(crate::operators::source::scan::ScanWorkerState::default());
                                         let worker_tail: Box<dyn PipelineNode> =
                                             Box::new(SuppressFlush::new(local));
                                         let mut pipeline: Box<dyn PipelineNode> =
@@ -231,6 +232,7 @@ impl DefaultTaskExecutor {
                                                 attempt,
                                                 runtime_filters.as_deref(),
                                                 Some(Arc::clone(&query_statistics)),
+                                                Arc::clone(&worker_state),
                                             )?;
                                             let source_started = std::time::Instant::now();
                                             runtime.block_on(async {
@@ -326,6 +328,7 @@ impl DefaultTaskExecutor {
                             let (sender, receiver) = flume::bounded(worker_count);
                             let runtime = tokio::runtime::Handle::current();
                             let mut workers = tokio::task::JoinSet::new();
+                            let query_statistics = trace.query_statistics_context();
                             for _ in 0..worker_count {
                                 let builder = Arc::clone(&self.builder);
                                 let pending = Arc::clone(&pending);
@@ -338,8 +341,10 @@ impl DefaultTaskExecutor {
                                 let span = span.clone();
                                 let runtime = runtime.clone();
                                 let runtime_filters = runtime_filters.clone();
+                                let query_statistics = Arc::clone(&query_statistics);
                                 workers.spawn_blocking(move || {
                                     let mut bytes = 0u64;
+                                    let worker_state = Arc::new(crate::operators::source::scan::ScanWorkerState::default());
                                     loop {
                                         if cancel.is_cancelled() {
                                             return Err(VeinError::cancelled());
@@ -353,16 +358,14 @@ impl DefaultTaskExecutor {
                                         let Some(source_spec) = source_spec else {
                                             return Ok(bytes);
                                         };
-                                        let mut source = match runtime_filters.as_deref() {
-                                            Some(filters) if !filters.is_empty() => builder
-                                                .build_source_with_runtime_filters(
-                                                    &source_spec,
-                                                    task_id,
-                                                    attempt,
-                                                    filters,
-                                                )?,
-                                            _ => builder.build_source(&source_spec, task_id, attempt)?,
-                                        };
+                                        let mut source = builder.build_source_with_query_context(
+                                            &source_spec,
+                                            task_id,
+                                            attempt,
+                                            runtime_filters.as_deref(),
+                                            Some(Arc::clone(&query_statistics)),
+                                            Arc::clone(&worker_state),
+                                        )?;
                                         let channel: Box<dyn PipelineNode> = Box::new(
                                             SuppressFlush::new(Box::new(ChannelPipelineNode {
                                                 sender: sender.clone(),
@@ -465,6 +468,7 @@ impl DefaultTaskExecutor {
                             task.attempt,
                             runtime_filters.as_deref(),
                             Some(trace.query_statistics_context()),
+                            Arc::default(),
                         )?;
                         let bytes_read = if program.is_empty() {
                             let mut source_next = next;
@@ -496,10 +500,11 @@ impl DefaultTaskExecutor {
                     PhysicalPlanOperator::Transform { input, program } => {
                         let transform = self.builder.build_expression_executor(program, next)?;
                         let bytes = self
-                            .execute_input(
+                            .execute_input_with_runtime_filters(
                                 input,
                                 Box::new(TransformHandle(transform)),
                                 context,
+                                runtime_filters,
                                 depth + 1,
                             )
                             .await?;

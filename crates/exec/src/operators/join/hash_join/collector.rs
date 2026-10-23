@@ -5,7 +5,7 @@ use common::Result;
 use error::VeinError;
 
 #[derive(Clone, Default)]
-/// Collects runtime filters derived from the join build side.
+/// Receives the residual predicate's accepted candidate view.
 pub struct JoinFilterCollector {
     output: Arc<Mutex<Option<DataChunkView>>>,
 }
@@ -30,6 +30,15 @@ impl PipelineNode for JoinFilterCollector {
     }
 
     fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn combine_local(self: Box<Self>, canonical: &mut dyn PipelineNode) -> Result<()> {
+        let target = canonical.as_any_mut().downcast_mut::<Self>()
+            .ok_or_else(|| VeinError::internal("join residual collector type mismatch"))?;
+        if self.take()?.is_some() || target.take()?.is_some() {
+            return Err(VeinError::internal("join residual collector contains unconsumed output"));
+        }
         Ok(())
     }
 }

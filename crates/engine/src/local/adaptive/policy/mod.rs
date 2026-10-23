@@ -7,6 +7,8 @@ use super::*;
 use optimizer::context::QueryStatisticsProvider;
 use optimizer::estimation::{CardinalityEstimator, EstimateConfidence, StatisticsEstimator};
 mod helpers;
+mod cost;
+pub use cost::{CheckpointCostModel, CheckpointWork, InputDominanceCost};
 use helpers::{
     contains_blocking_relation, known_input_rows, missing_synopses, needs_feedback, safe_subtree,
 };
@@ -16,12 +18,33 @@ use helpers::{
 #[derive(Debug, Default)]
 pub struct StatisticsCheckpointPolicy;
 
+/// Statistics checkpoint selection with an injected materialization cost model.
+pub struct CostedCheckpointPolicy<M> { model: M }
+
+impl StatisticsCheckpointPolicy {
+    /// Installs a cost strategy while retaining the same safety and lineage rules.
+    pub fn with_cost_model<M: CheckpointCostModel>(model: M) -> CostedCheckpointPolicy<M> {
+        CostedCheckpointPolicy { model }
+    }
+}
+
 impl AdaptiveCheckpointPolicy for StatisticsCheckpointPolicy {
     fn choose_boundary(
         &self,
         plan: &LogicalPlan,
         statistics: Arc<QueryStatisticsContext>,
     ) -> Option<AdaptiveBoundary> {
+        choose_boundary(plan, statistics, &InputDominanceCost)
+    }
+}
+
+impl<M: CheckpointCostModel> AdaptiveCheckpointPolicy for CostedCheckpointPolicy<M> {
+    fn choose_boundary(&self, plan: &LogicalPlan, statistics: Arc<QueryStatisticsContext>) -> Option<AdaptiveBoundary> {
+        choose_boundary(plan, statistics, &self.model)
+    }
+}
+
+fn choose_boundary(plan: &LogicalPlan, statistics: Arc<QueryStatisticsContext>, model: &impl CheckpointCostModel) -> Option<AdaptiveBoundary> {
         if !safe_subtree(plan) {
             return None;
         }
@@ -32,9 +55,9 @@ impl AdaptiveCheckpointPolicy for StatisticsCheckpointPolicy {
         });
         let mut observed = observed.lock().unwrap_or_else(|poison| poison.into_inner());
         let mut best: Option<((bool, u64), AdaptiveBoundary, Option<_>)> = None;
-        let mut pending = vec![(plan, Vec::new(), false)];
+        let mut pending = vec![(plan, Vec::new(), None)];
         while let Some((node, path, join_input)) = pending.pop() {
-            if join_input
+            if let Some(sibling) = join_input
                 && !matches!(node, LogicalPlan::Intermediate { .. })
                 && needs_feedback(node)
                 && known_input_rows(node).is_some()
@@ -44,7 +67,20 @@ impl AdaptiveCheckpointPolicy for StatisticsCheckpointPolicy {
                 // Fully described inputs need no new materialization barrier.
                 // Missing source cardinality is not a reason to invent a cost.
                 let work = known_input_rows(node)?;
-                if estimate.confidence < EstimateConfidence::Statistics || missing_synopses(node) {
+                let candidate_cost = CheckpointWork { input_rows: Some(work), output_rows: estimate.value() };
+                let sibling_cost = CheckpointWork {
+                    input_rows: known_input_rows(sibling),
+                    output_rows: estimator.estimate_plan(sibling).pop().and_then(|estimate| estimate.rows.value()),
+                };
+                let allowed = model.allows(candidate_cost, sibling_cost);
+                if !allowed {
+                    tracing::debug!(target: "vein.adaptive", event = "adaptive_checkpoint_candidate_skipped",
+                        source = node.table_name().unwrap_or(node.operator_name()),
+                        reason = "materialization_cost_dominated", candidate_input_rows = ?candidate_cost.input_rows,
+                        candidate_output_rows = ?candidate_cost.output_rows,
+                        sibling_input_rows = ?sibling_cost.input_rows, sibling_output_rows = ?sibling_cost.output_rows);
+                }
+                if allowed && (estimate.confidence < EstimateConfidence::Statistics || missing_synopses(node)) {
                     let signature = scan_population_signature(node);
                     let match_counts = signature
                         .as_ref()
@@ -100,7 +136,11 @@ impl AdaptiveCheckpointPolicy for StatisticsCheckpointPolicy {
             for (index, child) in node.children().into_iter().enumerate().rev() {
                 let mut child_path = path.clone();
                 child_path.push(index);
-                pending.push((child, child_path, matches!(node, LogicalPlan::Join { .. })));
+                let sibling = match node {
+                    LogicalPlan::Join { left, right, .. } => Some(if index == 0 { right.as_ref() } else { left.as_ref() }),
+                    _ => None,
+                };
+                pending.push((child, child_path, sibling));
             }
         }
         best.map(|(_, boundary, signature)| {
@@ -109,5 +149,4 @@ impl AdaptiveCheckpointPolicy for StatisticsCheckpointPolicy {
             }
             boundary
         })
-    }
 }

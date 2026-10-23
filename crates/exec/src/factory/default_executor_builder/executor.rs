@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::expression::executor::ExpressionExecutor;
 use crate::operators::sink::{CollectSink, DiscardSink, WriteSink};
+use crate::operators::source::scan::ScanWorkerState;
 use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
 use crate::runtime::ExecutorBuilder;
 use crate::runtime::filter::{RuntimeFilterDecisionPolicy, RuntimeFilterFactory, RuntimeFilterSet};
@@ -51,7 +52,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         _task_id: TaskId,
         _attempt: u32,
     ) -> Result<Box<dyn Source>> {
-        self.build_source_inner(source, &RuntimeFilterSet::empty(), None)
+        self.build_source_inner(source, &RuntimeFilterSet::empty(), None, Arc::default())
     }
 
     fn build_source_with_runtime_filters(
@@ -61,7 +62,7 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         _attempt: u32,
         filters: &RuntimeFilterSet,
     ) -> Result<Box<dyn Source>> {
-        self.build_source_inner(source, filters, None)
+        self.build_source_inner(source, filters, None, Arc::default())
     }
 
     fn build_source_with_query_context(
@@ -71,11 +72,13 @@ impl ExecutorBuilder for DefaultExecutorBuilder {
         _attempt: u32,
         runtime_filters: Option<&RuntimeFilterSet>,
         query_statistics: Option<Arc<QueryStatisticsContext>>,
+        worker_state: Arc<ScanWorkerState>,
     ) -> Result<Box<dyn Source>> {
         self.build_source_inner(
             source,
             runtime_filters.unwrap_or(&RuntimeFilterSet::empty()),
             query_statistics,
+            worker_state,
         )
     }
 

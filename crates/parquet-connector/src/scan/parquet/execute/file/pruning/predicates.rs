@@ -28,6 +28,14 @@ pub(super) fn build(
     let (runtime_predicates, diagnostics) = context
         .runtime_filters
         .statistics_predicates_with_diagnostics(context.projected);
+    for diagnostic in &diagnostics {
+        tracing::debug!(target: "vein.parquet_runtime_filter",
+            event = "parquet_runtime_filter_capability",
+            source_id = %common::logging::LogLocation::from(context.path),
+            filter = diagnostic.name, row_evaluation = diagnostic.row_evaluation,
+            metadata_predicate_count = diagnostic.metadata_predicate_count,
+            "runtime filter metadata and row evaluation capabilities");
+    }
     if !diagnostics.is_empty() {
         tracing::info!(
             target: "vein.parquet_runtime_filter",

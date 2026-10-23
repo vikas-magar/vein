@@ -3,6 +3,10 @@ name = "cli"
 version = "0.1.0"
 edition = "2024"
 
+[[test]]
+name = "output"
+path = "tests/output/mod.rs"
+
 [dependencies]
 common = { path = "../common" }
 engine = { path = "../engine" }
@@ -20,6 +24,7 @@ tokio = { workspace = true, features = ["full", "rt-multi-thread"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+parquet.workspace = true
 async-trait.workspace = true
 flume = "0.12"
 tempfile = "3"

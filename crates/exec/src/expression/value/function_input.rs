@@ -63,7 +63,7 @@ pub(crate) fn into_expression_value(
         functions::FunctionOutput::Array(array) => Ok(ExpressionValue::Array(array)),
         functions::FunctionOutput::Scalar(array) => Ok(ExpressionValue::Scalar(array)),
         functions::FunctionOutput::Segments(segments) => Ok(ExpressionValue::Segments(
-            super::SegmentedArray::new(segments)?,
+            super::SegmentedArray::from_runs(segments)?,
         )),
         functions::FunctionOutput::ReuseInput(index) => inputs.get(index).cloned().ok_or_else(|| {
             VeinError::internal(format!("function reused missing input argument {index}"))

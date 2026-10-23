@@ -21,6 +21,7 @@ use error::VeinError;
 use types::{ColumnId, LogicalLiteral};
 
 mod key_access;
+pub(crate) mod probe;
 use key_access::ChunkKeys;
 
 /// Which columns of a chunk form the join key.
@@ -522,7 +523,7 @@ impl HashTable {
     /// Computes the join's canonical row hashes for a spill batch.
     ///
     /// Null keys receive a deterministic hash only to choose a spill partition;
-    /// they remain non-matching because [`Self::probe`] skips null keys.
+    /// they remain non-matching because the probe cursor skips null keys.
     /// Keeping this beside the in-memory key encoder prevents spill partitioning
     /// from introducing a second, potentially incompatible key representation.
     pub fn hashes_for_view(view: &DataChunkView, keys: &JoinKeys) -> Result<Vec<u64>> {
@@ -1036,79 +1037,16 @@ impl HashTable {
         Ok(())
     }
 
-    /// Probes a reference-backed batch. Returned rows are logical positions in
-    /// the selected input batches.
-    /// Returns the probe key conversion report and resolution time in microseconds.
-    /// The report excludes hash/index allocations and never mutates build metrics.
+    /// Collect all matches for contract tests. Runtime operators use the bounded cursor.
+    #[cfg(test)]
     pub fn probe(
-        &self,
-        probe: &DataChunkView,
-        matches: &mut Vec<(u32, (u32, u32))>,
+        &self, probe: &DataChunkView, matches: &mut Vec<probe::JoinMatch>,
     ) -> Result<(MaterializationReport, u64)> {
-        self.probe_view_inner(probe, matches, None)
-    }
-
-    /// Probes while recording NULL-keyed probe row positions for a
-    /// null-aware anti join. Ordinary joins avoid allocating this side vector.
-    pub fn probe_view_with_null_rows(
-        &self,
-        probe: &DataChunkView,
-        matches: &mut Vec<(u32, (u32, u32))>,
-        null_probe_rows: &mut Vec<u32>,
-    ) -> Result<(MaterializationReport, u64)> {
-        self.probe_view_inner(probe, matches, Some(null_probe_rows))
-    }
-
-    fn probe_view_inner(
-        &self,
-        probe: &DataChunkView,
-        matches: &mut Vec<(u32, (u32, u32))>,
-        mut null_probe_rows: Option<&mut Vec<u32>>,
-    ) -> Result<(MaterializationReport, u64)> {
-        let (probe_keys, key_access_us) = ChunkKeys::resolve_view(&self.probe_keys, probe)?;
-        let report = MaterializationReport::default();
-        let inline_i64 = probe_keys.is_single_i64()
-            && self
-            .keys_by_chunk
-            .first()
-            .is_some_and(ChunkKeys::is_single_i64);
-        for position in 0..probe.num_rows() {
-            let row = position as u32;
-            let Some((hash, inline_key)) = probe_keys.hash_and_single_i64(position, probe)?
-            else {
-                if let Some(rows) = &mut null_probe_rows {
-                    rows.push(row);
-                }
-                continue;
-            };
-            let mut head = self.buckets[bucket_of(hash, self.buckets.len())];
-            while head != NONE {
-                let entry = self.entries[head as usize];
-                let same = self.hashes[head as usize] == hash
-                    && (if inline_i64 {
-                    let value = inline_key.ok_or_else(|| {
-                        VeinError::internal("single-Int64 probe key is missing its value")
-                    })?;
-                    self.keys_by_chunk[entry.chunk as usize].single_i64_value(
-                        &self.chunks[entry.chunk as usize],
-                        entry.row as usize,
-                    )? == Some(value)
-                } else {
-                    self.keys_by_chunk[entry.chunk as usize].equals(
-                        entry.row as usize,
-                        &self.chunks[entry.chunk as usize],
-                        &probe_keys,
-                        row as usize,
-                        probe,
-                    )?
-                });
-                if same {
-                    matches.push((row, (entry.chunk, entry.row)));
-                }
-                head = entry.next;
-            }
-        }
-        Ok((report, key_access_us))
+        let mut cursor = probe::HashProbe::new(self, probe, false)?;
+        let mut batch = Vec::new();
+        let limit = cursor.reserve_candidates(&mut batch)?;
+        while cursor.next_batch(&mut batch, limit, || false)? { matches.extend_from_slice(&batch); }
+        Ok((cursor.report(), cursor.key_access_us))
     }
 
     /// Whether a single-key membership build contains a NULL key.

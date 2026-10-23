@@ -126,3 +126,47 @@ fn equality_key_and_inequality_residual_lower_for_exists_and_not_exists() {
         assert!(!contains_outer(&on), "outer refs must resolve to join inputs");
     }
 }
+
+#[test]
+fn duplicate_correlated_equality_keys_are_emitted_once() {
+    let outer_key = column(80, "o_orderkey", "orders");
+    let inner_key = column(81, "l_orderkey", "lineitem");
+    let outer = scan("orders", vec![Arc::clone(&outer_key)]);
+    let inner = scan("lineitem", vec![Arc::clone(&inner_key)]);
+    let correlation = || {
+        compare(
+            LogicalExpr::Column(Arc::clone(&inner_key)),
+            BinaryOp::Eq,
+            LogicalExpr::OuterColumn(Arc::clone(&outer_key)),
+        )
+    };
+    let predicate = compare(correlation(), BinaryOp::And, correlation());
+    let filter = LogicalPlan::Filter {
+        input: Box::new(outer),
+        predicate: LogicalExpr::Exists {
+            subquery: Box::new(LogicalPlan::Filter {
+                input: Box::new(inner),
+                predicate,
+            }),
+            negated: false,
+        },
+    };
+
+    let rewritten = ExistsDecorrelationRule
+        .apply(&filter, &OptimizerContext::default())
+        .expect("duplicate equality keys are valid")
+        .expect("EXISTS should lower to a semi join");
+    let LogicalPlan::Join { on: Some(on), .. } = rewritten else {
+        panic!("expected semi join with a key predicate");
+    };
+    let mut terms = Vec::new();
+    conjuncts(&on, &mut terms);
+    assert_eq!(
+        terms
+            .iter()
+            .filter(|term| matches!(term, LogicalExpr::BinaryOp { op: BinaryOp::Eq, .. }))
+            .count(),
+        1,
+        "the same correlation pair must not create duplicate join keys"
+    );
+}

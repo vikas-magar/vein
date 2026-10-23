@@ -7,6 +7,7 @@ use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, ExpressionProgram};
 use common::statistics::QueryStatisticsContext;
 use functions::FunctionRegistry;
+use crate::operators::source::scan::ScanWorkerState;
 use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
 use crate::runtime::split_scan_by_file;
 use crate::runtime::filter::{
@@ -93,6 +94,7 @@ pub trait ExecutorBuilder: Send + Sync {
         attempt: u32,
         runtime_filters: Option<&RuntimeFilterSet>,
         _query_statistics: Option<Arc<QueryStatisticsContext>>,
+        _worker_state: Arc<ScanWorkerState>,
     ) -> Result<Box<dyn Source>> {
         match runtime_filters {
             Some(filters) if !filters.is_empty() => {

@@ -18,6 +18,16 @@ pub mod column_pruning;
 /// Shared helpers for safe predicate rewrites.
 mod predicate_utils;
 
+/// Shared semantic proof contracts for relational predicate rewrites.
+pub mod predicate_analysis;
+
+/// Null-rejection proofs that expose legally reorderable inner joins.
+pub mod outer_join_simplification;
+pub use outer_join_simplification::OuterJoinSimplificationRule;
+
+/// Push ON predicates into the inputs permitted by join semantics.
+pub mod join_on_pushdown;
+
 /// Predicate pushdown through relational operators.
 pub mod predicate_pushdown;
 
@@ -48,13 +58,14 @@ pub use checkpoint_filters::CheckpointJoinFilterRule;
 
 pub use column_pruning::ColumnPruningRule;
 pub use constant_fold::ConstantFoldingRule;
+pub use exists_decorrelation::ExistsDecorrelationRule;
 pub use expression_simplify::ExpressionSimplificationRule;
 pub use filter_normalize::FilterNormalizationRule;
 pub use filter_transitivity::FilterTransitivityRule;
+pub use in_subquery::InSubqueryJoinRule;
 pub use join_transitivity::JoinPredicateTransitivityRule;
+pub use join_on_pushdown::JoinOnPredicatePushdownRule;
 pub use predicate_pushdown::PredicatePushdownRule;
+pub use scalar_aggregate_decorrelation::ScalarAggregateDecorrelationRule;
 pub use scan_filter_pushdown::ScanFilterPushdownRule;
 pub use scan_statistics_pruning::ScanStatisticsPruningRule;
-pub use scalar_aggregate_decorrelation::ScalarAggregateDecorrelationRule;
-pub use exists_decorrelation::ExistsDecorrelationRule;
-pub use in_subquery::InSubqueryJoinRule;

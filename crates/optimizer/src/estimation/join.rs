@@ -5,7 +5,7 @@ use plan::{LogicalExpr, VeinSchema};
 use super::{Estimate, EstimateSource, columns::RelationEstimate};
 
 fn equality(left: &RelationEstimate<'_>, right: &RelationEstimate<'_>,
-            expr: &LogicalExpr) -> Option<f64>
+            expr: &LogicalExpr) -> Option<(f64, bool)>
 {
     let LogicalExpr::BinaryOp { left: a, op: BinaryOp::Eq, right: b, .. } = expr else { return None; };
     let (LogicalExpr::Column(a), LogicalExpr::Column(b)) = (a.as_ref(), b.as_ref()) else { return None; };
@@ -14,12 +14,12 @@ fn equality(left: &RelationEstimate<'_>, right: &RelationEstimate<'_>,
     let (a, b) = pair;
     if a.min.zip(b.max).is_some_and(|(a, b)| crate::statistics::compare(a, b).is_some_and(|o| o.is_gt()))
         || b.min.zip(a.max).is_some_and(|(b, a)| crate::statistics::compare(b, a).is_some_and(|o| o.is_gt())) {
-        return Some(0.0);
+        return Some((0.0, false));
     }
     let (da, db) = a.distinct.zip(b.distinct)?;
     let (na, nb) = a.null_fraction.zip(b.null_fraction)?;
-    if da == 0.0 || db == 0.0 { return Some(0.0); }
-    Some((1.0 - na) * (1.0 - nb) / da.max(db))
+    if da == 0.0 || db == 0.0 { return Some((0.0, false)); }
+    Some(((1.0 - na) * (1.0 - nb) / da.max(db), a.distinct_is_prior || b.distinct_is_prior))
 }
 
 fn join_selectivity<'e>(
@@ -46,8 +46,9 @@ fn join_selectivity<'e>(
         } else if matches!(expr, LogicalExpr::Literal(plan::LogicalLiteral::Boolean(false)
             | plan::LogicalLiteral::Null(_))) {
             return Estimate::model(0.0, EstimateSource::Join);
-        } else if let Some(value) = equality(left, right, expr) {
+        } else if let Some((value, prior)) = equality(left, right, expr) {
             fraction = fraction.min(value);
+            used_fallback |= prior;
         } else {
             used_fallback = true;
         }

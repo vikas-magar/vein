@@ -186,6 +186,8 @@ fn validate_node(node: &PhysicalPlanNode, path: &str, root: bool) -> Result<()> 
                     | crate::protocol::JoinKind::Cross
                     | crate::protocol::JoinKind::Semi
                     | crate::protocol::JoinKind::Anti
+                    | crate::protocol::JoinKind::RightSemi
+                    | crate::protocol::JoinKind::RightAnti
                     | crate::protocol::JoinKind::NullAwareAnti => false,
                 };
                 let expected_nullable = source_field.nullable || output_is_null_extended;
@@ -213,6 +215,12 @@ fn validate_node(node: &PhysicalPlanNode, path: &str, root: bool) -> Result<()> 
                             plan.join_type
                         ),
                     ));
+                }
+                if matches!(plan.join_type,
+                    crate::protocol::JoinKind::RightSemi | crate::protocol::JoinKind::RightAnti
+                ) && matches!(source, JoinOutput::Probe(_)) {
+                    return Err(invalid(path, format!(
+                        "{:?} join cannot emit probe-side output column {output_index}", plan.join_type)));
                 }
             }
         }

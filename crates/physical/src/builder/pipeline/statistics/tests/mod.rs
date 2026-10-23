@@ -5,6 +5,7 @@ use common::statistics::QueryStatisticsContext;
 use parser::ast::{expr::BinaryOp, pipe_op::JoinType};
 use plan::{ColumnId, LogicalExpr, LogicalPlan, PlanTraversal, ResolvedColumn, VeinDataType, VeinSchema};
 use crate::{DefaultPhysicalPlanner, PhysicalPlanner};
+mod existence;
 
 fn input(source: u128, rows: u64, id: usize) -> LogicalPlan {
     LogicalPlan::Intermediate {

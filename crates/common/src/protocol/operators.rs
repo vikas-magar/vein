@@ -40,6 +40,10 @@ pub enum JoinKind {
     Semi,
     /// Left anti join.
     Anti,
+    /// Each matching build row once, with no probe columns.
+    RightSemi,
+    /// Each unmatched build row once, with no probe columns.
+    RightAnti,
     /// Anti join with SQL `NOT IN` NULL semantics.
     NullAwareAnti,
     /// Single join that errors when one probe row has multiple matches.
@@ -48,5 +52,30 @@ pub enum JoinKind {
     Cross,
 }
 
+impl JoinKind {
+    /// Whether removing probe rows that cannot match preserves query results.
+    pub fn allows_probe_filtering(self) -> bool {
+        matches!(self, Self::Inner | Self::Semi | Self::RightSemi | Self::RightAnti)
+    }
+
+    /// Equivalent join semantics after exchanging physical inputs.
+    /// NULL-aware anti and scalar single joins keep their enforced orientation.
+    pub fn inverse(self) -> Option<Self> {
+        Some(match self {
+            Self::Inner | Self::Full | Self::Cross => self,
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+            Self::Semi => Self::RightSemi,
+            Self::Anti => Self::RightAnti,
+            Self::RightSemi => Self::Semi,
+            Self::RightAnti => Self::Anti,
+            Self::NullAwareAnti | Self::Single => return None,
+        })
+    }
+}
+
 /// Aggregate identity registered by the shared function catalog.
 pub use functions::AggregateOperation as AggOpCode;
+
+#[cfg(test)]
+mod tests;

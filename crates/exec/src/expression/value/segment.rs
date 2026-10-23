@@ -116,8 +116,12 @@ impl ExpressionValue {
             Self::Scalar(array) => Ok(ExpressionSegment::scalar(Arc::clone(array), max_len)),
             Self::ViewColumn(column) => column.segment(start, max_len, row_count),
             Self::Segments(segments) => {
-                let (array, len) = segments.segment(start, max_len, row_count)?;
-                Ok(ExpressionSegment::array(array, len))
+                let run = segments.segment(start, max_len, row_count)?;
+                let scalar = run.is_scalar();
+                let len = run.len();
+                let array = run.into_array();
+                Ok(if scalar { ExpressionSegment::scalar(array, len) }
+                   else { ExpressionSegment::array(array, len) })
             }
         }
     }
@@ -140,21 +144,35 @@ impl ViewColumnValue {
             }
             return Ok(ExpressionSegment::null_extended(len));
         };
-        let mut len = 1;
-        while len < max_len {
-            match view.resolve(self.0.column, start + len)? {
-                Some((array, row))
-                    if Arc::ptr_eq(first_array, array)
-                        && first_row.checked_add(len) == Some(row) =>
-                {
-                    len += 1
-                }
-                _ => break,
+        if max_len > 1
+            && let Some((array, row)) = view.resolve(self.0.column, start + 1)?
+            && Arc::ptr_eq(first_array, array)
+            && row == first_row
+        {
+            let mut len = 2;
+            while len < max_len
+                && view.resolve(self.0.column, start + len)?
+                .is_some_and(|(array, row)| Arc::ptr_eq(first_array, array) && row == first_row)
+            {
+                len += 1;
             }
+            return Ok(ExpressionSegment::scalar(first_array.slice(first_row, 1), len));
         }
-        Ok(ExpressionSegment::array(
-            first_array.slice(first_row, len),
-            len,
-        ))
+
+        let mut len = 1;
+        while len < max_len
+            && view.resolve(self.0.column, start + len)?
+            .is_some_and(|(array, row)| {
+                Arc::ptr_eq(first_array, array)
+                    && first_row.checked_add(len) == Some(row)
+            })
+        {
+            len += 1;
+        }
+        Ok(ExpressionSegment::array(first_array.slice(first_row, len), len))
     }
 }
+
+#[cfg(test)]
+#[path = "segment_tests.rs"]
+mod tests;

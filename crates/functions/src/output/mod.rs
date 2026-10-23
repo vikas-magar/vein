@@ -2,6 +2,9 @@ use arrow::array::{ArrayRef, new_empty_array};
 use arrow::datatypes::DataType;
 use error::{Result, VeinError};
 
+mod segment;
+pub use segment::OutputSegment;
+
 /// Scalar-function result representation.
 #[derive(Debug, Clone)]
 pub enum FunctionOutput {
@@ -10,7 +13,7 @@ pub enum FunctionOutput {
     /// One-value Arrow array broadcast over a logical batch.
     Scalar(ArrayRef),
     /// Ordered result segments, retained without concatenating their buffers.
-    Segments(Vec<ArrayRef>),
+    Segments(Vec<OutputSegment>),
     /// Reuses an input expression's exact view or Arrow storage.
     ReuseInput(usize),
 }
@@ -28,11 +31,19 @@ impl FunctionOutput {
     }
 
     /// Retains ordered result arrays without concatenating their buffers.
-    pub fn from_segments(mut arrays: Vec<ArrayRef>) -> Result<Self> {
-        match arrays.len() {
+    pub fn from_segments(arrays: Vec<ArrayRef>) -> Result<Self> {
+        Self::from_runs(arrays.into_iter().map(OutputSegment::dense).collect())
+    }
+
+    /// Retains dense and repeated runs with their logical row counts.
+    pub fn from_runs(mut runs: Vec<OutputSegment>) -> Result<Self> {
+        match runs.len() {
             0 => Err(VeinError::internal("function returned no output segments")),
-            1 => Ok(Self::Array(arrays.pop().expect("one segment remains"))),
-            _ => Ok(Self::Segments(arrays)),
+            1 if !runs[0].is_scalar() => {
+                let run = runs.pop().expect("one segment remains");
+                Ok(Self::Array(run.into_array()))
+            }
+            _ => Ok(Self::Segments(runs)),
         }
     }
 
@@ -55,9 +66,9 @@ impl FunctionOutput {
                 validate_array(array, 1, expected_type)
             }
             Self::Segments(arrays) => {
-                let total = arrays.iter().try_fold(0usize, |total, array| {
-                    validate_array(array, array.len(), expected_type)?;
-                    total.checked_add(array.len())
+                let total = arrays.iter().try_fold(0usize, |total, run| {
+                    validate_array(run.array(), if run.is_scalar() { 1 } else { run.len() }, expected_type)?;
+                    total.checked_add(run.len())
                         .ok_or_else(|| VeinError::internal("function output length overflow"))
                 })?;
                 if total != row_count {

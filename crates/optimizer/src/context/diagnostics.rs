@@ -41,6 +41,8 @@ pub struct OptimizationDiagnostics {
     pub cardinalities: Vec<NodeEstimate>,
     /// Cost-based join-order decisions made after heuristic convergence.
     pub join_order_decisions: Vec<JoinOrderDecision>,
+    /// Final predicate positions and exact correspondence with input conjuncts.
+    pub predicate_placements: Vec<super::PredicatePlacement>,
 }
 
 /// Outcome of bounded cost-based planning for one join region.

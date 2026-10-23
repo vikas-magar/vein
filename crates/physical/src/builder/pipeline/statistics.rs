@@ -32,5 +32,5 @@ impl DefaultPipelineStageBuilder {
 }
 
 #[cfg(test)]
-#[path = "statistics/tests.rs"]
+#[path = "statistics/tests/mod.rs"]
 mod tests;

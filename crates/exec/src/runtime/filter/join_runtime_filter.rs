@@ -14,7 +14,7 @@ impl DefaultTaskExecutor {
         trace: &ExecutionTrace,
         node_id: u32,
     ) -> Result<Option<Arc<RuntimeFilterSet>>> {
-        if !matches!(plan.join_type, JoinKind::Inner | JoinKind::Semi) {
+        if !plan.join_type.allows_probe_filtering() {
             return Ok(None);
         }
         let BuildResult::InMemory(table) = build else {

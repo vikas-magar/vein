@@ -16,7 +16,7 @@ use crate::expression::eval::ExpressionKernelProvider;
 use crate::pipeline::{PipelineNode, Source};
 use crate::runtime::filter::RuntimeFilterSet;
 
-use super::{ScanProvider, ScanRequest};
+use super::{ScanProvider, ScanRequest, ScanWorkerState};
 
 /// One file of a scan, identified by its storage path and canonical metadata key.
 #[derive(Debug, Clone)]
@@ -59,6 +59,7 @@ pub struct ScanSourceConfig {
 
 /// Source that delegates execution to a provider resolved by the executor.
 pub struct ScanSource {
+    worker_state: Arc<ScanWorkerState>,
     config: ScanSourceConfig,
     provider: Arc<dyn ScanProvider>,
     query_statistics: Option<Arc<QueryStatisticsContext>>,
@@ -68,7 +69,17 @@ pub struct ScanSource {
 impl ScanSource {
     /// Creates a scan with its already-resolved format provider.
     pub fn new(config: ScanSourceConfig, provider: Arc<dyn ScanProvider>) -> Self {
+        Self::new_with_worker_state(config, provider, Arc::default())
+    }
+
+    /// Creates a scan using state retained by its scheduling worker.
+    pub fn new_with_worker_state(
+        config: ScanSourceConfig,
+        provider: Arc<dyn ScanProvider>,
+        worker_state: Arc<ScanWorkerState>,
+    ) -> Self {
         Self {
+            worker_state,
             config,
             provider,
             query_statistics: None,
@@ -93,6 +104,7 @@ impl Source for ScanSource {
         self.provider
             .execute(
                 ScanRequest {
+                    worker_state: &self.worker_state,
                     storage: &config.storage,
                     files: &config.files,
                     projected: &config.projected,

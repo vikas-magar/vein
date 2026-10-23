@@ -94,9 +94,13 @@ impl DefaultPipelineStageBuilder {
                 .map(|field| field.data_type.clone())
                 .collect(),
         };
-        if matches!(join_type, JoinType::Inner | JoinType::Cross)
+        if (matches!(join_type, JoinType::Inner | JoinType::Cross)
+            || (matches!(join_type, JoinType::Semi | JoinType::Anti)
+                && on.as_ref().is_some_and(plan::LogicalExpr::is_reorder_safe)))
             && let Some((left_rows, right_rows)) = self.observed_rows(left).zip(self.observed_rows(right)) {
                 if left_rows < right_rows {
+                    join.join_type = join.join_type.inverse().ok_or_else(||
+                        VeinError::internal("join orientation policy selected a non-invertible join"))?;
                     std::mem::swap(&mut probe, &mut build);
                     std::mem::swap(&mut join.probe_keys, &mut join.build_keys);
                     std::mem::swap(&mut join.probe_types, &mut join.build_types);

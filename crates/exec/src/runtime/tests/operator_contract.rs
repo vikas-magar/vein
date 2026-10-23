@@ -9,6 +9,8 @@ fn physical_join_kinds_map_to_their_executor_types() {
         (JoinKind::Full, JoinType::Full),
         (JoinKind::Semi, JoinType::Semi),
         (JoinKind::Anti, JoinType::Anti),
+        (JoinKind::RightSemi, JoinType::RightSemi),
+        (JoinKind::RightAnti, JoinType::RightAnti),
         (JoinKind::Single, JoinType::Single),
         (JoinKind::Cross, JoinType::Cross),
     ];

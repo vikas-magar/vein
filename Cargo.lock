@@ -538,6 +538,7 @@ dependencies = [
  "functions",
  "futures",
  "optimizer",
+ "parquet",
  "parquet-connector",
  "physical",
  "plan",

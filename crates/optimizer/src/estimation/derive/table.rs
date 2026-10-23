@@ -58,7 +58,14 @@ pub(super) fn statistics_estimate<'a>(
     for column in &schema.fields {
         if let Some(stats) = statistics.column_statistics.get(&key(column)) {
             match ColumnEstimate::from_statistics(stats, rows, column.nullable) {
-                Ok(summary) => { input.columns.insert(column.id, summary); }
+                Ok(summary) => {
+                    tracing::debug!(target: "vein.optimizer.statistics", event = "optimizer_column_distribution",
+                        column = %column.name, column_id = column.id.0, population_rows = rows,
+                        distinct = ?summary.distinct, distinct_is_prior = summary.distinct_is_prior,
+                        null_fraction = ?summary.null_fraction,
+                        minimum_available = summary.min.is_some(), maximum_available = summary.max.is_some());
+                    input.columns.insert(column.id, summary);
+                }
                 Err(reason) => {
                     tracing::warn!(target: "vein.optimizer", event = "optimizer_column_statistics_rejected",
                         table_column = %column.name, reason = ?reason, rows,

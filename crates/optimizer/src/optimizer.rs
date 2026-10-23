@@ -16,22 +16,24 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
+use common::statistics::QueryStatisticsContext;
 use error::{Result, VeinError};
 use plan::{LogicalPlan, PlanTraversal};
-use common::statistics::QueryStatisticsContext;
 
-use crate::context::{CatalogStatisticsProvider, OptimizationDiagnostics, OptimizerConfig,
-                     OptimizerContext, QueryStatisticsProvider, RuleExecution, StatisticsProvider};
-use crate::rule::{OptimizerRule, RuleType};
-use crate::rules::{
-    ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule, FilterNormalizationRule,
-    InSubqueryJoinRule,
-    FilterTransitivityRule,
-    JoinPredicateTransitivityRule, PredicatePushdownRule, ScanFilterPushdownRule,
-    ScanStatisticsPruningRule, ScalarAggregateDecorrelationRule,
+use crate::context::{
+    CatalogStatisticsProvider, FilterPlacementVisibility, OptimizationDiagnostics, OptimizerConfig,
+    OptimizerContext, QueryStatisticsProvider, RuleExecution, StatisticsProvider,
 };
-use crate::rules::join_order::JoinOrderRule;
+use crate::rule::{OptimizerRule, RuleType};
 use crate::rules::CheckpointJoinFilterRule;
+use crate::rules::join_order::JoinOrderRule;
+use crate::rules::{
+    ColumnPruningRule, ConstantFoldingRule, ExistsDecorrelationRule, ExpressionSimplificationRule,
+    FilterNormalizationRule, FilterTransitivityRule, InSubqueryJoinRule,
+    JoinOnPredicatePushdownRule, JoinPredicateTransitivityRule, OuterJoinSimplificationRule,
+    PredicatePushdownRule, ScalarAggregateDecorrelationRule, ScanFilterPushdownRule,
+    ScanStatisticsPruningRule,
+};
 
 /// The engine-facing optimizer seam.
 ///
@@ -98,7 +100,9 @@ impl OptimizerPipeline {
             Arc::new(InSubqueryJoinRule),
             Arc::new(ExistsDecorrelationRule),
             Arc::new(ScalarAggregateDecorrelationRule),
+            Arc::new(OuterJoinSimplificationRule::default()),
             Arc::new(PredicatePushdownRule),
+            Arc::new(JoinOnPredicatePushdownRule),
             Arc::new(ScanFilterPushdownRule),
             Arc::new(ColumnPruningRule),
             Arc::new(JoinOrderRule::default()),
@@ -139,8 +143,7 @@ impl OptimizerPipeline {
         plan: LogicalPlan,
         statistics: Arc<dyn StatisticsProvider>,
     ) -> Result<(LogicalPlan, OptimizationDiagnostics)> {
-        let context = OptimizerContext::with_statistics_provider(
-            self.config.clone(), statistics);
+        let context = OptimizerContext::with_statistics_provider(self.config.clone(), statistics);
         let rules: Vec<_> = self
             .rules
             .iter()
@@ -152,6 +155,7 @@ impl OptimizerPipeline {
             .filter(|rule| rule.rule_type() == RuleType::CostBased)
             .collect();
 
+        let predicate_lineage = crate::context::PredicateLineage::capture(&plan);
         let mut diagnostics = OptimizationDiagnostics::default();
         let mut current = plan;
         tracing::info!(
@@ -236,8 +240,7 @@ impl OptimizerPipeline {
                 if cost_rewrite_changed_plan {
                     let pruning_rule = ColumnPruningRule;
                     let started = Instant::now();
-                    let (result, changed, _) =
-                        apply_rule(&pruning_rule, optimized, &context)?;
+                    let (result, changed, _) = apply_rule(&pruning_rule, optimized, &context)?;
                     optimized = result;
                     let elapsed = started.elapsed();
                     tracing::info!(
@@ -257,6 +260,7 @@ impl OptimizerPipeline {
                 }
                 validate_lowered_subqueries(&optimized)?;
                 diagnostics.cardinalities = context.estimate_plan(&optimized);
+                diagnostics.predicate_placements = predicate_lineage.placements(&optimized);
                 let filter_visibility = FilterPlacementVisibility::from_plan(&optimized);
                 tracing::info!(
                     target: "vein.audit",
@@ -264,6 +268,13 @@ impl OptimizerPipeline {
                     scan_count = filter_visibility.scan_count,
                     scan_filter_count = filter_visibility.scan_filter_count,
                     residual_filter_count = filter_visibility.residual_filter_count,
+                    left_join_count = filter_visibility.left_join_count,
+                    left_join_with_on_count = filter_visibility.left_join_with_on_count,
+                    semi_join_count = filter_visibility.semi_join_count,
+                    anti_join_count = filter_visibility.anti_join_count,
+                    semi_anti_left_scan_filter_count = filter_visibility.semi_anti_left_scan_filter_count,
+                    semi_anti_right_scan_filter_count = filter_visibility.semi_anti_right_scan_filter_count,
+                    filter_above_semi_anti_count = filter_visibility.filter_above_semi_anti_count,
                     "optimizer_filter_placement"
                 );
                 tracing::info!(
@@ -317,41 +328,6 @@ impl Optimizer for OptimizerPipeline {
     fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         self.optimize_with_diagnostics(plan)
             .map(|(optimized, _)| optimized)
-    }
-}
-
-/// Counts filters attached to scans and filters that remain above relational
-/// operators after optimization. The latter are usually residual filters whose
-/// semantics do not permit moving them into a source.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct FilterPlacementVisibility {
-    scan_count: usize,
-    scan_filter_count: usize,
-    residual_filter_count: usize,
-}
-
-impl FilterPlacementVisibility {
-    fn from_plan(plan: &LogicalPlan) -> Self {
-        fn visit(plan: &LogicalPlan, summary: &mut FilterPlacementVisibility) {
-            match plan {
-                LogicalPlan::Scan { filters, .. } => {
-                    summary.scan_count += 1;
-                    summary.scan_filter_count += filters.len();
-                }
-                LogicalPlan::Filter { .. } => summary.residual_filter_count += 1,
-                _ => {}
-            }
-            for child in plan.children() {
-                visit(child, summary);
-            }
-            for subquery in plan.subquery_plans() {
-                visit(subquery, summary);
-            }
-        }
-
-        let mut summary = Self::default();
-        visit(plan, &mut summary);
-        summary
     }
 }
 

@@ -7,7 +7,10 @@ use plan::{
     VeinSchema,
 };
 
-use super::{tests, PredicatePushdownRule};
+use super::{PredicatePushdownRule, tests};
+
+#[path = "disjunction_cast_tests.rs"]
+mod cast_tests;
 
 fn comparison(column: &ResolvedColumnRef, value: &str) -> LogicalExpr {
     LogicalExpr::BinaryOp {

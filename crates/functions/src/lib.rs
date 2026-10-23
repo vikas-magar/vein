@@ -29,6 +29,6 @@ pub use function::{
     Volatility,
 };
 pub use input::{FunctionInput, FunctionInputRow, FunctionInputSegment, FunctionInputSource};
-pub use output::FunctionOutput;
+pub use output::{FunctionOutput, OutputSegment};
 pub use registry::{FunctionCatalog, FunctionRegistry};
 pub use scalar::ScalarFunction;

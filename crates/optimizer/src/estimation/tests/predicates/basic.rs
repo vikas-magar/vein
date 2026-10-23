@@ -27,7 +27,8 @@ fn unsupported_expressions_and_absent_column_stats_use_explicit_fallbacks() {
     let c = plan.schema().fields[0].clone();
     let eq = predicate(&c, BinaryOp::Eq, LogicalLiteral::Int64(4));
     let equality_estimate = root(&filter(plan.clone(), eq)).rows;
-    assert_eq!(equality_estimate.value(), Some(1.0));
+    assert_eq!(equality_estimate.value(), Some(100.0));
+    assert_eq!(equality_estimate.source, EstimateSource::SelectivityFallback);
     assert_eq!(equality_estimate.confidence, EstimateConfidence::Model);
     with_stats(&mut plan, |s| s.column_statistics.clear());
     let like = LogicalExpr::Like {

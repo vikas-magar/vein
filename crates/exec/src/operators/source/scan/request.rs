@@ -13,7 +13,7 @@ use crate::expression::eval::ExpressionKernelProvider;
 use crate::runtime::filter::RuntimeFilterSet;
 use types::VeinSchema;
 
-use super::ScanFile;
+use super::{ScanFile, ScanWorkerState};
 
 /// Borrowed inputs for one source scan invocation.
 ///
@@ -21,6 +21,8 @@ use super::ScanFile;
 /// according to their registered file format. The request itself keeps no
 /// payload copies and providers emit reference-backed pipeline views.
 pub struct ScanRequest<'a> {
+    /// Provider-local state retained across this worker's scan work units.
+    pub worker_state: &'a ScanWorkerState,
     /// Root-scoped storage interface used to read the scan files.
     pub storage: &'a Arc<dyn ReadStorage>,
     /// Files and optional provider-defined unit ranges assigned to this scan.

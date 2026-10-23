@@ -7,7 +7,7 @@ mod metrics;
 mod page_header;
 #[path = "tests/projection.rs"]
 mod projection;
-#[path = "tests/page_selection_io.rs"]
+#[path = "tests/page_selection_io/mod.rs"]
 mod page_selection_io;
 #[path = "tests/partitioning.rs"]
 mod partitioning;
