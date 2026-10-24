@@ -20,7 +20,7 @@ fn accumulation_reads_only_selected_physical_rows() {
         ],
         SelectionVector::new_sparse(vec![1, 3]),
     );
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(chunk).unwrap();
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
@@ -31,7 +31,7 @@ fn accumulation_reads_only_selected_physical_rows() {
     let output = sink.finish().unwrap();
 
     let keys = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0);
-    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
+    let sums = int128_column(&output[0], 1);
     assert_eq!(keys.values(), &[20, 40, 50]);
     assert_eq!(sums.values(), &[203, 400, 5]);
 }
@@ -51,7 +51,7 @@ fn empty_global_aggregate_emits_count_zero_and_null_sum() {
         Arc::new(Int64Array::from(Vec::<i64>::new())),
         Arc::new(Float64Array::from(Vec::<f64>::new())),
     ]);
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(chunk).unwrap();
     let output = sink.finish().unwrap();
@@ -102,7 +102,7 @@ fn empty_global_average_uses_its_declared_input_type() {
         types: vec![VeinDataType::Float64],
     };
     let chunk = crate::pipeline::test_support::dense_view(vec![Arc::new(Float32Array::from(Vec::<f32>::new()))]);
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(chunk).unwrap();
     let output = sink.finish().unwrap();

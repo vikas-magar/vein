@@ -21,8 +21,9 @@ pub fn eval_cast(src: &dyn Array, target: &VeinDataType) -> Result<ArrayRef> {
         safe: false,
         ..CastOptions::default()
     };
-    cast_with_options(src, &to, &options)
-        .map_err(|e| VeinError::internal(format!("cast to {target:?} failed: {e}")))
+    let result = cast_with_options(src, &to, &options)
+        .map_err(|e| VeinError::internal(format!("cast to {target:?} failed: {e}")))?;
+    if target.is_int128() { super::wide_integer::normalize(result.as_ref()) } else { Ok(result) }
 }
 
 #[cfg(test)]

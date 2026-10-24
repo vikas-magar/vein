@@ -51,8 +51,15 @@ impl PipelineNode for AggregateHandle {
             .0
             .lock()
             .map_err(|_| VeinError::internal("aggregate mutex poisoned"))?;
+        // The estimate describes the entire relation, not this worker's
+        // dynamically assigned morsels. Replicating it multiplies speculative
+        // allocations by worker count. Local tables learn from their first
+        // batch and grow as groups actually arrive; the canonical sink keeps
+        // the query-wide estimate for combination.
+        let mut local_plan = sink.plan.clone();
+        local_plan.estimated_groups = None;
         let mut local = AggregateSink::with_registry_and_memory_tracker(
-            sink.plan.clone(),
+            local_plan,
             sink.tracker.clone(),
             Arc::clone(&sink.registry),
         )?;
@@ -60,6 +67,9 @@ impl PipelineNode for AggregateHandle {
         Ok(Some(Box::new(LocalAggregateHandle(local))))
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 /// Builds the accumulator and node for a view-backed aggregate input.
 pub fn shared(plan: AggregatePlan) -> Result<SharedAggregate> {

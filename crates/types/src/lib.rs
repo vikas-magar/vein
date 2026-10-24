@@ -15,6 +15,8 @@ pub mod literal;
 pub mod schema;
 /// Temporal interval construction and unit conversion.
 pub mod temporal;
+/// Native wide-integer semantics and Arrow interchange layout.
+pub mod wide_integer;
 
 pub use column::{ColumnId, ResolvedColumn, ResolvedColumnRef};
 pub use coercion::unify_types;

@@ -146,8 +146,8 @@ pub(super) fn create_aggregate_states(
         .map(|((operation, input_type), output_type)| {
             registry.create_aggregate_accumulator(
                 operation.name(),
-                &[input_type.to_arrow()],
-                &output_type.to_arrow(),
+                std::slice::from_ref(input_type),
+                output_type,
             )
         })
         .collect()

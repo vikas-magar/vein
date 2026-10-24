@@ -49,13 +49,13 @@ fn mapped_input() -> (DataChunkView, ArrayRef) {
     (joined, key_array)
 }
 
-fn grouped_rows(sink: &mut AggregateSink) -> BTreeMap<Option<i64>, i64> {
+fn grouped_rows(sink: &mut AggregateSink) -> BTreeMap<Option<i64>, i128> {
     sink.finish()
         .expect("finish aggregate")
         .into_iter()
         .flat_map(|batch| {
             let keys = materialized_column::<Int64Array>(&batch, 0);
-            let sums = materialized_column::<Int64Array>(&batch, 1);
+            let sums = int128_column(&batch, 1);
             (0..batch.num_rows())
                 .map(|row| {
                     (
@@ -72,7 +72,7 @@ fn grouped_rows(sink: &mut AggregateSink) -> BTreeMap<Option<i64>, i64> {
 fn aggregate_view_groups_mapped_duplicate_and_null_extended_keys_without_gathering_keys() {
     let (view, source_keys) = mapped_input();
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
-    let mut sink = AggregateSink::with_memory_tracker(sum_plan(), tracker.clone())
+    let mut sink = AggregateSink::with_memory_tracker(inferred_results(sum_plan()), tracker.clone())
         .expect("aggregate sink");
 
     sink.accumulate(view).expect("aggregate mapped view");
@@ -97,9 +97,9 @@ fn aggregate_view_groups_mapped_duplicate_and_null_extended_keys_without_gatheri
 fn combining_view_backed_local_groups_preserves_keys_and_merges_duplicates() {
     let (view, source_keys) = mapped_input();
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
-    let mut local = AggregateSink::with_memory_tracker(sum_plan(), tracker.clone())
+    let mut local = AggregateSink::with_memory_tracker(inferred_results(sum_plan()), tracker.clone())
         .expect("local aggregate sink");
-    let mut target = AggregateSink::with_memory_tracker(sum_plan(), tracker.clone())
+    let mut target = AggregateSink::with_memory_tracker(inferred_results(sum_plan()), tracker.clone())
         .expect("target aggregate sink");
     local
         .inherit_hash_builders(&target)
@@ -113,7 +113,7 @@ fn combining_view_backed_local_groups_preserves_keys_and_merges_duplicates() {
         ]))
         .expect("seed target with a duplicate key");
     let mut materialized_local =
-        AggregateSink::with_memory_tracker(sum_plan(), tracker.clone()).expect("materialized local");
+        AggregateSink::with_memory_tracker(inferred_results(sum_plan()), tracker.clone()).expect("materialized local");
     materialized_local
         .inherit_hash_builders(&target)
         .expect("materialized worker inherits canonical hash seeds");
@@ -154,7 +154,7 @@ fn combining_view_backed_local_groups_preserves_keys_and_merges_duplicates() {
 fn spilling_view_backed_groups_resolves_source_rows_and_null_extensions() {
     let (view, _) = mapped_input();
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
-    let mut sink = AggregateSink::with_memory_tracker(sum_plan(), tracker.clone())
+    let mut sink = AggregateSink::with_memory_tracker(inferred_results(sum_plan()), tracker.clone())
         .expect("aggregate sink");
     sink.accumulate(view).expect("aggregate mapped view");
     assert!(matches!(

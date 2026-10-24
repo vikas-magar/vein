@@ -60,8 +60,8 @@ impl FunctionRegistry {
     pub fn create_aggregate_accumulator(
         &self,
         name: &str,
-        argument_types: &[DataType],
-        expected_type: &DataType,
+        argument_types: &[types::VeinDataType],
+        expected_type: &types::VeinDataType,
     ) -> Result<Box<dyn AggregateAccumulator>> {
         let definition = self.definition(name)?;
         let FunctionImplementation::Aggregate(function) = definition.implementation() else {

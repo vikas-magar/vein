@@ -13,12 +13,12 @@ fn year_accepts_scalar_runs_inside_column_inputs_and_keeps_nulls() {
     let adapter = ExpressionFunctionInputSource::new(&value);
     let arguments = [FunctionInput::new(&adapter, 7)];
     let output = FunctionRegistry::with_builtins()
-        .invoke("year", &arguments, 7, &DataType::Int32).unwrap();
-    output.validate(7, &DataType::Int32, &arguments).unwrap();
+        .invoke("year", &arguments, 7, &DataType::Int64).unwrap();
+    output.validate(7, &DataType::Int64, &arguments).unwrap();
     let value = into_expression_value(output, &[]).unwrap();
     let actual = (0..7).map(|row| {
         value.source_row(row, 7).unwrap().and_then(|(array, index, _)| {
-            let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
             array.is_valid(index).then(|| array.value(index))
         })
     }).collect::<Vec<_>>();

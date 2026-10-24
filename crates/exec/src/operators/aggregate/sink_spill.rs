@@ -83,10 +83,13 @@ impl AggregateSink {
             })?;
         self.spill_runs.append(&mut local.spill_runs);
 
+        let started = Instant::now();
+        let key_batches_before = self.group_key_batches.len();
+        let mut batches = vec![None; local.group_key_batches.len()];
+        let mut direct_groups = 0;
         for slot in 0..local.groups.len() {
-            let group = local.intermediate_group_state(slot)?;
-            match self.merge_spilled_group(group) {
-                Ok(()) => {}
+            let target = match self.prepare_local_merge_group(&local, slot, &mut batches) {
+                Ok(target) => target,
                 Err(VeinError::ResourceExhausted { .. }) => {
                     self.flush_current_run()?;
                     local.write_group_suffix_to_run(slot)?;
@@ -101,8 +104,20 @@ impl AggregateSink {
                     break;
                 }
                 Err(error) => return Err(error),
+            };
+            // A kernel error must propagate, rather than replaying a possibly
+            // partially updated state through the memory-spill fallback.
+            for (target_state, source_state) in self.aggregate_states.iter_mut().zip(&local.aggregate_states) {
+                target_state.combine_group(target, source_state.as_ref(), slot)?;
             }
+            direct_groups += 1;
         }
+        tracing::info!(target: "vein.audit", event = "aggregate_worker_combined",
+            local_groups = local.groups.len(), direct_groups,
+            externalized_groups = local.groups.len() - direct_groups,
+            retained_key_batches = self.group_key_batches.len().saturating_sub(key_batches_before),
+            combine_us = started.elapsed().as_micros() as u64,
+            "combined typed worker states; codec used only for externalized groups");
         self.metrics.accumulate(local.metrics);
         Ok(())
     }

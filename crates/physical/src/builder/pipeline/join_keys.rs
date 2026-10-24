@@ -42,8 +42,8 @@ fn is_column_equality(expression: &LogicalExpr) -> bool {
 /// Extract all supported direct-column equalities that compare probe and build
 /// inputs. Other conjuncts remain residual predicates, so same-side equalities,
 /// expression equalities, and non-equality conditions still participate in the
-/// complete `ON` test. A hash join requires at least one extracted key; joins
-/// with only residual conditions need a different physical algorithm.
+/// complete `ON` test. With no hash keys, the executor enumerates bounded
+/// candidate batches and evaluates the complete residual condition.
 pub(super) fn extract_equi_join_keys(
     conjuncts: &[&LogicalExpr],
     probe: &VeinSchema,
@@ -65,13 +65,6 @@ pub(super) fn extract_equi_join_keys(
                 }
             }
         residual.push((*conjunct).clone());
-    }
-
-    if probe_keys.is_empty() {
-        return Err(VeinError::unsupported(
-            "hash join requires at least one equality between direct columns from opposite inputs with matching supported hash-key types; expression-only and non-equi joins are not supported",
-            None,
-        ));
     }
 
     Ok(((probe_keys, build_keys), residual))

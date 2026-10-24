@@ -16,12 +16,19 @@ use std::sync::Arc;
 /// the pre-populated mock registry. Returns a fully-typed logical plan or a
 /// typed `VeinError`; never panics on user input.
 pub async fn plan(sql: &str) -> error::Result<LogicalPlan> {
+    plan_with_catalog(sql, Arc::new(TestCatalog::with_fixtures())).await
+}
+
+/// Binds against caller-supplied metadata without introducing a format dependency.
+pub(crate) async fn plan_with_catalog(
+    sql: &str, catalog: Arc<dyn plan::CatalogProvider>,
+) -> error::Result<LogicalPlan> {
     let node = Parser::new(sql)
         .parse_statement()
         .map_err(|e| VeinError::semantic(format!("parse error: {e}"), parse_error_span(&e)))?;
 
     QueryBinder::new(
-        Arc::new(TestCatalog::with_fixtures()),
+        catalog,
         Arc::new(FunctionRegistry::with_builtins()),
     )
         .bind(&node)

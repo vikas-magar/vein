@@ -13,7 +13,7 @@ fn grouping_sets_keep_set_identity_and_null_omitted_keys() {
         aggregate_input_types: vec![VeinDataType::Int64],
         types: vec![VeinDataType::Int64, VeinDataType::Utf8, VeinDataType::Int64],
     };
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![Some(1), None])),
         Arc::new(StringArray::from(vec![Some("x"), Some("z")])),
@@ -35,7 +35,7 @@ fn grouping_sets_keep_set_identity_and_null_omitted_keys() {
     let batch = &output[0];
     let first_key = crate::pipeline::test_support::materialized_column::<Int64Array>(batch, 0);
     let second_key = crate::pipeline::test_support::materialized_column::<StringArray>(batch, 1);
-    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(batch, 2);
+    let sums = int128_column(batch, 2);
 
     assert_eq!(batch.num_rows(), 5);
     let mut actual = (0..batch.num_rows())
@@ -70,7 +70,7 @@ fn empty_input_emits_only_empty_grouping_sets() {
         aggregate_input_types: vec![VeinDataType::Int64],
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(Vec::<i64>::new())),
         Arc::new(Int64Array::from(Vec::<i64>::new())),

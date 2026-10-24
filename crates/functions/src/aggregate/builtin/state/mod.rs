@@ -43,8 +43,8 @@ pub(super) struct BuiltinAccumulator {
 impl BuiltinAccumulator {
     pub(super) fn new(
         operation: AggregateOperation,
-        argument_types: &[DataType],
-        result_type: &DataType,
+        argument_types: &[types::VeinDataType],
+        result_type: &types::VeinDataType,
     ) -> Result<Self> {
         Self::create(operation, argument_types, result_type)
     }

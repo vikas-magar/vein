@@ -60,7 +60,7 @@ fn register_temporal_scalars(registry: &mut FunctionRegistry) -> Result<()> {
     for &(name, part) in EXTRACTORS {
         registry.register(FunctionDefinition::scalar(
             name,
-            signature(VeinDataType::Int32, Vec::new(), 1, FunctionKind::TemporalExtract),
+            signature(VeinDataType::Int64, Vec::new(), 1, FunctionKind::TemporalExtract),
             extract::ExtractFunction { part },
         ))?;
     }

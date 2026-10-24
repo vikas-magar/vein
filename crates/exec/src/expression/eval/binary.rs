@@ -27,15 +27,17 @@ pub(super) fn evaluate_binary(
         BinaryExprOp::Divide => ops::eval_mapped_binary_value(&lhs, &rhs, rows, ops::eval_div)?,
         BinaryExprOp::Modulo => ops::eval_mapped_binary_value(&lhs, &rhs, rows, ops::eval_mod)?,
         BinaryExprOp::Concat => ops::eval_mapped_binary_value(&lhs, &rhs, rows, concat)?,
-        BinaryExprOp::Equal => ops::eval_mapped_boolean_binary(&lhs, &rhs, rows, ops::eval_cmp_eq)?,
-        BinaryExprOp::NotEqual => ops::eval_mapped_boolean_binary(&lhs, &rhs, rows, ops::eval_cmp_neq)?,
-        BinaryExprOp::Less => ops::eval_mapped_boolean_binary(&lhs, &rhs, rows, ops::eval_cmp_lt)?,
-        BinaryExprOp::LessEqual => ops::eval_mapped_boolean_binary(&lhs, &rhs, rows, ops::eval_cmp_lte)?,
-        BinaryExprOp::Greater => ops::eval_mapped_boolean_binary(&lhs, &rhs, rows, ops::eval_cmp_gt)?,
-        BinaryExprOp::GreaterEqual => ops::eval_mapped_boolean_binary(&lhs, &rhs, rows, ops::eval_cmp_gte)?,
+        BinaryExprOp::Equal | BinaryExprOp::NotEqual | BinaryExprOp::Less
+        | BinaryExprOp::LessEqual | BinaryExprOp::Greater | BinaryExprOp::GreaterEqual =>
+            ops::mapped_comparison::evaluate(*op, &lhs, &rhs, rows)?,
         BinaryExprOp::And => ops::eval_mapped_boolean_binary(&lhs, &rhs, rows, ops::eval_and_datum)?,
         BinaryExprOp::Or => ops::eval_mapped_boolean_binary(&lhs, &rhs, rows, ops::eval_or_datum)?,
     };
+    let result = if expression.return_type.is_int128() {
+        ops::eval_mapped_unary_value(&result, rows,
+            |len| Ok(new_null_array(&types::wide_integer::INT128_STORAGE, len)),
+            ops::wide_integer::normalize)?
+    } else { result };
     Ok(super::normalize_scalar(result, lhs.is_scalar() && rhs.is_scalar()))
 }
 

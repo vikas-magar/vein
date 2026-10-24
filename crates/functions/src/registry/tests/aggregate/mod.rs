@@ -3,7 +3,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int64Array};
-use arrow::datatypes::DataType;
 use error::{Result, VeinError};
 use types::VeinDataType;
 
@@ -16,17 +15,17 @@ use crate::{
 struct SumFunction;
 
 impl AggregateFunction for SumFunction {
-    fn return_type(&self, arguments: &[DataType]) -> Result<DataType> {
+    fn return_type(&self, arguments: &[VeinDataType]) -> Result<VeinDataType> {
         match arguments {
-            [DataType::Int64] => Ok(DataType::Int64),
+            [VeinDataType::Int64] => Ok(VeinDataType::Int64),
             _ => Err(VeinError::planning("sum_test expects one Int64 input", None)),
         }
     }
 
     fn create_accumulator(
         &self,
-        _arguments: &[DataType],
-        _result: &DataType,
+        _arguments: &[VeinDataType],
+        _result: &VeinDataType,
     ) -> Result<Box<dyn AggregateAccumulator>> {
         Ok(Box::new(SumState(Vec::new())))
     }
@@ -106,14 +105,14 @@ fn registered_aggregate_batches_combine_and_spills_without_gathering_inputs() {
     )).unwrap();
 
     let mut state = registry.create_aggregate_accumulator(
-        "SUM_TEST", &[DataType::Int64], &DataType::Int64,
+        "SUM_TEST", &[VeinDataType::Int64], &VeinDataType::Int64,
     ).unwrap();
     state.ensure_groups(2).unwrap();
     let input = DenseInput::column(Arc::new(Int64Array::from(vec![4, 6, 3])) as ArrayRef);
     state.update_batch(&[FunctionInput::new(&input, 3)], &[0, 1, 0]).unwrap();
 
     let mut worker = registry.create_aggregate_accumulator(
-        "sum_test", &[DataType::Int64], &DataType::Int64,
+        "sum_test", &[VeinDataType::Int64], &VeinDataType::Int64,
     ).unwrap();
     worker.ensure_groups(1).unwrap();
     let input = DenseInput::column(Arc::new(Int64Array::from(vec![5])) as ArrayRef);
@@ -123,7 +122,7 @@ fn registered_aggregate_batches_combine_and_spills_without_gathering_inputs() {
     let mut encoded = Vec::new();
     state.encode_group(0, &mut encoded).unwrap();
     let mut restored = registry.create_aggregate_accumulator(
-        "sum_test", &[DataType::Int64], &DataType::Int64,
+        "sum_test", &[VeinDataType::Int64], &VeinDataType::Int64,
     ).unwrap();
     restored.ensure_groups(1).unwrap();
     let mut remaining = encoded.as_slice();

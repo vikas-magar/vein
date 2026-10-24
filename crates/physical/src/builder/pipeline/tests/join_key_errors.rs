@@ -1,12 +1,12 @@
-use super::support::{equality, join_key_schemas, test_column};
 use super::super::{equality_keys, extract_equi_join_keys};
+use super::support::{equality, join_key_schemas, test_column};
 use parser::ast::expr::BinaryOp;
 use plan::schema::{VeinDataType, VeinSchema};
 use plan::{LogicalExpr, LogicalLiteral};
 use std::sync::Arc;
 
 #[test]
-fn rejects_expression_only_join_equality_with_supported_boundary_error() {
+fn expression_only_join_equality_remains_an_exact_residual() {
     let probe_value = test_column(12, "probe_value");
     let build_value = test_column(22, "build_value");
     let probe = VeinSchema::new(vec![Arc::clone(&probe_value)]);
@@ -23,16 +23,14 @@ fn rejects_expression_only_join_equality_with_supported_boundary_error() {
         return_type: VeinDataType::Boolean,
     };
 
-    let error = extract_equi_join_keys(&[&expression_equality], &probe, &build)
-        .expect_err("expression-only equality cannot run as a hash join");
-
-    let message = error.to_string();
-    assert!(message.contains("direct columns from opposite inputs"), "{message}");
-    assert!(message.contains("expression-only and non-equi joins are not supported"), "{message}");
+    let ((probe_keys, build_keys), residual) =
+        extract_equi_join_keys(&[&expression_equality], &probe, &build).unwrap();
+    assert!(probe_keys.is_empty() && build_keys.is_empty());
+    assert_eq!(residual, vec![expression_equality]);
 }
 
 #[test]
-fn rejects_pure_non_equi_join_with_supported_boundary_error() {
+fn non_equality_join_uses_bounded_residual_candidates() {
     let probe_value = test_column(12, "probe_value");
     let build_value = test_column(22, "build_value");
     let probe = VeinSchema::new(vec![Arc::clone(&probe_value)]);
@@ -44,12 +42,10 @@ fn rejects_pure_non_equi_join_with_supported_boundary_error() {
         return_type: VeinDataType::Boolean,
     };
 
-    let error = extract_equi_join_keys(&[&non_equi], &probe, &build)
-        .expect_err("pure non-equi conditions need a non-hash join algorithm");
-
-    let message = error.to_string();
-    assert!(message.contains("direct columns from opposite inputs"), "{message}");
-    assert!(message.contains("expression-only and non-equi joins are not supported"), "{message}");
+    let ((probe_keys, build_keys), residual) =
+        extract_equi_join_keys(&[&non_equi], &probe, &build).unwrap();
+    assert!(probe_keys.is_empty() && build_keys.is_empty());
+    assert_eq!(residual, vec![non_equi]);
 }
 
 #[test]
@@ -61,12 +57,21 @@ fn rejects_equality_keys_from_the_same_input_side() {
         &probe,
         &build,
     )
-        .expect_err("same-side equality cannot be a hash join key");
+    .expect_err("same-side equality cannot be a hash join key");
 
     assert_eq!(error.category(), error::ErrorCategory::Planning);
     let message = error.to_string();
     assert!(message.contains("key#11"), "{message}");
-    assert!(message.contains("must resolve to one column from each input"), "{message}");
-    assert!(message.contains("probe schema [other#10, key#11]"), "{message}");
-    assert!(message.contains("build schema [key#21, other#22]"), "{message}");
+    assert!(
+        message.contains("must resolve to one column from each input"),
+        "{message}"
+    );
+    assert!(
+        message.contains("probe schema [other#10, key#11]"),
+        "{message}"
+    );
+    assert!(
+        message.contains("build schema [key#21, other#22]"),
+        "{message}"
+    );
 }

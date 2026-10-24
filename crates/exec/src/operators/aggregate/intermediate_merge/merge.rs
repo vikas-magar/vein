@@ -21,7 +21,7 @@ impl AggregateSink {
 
         let mut key_columns = std::iter::repeat_with(|| None)
             .take(group.keys.len())
-            .collect::<Vec<Option<GroupKeyColumn>>>();
+            .collect::<Vec<Option<Arc<GroupKeyColumn>>>>();
         let mut key_arrays = vec![Vec::new(); group.keys.len()];
         let mut key_row = None;
         for (column, key) in group.keys.iter().enumerate() {
@@ -39,7 +39,7 @@ impl AggregateSink {
                             "aggregate intermediate keys disagree on their group row",
                         ));
                     }
-                    key_columns[column] = Some(key_column);
+                    key_columns[column] = Some(Arc::new(key_column));
                     key_arrays[column] = key.source_arrays()?;
                     key_row.get_or_insert(row);
                 }
@@ -57,51 +57,15 @@ impl AggregateSink {
             }
         }
 
-        let matching_slot = self.index.find(group.hash, |entry| {
-            let Some(existing) = self.groups.get(entry.slot) else {
-                return false;
-            };
-            existing.grouping_set_id == group.grouping_set_id
-                && grouping_set.iter().all(|&column| {
-                let column = column as usize;
-                let Some(location) = existing.key_location else {
-                    return false;
-                };
-                let Some(existing_key) = self.group_key_batches[location.batch][column].as_ref()
-                else {
-                    return false;
-                };
-                key_columns[column]
-                    .as_ref()
-                    .zip(key_row)
-                    .is_some_and(|(key, row)| key.rows_equal(row, existing_key, location.row))
-            })
-        });
+        let matching_slot = self.matching_merge_group(
+            group.hash, group.grouping_set_id, &key_columns, key_row,
+        );
 
-        let slot = if let Some(entry) = matching_slot {
-            entry.slot
+        let slot = if let Some(slot) = matching_slot {
+            slot
         } else {
-            let group_bytes = size_of::<Group>()
-                .checked_add(
-                    size_of::<Option<GroupKeyLocation>>()
-                        .checked_mul(self.plan.groups as usize)
-                        .ok_or_else(|| VeinError::internal("aggregate spill key size overflow"))?,
-                )
-                .and_then(|bytes| {
-                    self.aggregate_states
-                        .iter()
-                        .try_fold(bytes, |total, state| {
-                            total.checked_add(state.estimated_bytes_per_group())
-                        })
-                })
-                .and_then(|bytes| bytes.checked_add(size_of::<GroupIndexEntry>()))
-                .ok_or_else(|| VeinError::internal("aggregate spill group size overflow"))?;
             let before = self.memory.bytes();
-            self.memory.grow(group_bytes, "aggregate spill merge state")?;
-            if let Err(error) = self.index.reserve(1) {
-                self.memory.shrink(self.memory.bytes() - before);
-                return Err(error);
-            }
+            self.reserve_merge_group()?;
 
             let mut leases = HashMap::new();
             if let Err(error) = leases.try_reserve(key_arrays.iter().map(Vec::len).sum()) {
@@ -151,12 +115,7 @@ impl AggregateSink {
                 batch: self.group_key_batches.len(),
                 row,
             });
-            self.group_key_batches.push(
-                key_columns
-                    .into_iter()
-                    .map(|column| column.map(Arc::new))
-                    .collect(),
-            );
+            self.group_key_batches.push(key_columns);
             self.group_key_batch_arrays.push(key_arrays);
             self.group_key_batch_leases.push(leases);
             let slot = Self::push_group(

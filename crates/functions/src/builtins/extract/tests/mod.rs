@@ -1,4 +1,4 @@
-use arrow::array::{Array, ArrayRef, Date32Array, Int32Array, TimestampMicrosecondArray};
+use arrow::array::{Array, ArrayRef, Date32Array, Int64Array, TimestampMicrosecondArray};
 use arrow::compute::kernels::temporal::DatePart;
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ fn extract_handles_date_and_timestamp_units_and_nulls() {
         vec![date],
     )
         .expect("extract year");
-    let years = years.as_any().downcast_ref::<Int32Array>().expect("Int32 output");
+    let years = years.as_any().downcast_ref::<Int64Array>().expect("Int64 output");
     assert_eq!(years.value(0), 1970);
     assert_eq!(years.value(1), 2024);
     assert!(years.is_null(2));
@@ -33,7 +33,7 @@ fn extract_handles_date_and_timestamp_units_and_nulls() {
         vec![timestamp],
     )
         .expect("extract hour");
-    let hours = hours.as_any().downcast_ref::<Int32Array>().expect("Int32 output");
+    let hours = hours.as_any().downcast_ref::<Int64Array>().expect("Int64 output");
     assert_eq!(hours.value(0), 1);
     assert!(hours.is_null(1));
 }

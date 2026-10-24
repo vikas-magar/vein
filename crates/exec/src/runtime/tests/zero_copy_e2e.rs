@@ -81,7 +81,7 @@ async fn scan_join_expression_aggregate_sort_preserve_arrays_to_client_sink() {
         },
     );
     let aggregate_schema =
-        schema_for_types(&[types::VeinDataType::Int64, types::VeinDataType::Int64]);
+        schema_for_types(&[types::VeinDataType::Int64, types::VeinDataType::int128()]);
     let aggregate = plan_node(
         Arc::clone(&aggregate_schema),
         PhysicalPlanOperator::Aggregate {
@@ -93,7 +93,7 @@ async fn scan_join_expression_aggregate_sort_preserve_arrays_to_client_sink() {
                 emit_empty_group_on_empty_input: false,
                 aggs: vec![AggOpCode::Sum],
                 aggregate_input_types: vec![types::VeinDataType::Int64],
-                types: vec![types::VeinDataType::Int64, types::VeinDataType::Int64],
+                types: vec![types::VeinDataType::Int64, types::VeinDataType::int128()],
             },
         },
     );
@@ -133,8 +133,9 @@ async fn scan_join_expression_aggregate_sort_preserve_arrays_to_client_sink() {
                 "group key must still reference a scan array after join, expression, aggregate, and sort"
             );
             let (sum_array, sum_row) = batch.resolve(1, row).unwrap().unwrap();
-            let sum_values = sum_array.as_any().downcast_ref::<Int64Array>().unwrap();
-            rows.push((key_values.value(key_row), sum_values.value(sum_row)));
+            let sum_values = sum_array.as_any().downcast_ref::<arrow::array::Decimal256Array>().unwrap();
+            let sum = types::wide_integer::decode(sum_values.value(sum_row)).unwrap();
+            rows.push((key_values.value(key_row), sum));
         }
     }
     assert_eq!(rows, vec![(3, 6), (2, 4)]);

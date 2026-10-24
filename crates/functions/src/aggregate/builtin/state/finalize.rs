@@ -36,6 +36,12 @@ impl BuiltinState {
             (Self::Int128(values), AggregateOperation::Avg, DataType::Float64) => {
                 Arc::new(Float64Array::from(averages(&values[range])))
             }
+            (Self::Int128(values), AggregateOperation::Sum | AggregateOperation::Min | AggregateOperation::Max, data_type)
+                if data_type == &types::wide_integer::INT128_STORAGE => {
+                Arc::new(Decimal256Array::from(convert_values(&values[range], arrow::datatypes::i256::from))
+                    .with_precision_and_scale(39, 0)
+                    .map_err(|error| VeinError::internal(format!("invalid Int128 storage: {error}")))?)
+            }
             (Self::UInt64(values), AggregateOperation::Avg, DataType::Float64) => {
                 Arc::new(Float64Array::from(averages(&values[range])))
             }

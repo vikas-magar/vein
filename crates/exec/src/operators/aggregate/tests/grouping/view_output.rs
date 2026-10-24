@@ -26,7 +26,7 @@ fn aggregate_view_output_reuses_key_array_and_retains_its_memory_lease() {
         Arc::clone(&keys),
         values,
     ]);
-    let mut sink = AggregateSink::with_memory_tracker(plan, tracker.clone()).expect("sink");
+    let mut sink = AggregateSink::with_memory_tracker(inferred_results(plan), tracker.clone()).expect("sink");
     sink.accumulate(input).expect("accumulate view");
 
     let mut output = Vec::new();
@@ -43,7 +43,7 @@ fn aggregate_view_output_reuses_key_array_and_retains_its_memory_lease() {
         .any(|array| Arc::ptr_eq(array, &keys)));
 
     let rows = materialized_column::<Int64Array>(&output[0], 0);
-    let sums = materialized_column::<Int64Array>(&output[0], 1);
+    let sums = int128_column(&output[0], 1);
     let actual = (0..output[0].num_rows())
         .map(|row| (rows.value(row), sums.value(row)))
         .collect::<BTreeMap<_, _>>();

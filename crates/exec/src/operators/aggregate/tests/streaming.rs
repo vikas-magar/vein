@@ -13,7 +13,7 @@ fn aggregate_finish_streams_ordered_groups_in_bounded_chunks() {
         aggregate_input_types: vec![VeinDataType::Int64],
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
-    let mut sink = AggregateSink::new(plan).expect("create grouped sum");
+    let mut sink = AggregateSink::new(inferred_results(plan)).expect("create grouped sum");
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![Some(1), None, Some(1), Some(3), None])) as ArrayRef,
         Arc::new(Int64Array::from(vec![10, 20, 15, 30, 25])) as ArrayRef,
@@ -38,7 +38,7 @@ fn aggregate_finish_streams_ordered_groups_in_bounded_chunks() {
     let mut actual = Vec::new();
     for chunk in &chunks {
         let keys = crate::pipeline::test_support::materialized_column::<Int64Array>(chunk, 0);
-        let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(chunk, 1);
+        let sums = int128_column(chunk, 1);
         for row in 0..chunk.num_rows() {
             actual.push((
                 (!keys.is_null(row)).then(|| keys.value(row)),
@@ -60,7 +60,7 @@ fn aggregate_finish_callback_error_stops_emission_without_losing_groups() {
         aggregate_input_types: vec![VeinDataType::Int64],
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
-    let mut sink = AggregateSink::new(plan).expect("create grouped count");
+    let mut sink = AggregateSink::new(inferred_results(plan)).expect("create grouped count");
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
         Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,

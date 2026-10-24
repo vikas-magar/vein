@@ -108,16 +108,16 @@ async fn executes_lower_and_round_scalar_projections_preserving_nulls() {
     let year_array = materialized_result_column(&result, 0);
     let years = year_array
         .as_any()
-        .downcast_ref::<arrow::array::Int32Array>()
-        .expect("Int32 output");
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("Int64 output");
     assert_eq!(years.value(0), 1970);
     assert_eq!(years.value(1), 2024);
     assert!(years.is_null(2));
     let year_alias_array = materialized_result_column(&result, 1);
     let year_alias = year_alias_array
         .as_any()
-        .downcast_ref::<arrow::array::Int32Array>()
-        .expect("Int32 YEAR alias output");
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("Int64 YEAR alias output");
     assert_eq!(year_alias, years);
     assert!(stream.next().await.is_none());
 

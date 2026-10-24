@@ -42,7 +42,7 @@ fn int8_and_int16_aggregates_share_int64_state() {
             VeinDataType::Float64,
         ],
     };
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         int8_values.clone(),
@@ -58,7 +58,7 @@ fn int8_and_int16_aggregates_share_int64_state() {
     let output = sink.finish().unwrap();
 
     assert_eq!(
-        crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0)
+        int128_column(&output[0], 0)
             .value(0),
         90
     );
@@ -78,7 +78,7 @@ fn int8_and_int16_aggregates_share_int64_state() {
         45.0
     );
     assert_eq!(
-        crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 4)
+        int128_column(&output[0], 4)
             .value(0),
         990
     );

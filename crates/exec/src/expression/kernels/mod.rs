@@ -8,6 +8,9 @@ pub mod constant;
 pub mod logic;
 mod mapped_kernel;
 mod mapped_predicate;
+pub(crate) mod mapped_comparison;
+pub(crate) mod mapped_cast;
+pub(crate) mod wide_integer;
 
 pub(crate) use conditional::{eval_case_value, eval_in_list_value};
 pub(crate) use mapped_kernel::{eval_mapped_binary_value, eval_mapped_unary_value};

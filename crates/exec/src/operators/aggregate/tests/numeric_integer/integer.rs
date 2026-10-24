@@ -18,11 +18,11 @@ fn integer_sum_preserves_values_above_f64_precision() {
         9_007_199_254_740_993,
     ]));
     let input = crate::pipeline::test_support::dense_view(vec![values.clone(), values.clone(), values]);
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(input).unwrap();
     let output = sink.finish().unwrap();
-    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0);
+    let sums = int128_column(&output[0], 0);
     let minimum = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
     let maximum = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 2);
 
@@ -42,7 +42,7 @@ fn int64_average_accumulates_exactly_across_batches() {
         aggregate_input_types: vec![VeinDataType::Int64],
         types: vec![VeinDataType::Float64],
     };
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(Int64Array::from(
         vec![9_007_199_254_740_993_i64],
@@ -66,11 +66,13 @@ fn integer_sum_reports_overflow() {
         grouping_sets: None,
         emit_empty_group_on_empty_input: true,
         aggs: vec![AggOpCode::Sum],
-        aggregate_input_types: vec![VeinDataType::Int64],
-        types: vec![VeinDataType::Int64],
+        aggregate_input_types: vec![VeinDataType::int128()],
+        types: vec![VeinDataType::int128()],
     };
-    let input = crate::pipeline::test_support::dense_view(vec![Arc::new(Int64Array::from(vec![i64::MAX, 1]))]);
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let values = Decimal256Array::from(vec![i256::from(i128::MAX), i256::from(1)])
+        .with_precision_and_scale(39, 0).unwrap();
+    let input = crate::pipeline::test_support::dense_view(vec![Arc::new(values)]);
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     let error = sink.accumulate(input).unwrap_err();
     assert!(error.to_string().contains("overflow while computing SUM"));

@@ -1,5 +1,7 @@
 # Final TPC-H validation — 2026-10-23
 
+Historical pass. See `performance_completion.md` for the latest fixes and validation.
+
 Validated the tuple-domain checkpoint continuation and cost-aware semi-join placement.
 Executed Q1–Q22 sequentially through RustRover's existing Query configuration.
 Workspace Test: 1,344 passed, zero failed. Check and incremental build passed.

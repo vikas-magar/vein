@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::datatypes::DataType;
+use types::VeinDataType;
 use common::Result;
 use functions::FunctionRegistry;
 
@@ -9,8 +9,8 @@ pub(in crate::operators::aggregate) fn count_state(count: usize) -> Result<Arc<V
     let registry = FunctionRegistry::with_builtins();
     let mut accumulator = registry.create_aggregate_accumulator(
         "COUNT",
-        &[DataType::Int64],
-        &DataType::Int64,
+        &[VeinDataType::Int64],
+        &VeinDataType::Int64,
     )?;
     accumulator.ensure_groups(1)?;
     let group_ids = vec![0; count];

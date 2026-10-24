@@ -1,19 +1,12 @@
 use super::*;
 
 use arrow::array::{ArrayRef, Decimal128Array, Float64Array, Int64Array};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema};
 use common::arrow::SelectionVector;
 use exec::pipeline::DataChunkView;
 
-fn result_batch(
-    schema: SchemaRef,
-    columns: Vec<ArrayRef>,
-    rows: Vec<u32>,
-) -> DataChunkView {
-    let view = DataChunkView::from_selected_arrays(
-        columns,
-        SelectionVector::new_sparse(rows),
-    )
+fn result_batch(schema: SchemaRef, columns: Vec<ArrayRef>, rows: Vec<u32>) -> DataChunkView {
+    let view = DataChunkView::from_selected_arrays(columns, SelectionVector::new_sparse(rows))
         .expect("valid view");
     view.with_schema(schema).expect("valid result view")
 }
@@ -49,32 +42,76 @@ fn json_lines_serialize_mapped_rows_and_preserve_typed_nulls() {
 }
 
 #[test]
-fn json_row_batch_slices_share_the_source_value_buffer() {
+fn json_encoder_reuses_one_source_for_discontiguous_rows() {
     let source: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
-    let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
-    let result = result_batch(Arc::clone(&schema), vec![Arc::clone(&source)], vec![2]);
-
-    let (row, run_len) = contiguous_run_batch(&result, schema, 0).unwrap();
-    assert_eq!(run_len, 1);
-    let source_buffer = source.to_data().buffers()[0].as_ptr();
-    let row_buffer = row.column(0).to_data().buffers()[0].as_ptr();
-    assert_eq!(
-        source_buffer.wrapping_add(2 * std::mem::size_of::<i64>()),
-        row_buffer,
-        "the row slice must point into the original Arrow values buffer",
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let result = result_batch(
+        Arc::clone(&schema),
+        vec![Arc::clone(&source)],
+        vec![2, 0, 2, 1],
     );
+    let mut output = Vec::new();
+    let encoders = encode::write_view(
+        &result,
+        &schema,
+        &[b"\"n\":".to_vec()],
+        &mut Vec::new(),
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(
+        encoders.source_encoders, 1,
+        "encoder creation must depend on sources, not row runs"
+    );
+    assert_eq!(encoders.bytes, output.len());
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "{\"n\":30}\n{\"n\":10}\n{\"n\":30}\n{\"n\":20}\n"
+    );
+    assert!(Arc::ptr_eq(
+        result.resolve(0, 0).unwrap().unwrap().0,
+        &source
+    ));
 }
 
 #[test]
-fn json_writer_coalesces_contiguous_rows_into_one_shared_buffer_slice() {
+fn json_encoder_reuses_one_source_for_contiguous_rows() {
     let source: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
-    let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
-    let result = result_batch(Arc::clone(&schema), vec![Arc::clone(&source)], vec![0, 1, 2]);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let result = result_batch(
+        Arc::clone(&schema),
+        vec![Arc::clone(&source)],
+        vec![0, 1, 2],
+    );
 
-    let (batch, run_len) = contiguous_run_batch(&result, schema, 0).unwrap();
-
-    assert_eq!(run_len, 3);
-    let source_buffer = source.to_data().buffers()[0].as_ptr();
-    let output_buffer = batch.column(0).to_data().buffers()[0].as_ptr();
-    assert_eq!(output_buffer, source_buffer);
+    let mut output = Vec::new();
+    assert_eq!(
+        encode::write_view(
+            &result,
+            &schema,
+            &[b"\"n\":".to_vec()],
+            &mut Vec::new(),
+            &mut output
+        )
+        .unwrap()
+        .source_encoders,
+        1
+    );
+    assert_eq!(
+        output
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .count(),
+        3
+    );
 }
+
+mod sources;

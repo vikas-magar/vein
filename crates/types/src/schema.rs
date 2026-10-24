@@ -4,11 +4,13 @@
 //! management, column resolution, and zero-allocation conversion to/from Apache Arrow.
 
 use std::sync::Arc;
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::Schema;
 use error::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::column::{ColumnId, ResolvedColumn, ResolvedColumnRef};
+
+mod field;
 
 /// Query schema representing an ordered sequence of resolved columns.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,7 +53,7 @@ impl VeinSchema {
         let arrow_fields = self
             .fields
             .iter()
-            .map(|f| Field::new(&f.name, f.data_type.to_arrow(), f.nullable))
+            .map(|f| f.data_type.to_arrow_field(&f.name, f.nullable))
             .collect::<Vec<_>>();
         Schema::new(arrow_fields)
     }
@@ -70,7 +72,7 @@ impl TryFrom<&Schema> for VeinSchema {
                     ColumnId(i),
                     f.name().clone(),
                     None,
-                    crate::data_type::VeinDataType::try_from(f.data_type())?,
+                    crate::data_type::VeinDataType::from_arrow_field(f)?,
                 )
                     .with_nullable(f.is_nullable())))
             })
@@ -103,6 +105,7 @@ pub type VeinSchemaRef = Arc<VeinSchema>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::Field;
     use crate::data_type::VeinDataType;
 
     #[test]

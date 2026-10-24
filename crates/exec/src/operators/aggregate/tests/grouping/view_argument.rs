@@ -56,7 +56,7 @@ fn aggregate_view_reads_mapped_arguments_from_original_arrow_buffers() {
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
     let tracker = QueryMemoryTracker::unlimited(CancellationToken::new());
-    let mut sink = AggregateSink::with_memory_tracker(plan, tracker).expect("aggregate sink");
+    let mut sink = AggregateSink::with_memory_tracker(inferred_results(plan), tracker).expect("aggregate sink");
     sink.accumulate(view).expect("aggregate mapped input");
 
     let rows = sink
@@ -65,7 +65,7 @@ fn aggregate_view_reads_mapped_arguments_from_original_arrow_buffers() {
         .into_iter()
         .flat_map(|batch| {
             let keys = materialized_column::<Int64Array>(&batch, 0);
-            let sums = materialized_column::<Int64Array>(&batch, 1);
+            let sums = int128_column(&batch, 1);
             (0..batch.num_rows())
                 .map(|row| (keys.value(row), sums.value(row)))
                 .collect::<Vec<_>>()

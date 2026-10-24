@@ -65,12 +65,6 @@ fn evaluate_cast(
         return Err(VeinError::internal("cast kernel received another expression kind"));
     };
     let value = context.evaluate(expr)?;
-    let target = target_type.clone();
-    let result = kernels::eval_mapped_unary_value(
-        &value,
-        context.input().num_rows(),
-        |rows| Ok(arrow::array::new_null_array(&target.to_arrow(), rows)),
-        |array| kernels::eval_cast(array, target_type),
-    )?;
+    let result = kernels::mapped_cast::evaluate(&value, target_type, context.input().num_rows())?;
     Ok(super::normalize_scalar(result, value.is_scalar()))
 }

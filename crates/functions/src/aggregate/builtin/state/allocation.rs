@@ -10,8 +10,8 @@ use super::number::AggregateNumber;
 impl BuiltinAccumulator {
     pub(super) fn create(
         operation: AggregateOperation,
-        argument_types: &[DataType],
-        result_type: &DataType,
+        argument_types: &[types::VeinDataType],
+        result_type: &types::VeinDataType,
     ) -> Result<Self> {
         let argument_type = match (operation.clone(), argument_types) {
             (AggregateOperation::Count, []) => None,
@@ -22,17 +22,22 @@ impl BuiltinAccumulator {
                 format!("aggregate {} accepts at most one argument", operation.name()), None,
             )),
         };
+        let native_int128 = result_type.is_int128()
+            || argument_type.as_ref().is_some_and(types::VeinDataType::is_int128);
+        let argument_type = argument_type.as_ref().map(types::VeinDataType::to_arrow);
+        let result_type = result_type.to_arrow();
         let (state, scale, decimal_precision_limit) = match operation.clone() {
             AggregateOperation::Count | AggregateOperation::CountDistinct => {
                 (BuiltinState::Count(Vec::new()), 0, false)
             }
             AggregateOperation::SingleValue => (BuiltinState::SingleValue(Vec::new()), 0, false),
-            _ => numeric_state(operation.clone(), argument_type.as_ref(), result_type)?,
+            _ if native_int128 => (BuiltinState::Int128(Vec::new()), 0, false),
+            _ => numeric_state(operation.clone(), argument_type.as_ref(), &result_type)?,
         };
         Ok(Self {
             operation,
             argument_type,
-            result_type: result_type.clone(),
+            result_type,
             scale,
             decimal_precision_limit,
             state,

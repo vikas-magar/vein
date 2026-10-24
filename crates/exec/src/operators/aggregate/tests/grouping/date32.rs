@@ -10,17 +10,17 @@ fn date_sum_plan() -> AggregatePlan {
         emit_empty_group_on_empty_input: false,
         aggs: vec![AggOpCode::Sum],
         aggregate_input_types: vec![VeinDataType::Int64],
-        types: vec![VeinDataType::Date32, VeinDataType::Int64],
+        types: vec![VeinDataType::Date32, VeinDataType::int128()],
     }
 }
 
 fn collect_date_sums(
     sink: &mut AggregateSink,
-) -> Result<std::collections::BTreeMap<Option<i32>, i64>> {
+) -> Result<std::collections::BTreeMap<Option<i32>, i128>> {
     let mut groups = std::collections::BTreeMap::new();
     sink.finish_with(AGGREGATE_BATCH_ROWS, |batch| {
         let dates = crate::pipeline::test_support::materialized_column::<Date32Array>(&batch, 0);
-        let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
+        let sums = int128_column(&batch, 1);
         for row in 0..batch.num_rows() {
             groups.insert(dates.is_valid(row).then(|| dates.value(row)), sums.value(row));
         }
@@ -79,6 +79,6 @@ fn date32_group_keys_survive_aggregate_spill_and_merge() {
             .filter(|row| row % 257 == key)
             .map(|row| row + 1)
             .sum::<i64>();
-        assert_eq!(sum, expected, "wrong sum for date key {key}");
+        assert_eq!(sum, i128::from(expected), "wrong sum for date key {key}");
     }
 }

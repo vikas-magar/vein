@@ -140,13 +140,10 @@ fn assert_composite_left_join(plan: LogicalPlan) {
     assert_eq!(*join_type, JoinType::Left);
     assert_eq!(join_equality_count(on), 2, "both key equalities must be retained");
 
-    let LogicalPlan::Project { input: grouped, schema, .. } = right.as_ref() else {
-        panic!("the scalar expression should be projected over the grouped aggregate");
-    };
-    assert_eq!(schema.fields.len(), 3, "two keys plus the scalar result");
-    let LogicalPlan::Aggregate { grouping_sets, schema, .. } = grouped.as_ref() else {
+    let LogicalPlan::Aggregate { grouping_sets, schema, .. } = right.as_ref() else {
         panic!("correlated aggregate should group before joining");
     };
+    assert_eq!(schema.fields.len(), 3, "two keys plus the aggregate result");
     let [keys] = grouping_sets.as_slice() else {
         panic!("one composite grouping set is expected");
     };

@@ -24,7 +24,7 @@ fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
             VeinDataType::Float64,
         ],
     };
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         values.clone(),
@@ -36,7 +36,7 @@ fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
     let output = sink.finish().unwrap();
 
     assert_eq!(
-        crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0)
+        int128_column(&output[0], 0)
             .value(0),
         4
     );

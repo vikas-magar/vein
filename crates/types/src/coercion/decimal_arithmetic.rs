@@ -1,7 +1,7 @@
 //! Arrow-compatible result precision and scale for decimal arithmetic.
 
-use error::{Result, VeinError};
 use arrow::array::types::{Decimal128Type, Decimal256Type, DecimalType};
+use error::{Result, VeinError};
 
 use super::decimal_shape;
 use crate::VeinDataType;
@@ -19,6 +19,31 @@ pub enum DecimalArithmeticOp {
     Divide,
     /// Remainder.
     Remainder,
+}
+
+/// Selects equal-width decimal operands without aligning their scales.
+///
+/// Multiplication adds scales; rescaling both inputs to their maximum scale
+/// changes the result's declared scale and performs unnecessary input work.
+/// Integral operands become scale-zero decimals. Floating-point promotion
+/// remains the responsibility of ordinary numeric coercion.
+pub fn decimal_multiplication_operands(
+    left: &VeinDataType,
+    right: &VeinDataType,
+) -> Option<(VeinDataType, VeinDataType)> {
+    if !is_decimal(left) && !is_decimal(right) {
+        return None;
+    }
+    let (lp, ls, lw) = decimal_shape(left)?;
+    let (rp, rs, rw) = decimal_shape(right)?;
+    let make = |precision, scale| {
+        if lw || rw {
+            VeinDataType::Decimal256(precision as u8, scale as i8)
+        } else {
+            VeinDataType::Decimal128(precision as u8, scale as i8)
+        }
+    };
+    Some((make(lp, ls), make(rp, rs)))
 }
 
 /// Infers the result type used by Arrow for two decimal operands.
@@ -66,7 +91,9 @@ pub fn decimal_arithmetic_result_type(
         || (scale > 0 && scale > precision)
     {
         return Err(VeinError::semantic(
-            format!("decimal {op:?} result cannot be represented: precision {precision}, scale {scale}"),
+            format!(
+                "decimal {op:?} result cannot be represented: precision {precision}, scale {scale}"
+            ),
             None,
         ));
     }
@@ -79,7 +106,10 @@ pub fn decimal_arithmetic_result_type(
 }
 
 fn is_decimal(data_type: &VeinDataType) -> bool {
-    matches!(data_type, VeinDataType::Decimal128(_, _) | VeinDataType::Decimal256(_, _))
+    matches!(
+        data_type,
+        VeinDataType::Decimal128(_, _) | VeinDataType::Decimal256(_, _)
+    )
 }
 
 fn result_shape(
@@ -105,17 +135,11 @@ fn result_shape(
         ),
         DecimalArithmeticOp::Divide => {
             let scale = i16::from((s1 as i8).saturating_add(4).min(max_scale as i8));
-            (
-                (p1 + scale - s1 + s2).min(max_precision),
-                scale,
-            )
+            ((p1 + scale - s1 + s2).min(max_precision), scale)
         }
         DecimalArithmeticOp::Remainder => {
             let scale = s1.max(s2);
-            (
-                (scale + (p1 - s1).min(p2 - s2)).min(max_precision),
-                scale,
-            )
+            ((scale + (p1 - s1).min(p2 - s2)).min(max_precision), scale)
         }
     }
 }

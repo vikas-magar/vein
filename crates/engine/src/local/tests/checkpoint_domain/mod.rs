@@ -4,6 +4,8 @@ use optimizer::{OptimizerPipeline, context::OptimizerContext, rule::{OptimizerRu
 use plan::LogicalPlan;
 mod fixture;
 mod semantics;
+mod empty_groups;
+mod scalar_rows;
 
 struct ObserveDomain(Arc<AtomicUsize>);
 
@@ -22,6 +24,12 @@ impl OptimizerRule for ObserveDomain {
 }
 
 fn execute(definitions: Vec<(&str, fixture::Columns)>, query: &str) -> Vec<Vec<Option<i64>>> {
+    execute_result(definitions, query, true).unwrap()
+}
+
+fn execute_result(
+    definitions: Vec<(&str, fixture::Columns)>, query: &str, require_domain: bool,
+) -> Result<Vec<Vec<Option<i64>>>> {
     let root = tempfile::tempdir().unwrap();
     let tables = fixture::tables(root.path(), definitions);
     let retained_key = Arc::clone(tables.views["outer_rows"].resolve(0, 0).unwrap().unwrap().0);
@@ -46,9 +54,11 @@ fn execute(definitions: Vec<(&str, fixture::Columns)>, query: &str) -> Vec<Vec<O
     };
     let engine = LocalEngineBuilder::new(components).build();
     let batches = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        engine.prepare(query).await.unwrap().into_stream().try_collect::<Vec<_>>().await.unwrap()
-    });
-    assert!(observations.load(Ordering::Relaxed) > 0, "domain restriction must actually execute");
+        engine.prepare(query).await?.into_stream().try_collect::<Vec<_>>().await
+    })?;
+    if require_domain {
+        assert!(observations.load(Ordering::Relaxed) > 0, "domain restriction must actually execute");
+    }
     let mut output = Vec::new();
     for batch in batches {
         for row in 0..batch.num_rows() {
@@ -59,12 +69,19 @@ fn execute(definitions: Vec<(&str, fixture::Columns)>, query: &str) -> Vec<Vec<O
                                    retained_key.to_data().buffers()[0].as_ptr(),
                                    "checkpoint replay and joins must retain the outer key buffer");
                     }
-                    let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                    (!values.is_null(index)).then(|| values.value(index))
+                    if array.is_null(index) {
+                        return None;
+                    }
+                    Some(if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+                        values.value(index)
+                    } else {
+                        let values = array.as_any().downcast_ref::<arrow::array::Decimal256Array>().unwrap();
+                        i64::try_from(types::wide_integer::decode(values.value(index)).unwrap()).unwrap()
+                    })
                 })
             }).collect::<Vec<_>>());
         }
     }
     output.sort();
-    output
+    Ok(output)
 }

@@ -13,7 +13,7 @@ macro_rules! assert_unsigned_group_key_layout {
             aggregate_input_types: vec![VeinDataType::Int64],
             types: vec![$data_type, VeinDataType::Int64],
         };
-        let mut sink = AggregateSink::new(plan).unwrap();
+        let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
         sink.accumulate(crate::pipeline::test_support::dense_view(vec![
             Arc::new(<$array>::from(vec![Some(2), None])),
@@ -28,7 +28,7 @@ macro_rules! assert_unsigned_group_key_layout {
 
         let output = sink.finish().unwrap();
         let keys = crate::pipeline::test_support::materialized_column::<$array>(&output[0], 0);
-        let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
+        let sums = int128_column(&output[0], 1);
 
         assert_eq!(keys.len(), 3);
         assert_eq!(keys.value(0), 2);
@@ -57,7 +57,7 @@ fn dictionary_utf8_grouping_handles_nulls_unused_values_and_batch_local_ids() {
         aggregate_input_types: vec![VeinDataType::Int64],
         types: vec![VeinDataType::Utf8, VeinDataType::Int64],
     };
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
     let first_dictionary = DictionaryArray::<Int32Type>::try_new(
         Int32Array::from(vec![Some(0), Some(1), Some(0), None, Some(2), Some(3)]),
         Arc::new(StringArray::from(vec![
@@ -88,7 +88,7 @@ fn dictionary_utf8_grouping_handles_nulls_unused_values_and_batch_local_ids() {
 
     let output = sink.finish().unwrap();
     let keys = crate::pipeline::test_support::materialized_column::<StringArray>(&output[0], 0);
-    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
+    let sums = int128_column(&output[0], 1);
     let actual = (0..output[0].num_rows())
         .map(|row| {
             (

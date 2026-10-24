@@ -10,6 +10,7 @@ use crate::{
 };
 
 mod numeric;
+mod wide_integer;
 
 struct ArrayInput(ArrayRef);
 
@@ -40,14 +41,14 @@ impl FunctionInputSource for ArrayInput {
 
 fn accumulator(name: &str, input_type: DataType) -> (Box<dyn AggregateAccumulator>, DataType) {
     let registry = FunctionRegistry::with_builtins();
-    let input_types = [input_type];
+    let input_types = [types::VeinDataType::try_from(&input_type).unwrap()];
     let result_type = registry.aggregate_function(name)
         .expect("registered aggregate")
         .return_type(&input_types)
         .expect("infer aggregate result type");
     let state = registry.create_aggregate_accumulator(name, &input_types, &result_type)
         .expect("create registered accumulator");
-    (state, result_type)
+    (state, result_type.to_arrow())
 }
 
 #[test]
@@ -85,8 +86,8 @@ fn combine_and_spill_restore_preserve_sum_state() {
     assert!(remaining.is_empty());
 
     let output = restored.finalize(0..1).expect("finalize restored SUM");
-    let sum = output.as_any().downcast_ref::<Int64Array>().expect("Int64 result");
-    assert_eq!(sum.value(0), 60);
+    let sum = output.as_any().downcast_ref::<arrow::array::Decimal256Array>().expect("Int128 storage");
+    assert_eq!(types::wide_integer::decode(sum.value(0)).unwrap(), 60);
 }
 
 #[test]

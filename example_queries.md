@@ -456,7 +456,7 @@ FROM customer
 |> JOIN orders ON c_custkey = o_custkey
 |> JOIN lineitem ON o_orderkey = l_orderkey
 |> WHERE o_orderkey IN (FROM lineitem |> AGGREGATE sum(l_quantity) AS total_qty
-   GROUP BY l_orderkey |> WHERE total_qty > 300)
+   GROUP BY l_orderkey |> WHERE total_qty > 300 |> SELECT l_orderkey)
 |> AGGREGATE sum(l_quantity) AS total_qty GROUP BY c_name, c_custkey,
    o_orderkey, o_orderdate, o_totalprice
 |> ORDER o_totalprice DESC, o_orderdate
@@ -492,7 +492,7 @@ FROM supplier
       |> WHERE ps_availqty > (FROM lineitem
           |> WHERE l_partkey = partsupp.ps_partkey AND l_suppkey = partsupp.ps_suppkey
             AND l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'
-         |> AGGREGATE sum(l_quantity) * 0.5))
+         |> AGGREGATE sum(l_quantity) * 0.5) |> SELECT ps_suppkey)
 |> SELECT s_name, s_address
 |> ORDER s_name
 "

@@ -9,12 +9,14 @@ use crate::traits::{FunctionKind, RuntimeKind};
 use error::{Result, VeinError};
 use parser::ast::data_type::{DataType, IntervalField};
 use parser::ast::expr::{BinaryOp as AstBinaryOp, Expr, Literal as AstLiteral, SpannedExpr};
-use plan::PlanTraversal;
 use plan::SortKey;
 use plan::{LogicalExpr, LogicalLiteral};
 use plan::{ResolvedColumn, VeinDataType};
 use types::{IntervalUnit, TimeUnit};
 use types::{aggregate_return_type, unify_types};
+
+mod subquery;
+use subquery::SubqueryUse;
 
 /// Derives a human-readable output column name from an AST expression, used
 /// when a projection/aggregate item carries no explicit alias. Follows
@@ -233,7 +235,15 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 let bound = Box::pin(self.bind(expr)).await?;
                 let mut bound_list = Vec::with_capacity(list.len());
                 for item in list {
-                    bound_list.push(Box::pin(self.bind(item)).await?);
+                    let item = match &item.node {
+                        Expr::Subquery(query) | Expr::ScalarSubquery(query) => {
+                            self.bind_single_column_subquery(
+                                query, item.span, SubqueryUse::Membership { negated: *negated },
+                            ).await?
+                        }
+                        _ => Box::pin(self.bind(item)).await?,
+                    };
+                    bound_list.push(item);
                 }
 
                 // Establish one common type across the probe and every list item,
@@ -276,15 +286,7 @@ impl<'a, 'b> ExprBinder<'a, 'b> {
                 })
             }
             Expr::Subquery(subquery) | Expr::ScalarSubquery(subquery) => {
-                let plan = self.bind_subquery(subquery).await?;
-                // A scalar subquery must produce exactly one column.
-                if plan.schema().fields.len() != 1 {
-                    return Err(VeinError::semantic(
-                        "scalar subquery must return exactly one column",
-                        Some(ast.span),
-                    ));
-                }
-                Ok(LogicalExpr::ScalarSubquery(Box::new(plan)))
+                self.bind_single_column_subquery(subquery, ast.span, SubqueryUse::Scalar).await
             }
         }
     }

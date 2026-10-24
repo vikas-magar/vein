@@ -5,7 +5,8 @@ use error::{Result, VeinError};
 use crate::{TimeUnit, VeinDataType};
 
 mod decimal_arithmetic;
-pub use decimal_arithmetic::{DecimalArithmeticOp, decimal_arithmetic_result_type};
+pub use decimal_arithmetic::{DecimalArithmeticOp, decimal_arithmetic_result_type,
+    decimal_multiplication_operands};
 
 /// Resolves the common supertype of two data types, or errors if none exists.
 ///
@@ -98,6 +99,7 @@ fn common_string(left: &VeinDataType, right: &VeinDataType) -> VeinDataType {
 }
 
 fn common_numeric(left: &VeinDataType, right: &VeinDataType) -> Option<VeinDataType> {
+    if let Some(common) = crate::wide_integer::common_type(left, right) { return Some(common); }
     let is_decimal = |data_type: &VeinDataType| {
         matches!(data_type, VeinDataType::Decimal128(_, _) | VeinDataType::Decimal256(_, _))
     };
@@ -169,6 +171,7 @@ fn common_decimal(left: &VeinDataType, right: &VeinDataType) -> Option<VeinDataT
 /// Returns precision, scale, and decimal width for decimal types and integral
 /// layouts. Integral precision covers every value of that layout.
 fn decimal_shape(data_type: &VeinDataType) -> Option<(i16, i16, bool)> {
+    if data_type.is_int128() { return Some((39, 0, true)); }
     Some(match data_type {
         VeinDataType::Decimal128(precision, scale) =>
             (i16::from(*precision), i16::from(*scale), false),

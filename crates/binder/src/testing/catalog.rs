@@ -13,6 +13,10 @@ pub(crate) struct TestCatalog {
 }
 
 impl TestCatalog {
+    pub(crate) fn from_tables(tables: impl IntoIterator<Item = TableMetadata>) -> Self {
+        Self { tables: tables.into_iter().map(|table| (table.name.clone(), Arc::new(table))).collect() }
+    }
+
     pub(super) fn with_fixtures() -> Self {
         let mut catalog = Self::default();
         catalog.add_table("users", &[("id", VeinDataType::Int64), ("name", VeinDataType::Utf8), ("age", VeinDataType::Int64)]);
@@ -80,4 +84,3 @@ impl CatalogProvider for TestCatalog {
         MetadataStore::new()
     }
 }
-
