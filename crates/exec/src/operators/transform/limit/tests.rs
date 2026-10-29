@@ -5,6 +5,8 @@ use common::arrow::SelectionVector;
 use crate::pipeline::{DataChunkView, RowMapping, SourceRow, ViewColumn};
 use std::sync::{Arc, Mutex};
 
+mod resumable;
+
 struct TestCollector(Arc<Mutex<Vec<u32>>>);
 #[async_trait::async_trait]
 impl PipelineNode for TestCollector {

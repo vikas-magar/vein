@@ -14,7 +14,7 @@ use super::{ScanPlanningRequest, ScanRequest};
 /// Executes a file scan for one registered physical data format.
 ///
 /// Implementations own format-specific metadata interpretation and decoding.
-/// They push reference-backed views to the next pipeline node.
+/// They expose lazy cursors over reference-backed views, retaining pending I/O.
 #[async_trait]
 pub trait ScanProvider: Send + Sync {
     /// Returns the open identifier used to register this provider.
@@ -30,6 +30,11 @@ pub trait ScanProvider: Send + Sync {
         false
     }
 
-    /// Reads the request and streams views into the execution pipeline.
-    async fn execute(&self, request: ScanRequest<'_>, next: &mut dyn PipelineNode) -> Result<()>;
+    /// Opens a lazy cursor; no downstream operator or client is owned by the provider.
+    fn open<'a>(&'a self, request: ScanRequest<'a>) -> super::ScanCursor<'a>;
+
+    /// Drains the same cursor for operators awaiting resumable migration.
+    async fn execute(&self, request: ScanRequest<'_>, next: &mut dyn PipelineNode) -> Result<()> {
+        super::cursor::drain(self.open(request), next).await
+    }
 }

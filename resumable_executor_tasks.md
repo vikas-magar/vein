@@ -113,7 +113,7 @@ Q10 previously deadlocked when sorted output exceeded two 8,192-row batches on a
 - [x] Done: buffer contracts and scheduler integration are validated. These are explicit engine footprint estimates, not allocator/RSS telemetry; distinct arrays sharing internal buffers may be conservatively counted more than once. T08 and later host/client/operator migrations replace the existing production channels.
 
 ### T08 — Add native and cooperative host drivers
-- [x] Add HostDriver over the existing scheduler: persistent scoped native workers park on generation-checked condition-variable notifications; a cooperative host awaits asynchronous readiness and yields after each productive bounded turn.
+- [x] Add HostDriver over the existing scheduler. T11 replaces native scoped threads and condition variables with persistent Tokio async workers: runnable CPU bursts use `spawn_blocking`, and idle workers asynchronously await versioned Tokio notifications. The cooperative WASM host uses the same scheduler and readiness signal.
 - [x] Keep host policy outside operators using a generic CooperativeHost interface and the existing WaitRegistrar. Driver drop, explicit cancellation, worker failure and panic stop scheduling and unregister parked I/O.
 - [x] Add a reusable browser MessageChannel adapter. Yield messages contain only tickets; stale or abandoned messages cannot complete later yields. Release callback/port resources on drop and wake outside mutable borrows.
 - [x] Add 17 regressions for host semantics, worker combination/dependencies, bounded turns, idle I/O, cancellation, failure, readiness races, slow-consumer backpressure and browser-ticket lifecycle. The same source Arrow value-buffer addresses survive both native and cooperative delivery.
@@ -151,14 +151,21 @@ Migration boundary: `LocalQuery::start` adapts the existing production execution
 Final regression query: Q12 returned MAIL (9,883 / 14,894) and SHIP (9,953 / 14,906), two rows in 223 ms. WASM Check passed again after the cancellation correction. This validates existing production behavior, not a resumable-scheduler speedup.
 
 ### T11 — Migrate generic scans and connector execution
-- [ ] Replace run-to-completion source pushing with incremental source state/cursors and retained I/O readiness.
-- Preserve provider-defined morsels, projection, pruning, runtime filters, shared metadata, row coverage and scan statistics.
-- Done when file-format-neutral provider tests, slow I/O, early LIMIT, cancellation and Parquet regressions pass without preloading data.
+- [x] Replace provider-owned push loops with one lazy `ScanCursor` (`Stream<Result<DataChunkView>>`). The transitional push adapter drains this same cursor, without a second decoding path or batch channel. Owned scan cursors retain configuration and pending I/O without self-referential structs.
+- [x] Add `ScanStage`, race-safe I/O subscriptions and a composable wait registrar. Bind source phases through `ScanPipelineProvider`/`ScanWorkQueue`; workers claim provider-planned units once and retain worker-local adaptive state and query statistics.
+- [x] Preserve projection, pruning, runtime filters, shared metadata, row-group assignments and scan statistics. Parquet prepares each file lazily and does not publish partition completion when its cursor is dropped before EOF.
+- [x] Use Tokio throughout the native resumable host: an async entry point awaits worker cleanup, CPU bursts stay off async threads, and idle workers release blocking-pool slots. Remove the temporary worker-context hook. Cancellation of an abandoned async owner stops outstanding work.
+- [x] Validate pending I/O, wake-before-subscription, stale registration guards, error terminality, empty batches, buffer identity, early stop, unopened later files, assigned ranges/runtime filters and exactly-once morsels. Native/cooperative integration passes, including a one-thread blocking pool with nested asynchronous I/O.
+- [x] Workspace Test: 1,576 passed, zero failures, no unfinished tests in the final suite diagnostics. Native Check, WASM Check and incremental IDE build passed. Q12 retained expected MAIL (9,883 / 14,894) and SHIP (9,953 / 14,906) results, 278 ms in one validation run; this is not a performance comparison.
+- Migration boundary: production scans now consume the canonical cursor through the push adapter. Full production scheduler activation awaits T12-T19. Fused scan expressions explicitly require T12; joins, aggregation, sinks and client migration remain their planned tasks. WASM retains its cooperative browser host, not native blocking workers.
 
 ### T12 — Migrate expression and LIMIT operators
-- [ ] Remove downstream ownership from expression and LIMIT execution; return output/status to the pipeline executor.
-- Reuse expression kernels and the functions crate; preserve mapped inputs, selection-only filtering and computed-column ownership.
-- Done when custom functions/kernels, NULLs, casts, empty output and early completion pass with unchanged source buffer identity.
+- [x] Add a worker-local `BatchProcessor` contract and resumable transform stage; return output/status to the pipeline executor rather than owning a downstream node.
+- [x] Reuse expression kernels and the functions registry for fused scan programs and standalone transforms; preserve mapped inputs, selection-only filtering and computed-column ownership.
+- [x] Bind LIMIT through the canonical transform state, including zero-count completion after EOF and upstream stop for early completion.
+- [x] Cover registered scalar functions, injected kernels, casts, NULLs, all-true/all-false filters, empty output, early stop and unchanged Arrow source-buffer identity.
+- [x] Workspace Test and Check passed; incremental IDE build passed. WASM package Check also passed for the operator implementation. The Build run configuration still fails to start; IDE incremental build supplied build validation.
+- [x] Done: expression and LIMIT operator states are resumable and covered; production runtime activation and removal of the legacy driver remain T26 work after T13–T19.
 
 ### T13 — Migrate join build and probe execution
 - [ ] Separate build, publish/combine, probe and unmatched-output phases; adapt the existing bounded hash-probe machinery.

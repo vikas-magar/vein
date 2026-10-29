@@ -3,15 +3,13 @@
 mod file;
 mod worker;
 
-use common::Result;
 use exec::operators::source::scan::ScanRequest;
-use exec::pipeline::PipelineNode;
+use exec::operators::source::scan::ScanCursor;
+use futures::StreamExt;
 
 /// Executes each assigned file range and publishes scan completion to statistics.
-pub(in crate::scan) async fn execute_parquet_scan(
-    request: ScanRequest<'_>,
-    next: &mut dyn PipelineNode,
-) -> Result<()> {
+pub(in crate::scan) fn execute_parquet_scan<'a>(request: ScanRequest<'a>) -> ScanCursor<'a> {
+    Box::pin(async_stream::try_stream! {
     let io_backend = crate::scan::parquet::reader::ParquetIoBackend::configured();
     let batch_size_policy = crate::scan::parquet::batch_size::RowGroupBatchSizePolicy::default();
     let batch_rows_override = std::env::var("VEIN_SCAN_BATCH_ROWS").ok();
@@ -25,22 +23,19 @@ pub(in crate::scan) async fn execute_parquet_scan(
         prior_observations = adaptive_order.as_ref().map_or(0, |order| order.snapshot().observations),
         "scan work unit reuses only its owning worker's predicate observations");
     for file in request.files {
-        file::execute(file::FileExecution {
+        let mut cursor = file::execute(file::FileExecution {
             request: &request,
             file,
-            next,
             adaptive_order: &mut adaptive_order,
             io_backend,
             batch_size_policy: &batch_size_policy,
             batch_rows_override: batch_rows_override.as_deref(),
-        })
-            .await?;
+        });
+        while let Some(view) = cursor.next().await { yield view?; }
+        drop(cursor);
         request.worker_state.with::<worker::AdaptiveWorkerState, _>(|state| {
             state.order.clone_from(&adaptive_order);
         })?;
-        if next.finished() {
-            break;
-        }
     }
     if let Some(scan) = request.statistics_scan {
         let queued = request.runtime_statistics.enqueue_partition_completion(
@@ -63,5 +58,5 @@ pub(in crate::scan) async fn execute_parquet_scan(
             );
         }
     }
-    Ok(())
+    })
 }

@@ -72,6 +72,7 @@ pub(super) struct OperatorAdapter<O> {
     operator: O,
     role: OperatorRole,
     input_closed: Vec<Option<bool>>,
+    stop_input_port: Option<usize>,
     pending_output: bool,
     finished: bool,
     local_state_taken: bool,
@@ -84,6 +85,7 @@ impl<O: LocalStateOperator> OperatorAdapter<O> {
             operator,
             role: metadata.role,
             input_closed: vec![Some(false); metadata.children.len()],
+            stop_input_port: (metadata.role == OperatorRole::Transform).then_some(0),
             pending_output: false,
             finished: false,
             local_state_taken: false,
@@ -100,6 +102,10 @@ impl<O: LocalStateOperator> OperatorAdapter<O> {
             operator,
             role: phase.role(),
             input_closed,
+            stop_input_port: match phase {
+                PipelinePhase::Transform(port) => Some(port.index()),
+                _ => None,
+            },
             pending_output: false,
             finished: false,
             local_state_taken: false,
@@ -147,6 +153,18 @@ impl<O: LocalStateOperator> ErasedResumableOperator for OperatorAdapter<O> {
                 Err(VeinError::internal("stage cannot request input after all active ports are closed"))
             }
             OperatorStep::Blocked(reason) => Ok(OperatorStep::Blocked(super::ErasedWaitReason::new(reason))),
+            OperatorStep::StopInput => {
+                let port = self.stop_input_port.ok_or_else(|| {
+                    VeinError::internal("only a streaming transform can stop upstream input")
+                })?;
+                let closed = self.input_closed.get_mut(port).and_then(Option::as_mut)
+                    .ok_or_else(|| VeinError::internal("stop-input port is not active"))?;
+                if *closed {
+                    return Err(VeinError::internal("stage requested an upstream stop after input EOF"));
+                }
+                *closed = true;
+                Ok(OperatorStep::StopInput)
+            }
             OperatorStep::Finished if self.role != OperatorRole::Source && !self.input_closed.iter().flatten().all(|closed| *closed) => {
                 Err(VeinError::internal("transform or sink finished before end-of-input"))
             }

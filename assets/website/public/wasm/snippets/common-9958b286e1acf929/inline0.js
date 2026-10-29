@@ -1,0 +1,1 @@
+export function vein_monotonic_now() { return globalThis.performance?.now() ?? Date.now(); }

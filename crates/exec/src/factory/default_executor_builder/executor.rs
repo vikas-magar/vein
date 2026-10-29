@@ -3,12 +3,16 @@ use std::sync::Arc;
 use crate::expression::executor::ExpressionExecutor;
 use crate::operators::sink::{CollectSink, DiscardSink, WriteSink};
 use crate::operators::source::scan::ScanWorkerState;
+use crate::operators::transform::limit::resumable::LimitPipelineState;
+use crate::pipeline::resumable::{BatchProcessor, BatchProcessorState, OperatorInputPort,
+                                 OperatorMetadata, executable::PipelineOperatorState};
 use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
 use crate::runtime::ExecutorBuilder;
 use crate::runtime::filter::{RuntimeFilterDecisionPolicy, RuntimeFilterFactory, RuntimeFilterSet};
 use common::Result;
 use common::identifiers::TaskId;
-use common::protocol::{DataSink, DataSource, ExpressionProgram};
+use common::protocol::{DataSink, DataSource, ExpressionProgram, PhysicalPlanNode, PhysicalPlanOperator,
+                       pipeline_graph::PipelinePhase};
 use common::statistics::QueryStatisticsContext;
 use error::VeinError;
 use functions::FunctionRegistry;
@@ -19,6 +23,39 @@ use crate::factory::scan_partition::partition_source;
 
 #[async_trait::async_trait]
 impl ExecutorBuilder for DefaultExecutorBuilder {
+    fn prepare_pipeline_operator(
+        &self,
+        node: &Arc<PhysicalPlanNode>,
+        metadata: Arc<OperatorMetadata>,
+        phases: &[PipelinePhase],
+    ) -> Result<Arc<dyn PipelineOperatorState>> {
+        let transform = PipelinePhase::Transform(OperatorInputPort::new(0));
+        match &node.operator {
+            PhysicalPlanOperator::Transform { program, .. } => {
+                if phases != [transform] {
+                    return Err(VeinError::invalid_input("expression transform requested an unsupported phase"));
+                }
+                let processor: Arc<dyn BatchProcessor> = Arc::from(self.build_batch_processor(program)?);
+                Ok(Arc::new(BatchProcessorState::new(metadata, processor)?))
+            }
+            PhysicalPlanOperator::Limit { spec, .. } => {
+                if phases != [transform] {
+                    return Err(VeinError::invalid_input("LIMIT requested an unsupported phase"));
+                }
+                Ok(Arc::new(LimitPipelineState::new(*spec, metadata)?))
+            }
+            _ => Err(VeinError::unsupported(format!(
+                "resumable phases are not yet provided for '{}'", node.operator.data_flow().operator), None)),
+        }
+    }
+
+    fn build_batch_processor(&self, program: &Arc<ExpressionProgram>)
+                             -> Result<Box<dyn crate::pipeline::resumable::BatchProcessor>> {
+        Ok(Box::new(crate::expression::executor::ExpressionProcessor::new(
+            Arc::clone(program), Arc::clone(&self.expression_kernels), Arc::clone(&self.registry),
+        )))
+    }
+
     fn function_registry(&self) -> Option<Arc<FunctionRegistry>> {
         Some(Arc::clone(&self.registry))
     }

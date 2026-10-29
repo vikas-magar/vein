@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use common::arrow::SelectionVector;
@@ -41,23 +41,35 @@ fn literal(value: i64) -> PhysicalExpr {
 }
 
 fn input() -> (DataChunkView, ArrayRef) {
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, true),
+    ]));
     let source: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::clone(&source)]).unwrap();
+    let labels: ArrayRef = Arc::new(StringArray::from(vec![Some("A"), None, Some("C")]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::clone(&source), labels]).unwrap();
     (crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap(), source)
 }
 
-async fn run(program: ExpressionProgram, batch: DataChunkView) -> Vec<DataChunkView> {
+async fn run_with_functions(
+    program: ExpressionProgram,
+    batch: DataChunkView,
+    functions: Arc<FunctionRegistry>,
+) -> Vec<DataChunkView> {
     let output = Arc::new(Mutex::new(Vec::new()));
     let next = Capture(Arc::clone(&output));
     let mut executor = ExpressionExecutor::new(
         Arc::new(program),
         Arc::new(ExpressionKernelRegistry::with_builtins()),
-        Arc::new(FunctionRegistry::new()),
+        functions,
         Box::new(next),
     );
     executor.push(batch).await.unwrap();
     std::mem::take(&mut *output.lock().unwrap())
+}
+
+async fn run(program: ExpressionProgram, batch: DataChunkView) -> Vec<DataChunkView> {
+    run_with_functions(program, batch, Arc::new(FunctionRegistry::new())).await
 }
 
 #[tokio::test]
@@ -136,3 +148,5 @@ async fn all_true_filter_does_not_allocate_a_sparse_selection() {
     let [view] = output.as_slice() else { panic!("expected one filtered view") };
     assert_eq!(view.selection().contiguous_range(), Some(0..3));
 }
+
+mod edge_cases;

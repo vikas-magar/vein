@@ -32,15 +32,17 @@ async fn collect(mut consumer: ResultConsumer, original: &ArrayRef) -> usize {
     }
 }
 
-#[test]
-fn both_hosts_stream_through_one_batch_capacity_to_a_slow_consumer() {
+#[tokio::test]
+async fn both_hosts_stream_through_one_batch_capacity_to_a_slow_consumer() {
     for cooperative in [true, false] {
         let array: ArrayRef = Arc::new(Int64Array::from(vec![7]));
         let view = || dense_view(vec![Arc::clone(&array)]);
         let bytes = n(result_batch_footprint(&view()).unwrap());
         let tracker = QueryMemoryTracker::unlimited(CancellationToken::new());
         let (consumer, mut producers) = result_buffer(ResultBufferConfig {
-            capacity_bytes: bytes, max_batch_bytes: bytes, order: OutputOrder::Unordered,
+            capacity_bytes: bytes,
+            max_batch_bytes: bytes,
+            order: OutputOrder::Unordered,
         }, n(1), tracker.clone()).unwrap();
         let (plan, records) = prepared_result(vec![
             vec![Action::Output(view()), Action::Output(view()), Action::Output(view()), Action::Finish],
@@ -57,9 +59,9 @@ fn both_hosts_stream_through_one_batch_capacity_to_a_slow_consumer() {
         } else {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let execution = std::thread::spawn(move || driver.run_native(n(2)));
-                assert_eq!(futures::executor::block_on(collect(consumer, &array)), 3);
-                assert_eq!(execution.join().unwrap().unwrap(), SchedulerStep::Finished);
+                let (execution, rows) = tokio::join!(driver.run_native(n(2)), collect(consumer, &array));
+                assert_eq!(rows, 3);
+                assert_eq!(execution.unwrap(), SchedulerStep::Finished);
             }
             #[cfg(target_arch = "wasm32")]
             { continue; }

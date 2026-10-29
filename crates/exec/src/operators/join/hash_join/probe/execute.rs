@@ -24,7 +24,7 @@ impl HashJoin {
         let table = Arc::clone(&self.table);
         let existence = matches!(self.join_type, JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti);
         let started = Instant::now();
-        let mut cursor = HashProbe::new(&table, &chunk, existence)?;
+        let mut cursor = HashProbe::new(Arc::clone(&table), &chunk, existence)?;
         self.probe_key_materialization.accumulate(cursor.report());
         self.probe_key_materialize_us = self.probe_key_materialize_us.saturating_add(cursor.key_access_us);
         let mut candidates = Vec::new();
@@ -70,7 +70,7 @@ impl HashJoin {
             let keep = match self.join_type {
                 JoinType::Semi => matched,
                 JoinType::Anti => !matched,
-                JoinType::NullAwareAnti => !matched && (table.is_empty() || !cursor.is_null(row)?),
+                JoinType::NullAwareAnti => !matched && (self.table.is_empty() || !cursor.is_null(row)?),
                 JoinType::Left | JoinType::Full | JoinType::Single => !matched,
                 _ => false,
             };

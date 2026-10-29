@@ -5,8 +5,8 @@ use crate::pipeline::resumable::OperatorFactoryRegistry;
 use crate::pipeline::test_support::dense_view;
 use arrow::array::{Array, ArrayRef, Int64Array};
 
-#[test]
-fn cooperative_and_native_hosts_preserve_values_eof_and_payload_identity() {
+#[tokio::test]
+async fn cooperative_and_native_hosts_preserve_values_eof_and_payload_identity() {
     for mode in 0..3 {
         let array: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(3)]));
         let pointer = array.to_data().buffers()[0].as_ptr();
@@ -18,12 +18,12 @@ fn cooperative_and_native_hosts_preserve_values_eof_and_payload_identity() {
         let driver = HostDriver::new(&plan, n(1), n(1), Io::default());
         let terminal = if mode == 0 {
             let mut host = EventHost::default();
-            let outcome = futures::executor::block_on(driver.run_cooperative(&mut host)).unwrap();
+            let outcome = driver.run_cooperative(&mut host).await.unwrap();
             assert!(host.yields > 1);
             outcome
         } else {
             #[cfg(not(target_arch = "wasm32"))]
-            { driver.run_native(n(mode)).unwrap() }
+            { driver.run_native(n(mode)).await.unwrap() }
             #[cfg(target_arch = "wasm32")]
             { continue; }
         };
@@ -38,8 +38,8 @@ fn cooperative_and_native_hosts_preserve_values_eof_and_payload_identity() {
     }
 }
 
-#[test]
-fn both_hosts_finish_every_parallel_local_state_and_dependent_pipeline() {
+#[tokio::test]
+async fn both_hosts_finish_every_parallel_local_state_and_dependent_pipeline() {
     for cooperative in [true, false] {
         let provider = Provider { combine: true, ..Default::default() };
         let probe = source(empty());
@@ -50,10 +50,10 @@ fn both_hosts_finish_every_parallel_local_state_and_dependent_pipeline() {
         ).unwrap();
         let driver = HostDriver::new(&plan, n(4), n(1), Io::default());
         let terminal = if cooperative {
-            futures::executor::block_on(driver.run_cooperative(&mut EventHost::default())).unwrap()
+            driver.run_cooperative(&mut EventHost::default()).await.unwrap()
         } else {
             #[cfg(not(target_arch = "wasm32"))]
-            { driver.run_native(n(4)).unwrap() }
+            { driver.run_native(n(4)).await.unwrap() }
             #[cfg(target_arch = "wasm32")]
             { continue; }
         };

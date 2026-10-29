@@ -15,6 +15,7 @@ pub(in crate::pipeline::resumable::executable::tests) enum Action {
     Forward,
     Finish,
     Fail,
+    StopInput,
     AcceptBatch,
     AcceptEof,
     RetryBatch,
@@ -89,6 +90,7 @@ impl ResumableOperator for Script {
                 OperatorStep::Runnable
             }
             Action::Block(reason) => OperatorStep::Blocked(reason),
+            Action::StopInput => OperatorStep::StopInput,
             Action::Output(view) => OperatorStep::Output(view),
             Action::Forward => OperatorStep::Output(
                 self.input

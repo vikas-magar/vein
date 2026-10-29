@@ -1,0 +1,41 @@
+{
+  "name": "vein-website",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate:queries": "node scripts/export-tpch-queries.mjs",
+    "predev": "npm run generate:queries",
+    "dev": "next dev",
+    "prebuild": "npm run generate:queries",
+    "build": "next build",
+    "test:worker": "tsx --test scripts/tests/*.test.mjs",
+    "test:browser": "playwright test",
+    "typecheck": "tsc --noEmit",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.20.4",
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/language": "^6.13.1",
+    "@codemirror/lint": "^6.9.7",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.15",
+    "@lezer/highlight": "^1.2.5",
+    "@tanstack/react-virtual": "^3.14.22",
+    "apache-arrow": "21.2.0",
+    "flexlayout-react": "^0.11.1",
+    "next": "16.4.3",
+    "react": "19.3.1",
+    "react-aria-components": "^1.22.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

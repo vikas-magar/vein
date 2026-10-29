@@ -10,32 +10,29 @@ impl AggregateSink {
         emit: &mut impl crate::pipeline::delivery::BatchConsumer,
     ) -> Result<()> {
         self.ensure_empty_groups()?;
+        for start in (0..self.groups.len()).step_by(batch_rows.get()) {
+            let end = start.saturating_add(batch_rows.get()).min(self.groups.len());
+            emit.consume(self.output_range_view(start..end)?).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn output_range_view(&mut self, range: Range<usize>) -> Result<DataChunkView> {
+        self.tracker.check_cancelled()?;
         let started = Instant::now();
         let width = self.plan.types.len();
-        for start in (0..self.groups.len()).step_by(batch_rows.get()) {
-            self.tracker.check_cancelled()?;
-            let end = start.saturating_add(batch_rows.get()).min(self.groups.len());
-            let range = start..end;
-            let mut columns = Vec::with_capacity(width);
-            for column in 0..self.plan.groups as usize {
-                columns.push(self.group_key_output(column, range.clone())?);
-            }
-            for column in self.plan.groups as usize..width {
-                let array = self.column_range(column, &self.plan.types[column], range.clone())?;
-                columns.push(owned_array_view(array, range.len())?);
-            }
-            let output = DataChunkView::new(
-                range.len(),
-                columns,
-                SelectionVector::new_dense(range.len()),
-            )?;
-            emit.consume(output).await?;
+        let mut columns = Vec::with_capacity(width);
+        for column in 0..self.plan.groups as usize {
+            columns.push(self.group_key_output(column, range.clone())?);
         }
-        self.metrics.output_materialize_ns = self
-            .metrics
-            .output_materialize_ns
+        for column in self.plan.groups as usize..width {
+            let array = self.column_range(column, &self.plan.types[column], range.clone())?;
+            columns.push(owned_array_view(array, range.len())?);
+        }
+        let output = DataChunkView::new(range.len(), columns, SelectionVector::new_dense(range.len()))?;
+        self.metrics.output_materialize_ns = self.metrics.output_materialize_ns
             .saturating_add(started.elapsed().as_nanos() as u64);
-        Ok(())
+        Ok(output)
     }
 
     fn group_key_output(&self, column: usize, range: Range<usize>) -> Result<ViewColumn> {

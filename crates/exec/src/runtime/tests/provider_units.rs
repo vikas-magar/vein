@@ -1,4 +1,6 @@
 use super::*;
+#[path = "provider_units/scheduler.rs"]
+mod scheduler;
 
 use arrow::array::{Array, Int64Array};
 use common::arrow::SelectionVector;
@@ -7,7 +9,7 @@ use crate::factory::DefaultExecutorBuilder;
 use crate::operators::source::scan::{
     ScanPlanningRequest, ScanProvider, ScanProviderRegistry, ScanRequest, file_scan_work_unit,
 };
-use crate::pipeline::{DataChunkView, PipelineNode};
+use crate::pipeline::DataChunkView;
 use error::VeinError;
 use functions::FunctionRegistry;
 use std::sync::Mutex;
@@ -39,34 +41,37 @@ impl ScanProvider for UnevenProvider {
             .collect())
     }
 
-    async fn execute(&self, request: ScanRequest<'_>, next: &mut dyn PipelineNode) -> common::Result<()> {
-        if request.files.len() != 1 {
-            return Err(VeinError::internal("scan unit must contain exactly one file"));
-        }
-        let file = &request.files[0];
-        let range = file
-            .scan_unit_range
-            .clone()
-            .ok_or_else(|| VeinError::internal("provider scan unit has no range"))?;
-        let base = if file.relative == "a.data" { 0 } else { 100 };
-        let values = Arc::new(Int64Array::from(
-            range.clone().map(|index| base + index as i64).collect::<Vec<_>>(),
-        ));
-        self.executed
-            .lock()
-            .map_err(|_| VeinError::internal("provider execution test mutex poisoned"))?
-            .push((file.relative.clone(), range.start, range.end));
-        self.source_arrays
-            .lock()
-            .map_err(|_| VeinError::internal("provider buffer test mutex poisoned"))?
-            .push(Arc::clone(&values));
-        let view = DataChunkView::from_arrays(
-            vec![values],
-            range.end - range.start,
-            SelectionVector::new_dense(range.end - range.start),
-        )?
-            .with_schema(Arc::new(request.projected.to_arrow()))?;
-        next.push(view).await
+    fn open<'a>(&'a self, request: ScanRequest<'a>) -> crate::operators::source::scan::ScanCursor<'a> {
+        Box::pin(futures::stream::once(async move {
+            tokio::task::spawn_blocking(|| ()).await.expect("scan I/O runtime is entered");
+            if request.files.len() != 1 {
+                return Err(VeinError::internal("scan unit must contain exactly one file"));
+            }
+            let file = &request.files[0];
+            let range = file
+                .scan_unit_range
+                .clone()
+                .ok_or_else(|| VeinError::internal("provider scan unit has no range"))?;
+            let base = if file.relative == "a.data" { 0 } else { 100 };
+            let values = Arc::new(Int64Array::from(
+                range.clone().map(|index| base + index as i64).collect::<Vec<_>>(),
+            ));
+            self.executed
+                .lock()
+                .map_err(|_| VeinError::internal("provider execution test mutex poisoned"))?
+                .push((file.relative.clone(), range.start, range.end));
+            self.source_arrays
+                .lock()
+                .map_err(|_| VeinError::internal("provider buffer test mutex poisoned"))?
+                .push(Arc::clone(&values));
+            let view = DataChunkView::from_arrays(
+                vec![values],
+                range.end - range.start,
+                SelectionVector::new_dense(range.end - range.start),
+            )?
+                .with_schema(Arc::new(request.projected.to_arrow()))?;
+            Ok(view)
+        }))
     }
 }
 
@@ -109,6 +114,7 @@ async fn provider_planned_units_execute_once_and_keep_arrow_buffers() {
         catalog_snapshot: None,
         runtime_statistics: None,
     };
+    let cursor_source = DataSource::File(scan.clone());
     let mut task = task();
     let input = plan_node(
         Arc::clone(&schema),
@@ -137,10 +143,35 @@ async fn provider_planned_units_execute_once_and_keep_arrow_buffers() {
     units.sort();
     assert_eq!(units, vec![("a.data".into(), 0, 1), ("a.data".into(), 1, 4), ("b.data".into(), 0, 2)]);
 
+    let cursor_arrays = Arc::clone(&source_arrays);
     let source_arrays = source_arrays.lock().expect("provider output arrays");
     for view in &result.output {
         let (array, _) = view.resolve(0, 0).expect("resolve output view").expect("output value");
         let output = array.as_any().downcast_ref::<Int64Array>().expect("int64 output");
         assert!(source_arrays.iter().any(|source| source.values().as_ptr() == output.values().as_ptr()));
     }
+    drop(source_arrays);
+    executed.lock().unwrap().clear();
+    let resources = executor.create_query_resources(&task, CancellationToken::new()).unwrap();
+    let queue = crate::operators::source::scan::cursor::ScanWorkQueue::prepare(
+        Arc::clone(&executor.builder), &cursor_source, &task, resources, None,
+    ).unwrap();
+    assert_eq!(queue.work_units(), 3);
+    let output = futures::TryStreamExt::try_collect::<Vec<_>>(
+        futures::stream::select(queue.cursor(), queue.cursor()),
+    ).await.unwrap();
+    assert_eq!(output.iter().map(DataChunkView::num_rows).sum::<usize>(), 6);
+    let mut units = executed.lock().unwrap().clone();
+    units.sort();
+    assert_eq!(units, vec![("a.data".into(), 0, 1), ("a.data".into(), 1, 4), ("b.data".into(), 0, 2)]);
+    let arrays = cursor_arrays.lock().unwrap();
+    for view in output {
+        let (array, _) = view.resolve(0, 0).unwrap().unwrap();
+        let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(arrays.iter().any(|source| source.values().as_ptr() == values.values().as_ptr()));
+    }
+    drop(arrays);
+    scheduler::validate(&executor, &task).await;
+    tokio::task::spawn_blocking(move || scheduler::validate_small_pool(&executor, &task))
+        .await.unwrap();
 }

@@ -3,7 +3,6 @@ use common::time::Instant;
 
 use common::protocol::RuntimeStatisticsScan;
 use common::statistics::RuntimeStatisticsStore;
-use exec::pipeline::PipelineNode;
 
 use crate::scan::parquet::metrics::ScanPredicateMetrics;
 use crate::scan::parquet::reader::IoStats;
@@ -11,7 +10,6 @@ use crate::scan::parquet::reader::IoStats;
 pub(in crate::scan::parquet) struct ScanStreamContext<'a> {
     pub(in crate::scan::parquet) path: &'a str,
     pub(in crate::scan::parquet) output_positions: &'a [usize],
-    pub(in crate::scan::parquet) next: &'a mut dyn PipelineNode,
     pub(in crate::scan::parquet) scan_started: Instant,
     pub(in crate::scan::parquet) bytes_read: &'a AtomicU64,
     pub(in crate::scan::parquet) bytes_before_file: u64,

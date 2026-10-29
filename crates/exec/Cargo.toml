@@ -15,6 +15,7 @@ arrow-row = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+async-stream = "0.3"
 tracing = { workspace = true }
 types = { path = "../types" }
 functions = { path = "../functions" }

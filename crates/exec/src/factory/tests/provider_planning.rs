@@ -5,7 +5,6 @@ use crate::factory::tests::support::{file_scan, partition};
 use crate::operators::source::scan::{
     ScanPlanningRequest, ScanProvider, ScanProviderRegistry, ScanRequest,
 };
-use crate::pipeline::PipelineNode;
 use crate::runtime::filter::RuntimeFilterSet;
 use catalog::{DataFileFormatId, MetadataStore};
 use common::Result;
@@ -41,8 +40,8 @@ impl ScanProvider for UnevenUnitProvider {
         Ok(work)
     }
 
-    async fn execute(&self, _request: ScanRequest<'_>, _next: &mut dyn PipelineNode) -> Result<()> {
-        Ok(())
+    fn open<'a>(&'a self, _request: ScanRequest<'a>) -> crate::operators::source::scan::ScanCursor<'a> {
+        Box::pin(futures::stream::empty())
     }
 }
 

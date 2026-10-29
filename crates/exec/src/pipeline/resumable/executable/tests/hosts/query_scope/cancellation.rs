@@ -30,8 +30,8 @@ fn dropping_the_query_guard_wakes_a_cooperative_io_wait_and_unregisters_it() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[test]
-fn the_same_scope_stops_parked_native_workers() {
+#[tokio::test]
+async fn the_same_scope_stops_parked_native_workers() {
     use std::time::{Duration, Instant};
     let (plan, _) = prepared(vec![
         vec![Action::Block(1), Action::Finish],
@@ -43,24 +43,17 @@ fn the_same_scope_stops_parked_native_workers() {
     let driver = resources
         .host_driver(&plan, n(1), n(100), io.clone())
         .unwrap();
-    let (send, receive) = std::sync::mpsc::sync_channel(1);
-    let run = std::thread::spawn(move || {
-        send.send(driver.run_native(n(3))).unwrap();
-    });
+    let run = tokio::spawn(driver.run_native(n(3)));
     let deadline = Instant::now() + Duration::from_secs(5);
     while io.1.load(Ordering::SeqCst) == 0 {
         assert!(Instant::now() < deadline);
-        std::thread::yield_now();
+        tokio::task::yield_now().await;
     }
     drop(guard);
     assert_eq!(
-        receive
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(5), run).await.unwrap().unwrap().unwrap(),
         SchedulerStep::Cancelled
     );
-    run.join().unwrap();
     assert!(io.0.lock().unwrap().waker.is_none());
 }
 
@@ -93,15 +86,15 @@ fn driver_failure_or_abandoned_future_cancels_the_query_scope() {
     }
 }
 
-#[test]
-fn scheduler_failure_reaches_the_query_before_cleanup_cancellation() {
+#[tokio::test]
+async fn scheduler_failure_reaches_the_query_before_cleanup_cancellation() {
     for native in [false, true] {
         let (plan, _) = prepared(vec![vec![Action::Fail], vec![Action::Need]]);
         let scope = resources(&plan);
         let driver = scope.host_driver(&plan, n(1), n(1), Io::default()).unwrap();
         let result = if native {
             #[cfg(not(target_arch = "wasm32"))]
-            { driver.run_native(n(4)) }
+            { driver.run_native(n(4)).await }
             #[cfg(target_arch = "wasm32")]
             { continue; }
         } else { futures::executor::block_on(driver.run_cooperative(&mut EventHost::default())) };

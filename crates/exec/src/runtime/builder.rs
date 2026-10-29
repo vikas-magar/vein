@@ -21,6 +21,12 @@ use functions::FunctionRegistry;
 /// [`Source`], [`Transform`], and [`Sink`] implementations are selected here
 /// from the self-contained task description a worker receives.
 pub trait ExecutorBuilder: Send + Sync {
+    /// Builds downstream-free expression processing using the registered kernels.
+    fn build_batch_processor(&self, _program: &Arc<ExpressionProgram>)
+        -> Result<Box<dyn crate::pipeline::resumable::BatchProcessor>> {
+        Err(common::VeinError::unsupported("batch expression processor is not configured", None))
+    }
+
     /// Binds one built-in operator's shared state for its requested resumable phases.
     fn prepare_pipeline_operator(
         &self,

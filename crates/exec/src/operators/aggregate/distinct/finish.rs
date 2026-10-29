@@ -27,7 +27,7 @@ impl AggregateSink {
         Ok(())
     }
 
-    fn merge_distinct_batch(
+    pub(in crate::operators::aggregate) fn merge_distinct_batch(
         &mut self,
         aggregate_index: usize,
         grouping_set_id: usize,

@@ -17,7 +17,7 @@ use common::statistics::analysis::{StatisticsAnalysisProvider, StatisticsAnalysi
 use error::VeinError;
 use exec::operators::sink::{WriteStorage, WriteTransaction};
 use exec::operators::source::scan::{ScanProvider, ScanProviderRegistry, ScanRequest};
-use exec::pipeline::{DataChunkView, PipelineNode};
+use exec::pipeline::DataChunkView;
 use functions::FunctionRegistry;
 use futures::TryStreamExt;
 use plan::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
@@ -54,14 +54,14 @@ impl ScanProvider for MemoryScanProvider {
         &self.format
     }
 
-    async fn execute(&self, _request: ScanRequest<'_>, next: &mut dyn PipelineNode) -> Result<()> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let values = Arc::new(Int64Array::from(vec![41, 42]));
-        next.push(
-            DataChunkView::from_arrays(vec![values], 2, SelectionVector::new_dense(2))?
-                .with_schema(schema)?,
-        ).await
+    fn open<'a>(&'a self, _request: ScanRequest<'a>) -> exec::operators::source::scan::ScanCursor<'a> {
+        Box::pin(futures::stream::once(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let values = Arc::new(Int64Array::from(vec![41, 42]));
+            Ok(DataChunkView::from_arrays(vec![values], 2, SelectionVector::new_dense(2))?
+                .with_schema(schema)?)
+        }))
     }
 }
 

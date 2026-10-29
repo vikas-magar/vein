@@ -6,7 +6,8 @@ pub(super) struct ProbeRow {
     pub(super) head: u32,
 }
 
-impl HashProbe<'_> {
+impl<T, V> HashProbe<T, V>
+where T: std::ops::Deref<Target=HashTable>, V: std::ops::Deref<Target=DataChunkView> {
     pub(super) fn load_window(&mut self) -> Result<bool> {
         if self.next_window >= self.view.num_rows() { return Ok(false); }
         self.rows.clear();
@@ -16,7 +17,7 @@ impl HashProbe<'_> {
         let started = Instant::now();
         for row in self.window_start..end {
             self.rows.push(ProbeRow {
-                key: self.keys.hash_and_single_i64(row, self.view)?,
+                key: self.keys.hash_and_single_i64(row, &self.view)?,
                 head: NONE,
             });
         }

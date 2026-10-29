@@ -27,8 +27,9 @@ pub(super) struct MemoryProvider {
 impl ScanProvider for MemoryProvider {
     fn format_id(&self) -> &DataFileFormatId { &self.format }
 
-    async fn execute(&self, request: ScanRequest<'_>, next: &mut dyn PipelineNode) -> Result<()> {
-        for file in request.files {
+    fn open<'a>(&'a self, request: ScanRequest<'a>) -> exec::operators::source::scan::ScanCursor<'a> {
+        use futures::StreamExt;
+        Box::pin(futures::stream::iter(request.files).map(move |file| {
             let name = file.absolute.file_stem().unwrap().to_str().unwrap();
             let view = &self.tables.views[name];
             let schema = &self.tables.metadata[name].schema;
@@ -37,9 +38,8 @@ impl ScanProvider for MemoryProvider {
             }).collect::<Vec<_>>();
             // Static fixture predicates are tautologies over these values.
             // Runtime filters may be ignored: the join still enforces membership.
-            next.push(view.project(&columns)?).await?;
-        }
-        Ok(())
+            view.project(&columns)
+        }))
     }
 }
 

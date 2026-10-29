@@ -1,6 +1,7 @@
 use super::*;
 use futures::task::noop_waker;
 use std::task::Waker;
+use std::{future::Future, task::Context};
 
 #[test]
 fn readiness_before_subscription_is_not_lost() {
@@ -29,7 +30,7 @@ fn dropping_async_wait_removes_its_task_waker() {
     let mut changed = Box::pin(signal.changed(signal.generation()));
     assert!(changed.as_mut().poll(&mut Context::from_waker(&noop_waker())).is_pending());
     drop(changed);
-    assert!(signal.asynchronous.take().is_none());
+    assert_eq!(signal.generation.receiver_count(), 0);
 }
 
 #[test]
@@ -55,5 +56,5 @@ fn native_readiness_before_sleep_is_not_lost() {
     let signal = Arc::new(Signal::default());
     let generation = signal.generation();
     Waker::from(Arc::clone(&signal)).wake();
-    signal.wait(generation);
+    futures::executor::block_on(signal.changed(generation));
 }

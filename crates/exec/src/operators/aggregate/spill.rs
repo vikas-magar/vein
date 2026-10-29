@@ -40,6 +40,7 @@ mod decimal_key_builder;
 mod encode;
 mod keys;
 mod partition;
+pub(in crate::operators::aggregate) use partition::AggregatePartitionCursor;
 mod reader;
 mod schema;
 mod writer;

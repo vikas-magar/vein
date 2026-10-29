@@ -1,6 +1,7 @@
 use super::*;
 
-impl HashProbe<'_> {
+impl<T, V> HashProbe<T, V>
+where T: std::ops::Deref<Target=HashTable>, V: std::ops::Deref<Target=DataChunkView> {
     /// Hashes one bounded window, then resumes its duplicate chains between output batches.
     /// Existence joins finish unresolved rows in that window before hashing the next window.
     pub(crate) fn next_batch(
@@ -58,7 +59,7 @@ impl HashProbe<'_> {
                             &self.table.chunks[entry.chunk as usize], entry.row as usize)? == inline_key
                     } else {
                         self.table.keys_by_chunk[entry.chunk as usize].equals(entry.row as usize,
-                            &self.table.chunks[entry.chunk as usize], &self.keys, row, self.view)?
+                            &self.table.chunks[entry.chunk as usize], &self.keys, row, &self.view)?
                     };
                     if hash_matches && !same { self.metrics.key_rejections += 1; }
                     if same {

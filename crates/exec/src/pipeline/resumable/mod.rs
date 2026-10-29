@@ -4,6 +4,8 @@
 //! remains the active driver until the later migration tasks replace it.
 
 mod configuration;
+mod batch;
+pub use batch::{BatchProcessor, BatchProcessorState};
 /// Executable phase bindings over the canonical derived graph.
 pub mod executable;
 /// Bounded, synchronous driving of a prepared worker pipeline.
@@ -38,6 +40,12 @@ pub use operator::{
 };
 pub use progress::OperatorStep;
 pub use registry::OperatorFactoryRegistry;
+
+pub(crate) fn erase_operator<O: LocalStateOperator + 'static>(operator: O,
+                                                              metadata: &OperatorMetadata, phase: common::protocol::pipeline_graph::PipelinePhase,
+) -> common::Result<Box<dyn ErasedResumableOperator>> {
+    Ok(Box::new(operator::OperatorAdapter::for_phase(operator, metadata, phase)?))
+}
 
 #[cfg(test)]
 mod tests;

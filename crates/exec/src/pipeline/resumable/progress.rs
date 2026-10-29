@@ -8,6 +8,9 @@ pub enum OperatorStep<W> {
     Runnable,
     /// The stage needs another input event before it can make progress.
     NeedsInput,
+    /// The stage has enough input to finish and asks the driver to drop its
+    /// unfinished upstream stages before it emits its terminal EOF.
+    StopInput,
     /// The stage cannot progress until the identified resource becomes ready.
     Blocked(W),
     /// Input, buffered output, and finalization are all complete.

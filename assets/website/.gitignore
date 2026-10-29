@@ -1,0 +1,7 @@
+node_modules/
+.next/
+out/
+public/wasm/*.js
+public/wasm/*.wasm
+public/wasm/*.d.ts
+public/queries/tpch-pipe.json

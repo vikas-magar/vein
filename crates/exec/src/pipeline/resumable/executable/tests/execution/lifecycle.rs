@@ -70,3 +70,21 @@ fn invalid_stage_completion_is_terminal_instead_of_silently_losing_rows() {
     assert!(executor.execute(budget(100)).is_err(), "sink cannot finish before EOF");
     assert!(executor.execute(budget(1)).is_err());
 }
+
+#[test]
+fn stopping_input_drops_upstream_state_and_finishes_downstream_once() {
+    let source = dense_view(vec![Arc::new(Int64Array::from(vec![5])) as ArrayRef]);
+    let (mut executor, records) = pipeline(vec![
+        vec![Output(source), Finish],
+        vec![Need, AcceptBatch, StopInput, Finish],
+        vec![Need, AcceptEof, Finish],
+    ]);
+
+    assert_eq!(drain(&mut executor, 1), 0);
+    assert_eq!(records[0].lock().unwrap().combined, 0, "abandoned upstream state is never combined");
+    assert_eq!(records[1].lock().unwrap().combined, 1, "LIMIT state is finalized once");
+    let sink = records[2].lock().unwrap();
+    assert_eq!(sink.batches, 0, "LIMIT emits no batch for a zero-length result");
+    assert_eq!(sink.eof, 1, "downstream receives exactly one EOF");
+    assert!(sink.received.is_empty());
+}

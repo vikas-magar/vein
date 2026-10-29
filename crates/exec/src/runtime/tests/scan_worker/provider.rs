@@ -8,7 +8,7 @@ use common::{Result, protocol::DataSource};
 use crate::operators::source::scan::{
     ScanPlanningRequest, ScanProvider, ScanRequest, file_scan_work_unit,
 };
-use crate::pipeline::{DataChunkView, PipelineNode};
+use crate::pipeline::DataChunkView;
 
 pub(super) type Visits = Arc<Mutex<HashMap<u64, Vec<usize>>>>;
 
@@ -30,16 +30,18 @@ impl ScanProvider for StatefulProvider {
         }).collect())
     }
 
-    async fn execute(&self, request: ScanRequest<'_>, next: &mut dyn PipelineNode) -> Result<()> {
-        assert!(request.query_statistics.is_some(), "every scheduling path retains query context");
-        let count = request.worker_state.with::<usize, _>(|count| {
-            *count += 1;
-            *count
-        })?;
-        self.visits.lock().unwrap().entry(request.worker_state.diagnostic_id())
-            .or_default().push(count);
-        let view = DataChunkView::from_dense_arrays(vec![Arc::new(Int64Array::from(vec![1]))])?
-            .with_schema(Arc::new(request.projected.to_arrow()))?;
-        next.push(view).await
+    fn open<'a>(&'a self, request: ScanRequest<'a>) -> crate::operators::source::scan::ScanCursor<'a> {
+        Box::pin(futures::stream::once(async move {
+            assert!(request.query_statistics.is_some(), "every scheduling path retains query context");
+            let count = request.worker_state.with::<usize, _>(|count| {
+                *count += 1;
+                *count
+            })?;
+            self.visits.lock().unwrap().entry(request.worker_state.diagnostic_id())
+                .or_default().push(count);
+            let view = DataChunkView::from_dense_arrays(vec![Arc::new(Int64Array::from(vec![1]))])?
+                .with_schema(Arc::new(request.projected.to_arrow()))?;
+            Ok(view)
+        }))
     }
 }

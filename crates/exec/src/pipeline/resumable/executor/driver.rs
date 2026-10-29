@@ -63,6 +63,7 @@ impl PipelineExecutor {
                 self.active = next;
             }
             OperatorStep::NeedsInput => self.states[index] = StageState::NeedsInput,
+            OperatorStep::StopInput => self.abandon_upstream(index)?,
             OperatorStep::Runnable => {}
             OperatorStep::Blocked(reason) => {
                 self.generation = self.generation.checked_add(1)
@@ -86,5 +87,17 @@ impl PipelineExecutor {
             }
         }
         Ok(None)
+    }
+
+    fn abandon_upstream(&mut self, stop: usize) -> Result<()> {
+        self.pending[..=stop].iter_mut().for_each(|event| *event = None);
+        for index in 0..stop {
+            if self.states[index] == StageState::Finished { continue; }
+            self.instance.abandon_stage(index)?;
+            self.states[index] = StageState::Finished;
+            self.finished += 1;
+        }
+        self.active = stop;
+        Ok(())
     }
 }
