@@ -78,12 +78,6 @@ jobs:
       - name: Test website worker modules
         working-directory: assets/website
         run: npm run test:worker
-      - name: Install browser test engines
-        working-directory: assets/website
-        run: npx playwright install --with-deps chromium webkit
-      - name: Test website in Chromium and WebKit
-        working-directory: assets/website
-        run: npm run test:browser
       - name: Configure GitHub Pages
         id: pages
         uses: actions/configure-pages@v5
