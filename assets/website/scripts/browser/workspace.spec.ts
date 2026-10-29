@@ -38,7 +38,7 @@ test("real WASM queries, independent drafts, virtualized results and retained se
     mountedCells: await page.getByRole("gridcell").count(), engineModulesRequested: engineRequests.length }));
   await page.getByRole("grid").evaluate(element => { element.scrollTop = 150000; });
   await expect(page.getByRole("rowheader", { name: "1", exact: true })).toHaveCount(0);
-  await page.screenshot({ path: `/private/tmp/vein-ide-${test.info().project.name}.png` });
+  await page.screenshot({ path: test.info().outputPath(`vein-ide-${test.info().project.name}.png`) });
   await page.getByRole("tab", { name: /Welcome.vein/ }).click();
   await expect(page.locator(".cm-content:visible")).toContainText("WHERE id <= 3");
   await expect(page.getByRole("gridcell", { name: "60", exact: true })).toBeVisible();
@@ -66,7 +66,7 @@ test("compact layout keeps the editor usable without horizontal page overflow", 
   expect(editor!.width).toBeGreaterThan(300);
   expect(results!.y).toBeGreaterThan(editor!.y);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
-  await page.screenshot({ path: `/private/tmp/vein-ide-compact-${test.info().project.name}.png` });
+  await page.screenshot({ path: test.info().outputPath(`vein-ide-compact-${test.info().project.name}.png`) });
 });
 
 test("query errors keep the engine usable and drafts survive refresh", async ({ page }) => {

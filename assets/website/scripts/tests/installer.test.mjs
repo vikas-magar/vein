@@ -4,13 +4,15 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, stat } from "node:fs/promises"
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const execute = promisify(execFile);
 const installer = fileURLToPath(new URL("../../public/install.sh", import.meta.url));
 
 async function fixture(platform = "Linux", architecture = "x86_64") {
-  const root = await mkdtemp("/private/tmp/vein-installer-test-");
+  const root = await mkdtemp(join(tmpdir(), "vein-installer-test-"));
   for (const name of ["bin", "assets", "source"]) await mkdir(`${root}/${name}`);
   await writeFile(`${root}/source/vein`, "#!/bin/sh\nprintf 'fixture CLI\\n'\n");
   const asset = platform === "Darwin" ? "vein-macos-aarch64.tar.gz" : "vein-linux-x86_64.tar.gz";

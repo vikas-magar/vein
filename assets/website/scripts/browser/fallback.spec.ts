@@ -39,7 +39,7 @@ test("fallback retains the draft and runs only the statement at the cursor", asy
   expect(await editor.evaluate(element => (element as HTMLTextAreaElement).selectionStart)).toBe(0);
   await editor.press("ControlOrMeta+Enter");
   await expect(page.getByRole("gridcell", { name: "60", exact: true })).toBeVisible();
-  await page.screenshot({ path: `/private/tmp/vein-fallback-${test.info().project.name}.png` });
+  await page.screenshot({ path: test.info().outputPath(`vein-fallback-${test.info().project.name}.png`) });
   await editor.fill("");
   await expect(page.getByRole("button", { name: "Run", exact: true })).toBeDisabled();
   await page.getByRole("button", { name: "New query", exact: true }).click();

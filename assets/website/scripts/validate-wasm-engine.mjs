@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { tableFromIPC } from "apache-arrow";
 import { createEngineRuntime } from "../public/worker/engine-runtime.mjs";
 import { formatCell } from "../components/workbench/results/format.mjs";
@@ -126,7 +128,7 @@ async function validate(directory) {
     io: result.ioStatistics, engineMs: result.engineMs }));
 }
 
-const directory = await mkdtemp("/private/tmp/vein-browser-");
+const directory = await mkdtemp(join(tmpdir(), "vein-browser-"));
 try {
   await validate(directory);
 } catch (error) {
