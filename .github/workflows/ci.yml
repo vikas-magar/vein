@@ -64,7 +64,7 @@ jobs:
           wasm-bindgen target/wasm32-unknown-unknown/release/vein_wasm.wasm
           --target web --out-dir assets/website/public/wasm --out-name vein_wasm
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
