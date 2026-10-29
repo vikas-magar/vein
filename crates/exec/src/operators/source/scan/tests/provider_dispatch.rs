@@ -42,7 +42,7 @@ impl ScanProvider for EmittingProvider {
             SelectionVector::new_dense(2),
         )?
             .with_schema(schema)?;
-        next.push(view)
+        next.push(view).await
     }
 }
 
@@ -88,13 +88,14 @@ struct CountingSink {
     rows: usize,
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for CountingSink {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.rows += view.num_rows();
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }

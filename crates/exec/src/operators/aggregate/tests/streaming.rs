@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn aggregate_finish_streams_ordered_groups_in_bounded_chunks() {
+#[tokio::test]
+async fn aggregate_finish_streams_ordered_groups_in_bounded_chunks() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -25,7 +25,7 @@ fn aggregate_finish_streams_ordered_groups_in_bounded_chunks() {
         chunks.push(chunk);
         Ok(())
     })
-        .expect("stream aggregate output");
+        .await.expect("stream aggregate output");
 
     assert_eq!(
         chunks
@@ -49,8 +49,8 @@ fn aggregate_finish_streams_ordered_groups_in_bounded_chunks() {
     assert_eq!(actual, vec![(Some(1), 25), (None, 45), (Some(3), 30)]);
 }
 
-#[test]
-fn aggregate_finish_callback_error_stops_emission_without_losing_groups() {
+#[tokio::test]
+async fn aggregate_finish_callback_error_stops_emission_without_losing_groups() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -73,16 +73,16 @@ fn aggregate_finish_callback_error_stops_emission_without_losing_groups() {
             emitted += 1;
             Err(VeinError::internal("downstream stopped"))
         })
-        .expect_err("propagate downstream failure");
+        .await.expect_err("propagate downstream failure");
     assert!(error.to_string().contains("downstream stopped"));
     assert_eq!(emitted, 1, "stop after the first failed push");
 
-    let output = sink.finish().expect("groups remain available for retry");
+    let output = sink.finish().await.expect("groups remain available for retry");
     assert_eq!(output.iter().map(|chunk| chunk.num_rows()).sum::<usize>(), 3);
 }
 
-#[test]
-fn aggregate_finish_streaming_preserves_empty_group_semantics() {
+#[tokio::test]
+async fn aggregate_finish_streaming_preserves_empty_group_semantics() {
     let grouped_plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -99,7 +99,7 @@ fn aggregate_finish_streaming_preserves_empty_group_semantics() {
             grouped_batches += 1;
             Ok(())
         })
-        .expect("finish empty grouped aggregate");
+        .await.expect("finish empty grouped aggregate");
     assert_eq!(grouped_batches, 0);
 
     let global_plan = AggregatePlan {
@@ -118,7 +118,7 @@ fn aggregate_finish_streaming_preserves_empty_group_semantics() {
             global_batches.push(batch);
             Ok(())
         })
-        .expect("finish empty global aggregate");
+        .await.expect("finish empty global aggregate");
     assert_eq!(global_batches.len(), 1);
     assert_eq!(global_batches[0].num_rows(), 1);
     let count = crate::pipeline::test_support::materialized_column::<Int64Array>(

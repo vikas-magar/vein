@@ -30,7 +30,11 @@ async fn executes_pipe_write_and_exposes_only_committed_rows() {
         .await
         .expect("prepare WRITE query");
     assert!(query.is_write());
+    let resources = Arc::clone(query.execution_resources());
+    assert!(!resources.cancellation().is_cancelled());
     let receipt = query.execute_write().await.expect("commit WRITE query");
+    assert!(resources.cancellation().is_cancelled(), "WRITE releases the same lifetime guard");
+    assert_eq!(resources.memory_used_bytes(), 0);
     assert_eq!(receipt.destination, "archived");
     assert_eq!(receipt.row_count, 2);
 

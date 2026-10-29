@@ -35,8 +35,8 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --locked
 
-  wasm-portable:
-    name: Build portable crates (wasm32-unknown-unknown)
+  wasm-browser:
+    name: Package browser playground
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -47,5 +47,32 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Build portable crates
-        run: cargo build --locked --target wasm32-unknown-unknown -p error -p types -p parser -p functions
+      - name: Build browser engine
+        run: cargo build --locked --release --target wasm32-unknown-unknown -p vein-wasm
+      - name: Install matching wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Prepare browser package directory
+        run: mkdir -p assets/website/public/wasm
+      - name: Generate JavaScript bindings
+        run: >-
+          wasm-bindgen target/wasm32-unknown-unknown/release/vein_wasm.wasm
+          --target web --out-dir assets/website/public/wasm --out-name vein_wasm
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: assets/website/package-lock.json
+      - name: Install website dependencies
+        working-directory: assets/website
+        run: npm ci
+      - name: Build static website
+        working-directory: assets/website
+        run: npm run build
+      - name: Upload static website
+        uses: actions/upload-artifact@v4
+        with:
+          name: vein-website
+          path: assets/website/out/
+          if-no-files-found: error
+          retention-days: 7

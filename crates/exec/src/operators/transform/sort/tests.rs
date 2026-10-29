@@ -12,13 +12,14 @@ use crate::pipeline::DataChunkView;
 #[derive(Clone)]
 struct Collect(Arc<Mutex<Vec<DataChunkView>>>);
 
+#[async_trait::async_trait]
 impl PipelineNode for Collect {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0.lock().unwrap().push(view);
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }
@@ -57,8 +58,8 @@ fn string_at(view: &DataChunkView, column: usize, row: usize) -> Option<String> 
         .then(|| values.value(physical_row).to_owned())
 }
 
-#[test]
-fn globally_sorts_multiple_chunks_by_keys_and_null_order() {
+#[tokio::test]
+async fn globally_sorts_multiple_chunks_by_keys_and_null_order() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let plan = SortPlan {
         keys: vec![
@@ -79,14 +80,14 @@ fn globally_sorts_multiple_chunks_by_keys_and_null_order() {
         vec![strings(&[Some("b"), Some("a")]), integers(&[1, 1])],
         SelectionVector::new_dense(2),
     )))
-        .unwrap();
+        .await.unwrap();
     sort.push(view(crate::pipeline::test_support::selected_view(
         vec![strings(&[Some("b"), None]), integers(&[3, 9])],
         SelectionVector::new_dense(2),
     )))
-        .unwrap();
+        .await.unwrap();
 
-    sort.flush().unwrap();
+    sort.flush().await.unwrap();
 
     let chunks = output.lock().unwrap();
     let labels: Vec<Option<String>> = chunks
@@ -105,8 +106,8 @@ fn globally_sorts_multiple_chunks_by_keys_and_null_order() {
     assert_eq!(tie_breakers, vec![1, 3, 1, 9]);
 }
 
-#[test]
-fn full_sort_accounts_distinct_source_arrays_once_across_retained_views() {
+#[tokio::test]
+async fn full_sort_accounts_distinct_source_arrays_once_across_retained_views() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let source = integers(&[2, 1]);
@@ -131,7 +132,7 @@ fn full_sort_accounts_distinct_source_arrays_once_across_retained_views() {
         sort.push(view(crate::pipeline::test_support::dense_view(vec![
             Arc::clone(&source),
         ])))
-            .expect("retain view without copying source values");
+            .await.expect("retain view without copying source values");
     }
 
     assert_eq!(
@@ -139,7 +140,7 @@ fn full_sort_accounts_distinct_source_arrays_once_across_retained_views() {
         source_bytes + 2 * row_reservation,
         "two views share one source-array reservation"
     );
-    sort.flush().expect("sort retained views");
+    sort.flush().await.expect("sort retained views");
 
     let output = output.lock().unwrap();
     let values = output
@@ -155,8 +156,8 @@ fn full_sort_accounts_distinct_source_arrays_once_across_retained_views() {
     }
 }
 
-#[test]
-fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mutation() {
+#[tokio::test]
+async fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mutation() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let first_key = integers(&[5]);
     let first_payload = strings(&[Some("small")]);
@@ -186,7 +187,7 @@ fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mu
         Arc::clone(&first_key),
         Arc::clone(&first_payload),
     ])))
-        .expect("retain first candidate");
+        .await.expect("retain first candidate");
     let retained_bytes = tracker.used();
 
     let large_payload = strings(&[Some(&"x".repeat(8192))]);
@@ -194,7 +195,7 @@ fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mu
         integers(&[99]),
         Arc::clone(&large_payload),
     ])))
-        .expect("discard a batch that cannot enter Top-N");
+        .await.expect("discard a batch that cannot enter Top-N");
     assert_eq!(tracker.used(), retained_bytes);
     assert_eq!(sort.chunks.len(), 1, "non-candidate view is not retained");
     let retained_sort_bytes = sort.memory.bytes();
@@ -204,7 +205,7 @@ fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mu
             integers(&[1]),
             Arc::clone(&large_payload),
         ])))
-        .expect_err("candidate source arrays exceed the query budget");
+        .await.expect_err("candidate source arrays exceed the query budget");
     assert!(matches!(error, VeinError::ResourceExhausted { .. }));
     assert_eq!(tracker.used(), retained_bytes);
     assert_eq!(sort.memory.bytes(), retained_sort_bytes);
@@ -220,14 +221,14 @@ fn top_n_skips_non_candidates_and_rejects_unaccountable_candidate_before_heap_mu
         "failed accounting does not mutate the Top-N heap"
     );
 
-    sort.flush().expect("emit the original retained candidate");
+    sort.flush().await.expect("emit the original retained candidate");
     let values = output.lock().unwrap();
     assert_eq!(values.len(), 1);
     assert_eq!(int_at(&values[0], 0, 0), Some(5));
 }
 
-#[test]
-fn full_sort_includes_source_arrays_when_selecting_spill_path() {
+#[tokio::test]
+async fn full_sort_includes_source_arrays_when_selecting_spill_path() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let source = integers(&(0..10).rev().collect::<Vec<_>>());
     let source_bytes = source.get_array_memory_size();
@@ -255,7 +256,7 @@ fn full_sort_includes_source_arrays_when_selecting_spill_path() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         source,
     ])))
-        .expect("fall back to external sorting when retained memory is over budget");
+        .await.expect("fall back to external sorting when retained memory is over budget");
     assert!(
         sort.spilling,
         "source arrays are included in the sort budget"
@@ -292,8 +293,8 @@ fn full_sort_includes_source_arrays_when_selecting_spill_path() {
     assert!(output.lock().unwrap().is_empty());
 }
 
-#[test]
-fn sort_composes_cross_batch_payload_references_with_sparse_selections() {
+#[tokio::test]
+async fn sort_composes_cross_batch_payload_references_with_sparse_selections() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let first_keys = integers(&[4, 999, 1]);
     let first_payload = integers(&[40, 9_990, 10]);
@@ -313,14 +314,14 @@ fn sort_composes_cross_batch_payload_references_with_sparse_selections() {
         vec![Arc::clone(&first_keys), Arc::clone(&first_payload)],
         SelectionVector::new_sparse(vec![0, 2]),
     )))
-        .expect("push first sparse input view");
+        .await.expect("push first sparse input view");
     sort.push(view(crate::pipeline::test_support::selected_view(
         vec![Arc::clone(&second_keys), Arc::clone(&second_payload)],
         SelectionVector::new_dense(2),
     )))
-        .expect("push second input view");
+        .await.expect("push second input view");
 
-    sort.flush().expect("sort sparse input views");
+    sort.flush().await.expect("sort sparse input views");
 
     let output = output.lock().unwrap();
     let sorted_keys = output
@@ -345,8 +346,8 @@ fn sort_composes_cross_batch_payload_references_with_sparse_selections() {
     }
 }
 
-#[test]
-fn single_chunk_sort_reuses_arrow_columns_and_reorders_selection() {
+#[tokio::test]
+async fn single_chunk_sort_reuses_arrow_columns_and_reorders_selection() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let values = integers(&[3, 1, 2]);
     let mut sort = SortTransform::new(
@@ -362,9 +363,9 @@ fn single_chunk_sort_reuses_arrow_columns_and_reorders_selection() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         values.clone(),
     ])))
-        .unwrap();
+        .await.unwrap();
 
-    sort.flush().unwrap();
+    sort.flush().await.unwrap();
 
     let chunks = output.lock().unwrap();
     assert_eq!(chunks.len(), 1);
@@ -376,8 +377,8 @@ fn single_chunk_sort_reuses_arrow_columns_and_reorders_selection() {
     assert_eq!(selected, vec![1, 2, 3]);
 }
 
-#[test]
-fn full_sort_and_top_n_compare_retained_sort_values_without_gathering() {
+#[tokio::test]
+async fn full_sort_and_top_n_compare_retained_sort_values_without_gathering() {
     for top_n in [false, true] {
         let output = Arc::new(Mutex::new(Vec::new()));
         let keys = integers(&[30, 10, 20]);
@@ -405,9 +406,9 @@ fn full_sort_and_top_n_compare_retained_sort_values_without_gathering() {
                 vec![Arc::clone(&keys), Arc::clone(&payload)],
                 selection,
             )))
-                .unwrap();
+                .await.unwrap();
         }
-        sort.flush().unwrap();
+        sort.flush().await.unwrap();
         assert_eq!(
             sort.metrics.spill_write_materialization,
             MaterializationReport::default()
@@ -436,8 +437,8 @@ fn full_sort_and_top_n_compare_retained_sort_values_without_gathering() {
     }
 }
 
-#[test]
-fn top_n_sorts_only_offset_plus_count_and_keeps_single_chunk_payload_shared() {
+#[tokio::test]
+async fn top_n_sorts_only_offset_plus_count_and_keeps_single_chunk_payload_shared() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let values = integers(&[4, 1, 3, 2]);
     let sink = Box::new(Collect(output.clone()));
@@ -460,9 +461,9 @@ fn top_n_sorts_only_offset_plus_count_and_keeps_single_chunk_payload_shared() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         values.clone(),
     ])))
-        .unwrap();
+        .await.unwrap();
 
-    sort.flush().unwrap();
+    sort.flush().await.unwrap();
 
     let chunks = output.lock().unwrap();
     assert_eq!(chunks.len(), 1);
@@ -474,8 +475,8 @@ fn top_n_sorts_only_offset_plus_count_and_keeps_single_chunk_payload_shared() {
     assert_eq!(sorted, vec![2, 3]);
 }
 
-#[test]
-fn top_n_releases_chunks_without_current_winning_rows() {
+#[tokio::test]
+async fn top_n_releases_chunks_without_current_winning_rows() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let winner = integers(&[1]);
     let mut sort = SortTransform::with_limit(
@@ -496,15 +497,15 @@ fn top_n_releases_chunks_without_current_winning_rows() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         integers(&[8, 9]),
     ])))
-        .unwrap();
+        .await.unwrap();
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         winner.clone(),
     ])))
-        .unwrap();
+        .await.unwrap();
 
     assert!(sort.chunks[0].is_none());
     assert!(sort.chunks[1].is_some());
-    sort.flush().unwrap();
+    sort.flush().await.unwrap();
 
     let chunks = output.lock().unwrap();
     assert_eq!(chunks.len(), 1);
@@ -512,8 +513,8 @@ fn top_n_releases_chunks_without_current_winning_rows() {
     assert!(Arc::ptr_eq(array, &winner));
 }
 
-#[test]
-fn top_n_gathers_sorted_winners_from_multiple_chunks() {
+#[tokio::test]
+async fn top_n_gathers_sorted_winners_from_multiple_chunks() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let mut sort = SortTransform::with_limit(
         SortPlan {
@@ -535,11 +536,11 @@ fn top_n_gathers_sorted_winners_from_multiple_chunks() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         first.clone(),
     ])))
-        .unwrap();
+        .await.unwrap();
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         second.clone(),
     ])))
-        .unwrap();
+        .await.unwrap();
 
     let replacement = sort
         .top_n
@@ -552,7 +553,7 @@ fn top_n_gathers_sorted_winners_from_multiple_chunks() {
     assert_eq!(replacement.chunk, 1);
     assert_eq!(replacement.row, 1);
 
-    sort.flush().unwrap();
+    sort.flush().await.unwrap();
 
     assert_eq!(sort.metrics.input_batches, 2);
     assert_eq!(sort.metrics.input_rows, 4);
@@ -580,8 +581,8 @@ fn top_n_gathers_sorted_winners_from_multiple_chunks() {
     }
 }
 
-#[test]
-fn top_n_sort_reuses_its_candidate_reference_buffer() {
+#[tokio::test]
+async fn top_n_sort_reuses_its_candidate_reference_buffer() {
     let mut top_n = BoundedTopN::new(4);
     let mut compare = |left: &i64, right: &i64| Ok(left.cmp(right));
     for value in [3, 1, 4, 2] {
@@ -598,8 +599,8 @@ fn top_n_sort_reuses_its_candidate_reference_buffer() {
     assert_eq!(sorted, vec![1, 2, 3, 4]);
 }
 
-#[test]
-fn top_n_keeps_candidate_reference_reservation_when_replacing_source_chunk() {
+#[tokio::test]
+async fn top_n_keeps_candidate_reference_reservation_when_replacing_source_chunk() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let tracker = QueryMemoryTracker::new(1 << 20, common::cancellation::CancellationToken::new());
     let mut sort = SortTransform::with_limit_and_memory_tracker(
@@ -624,7 +625,7 @@ fn top_n_keeps_candidate_reference_reservation_when_replacing_source_chunk() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         long_key,
     ])))
-        .expect("retain first candidate");
+        .await.expect("retain first candidate");
     let before_replacement = sort.memory.bytes();
     let chunk_metadata = size_of::<Option<DataChunkView>>() + size_of::<usize>();
     let short_key_bytes = short_key.get_array_memory_size();
@@ -632,7 +633,7 @@ fn top_n_keeps_candidate_reference_reservation_when_replacing_source_chunk() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         short_key,
     ])))
-        .expect("replace with better short candidate");
+        .await.expect("replace with better short candidate");
 
     assert_eq!(
         sort.memory.bytes(),
@@ -646,8 +647,8 @@ fn top_n_keeps_candidate_reference_reservation_when_replacing_source_chunk() {
     );
 }
 
-#[test]
-fn zero_count_top_n_finishes_without_retaining_input() {
+#[tokio::test]
+async fn zero_count_top_n_finishes_without_retaining_input() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let mut sort = SortTransform::with_limit(
         SortPlan {
@@ -669,15 +670,15 @@ fn zero_count_top_n_finishes_without_retaining_input() {
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         integers(&[3, 1, 2]),
     ])))
-        .unwrap();
-    sort.flush().unwrap();
+        .await.unwrap();
+    sort.flush().await.unwrap();
 
     assert!(sort.chunks.is_empty());
     assert!(output.lock().unwrap().is_empty());
 }
 
-#[test]
-fn sort_reference_growth_respects_budget_and_releases_on_error() {
+#[tokio::test]
+async fn sort_reference_growth_respects_budget_and_releases_on_error() {
     let tracker = QueryMemoryTracker::new(0, common::cancellation::CancellationToken::new());
     let mut sort = SortTransform::with_memory_tracker(
         SortPlan {
@@ -696,14 +697,14 @@ fn sort_reference_growth_respects_budget_and_releases_on_error() {
         .push(view(crate::pipeline::test_support::dense_view(vec![
             integers(&[3, 1, 2]),
         ])))
-        .expect_err("sort row references must reserve memory before growth");
+        .await.expect_err("sort row references must reserve memory before growth");
     assert!(matches!(error, VeinError::ResourceExhausted { .. }));
     drop(sort);
     assert_eq!(tracker.used(), 0, "failed sort state releases reservations");
 }
 
-#[test]
-fn memory_pressure_switches_sort_to_spill_and_releases_temporary_reservations() {
+#[tokio::test]
+async fn memory_pressure_switches_sort_to_spill_and_releases_temporary_reservations() {
     let tracker = QueryMemoryTracker::new(64, common::cancellation::CancellationToken::new());
     let mut sort = SortTransform::with_memory_tracker(
         SortPlan {
@@ -721,12 +722,12 @@ fn memory_pressure_switches_sort_to_spill_and_releases_temporary_reservations() 
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         integers(&[2]),
     ])))
-        .expect("retain first row within budget");
+        .await.expect("retain first row within budget");
 
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         integers(&[1]),
     ])))
-        .expect("spill retained and incoming views when references exceed budget");
+        .await.expect("spill retained and incoming views when references exceed budget");
 
     assert!(sort.spilling);
     assert_eq!(sort.spill_runs.len(), 2);
@@ -744,8 +745,8 @@ fn memory_pressure_switches_sort_to_spill_and_releases_temporary_reservations() 
     );
 }
 
-#[test]
-fn spill_runs_merge_without_losing_projection_and_account_for_retained_output() {
+#[tokio::test]
+async fn spill_runs_merge_without_losing_projection_and_account_for_retained_output() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let keys_a = integers(&[4, 1]);
@@ -770,18 +771,18 @@ fn spill_runs_merge_without_losing_projection_and_account_for_retained_output() 
         Arc::clone(&payload_a),
         Arc::clone(&keys_a),
     ])))
-        .expect("retain first batch within budget");
+        .await.expect("retain first batch within budget");
     sort.push(view(crate::pipeline::test_support::dense_view(vec![
         Arc::clone(&payload_b),
         Arc::clone(&keys_b),
     ])))
-        .expect("spill after the second batch exceeds the budget");
+        .await.expect("spill after the second batch exceeds the budget");
     let spill_directory = tracker
         .spill_manager()
         .local_directory()
         .expect("spill run directory");
 
-    sort.flush().expect("merge sorted spill runs");
+    sort.flush().await.expect("merge sorted spill runs");
 
     let collected = output.lock().unwrap();
     let sorted_payload = collected
@@ -820,8 +821,8 @@ fn spill_runs_merge_without_losing_projection_and_account_for_retained_output() 
     );
 }
 
-#[test]
-fn external_sort_uses_bounded_multi_pass_merge_for_many_spill_runs() {
+#[tokio::test]
+async fn external_sort_uses_bounded_multi_pass_merge_for_many_spill_runs() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let mut sort = SortTransform::with_memory_tracker(
@@ -842,11 +843,11 @@ fn external_sort_uses_bounded_multi_pass_merge_for_many_spill_runs() {
         sort.push(view(crate::pipeline::test_support::dense_view(vec![
             integers(&[value]),
         ])))
-            .expect("spill input after memory budget fills");
+            .await.expect("spill input after memory budget fills");
     }
     assert!(sort.spill_runs.len() > SPILL_MERGE_FAN_IN);
 
-    sort.flush().expect("merge spill runs over bounded passes");
+    sort.flush().await.expect("merge spill runs over bounded passes");
 
     let collected = output.lock().unwrap();
     let values = collected
@@ -869,8 +870,8 @@ fn external_sort_uses_bounded_multi_pass_merge_for_many_spill_runs() {
     );
 }
 
-#[test]
-fn external_sort_preserves_null_order_and_duplicate_keys() {
+#[tokio::test]
+async fn external_sort_preserves_null_order_and_duplicate_keys() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let mut sort = SortTransform::with_memory_tracker(
@@ -895,10 +896,10 @@ fn external_sort_preserves_null_order_and_duplicate_keys() {
             integers(&payload),
             strings(&key),
         ])))
-            .expect("spill input rows");
+            .await.expect("spill input rows");
     }
 
-    sort.flush().expect("merge duplicate and NULL keys");
+    sort.flush().await.expect("merge duplicate and NULL keys");
 
     let output = output.lock().unwrap();
     let payload = output
@@ -908,8 +909,8 @@ fn external_sort_preserves_null_order_and_duplicate_keys() {
     assert_eq!(payload, vec![1, 4, 3, 2]);
 }
 
-#[test]
-fn canceled_external_merge_returns_cancelled_and_cleans_spill_files() {
+#[tokio::test]
+async fn canceled_external_merge_returns_cancelled_and_cleans_spill_files() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let cancel = common::cancellation::CancellationToken::new();
     let tracker = QueryMemoryTracker::new(64, cancel.clone());
@@ -930,7 +931,7 @@ fn canceled_external_merge_returns_cancelled_and_cleans_spill_files() {
         sort.push(view(crate::pipeline::test_support::dense_view(vec![
             integers(&values),
         ])))
-            .expect("spill input rows");
+            .await.expect("spill input rows");
     }
     let spill_directory = tracker
         .spill_manager()
@@ -938,7 +939,7 @@ fn canceled_external_merge_returns_cancelled_and_cleans_spill_files() {
         .expect("spill run directory");
     cancel.cancel();
 
-    assert!(matches!(sort.flush(), Err(VeinError::Cancelled)));
+    assert!(matches!(sort.flush().await, Err(VeinError::Cancelled)));
     assert!(output.lock().unwrap().is_empty());
     drop(sort);
     drop(tracker);
@@ -948,8 +949,8 @@ fn canceled_external_merge_returns_cancelled_and_cleans_spill_files() {
     );
 }
 
-#[test]
-fn external_merge_emits_bounded_batches_across_run_batch_boundaries() {
+#[tokio::test]
+async fn external_merge_emits_bounded_batches_across_run_batch_boundaries() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let mut sort = SortTransform::with_memory_tracker(
@@ -974,10 +975,10 @@ fn external_merge_emits_bounded_batches_across_run_batch_boundaries() {
         sort.push(view(crate::pipeline::test_support::dense_view(vec![
             integers(&values),
         ])))
-            .expect("spill after the retained views exceed the budget");
+            .await.expect("spill after the retained views exceed the budget");
     }
 
-    sort.flush().expect("merge runs with multiple IPC batches");
+    sort.flush().await.expect("merge runs with multiple IPC batches");
 
     assert!(
         sort.metrics.spill_write_materialization.gathered_columns > 0,
@@ -1006,8 +1007,8 @@ fn external_merge_emits_bounded_batches_across_run_batch_boundaries() {
     assert_eq!(values, (0..36_000i64).collect::<Vec<_>>());
 }
 
-#[test]
-fn spill_array_reservation_lives_until_the_last_composed_view_is_dropped() {
+#[tokio::test]
+async fn spill_array_reservation_lives_until_the_last_composed_view_is_dropped() {
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let source: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
     let source_bytes = source.get_array_memory_size();

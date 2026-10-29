@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn integer_sum_preserves_values_above_f64_precision() {
+#[tokio::test]
+async fn integer_sum_preserves_values_above_f64_precision() {
     let plan = AggregatePlan {
         groups: 0,
         estimated_groups: None,
@@ -21,7 +21,7 @@ fn integer_sum_preserves_values_above_f64_precision() {
     let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(input).unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let sums = int128_column(&output[0], 0);
     let minimum = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
     let maximum = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 2);
@@ -31,8 +31,8 @@ fn integer_sum_preserves_values_above_f64_precision() {
     assert_eq!(maximum.value(0), 9_007_199_254_740_993);
 }
 
-#[test]
-fn int64_average_accumulates_exactly_across_batches() {
+#[tokio::test]
+async fn int64_average_accumulates_exactly_across_batches() {
     let plan = AggregatePlan {
         groups: 0,
         estimated_groups: None,
@@ -53,13 +53,13 @@ fn int64_average_accumulates_exactly_across_batches() {
     ))]))
         .unwrap();
 
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let average = crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0);
     assert_eq!(average.value(0), 0.5);
 }
 
-#[test]
-fn integer_sum_reports_overflow() {
+#[tokio::test]
+async fn integer_sum_reports_overflow() {
     let plan = AggregatePlan {
         groups: 0,
         estimated_groups: None,

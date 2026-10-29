@@ -54,8 +54,8 @@ fn observe(sink: &mut AggregateSink, calls: &Arc<AtomicUsize>) {
     }));
 }
 
-#[test]
-fn in_memory_combination_never_invokes_the_spill_codec() {
+#[tokio::test]
+async fn in_memory_combination_never_invokes_the_spill_codec() {
     let (shared, mut canonical) = shared(plan(None)).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     observe(&mut shared.lock().unwrap(), &calls);
@@ -73,7 +73,7 @@ fn in_memory_combination_never_invokes_the_spill_codec() {
             ])
             .unwrap(),
         )
-        .unwrap();
+        .await.unwrap();
     worker.combine_local(canonical.as_mut()).unwrap();
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     let mut target = shared.lock().unwrap();
@@ -83,7 +83,7 @@ fn in_memory_combination_never_invokes_the_spill_codec() {
         1,
         "retain source batches, not one copy of their metadata per group"
     );
-    let output = target.finish().unwrap();
+    let output = target.finish().await.unwrap();
     let total: i64 = output
         .iter()
         .map(|batch| {

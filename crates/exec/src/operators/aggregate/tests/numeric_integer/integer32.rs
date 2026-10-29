@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
+#[tokio::test]
+async fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
     let values: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
     let plan = AggregatePlan {
         groups: 0,
@@ -33,7 +33,7 @@ fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
         values,
     ]))
         .unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
 
     assert_eq!(
         int128_column(&output[0], 0)

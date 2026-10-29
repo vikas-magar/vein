@@ -23,13 +23,14 @@ impl JoinFilterCollector {
     }
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for JoinFilterCollector {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         *self.output.lock().map_err(|_| VeinError::internal("join filter collector poisoned"))? = Some(view);
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 

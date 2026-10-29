@@ -8,7 +8,7 @@ use common::{Result, VeinError};
 use exec::pipeline::DataChunkView;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OutputFormat {

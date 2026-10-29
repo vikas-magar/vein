@@ -1,6 +1,7 @@
 //! Local engine composition and execution tests.
 
 mod checkpoint_domain;
+mod inspection;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -60,7 +61,7 @@ impl ScanProvider for MemoryScanProvider {
         next.push(
             DataChunkView::from_arrays(vec![values], 2, SelectionVector::new_dense(2))?
                 .with_schema(schema)?,
-        )
+        ).await
     }
 }
 

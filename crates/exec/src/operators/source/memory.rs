@@ -17,9 +17,9 @@ impl MemorySource {
 impl Source for MemorySource {
     async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()> {
         if let Some(view) = self.view.take() {
-            next.push(view)?;
+            next.push(view).await?;
         }
-        next.flush()?;
+        next.flush().await?;
         Ok(())
     }
 }

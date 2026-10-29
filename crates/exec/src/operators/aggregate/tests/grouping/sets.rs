@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn grouping_sets_keep_set_identity_and_null_omitted_keys() {
+#[tokio::test]
+async fn grouping_sets_keep_set_identity_and_null_omitted_keys() {
     let plan = AggregatePlan {
         groups: 2,
         estimated_groups: None,
@@ -31,7 +31,7 @@ fn grouping_sets_keep_set_identity_and_null_omitted_keys() {
     assert_eq!(metrics.retained_key_slots_initialized, 10);
     assert_eq!(metrics.string_key_bytes_copied, 0);
 
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let batch = &output[0];
     let first_key = crate::pipeline::test_support::materialized_column::<Int64Array>(batch, 0);
     let second_key = crate::pipeline::test_support::materialized_column::<StringArray>(batch, 1);
@@ -59,8 +59,8 @@ fn grouping_sets_keep_set_identity_and_null_omitted_keys() {
     assert_eq!(actual, expected);
 }
 
-#[test]
-fn empty_input_emits_only_empty_grouping_sets() {
+#[tokio::test]
+async fn empty_input_emits_only_empty_grouping_sets() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -77,7 +77,7 @@ fn empty_input_emits_only_empty_grouping_sets() {
     ]))
         .unwrap();
 
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     assert_eq!(output[0].num_rows(), 1);
     assert!(
         crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0)

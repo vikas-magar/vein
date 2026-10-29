@@ -13,24 +13,24 @@ impl AdaptiveCoordinator {
     pub(super) async fn transition(
         &self, prepared: &PreparedAdaptiveCheckpoint, current: &LogicalPlan,
         execution: &AdaptiveExecution, stage: usize, source_id: IntermediateSourceId,
-    ) -> common::Result<(Vec<ExecuteTask>, LogicalPlan, IntermediateSourceRegistration, bool)> {
-        let resources = execution.resources.as_ref().expect("resources created before transition");
+    ) -> common::Result<(Vec<ExecuteTask>, LogicalPlan, CancellationRegistration, bool)> {
+        let resources = execution.scope.resources();
         tracing::info!(target: "vein.adaptive", event = "adaptive_checkpoint_started", stage,
         source = prepared.boundary.table_name(), "executing checkpoint producer");
         let checkpoint = self.executor.execute_to_checkpoint_with_resources(
-            &prepared.producer_task, execution.cancel.clone(), Arc::clone(resources),
+            &prepared.producer_task, Arc::clone(resources),
         ).await?;
         let rows = checkpoint.relation.row_count()?;
         match checkpoint.relation.collect_statistics(prepared.boundary.output_schema()).await {
-            Ok(statistics) => self.statistics.record_intermediate(source_id.into_raw(), statistics)?,
+            Ok(statistics) => resources.statistics_context().record_intermediate(source_id.into_raw(), statistics)?,
             Err(error) => tracing::warn!(target: "vein.adaptive", event = "adaptive_synopsis_unavailable",
             stage, error = %error, "retaining exact row count without column synopses"),
         }
         let rewritten = prepared.boundary.replace(current.clone(), source_id, rows)?;
         let before = rewritten.clone();
-        let started = std::time::Instant::now();
+        let started = common::time::Instant::now();
         let (optimized, diagnostics) = match self.optimizer.optimize_with_statistics_context(
-            rewritten, Arc::clone(&self.statistics),
+            rewritten, Arc::clone(resources.statistics_context()),
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -58,11 +58,13 @@ impl AdaptiveCoordinator {
             pending_domain_inputs,
             schedule_followup, "decided whether additional runtime statistics can inform remaining joins");
         let plan_changed = optimized != before;
-        let job = self.planner.create_physical_plan_with_statistics(self.request_id, optimized.clone(), Arc::clone(&self.statistics))?;
-        let tasks = tasks_from_job(job, Arc::clone(&self.statistics), self.query_id)?;
+        let job = self.planner.create_physical_plan_with_statistics(resources.request_id(), optimized.clone(), Arc::clone(resources.statistics_context()))?;
+        let tasks = tasks_from_job(job, Arc::clone(resources.statistics_context()), resources.query_id())?;
         let registration = self.executor.register_intermediate_source(
-            self.query_id, source_id, checkpoint.relation,
+            resources.query_id(), source_id, checkpoint.relation,
         )?;
+        let registration = resources.retain_until_cancel(registration)?;
+        if resources.cancellation().is_cancelled() { return Err(common::VeinError::cancelled()); }
         let reoptimization_us = started.elapsed().as_micros() as u64;
         tracing::info!(target: "vein.adaptive.summary", event = "adaptive_stage_summary",
             stage,

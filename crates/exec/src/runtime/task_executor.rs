@@ -15,20 +15,19 @@ use super::{QueryExecutionResources, TaskResult};
 
 /// Executes a single task (`source -> transforms -> sink`) end-to-end.
 ///
-/// This is the unit of work the distributed master schedules: the executor
-/// receives a self-contained [`ExecuteTask`] and runs it, returning its result.
+/// The single-node engine supplies a physical task and its query resource scope.
 ///
 /// Every future here is `Send`, so tasks can be dispatched onto a multi-threaded
 /// runtime and executed concurrently; nothing in the pipeline holds `!Send`
 /// state.
 #[async_trait]
 pub trait TaskExecutor: Send + Sync {
-    /// Create one resource scope for a multi-stage query execution.
+    /// Create the resource authority shared by all query stages.
     ///
-    /// Executors that do not support query-wide accounting return an error;
-    /// callers can then keep the original single-stage plan.
+    /// Executors without query-wide accounting report an explicit capability error.
     fn create_query_resources(
         &self,
+        _task: &ExecuteTask,
         _cancel: CancellationToken,
     ) -> Result<Arc<QueryExecutionResources>> {
         Err(VeinError::unsupported(
@@ -39,6 +38,11 @@ pub trait TaskExecutor: Send + Sync {
 
     /// Run one task, driving its source through the operator chain.
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult>;
+
+    /// Executes a terminal task using the same scope as all preceding stages.
+    async fn execute_with_resources(
+        &self, task: &ExecuteTask, resources: Arc<QueryExecutionResources>,
+    ) -> Result<TaskResult>;
 
     /// Runs a client-result task into a query-accounted, replayable checkpoint.
     ///
@@ -55,11 +59,8 @@ pub trait TaskExecutor: Send + Sync {
     async fn execute_to_checkpoint_with_resources(
         &self,
         task: &ExecuteTask,
-        cancel: CancellationToken,
-        _resources: Arc<QueryExecutionResources>,
-    ) -> Result<checkpoint::CheckpointTaskResult> {
-        self.execute_to_checkpoint(task, cancel).await
-    }
+        resources: Arc<QueryExecutionResources>,
+    ) -> Result<checkpoint::CheckpointTaskResult>;
 
     /// Make a sealed query-local relation available to a later physical fragment.
     ///
@@ -82,12 +83,9 @@ pub trait TaskExecutor: Send + Sync {
     async fn execute_streaming_with_resources(
         &self,
         task: &ExecuteTask,
-        cancel: CancellationToken,
         output: flume::Sender<DataChunkView>,
-        _resources: Arc<QueryExecutionResources>,
-    ) -> Result<TaskResult> {
-        self.execute_streaming(task, cancel, output).await
-    }
+        resources: Arc<QueryExecutionResources>,
+    ) -> Result<TaskResult>;
 
     /// Execute a task while forwarding canonical views through a bounded channel.
     ///

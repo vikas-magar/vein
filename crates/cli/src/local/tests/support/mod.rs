@@ -74,23 +74,6 @@ fn find_first_plan_node<'a>(
         return Some(node);
     }
 
-    child_nodes(node)
-        .into_iter()
-        .flatten()
+    node.operator.inputs()
         .find_map(|child| find_first_plan_node(child, predicate))
-}
-
-fn child_nodes(node: &PhysicalPlanNode) -> [Option<&PhysicalPlanNode>; 2] {
-    match &node.operator {
-        PhysicalPlanOperator::Transform { input, .. }
-        | PhysicalPlanOperator::Aggregate { input, .. }
-        | PhysicalPlanOperator::Distinct { input, .. }
-        | PhysicalPlanOperator::Sort { input, .. }
-        | PhysicalPlanOperator::Limit { input, .. }
-        | PhysicalPlanOperator::Sink { input, .. } => [Some(input.as_ref()), None],
-        PhysicalPlanOperator::Join { probe, build, .. } => {
-            [Some(probe.as_ref()), Some(build.as_ref())]
-        }
-        PhysicalPlanOperator::Pipeline { .. } => [None, None],
-    }
 }

@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
+#[tokio::test]
+async fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -61,7 +61,7 @@ fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
     assert_eq!(metrics.group_index_hits, 1);
     assert_eq!(metrics.group_index_misses, 2);
 
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let batch = &output[0];
     let keys = materialized_column::<Int64Array>(batch, 0);
     let sums = int128_column(batch, 1);

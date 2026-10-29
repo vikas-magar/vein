@@ -6,8 +6,8 @@ use common::protocol::{ExprKind, PhysicalExpr};
 
 use super::*;
 
-#[test]
-fn not_like_residual_reads_declared_utf8_slots_independent_of_join_output() {
+#[tokio::test]
+async fn not_like_residual_reads_declared_utf8_slots_independent_of_join_output() {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     table
         .insert(crate::pipeline::test_support::dense_view(vec![
@@ -45,8 +45,8 @@ fn not_like_residual_reads_declared_utf8_slots_independent_of_join_output() {
         ints(&[1, 2]),
         Arc::new(StringArray::from(vec![Some("visible"), Some("blocked item")])),
     ]))
-        .expect("probe rows through the residual predicate");
-    join.flush().expect("flush left join");
+        .await.expect("probe rows through the residual predicate");
+    join.flush().await.expect("flush left join");
 
     let chunks = sink.0.lock().expect("collect lock");
     let mut result = chunks

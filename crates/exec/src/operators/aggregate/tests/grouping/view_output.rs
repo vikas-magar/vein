@@ -8,8 +8,8 @@ use arrow::array::{ArrayRef, Int64Array};
 use common::cancellation::CancellationToken;
 use super::*;
 
-#[test]
-fn aggregate_view_output_reuses_key_array_and_retains_its_memory_lease() {
+#[tokio::test]
+async fn aggregate_view_output_reuses_key_array_and_retains_its_memory_lease() {
     let keys: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 10, 30]));
     let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4]));
     let tracker = QueryMemoryTracker::unlimited(CancellationToken::new());
@@ -34,7 +34,7 @@ fn aggregate_view_output_reuses_key_array_and_retains_its_memory_lease() {
         output.push(view);
         Ok(())
     })
-        .expect("finish as views");
+        .await.expect("finish as views");
     assert_eq!(output.len(), 1);
     assert!(output[0]
         .source_arrays_for_column(0)

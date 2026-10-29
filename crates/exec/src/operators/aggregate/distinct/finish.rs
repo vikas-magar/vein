@@ -2,7 +2,7 @@ use super::super::*;
 use super::DistinctCollector;
 
 impl AggregateSink {
-    pub(in crate::operators::aggregate) fn finish_distinct_counts(
+    pub(in crate::operators::aggregate) async fn finish_distinct_counts(
         &mut self,
         batch_rows: NonZeroUsize,
     ) -> Result<()> {
@@ -22,7 +22,7 @@ impl AggregateSink {
                     &parent_columns,
                     &batch,
                 )
-            })?;
+            }).await?;
         }
         Ok(())
     }

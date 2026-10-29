@@ -9,8 +9,8 @@ fn view_int(view: &DataChunkView, column: usize, row: usize) -> Option<i64> {
     values.is_valid(physical_row).then(|| values.value(physical_row))
 }
 
-#[test]
-fn join_batches_multiple_build_chunks_without_copying_payloads() {
+#[tokio::test]
+async fn join_batches_multiple_build_chunks_without_copying_payloads() {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     let build_payloads = [ints(&[70, 80]), ints(&[71, 81]), ints(&[72, 82])];
     for (keys, payload) in [
@@ -36,8 +36,8 @@ fn join_batches_multiple_build_chunks_without_copying_payloads() {
     join.push(
         crate::pipeline::test_support::dense_view(vec![ints(&[7, 8, 9]), Arc::clone(&probe_payload)]),
     )
-        .expect("probe rows across build chunks");
-    join.flush().expect("flush join");
+        .await.expect("probe rows across build chunks");
+    join.flush().await.expect("flush join");
 
     assert_eq!(join.output_batches, 3);
     assert_eq!(join.output_rows, 7);

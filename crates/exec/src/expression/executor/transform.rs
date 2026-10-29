@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 use common::Result;
 use common::protocol::{ExpressionProgram, ExpressionStep};
@@ -93,23 +93,24 @@ where
     }
 }
 
+#[async_trait::async_trait]
 impl<K> PipelineNode for ExpressionExecutor<K>
 where
     K: ExpressionKernelProvider + ?Sized + 'static,
 {
-    fn push(&mut self, batch: DataChunkView) -> Result<()> {
+    async fn push(&mut self, batch: DataChunkView) -> Result<()> {
         let started = Instant::now();
         let rows_in = batch.num_rows();
         let result = self.execute(batch)?;
         let rows_out = result.as_ref().map_or(0, DataChunkView::num_rows);
         self.metrics.record(rows_in, rows_out, started.elapsed().as_micros() as u64);
         if let Some(view) = result {
-            self.next.push(view)?;
+            self.next.push(view).await?;
         }
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         let metrics = std::mem::take(&mut self.metrics);
         if metrics.chunks > 0 {
             tracing::debug!(target: "vein.audit", event = "expression_executor_finished",
@@ -117,7 +118,7 @@ where
                 rows_out = metrics.rows_out, eval_us = metrics.elapsed_us,
                 "expression executor completed");
         }
-        self.next.flush()
+        self.next.flush().await
     }
 
     fn finished(&self) -> bool {

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use super::support::{equality, inner_join, scan_with_statistics, test_column};
 use super::super::{DefaultPipelineStageBuilder, PipelineStageBuilder};
+use super::support::{equality, inner_join, scan_with_statistics, test_column};
 use common::protocol::{JoinOutput, PhysicalPlanNode, PhysicalPlanOperator};
 use optimizer::{JoinOrderOutcome, OptimizerPipeline};
 use plan::{LogicalExpr, LogicalPlan, VeinSchema};
@@ -51,6 +51,7 @@ fn cost_reordered_join_refreshes_pruned_scan_lineage_before_lowering() {
 
 fn assert_join_output_lineage(node: &PhysicalPlanNode) -> usize {
     match &node.operator {
+        PhysicalPlanOperator::Extension { inputs, .. } => inputs.iter().map(|input| assert_join_output_lineage(input)).sum(),
         PhysicalPlanOperator::Join { probe, build, plan } => {
             assert_eq!(node.output_schema.fields.len(), plan.outputs.len());
             for (output_field, source) in node.output_schema.fields.iter().zip(&plan.outputs) {

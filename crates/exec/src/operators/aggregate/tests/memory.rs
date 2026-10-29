@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn estimated_group_count_reserves_index_before_accumulation() {
+#[tokio::test]
+async fn estimated_group_count_reserves_index_before_accumulation() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: Some(4),
@@ -21,12 +21,12 @@ fn estimated_group_count_reserves_index_before_accumulation() {
         .expect("accumulate groups");
 
     assert_eq!(sink.metrics().group_index_capacity_growth_events, 0);
-    let output = sink.finish().expect("finish aggregate");
+    let output = sink.finish().await.expect("finish aggregate");
     assert_eq!(output[0].num_rows(), 4);
 }
 
-#[test]
-fn first_batch_candidate_bound_reserves_index_without_group_estimate() {
+#[tokio::test]
+async fn first_batch_candidate_bound_reserves_index_without_group_estimate() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -49,7 +49,7 @@ fn first_batch_candidate_bound_reserves_index_without_group_estimate() {
     assert_eq!(metrics.group_index_capacity_growth_events, 0);
     assert_eq!(metrics.new_groups, 4);
 
-    let output = sink.finish().expect("finish aggregate");
+    let output = sink.finish().await.expect("finish aggregate");
     assert_eq!(output[0].num_rows(), 4);
 }
 

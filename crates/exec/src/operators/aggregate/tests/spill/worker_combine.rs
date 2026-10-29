@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn worker_local_aggregate_states_combine_null_and_repeated_keys_without_copying_keys() {
+#[tokio::test]
+async fn worker_local_aggregate_states_combine_null_and_repeated_keys_without_copying_keys() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -30,13 +30,13 @@ fn worker_local_aggregate_states_combine_null_and_repeated_keys_without_copying_
             Arc::clone(&first_keys) as ArrayRef,
             Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
         ]))
-        .expect("accumulate first worker batch");
+        .await.expect("accumulate first worker batch");
     second
         .push(crate::pipeline::test_support::dense_view(vec![
             Arc::clone(&second_keys) as ArrayRef,
             Arc::new(Int64Array::from(vec![30, 40])) as ArrayRef,
         ]))
-        .expect("accumulate second worker batch");
+        .await.expect("accumulate second worker batch");
     first
         .combine_local(canonical.as_mut())
         .expect("combine first aggregate state");
@@ -63,7 +63,7 @@ fn worker_local_aggregate_states_combine_null_and_repeated_keys_without_copying_
         "combining group state retains the original Arrow key buffers"
     );
 
-    let output = aggregate.finish().expect("finish combined aggregate");
+    let output = aggregate.finish().await.expect("finish combined aggregate");
     let mut counts = std::collections::BTreeMap::new();
     for batch in output {
         let keys = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 0);

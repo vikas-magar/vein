@@ -4,10 +4,10 @@ use super::*;
 use crate::pipeline::view::{DerivedColumnBuilder, ViewColumn, ViewMemoryLease};
 
 impl AggregateSink {
-    pub(super) fn finish_in_memory_view_with(
+    pub(super) async fn finish_in_memory_view_with(
         &mut self,
         batch_rows: NonZeroUsize,
-        emit: &mut impl FnMut(DataChunkView) -> Result<()>,
+        emit: &mut impl crate::pipeline::delivery::BatchConsumer,
     ) -> Result<()> {
         self.ensure_empty_groups()?;
         let started = Instant::now();
@@ -29,7 +29,7 @@ impl AggregateSink {
                 columns,
                 SelectionVector::new_dense(range.len()),
             )?;
-            emit(output)?;
+            emit.consume(output).await?;
         }
         self.metrics.output_materialize_ns = self
             .metrics

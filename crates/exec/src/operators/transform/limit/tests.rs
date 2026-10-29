@@ -6,21 +6,22 @@ use crate::pipeline::{DataChunkView, RowMapping, SourceRow, ViewColumn};
 use std::sync::{Arc, Mutex};
 
 struct TestCollector(Arc<Mutex<Vec<u32>>>);
+#[async_trait::async_trait]
 impl PipelineNode for TestCollector {
-    fn push(&mut self, chunk: DataChunkView) -> Result<()> {
+    async fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         let mut out = self.0.lock().unwrap();
         for i in 0..chunk.selection().size() {
             out.push(chunk.selection().get_index(i) as u32);
         }
         Ok(())
     }
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }
 
-#[test]
-fn test_limit_single_chunk() {
+#[tokio::test]
+async fn test_limit_single_chunk() {
     let collected = Arc::new(Mutex::new(Vec::new()));
     let sink = Box::new(TestCollector(collected.clone()));
     let mut limit = LimitTransform::new(2, 3, sink);
@@ -29,15 +30,15 @@ fn test_limit_single_chunk() {
     let chunk = DataChunkView::from_arrays(vec![array], 7, SelectionVector::new_dense(7))
         .expect("view from arrays");
 
-    limit.push(chunk).unwrap();
+    limit.push(chunk).await.unwrap();
 
     let out = collected.lock().unwrap().clone();
     // Offset 2, count 3: indices [2, 3, 4]
     assert_eq!(out, vec![2, 3, 4]);
 }
 
-#[test]
-fn test_limit_spanning_multiple_chunks() {
+#[tokio::test]
+async fn test_limit_spanning_multiple_chunks() {
     let collected = Arc::new(Mutex::new(Vec::new()));
     let sink = Box::new(TestCollector(collected.clone()));
     // Offset 3, Count 4 across chunks of size 3
@@ -50,7 +51,7 @@ fn test_limit_spanning_multiple_chunks() {
         SelectionVector::new_dense(3),
     )
     .expect("view from arrays");
-    limit.push(c1).unwrap();
+    limit.push(c1).await.unwrap();
     assert!(collected.lock().unwrap().is_empty());
 
     // Chunk 2: indices [0, 1, 2] (all 3 taken)
@@ -60,7 +61,7 @@ fn test_limit_spanning_multiple_chunks() {
         SelectionVector::new_dense(3),
     )
     .expect("view from arrays");
-    limit.push(c2).unwrap();
+    limit.push(c2).await.unwrap();
     assert_eq!(collected.lock().unwrap().len(), 3);
 
     // Chunk 3: indices [0, 1, 2] (only 1 taken to reach count = 4)
@@ -70,14 +71,15 @@ fn test_limit_spanning_multiple_chunks() {
         SelectionVector::new_dense(3),
     )
     .expect("view from arrays");
-    limit.push(c3).unwrap();
+    limit.push(c3).await.unwrap();
     assert_eq!(collected.lock().unwrap().len(), 4);
 }
 
 struct ViewCollector(Arc<Mutex<Option<DataChunkView>>>, arrow::array::ArrayRef);
 
+#[async_trait::async_trait]
 impl PipelineNode for ViewCollector {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         assert_eq!(view.num_rows(), 1);
         let (array, physical_row) = view.resolve(0, 0)?.expect("selected value");
         assert!(Arc::ptr_eq(array, &self.1));
@@ -86,13 +88,13 @@ impl PipelineNode for ViewCollector {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }
 
-#[test]
-fn limit_preserves_reference_backed_view_and_slices_only_selection() {
+#[tokio::test]
+async fn limit_preserves_reference_backed_view_and_slices_only_selection() {
     let source = Arc::new(Int64Array::from(vec![10, 20, 30, 40])) as arrow::array::ArrayRef;
     let mapping = Arc::new(
         RowMapping::new(
@@ -119,7 +121,7 @@ fn limit_preserves_reference_backed_view_and_slices_only_selection() {
 
     limit
         .push(view)
-        .expect("limit should forward selected view rows");
+        .await.expect("limit should forward selected view rows");
 
     let output = output.lock().unwrap();
     let Some(view) = output.as_ref() else {

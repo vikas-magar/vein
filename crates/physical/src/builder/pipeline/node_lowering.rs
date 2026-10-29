@@ -3,11 +3,11 @@ use std::sync::Arc;
 use common::Result;
 use common::protocol::{LimitSpec, PhysicalPlanNode, PhysicalPlanOperator};
 use error::VeinError;
-use plan::schema::VeinSchema;
 use plan::LogicalPlan;
+use plan::schema::VeinSchema;
 
 use super::{
-    DefaultPipelineStageBuilder, PipelineCompiler, PipelineStageBuilder, logical_node_name,
+    DefaultPipelineStageBuilder, PipelineCompiler, PipelineStageBuilder,
 };
 
 impl DefaultPipelineStageBuilder {
@@ -169,13 +169,7 @@ impl DefaultPipelineStageBuilder {
                     (*output_schema).clone(),
                 ))
             }
-            _ => Err(VeinError::unsupported(
-                format!(
-                    "logical operator '{}' is not supported by recursive physical lowering",
-                    logical_node_name(plan)
-                ),
-                None,
-            )),
+            _ => self.lower_registered_extension(plan),
         }
     }
 }

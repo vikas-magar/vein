@@ -6,7 +6,7 @@
 mod array;
 
 use std::mem::size_of;
-use std::time::Instant;
+use common::time::Instant;
 
 use common::Result;
 use error::VeinError;

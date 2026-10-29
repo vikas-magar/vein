@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 use crate::memory::{MemoryReservation, QueryMemoryTracker};
 use crate::spill::{IpcRunWriter, SpillRun, SpillStream};
@@ -270,7 +270,7 @@ impl SortTransform {
         })
     }
 
-    fn sort_and_emit(&mut self) -> Result<()> {
+    async fn sort_and_emit(&mut self) -> Result<()> {
         let order = if let Some(top_n) = self.top_n.as_mut() {
             let started = Instant::now();
             let mut ordering = ViewRowOrder::new(&self.plan, self.tracker.clone())?;
@@ -299,7 +299,7 @@ impl SortTransform {
         };
         self.metrics.output_rows = order.len() as u64;
         let emit_started = Instant::now();
-        let result = self.emit_rows(order);
+        let result = self.emit_rows(order).await;
         self.metrics.emit_us = self
             .metrics
             .emit_us
@@ -365,7 +365,7 @@ impl SortTransform {
         Ok(order)
     }
 
-    fn emit_rows(&mut self, order: Vec<RowRef>) -> Result<()> {
+    async fn emit_rows(&mut self, order: Vec<RowRef>) -> Result<()> {
         let Some(first_row) = order.first() else {
             return Ok(());
         };
@@ -403,7 +403,7 @@ impl SortTransform {
                 &inputs,
                 &indices,
                 output_columns,
-            )?)?;
+            )?).await?;
         }
         Ok(())
     }
@@ -523,7 +523,7 @@ impl SortTransform {
         result
     }
 
-    fn spill_merged_group(&mut self, paths: &[SpillRun]) -> Result<SpillRun> {
+    async fn spill_merged_group(&mut self, paths: &[SpillRun]) -> Result<SpillRun> {
         let schema = self
             .spill_schema
             .as_ref()
@@ -544,7 +544,7 @@ impl SortTransform {
                     .write_view(&view, "write merged sort batch")
                     .map(|_| ())
             },
-        )?;
+        ).await?;
         let output = writer.finish("finish merged sort run")?;
         let run = pending.commit(output)?;
         let bytes = run.bytes();
@@ -553,7 +553,7 @@ impl SortTransform {
         Ok(run)
     }
 
-    fn merge_spill_runs(&mut self) -> Result<()> {
+    async fn merge_spill_runs(&mut self) -> Result<()> {
         if self.spill_runs.is_empty() {
             return Ok(());
         }
@@ -565,7 +565,7 @@ impl SortTransform {
                     next_pass.push(group[0].clone());
                     continue;
                 }
-                let merged = self.spill_merged_group(group)?;
+                let merged = self.spill_merged_group(group).await?;
                 next_pass.push(merged);
             }
             runs = next_pass;
@@ -585,20 +585,15 @@ impl SortTransform {
             ));
         }
         let plan = self.plan.clone();
-        let next = &mut self.next;
-        let mut output_rows = 0u64;
+        let output = crate::pipeline::delivery::PipelineConsumer(self.next.as_mut());
         merge_spill_group(
             &runs,
             &plan,
             output_columns,
             &self.tracker,
             &mut self.metrics,
-            |view| {
-                output_rows = output_rows.saturating_add(view.num_rows() as u64);
-                next.push(view)
-            },
-        )?;
-        self.metrics.output_rows = output_rows;
+            output,
+        ).await?;
         Ok(())
     }
 
@@ -792,13 +787,13 @@ fn view_from_spill_batch(
 /// Merge at most `SPILL_MERGE_FAN_IN` sorted IPC runs and pass bounded batches
 /// of reference-backed rows to the caller. The callback either writes an
 /// intermediate run or forwards the final views downstream.
-fn merge_spill_group(
+async fn merge_spill_group(
     paths: &[SpillRun],
     plan: &SortPlan,
     output_columns: usize,
     tracker: &QueryMemoryTracker,
     metrics: &mut SortMetrics,
-    mut consume: impl FnMut(DataChunkView) -> Result<()>,
+    mut consume: impl crate::pipeline::delivery::BatchConsumer,
 ) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
@@ -932,7 +927,7 @@ fn merge_spill_group(
         if rows.len() == OUTPUT_BATCH_ROWS {
             let inputs = snapshots.iter().collect::<Vec<_>>();
             let output = DataChunkView::compose_rows(&inputs, &rows, output_columns)?;
-            consume(output)?;
+            consume.consume(output).await?;
             rows.clear();
             snapshots.clear();
             for cursor in &mut cursors {
@@ -946,7 +941,7 @@ fn merge_spill_group(
     if !rows.is_empty() {
         let inputs = snapshots.iter().collect::<Vec<_>>();
         let output = DataChunkView::compose_rows(&inputs, &rows, output_columns)?;
-        consume(output)?;
+        consume.consume(output).await?;
     }
     metrics.row_comparisons = metrics
         .row_comparisons
@@ -974,8 +969,9 @@ fn compare_spill_rows(
         .map(|ordering| ordering.then_with(|| left.chunk.cmp(&right.chunk)).then_with(|| left.row.cmp(&right.row)))
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for SortTransform {
-    fn push(&mut self, chunk: DataChunkView) -> Result<()> {
+    async fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         if self.top_n.is_some() {
             self.push_top_n(chunk)
         } else if self.spilling {
@@ -1026,11 +1022,11 @@ impl PipelineNode for SortTransform {
         }
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         if self.spilling {
-            self.merge_spill_runs()?;
+            self.merge_spill_runs().await?;
         } else {
-            self.sort_and_emit()?;
+            self.sort_and_emit().await?;
         }
         tracing::info!(
             target: "vein.audit",
@@ -1066,7 +1062,7 @@ impl PipelineNode for SortTransform {
         self.chunks.clear();
         self.chunk_reservations.clear();
         self.top_n_references.clear();
-        self.next.flush()
+        self.next.flush().await
     }
 
     fn finished(&self) -> bool {

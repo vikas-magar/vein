@@ -2,7 +2,7 @@
 use super::*;
 
 impl HashJoin {
-    pub(super) fn filter_residual_matches(
+    pub(super) async fn filter_residual_matches(
         &mut self, probe: &DataChunkView, matches: &mut Vec<JoinMatch>,
     ) -> Result<u64> {
         if matches.is_empty() { return Ok(0); }
@@ -23,7 +23,7 @@ impl HashJoin {
         let started = Instant::now();
         self.residual_transform.as_mut()
             .ok_or_else(|| VeinError::internal("join residual transform is missing"))?
-            .push(candidate)?;
+            .push(candidate).await?;
         let elapsed = started.elapsed().as_micros() as u64;
         let filtered = output.take()?;
         if let Some(filtered) = filtered {

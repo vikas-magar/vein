@@ -47,7 +47,7 @@ impl Source for TrackedFileSource {
             .view
             .take()
             .ok_or_else(|| VeinError::internal("synthetic source view already consumed"))?;
-        next.push(view)
+        next.push(view).await
     }
 }
 

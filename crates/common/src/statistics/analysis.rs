@@ -92,7 +92,7 @@ where
         ));
     }
 
-    let started = std::time::Instant::now();
+    let started = crate::time::Instant::now();
     let mut snapshot = provider
         .open_analysis(table_name, config.scan_batch_size)
         .await?;

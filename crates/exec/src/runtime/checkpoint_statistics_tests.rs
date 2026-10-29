@@ -35,8 +35,8 @@ async fn checkpoint_synopses_follow_mapped_rows_null_extensions_and_column_ident
     let tracker = QueryMemoryTracker::new(1 << 20, CancellationToken::new());
     let relation = IntermediateRelation::new(arrow, tracker.clone());
     let mut sink = relation.sink();
-    sink.push(mapped).unwrap();
-    sink.flush().unwrap();
+    sink.push(mapped).await.unwrap();
+    sink.flush().await.unwrap();
     let retained = tracker.used();
     let stats = relation.collect_statistics(logical).await.unwrap();
     assert_eq!(stats.num_rows, Some(4));
@@ -71,9 +71,9 @@ async fn parallel_checkpoint_statistics_merge_batches_without_copying_arrays() {
                 Arc::new(Int64Array::from(vec![Some(1), Some(2), None, Some(2)])),
                 Arc::new(Int64Array::from(vec![Some(10), Some(20), None, Some(20)])),
             ],
-        ).unwrap()).unwrap()).unwrap();
+        ).unwrap()).unwrap()).await.unwrap();
     }
-    sink.flush().unwrap();
+    sink.flush().await.unwrap();
     let retained_bytes = tracker.used();
     let mut source = relation.source().unwrap();
     let statistics_schema = super::statistics::statistics_schema(&relation, &logical).unwrap();
@@ -105,7 +105,7 @@ async fn empty_checkpoint_produces_typed_zero_population_and_rejects_wrong_schem
     let relation = IntermediateRelation::new(Arc::new(logical.to_arrow()),
                                              QueryMemoryTracker::new(1 << 20, CancellationToken::new()));
     assert!(relation.collect_statistics(Arc::clone(&logical)).await.is_err());
-    relation.sink().flush().unwrap();
+    relation.sink().flush().await.unwrap();
     let stats = relation.collect_statistics(logical).await.unwrap();
     assert_eq!(stats.num_rows, Some(0));
     assert_eq!(stats.column_statistics.len(), 2);
@@ -123,8 +123,8 @@ async fn spilled_checkpoint_synopses_cover_the_complete_population() {
     sink.push(crate::pipeline::arrow_adapter::from_record_batch(RecordBatch::try_new(arrow, vec![
         Arc::new(Int64Array::from(vec![Some(5), None, Some(8)])),
         Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2)])),
-    ]).unwrap()).unwrap()).unwrap();
-    sink.flush().unwrap();
+    ]).unwrap()).unwrap()).await.unwrap();
+    sink.flush().await.unwrap();
     let stats = relation.collect_statistics(logical).await.unwrap();
     assert_eq!(stats.num_rows, Some(3));
     assert_eq!(stats.column_statistics["11"].null_count, Some(1));
@@ -141,8 +141,8 @@ async fn cancelled_checkpoint_statistics_stop_without_publishing_partial_results
     let mut sink = relation.sink();
     sink.push(crate::pipeline::arrow_adapter::from_record_batch(RecordBatch::try_new(arrow, vec![
         Arc::new(Int64Array::from(vec![1])), Arc::new(Int64Array::from(vec![2])),
-    ]).unwrap()).unwrap()).unwrap();
-    sink.flush().unwrap();
+    ]).unwrap()).unwrap()).await.unwrap();
+    sink.flush().await.unwrap();
     cancel.cancel();
     assert!(relation.collect_statistics(logical).await.is_err());
 }

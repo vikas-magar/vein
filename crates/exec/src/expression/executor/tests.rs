@@ -17,13 +17,14 @@ use functions::FunctionRegistry;
 #[derive(Clone)]
 struct Capture(Arc<Mutex<Vec<DataChunkView>>>);
 
+#[async_trait::async_trait]
 impl PipelineNode for Capture {
-    fn push(&mut self, batch: DataChunkView) -> common::Result<()> {
+    async fn push(&mut self, batch: DataChunkView) -> common::Result<()> {
         self.0.lock().unwrap().push(batch);
         Ok(())
     }
 
-    fn flush(&mut self) -> common::Result<()> {
+    async fn flush(&mut self) -> common::Result<()> {
         Ok(())
     }
 }
@@ -46,7 +47,7 @@ fn input() -> (DataChunkView, ArrayRef) {
     (crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap(), source)
 }
 
-fn run(program: ExpressionProgram, batch: DataChunkView) -> Vec<DataChunkView> {
+async fn run(program: ExpressionProgram, batch: DataChunkView) -> Vec<DataChunkView> {
     let output = Arc::new(Mutex::new(Vec::new()));
     let next = Capture(Arc::clone(&output));
     let mut executor = ExpressionExecutor::new(
@@ -55,12 +56,12 @@ fn run(program: ExpressionProgram, batch: DataChunkView) -> Vec<DataChunkView> {
         Arc::new(FunctionRegistry::new()),
         Box::new(next),
     );
-    executor.push(batch).unwrap();
+    executor.push(batch).await.unwrap();
     std::mem::take(&mut *output.lock().unwrap())
 }
 
-#[test]
-fn direct_projection_keeps_source_arrow_buffer_and_computes_only_new_result() {
+#[tokio::test]
+async fn direct_projection_keeps_source_arrow_buffer_and_computes_only_new_result() {
     let (batch, source) = input();
     let computed = PhysicalExpr {
         kind: ExprKind::Binary {
@@ -76,6 +77,7 @@ fn direct_projection_keeps_source_arrow_buffer_and_computes_only_new_result() {
         },
         batch,
     );
+    let output = output.await;
     let [view] = output.as_slice() else { panic!("expected one projected view") };
 
     assert!(Arc::ptr_eq(
@@ -86,8 +88,8 @@ fn direct_projection_keeps_source_arrow_buffer_and_computes_only_new_result() {
     assert_eq!(result.as_any().downcast_ref::<Int64Array>().unwrap().values(), &[11, 12, 13]);
 }
 
-#[test]
-fn filter_updates_only_selection_and_projection_preserves_source_mapping() {
+#[tokio::test]
+async fn filter_updates_only_selection_and_projection_preserves_source_mapping() {
     let (batch, source) = input();
     let predicate = PhysicalExpr {
         kind: ExprKind::Binary {
@@ -106,6 +108,7 @@ fn filter_updates_only_selection_and_projection_preserves_source_mapping() {
         },
         batch,
     );
+    let output = output.await;
     let [view] = output.as_slice() else { panic!("expected one filtered view") };
 
     assert_eq!(view.num_rows(), 2);
@@ -113,8 +116,8 @@ fn filter_updates_only_selection_and_projection_preserves_source_mapping() {
     assert_eq!(view.selection().contiguous_range(), Some(0..2));
 }
 
-#[test]
-fn all_true_filter_does_not_allocate_a_sparse_selection() {
+#[tokio::test]
+async fn all_true_filter_does_not_allocate_a_sparse_selection() {
     let (mut batch, _) = input();
     batch = batch.with_selection(SelectionVector::new_dense(3)).unwrap();
     let predicate = PhysicalExpr {
@@ -129,6 +132,7 @@ fn all_true_filter_does_not_allocate_a_sparse_selection() {
         ExpressionProgram { steps: vec![ExpressionStep::Filter(predicate)] },
         batch,
     );
+    let output = output.await;
     let [view] = output.as_slice() else { panic!("expected one filtered view") };
     assert_eq!(view.selection().contiguous_range(), Some(0..3));
 }

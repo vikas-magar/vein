@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use common::time::Instant;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -85,7 +86,7 @@ pub(super) fn thread_cpu_time() -> Duration {
 
 /// Reports zero where the platform has no portable per-thread CPU clock.
 #[cfg(not(unix))]
-fn thread_cpu_time() -> Duration {
+pub(super) fn thread_cpu_time() -> Duration {
     Duration::ZERO
 }
 

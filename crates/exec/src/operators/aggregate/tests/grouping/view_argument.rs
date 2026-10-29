@@ -10,8 +10,8 @@ use crate::operators::aggregate::input_batch::AggregateColumn;
 
 use super::*;
 
-#[test]
-fn aggregate_view_reads_mapped_arguments_from_original_arrow_buffers() {
+#[tokio::test]
+async fn aggregate_view_reads_mapped_arguments_from_original_arrow_buffers() {
     let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 1, 2, 2]));
     let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30, 40]));
     let key_view = crate::pipeline::test_support::dense_view(vec![Arc::clone(&keys)]);
@@ -61,7 +61,7 @@ fn aggregate_view_reads_mapped_arguments_from_original_arrow_buffers() {
 
     let rows = sink
         .finish()
-        .expect("finish")
+        .await.expect("finish")
         .into_iter()
         .flat_map(|batch| {
             let keys = materialized_column::<Int64Array>(&batch, 0);

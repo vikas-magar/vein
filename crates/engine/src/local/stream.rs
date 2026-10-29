@@ -22,26 +22,25 @@ impl LocalQuery {
             let LocalQuery {
                 tasks: initial_tasks,
                 executor,
-                statistics_context,
+                scope,
                 logical_plan,
                 adaptive_checkpoint,
                 adaptive_policy,
                 optimizer,
                 planner,
-                request_id,
-                query_id,
                 ..
             } = self;
+            scope.resources().begin_query();
             let mut adaptive_execution = adaptive::AdaptiveCoordinator {
                 executor: Arc::clone(&executor), optimizer, planner, policy: adaptive_policy,
-                statistics: Arc::clone(&statistics_context), request_id, query_id,
-            }.execute(initial_tasks, logical_plan, adaptive_checkpoint).await;
+            }.execute(initial_tasks, logical_plan, adaptive_checkpoint, scope).await;
             let tasks = std::mem::take(&mut adaptive_execution.tasks);
-            let query_resources = adaptive_execution.resources.clone();
+            let query_resources = Arc::clone(adaptive_execution.scope.resources());
 
             let tasks = Arc::new(tasks);
             let task_count = tasks.len();
             if task_count == 0 {
+                query_resources.finish_query(None);
                 return;
             }
 
@@ -87,7 +86,7 @@ impl LocalQuery {
                 let senders = Arc::clone(&senders);
                 let outcomes = Arc::clone(&outcomes);
                 let query_resources = query_resources.clone();
-                tokio::spawn(async move {
+                common::runtime::spawn(async move {
                     run_task(&executor, &tasks[0], &senders, &outcomes, 0, query_resources).await;
                 });
             } else {
@@ -102,7 +101,7 @@ impl LocalQuery {
                     let outcomes = Arc::clone(&outcomes);
                     let query_resources = query_resources.clone();
                     let next = Arc::clone(&next);
-                    tokio::spawn(async move {
+                    common::runtime::spawn(async move {
                         let mut index = worker;
                         loop {
                             run_task(&executor, &tasks[index], &senders, &outcomes, index, query_resources.clone()).await;
@@ -126,17 +125,20 @@ impl LocalQuery {
                 match outcome {
                     Some(Ok(())) => {}
                     Some(Err(error)) => {
+                        let error = VeinError::from_shared(query_resources.fail_query(error));
                         yield Err(error);
                         return;
                     }
                     None => {
-                        yield Err(VeinError::internal(
+                        let error = query_resources.fail_query(VeinError::internal(
                             "task worker stopped without reporting an outcome",
                         ));
+                        yield Err(VeinError::from_shared(error));
                         return;
                     }
                 }
             }
+            query_resources.finish_query(None);
         })
     }
 }

@@ -23,7 +23,7 @@ use super::{ScanProvider, ScanRequest, ScanWorkerState};
 pub struct ScanFile {
     /// Path relative to the storage handle's root.
     pub relative: String,
-    /// Local path used by the selected reader backend when required.
+    /// Local path used by native readers; empty for non-local storage objects.
     pub absolute: PathBuf,
     /// Catalog-observed storage version for cache-safe metadata reuse.
     pub storage_metadata: Option<StorageFileMetadata>,
@@ -122,7 +122,7 @@ impl Source for ScanSource {
                 next,
             )
             .await?;
-        next.flush()
+        next.flush().await
     }
 
     fn bytes_read(&self) -> u64 {

@@ -1,4 +1,5 @@
 //! Arrow-compatible row selection metadata shared by columnar execution views.
+use std::mem::size_of;
 
 /// A mask indicating which physical row indices in a source array are active.
 #[derive(Debug, Clone)]
@@ -42,6 +43,11 @@ impl SelectionVector {
     /// Number of currently selected rows.
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Heap bytes retained by sparse selection indices, including spare capacity.
+    pub fn retained_bytes(&self) -> usize {
+        self.indices.as_ref().map_or(0, |indices| indices.capacity() * size_of::<u32>())
     }
 
     /// Returns the active physical rows as a contiguous range, when possible.

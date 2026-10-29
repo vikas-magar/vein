@@ -1,5 +1,5 @@
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use common::time::Instant;
 
 use common::protocol::RuntimeStatisticsScan;
 use common::statistics::RuntimeStatisticsStore;

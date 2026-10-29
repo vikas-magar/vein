@@ -60,3 +60,6 @@ approval_mode = "approve"
 
 [mcp_servers.rustrover.tools.xdebug_get_debugger_status]
 approval_mode = "approve"
+
+[mcp_servers.rustrover.tools.xdebug_attach_to_process]
+approval_mode = "approve"

@@ -6,7 +6,7 @@ use arrow::ipc::reader::StreamReader;
 use common::Result;
 use common::protocol::StorageTarget;
 use error::VeinError;
-use std::time::Instant;
+use common::time::Instant;
 use tracing::info;
 
 use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode, Sink};
@@ -91,8 +91,9 @@ impl WriteSink {
     }
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for WriteSink {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         if view.is_empty() {
             return Ok(());
         }
@@ -114,7 +115,7 @@ impl PipelineNode for WriteSink {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         if self.receipt.is_none() {
             let transaction = self.transaction.take()
                 .ok_or_else(|| VeinError::internal("storage transaction already completed"))?;

@@ -56,7 +56,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, wasm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -77,3 +77,38 @@ jobs:
           --title "$GITHUB_REF_NAME"
           release-assets/*.tar.gz
           release-assets/*.sha256
+
+  wasm:
+    name: Build browser package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Install Rust and WebAssembly target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Build browser engine
+        run: cargo build --locked --release --target wasm32-unknown-unknown -p vein-wasm
+      - name: Install matching wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Generate JavaScript bindings
+        run: >-
+          wasm-bindgen target/wasm32-unknown-unknown/release/vein_wasm.wasm
+          --target web --out-dir dist/vein-wasm-web --out-name vein_wasm
+      - name: Package browser runtime
+        run: |
+          archive="vein-wasm-web.tar.gz"
+          tar -C dist -czf "$archive" vein-wasm-web
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - name: Upload browser release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-wasm-web
+          path: |
+            vein-wasm-web.tar.gz
+            vein-wasm-web.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1

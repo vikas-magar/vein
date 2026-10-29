@@ -5,7 +5,7 @@ use crate::pipeline::{DataChunkView, MaterializationReport};
 use common::Result;
 use error::VeinError;
 use std::mem::size_of;
-use std::time::Instant;
+use common::time::Instant;
 
 pub(crate) mod control;
 pub(crate) mod metrics;

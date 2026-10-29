@@ -40,6 +40,6 @@ impl ScanProvider for StatefulProvider {
             .or_default().push(count);
         let view = DataChunkView::from_dense_arrays(vec![Arc::new(Int64Array::from(vec![1]))])?
             .with_schema(Arc::new(request.projected.to_arrow()))?;
-        next.push(view)
+        next.push(view).await
     }
 }

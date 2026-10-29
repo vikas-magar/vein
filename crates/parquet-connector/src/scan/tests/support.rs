@@ -163,8 +163,9 @@ impl RuntimeFilter for KeepIds {
 #[derive(Default)]
 pub(super) struct Int64Collector(pub(super) Vec<i64>);
 
+#[async_trait::async_trait]
 impl PipelineNode for Int64Collector {
-    fn push(&mut self, chunk: DataChunkView) -> Result<()> {
+    async fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         let column = chunk.materialize_column(0)?;
         let values = column
             .as_any()
@@ -178,7 +179,7 @@ impl PipelineNode for Int64Collector {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }
@@ -186,13 +187,14 @@ impl PipelineNode for Int64Collector {
 #[derive(Default)]
 pub(super) struct ArrayTypeSink(pub(super) Option<DataType>);
 
+#[async_trait::async_trait]
 impl PipelineNode for ArrayTypeSink {
-    fn push(&mut self, batch: DataChunkView) -> Result<()> {
+    async fn push(&mut self, batch: DataChunkView) -> Result<()> {
         self.0 = Some(batch.materialize_column(0)?.data_type().clone());
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }

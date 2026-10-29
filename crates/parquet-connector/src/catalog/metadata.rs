@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 use catalog::MetadataStore;
 use common::Result;

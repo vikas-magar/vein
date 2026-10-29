@@ -1,0 +1,21 @@
+.ide-dock { position: relative; min-width: 0; min-height: 0; overflow: hidden;
+  --color-background: var(--page); --color-text: var(--ink); --color-1: var(--page);
+  --color-2: var(--panel); --color-3: var(--panel-raised); --color-4: var(--line);
+  --color-5: var(--line-strong); --color-6: var(--subtle);
+  --font-size: 12px; --font-family: var(--sans); --ide-tab-height: 28px;
+}
+.ide-dock .flexlayout__layout { background: var(--page); }
+.ide-dock .flexlayout__tab { background: var(--page); color: var(--ink); }
+.ide-dock .flexlayout__tabset_tabbar_outer { background: var(--panel); border: 0; border-bottom: 1px solid var(--line); }
+.ide-dock .flexlayout__tab_button { height: var(--ide-tab-height); align-items: center; padding: 0 10px; border-radius: 0; border: 0; color: var(--muted); background: transparent; font-size: 12px; }
+.ide-dock .flexlayout__border_button { min-height: var(--ide-tab-height); padding: 4px 8px; font-size: 12px; }
+.ide-dock .flexlayout__tab_button--selected { background: var(--page); color: var(--ink); box-shadow: inset 0 -2px var(--accent); }
+.ide-dock .flexlayout__tab_button:hover { background: var(--panel-hover); }
+.ide-dock .flexlayout__splitter { background: var(--panel); border-inline: 1px solid var(--line); }
+.ide-dock .flexlayout__splitter:hover, .ide-dock .flexlayout__splitter_drag { background: var(--accent-soft); }
+.ide-dock .flexlayout__tabset_header { color: var(--muted); background: var(--panel); }
+.ide-dock .flexlayout__tab_toolbar_button { color: var(--muted); }
+.ide-dock .flexlayout__tab_button_trailing { opacity: .6; }
+.ide-dock .flexlayout__tabset-selected { background: var(--panel); }
+.ide-new-tab { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; background: transparent; border: 0; border-radius: 4px; color: var(--muted); cursor: pointer; font-size: 19px; }
+.ide-new-tab:hover { background: var(--panel-hover); color: var(--ink); }

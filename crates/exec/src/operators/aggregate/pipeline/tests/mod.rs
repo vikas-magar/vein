@@ -17,8 +17,8 @@ fn plan(estimate: Option<u64>) -> AggregatePlan {
     }
 }
 
-#[test]
-fn worker_fork_does_not_reserve_the_global_cardinality_again() {
+#[tokio::test]
+async fn worker_fork_does_not_reserve_the_global_cardinality_again() {
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
     let (shared, mut canonical) =
         shared_with_memory_tracker(plan(Some(1_000_000)), tracker.clone()).unwrap();
@@ -52,8 +52,8 @@ fn worker_fork_does_not_reserve_the_global_cardinality_again() {
     assert_eq!(tracker.used(), 0);
 }
 
-#[test]
-fn local_tables_grow_and_combine_without_copying_group_keys() {
+#[tokio::test]
+async fn local_tables_grow_and_combine_without_copying_group_keys() {
     let (shared, mut canonical) = shared(plan(Some(1_000_000))).unwrap();
     let source: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 10]));
     for _ in 0..2 {
@@ -70,7 +70,7 @@ fn local_tables_grow_and_combine_without_copying_group_keys() {
                 )
                 .unwrap(),
             )
-            .unwrap();
+            .await.unwrap();
         let local = worker
             .as_any_mut()
             .downcast_mut::<LocalAggregateHandle>()
@@ -80,7 +80,7 @@ fn local_tables_grow_and_combine_without_copying_group_keys() {
         worker.combine_local(canonical.as_mut()).unwrap();
     }
     let mut state = shared.lock().unwrap();
-    let batches = state.finish().unwrap();
+    let batches = state.finish().await.unwrap();
     let mut rows = Vec::new();
     for batch in batches {
         for row in 0..batch.num_rows() {

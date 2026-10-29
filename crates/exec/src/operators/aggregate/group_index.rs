@@ -1,4 +1,4 @@
-use std::time::Instant;
+use common::time::Instant;
 
 use common::Result;
 use error::VeinError;

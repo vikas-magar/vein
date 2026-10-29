@@ -82,13 +82,14 @@ mod tests {
     #[derive(Clone, Default)]
     struct Collect(Arc<Mutex<Vec<DataChunkView>>>);
 
+    #[async_trait::async_trait]
     impl PipelineNode for Collect {
-        fn push(&mut self, chunk: DataChunkView) -> Result<(), error::VeinError> {
+        async fn push(&mut self, chunk: DataChunkView) -> Result<(), error::VeinError> {
             self.0.lock().expect("collect lock").push(chunk);
             Ok(())
         }
 
-        fn flush(&mut self) -> Result<(), error::VeinError> {
+        async fn flush(&mut self) -> Result<(), error::VeinError> {
             Ok(())
         }
     }
@@ -110,8 +111,8 @@ mod tests {
     /// The key sits at column 1 on the build side and column 0 on the probe, so
     /// this also proves the two sides' key positions travel through the spec
     /// rather than being assumed equal.
-    #[test]
-    fn a_spec_builds_a_working_join() {
+    #[tokio::test]
+    async fn a_spec_builds_a_working_join() {
         let spec = JoinSpec {
             probe_keys: JoinKeys::new(vec![0]),
             build_keys: JoinKeys::new(vec![1]),
@@ -127,15 +128,15 @@ mod tests {
                 ints(&[100, 200]),
                 ints(&[7, 8]),
             ]))
-            .expect("build");
+            .await.expect("build");
         let table = build.finish();
 
         let sink = Collect::default();
         let mut probe = spec.into_probe(Arc::new(table), Box::new(sink.clone()));
         probe
             .push(crate::pipeline::test_support::dense_view(vec![ints(&[8])]))
-            .expect("probe");
-        probe.flush().expect("flush");
+            .await.expect("probe");
+        probe.flush().await.expect("flush");
 
         let chunks = sink.0.lock().expect("collect lock");
         let probe_side: Vec<Option<i64>> = chunks.iter().flat_map(|c| cells(c, 0)).collect();

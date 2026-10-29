@@ -14,7 +14,7 @@
 
 use std::cell::Cell;
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 use common::statistics::QueryStatisticsContext;
 use error::{Result, VeinError};

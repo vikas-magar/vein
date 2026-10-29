@@ -10,7 +10,7 @@ use super::{OpenDalReadStorage, storage_error};
 pub(super) fn list<'a>(
     storage: &'a OpenDalReadStorage,
     prefix: &'a StorageObjectPath,
-) -> impl futures::Stream<Item=Result<StorageObjectPath>> + Send + 'a {
+) -> impl futures::Stream<Item=Result<StorageObjectPath>> + 'static {
     let operator = storage.operator.clone();
     let prefix = prefix.clone();
     let filter_prefix = prefix.clone();

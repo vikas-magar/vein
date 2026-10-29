@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 use arrow::datatypes::DataType;
 
@@ -10,6 +10,17 @@ use error::VeinError;
 
 use super::super::hash_table::{HashTable, JoinKeys};
 use super::super::spill::{JoinSpillRun, JoinSpillSchema, JoinSpillWriter};
+
+#[async_trait::async_trait]
+impl PipelineNode for BuildSink {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.accumulate(view)
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.complete()
+    }
+}
 
 /// Collects build-side chunks and publishes a reusable hash table at flush.
 pub struct BuildSink {
@@ -195,8 +206,8 @@ pub(crate) enum BuildResult {
     },
 }
 
-impl PipelineNode for BuildSink {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+impl BuildSink {
+    pub(crate) fn accumulate(&mut self, view: DataChunkView) -> Result<()> {
         self.rows += view.num_rows() as u64;
         let started = Instant::now();
         if let Some(writer) = self.spill_writer.as_mut() {
@@ -240,7 +251,7 @@ impl PipelineNode for BuildSink {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    pub(crate) fn complete(&mut self) -> Result<()> {
         if self.is_worker_local {
             let table = self.table.as_ref().ok_or_else(|| {
                 VeinError::internal("worker-local join build table is unavailable at flush")

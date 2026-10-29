@@ -2,7 +2,7 @@
 use std::collections::{HashMap, hash_map::Entry};
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 use arrow::datatypes::SchemaRef;
 use arrow::json::writer::{EncoderOptions, NullableEncoder, make_encoder};

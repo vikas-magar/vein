@@ -29,8 +29,9 @@ impl LimitTransform {
     }
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for LimitTransform {
-    fn push(&mut self, chunk: DataChunkView) -> Result<()> {
+    async fn push(&mut self, chunk: DataChunkView) -> Result<()> {
         if self.rows_emitted >= self.count {
             // Maximum rows already reached; drop further pushes
             return Ok(());
@@ -67,11 +68,11 @@ impl PipelineNode for LimitTransform {
 
         let selection = chunk.selection().slice(start_in_chunk, take_count);
         let limited = chunk.into_selection(selection)?;
-        self.next.push(limited)
+        self.next.push(limited).await
     }
 
-    fn flush(&mut self) -> Result<()> {
-        self.next.flush()
+    async fn flush(&mut self) -> Result<()> {
+        self.next.flush().await
     }
 
     /// Once the window is full, nothing further down can matter.

@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn assert_grouped(keys: ArrayRef, key_type: VeinDataType) {
+async fn assert_grouped(keys: ArrayRef, key_type: VeinDataType) {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -19,7 +19,7 @@ fn assert_grouped(keys: ArrayRef, key_type: VeinDataType) {
     ]))
         .unwrap();
 
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let source_keys = output[0].materialize_column(0).unwrap();
     let keys = arrow::compute::cast(source_keys.as_ref(), &arrow::datatypes::DataType::Int64)
         .unwrap();
@@ -34,14 +34,14 @@ fn assert_grouped(keys: ArrayRef, key_type: VeinDataType) {
     );
 }
 
-#[test]
-fn int8_and_int16_group_keys_preserve_values_and_nulls() {
+#[tokio::test]
+async fn int8_and_int16_group_keys_preserve_values_and_nulls() {
     assert_grouped(
         Arc::new(Int8Array::from(vec![Some(-2), None, Some(4), Some(-2)])),
         VeinDataType::Int8,
-    );
+    ).await;
     assert_grouped(
         Arc::new(Int16Array::from(vec![Some(-2), None, Some(4), Some(-2)])),
         VeinDataType::Int16,
-    );
+    ).await;
 }

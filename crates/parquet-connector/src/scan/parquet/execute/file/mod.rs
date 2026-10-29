@@ -6,7 +6,7 @@ mod prepare;
 mod pruning;
 
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 use common::Result;
 use exec::operators::source::scan::{ScanFile, ScanRequest};

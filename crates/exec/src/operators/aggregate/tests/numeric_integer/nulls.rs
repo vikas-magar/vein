@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn null_inputs_are_ignored_and_count_only_counts_non_null_values() {
+#[tokio::test]
+async fn null_inputs_are_ignored_and_count_only_counts_non_null_values() {
     let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(5)]));
     let plan = AggregatePlan {
         groups: 0,
@@ -36,7 +36,7 @@ fn null_inputs_are_ignored_and_count_only_counts_non_null_values() {
         values,
     ]))
         .unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let row = &output[0];
 
     assert_eq!(

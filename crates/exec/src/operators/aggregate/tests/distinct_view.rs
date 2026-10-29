@@ -8,8 +8,8 @@ use crate::pipeline::{DataChunkView, ViewColumnRef, ViewInputRows};
 
 use super::*;
 
-#[test]
-fn count_distinct_view_keeps_source_buffers_and_ignores_null_values() {
+#[tokio::test]
+async fn count_distinct_view_keeps_source_buffers_and_ignores_null_values() {
     let groups: ArrayRef = Arc::new(Int64Array::from(vec![1, 1, 1, 2, 2, 2]));
     let values: ArrayRef =
         Arc::new(Int64Array::from(vec![Some(10), Some(10), None, Some(20), Some(30), Some(30)]));
@@ -61,7 +61,7 @@ fn count_distinct_view_keeps_source_buffers_and_ignores_null_values() {
 
     let results = sink
         .finish()
-        .expect("finish distinct aggregate")
+        .await.expect("finish distinct aggregate")
         .into_iter()
         .flat_map(|batch| {
             let keys = materialized_column::<Int64Array>(&batch, 0);

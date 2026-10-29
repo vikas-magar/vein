@@ -34,18 +34,18 @@ impl<T: Any + Send + Sync> PipelineNodeDowncast for T {
     }
 }
 
-/// The synchronous trait implemented by all CPU-bound operators (Transforms
-/// and Sinks).
+/// Batch-oriented operators with cooperative downstream delivery.
 ///
 /// Every pipeline operator consumes and emits the engine's canonical
-/// reference-backed view. Implementations must NEVER yield to an asynchronous
-/// scheduler; they process the view and immediately return or push it onward.
+/// reference-backed view. CPU kernels remain synchronous; batch handoffs may
+/// suspend on backpressure so producers and consumers can share one scheduler.
+#[async_trait::async_trait]
 pub trait PipelineNode: PipelineNodeDowncast + Send + Sync {
     /// Pushes a view of columnar data into the operator.
-    fn push(&mut self, view: DataChunkView) -> Result<()>;
+    async fn push(&mut self, view: DataChunkView) -> Result<()>;
 
     /// Signals that no more data will be pushed.
-    fn flush(&mut self) -> Result<()>;
+    async fn flush(&mut self) -> Result<()>;
 
     /// Whether this node has all the data it will ever need, so the source
     /// feeding it may stop reading.

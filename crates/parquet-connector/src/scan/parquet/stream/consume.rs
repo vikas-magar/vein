@@ -1,7 +1,8 @@
 use std::fmt::Display;
 use std::future::poll_fn;
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use common::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use common::Result;
@@ -56,7 +57,7 @@ where
         let Some(batch_result) = next_batch else { break };
         let batch = batch_result
             .map_err(|error| VeinError::internal(format!("Parquet read error: {error}")))?;
-        consume_batch(batch, &mut metrics, &mut context)?;
+        consume_batch(batch, &mut metrics, &mut context).await?;
         if context.next.finished() {
             break;
         }
@@ -71,7 +72,7 @@ where
     Ok(metrics)
 }
 
-fn consume_batch(
+async fn consume_batch(
     batch: RecordBatch,
     metrics: &mut ScanStreamMetrics,
     context: &mut ScanStreamContext<'_>,
@@ -86,7 +87,7 @@ fn consume_batch(
     }
     metrics.batches += 1;
     queue_runtime_statistics(&view, metrics, context)?;
-    push_output(view, metrics, context)
+    push_output(view, metrics, context).await
 }
 
 fn queue_runtime_statistics(
@@ -125,7 +126,7 @@ fn queue_runtime_statistics(
     Ok(())
 }
 
-fn push_output(
+async fn push_output(
     view: exec::pipeline::DataChunkView,
     metrics: &mut ScanStreamMetrics,
     context: &mut ScanStreamContext<'_>,
@@ -143,7 +144,7 @@ fn push_output(
             arrow_array_handles_moved = true, "scan_view_batch_emitted");
     }
     let downstream_started = Instant::now();
-    context.next.push(chunk)?;
+    context.next.push(chunk).await?;
     metrics.downstream_time += downstream_started.elapsed();
     Ok(())
 }

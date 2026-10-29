@@ -15,7 +15,7 @@ use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use common::time::Instant;
 
 use arrow::array::{
     Array, ArrayRef, Date32Array, Decimal128Array, Decimal256Array, DictionaryArray, Int16Array,

@@ -27,8 +27,8 @@ fn parallel_join(kind: JoinType, residual: bool) -> (HashJoin, Collect, ArrayRef
     (join, sink, payload)
 }
 
-#[test]
-fn parallel_outer_join_combines_matches_and_emits_unmatched_build_once() {
+#[tokio::test]
+async fn parallel_outer_join_combines_matches_and_emits_unmatched_build_once() {
     for kind in [JoinType::Right, JoinType::Full] {
         for residual in [false, true] {
             let (mut join, sink, payload) = parallel_join(kind, residual);
@@ -36,20 +36,20 @@ fn parallel_outer_join_combines_matches_and_emits_unmatched_build_once() {
             for (keys, values) in [(vec![Some(1), None], vec![10, 99]),
                 (vec![Some(2), Some(1)], vec![20, 1])] {
                 let mut worker = join.fork_local().unwrap().expect("parallel outer probe");
-                workers.push(std::thread::spawn(move || {
+                workers.push(std::thread::spawn(move || futures::executor::block_on(async move {
                     worker.push(crate::pipeline::test_support::dense_view(vec![
                         nullable_ints(&keys), ints(&values),
-                    ])).unwrap();
+                    ])).await.unwrap();
                     // Even explicit worker finalization must not emit unmatched build rows.
-                    worker.flush().unwrap();
+                    worker.flush().await.unwrap();
                     worker
-                }));
+                })));
             }
             for worker in workers {
                 worker.join().unwrap().combine_local(&mut join).unwrap();
             }
             assert_eq!(join.probed_rows, 4);
-            join.flush().unwrap();
+            join.flush().await.unwrap();
             let chunks = sink.0.lock().unwrap();
             let mut actual = chunks.iter().flat_map(selected_rows).collect::<Vec<_>>();
             actual.sort_unstable();
@@ -85,23 +85,23 @@ fn parallel_outer_join_combines_matches_and_emits_unmatched_build_once() {
     }
 }
 
-#[test]
-fn parallel_inner_residual_workers_keep_private_collectors() {
+#[tokio::test]
+async fn parallel_inner_residual_workers_keep_private_collectors() {
     let (mut join, sink, _) = parallel_join(JoinType::Inner, true);
     let mut workers = Vec::new();
     for value in [10, 20, 1] {
         let mut local = join.fork_local().unwrap().expect("fork residual evaluator");
-        workers.push(std::thread::spawn(move || {
+        workers.push(std::thread::spawn(move || futures::executor::block_on(async move {
             for _ in 0..20 {
                 local.push(crate::pipeline::test_support::dense_view(vec![
                     ints(&[1]), ints(&[value]),
-                ])).unwrap();
+                ])).await.unwrap();
             }
             local
-        }));
+        })));
     }
     for worker in workers { worker.join().unwrap().combine_local(&mut join).unwrap(); }
-    join.flush().unwrap();
+    join.flush().await.unwrap();
     let chunks = sink.0.lock().unwrap();
     let rows = chunks.iter().flat_map(selected_rows).collect::<Vec<_>>();
     assert_eq!(rows.len(), 60);
@@ -109,8 +109,8 @@ fn parallel_inner_residual_workers_keep_private_collectors() {
     assert_eq!(rows.iter().filter(|row| row[1] == Some(20)).count(), 40);
 }
 
-#[test]
-fn non_forkable_downstream_keeps_explicit_serial_fallback() {
+#[tokio::test]
+async fn non_forkable_downstream_keeps_explicit_serial_fallback() {
     let mut join = HashJoin::new(
         Arc::new(build(&[1])), JoinType::Full,
         vec![OutputColumn::Build(0)], vec![DataType::Int64],
@@ -122,8 +122,8 @@ fn non_forkable_downstream_keeps_explicit_serial_fallback() {
     assert!(join.fork_local().unwrap().is_none());
 }
 
-#[test]
-fn parallel_join_rejects_different_residual_programs() {
+#[tokio::test]
+async fn parallel_join_rejects_different_residual_programs() {
     let (mut join, _, _) = parallel_join(JoinType::Full, true);
     let worker = join.fork_local().unwrap().unwrap();
     let (transform, collector) = residual_greater_than_filter();

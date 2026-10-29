@@ -18,6 +18,9 @@ pub struct StorageObjectVersion {
 pub struct StorageTimestamp(i128);
 
 impl StorageTimestamp {
+    /// Constructs a timestamp from exact, signed nanoseconds relative to the Unix epoch.
+    pub const fn from_unix_nanos(nanos: i128) -> Self { Self(nanos) }
+
     /// Captures a provider timestamp without depending on platform-specific `SystemTime` encoding.
     pub fn from_system_time(value: SystemTime) -> Option<Self> {
         let nanos = match value.duration_since(UNIX_EPOCH) {

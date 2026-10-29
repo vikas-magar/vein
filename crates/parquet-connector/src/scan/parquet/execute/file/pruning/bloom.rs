@@ -1,7 +1,7 @@
 //! Loads eligible column-chunk Bloom filters and prunes candidate row groups.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use common::time::Instant;
 
 use parquet::arrow::arrow_reader::RowGroupSelection;
 

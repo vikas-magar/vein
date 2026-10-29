@@ -2,7 +2,7 @@
 use arrow::datatypes::SchemaRef;
 use common::Result;
 use error::VeinError;
-use std::time::Instant;
+use common::time::Instant;
 
 use crate::pipeline::{DataChunkView, PipelineNode, Sink};
 
@@ -42,8 +42,9 @@ impl CollectSink {
     }
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for CollectSink {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.chunks_in = self.chunks_in.saturating_add(1);
         let started = Instant::now();
         let view = view.with_schema(self.schema.clone())?;
@@ -64,7 +65,8 @@ impl PipelineNode for CollectSink {
             .ok_or_else(|| VeinError::internal("client row count overflow"))?;
         if let Some(sender) = &self.output_sender {
             sender
-                .send(view)
+                .send_async(view)
+                .await
                 .map_err(|error| VeinError::internal(format!("client result channel closed: {error}")))?;
         } else {
             self.output.push(view);
@@ -74,7 +76,7 @@ impl PipelineNode for CollectSink {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         tracing::info!(
             target: "vein.audit",
             event = "client_sink_finished",

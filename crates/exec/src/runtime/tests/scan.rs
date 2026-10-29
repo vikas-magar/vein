@@ -84,8 +84,8 @@ async fn intermediate_physical_source_replays_registered_checkpoint_views() {
     let relation = crate::runtime::checkpoint::IntermediateRelation::new(arrow_schema, memory);
     let mut sink = relation.sink();
     sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch.clone()).unwrap())
-        .expect("retain checkpoint batch");
-    sink.flush().expect("seal checkpoint before execution");
+        .await.expect("retain checkpoint batch");
+    sink.flush().await.expect("seal checkpoint before execution");
 
     let source_id = common::identifiers::IntermediateSourceId::new();
     let _registration = runner

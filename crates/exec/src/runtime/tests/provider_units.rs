@@ -66,7 +66,7 @@ impl ScanProvider for UnevenProvider {
             SelectionVector::new_dense(range.end - range.start),
         )?
             .with_schema(Arc::new(request.projected.to_arrow()))?;
-        next.push(view)
+        next.push(view).await
     }
 }
 

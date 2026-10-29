@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fmt;
 use std::sync::{Arc, Mutex, mpsc};
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::thread;
-use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::{thread, time::Duration};
 
 use arrow::datatypes::SchemaRef;
 use catalog::{CatalogSnapshotToken, TableStatistics};
@@ -266,45 +266,11 @@ impl RuntimeStatisticsStore {
         let state = Arc::new(Mutex::new(StoreState::default()));
         let (batch_tx, batch_rx) = mpsc::sync_channel(config.queue_capacity);
         let (control_tx, control_rx) = mpsc::channel();
-        let worker_state = Arc::clone(&state);
-        thread::Builder::new()
-            .name("vein-runtime-statistics".to_owned())
-            .spawn(move || {
-                let store = RuntimeStatisticsStore {
-                    state: worker_state,
-                    worker: None,
-                };
-                loop {
-                    match control_rx.try_recv() {
-                        Ok(control) => {
-                            drain_statistics_batches(&store, &batch_rx);
-                            if handle_statistics_control(&store, control).is_err() {
-                                tracing::warn!(target: "vein.audit", event = "runtime_statistics_worker_error", "runtime statistics control processing failed");
-                            }
-                            continue;
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            drain_statistics_batches(&store, &batch_rx);
-                            break;
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {}
-                    }
-                    match batch_rx.recv_timeout(Duration::from_millis(10)) {
-                        Ok(work) => process_statistics_batch(&store, work),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            if control_rx.try_recv().is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
-            .map_err(|error| VeinError::internal(format!("failed to start runtime statistics worker: {error}")))?;
+        let has_worker = start_statistics_worker(Arc::clone(&state), batch_rx, control_rx, config)?;
 
         Ok(Self {
             state,
-            worker: Some(Arc::new(RuntimeStatisticsWorker {
+            worker: has_worker.then(|| Arc::new(RuntimeStatisticsWorker {
                 batches: batch_tx,
                 controls: control_tx,
                 config,
@@ -502,6 +468,73 @@ impl RuntimeStatisticsStore {
             .get(table_key)
             .cloned()
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn start_statistics_worker(
+    state: Arc<Mutex<StoreState>>,
+    batches: mpsc::Receiver<StatisticsWork>,
+    controls: mpsc::Receiver<StatisticsControl>,
+    _config: RuntimeStatisticsConfig,
+) -> Result<bool> {
+    thread::Builder::new()
+        .name("vein-runtime-statistics".to_owned())
+        .spawn(move || {
+            let store = RuntimeStatisticsStore { state, worker: None };
+            run_statistics_worker(&store, batches, controls);
+        })
+        .map_err(|error| VeinError::internal(format!("failed to start runtime statistics worker: {error}")))?;
+    Ok(true)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_statistics_worker(
+    store: &RuntimeStatisticsStore,
+    batches: mpsc::Receiver<StatisticsWork>,
+    controls: mpsc::Receiver<StatisticsControl>,
+) {
+    loop {
+        match controls.try_recv() {
+            Ok(control) => {
+                drain_statistics_batches(store, &batches);
+                if handle_statistics_control(store, control).is_err() {
+                    tracing::warn!(target: "vein.audit", event = "runtime_statistics_worker_error", "runtime statistics control processing failed");
+                }
+                continue;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                drain_statistics_batches(store, &batches);
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        match batches.recv_timeout(Duration::from_millis(10)) {
+            Ok(work) => process_statistics_batch(store, work),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if controls.try_recv().is_err() { break; }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn start_statistics_worker(
+    _state: Arc<Mutex<StoreState>>,
+    batches: mpsc::Receiver<StatisticsWork>,
+    controls: mpsc::Receiver<StatisticsControl>,
+    _config: RuntimeStatisticsConfig,
+) -> Result<bool> {
+    drop(batches);
+    drop(controls);
+    tracing::debug!(
+        target: "vein.statistics",
+        event = "runtime_statistics_worker_unavailable",
+        backend = "wasm",
+        reason = "browser WebAssembly cannot start native threads",
+        "runtime synopses are disabled for this browser query"
+    );
+    Ok(false)
 }
 
 fn process_statistics_batch(store: &RuntimeStatisticsStore, work: StatisticsWork) {

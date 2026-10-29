@@ -1,7 +1,7 @@
 //! Runtime membership predicate with optional per-stage decode diagnostics.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use common::time::Instant;
 
 use arrow::array::Array;
 use common::Result;

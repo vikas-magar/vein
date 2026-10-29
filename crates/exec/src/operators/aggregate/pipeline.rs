@@ -11,12 +11,13 @@ struct AggregateHandle(SharedAggregateSink);
 /// Worker-owned aggregate state, combined into its matching canonical handle.
 struct LocalAggregateHandle(AggregateSink);
 
+#[async_trait::async_trait]
 impl PipelineNode for LocalAggregateHandle {
-    fn push(&mut self, batch: DataChunkView) -> Result<()> {
+    async fn push(&mut self, batch: DataChunkView) -> Result<()> {
         self.0.accumulate(batch)
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -33,8 +34,9 @@ impl PipelineNode for LocalAggregateHandle {
     }
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for AggregateHandle {
-    fn push(&mut self, batch: DataChunkView) -> Result<()> {
+    async fn push(&mut self, batch: DataChunkView) -> Result<()> {
         let mut sink = self
             .0
             .lock()
@@ -42,7 +44,7 @@ impl PipelineNode for AggregateHandle {
         sink.accumulate(batch)
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 

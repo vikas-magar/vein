@@ -3,6 +3,7 @@
 mod builder;
 mod components;
 mod engine;
+mod inspection;
 mod prepare;
 mod query;
 mod stream;

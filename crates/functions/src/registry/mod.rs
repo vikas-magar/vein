@@ -13,6 +13,8 @@ use crate::{
 pub trait FunctionCatalog: Send + Sync {
     /// Resolves a function name without transferring runtime implementation ownership.
     fn resolve(&self, name: &str) -> Result<FunctionSignature>;
+    /// Enumerates available signatures by reference for tooling; lookup-only catalogs may omit it.
+    fn list(&self) -> Vec<(&str, &FunctionSignature)> { Vec::new() }
 }
 
 /// Shared case-insensitive function registry for binding and execution.
@@ -120,6 +122,13 @@ impl FunctionRegistry {
 }
 
 impl FunctionCatalog for FunctionRegistry {
+    fn list(&self) -> Vec<(&str, &FunctionSignature)> {
+        let mut entries = self.definitions.values().map(|definition|
+            (definition.name(), definition.signature())).collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        entries
+    }
+
     fn resolve(&self, name: &str) -> Result<FunctionSignature> {
         Ok(self.definition(name)?.signature().clone())
     }

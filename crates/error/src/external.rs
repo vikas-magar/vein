@@ -1,12 +1,31 @@
 //! Generic adapters for errors originating outside Vein.
 
 use std::error::Error;
+use std::sync::Arc;
 
 use crate::ErrorCategory;
 use crate::{Result, VeinError};
 
 /// A boxed, thread-safe external error source.
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+
+impl VeinError {
+    /// Retains a terminal error once, recognizing the owned shared-error adapter.
+    pub fn into_shared(self) -> Arc<Self> {
+        if let Self::External(error) = &self
+            && error.context() == "query execution"
+            && let Some(source) = error.source_error().downcast_ref::<Arc<Self>>() {
+            return Arc::clone(source);
+        }
+        Arc::new(self)
+    }
+    /// Adapts a shared terminal error to an owned boundary error without losing
+    /// its typed source chain. Cancellation retains its direct variant.
+    pub fn from_shared(source: Arc<Self>) -> Self {
+        if matches!(source.as_ref(), Self::Cancelled) { return Self::cancelled(); }
+        Self::external(source.category(), "query execution", source)
+    }
+}
 
 /// An external error with Vein-owned category and operation context.
 #[derive(Debug, thiserror::Error)]
@@ -72,3 +91,6 @@ where
         self.map_err(|source| VeinError::from_error_chain(category, context, source))
     }
 }
+
+#[cfg(test)]
+mod tests;

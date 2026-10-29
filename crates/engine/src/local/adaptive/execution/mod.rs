@@ -3,13 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use common::cancellation::CancellationToken;
 use common::identifiers::{IntermediateSourceId, QueryId, RequestId};
 use common::protocol::ExecuteTask;
 use common::protocol::{PhysicalPlanNode, PhysicalPlanOperator};
 use common::statistics::QueryStatisticsContext;
-use exec::runtime::checkpoint::IntermediateSourceRegistration;
-use exec::runtime::{QueryExecutionResources, TaskExecutor};
+use common::cancellation::CancellationRegistration;
+use exec::runtime::{QueryExecutionGuard, TaskExecutor};
 use physical::PhysicalPlanner;
 use plan::{LogicalPlan, PlanTraversal};
 
@@ -29,23 +28,13 @@ pub(in crate::local) struct AdaptiveCoordinator {
     pub optimizer: Arc<optimizer::OptimizerPipeline>,
     pub planner: Arc<dyn PhysicalPlanner>,
     pub policy: Arc<dyn AdaptiveCheckpointPolicy>,
-    pub statistics: Arc<QueryStatisticsContext>,
-    pub request_id: RequestId,
-    pub query_id: QueryId,
 }
 
 /// Retains registrations and cancellation for the entire result stream lifetime.
 pub(in crate::local) struct AdaptiveExecution {
     pub tasks: Vec<ExecuteTask>,
-    pub resources: Option<Arc<QueryExecutionResources>>,
-    registrations: HashMap<u128, IntermediateSourceRegistration>,
-    cancel: CancellationToken,
-}
-
-impl Drop for AdaptiveExecution {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
+    pub scope: QueryExecutionGuard,
+    registrations: HashMap<u128, CancellationRegistration>,
 }
 
 pub(in crate::local) fn prepare_checkpoint(
@@ -73,8 +62,8 @@ pub(in crate::local) fn prepare_checkpoint(
             if join_count(remaining_plan) == 1
                 && !domain_checkpoint
                 && remaining
-                    .iter()
-                    .any(|task| already_builds(&task.plan.root, &boundary.output_schema))
+                .iter()
+                .any(|task| already_builds(&task.plan.root, &boundary.output_schema))
             {
                 tracing::info!(target: "vein.adaptive", event = "adaptive_checkpoint_skipped",
                     source = boundary.table_name(), reason = "only_join_already_builds_this_input",
@@ -161,17 +150,17 @@ fn continuation_join_count(plan: &LogicalPlan, path: &[usize]) -> usize {
     };
     usize::from(matches!(plan, LogicalPlan::Join { .. }))
         + plan
-            .children()
-            .into_iter()
-            .enumerate()
-            .map(|(index, child)| {
-                if index == target {
-                    continuation_join_count(child, rest)
-                } else {
-                    join_count(child)
-                }
-            })
-            .sum::<usize>()
+        .children()
+        .into_iter()
+        .enumerate()
+        .map(|(index, child)| {
+            if index == target {
+                continuation_join_count(child, rest)
+            } else {
+                join_count(child)
+            }
+        })
+        .sum::<usize>()
 }
 
 fn already_builds(node: &PhysicalPlanNode, schema: &plan::VeinSchema) -> bool {
@@ -184,5 +173,6 @@ fn already_builds(node: &PhysicalPlanNode, schema: &plan::VeinSchema) -> bool {
         | PhysicalPlanOperator::Limit { input, .. }
         | PhysicalPlanOperator::Sink { input, .. } => already_builds(input, schema),
         PhysicalPlanOperator::Pipeline { .. } => false,
+        PhysicalPlanOperator::Extension { .. } => false,
     }
 }

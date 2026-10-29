@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn aggregate_spill_flushes_retries_and_merges_repeated_keys() {
+#[tokio::test]
+async fn aggregate_spill_flushes_retries_and_merges_repeated_keys() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -43,7 +43,7 @@ fn aggregate_spill_flushes_retries_and_merges_repeated_keys() {
         }
         Ok(())
     })
-        .expect("merge spill runs");
+        .await.expect("merge spill runs");
     assert_eq!(tracker.spill_bytes_used(), 0);
     let expected = keys.into_iter().fold(
         std::collections::BTreeMap::new(),

@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
-use std::time::Instant;
+use web_time::Instant;
 
 /// Elapsed leaf-reader work, summed across calls. Decompression is a subset of
 /// read, skip or materialization time, not an additional exclusive duration.

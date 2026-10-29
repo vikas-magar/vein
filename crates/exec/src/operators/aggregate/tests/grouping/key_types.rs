@@ -26,7 +26,7 @@ macro_rules! assert_unsigned_group_key_layout {
         ]))
         .unwrap();
 
-        let output = sink.finish().unwrap();
+        let output = sink.finish().await.unwrap();
         let keys = crate::pipeline::test_support::materialized_column::<$array>(&output[0], 0);
         let sums = int128_column(&output[0], 1);
 
@@ -38,16 +38,16 @@ macro_rules! assert_unsigned_group_key_layout {
     }};
 }
 
-#[test]
-fn unsigned_group_keys_preserve_width_nulls_and_cross_batch_groups() {
+#[tokio::test]
+async fn unsigned_group_keys_preserve_width_nulls_and_cross_batch_groups() {
     assert_unsigned_group_key_layout!(UInt8Array, VeinDataType::UInt8);
     assert_unsigned_group_key_layout!(UInt16Array, VeinDataType::UInt16);
     assert_unsigned_group_key_layout!(UInt32Array, VeinDataType::UInt32);
     assert_unsigned_group_key_layout!(UInt64Array, VeinDataType::UInt64);
 }
 
-#[test]
-fn dictionary_utf8_grouping_handles_nulls_unused_values_and_batch_local_ids() {
+#[tokio::test]
+async fn dictionary_utf8_grouping_handles_nulls_unused_values_and_batch_local_ids() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -86,7 +86,7 @@ fn dictionary_utf8_grouping_handles_nulls_unused_values_and_batch_local_ids() {
     ]))
         .unwrap();
 
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let keys = crate::pipeline::test_support::materialized_column::<StringArray>(&output[0], 0);
     let sums = int128_column(&output[0], 1);
     let actual = (0..output[0].num_rows())

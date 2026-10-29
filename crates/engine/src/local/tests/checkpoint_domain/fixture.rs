@@ -37,7 +37,7 @@ impl ScanProvider for MemoryProvider {
             }).collect::<Vec<_>>();
             // Static fixture predicates are tautologies over these values.
             // Runtime filters may be ignored: the join still enforces membership.
-            next.push(view.project(&columns)?)?;
+            next.push(view.project(&columns)?).await?;
         }
         Ok(())
     }

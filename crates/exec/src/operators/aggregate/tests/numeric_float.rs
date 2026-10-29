@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn float16_aggregates_use_wide_fold_and_preserve_min_max_layout() {
+#[tokio::test]
+async fn float16_aggregates_use_wide_fold_and_preserve_min_max_layout() {
     let source: ArrayRef = Arc::new(Float32Array::from(vec![Some(1.5), None, Some(2.5)]));
     let input = arrow::compute::cast(&source, &VeinDataType::Float16.to_arrow()).unwrap();
     assert!(input.as_any().is::<Float16Array>());
@@ -35,7 +35,7 @@ fn float16_aggregates_use_wide_fold_and_preserve_min_max_layout() {
         input,
     ]))
         .unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
 
     assert_eq!(
         crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0)
@@ -62,8 +62,8 @@ fn float16_aggregates_use_wide_fold_and_preserve_min_max_layout() {
     );
 }
 
-#[test]
-fn float32_average_accumulates_in_float64_state() {
+#[tokio::test]
+async fn float32_average_accumulates_in_float64_state() {
     let input = Float32Array::from(vec![100_000_000.0_f32, 1.0, -100_000_000.0]);
     let plan = AggregatePlan {
         groups: 0,
@@ -79,13 +79,13 @@ fn float32_average_accumulates_in_float64_state() {
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![Arc::new(input)]))
         .unwrap();
 
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let average = crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0);
     assert_eq!(average.value(0), 1.0 / 3.0);
 }
 
-#[test]
-fn float32_sum_reads_input_layout_and_emits_widened_result() {
+#[tokio::test]
+async fn float32_sum_reads_input_layout_and_emits_widened_result() {
     let plan = AggregatePlan {
         groups: 0,
         estimated_groups: None,
@@ -101,14 +101,14 @@ fn float32_sum_reads_input_layout_and_emits_widened_result() {
         vec![1.25, 2.75],
     ))]))
         .unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let sum = crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0);
 
     assert_eq!(sum.value(0), 4.0);
 }
 
-#[test]
-fn floating_aggregates_share_the_generic_fold() {
+#[tokio::test]
+async fn floating_aggregates_share_the_generic_fold() {
     let values: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.5), None, Some(2.5)]));
     let plan = AggregatePlan {
         groups: 0,
@@ -133,7 +133,7 @@ fn floating_aggregates_share_the_generic_fold() {
         values,
     ]))
         .unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let result = (0..4)
         .map(|column| {
             crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], column)
