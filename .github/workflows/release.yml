@@ -95,6 +95,8 @@ jobs:
         run: cargo build --locked --release --target wasm32-unknown-unknown -p vein-wasm
       - name: Install matching wasm-bindgen CLI
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Prepare browser runtime package directory
+        run: mkdir -p dist/vein-wasm-web
       - name: Generate JavaScript bindings
         run: >-
           wasm-bindgen target/wasm32-unknown-unknown/release/vein_wasm.wasm
