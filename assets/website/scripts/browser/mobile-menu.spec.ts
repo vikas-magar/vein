@@ -12,7 +12,7 @@ test("mobile menu supports keyboard dismissal and the shared command dialog", as
   const menu = page.getByRole("menu", { name: "Workspace menu", exact: true });
   await expect(menu).toBeVisible();
   await expect(menu.getByRole("menuitem")).toHaveCount(3);
-  await page.screenshot({ path: `/private/tmp/vein-mobile-menu-${test.info().project.name}.png` });
+  await page.screenshot({ path: test.info().outputPath(`vein-mobile-menu-${test.info().project.name}.png`) });
   await page.keyboard.press("Escape");
   await expect(menu).toHaveCount(0);
   await expect(trigger).toBeFocused();

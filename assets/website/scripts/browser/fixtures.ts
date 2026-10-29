@@ -1,5 +1,7 @@
 import { mkdtemp, mkdir } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import type { Page } from "@playwright/test";
 
@@ -22,7 +24,7 @@ export async function createDataDirectory(
   projection = "SELECT i::BIGINT AS id, (i * 10)::BIGINT AS amount FROM range(1, 10001) t(i)",
   table = "smoke",
 ) {
-  const directory = await mkdtemp("/private/tmp/vein-workspace-");
+  const directory = await mkdtemp(join(tmpdir(), "vein-workspace-"));
   await addParquetTable(directory, table, projection);
   return directory;
 }

@@ -11,5 +11,5 @@ test("wordmark accents only the i dot and retains its accessible name", async ({
   });
   expect(dot.color).toBe("rgb(255, 73, 105)");
   expect(dot.width).toBeGreaterThan(0);
-  await brand.screenshot({ path: `/private/tmp/vein-wordmark-${test.info().project.name}.png` });
+  await brand.screenshot({ path: test.info().outputPath(`vein-wordmark-${test.info().project.name}.png`) });
 });

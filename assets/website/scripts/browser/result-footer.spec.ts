@@ -44,6 +44,6 @@ for (const width of [1280, 390]) {
     await page.getByRole("tab", { name: "Messages", exact: true }).click();
     await expect(summary).toBeVisible();
     await expect(summary.getByRole("button", { name: "Arrow", exact: true })).toBeVisible();
-    await page.screenshot({ path: `/private/tmp/vein-footer-${width}-${test.info().project.name}.png` });
+    await page.screenshot({ path: test.info().outputPath(`vein-footer-${width}-${test.info().project.name}.png`) });
   });
 }
