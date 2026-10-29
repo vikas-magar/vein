@@ -263,7 +263,7 @@ impl IntermediateRelation {
 
     fn add_rows(&self, rows: usize) {
         let rows = u64::try_from(rows).unwrap_or(u64::MAX);
-        let _ = self.rows.fetch_update(
+        let _ = self.rows.try_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |current| Some(current.saturating_add(rows)),

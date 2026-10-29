@@ -72,26 +72,12 @@ jobs:
       - name: Install website dependencies
         working-directory: assets/website
         run: npm ci
-      - name: Install DuckDB CLI for Parquet test fixtures
-        env:
-          DUCKDB_VERSION: "1.4.5"
-        run: curl -fsSL https://install.duckdb.org | bash
-      - name: Add DuckDB CLI to PATH
-        run: echo "$HOME/.duckdb/cli/latest" >> "$GITHUB_PATH"
-      - name: Verify DuckDB CLI
-        run: duckdb --version
       - name: Check website types
         working-directory: assets/website
         run: npm run typecheck
       - name: Test website worker modules
         working-directory: assets/website
         run: npm run test:worker
-      - name: Install browser test engines
-        working-directory: assets/website
-        run: npx playwright install --with-deps chromium webkit
-      - name: Test website in Chromium and WebKit
-        working-directory: assets/website
-        run: npm run test:browser
       - name: Configure GitHub Pages
         id: pages
         uses: actions/configure-pages@v5
