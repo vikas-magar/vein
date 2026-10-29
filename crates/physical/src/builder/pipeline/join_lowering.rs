@@ -45,6 +45,9 @@ impl DefaultPipelineStageBuilder {
             }
             residual = None;
         } else if using.is_empty() {
+            if on.is_none() {
+                return Err(VeinError::planning("non-CROSS JOIN requires ON or USING", None));
+            }
             let mut conjuncts = Vec::new();
             if let Some(on) = on {
                 flatten_conjunction(on, &mut conjuncts);
@@ -52,11 +55,16 @@ impl DefaultPipelineStageBuilder {
             let (keys, residual_conjuncts) =
                 extract_equi_join_keys(&conjuncts, &probe_schema, &build_schema)?;
             (probe_keys, build_keys) = keys;
+            if probe_keys.is_empty() && *join_type == JoinType::NullAwareAnti {
+                return Err(VeinError::unsupported(
+                    "NULL-aware anti joins require a supported equality key", None,
+                ));
+            }
             residual = PipelineCompiler::compile_join_residual(
                 &residual_conjuncts,
                 &probe_schema,
                 &build_schema,
-                probe_keys[0],
+                probe_keys.first().copied().unwrap_or_default(),
             )?;
         } else {
             for column in using {
@@ -71,7 +79,7 @@ impl DefaultPipelineStageBuilder {
                 &conjuncts.into_iter().cloned().collect::<Vec<_>>(),
                 &probe_schema,
                 &build_schema,
-                probe_keys[0],
+                probe_keys.first().copied().unwrap_or_default(),
             )?;
         }
 

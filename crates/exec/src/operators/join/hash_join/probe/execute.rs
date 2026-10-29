@@ -3,7 +3,7 @@ use super::*;
 use super::super::super::hash_table::probe::HashProbe;
 
 impl HashJoin {
-    pub(super) fn probe(&mut self, chunk: DataChunkView) -> Result<()> {
+    pub(super) async fn probe(&mut self, chunk: DataChunkView) -> Result<()> {
         if chunk.is_empty() || self.next.finished() { return Ok(()); }
         u32::try_from(chunk.num_rows())
             .map_err(|_| VeinError::internal("hash join probe batch exceeds the row-index range"))?;
@@ -13,7 +13,7 @@ impl HashJoin {
                 self.forward_rows(Some(&chunk), (0..chunk.num_rows()).map(|row| OutputRow {
                     probe: Some(row as u32),
                     build: None,
-                }))?;
+                })).await?;
             }
             return Ok(());
         }
@@ -24,7 +24,7 @@ impl HashJoin {
         let table = Arc::clone(&self.table);
         let existence = matches!(self.join_type, JoinType::Semi | JoinType::Anti | JoinType::NullAwareAnti);
         let started = Instant::now();
-        let mut cursor = HashProbe::new(&table, &chunk, existence)?;
+        let mut cursor = HashProbe::new(Arc::clone(&table), &chunk, existence)?;
         self.probe_key_materialization.accumulate(cursor.report());
         self.probe_key_materialize_us = self.probe_key_materialize_us.saturating_add(cursor.key_access_us);
         let mut candidates = Vec::new();
@@ -40,7 +40,7 @@ impl HashJoin {
                 self.retain_unmatched_build_candidates(&mut candidates)?;
             }
             if self.residual_transform.is_some() {
-                let elapsed = self.filter_residual_matches(&chunk, &mut candidates)?;
+                let elapsed = self.filter_residual_matches(&chunk, &mut candidates).await?;
                 self.residual_us = self.residual_us.saturating_add(elapsed);
             }
             for &(probe, _) in &candidates {
@@ -53,10 +53,10 @@ impl HashJoin {
             }
             self.matched_rows = self.matched_rows.saturating_add(candidates.len() as u64);
             if !existence && !self.join_type.build_existence() {
-                self.forward_rows(Some(&chunk), candidates.iter().map(|&(probe, build)| OutputRow {
+                self.forward_rows(Some(&chunk), candidates.iter().copied().map(|(probe, build)| OutputRow {
                     probe: Some(probe),
                     build: Some(build),
-                }))?;
+                })).await?;
             }
             if self.next.finished() { break; }
         }
@@ -70,19 +70,19 @@ impl HashJoin {
             let keep = match self.join_type {
                 JoinType::Semi => matched,
                 JoinType::Anti => !matched,
-                JoinType::NullAwareAnti => !matched && (table.is_empty() || !cursor.is_null(row)?),
+                JoinType::NullAwareAnti => !matched && (self.table.is_empty() || !cursor.is_null(row)?),
                 JoinType::Left | JoinType::Full | JoinType::Single => !matched,
                 _ => false,
             };
             if keep {
                 remaining.push(OutputRow { probe: Some(row as u32), build: None });
                 if remaining.len() == limit {
-                    self.forward_rows(Some(&chunk), remaining.drain(..))?;
+                    self.forward_rows(Some(&chunk), remaining.drain(..)).await?;
                     if self.next.finished() { break; }
                 }
             }
         }
-        self.forward_rows(Some(&chunk), remaining)?;
+        self.forward_rows(Some(&chunk), remaining).await?;
         Ok(())
     }
 }

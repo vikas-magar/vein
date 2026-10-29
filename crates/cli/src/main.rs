@@ -1,4 +1,4 @@
-use std::time::Instant;
+use common::time::Instant;
 
 use cli::local::build_local_engine;
 use common::{Result, VeinError};

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 use arrow::datatypes::DataType;
 
@@ -168,13 +168,14 @@ impl HashJoin {
     }
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for HashJoin {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
-        self.probe(view)
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.probe(view).await
     }
 
-    fn flush(&mut self) -> Result<()> {
-        self.finish()
+    async fn flush(&mut self) -> Result<()> {
+        self.finish().await
     }
     /// Whether the pipeline is done is decided below the join, so the source's
     /// question has to pass through it.

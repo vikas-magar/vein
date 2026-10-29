@@ -1,7 +1,7 @@
 use super::*;
 
 impl HashJoin {
-    pub(super) fn finish(&mut self) -> Result<()> {
+    pub(super) async fn finish(&mut self) -> Result<()> {
         // An outer join owes the build rows nothing matched. They are emitted
         // here, once, with the probe side null.
         if self.emit_unmatched_build && self.join_type.tracks_build_matches() {
@@ -17,11 +17,11 @@ impl HashJoin {
                 if self.build_row_matched(build.0, build.1)? == (self.join_type == JoinType::RightSemi) {
                     rows.push(OutputRow { probe: None, build: Some(build) });
                     if rows.len() == self.build_batch_rows {
-                        self.forward_rows(None, rows.drain(..))?;
+                        self.forward_rows(None, rows.drain(..)).await?;
                     }
                 }
             }
-            self.forward_rows(None, rows)?;
+            self.forward_rows(None, rows).await?;
         }
         tracing::info!(
             target: "vein.audit",
@@ -55,6 +55,6 @@ impl HashJoin {
             key_materialize_us = self.probe_key_materialize_us,
             "join_finished"
         );
-        self.next.flush()
+        self.next.flush().await
     }
 }

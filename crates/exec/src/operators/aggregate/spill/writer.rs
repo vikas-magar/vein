@@ -11,8 +11,8 @@ use crate::spill::{IpcRunOutput, IpcRunWriter};
 use super::{AggregateIntermediateGroup, AggregateSpillSchema, SPILL_RECORD_BATCH_SIZE};
 
 /// Bounded writer shared by aggregate flush and recursive repartition paths.
-pub(super) struct AggregateSpillWriter<'a, W: IpcRunOutput> {
-    layout: &'a AggregateSpillSchema,
+pub(super) struct AggregateSpillWriter<W: IpcRunOutput> {
+    layout: AggregateSpillSchema,
     writer: IpcRunWriter<W>,
     target_workspace_bytes: usize,
     pending: Vec<AggregateIntermediateGroup>,
@@ -20,15 +20,15 @@ pub(super) struct AggregateSpillWriter<'a, W: IpcRunOutput> {
     retained_key_identities: HashSet<usize>,
 }
 
-impl<'a, W: IpcRunOutput> AggregateSpillWriter<'a, W> {
+impl<W: IpcRunOutput> AggregateSpillWriter<W> {
     pub(super) fn new(
-        layout: &'a AggregateSpillSchema,
+        layout: &AggregateSpillSchema,
         output: W,
         target_workspace_bytes: usize,
     ) -> Result<Self> {
         let writer = IpcRunWriter::new(output, &layout.schema, "create aggregate IPC writer")?;
         Ok(Self {
-            layout,
+            layout: layout.clone(),
             writer,
             target_workspace_bytes,
             pending: Vec::with_capacity(SPILL_RECORD_BATCH_SIZE),
@@ -65,7 +65,7 @@ impl<'a, W: IpcRunOutput> AggregateSpillWriter<'a, W> {
         }
 
         Self::write_bounded_batch(
-            self.layout,
+            &self.layout,
             self.target_workspace_bytes,
             &mut self.writer,
             &self.pending,

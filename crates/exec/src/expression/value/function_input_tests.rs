@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Date32Array, Int32Array};
+use arrow::array::{Array, ArrayRef, Date32Array, Int64Array};
 use arrow::datatypes::DataType;
 use functions::{FunctionInput, FunctionOutput, FunctionRegistry};
 
@@ -21,7 +21,7 @@ fn temporal_function_reads_reference_backed_view_and_preserves_nulls() {
     let functions = FunctionRegistry::with_builtins();
 
     let output = functions
-        .invoke("year", &arguments, view.num_rows(), &DataType::Int32)
+        .invoke("year", &arguments, view.num_rows(), &DataType::Int64)
         .expect("YEAR evaluates from Arrow-backed segments");
     let output = into_expression_value(output, std::slice::from_ref(&value))
         .expect("convert function output");
@@ -29,8 +29,8 @@ fn temporal_function_reads_reference_backed_view_and_preserves_nulls() {
         .array()
         .expect("computed scalar result")
         .as_any()
-        .downcast_ref::<Int32Array>()
-        .expect("Int32 year output");
+        .downcast_ref::<Int64Array>()
+        .expect("Int64 year output");
 
     assert_eq!(years.value(0), 1970);
     assert_eq!(years.value(1), 2024);

@@ -8,12 +8,12 @@
 //! task end-to-end (see `crate::pipeline`).
 
 use arrow::array::Array;
+use common::time::Instant;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use tracing::Instrument;
 
 use self::filter::{RuntimeFilterBuildInput, RuntimeFilterSet};
@@ -35,7 +35,6 @@ use common::protocol::{
     DataSink, DataSource, ExecuteTask, JoinPlan, PhysicalPlanNode, PhysicalPlanOperator,
     PipelineBoundaryKind,
 };
-use common::statistics::QueryStatisticsContext;
 use error::VeinError;
 
 #[cfg(test)]
@@ -49,18 +48,19 @@ mod result;
 pub use result::{TaskMetrics, TaskResult};
 
 mod resources;
-pub use resources::QueryExecutionResources;
+pub use resources::{QueryExecutionGuard, QueryExecutionResources, QueryStatus, QueryProgress};
 
 mod dependency_guard;
 mod join_utils;
 mod schedule;
 pub(crate) use crate::operators::source::scan::split_scan_by_file;
 use dependency_guard::PipelineDependencyGuard;
-use join_utils::{join_keys, join_outputs, join_type, join_types};
 use filter::lineage::direct_scan_probe_columns;
+use join_utils::{join_keys, join_outputs, join_type, join_types};
 use schedule::PipelineExecutionSchedule;
 
 mod builder;
+mod pipeline_provider;
 pub mod checkpoint;
 pub use builder::ExecutorBuilder;
 mod task_executor;

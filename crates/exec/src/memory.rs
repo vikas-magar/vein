@@ -16,6 +16,8 @@ use common::cancellation::CancellationToken;
 use error::VeinError;
 use crate::spill::{SpillManager, SpillStorage};
 
+pub(crate) mod batch;
+
 /// Per-execution budgets shared by all blocking operators.
 ///
 /// These limits cover memory reservations and bytes written to temporary spill

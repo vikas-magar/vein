@@ -27,7 +27,7 @@ pub(super) async fn stat(
             provider_version: metadata.version().map(Arc::<str>::from),
             last_modified: metadata
                 .last_modified()
-                .and_then(|time| StorageTimestamp::from_system_time(time.into())),
+                .map(|time| StorageTimestamp::from_unix_nanos(time.into_inner().as_nanosecond())),
         },
     })
 }

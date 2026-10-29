@@ -24,28 +24,27 @@ impl AggregateSink {
     }
 
     /// Collects finished output views for callers that need an owned result list.
-    pub fn finish(&mut self) -> Result<Vec<DataChunkView>> {
+    pub async fn finish(&mut self) -> Result<Vec<DataChunkView>> {
         let mut output = Vec::new();
         self.finish_with(AGGREGATE_BATCH_ROWS, |batch| {
             output.push(batch);
             Ok(())
-        })?;
+        }).await?;
         Ok(output)
     }
 
     /// Emits bounded output views while retaining only the aggregate state.
-    /// The callback runs synchronously for each chunk and can stop emission by
-    /// returning an error.
-    pub fn finish_with(
+    /// Delivery may suspend between batches and stops on the first error.
+    pub async fn finish_with(
         &mut self,
         batch_rows: NonZeroUsize,
-        mut emit: impl FnMut(DataChunkView) -> Result<()>,
+        mut emit: impl crate::pipeline::delivery::BatchConsumer,
     ) -> Result<()> {
         if !self.distinct_collectors.is_empty() {
-            self.finish_distinct_counts(batch_rows)?;
+            Box::pin(self.finish_distinct_counts(batch_rows)).await?;
         }
         if self.spill_runs.is_empty() {
-            return self.finish_in_memory_view_with(batch_rows, &mut emit);
+            return self.finish_in_memory_view_with(batch_rows, &mut emit).await;
         }
         self.flush_current_run()?;
         let runs = std::mem::take(&mut self.spill_runs);
@@ -56,7 +55,7 @@ impl AggregateSink {
             schema: &self.spill_schema,
             batch_rows,
         };
-        Self::finish_spill_partition_view(&context, runs, 0, &mut emit)
+        Self::finish_spill_partition_view(&context, runs, 0, &mut emit).await
     }
 
     pub(super) fn ensure_empty_groups(&mut self) -> Result<()> {

@@ -26,8 +26,13 @@ impl BuiltinState {
 
 macro_rules! update {
     ($states:expr, $array:ty, $input:expr, $groups:expr, $convert:expr) => {
-        update_values::<_, $array, _>($states, $input, $groups, $convert)
+        update_values::<_, $array, _>($states, $input, $groups, infallible::<_, $array, _>($convert))
     };
+}
+
+fn infallible<T, A, V: FnMut(&A, usize) -> T>(mut value: V)
+    -> impl FnMut(&A, usize) -> Result<T> {
+    move |array, row| Ok(value(array, row))
 }
 
 fn validate_inputs(arguments: &[FunctionInput<'_>], group_ids: &[usize]) -> Result<()> {
@@ -106,6 +111,9 @@ fn update_numeric_state(
         (BuiltinState::Int128(states), DataType::Int16) => update!(states, Int16Array, input, groups, |a, r| i128::from(a.value(r))),
         (BuiltinState::Int128(states), DataType::Int32) => update!(states, Int32Array, input, groups, |a, r| i128::from(a.value(r))),
         (BuiltinState::Int128(states), DataType::Int64) => update!(states, Int64Array, input, groups, |a, r| i128::from(a.value(r))),
+        (BuiltinState::Int128(states), DataType::Decimal256(_, 0)) =>
+            update_values::<_, Decimal256Array, _>(states, input, groups,
+                |array, row| types::wide_integer::decode(array.value(row))),
         (BuiltinState::UInt64(states), DataType::UInt8) => update!(states, UInt8Array, input, groups, |a, r| u64::from(a.value(r))),
         (BuiltinState::UInt64(states), DataType::UInt16) => update!(states, UInt16Array, input, groups, |a, r| u64::from(a.value(r))),
         (BuiltinState::UInt64(states), DataType::UInt32) => update!(states, UInt32Array, input, groups, |a, r| u64::from(a.value(r))),
@@ -135,7 +143,7 @@ fn update_values<T, A, V>(
 where
     T: AggregateNumber,
     A: Array + 'static,
-    V: FnMut(&A, usize) -> T,
+    V: FnMut(&A, usize) -> Result<T>,
 {
     let mut start = 0;
     while start < groups.len() {
@@ -146,7 +154,7 @@ where
             })?;
             for local in 0..segment.len() {
                 let row = if segment.is_scalar() { 0 } else { local };
-                let value = (!array.is_null(row)).then(|| value(array, row));
+                let value = if array.is_null(row) { None } else { Some(value(array, row)?) };
                 let group = groups[start + local];
                 states.get_mut(group)
                     .ok_or_else(|| VeinError::internal("aggregate group ID is out of bounds"))?

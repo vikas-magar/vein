@@ -1,4 +1,5 @@
 use arrow::array::new_null_array;
+use arrow::compute::cast;
 use arrow::compute::kernels::temporal::{DatePart, date_part};
 use arrow::datatypes::DataType;
 use error::{Result, VeinError};
@@ -19,7 +20,7 @@ impl ScalarFunction for ExtractFunction {
                 None,
             ));
         }
-        Ok(DataType::Int32)
+        Ok(DataType::Int64)
     }
 
     fn invoke(
@@ -38,9 +39,12 @@ impl ScalarFunction for ExtractFunction {
             let Some(array) = input.array() else {
                 return Ok(new_null_array(return_type, segment_rows));
             };
-            date_part(array, self.part).map_err(|error| {
+            let parts = date_part(array, self.part).map_err(|error| {
                 VeinError::internal(format!("EXTRACT field {:?} failed: {error}", self.part))
-            })
+            })?;
+            // Arrow computes calendar parts as Int32. Widen the derived result,
+            // never the retained input, to the SQL integer result contract.
+            cast(&parts, return_type).map_err(Into::into)
         })
     }
 }

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use common::time::Instant;
 
 use arrow::array::Array;
 use arrow::datatypes::Schema;

@@ -2,7 +2,7 @@
 
 mod state;
 
-use arrow::datatypes::DataType;
+use types::VeinDataType;
 use error::{Result, VeinError};
 
 use super::{AggregateAccumulator, AggregateFunction, AggregateOperation};
@@ -20,9 +20,9 @@ impl BuiltinAggregate {
 }
 
 impl AggregateFunction for BuiltinAggregate {
-    fn return_type(&self, argument_types: &[DataType]) -> Result<DataType> {
+    fn return_type(&self, argument_types: &[VeinDataType]) -> Result<VeinDataType> {
         if self.operation == AggregateOperation::Count {
-            return Ok(DataType::Int64);
+            return Ok(VeinDataType::Int64);
         }
         let [argument] = argument_types else {
             return Err(VeinError::planning(
@@ -33,7 +33,7 @@ impl AggregateFunction for BuiltinAggregate {
         if self.operation == AggregateOperation::SingleValue {
             return Ok(argument.clone());
         }
-        let input = types::VeinDataType::try_from(argument)?;
+        let input = argument.clone();
         let fallback = if self.operation == AggregateOperation::Avg {
             types::VeinDataType::Float64
         } else {
@@ -43,14 +43,13 @@ impl AggregateFunction for BuiltinAggregate {
             self.operation.name(),
             Some(&input),
             fallback,
-        )
-            .to_arrow())
+        ))
     }
 
     fn create_accumulator(
         &self,
-        argument_types: &[DataType],
-        result_type: &DataType,
+        argument_types: &[VeinDataType],
+        result_type: &VeinDataType,
     ) -> Result<Box<dyn AggregateAccumulator>> {
         Ok(Box::new(state::BuiltinAccumulator::new(
             self.operation.clone(),

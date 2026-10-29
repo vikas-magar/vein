@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn shared_build_sink_combines_unlimited_worker_tables_without_copying_payloads() {
+#[tokio::test]
+async fn shared_build_sink_combines_unlimited_worker_tables_without_copying_payloads() {
     use arrow::array::Int64Array;
 
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
@@ -33,10 +33,10 @@ fn shared_build_sink_combines_unlimited_worker_tables_without_copying_payloads()
         Arc::clone(&second_payload),
     ]);
 
-    first.push(first_view).expect("insert first worker chunk");
-    second.push(second_view).expect("insert second worker chunk");
-    first.flush().expect("finish first worker table");
-    second.flush().expect("finish second worker table");
+    first.push(first_view).await.expect("insert first worker chunk");
+    second.push(second_view).await.expect("insert second worker chunk");
+    first.flush().await.expect("finish first worker table");
+    second.flush().await.expect("finish second worker table");
     first
         .combine_local(&mut canonical)
         .expect("merge first worker table");
@@ -84,8 +84,8 @@ fn shared_build_sink_combines_unlimited_worker_tables_without_copying_payloads()
     assert_eq!(payloads, vec![20, 21]);
 }
 
-#[test]
-fn shared_build_sink_keeps_bounded_memory_on_the_spill_safe_serial_path() {
+#[tokio::test]
+async fn shared_build_sink_keeps_bounded_memory_on_the_spill_safe_serial_path() {
     let tracker = QueryMemoryTracker::new(
         1 << 20,
         common::cancellation::CancellationToken::new(),

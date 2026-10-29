@@ -1,17 +1,17 @@
 //! Linear pipeline builder abstraction: translates unbroken operator sequences into a single [`Stage`].
 
 use crate::compiler::PipelineCompiler;
+use crate::pipeline_graph::DerivedPipelineGraph;
 use crate::stage::Stage;
 use crate::task::Task;
-use crate::pipeline_graph::DerivedPipelineGraph;
 use common::Result;
 use common::identifiers::{PartitionId, StageId, TaskId};
 use common::protocol::{
     DataSink, DataSource, ExpressionProgram, PhysicalPlan, PhysicalPlanNode, PhysicalPlanOperator,
 };
 use error::VeinError;
-use plan::schema::VeinSchema;
 use plan::LogicalPlan;
+use plan::schema::VeinSchema;
 use std::sync::Arc;
 
 mod join_keys;
@@ -19,11 +19,14 @@ mod join_layout;
 mod join_lowering;
 mod node_lowering;
 mod statistics;
+mod extensions;
+mod name;
+use name::logical_node_name;
 
-use join_keys::{extract_equi_join_keys, flatten_conjunction, join_kind};
-use join_layout::{available_join_outputs, position};
 #[cfg(test)]
 use join_keys::equality_keys;
+use join_keys::{extract_equi_join_keys, flatten_conjunction, join_kind};
+use join_layout::{available_join_outputs, position};
 
 /// Trait for lowering supported logical plans into physical [`Stage`]s.
 pub trait PipelineStageBuilder: Send + Sync {
@@ -46,12 +49,14 @@ pub trait PipelineStageBuilder: Send + Sync {
 #[derive(Default, Clone)]
 pub struct DefaultPipelineStageBuilder {
     statistics: Option<Arc<dyn optimizer::StatisticsProvider>>,
+    extensions: Arc<[Arc<dyn crate::builder::extension::PhysicalExtensionLowerer>]>,
 }
 
 impl std::fmt::Debug for DefaultPipelineStageBuilder {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("DefaultPipelineStageBuilder")
-            .field("query_statistics", &self.statistics.is_some()).finish()
+            .field("query_statistics", &self.statistics.is_some())
+            .field("extension_lowerers", &self.extensions.len()).finish()
     }
 }
 
@@ -62,41 +67,11 @@ impl DefaultPipelineStageBuilder {
     }
 }
 
-pub(super) fn logical_node_name(plan: &LogicalPlan) -> &'static str {
-    match plan {
-        LogicalPlan::Scan { .. } => "scan",
-        LogicalPlan::ExternalScan { .. } => "external scan",
-        LogicalPlan::Intermediate { .. } => "intermediate relation",
-        LogicalPlan::Filter { .. } => "filter",
-        LogicalPlan::Project { .. } => "projection",
-        LogicalPlan::Aggregate { .. } => "aggregate",
-        LogicalPlan::Window { .. } => "window",
-        LogicalPlan::Join { .. } => "join",
-        LogicalPlan::Sort { .. } => "sort",
-        LogicalPlan::Limit { .. } => "limit",
-        LogicalPlan::Distinct { .. } => "distinct",
-        LogicalPlan::SubqueryAlias { .. } => "subquery alias",
-        LogicalPlan::Explain { .. } => "explain",
-        LogicalPlan::SetOp { .. } => "set operation",
-        LogicalPlan::Sample { .. } => "sample",
-        LogicalPlan::Assert { .. } => "assert",
-        LogicalPlan::Pivot { .. } => "pivot",
-        LogicalPlan::Unpivot { .. } => "unpivot",
-        LogicalPlan::Fork { .. } => "fork",
-        LogicalPlan::Tee { .. } => "tee",
-        LogicalPlan::SemanticFilter { .. } => "semantic filter",
-        LogicalPlan::SemanticJoin { .. } => "semantic join",
-        LogicalPlan::SemanticCalibrate { .. } => "semantic calibration",
-        LogicalPlan::Write { .. } => "write",
-        LogicalPlan::Call { .. } => "call",
-    }
-}
-
 
 impl PipelineStageBuilder for DefaultPipelineStageBuilder {
     fn build_with_statistics(&self, plan: &LogicalPlan,
                              statistics: Arc<common::statistics::QueryStatisticsContext>) -> Result<Stage> {
-        Self { statistics: Some(Arc::new(optimizer::QueryStatisticsProvider::new(statistics))) }.build(plan)
+        Self { statistics: Some(Arc::new(optimizer::QueryStatisticsProvider::new(statistics))), extensions: Arc::clone(&self.extensions) }.build(plan)
     }
     fn build(&self, plan: &LogicalPlan) -> Result<Stage> {
         let (input, sink) = match plan {
@@ -142,6 +117,10 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
             }
             _ => {
                 let (input, schema) = self.lower_node(plan)?;
+                if matches!(&input.operator, PhysicalPlanOperator::Extension { descriptor, .. }
+                    if descriptor.role == common::protocol::extension::OperatorRole::Sink) {
+                    return self.build_canonical(PhysicalPlan { root: input });
+                }
                 (
                     input,
                     DataSink::Client {
@@ -164,18 +143,7 @@ impl PipelineStageBuilder for DefaultPipelineStageBuilder {
                 sink: Arc::clone(&sink),
             },
         });
-        let pipeline_graph = DerivedPipelineGraph::derive(&PhysicalPlan {
-            root: Arc::clone(&canonical_root),
-        })?;
-        Ok(Stage::new(StageId::new())
-            .with_pipeline_graph(pipeline_graph)
-            .with_task(Task::new(
-                TaskId::new(),
-                PartitionId::from_raw(0),
-                PhysicalPlan {
-                    root: canonical_root,
-                },
-            )))
+        self.build_canonical(PhysicalPlan { root: canonical_root })
     }
 
     fn compile_pipeline(

@@ -15,10 +15,11 @@ arrow-row = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+async-stream = "0.3"
 tracing = { workspace = true }
 types = { path = "../types" }
 functions = { path = "../functions" }
-storage = { path = "../storage" }
+storage = { path = "../storage", default-features = false }
 flume = "0.12.0"
 
 [target.'cfg(unix)'.dependencies]
@@ -26,3 +27,4 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+storage = { path = "../storage", features = ["opendal-fs"] }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 use binder::LogicalBinder;
 use common::identifiers::RequestId;
@@ -162,18 +162,18 @@ impl LocalQueryEngine {
             "prepare_finished"
         );
 
+        let first = tasks.first().ok_or_else(|| VeinError::internal("physical query has no tasks"))?;
+        let resources = self.executor.create_query_resources(first, common::cancellation::CancellationToken::new())?;
         Ok(LocalQuery {
             tasks,
             executor: self.executor.clone(),
-            statistics_context,
+            scope: resources.guard(),
             logical_plan,
             is_write,
             adaptive_checkpoint: adaptive_scan,
             adaptive_policy: Arc::clone(&self.adaptive_policy),
             optimizer: Arc::clone(&self.optimizer),
             planner: Arc::clone(&self.planner),
-            request_id,
-            query_id,
         })
     }
 }

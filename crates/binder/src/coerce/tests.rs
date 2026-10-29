@@ -2,6 +2,8 @@ use super::*;
 use error::VeinError;
 use plan::LogicalLiteral;
 
+mod multiplication;
+
 fn lit(t: VeinDataType) -> LogicalExpr {
     LogicalExpr::Literal(LogicalLiteral::Null(t))
 }

@@ -5,7 +5,6 @@ mod executor;
 mod source;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::expression::eval::ExpressionKernelProvider;
@@ -15,7 +14,7 @@ use crate::runtime::filter::{RuntimeFilterDecisionPolicy, RuntimeFilterFactory};
 use catalog::MetadataStore;
 use common::statistics::RuntimeStatisticsStore;
 use functions::FunctionRegistry;
-use storage::{ReadStorage, ReadStorageFactory};
+use storage::{ReadStorage, ReadStorageFactory, StorageLocation};
 
 /// Maximum number of root-scoped read handles retained by one executor.
 const STORAGE_HANDLE_CACHE_CAPACITY: usize = 64;
@@ -31,5 +30,5 @@ pub struct DefaultExecutorBuilder {
     runtime_statistics: RuntimeStatisticsStore,
     scan_providers: ScanProviderRegistry,
     read_storage_factory: Option<Arc<dyn ReadStorageFactory>>,
-    storages: Mutex<HashMap<PathBuf, Arc<dyn ReadStorage>>>,
+    storages: Mutex<HashMap<StorageLocation, Arc<dyn ReadStorage>>>,
 }

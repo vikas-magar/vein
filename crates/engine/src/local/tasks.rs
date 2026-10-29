@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use common::Result;
-use common::cancellation::CancellationToken;
 use common::protocol::ExecuteTask;
 use common::statistics::QueryStatisticsContext;
 use exec::pipeline::DataChunkView;
 use exec::runtime::TaskExecutor;
+use futures::FutureExt;
 
 pub(super) fn tasks_from_job(
     job: physical::Job,
@@ -36,26 +36,19 @@ pub(super) async fn run_task(
     senders: &[Mutex<Option<flume::Sender<DataChunkView>>>],
     outcomes: &Mutex<Vec<Option<Result<()>>>>,
     index: usize,
-    resources: Option<Arc<exec::runtime::QueryExecutionResources>>,
+    resources: Arc<exec::runtime::QueryExecutionResources>,
 ) {
     let Some(sender) = senders[index].lock().ok().and_then(|mut slot| slot.take()) else {
         return;
     };
-    let outcome = match resources {
-        Some(resources) => executor
-            .execute_streaming_with_resources(
-                task,
-                CancellationToken::new(),
-                sender.clone(),
-                resources,
-            )
-            .await
-            .map(|_| ()),
-        None => executor
-            .execute_streaming(task, CancellationToken::new(), sender.clone())
-            .await
-            .map(|_| ()),
-    };
+    let execution =
+        executor.execute_streaming_with_resources(task, sender.clone(), Arc::clone(&resources));
+    let outcome = std::panic::AssertUnwindSafe(execution)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(common::VeinError::internal("query task panicked")))
+        .map(|_| ());
+    let outcome = outcome.map_err(|error| common::VeinError::from_shared(resources.fail_query(error)));
     if let Ok(mut outcomes) = outcomes.lock()
         && let Some(slot) = outcomes.get_mut(index)
     {

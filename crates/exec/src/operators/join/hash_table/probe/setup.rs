@@ -1,9 +1,10 @@
 use super::*;
 
-impl<'a> HashProbe<'a> {
-    pub(crate) fn new(table: &'a HashTable, view: &'a DataChunkView, existence: bool) -> Result<Self> {
+impl<T, V> HashProbe<T, V>
+where T: std::ops::Deref<Target=HashTable>, V: std::ops::Deref<Target=DataChunkView> {
+    pub(crate) fn new(table: T, view: V, existence: bool) -> Result<Self> {
         u32::try_from(view.num_rows()).map_err(|_| VeinError::internal("join probe row-index overflow"))?;
-        let (keys, key_access_us) = ChunkKeys::resolve_view(&table.probe_keys, view)?;
+        let (keys, key_access_us) = ChunkKeys::resolve_view(&table.probe_keys, &view)?;
         let bytes = view.num_rows().checked_mul(size_of::<bool>())
             .and_then(|bytes| bytes.checked_add(keys.metadata_bytes()))
             .ok_or_else(|| VeinError::internal("join probe workspace overflow"))?;

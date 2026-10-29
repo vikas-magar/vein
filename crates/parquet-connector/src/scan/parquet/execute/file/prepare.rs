@@ -29,7 +29,7 @@ pub(super) struct PreparedScan {
     pub(super) bytes_before_file: u64,
     pub(super) file_size_bytes: u64,
     pub(super) stat_us: u64,
-    pub(super) metadata_started: std::time::Instant,
+    pub(super) metadata_started: common::time::Instant,
     pub(super) footer_hit: bool,
     pub(super) detailed_metrics_enabled: bool,
 }

@@ -3,6 +3,10 @@ name = "parquet-connector"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["zstd"]
+zstd = ["parquet/zstd"]
+
 [dependencies]
 catalog = { path = "../catalog" }
 common = { path = "../common" }
@@ -19,7 +23,7 @@ parquet = { workspace = true }
 plan = { path = "../plan" }
 serde = { workspace = true }
 serde_json = "1.0"
-storage = { path = "../storage" }
+storage = { path = "../storage", default-features = false }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
@@ -29,3 +33,4 @@ libc = "0.2"
 [dev-dependencies]
 arrow = { workspace = true }
 tempfile = "3"
+storage = { path = "../storage", features = ["opendal-fs"] }

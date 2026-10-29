@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn accumulation_reads_only_selected_physical_rows() {
+#[tokio::test]
+async fn accumulation_reads_only_selected_physical_rows() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -20,7 +20,7 @@ fn accumulation_reads_only_selected_physical_rows() {
         ],
         SelectionVector::new_sparse(vec![1, 3]),
     );
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(chunk).unwrap();
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
@@ -28,16 +28,16 @@ fn accumulation_reads_only_selected_physical_rows() {
         Arc::new(Int64Array::from(vec![3, 5])),
     ]))
         .unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
 
     let keys = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0);
-    let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 1);
+    let sums = int128_column(&output[0], 1);
     assert_eq!(keys.values(), &[20, 40, 50]);
     assert_eq!(sums.values(), &[203, 400, 5]);
 }
 
-#[test]
-fn empty_global_aggregate_emits_count_zero_and_null_sum() {
+#[tokio::test]
+async fn empty_global_aggregate_emits_count_zero_and_null_sum() {
     let plan = AggregatePlan {
         groups: 0,
         estimated_groups: None,
@@ -51,10 +51,10 @@ fn empty_global_aggregate_emits_count_zero_and_null_sum() {
         Arc::new(Int64Array::from(Vec::<i64>::new())),
         Arc::new(Float64Array::from(Vec::<f64>::new())),
     ]);
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(chunk).unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
 
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].num_rows(), 1);
@@ -64,8 +64,8 @@ fn empty_global_aggregate_emits_count_zero_and_null_sum() {
     assert!(sum.is_null(0));
 }
 
-#[test]
-fn zero_column_distinct_emits_one_row_only_for_nonempty_input() {
+#[tokio::test]
+async fn zero_column_distinct_emits_one_row_only_for_nonempty_input() {
     let distinct_plan = || AggregatePlan {
         groups: 0,
         estimated_groups: None,
@@ -77,21 +77,21 @@ fn zero_column_distinct_emits_one_row_only_for_nonempty_input() {
     };
 
     let mut empty = AggregateSink::new(distinct_plan()).expect("create empty distinct sink");
-    assert!(empty.finish().expect("finish empty distinct").is_empty());
+    assert!(empty.finish().await.expect("finish empty distinct").is_empty());
 
     let mut nonempty = AggregateSink::new(distinct_plan()).expect("create distinct sink");
     nonempty
         .accumulate(crate::pipeline::test_support::selected_view(Vec::new(), SelectionVector::new_dense(4)))
         .expect("accumulate zero-column input rows");
-    let output = nonempty.finish().expect("finish distinct");
+    let output = nonempty.finish().await.expect("finish distinct");
 
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].num_columns(), 0);
     assert_eq!(output[0].num_rows(), 1);
 }
 
-#[test]
-fn empty_global_average_uses_its_declared_input_type() {
+#[tokio::test]
+async fn empty_global_average_uses_its_declared_input_type() {
     let plan = AggregatePlan {
         groups: 0,
         estimated_groups: None,
@@ -102,10 +102,10 @@ fn empty_global_average_uses_its_declared_input_type() {
         types: vec![VeinDataType::Float64],
     };
     let chunk = crate::pipeline::test_support::dense_view(vec![Arc::new(Float32Array::from(Vec::<f32>::new()))]);
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(chunk).unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let average = crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0);
 
     assert!(average.is_null(0));

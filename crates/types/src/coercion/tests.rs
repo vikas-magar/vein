@@ -3,6 +3,8 @@ use arrow::array::new_null_array;
 use arrow::compute::kernels::numeric;
 use arrow::datatypes::TimeUnit;
 
+mod multiplication;
+
 #[test]
 fn unifies_numeric_types_symmetrically() {
     assert_eq!(

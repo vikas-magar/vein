@@ -4,7 +4,7 @@ use std::any::Any;
 use std::ops::Range;
 
 use arrow::array::ArrayRef;
-use arrow::datatypes::DataType;
+use types::VeinDataType;
 use error::Result;
 
 use crate::FunctionInput;
@@ -12,13 +12,13 @@ use crate::FunctionInput;
 /// Creates typed accumulator state for one aggregate call.
 pub trait AggregateFunction: Send + Sync {
     /// Infers the result type from the bound input types.
-    fn return_type(&self, argument_types: &[DataType]) -> Result<DataType>;
+    fn return_type(&self, argument_types: &[VeinDataType]) -> Result<VeinDataType>;
 
     /// Creates empty state sized by later calls to `ensure_groups`.
     fn create_accumulator(
         &self,
-        argument_types: &[DataType],
-        result_type: &DataType,
+        argument_types: &[VeinDataType],
+        result_type: &VeinDataType,
     ) -> Result<Box<dyn AggregateAccumulator>>;
 }
 

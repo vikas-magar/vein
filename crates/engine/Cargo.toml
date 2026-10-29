@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arrow = { workspace = true }
 binder = { path = "../binder" }
 catalog = { path = "../catalog" }
 common = { path = "../common" }
@@ -14,14 +15,17 @@ optimizer = { path = "../optimizer" }
 parser = { path = "../parser" }
 physical = { path = "../physical" }
 plan = { path = "../plan" }
-storage = { path = "../storage" }
+storage = { path = "../storage", default-features = false }
 async-stream = "0.3"
 flume = "0.12"
 futures = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing = { workspace = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
 [dev-dependencies]
-arrow = { workspace = true }
+types = { path = "../types" }
 async-trait.workspace = true
 tempfile = "3"
+storage = { path = "../storage", features = ["opendal-fs"] }

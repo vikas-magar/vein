@@ -42,7 +42,7 @@ pub(super) async fn load(
     summary: &mut PruningSummary,
 ) -> DictionaryLoad {
     let mut metrics = DictionaryLoadMetrics::default();
-    let load_started = std::time::Instant::now();
+    let load_started = common::time::Instant::now();
     let mut reader = if inputs.dictionary_predicates.is_empty() || selections.is_empty() {
         None
     } else {

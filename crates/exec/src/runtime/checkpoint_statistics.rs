@@ -16,9 +16,9 @@ impl IntermediateRelation {
         let tracker = self.tracker.clone();
         let span = tracing::Span::current();
 
-        tokio::task::spawn_blocking(move || {
+        common::runtime::run_blocking(move || {
             let _entered = span.enter();
-            let started = std::time::Instant::now();
+            let started = common::time::Instant::now();
             let (statistics, batches) = collect_from_source(
                 &mut source, statistics_schema, expected_rows, &tracker, workers,
             )?;
@@ -35,7 +35,6 @@ impl IntermediateRelation {
             Ok(Arc::new(statistics))
         })
             .await
-            .map_err(|error| VeinError::internal(format!("checkpoint statistics task failed: {error}")))?
     }
 }
 
@@ -56,6 +55,7 @@ pub(super) fn statistics_schema(
 }
 
 fn worker_count(source: &IntermediateRelationSource) -> usize {
+    if cfg!(target_arch = "wasm32") { return 1; }
     let available = thread::available_parallelism().map_or(1, |count| count.get());
     match &source.input {
         CheckpointInput::Memory(batches) => available.min(batches.len()).max(1),
@@ -70,6 +70,7 @@ pub(super) fn collect_from_source(
     tracker: &QueryMemoryTracker,
     workers: usize,
 ) -> Result<(catalog::TableStatistics, usize)> {
+    let workers = if cfg!(target_arch = "wasm32") { 1 } else { workers };
     if workers <= 1 {
         let mut collector = common::statistics::StatisticsCollector::new(
             schema, common::statistics::StatisticsConfig::default(),

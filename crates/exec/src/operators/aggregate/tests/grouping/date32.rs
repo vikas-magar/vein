@@ -10,27 +10,27 @@ fn date_sum_plan() -> AggregatePlan {
         emit_empty_group_on_empty_input: false,
         aggs: vec![AggOpCode::Sum],
         aggregate_input_types: vec![VeinDataType::Int64],
-        types: vec![VeinDataType::Date32, VeinDataType::Int64],
+        types: vec![VeinDataType::Date32, VeinDataType::int128()],
     }
 }
 
-fn collect_date_sums(
+async fn collect_date_sums(
     sink: &mut AggregateSink,
-) -> Result<std::collections::BTreeMap<Option<i32>, i64>> {
+) -> Result<std::collections::BTreeMap<Option<i32>, i128>> {
     let mut groups = std::collections::BTreeMap::new();
-    sink.finish_with(AGGREGATE_BATCH_ROWS, |batch| {
+    sink.finish_with(AGGREGATE_BATCH_ROWS, |batch: DataChunkView| {
         let dates = crate::pipeline::test_support::materialized_column::<Date32Array>(&batch, 0);
-        let sums = crate::pipeline::test_support::materialized_column::<Int64Array>(&batch, 1);
+        let sums = int128_column(&batch, 1);
         for row in 0..batch.num_rows() {
             groups.insert(dates.is_valid(row).then(|| dates.value(row)), sums.value(row));
         }
         Ok(())
-    })?;
+    }).await?;
     Ok(groups)
 }
 
-#[test]
-fn date32_group_keys_preserve_nulls_and_merge_repeated_values_across_batches() {
+#[tokio::test]
+async fn date32_group_keys_preserve_nulls_and_merge_repeated_values_across_batches() {
     let mut sink = AggregateSink::new(date_sum_plan()).expect("create aggregate sink");
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Date32Array::from(vec![Some(10), None, Some(20), Some(10)])),
@@ -44,7 +44,7 @@ fn date32_group_keys_preserve_nulls_and_merge_repeated_values_across_batches() {
         .expect("accumulate repeated date keys");
 
     assert_eq!(
-        collect_date_sums(&mut sink).expect("finish date aggregate"),
+        collect_date_sums(&mut sink).await.expect("finish date aggregate"),
         std::collections::BTreeMap::from([
             (None, 8),
             (Some(10), 5),
@@ -54,8 +54,8 @@ fn date32_group_keys_preserve_nulls_and_merge_repeated_values_across_batches() {
     );
 }
 
-#[test]
-fn date32_group_keys_survive_aggregate_spill_and_merge() {
+#[tokio::test]
+async fn date32_group_keys_survive_aggregate_spill_and_merge() {
     let tracker = QueryMemoryTracker::new(
         32 * 1024,
         common::cancellation::CancellationToken::new(),
@@ -71,7 +71,7 @@ fn date32_group_keys_survive_aggregate_spill_and_merge() {
         .expect("spill date groups under the small memory budget");
     assert!(!sink.spill_runs.is_empty(), "date groups must exercise spill");
 
-    let actual = collect_date_sums(&mut sink).expect("merge spilled date groups");
+    let actual = collect_date_sums(&mut sink).await.expect("merge spilled date groups");
     assert_eq!(actual.len(), 257);
     for (date, sum) in actual {
         let key = i64::from(date.expect("test data has no null dates"));
@@ -79,6 +79,6 @@ fn date32_group_keys_survive_aggregate_spill_and_merge() {
             .filter(|row| row % 257 == key)
             .map(|row| row + 1)
             .sum::<i64>();
-        assert_eq!(sum, expected, "wrong sum for date key {key}");
+        assert_eq!(sum, i128::from(expected), "wrong sum for date key {key}");
     }
 }

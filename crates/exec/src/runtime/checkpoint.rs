@@ -345,8 +345,9 @@ pub struct IntermediateRelationSink {
     rows: u64,
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for IntermediateRelationSink {
-    fn push(&mut self, batch: DataChunkView) -> Result<()> {
+    async fn push(&mut self, batch: DataChunkView) -> Result<()> {
         let rows = u64::try_from(batch.num_rows())
             .map_err(|_| VeinError::internal("intermediate relation row count overflow"))?;
         let next_rows = self.rows.checked_add(rows)
@@ -356,7 +357,7 @@ impl PipelineNode for IntermediateRelationSink {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         self.relation.seal()?;
         self.sealed = true;
         Ok(())
@@ -391,17 +392,22 @@ pub struct IntermediateRelationSource {
 
 impl IntermediateRelationSource {
     fn for_each_batch(&mut self, mut visit: impl FnMut(DataChunkView) -> Result<()>) -> Result<()> {
+        for batch in self.batches()? {
+            visit(batch?)?;
+        }
+        Ok(())
+    }
+
+    fn batches(&self) -> Result<Box<dyn Iterator<Item = Result<DataChunkView>> + Send + '_>> {
         match &self.input {
             CheckpointInput::Memory(batches) => {
-                for batch in batches.iter() {
-                    visit(batch.clone())?;
-                }
+                Ok(Box::new(batches.iter().cloned().map(Ok)))
             }
             CheckpointInput::Spill(run) => {
-                let mut reader = FileReader::try_new(run.open()?, None).map_err(|error| {
+                let reader = FileReader::try_new(run.open()?, None).map_err(|error| {
                     VeinError::internal(format!("open intermediate IPC relation: {error}"))
                 })?;
-                for batch in &mut reader {
+                Ok(Box::new(reader.map(|batch| {
                     let batch = batch.map_err(|error| {
                         VeinError::internal(format!("read intermediate IPC relation: {error}"))
                     })?;
@@ -410,19 +416,21 @@ impl IntermediateRelationSource {
                             "intermediate IPC relation schema changed while reading",
                         ));
                     }
-                    visit(crate::pipeline::arrow_adapter::from_record_batch(batch)?)?;
-                }
+                    crate::pipeline::arrow_adapter::from_record_batch(batch)
+                })))
             }
         }
-        Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl Source for IntermediateRelationSource {
     async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()> {
-        self.for_each_batch(|view| next.push(view))?;
-        next.flush()
+        for batch in self.batches()? {
+            if next.finished() { break; }
+            next.push(batch?).await?;
+        }
+        next.flush().await
     }
 }
 

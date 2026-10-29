@@ -1016,12 +1016,13 @@ mod tests {
             schema,
         };
 
-        // A join is planned now, so the blanket refusal must be gone. These mock
-        // inputs still cannot compile into a source, so this fails — but for a
-        // reason, not because joins are unsupported.
+        // Reject the missing condition without refusing supported joins or
+        // manufacturing a distributed shuffle stage.
         let error = DefaultPhysicalPlanner::new()
             .create_physical_plan(RequestId::new(), join)
             .expect_err("the mock join cannot execute");
+
+        assert!(error.to_string().contains("requires ON or USING"), "{error}");
 
         assert!(
             !error.to_string().contains("JOIN is not supported"),

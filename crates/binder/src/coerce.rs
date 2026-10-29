@@ -6,7 +6,7 @@
 //! unifiable pair is handled here, every non-unifiable pair surfaces as a
 //! `Semantic` error instead of a silent type lie.
 
-use error::Result;
+use error::{Result, VeinError};
 use parser::ast::expr::BinaryOp;
 use plan::LogicalExpr;
 use types::{VeinDataType, unify_types};
@@ -92,12 +92,29 @@ pub fn coerce_arithmetic(
         return Ok((right, left, right_type));
     }
 
+    if op == BinaryOp::Multiply
+        && let Some((left_type, right_type)) =
+            types::coercion::decimal_multiplication_operands(&left_type, &right_type)
+    {
+        let result_type = types::coercion::decimal_arithmetic_result_type(
+            types::coercion::DecimalArithmeticOp::Multiply,
+            &left_type,
+            &right_type,
+        )?
+        .ok_or_else(|| VeinError::internal("decimal operands have no arithmetic result type"))?;
+        return Ok((
+            cast_to(left, left_type),
+            cast_to(right, right_type),
+            result_type,
+        ));
+    }
+
     let common_type = unify_types(&left_type, &right_type)?;
     if op == BinaryOp::Divide
-        && matches!(
+        && (common_type.is_int128() || matches!(
             &common_type,
             VeinDataType::Decimal128(_, _) | VeinDataType::Decimal256(_, _)
-        )
+        ))
     {
         let result_type = VeinDataType::Float64;
         return Ok((
@@ -107,8 +124,7 @@ pub fn coerce_arithmetic(
         ));
     }
 
-    let (left, right) =
-        coerce_to_common_type(left, right, &left_type, &right_type, &common_type);
+    let (left, right) = coerce_to_common_type(left, right, &left_type, &right_type, &common_type);
     let decimal_op = match op {
         BinaryOp::Plus => Some(types::coercion::DecimalArithmeticOp::Add),
         BinaryOp::Minus => Some(types::coercion::DecimalArithmeticOp::Subtract),
@@ -123,7 +139,7 @@ pub fn coerce_arithmetic(
             &left.data_type(),
             &right.data_type(),
         )?
-            .unwrap_or(common_type),
+        .unwrap_or(common_type),
         None => common_type,
     };
 

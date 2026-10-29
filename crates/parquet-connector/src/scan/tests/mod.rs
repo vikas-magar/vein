@@ -5,5 +5,6 @@ mod dictionary;
 mod row_group;
 mod runtime_filter;
 mod support;
+mod cursor;
 
 use support::{scan_over, write_parquet};

@@ -1,0 +1,15 @@
+.ide-execution-progress {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  margin-left: 6px; height: 24px; overflow: hidden;
+  color: var(--muted); pointer-events: none; font: 10px/1.4 var(--mono);
+}
+.ide-progress-pulse { width: 30px; height: 20px; flex-shrink: 0; overflow: visible; }
+.ide-progress-pulse path { fill: none; stroke-width: 9; stroke-linecap: round; stroke-linejoin: round; }
+.ide-pulse-base { stroke: var(--accent); opacity: .25; }
+.ide-pulse-flow { stroke: var(--accent-bright); stroke-dasharray: 28 72; animation: ide-heartbeat-flow 1.6s linear infinite; }
+.ide-progress-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ide-progress-percent { color: var(--ink); font-variant-numeric: tabular-nums; }
+@keyframes ide-heartbeat-flow { from { stroke-dashoffset: 100; } to { stroke-dashoffset: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .ide-pulse-flow { animation: none; stroke-dasharray: none; }
+}

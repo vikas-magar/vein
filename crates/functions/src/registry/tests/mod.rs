@@ -13,6 +13,16 @@ use crate::{
 
 mod aggregate;
 
+#[test]
+fn tooling_lists_the_registered_catalog_without_replacing_signatures() {
+    let registry = registry_with_identity();
+    let entries = registry.list();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, "identity");
+    let definition = registry.definition("identity").unwrap();
+    assert!(std::ptr::eq(entries[0].1, definition.signature()));
+}
+
 #[derive(Debug)]
 struct Identity;
 

@@ -2,18 +2,18 @@
 
 use std::sync::Arc;
 
+use crate::operators::source::scan::ScanWorkerState;
+use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
+use crate::runtime::filter::{
+    ConservativeRuntimeFilterPolicy, RuntimeFilterDecisionPolicy, RuntimeFilterFactory,
+    RuntimeFilterSet,
+};
+use crate::runtime::split_scan_by_file;
 use common::Result;
 use common::identifiers::TaskId;
 use common::protocol::{DataSink, DataSource, ExpressionProgram};
 use common::statistics::QueryStatisticsContext;
 use functions::FunctionRegistry;
-use crate::operators::source::scan::ScanWorkerState;
-use crate::pipeline::{DataChunkView, PipelineNode, Sink, Source, Transform};
-use crate::runtime::split_scan_by_file;
-use crate::runtime::filter::{
-    ConservativeRuntimeFilterPolicy, RuntimeFilterDecisionPolicy, RuntimeFilterFactory,
-    RuntimeFilterSet,
-};
 
 /// Builds pipeline stages for a task from the wire protocol.
 ///
@@ -21,6 +21,28 @@ use crate::runtime::filter::{
 /// [`Source`], [`Transform`], and [`Sink`] implementations are selected here
 /// from the self-contained task description a worker receives.
 pub trait ExecutorBuilder: Send + Sync {
+    /// Builds downstream-free expression processing using the registered kernels.
+    fn build_batch_processor(&self, _program: &Arc<ExpressionProgram>)
+        -> Result<Box<dyn crate::pipeline::resumable::BatchProcessor>> {
+        Err(common::VeinError::unsupported("batch expression processor is not configured", None))
+    }
+
+    /// Binds one built-in operator's shared state for its requested resumable phases.
+    fn prepare_pipeline_operator(
+        &self,
+        node: &Arc<common::protocol::PhysicalPlanNode>,
+        _metadata: Arc<crate::pipeline::resumable::OperatorMetadata>,
+        _phases: &[common::protocol::pipeline_graph::PipelinePhase],
+    ) -> Result<Arc<dyn crate::pipeline::resumable::executable::PipelineOperatorState>> {
+        Err(common::VeinError::unsupported(format!(
+            "resumable phases are not yet provided for '{}'", node.operator.data_flow().operator), None))
+    }
+
+    /// Extension factories supplied by the embedding application at startup.
+    fn operator_factory_registry(&self) -> Option<Arc<crate::pipeline::resumable::OperatorFactoryRegistry>> {
+        None
+    }
+
     /// Registry shared by scalar and aggregate execution for this executor.
     fn function_registry(&self) -> Option<Arc<FunctionRegistry>> {
         None

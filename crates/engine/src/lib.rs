@@ -4,3 +4,5 @@
 
 /// In-process query preparation and streaming execution.
 pub mod local;
+/// Client-neutral execution contracts and result ownership.
+pub mod query;

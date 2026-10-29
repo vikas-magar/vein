@@ -2,6 +2,7 @@ use super::*;
 
 mod merge;
 mod merge_state;
+mod local;
 
 impl AggregateSink {
     /// Returns the number of currently retained groups.

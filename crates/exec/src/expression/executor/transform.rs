@@ -1,15 +1,16 @@
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
 use common::Result;
-use common::protocol::{ExpressionProgram, ExpressionStep};
+use common::protocol::ExpressionProgram;
 use error::VeinError;
 use functions::FunctionRegistry;
 
-use crate::expression::eval::{ExpressionEvaluator, ExpressionKernelProvider};
+use crate::expression::eval::ExpressionKernelProvider;
 use crate::pipeline::{DataChunkView, PipelineNode, Transform};
 
-use super::{filter, projection};
+use super::ExpressionProcessor;
+use crate::pipeline::resumable::BatchProcessor;
 
 #[derive(Default)]
 struct ExecutionMetrics {
@@ -37,9 +38,7 @@ impl ExecutionMetrics {
 
 /// Executes a typed expression program directly over reference-backed views.
 pub(crate) struct ExpressionExecutor<K: ?Sized> {
-    program: Arc<ExpressionProgram>,
-    kernels: Arc<K>,
-    functions: Arc<FunctionRegistry>,
+    processor: ExpressionProcessor<K>,
     next: Box<dyn PipelineNode>,
     metrics: ExecutionMetrics,
 }
@@ -54,62 +53,32 @@ where
         functions: Arc<FunctionRegistry>,
         next: Box<dyn PipelineNode>,
     ) -> Self {
-        Self { program, kernels, functions, next, metrics: ExecutionMetrics::default() }
-    }
-
-    fn execute(&self, batch: DataChunkView) -> Result<Option<DataChunkView>> {
-        if batch.num_rows() == 0 {
-            return Ok(None);
-        }
-        let mut view = Arc::new(batch);
-        for step in &self.program.steps {
-            match step {
-                ExpressionStep::Filter(expression) => {
-                    let evaluator = ExpressionEvaluator::new(
-                        self.kernels.as_ref(), self.functions.as_ref(),
-                    );
-                    let predicate = evaluator.evaluate(expression, &view)?;
-                    filter::validate_rows(&predicate, view.num_rows())?;
-                    view = Arc::new(filter::apply(&view, &predicate)?);
-                }
-                ExpressionStep::Projection(expressions) => {
-                    view = Arc::new(projection::apply(
-                        &view, expressions, self.kernels.as_ref(), self.functions.as_ref(),
-                    )?);
-                }
-            }
-            if view.num_rows() == 0 {
-                return Ok(None);
-            }
-        }
-        Ok(Some(Arc::try_unwrap(view).unwrap_or_else(|view| view.as_ref().clone())))
+        Self { processor: ExpressionProcessor::new(program, kernels, functions), next, metrics: ExecutionMetrics::default() }
     }
 
     fn fork_with_next(&self, next: Box<dyn PipelineNode>) -> Self {
-        Self::new(
-            Arc::clone(&self.program), Arc::clone(&self.kernels),
-            Arc::clone(&self.functions), next,
-        )
+        Self { processor: self.processor.fork(), next, metrics: ExecutionMetrics::default() }
     }
 }
 
+#[async_trait::async_trait]
 impl<K> PipelineNode for ExpressionExecutor<K>
 where
     K: ExpressionKernelProvider + ?Sized + 'static,
 {
-    fn push(&mut self, batch: DataChunkView) -> Result<()> {
+    async fn push(&mut self, batch: DataChunkView) -> Result<()> {
         let started = Instant::now();
         let rows_in = batch.num_rows();
-        let result = self.execute(batch)?;
+        let result = self.processor.process(batch)?;
         let rows_out = result.as_ref().map_or(0, DataChunkView::num_rows);
         self.metrics.record(rows_in, rows_out, started.elapsed().as_micros() as u64);
         if let Some(view) = result {
-            self.next.push(view)?;
+            self.next.push(view).await?;
         }
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         let metrics = std::mem::take(&mut self.metrics);
         if metrics.chunks > 0 {
             tracing::debug!(target: "vein.audit", event = "expression_executor_finished",
@@ -117,7 +86,7 @@ where
                 rows_out = metrics.rows_out, eval_us = metrics.elapsed_us,
                 "expression executor completed");
         }
-        self.next.flush()
+        self.next.flush().await
     }
 
     fn finished(&self) -> bool {
@@ -166,10 +135,7 @@ fn combine_state<K>(local: ExpressionExecutor<K>, canonical: &mut ExpressionExec
 where
     K: ExpressionKernelProvider + ?Sized + 'static,
 {
-    if !Arc::ptr_eq(&local.program, &canonical.program)
-        || !Arc::ptr_eq(&local.kernels, &canonical.kernels)
-        || !Arc::ptr_eq(&local.functions, &canonical.functions)
-    {
+    if !local.processor.same_configuration(&canonical.processor) {
         return Err(VeinError::internal("cannot combine different expression executor configurations"));
     }
     let ExpressionExecutor { next, metrics, .. } = local;

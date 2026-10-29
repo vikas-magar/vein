@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use common::time::Instant;
 
 use crate::pipeline::{DataChunkView, MaterializationReport, PipelineNode};
 use arrow::array::{Array, ArrayRef, Int64Array};
@@ -18,13 +18,14 @@ use residual_support::{
 #[derive(Clone, Default)]
 struct Collect(Arc<Mutex<Vec<DataChunkView>>>);
 
+#[async_trait::async_trait]
 impl PipelineNode for Collect {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0.lock().expect("collect lock").push(view);
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -56,12 +57,12 @@ impl PipelineNode for Collect {
 }
 
 impl HashJoin {
-    fn push(&mut self, chunk: DataChunkView) -> Result<()> {
-        PipelineNode::push(self, chunk)
+    async fn push(&mut self, chunk: DataChunkView) -> Result<()> {
+        PipelineNode::push(self, chunk).await
     }
 
-    fn flush(&mut self) -> Result<()> {
-        PipelineNode::flush(self)
+    async fn flush(&mut self) -> Result<()> {
+        PipelineNode::flush(self).await
     }
 }
 
@@ -117,7 +118,7 @@ fn residual_greater_than_filter() -> (TestExpressionExecutor, JoinFilterCollecto
     (expression_filter(predicate, collector.clone()), collector)
 }
 
-fn run_outer_join_with_residual(join_type: JoinType) -> Vec<[Option<i64>; 4]> {
+async fn run_outer_join_with_residual(join_type: JoinType) -> Vec<[Option<i64>; 4]> {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     table
         .insert(crate::pipeline::test_support::dense_view(vec![
@@ -151,8 +152,8 @@ fn run_outer_join_with_residual(join_type: JoinType) -> Vec<[Option<i64>; 4]> {
         ints(&[1, 1, 1, 2]),
         nullable_ints(&[Some(1), Some(10), None, Some(9)]),
     ]))
-        .expect("probe rows");
-    join.flush().expect("flush outer join");
+        .await.expect("probe rows");
+    join.flush().await.expect("flush outer join");
 
     let chunks = sink.0.lock().expect("collect lock");
     let mut rows = chunks.iter().flat_map(selected_rows).collect::<Vec<_>>();
@@ -163,7 +164,7 @@ fn run_outer_join_with_residual(join_type: JoinType) -> Vec<[Option<i64>; 4]> {
 /// A built table over one chunk of `values`.
 fn build(values: &[i64]) -> HashTable {
     let mut sink = BuildSink::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
-    sink.push(crate::pipeline::test_support::dense_view(vec![ints(
+    sink.accumulate(crate::pipeline::test_support::dense_view(vec![ints(
         values,
     )]))
         .expect("build");
@@ -173,19 +174,20 @@ fn build(values: &[i64]) -> HashTable {
 #[derive(Clone, Default)]
 struct ViewCollect(Arc<Mutex<Vec<DataChunkView>>>);
 
+#[async_trait::async_trait]
 impl PipelineNode for ViewCollect {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0.lock().expect("view collector lock").push(view);
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }
 
-#[test]
-fn output_timing_excludes_downstream_on_probe_flush_and_error() {
+#[tokio::test]
+async fn output_timing_excludes_downstream_on_probe_flush_and_error() {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -194,8 +196,9 @@ fn output_timing_excludes_downstream_on_probe_flush_and_error() {
         elapsed_us: Arc<AtomicU64>,
     }
 
+    #[async_trait::async_trait]
     impl PipelineNode for ObservingSink {
-        fn push(&mut self, _view: DataChunkView) -> Result<()> {
+        async fn push(&mut self, _view: DataChunkView) -> Result<()> {
             let started = Instant::now();
             // Make double-counting observable without asserting an upper
             // latency limit, which would depend on machine load.
@@ -209,7 +212,7 @@ fn output_timing_excludes_downstream_on_probe_flush_and_error() {
             }
         }
 
-        fn flush(&mut self) -> Result<()> {
+        async fn flush(&mut self) -> Result<()> {
             Ok(())
         }
     }
@@ -231,9 +234,9 @@ fn output_timing_excludes_downstream_on_probe_flush_and_error() {
             let probe = crate::pipeline::test_support::dense_view(vec![ints(&[7])]);
             let started = Instant::now();
             let outcome = if join_type == JoinType::Right {
-                join.flush()
+                join.flush().await
             } else {
-                join.push(probe)
+                join.push(probe).await
             };
             let total_us = started.elapsed().as_micros() as u64;
             let sink_us = downstream_elapsed.load(Ordering::Relaxed);
@@ -253,8 +256,8 @@ fn output_timing_excludes_downstream_on_probe_flush_and_error() {
     }
 }
 
-#[test]
-fn join_keeps_build_and_probe_payloads_as_views() {
+#[tokio::test]
+async fn join_keeps_build_and_probe_payloads_as_views() {
     use common::arrow::SelectionVector;
 
     let build_payload = ints(&[70, 80, 90]);
@@ -264,8 +267,8 @@ fn join_keeps_build_and_probe_payloads_as_views() {
             vec![ints(&[7, 8, 9]), Arc::clone(&build_payload)],
             SelectionVector::new_sparse(vec![2, 0]),
         ))
-        .unwrap();
-    build.flush().unwrap();
+        .await.unwrap();
+    build.flush().await.unwrap();
     let table = Arc::new(build.finish());
     let build_metrics = table.build_key_materialization();
     assert_eq!(build_metrics.0, MaterializationReport::default());
@@ -291,9 +294,9 @@ fn join_keeps_build_and_probe_payloads_as_views() {
                 selection,
             ),
         )
-            .unwrap();
+            .await.unwrap();
     }
-    join.flush().unwrap();
+    join.flush().await.unwrap();
     assert_eq!(
         join.probe_key_materialization,
         MaterializationReport::default()
@@ -324,8 +327,8 @@ fn join_keeps_build_and_probe_payloads_as_views() {
     assert_eq!(pairs, vec![(700, 70), (900, 90), (900, 90), (700, 70)]);
 }
 
-#[test]
-fn join_output_view_references_original_probe_and_build_payloads() {
+#[tokio::test]
+async fn join_output_view_references_original_probe_and_build_payloads() {
     let build_key = ints(&[7, 8]);
     let build_payload = ints(&[70, 80]);
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
@@ -351,8 +354,8 @@ fn join_output_view_references_original_probe_and_build_payloads() {
         &mut join,
         crate::pipeline::test_support::dense_view(vec![probe_key, Arc::clone(&probe_payload)]),
     )
-        .expect("probe join");
-    PipelineNode::flush(&mut join).expect("flush join");
+        .await.expect("probe join");
+    PipelineNode::flush(&mut join).await.expect("flush join");
 
     let outputs = sink.0.lock().expect("view collector lock");
     assert_eq!(outputs.len(), 1);
@@ -378,8 +381,8 @@ fn join_output_view_references_original_probe_and_build_payloads() {
     );
 }
 
-#[test]
-fn multiple_build_batches_preserve_duplicate_output_references() {
+#[tokio::test]
+async fn multiple_build_batches_preserve_duplicate_output_references() {
     let payloads = [ints(&[100, 101]), ints(&[200, 201])];
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     for payload in &payloads {
@@ -408,8 +411,8 @@ fn multiple_build_batches_preserve_duplicate_output_references() {
         &mut join,
         crate::pipeline::test_support::dense_view(vec![ints(&[7]), Arc::clone(&probe_payload)]),
     )
-        .unwrap();
-    join.flush().unwrap();
+        .await.unwrap();
+    join.flush().await.unwrap();
     let outputs = sink.0.lock().unwrap();
     assert_eq!(
         outputs.len(),
@@ -440,8 +443,8 @@ fn multiple_build_batches_preserve_duplicate_output_references() {
     assert_eq!(values, vec![100, 101, 200, 201]);
 }
 
-#[test]
-fn zero_column_join_views_retain_match_cardinality() {
+#[tokio::test]
+async fn zero_column_join_views_retain_match_cardinality() {
     let sink = ViewCollect::default();
     let mut join = HashJoin::new(
         Arc::new(build(&[7, 7])),
@@ -455,8 +458,8 @@ fn zero_column_join_views_retain_match_cardinality() {
         &mut join,
         crate::pipeline::test_support::dense_view(vec![ints(&[7, 8, 7])]),
     )
-        .unwrap();
-    join.flush().unwrap();
+        .await.unwrap();
+    join.flush().await.unwrap();
     let outputs = sink.0.lock().unwrap();
     assert_eq!(
         outputs.iter().map(DataChunkView::num_rows).sum::<usize>(),
@@ -475,8 +478,8 @@ fn zero_column_join_views_retain_match_cardinality() {
     }
 }
 
-#[test]
-fn outer_join_views_preserve_payloads_with_empty_opposite_sides() {
+#[tokio::test]
+async fn outer_join_views_preserve_payloads_with_empty_opposite_sides() {
     for join_type in [JoinType::Left, JoinType::Right, JoinType::Full] {
         for empty_build in [true, false] {
             let payload = ints(&[10, 20]);
@@ -506,8 +509,8 @@ fn outer_join_views_preserve_payloads_with_empty_opposite_sides() {
                 &mut join,
                 crate::pipeline::test_support::dense_view(vec![probe]),
             )
-                .unwrap();
-            join.flush().unwrap();
+                .await.unwrap();
+            join.flush().await.unwrap();
             let outputs = sink.0.lock().unwrap();
             let emits = join_type == JoinType::Full
                 || (empty_build && join_type == JoinType::Left)
@@ -531,8 +534,8 @@ fn outer_join_views_preserve_payloads_with_empty_opposite_sides() {
     }
 }
 
-#[test]
-fn empty_build_null_extension_requires_declared_output_column() {
+#[tokio::test]
+async fn empty_build_null_extension_requires_declared_output_column() {
     let sink = ViewCollect::default();
     let mut join = HashJoin::new(
         Arc::new(HashTable::new(
@@ -549,7 +552,7 @@ fn empty_build_null_extension_requires_declared_output_column() {
         &mut join,
         crate::pipeline::test_support::dense_view(vec![ints(&[10])]),
     )
-        .expect_err("missing build type must reject the output mapping");
+        .await.expect_err("missing build type must reject the output mapping");
     assert!(
         error.to_string().contains("missing column 0 in input 1"),
         "{error}"
@@ -558,8 +561,8 @@ fn empty_build_null_extension_requires_declared_output_column() {
 }
 
 /// The whole operator: absorb a build side, probe it, emit joined columns.
-#[test]
-fn inner_join_end_to_end() {
+#[tokio::test]
+async fn inner_join_end_to_end() {
     let sink = Collect::default();
     let mut join = HashJoin::new(
         Arc::new(build(&[20, 30])),
@@ -573,16 +576,16 @@ fn inner_join_end_to_end() {
     join.push(crate::pipeline::test_support::dense_view(vec![ints(&[
         10, 20,
     ])]))
-        .expect("probe");
-    join.flush().expect("flush");
+        .await.expect("probe");
+    join.flush().await.expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
     let all: Vec<Option<i64>> = chunks.iter().flat_map(|chunk| cells(chunk, 0)).collect();
     assert_eq!(all, vec![Some(20)], "only the matching probe row survives");
 }
 
-#[test]
-fn cross_join_emits_cartesian_product_with_empty_key_vectors() {
+#[tokio::test]
+async fn cross_join_emits_cartesian_product_with_empty_key_vectors() {
     let mut table = HashTable::new(JoinKeys::new(Vec::new()), JoinKeys::new(Vec::new()));
     let build_values = ints(&[10, 20, 30]);
     table
@@ -605,8 +608,8 @@ fn cross_join_emits_cartesian_product_with_empty_key_vectors() {
     join.push(crate::pipeline::test_support::dense_view(vec![Arc::clone(
         &probe_values,
     )]))
-        .expect("probe cross join rows");
-    join.flush().expect("flush cross join");
+        .await.expect("probe cross join rows");
+    join.flush().await.expect("flush cross join");
 
     let chunks = sink.0.lock().expect("collect lock");
     let mut pairs = chunks
@@ -631,10 +634,10 @@ fn cross_join_emits_cartesian_product_with_empty_key_vectors() {
     );
 }
 
-#[test]
-fn left_join_residual_false_and_null_leave_probe_rows_unmatched() {
+#[tokio::test]
+async fn left_join_residual_false_and_null_leave_probe_rows_unmatched() {
     assert_eq!(
-        run_outer_join_with_residual(JoinType::Left),
+        run_outer_join_with_residual(JoinType::Left).await,
         vec![
             [Some(1), None, None, None],
             [Some(1), Some(1), None, None],
@@ -644,10 +647,10 @@ fn left_join_residual_false_and_null_leave_probe_rows_unmatched() {
     );
 }
 
-#[test]
-fn right_join_residual_false_and_null_leave_build_rows_unmatched() {
+#[tokio::test]
+async fn right_join_residual_false_and_null_leave_build_rows_unmatched() {
     assert_eq!(
-        run_outer_join_with_residual(JoinType::Right),
+        run_outer_join_with_residual(JoinType::Right).await,
         vec![
             [None, None, Some(1), Some(15)],
             [None, None, Some(3), Some(7)],
@@ -656,10 +659,10 @@ fn right_join_residual_false_and_null_leave_build_rows_unmatched() {
     );
 }
 
-#[test]
-fn full_join_tracks_matches_only_after_residual_filtering() {
+#[tokio::test]
+async fn full_join_tracks_matches_only_after_residual_filtering() {
     assert_eq!(
-        run_outer_join_with_residual(JoinType::Full),
+        run_outer_join_with_residual(JoinType::Full).await,
         vec![
             [None, None, Some(1), Some(15)],
             [None, None, Some(3), Some(7)],
@@ -671,8 +674,8 @@ fn full_join_tracks_matches_only_after_residual_filtering() {
     );
 }
 
-#[test]
-fn semi_join_emits_a_probe_row_once_despite_duplicate_build_matches() {
+#[tokio::test]
+async fn semi_join_emits_a_probe_row_once_despite_duplicate_build_matches() {
     let sink = Collect::default();
     let mut join = HashJoin::new(
         Arc::new(build(&[20, 20, 30])),
@@ -686,8 +689,8 @@ fn semi_join_emits_a_probe_row_once_despite_duplicate_build_matches() {
     join.push(crate::pipeline::test_support::dense_view(vec![ints(&[
         20, 10, 30,
     ])]))
-        .expect("probe");
-    join.flush().expect("flush");
+        .await.expect("probe");
+    join.flush().await.expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
     let rows: Vec<Option<i64>> = chunks
@@ -698,8 +701,8 @@ fn semi_join_emits_a_probe_row_once_despite_duplicate_build_matches() {
     assert!(chunks.iter().all(|chunk| chunk.num_columns() == 1));
 }
 
-#[test]
-fn semi_join_materializes_sparse_selected_rows_at_the_result_boundary() {
+#[tokio::test]
+async fn semi_join_materializes_sparse_selected_rows_at_the_result_boundary() {
     use common::arrow::SelectionVector;
 
     let sink = Collect::default();
@@ -717,8 +720,8 @@ fn semi_join_materializes_sparse_selected_rows_at_the_result_boundary() {
         Box::new(sink.clone()),
     );
 
-    join.push(probe).expect("probe");
-    join.flush().expect("flush");
+    join.push(probe).await.expect("probe");
+    join.flush().await.expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
     assert_eq!(chunks.len(), 1);
@@ -726,8 +729,8 @@ fn semi_join_materializes_sparse_selected_rows_at_the_result_boundary() {
     assert_eq!(cells(&chunks[0], 0), vec![Some(40)]);
 }
 
-#[test]
-fn anti_join_materializes_unmatched_selected_rows_at_the_result_boundary() {
+#[tokio::test]
+async fn anti_join_materializes_unmatched_selected_rows_at_the_result_boundary() {
     use common::arrow::SelectionVector;
 
     let sink = Collect::default();
@@ -745,8 +748,8 @@ fn anti_join_materializes_unmatched_selected_rows_at_the_result_boundary() {
         Box::new(sink.clone()),
     );
 
-    join.push(probe).expect("probe");
-    join.flush().expect("flush");
+    join.push(probe).await.expect("probe");
+    join.flush().await.expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
     assert_eq!(chunks.len(), 1);
@@ -754,8 +757,8 @@ fn anti_join_materializes_unmatched_selected_rows_at_the_result_boundary() {
     assert_eq!(cells(&chunks[0], 0), vec![Some(20)]);
 }
 
-#[test]
-fn semi_join_emits_no_chunk_when_no_probe_key_matches() {
+#[tokio::test]
+async fn semi_join_emits_no_chunk_when_no_probe_key_matches() {
     let sink = Collect::default();
     let mut join = HashJoin::new(
         Arc::new(build(&[20])),
@@ -769,14 +772,14 @@ fn semi_join_emits_no_chunk_when_no_probe_key_matches() {
     join.push(crate::pipeline::test_support::dense_view(vec![ints(&[
         10, 30,
     ])]))
-        .expect("probe");
-    join.flush().expect("flush");
+        .await.expect("probe");
+    join.flush().await.expect("flush");
 
     assert!(sink.0.lock().expect("collect lock").is_empty());
 }
 
-#[test]
-fn anti_join_keeps_nonmatching_and_null_probe_keys() {
+#[tokio::test]
+async fn anti_join_keeps_nonmatching_and_null_probe_keys() {
     let sink = Collect::default();
     let mut join = HashJoin::new(
         Arc::new(build(&[20, 20])),
@@ -790,8 +793,8 @@ fn anti_join_keeps_nonmatching_and_null_probe_keys() {
     join.push(crate::pipeline::test_support::dense_view(vec![Arc::new(
         Int64Array::from(vec![Some(20), Some(10), None]),
     )]))
-        .expect("probe");
-    join.flush().expect("flush");
+        .await.expect("probe");
+    join.flush().await.expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
     let rows: Vec<Option<i64>> = chunks
@@ -804,8 +807,8 @@ fn anti_join_keeps_nonmatching_and_null_probe_keys() {
 
 /// A right join owes its unmatched build rows, and emits them at flush with
 /// a null probe side.
-#[test]
-fn right_join_emits_unmatched_build_rows_at_flush() {
+#[tokio::test]
+async fn right_join_emits_unmatched_build_rows_at_flush() {
     let sink = Collect::default();
     let mut join = HashJoin::new(
         Arc::new(build(&[20, 40])),
@@ -817,8 +820,8 @@ fn right_join_emits_unmatched_build_rows_at_flush() {
     );
 
     join.push(crate::pipeline::test_support::dense_view(vec![ints(&[20])]))
-        .expect("probe");
-    join.flush().expect("flush");
+        .await.expect("probe");
+    join.flush().await.expect("flush");
 
     let chunks = sink.0.lock().expect("collect lock");
     let probe: Vec<Option<i64>> = chunks.iter().flat_map(|c| cells(c, 0)).collect();
@@ -831,8 +834,8 @@ fn right_join_emits_unmatched_build_rows_at_flush() {
     assert_eq!(build, vec![Some(20), Some(40)], "build 40 matched nothing");
 }
 
-#[test]
-fn single_join_checks_cardinality_and_keeps_both_input_buffers() {
+#[tokio::test]
+async fn single_join_checks_cardinality_and_keeps_both_input_buffers() {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     let build_keys = ints(&[10, 20]);
     let build_values = ints(&[100, 200]);
@@ -859,8 +862,8 @@ fn single_join_checks_cardinality_and_keeps_both_input_buffers() {
         probe_keys,
         Arc::clone(&probe_payload),
     ]))
-        .expect("single match should not multiply probe rows");
-    join.flush().expect("flush single join");
+        .await.expect("single match should not multiply probe rows");
+    join.flush().await.expect("flush single join");
 
     let chunks = sink.0.lock().expect("collect lock");
     assert_eq!(chunks.len(), 1);
@@ -874,8 +877,8 @@ fn single_join_checks_cardinality_and_keeps_both_input_buffers() {
     assert_eq!(pairs, vec![(1_000, 100), (2_000, 200)]);
 }
 
-#[test]
-fn single_join_returns_null_for_an_unmatched_probe_row() {
+#[tokio::test]
+async fn single_join_returns_null_for_an_unmatched_probe_row() {
     let sink = Collect::default();
     let mut join = HashJoin::new(
         Arc::new(build(&[20])),
@@ -887,16 +890,16 @@ fn single_join_returns_null_for_an_unmatched_probe_row() {
     );
 
     join.push(crate::pipeline::test_support::dense_view(vec![ints(&[10])]))
-        .expect("unmatched probe should produce a null scalar");
-    join.flush().expect("flush single join");
+        .await.expect("unmatched probe should produce a null scalar");
+    join.flush().await.expect("flush single join");
 
     let chunks = sink.0.lock().expect("collect lock");
     assert_eq!(chunks.len(), 1);
     assert!(chunks[0].is_null(1, 0).unwrap());
 }
 
-#[test]
-fn single_join_errors_on_multiple_matches_across_build_chunks() {
+#[tokio::test]
+async fn single_join_errors_on_multiple_matches_across_build_chunks() {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     table
         .insert(crate::pipeline::test_support::dense_view(vec![ints(&[20])]))
@@ -916,7 +919,7 @@ fn single_join_errors_on_multiple_matches_across_build_chunks() {
 
     let error = join
         .push(crate::pipeline::test_support::dense_view(vec![ints(&[20])]))
-        .expect_err("two inner rows violate scalar cardinality");
+        .await.expect_err("two inner rows violate scalar cardinality");
     assert!(
         error
             .to_string()
@@ -924,8 +927,8 @@ fn single_join_errors_on_multiple_matches_across_build_chunks() {
     );
 }
 
-#[test]
-fn inner_join_preserves_duplicate_output_across_probe_batches() {
+#[tokio::test]
+async fn inner_join_preserves_duplicate_output_across_probe_batches() {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     table
         .insert(crate::pipeline::test_support::dense_view(vec![
@@ -953,13 +956,13 @@ fn inner_join_preserves_duplicate_output_across_probe_batches() {
         ints(&[7]),
         ints(&[700]),
     ]))
-        .expect("first probe batch");
+        .await.expect("first probe batch");
     join.push(crate::pipeline::test_support::dense_view(vec![
         ints(&[9, 7]),
         ints(&[900, 701]),
     ]))
-        .expect("second probe batch");
-    join.flush().expect("flush join");
+        .await.expect("second probe batch");
+    join.flush().await.expect("flush join");
 
     let chunks = sink.0.lock().expect("collect lock");
     let probe = chunks
@@ -986,8 +989,8 @@ fn inner_join_preserves_duplicate_output_across_probe_batches() {
     );
 }
 
-#[test]
-fn inner_join_worker_local_probe_states_combine_duplicate_matches() {
+#[tokio::test]
+async fn inner_join_worker_local_probe_states_combine_duplicate_matches() {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     table
         .insert(crate::pipeline::test_support::dense_view(vec![
@@ -1019,13 +1022,13 @@ fn inner_join_worker_local_probe_states_combine_duplicate_matches() {
             ints(&[7, 8]),
             ints(&[700, 800]),
         ]))
-        .expect("probe first worker batch");
+        .await.expect("probe first worker batch");
     second
         .push(crate::pipeline::test_support::dense_view(vec![
             ints(&[7]),
             ints(&[701]),
         ]))
-        .expect("probe second worker batch");
+        .await.expect("probe second worker batch");
 
     for (local, compose_us, downstream_us) in [(&mut first, 13, 17), (&mut second, 19, 23)] {
         let local = local
@@ -1042,7 +1045,7 @@ fn inner_join_worker_local_probe_states_combine_duplicate_matches() {
     second
         .combine_local(&mut canonical)
         .expect("combine second worker state");
-    canonical.flush().expect("flush canonical join");
+    canonical.flush().await.expect("flush canonical join");
 
     let chunks = sink.0.lock().expect("collect lock");
     let probe = chunks

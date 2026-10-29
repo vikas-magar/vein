@@ -266,6 +266,9 @@ version = "0.14"
 optional = true
 default-features = false
 
+[dependencies.web-time]
+version = "1"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.ahash]
 version = "0.8"
 features = ["runtime-rng"]

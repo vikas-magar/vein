@@ -83,6 +83,9 @@ impl ParquetIoBackend {
         expected_size_bytes: u64,
     ) -> Result<Arc<dyn ParquetRangeSource>> {
         let source: Arc<dyn ParquetRangeSource> = match self {
+            Self::Auto if absolute_path.as_os_str().is_empty() => Arc::new(
+                storage::StorageRangeSource::new(Arc::clone(storage), relative_path),
+            ),
             Self::Auto => match native::NativeRangeSource::open(absolute_path, expected_size_bytes).await {
                 Ok(source) => Arc::new(source),
                 Err(error) => {

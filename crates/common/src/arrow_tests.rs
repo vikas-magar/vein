@@ -68,3 +68,14 @@ fn dense_filter_that_keeps_every_row_stays_contiguous() {
     assert_eq!(windowed.filter(|_| true).contiguous_range(), Some(2..5));
     assert_eq!(selection.filter(|row| row != 2).contiguous_range(), None);
 }
+
+#[test]
+fn selection_footprint_counts_sparse_capacity_and_keeps_dense_ranges_allocation_free() {
+    let mut indices = Vec::with_capacity(64);
+    indices.push(3);
+    let bytes = indices.capacity() * std::mem::size_of::<u32>();
+    let sparse = SelectionVector::new_sparse(indices);
+    assert_eq!(sparse.size(), 1);
+    assert_eq!(sparse.retained_bytes(), bytes);
+    assert_eq!(SelectionVector::new_dense(1_000_000).retained_bytes(), 0);
+}

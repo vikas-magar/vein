@@ -13,3 +13,7 @@ vein_design
 duckdb
 reference_code
 assets
+!assets/
+assets/*
+!assets/website/
+!assets/website/**

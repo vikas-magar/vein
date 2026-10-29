@@ -3,22 +3,23 @@ use super::*;
 /// Shares a build sink with the join executor while a source owns its pipeline.
 pub(super) struct SharedBuildSink(pub(super) Arc<Mutex<Option<BuildSink>>>);
 
+#[async_trait::async_trait]
 impl PipelineNode for SharedBuildSink {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0
             .lock()
             .map_err(|_| VeinError::internal("join build mutex poisoned"))?
             .as_mut()
             .ok_or_else(|| VeinError::internal("join build sink already finished"))?
-            .push(view)
+            .accumulate(view)
     }
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         self.0
             .lock()
             .map_err(|_| VeinError::internal("join build mutex poisoned"))?
             .as_mut()
             .ok_or_else(|| VeinError::internal("join build sink already finished"))?
-            .flush()
+            .complete()
     }
 
     fn fork_local(&self) -> Result<Option<Box<dyn PipelineNode>>> {
@@ -38,13 +39,14 @@ impl PipelineNode for SharedBuildSink {
 /// Worker-private adapter whose completed table is merged into `SharedBuildSink`.
 pub(super) struct LocalBuildSink(BuildSink);
 
+#[async_trait::async_trait]
 impl PipelineNode for LocalBuildSink {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
-        self.0.push(view)
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
+        self.0.accumulate(view)
     }
 
-    fn flush(&mut self) -> Result<()> {
-        self.0.flush()
+    async fn flush(&mut self) -> Result<()> {
+        self.0.complete()
     }
 
     fn combine_local(
@@ -77,15 +79,16 @@ pub(super) struct JoinProbeCounter {
     pub(super) batches: Arc<AtomicU64>,
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for JoinProbeCounter {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.rows
             .fetch_add(view.num_rows() as u64, Ordering::Relaxed);
         self.batches.fetch_add(1, Ordering::Relaxed);
-        self.inner.push(view)
+        self.inner.push(view).await
     }
-    fn flush(&mut self) -> Result<()> {
-        self.inner.flush()
+    async fn flush(&mut self) -> Result<()> {
+        self.inner.flush().await
     }
     fn finished(&self) -> bool {
         self.inner.finished()
@@ -114,7 +117,7 @@ impl PipelineNode for JoinProbeCounter {
     }
 }
 
-pub(super) type SharedJoinOutput = Arc<Mutex<Box<dyn PipelineNode>>>;
+pub(super) type SharedJoinOutput = Arc<tokio::sync::Mutex<Box<dyn PipelineNode>>>;
 
 /// Forwards partition results into the one downstream operator instance.
 /// HashJoin flushes once per partition; this adapter defers that flush until
@@ -122,20 +125,21 @@ pub(super) type SharedJoinOutput = Arc<Mutex<Box<dyn PipelineNode>>>;
 #[derive(Clone)]
 struct JoinPartitionOutput(SharedJoinOutput);
 
+#[async_trait::async_trait]
 impl PipelineNode for JoinPartitionOutput {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.0
             .lock()
-            .map_err(|_| VeinError::internal("join partition output mutex poisoned"))?
-            .push(view)
+            .await
+            .push(view).await
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 
     fn finished(&self) -> bool {
-        self.0.lock().map(|next| next.finished()).unwrap_or(false)
+        self.0.try_lock().map(|next| next.finished()).unwrap_or(false)
     }
 }
 
@@ -154,7 +158,7 @@ pub(super) struct SpilledJoinProbe {
 }
 
 impl SpilledJoinProbe {
-    fn process_partitions(
+    async fn process_partitions(
         &self,
         build_runs: Vec<JoinSpillRun>,
         probe_runs: Vec<JoinSpillRun>,
@@ -277,7 +281,7 @@ impl SpilledJoinProbe {
                 let probe: Vec<JoinSpillRun> =
                     probe_children[partition].clone().into_iter().collect();
                 if !build.is_empty() || !probe.is_empty() {
-                    self.process_partitions(build, probe, bit + 1)?;
+                    Box::pin(self.process_partitions(build, probe, bit + 1)).await?;
                 }
             }
             return Ok(());
@@ -311,10 +315,10 @@ impl SpilledJoinProbe {
                     VeinError::internal(format!("decode spilled join probe batch: {error}"))
                 })?;
                 let view = crate::pipeline::arrow_adapter::from_record_batch(batch)?;
-                join.push(payload_view(view, &self.probe_schema, &self.tracker)?)?;
+                join.push(payload_view(view, &self.probe_schema, &self.tracker)?).await?;
             }
         }
-        join.flush()?;
+        join.flush().await?;
         for run in build_runs.into_iter().chain(probe_runs) {
             remove_run(run)?;
         }
@@ -322,15 +326,16 @@ impl SpilledJoinProbe {
     }
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for SpilledJoinProbe {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.probe_writer
             .as_mut()
             .ok_or_else(|| VeinError::internal("spilled join probe is already finished"))?
             .push(&view, &join_keys(&self.plan.probe_keys))
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         let probe_run = self
             .probe_writer
             .take()
@@ -345,16 +350,16 @@ impl PipelineNode for SpilledJoinProbe {
             probe_bytes = probe_run.bytes,
             "join spill inputs materialized"
         );
-        self.process_partitions(vec![self.build_run.clone()], vec![probe_run], 0)?;
+        self.process_partitions(vec![self.build_run.clone()], vec![probe_run], 0).await?;
         self.next
             .lock()
-            .map_err(|_| VeinError::internal("join spill output mutex poisoned"))?
-            .flush()
+            .await
+            .flush().await
     }
 
     fn finished(&self) -> bool {
         self.next
-            .lock()
+            .try_lock()
             .map(|next| next.finished())
             .unwrap_or(false)
     }

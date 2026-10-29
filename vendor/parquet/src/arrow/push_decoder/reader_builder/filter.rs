@@ -22,7 +22,8 @@ use crate::arrow::array_reader::{CacheOptionsBuilder, RowGroupCache};
 use crate::arrow::arrow_reader::{ArrowPredicate, RowFilter};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// State machine for evaluating a sequence of predicates.
 ///

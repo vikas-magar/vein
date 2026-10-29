@@ -53,9 +53,11 @@ pub(super) fn decorrelate(subquery: &LogicalPlan) -> Option<Decorrelation> {
     Some(Decorrelation {
         right,
         correlations: Vec::new(),
+        residual: Vec::new(),
         join_kind: super::ScalarJoinKind::Cross,
         value,
         aggregate_name: "GLOBAL_AGGREGATE_PROJECTION".to_string(),
+        replacement: None,
     })
 }
 

@@ -63,11 +63,8 @@ fn eval_in_candidate(
         ))));
     }
     if value.is_mapped() || candidate.is_mapped() {
-        return super::super::eval_mapped_boolean_binary(
-            value,
-            candidate,
-            rows,
-            super::super::eval_cmp_eq,
+        return super::super::mapped_comparison::evaluate(
+            common::protocol::BinaryExprOp::Equal, value, candidate, rows,
         );
     }
 

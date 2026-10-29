@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use common::time::Instant;
 
 use crate::ParquetMetadataService;
 use arrow::datatypes::SchemaRef;

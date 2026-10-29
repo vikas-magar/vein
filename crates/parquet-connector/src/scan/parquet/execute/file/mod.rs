@@ -6,11 +6,11 @@ mod prepare;
 mod pruning;
 
 use std::sync::Arc;
-use std::time::Instant;
+use common::time::Instant;
 
-use common::Result;
 use exec::operators::source::scan::{ScanFile, ScanRequest};
-use exec::pipeline::PipelineNode;
+use exec::operators::source::scan::ScanCursor;
+use futures::StreamExt;
 
 use crate::scan::parquet::batch_size::RowGroupBatchSizePolicy;
 use crate::scan::parquet::metrics::ScanPredicateMetrics;
@@ -21,18 +21,17 @@ use crate::scan::parquet::stream::{ScanStreamContext, consume_batches};
 pub(super) struct FileExecution<'a, 'q> {
     pub(super) request: &'a ScanRequest<'q>,
     pub(super) file: &'q ScanFile,
-    pub(super) next: &'a mut dyn PipelineNode,
     pub(super) adaptive_order: &'a mut Option<Arc<AdaptiveFilterOrder>>,
     pub(super) io_backend: ParquetIoBackend,
     pub(super) batch_size_policy: &'a RowGroupBatchSizePolicy,
     pub(super) batch_rows_override: Option<&'a str>,
 }
 
-pub(super) async fn execute(context: FileExecution<'_, '_>) -> Result<()> {
+pub(super) fn execute<'a, 'q: 'a>(context: FileExecution<'a, 'q>) -> ScanCursor<'a> {
+    Box::pin(async_stream::try_stream! {
     let FileExecution {
         request,
         file,
-        next,
         adaptive_order,
         io_backend,
         batch_size_policy,
@@ -134,12 +133,12 @@ pub(super) async fn execute(context: FileExecution<'_, '_>) -> Result<()> {
         metadata_us,
         build_us,
     });
-    let stream_metrics = consume_batches(
+    let mut stream_metrics = crate::scan::parquet::stream::ScanStreamMetrics::default();
+    let mut cursor = consume_batches(
         stream,
         ScanStreamContext {
             path,
             output_positions: &projection.output_positions,
-            next,
             scan_started,
             bytes_read: request.bytes_read.as_ref(),
             bytes_before_file,
@@ -151,8 +150,10 @@ pub(super) async fn execute(context: FileExecution<'_, '_>) -> Result<()> {
             statistics_scan: request.statistics_scan,
             runtime_statistics: request.runtime_statistics,
         },
-    )
-        .await?;
+        &mut stream_metrics,
+    );
+    while let Some(view) = cursor.next().await { yield view?; }
+    drop(cursor);
     audit::log_completed(audit::CompletedScan {
         path,
         scan_started,
@@ -176,7 +177,7 @@ pub(super) async fn execute(context: FileExecution<'_, '_>) -> Result<()> {
         build_us,
         file_rows,
     });
-    Ok(())
+    })
 }
 
 fn pushed_filter_columns<'query>(request: &ScanRequest<'query>) -> Vec<&'query str> {

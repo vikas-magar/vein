@@ -16,13 +16,14 @@ struct ViewCollector {
     batches: Vec<DataChunkView>,
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for ViewCollector {
-    fn push(&mut self, batch: DataChunkView) -> common::Result<()> {
+    async fn push(&mut self, batch: DataChunkView) -> common::Result<()> {
         self.batches.push(batch);
         Ok(())
     }
 
-    fn flush(&mut self) -> common::Result<()> {
+    async fn flush(&mut self) -> common::Result<()> {
         Ok(())
     }
 }
@@ -73,8 +74,8 @@ async fn intermediate_source_registry_is_query_scoped_and_registration_owned() {
     let relation = IntermediateRelation::new(Arc::clone(&schema), tracker);
     let mut sink = relation.sink();
     sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap())
-        .expect("retain checkpoint arrays");
-    sink.flush().expect("seal relation before registering source");
+        .await.expect("retain checkpoint arrays");
+    sink.flush().await.expect("seal relation before registering source");
 
     let registry = IntermediateSourceRegistry::default();
     let query_id = QueryId::new();
@@ -110,21 +111,21 @@ async fn in_memory_checkpoint_retains_shared_arrays_and_replays_views() {
     let mut sink = relation.sink();
 
     sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch.clone()).unwrap())
-        .expect("retain reference-backed batch");
+        .await.expect("retain reference-backed batch");
     assert_eq!(
         tracker.used(),
         batch.column(0).get_array_memory_size(),
         "the shared source array is charged once while the checkpoint retains it"
     );
-    sink.flush().expect("seal in-memory relation");
+    sink.flush().await.expect("seal in-memory relation");
 
     assert_eq!(relation.row_count().unwrap(), 3);
     assert_eq!(read_values(&relation).await, vec![3, 5, 8]);
     assert_eq!(tracker.used(), batch.column(0).get_array_memory_size());
 }
 
-#[test]
-fn checkpoint_sink_reports_rows_and_seals_as_a_task_sink() {
+#[tokio::test]
+async fn checkpoint_sink_reports_rows_and_seals_as_a_task_sink() {
     let (schema, batch) = input();
     let tracker = QueryMemoryTracker::new(1 << 20, CancellationToken::new());
     let relation = IntermediateRelation::new(schema, tracker);
@@ -132,10 +133,10 @@ fn checkpoint_sink_reports_rows_and_seals_as_a_task_sink() {
     let sink: &mut dyn Sink = &mut sink;
 
     sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap())
-        .expect("retain reference-backed batch");
+        .await.expect("retain reference-backed batch");
     assert_eq!(sink.row_count(), 3);
     assert!(sink.collect().is_empty(), "checkpoints are not client batches");
-    sink.flush().expect("seal checkpoint sink");
+    sink.flush().await.expect("seal checkpoint sink");
     assert_eq!(relation.row_count().unwrap(), 3);
 }
 
@@ -150,8 +151,8 @@ async fn checkpoint_spills_when_array_retention_exceeds_budget_and_replays_rows(
     let mut sink = relation.sink();
 
     sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap())
-        .expect("spill batch when memory budget is exhausted");
-    sink.flush().expect("finish spill run");
+        .await.expect("spill batch when memory budget is exhausted");
+    sink.flush().await.expect("finish spill run");
 
     assert_eq!(relation.row_count().unwrap(), 3);
     assert_eq!(tracker.used(), 0, "spilled input arrays are no longer retained");
@@ -163,14 +164,14 @@ async fn checkpoint_spills_when_array_retention_exceeds_budget_and_replays_rows(
     assert_eq!(tracker.spill_bytes_used(), 0, "the last relation handle removes its run");
 }
 
-#[test]
-fn unsealed_checkpoint_cannot_be_read_and_drop_discards_partial_state() {
+#[tokio::test]
+async fn unsealed_checkpoint_cannot_be_read_and_drop_discards_partial_state() {
     let (schema, batch) = input();
     let tracker = QueryMemoryTracker::new(1 << 20, CancellationToken::new());
     let relation = IntermediateRelation::new(schema, tracker.clone());
     let mut sink = relation.sink();
     sink.push(crate::pipeline::arrow_adapter::from_record_batch(batch).unwrap())
-        .expect("retain batch");
+        .await.expect("retain batch");
 
     assert!(relation.source().is_err());
     drop(sink);

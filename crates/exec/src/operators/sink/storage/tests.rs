@@ -50,8 +50,8 @@ fn view(source: &ArrayRef, selection: SelectionVector) -> DataChunkView {
         .expect("valid view over source arrays")
 }
 
-#[test]
-fn write_sink_forwards_sparse_view_without_copying_payloads() {
+#[tokio::test]
+async fn write_sink_forwards_sparse_view_without_copying_payloads() {
     let source: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30, 40]));
     let views = Arc::new(Mutex::new(Vec::new()));
     let report = MaterializationReport {
@@ -66,7 +66,7 @@ fn write_sink_forwards_sparse_view_without_copying_payloads() {
     let mut sink = write_sink(false, Some(Box::new(transaction)));
     let selected = view(&source, SelectionVector::new_sparse(vec![3, 1]));
 
-    sink.push(selected).expect("forward selected view");
+    sink.push(selected).await.expect("forward selected view");
 
     assert_eq!(sink.row_count(), 2);
     assert_eq!(sink.batches_written, 1);
@@ -88,8 +88,8 @@ fn write_sink_forwards_sparse_view_without_copying_payloads() {
     }
 }
 
-#[test]
-fn write_sink_validates_nullability_on_selected_rows() {
+#[tokio::test]
+async fn write_sink_validates_nullability_on_selected_rows() {
     let source: ArrayRef = Arc::new(Int64Array::from(vec![Some(10), None]));
     let selected_null = view(&source, SelectionVector::new_sparse(vec![1]));
     assert!(write_sink(false, None).validate_view(&selected_null).is_err());
@@ -98,13 +98,13 @@ fn write_sink_validates_nullability_on_selected_rows() {
     assert!(write_sink(false, None).validate_view(&selected_value).is_ok());
 }
 
-#[test]
-fn write_sink_skips_empty_views_without_opening_a_transaction() {
+#[tokio::test]
+async fn write_sink_skips_empty_views_without_opening_a_transaction() {
     let source: ArrayRef = Arc::new(Int64Array::from(vec![10, 20]));
     let empty = view(&source, SelectionVector::new_sparse(Vec::new()));
     let mut sink = write_sink(false, None);
 
-    sink.push(empty).expect("empty view is a no-op");
+    sink.push(empty).await.expect("empty view is a no-op");
 
     assert_eq!(sink.row_count(), 0);
     assert_eq!(sink.batches_written, 0);

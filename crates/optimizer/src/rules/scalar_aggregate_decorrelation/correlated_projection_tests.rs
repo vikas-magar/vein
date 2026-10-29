@@ -93,22 +93,21 @@ fn decorrelates_projected_average_and_preserves_nullable_left_join_value() {
         panic!("comparison should remain above the scalar join");
     };
     assert!(matches!(predicate, LogicalExpr::BinaryOp { right, .. }
-        if matches!(right.as_ref(), LogicalExpr::Column(column) if column.id == ColumnId(6) && column.nullable)));
+        if matches!(right.as_ref(), LogicalExpr::BinaryOp { left, .. }
+            if matches!(left.as_ref(), LogicalExpr::Column(column)
+                if column.id == ColumnId(5) && column.nullable))));
     let LogicalPlan::Join { join_type, right, .. } = joined.as_ref() else {
         panic!("correlated aggregate should become a join");
     };
     assert_eq!(*join_type, parser::ast::pipe_op::JoinType::Left);
-    let LogicalPlan::Project { input: grouped, exprs, schema } = right.as_ref() else {
-        panic!("scalar expression must be projected over the grouped aggregate");
+    let LogicalPlan::Aggregate { grouping_sets, schema, .. } = right.as_ref() else {
+        panic!("scalar expression must be evaluated after the grouped left join");
     };
     assert_eq!(schema.fields.len(), 2);
     assert_eq!(schema.fields[0].id, ColumnId(3));
-    assert_eq!(schema.fields[1].id, ColumnId(6));
+    assert_eq!(schema.fields[1].id, ColumnId(5));
     assert!(schema.fields[1].nullable, "unmatched outer keys produce NULL");
-    assert!(matches!(exprs.as_slice(), [LogicalExpr::Column(key), LogicalExpr::BinaryOp { .. }]
-        if key.id == ColumnId(3)));
-    assert!(matches!(grouped.as_ref(), LogicalPlan::Aggregate { grouping_sets, .. }
-        if grouping_sets == &vec![vec![LogicalExpr::Column(field(3, "inner_key", VeinDataType::Int64))]]));
+    assert_eq!(grouping_sets, &vec![vec![LogicalExpr::Column(field(3, "inner_key", VeinDataType::Int64))]]);
 }
 
 #[test]

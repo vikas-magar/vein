@@ -10,11 +10,11 @@ pub(super) struct SpillFinishContext<'a> {
 }
 
 impl AggregateSink {
-    pub(super) fn finish_spill_partition_view(
+    pub(super) async fn finish_spill_partition_view(
         context: &SpillFinishContext<'_>,
         runs: Vec<SpillRun>,
         bit: u32,
-        emit: &mut impl FnMut(DataChunkView) -> Result<()>,
+        emit: &mut impl crate::pipeline::delivery::BatchConsumer,
     ) -> Result<()> {
         let SpillFinishContext { plan, tracker, registry, schema, batch_rows } = *context;
         tracker.check_cancelled()?;
@@ -43,7 +43,7 @@ impl AggregateSink {
 
         match merge_result {
             Ok(()) => {
-                let finish_result = sink.finish_in_memory_view_with(batch_rows, emit);
+                let finish_result = sink.finish_in_memory_view_with(batch_rows, emit).await;
                 drop(sink);
                 finish_result?;
                 drop(runs);
@@ -63,12 +63,12 @@ impl AggregateSink {
                     "aggregate spill partition exceeded memory and was repartitioned"
                 );
                 for child in children.into_iter().flatten() {
-                    Self::finish_spill_partition_view(
+                    Box::pin(Self::finish_spill_partition_view(
                         context,
                         vec![child],
                         bit + 1,
                         emit,
-                    )?;
+                    )).await?;
                 }
                 Ok(())
             }

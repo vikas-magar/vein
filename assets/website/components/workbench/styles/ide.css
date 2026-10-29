@@ -1,0 +1,38 @@
+@import "./ide-shell.css";
+@import "./ide-dock.css";
+@import "./ide-explorer.css";
+@import "./ide-results.css";
+@import "./ide-progress.css";
+
+.workspace-starting { display: grid; height: 100dvh; place-items: center; color: var(--muted); font: 13px var(--mono); }
+.vein-ide { position: relative; height: 100dvh; display: grid; grid-template-rows: 56px minmax(0, 1fr) auto; overflow: hidden; font: 400 13px/1.5 var(--sans); background: var(--page); }
+.document-live { position: relative; }
+.vein-ide * { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+.ide-toolbar-spacer { flex: 1; }
+.ide-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.ide-tool, .ide-primary, .ide-run, .ide-command { display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; white-space: nowrap; }
+.ide-tool { padding: 4px 8px; background: transparent; color: var(--muted); font-size: 12px; }
+.ide-tool:hover { color: var(--ink); background: var(--panel-hover); }
+.ide-tool[data-disabled], .ide-run[data-disabled] { opacity: .45; cursor: not-allowed; }
+.ide-primary, .ide-run { background: var(--accent); color: #170c10; padding: 6px 12px; font-size: 12px; font-weight: 600; }
+.ide-primary:hover, .ide-run:hover:not([data-disabled]) { background: var(--accent-bright); }
+.ide-empty { height: 100%; min-height: 100px; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 12px; padding: 24px; color: var(--muted); text-align: center; }
+.ide-empty > svg { color: var(--accent-bright); opacity: .75; }
+.ide-empty strong { color: var(--ink); font-size: 15px; font-weight: 500; }
+.ide-empty p { max-width: 340px; margin: 0; font-size: 12px; }
+.ide-error { margin: 0; border-left: 2px solid var(--danger); background: #f078830a; color: var(--danger); padding: 12px 16px; font: 12px/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 140px; overflow: auto; }
+.ide-dot { display: inline-block; width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: var(--success); }
+.ide-dot.is-error { background: var(--danger); }
+.ide-running { color: var(--accent-bright); font-size: 11px; }
+.ide-dirty { color: var(--accent-bright); padding-left: 9px; font-size: 9px; }
+@media (max-width: 760px) {
+  .vein-ide { grid-template-rows: 48px minmax(0, 1fr) auto; }
+  .ide-tagline, .ide-command span, .ide-docs, .ide-settings, .ide-status-host { display: none; }
+  .ide-header { gap: 10px; padding-inline: 12px; }
+  .ide-status { gap: 10px; }
+  .ide-install { font-size: 10px; padding: 4px 6px; }
+  .ide-command { display: none; }
+  .ide-mobile-menu { display: inline-flex; }
+  .ide-editor-footer { white-space: nowrap; }
+}
+@media (prefers-reduced-motion: reduce) { .vein-ide *, .vein-ide *::before { animation: none !important; transition: none !important; } }

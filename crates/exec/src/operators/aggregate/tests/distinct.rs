@@ -15,8 +15,8 @@ fn distinct_plan(grouping_sets: Option<Vec<Vec<u32>>>) -> AggregatePlan {
     }
 }
 
-#[test]
-fn count_distinct_handles_duplicates_nulls_and_multiple_groups() {
+#[tokio::test]
+async fn count_distinct_handles_duplicates_nulls_and_multiple_groups() {
     let mut plan = distinct_plan(None);
     plan.aggs.insert(0, AggOpCode::Count);
     plan.aggregate_input_types.insert(0, VeinDataType::Int64);
@@ -30,7 +30,7 @@ fn count_distinct_handles_duplicates_nulls_and_multiple_groups() {
         .expect("accumulate duplicate and NULL values");
 
     let mut actual = BTreeMap::new();
-    for batch in sink.finish().expect("finish COUNT DISTINCT") {
+    for batch in sink.finish().await.expect("finish COUNT DISTINCT") {
         let keys = materialized_column::<Int64Array>(&batch, 0);
         let counts = materialized_column::<Int64Array>(&batch, 1);
         let distinct = materialized_column::<Int64Array>(&batch, 2);
@@ -44,8 +44,8 @@ fn count_distinct_handles_duplicates_nulls_and_multiple_groups() {
     assert_eq!(actual, BTreeMap::from([(None, (2, 1)), (Some(1), (2, 1)), (Some(2), (0, 0))]));
 }
 
-#[test]
-fn multiple_count_distinct_expressions_keep_independent_states() {
+#[tokio::test]
+async fn multiple_count_distinct_expressions_keep_independent_states() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -66,7 +66,7 @@ fn multiple_count_distinct_expressions_keep_independent_states() {
         .expect("accumulate independent distinct arguments");
 
     let mut actual = BTreeMap::new();
-    for batch in sink.finish().expect("finish multiple distinct aggregate") {
+    for batch in sink.finish().await.expect("finish multiple distinct aggregate") {
         let groups = materialized_column::<Int64Array>(&batch, 0);
         let first = materialized_column::<Int64Array>(&batch, 1);
         let second = materialized_column::<Int64Array>(&batch, 2);
@@ -77,8 +77,8 @@ fn multiple_count_distinct_expressions_keep_independent_states() {
     assert_eq!(actual, BTreeMap::from([(1, (2, 2)), (2, (2, 1))]));
 }
 
-#[test]
-fn count_distinct_preserves_grouping_set_identity_for_null_keys() {
+#[tokio::test]
+async fn count_distinct_preserves_grouping_set_identity_for_null_keys() {
     let mut sink = AggregateSink::new(distinct_plan(Some(vec![vec![0], vec![]])))
         .expect("create grouping-set distinct aggregate");
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
@@ -88,7 +88,7 @@ fn count_distinct_preserves_grouping_set_identity_for_null_keys() {
         .expect("accumulate grouping sets");
 
     let mut actual = Vec::new();
-    for batch in sink.finish().expect("finish grouping sets") {
+    for batch in sink.finish().await.expect("finish grouping sets") {
         let keys = materialized_column::<Int64Array>(&batch, 0);
         let counts = materialized_column::<Int64Array>(&batch, 1);
         for row in 0..batch.num_rows() {
@@ -99,8 +99,8 @@ fn count_distinct_preserves_grouping_set_identity_for_null_keys() {
     assert_eq!(actual, vec![(None, 1), (None, 2), (Some(4), 1)]);
 }
 
-#[test]
-fn count_distinct_spills_and_merges_exact_unique_pairs_within_budget() {
+#[tokio::test]
+async fn count_distinct_spills_and_merges_exact_unique_pairs_within_budget() {
     let tracker = QueryMemoryTracker::new(
         32 * 1024,
         common::cancellation::CancellationToken::new(),
@@ -125,7 +125,7 @@ fn count_distinct_spills_and_merges_exact_unique_pairs_within_budget() {
     );
     assert!(tracker.peak() <= tracker.limit());
 
-    let output = sink.finish().expect("merge exact distinct spill state");
+    let output = sink.finish().await.expect("merge exact distinct spill state");
     let mut counts = BTreeMap::new();
     for batch in output {
         let keys = materialized_column::<Int64Array>(&batch, 0);
@@ -138,8 +138,8 @@ fn count_distinct_spills_and_merges_exact_unique_pairs_within_budget() {
     assert!(counts.values().all(|count| *count == 13));
 }
 
-#[test]
-fn worker_local_distinct_states_deduplicate_again_during_fan_in() {
+#[tokio::test]
+async fn worker_local_distinct_states_deduplicate_again_during_fan_in() {
     let tracker = QueryMemoryTracker::unlimited(
         common::cancellation::CancellationToken::new(),
     );
@@ -154,13 +154,13 @@ fn worker_local_distinct_states_deduplicate_again_during_fan_in() {
                 Arc::new(Int64Array::from(vec![1, 1])) as ArrayRef,
                 Arc::new(Int64Array::from(values)) as ArrayRef,
             ]))
-            .expect("accumulate worker-local distinct values");
+            .await.expect("accumulate worker-local distinct values");
         worker
             .combine_local(canonical.as_mut())
             .expect("combine worker-local distinct state");
     }
 
-    let output = aggregate.lock().unwrap().finish().expect("finish fan-in");
+    let output = aggregate.lock().unwrap().finish().await.expect("finish fan-in");
     let count = materialized_column::<Int64Array>(&output[0], 1);
     assert_eq!(count.value(0), 2);
 }

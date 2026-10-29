@@ -157,7 +157,7 @@ impl VeinDataType {
 
     /// Whether this type has a numeric Arrow layout supported by arithmetic.
     pub fn is_numeric(&self) -> bool {
-        matches!(
+        self.is_int128() || matches!(
             self,
             Self::Int8
                 | Self::Int16
@@ -177,11 +177,12 @@ impl VeinDataType {
 
     /// Result layout selected for `SUM` over this numeric input layout.
     ///
-    /// Narrow integers widen to 64 bits, floating point widens to Float64, and
-    /// decimals widen precision while preserving their scale.
+    /// Signed integers use native Int128 sums, unsigned integers widen to UInt64,
+    /// floating point widens to Float64, and decimals retain their scale.
     pub fn sum_result_type(&self) -> Option<Self> {
+        if self.is_int128() { return Some(Self::int128()); }
         Some(match self {
-            Self::Int8 | Self::Int16 | Self::Int32 | Self::Int64 => Self::Int64,
+            Self::Int8 | Self::Int16 | Self::Int32 | Self::Int64 => Self::int128(),
             Self::UInt8 | Self::UInt16 | Self::UInt32 | Self::UInt64 => Self::UInt64,
             Self::Float16 | Self::Float32 | Self::Float64 => Self::Float64,
             Self::Decimal128(_, scale) => Self::Decimal128(38, *scale),
@@ -229,13 +230,13 @@ impl VeinDataType {
             VeinDataType::Decimal256(p, s) => DataType::Decimal256(*p, *s),
 
             VeinDataType::List(inner) => {
-                DataType::List(Arc::new(Field::new("item", inner.to_arrow(), true)))
+                DataType::List(Arc::new(inner.to_arrow_field("item", true)))
             }
             VeinDataType::LargeList(inner) => {
-                DataType::LargeList(Arc::new(Field::new("item", inner.to_arrow(), true)))
+                DataType::LargeList(Arc::new(inner.to_arrow_field("item", true)))
             }
             VeinDataType::FixedSizeList(inner, size) => {
-                DataType::FixedSizeList(Arc::new(Field::new("item", inner.to_arrow(), true)), *size)
+                DataType::FixedSizeList(Arc::new(inner.to_arrow_field("item", true)), *size)
             }
             VeinDataType::Vector(dim) => DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
@@ -244,7 +245,7 @@ impl VeinDataType {
             VeinDataType::Struct(fields) => {
                 let arrow_fields = fields
                     .iter()
-                    .map(|f| Field::new(&f.name, f.data_type.to_arrow(), true))
+                    .map(|f| f.data_type.to_arrow_field(&f.name, f.nullable))
                     .collect();
                 DataType::Struct(arrow_fields)
             }
@@ -316,10 +317,10 @@ impl TryFrom<&DataType> for VeinDataType {
             DataType::Decimal128(p, s) => VeinDataType::Decimal128(*p, *s),
             DataType::Decimal256(p, s) => VeinDataType::Decimal256(*p, *s),
             DataType::List(inner) => {
-                VeinDataType::List(Arc::new(Self::try_from(inner.data_type())?))
+                VeinDataType::List(Arc::new(Self::from_arrow_field(inner)?))
             }
             DataType::LargeList(inner) => {
-                VeinDataType::LargeList(Arc::new(Self::try_from(inner.data_type())?))
+                VeinDataType::LargeList(Arc::new(Self::from_arrow_field(inner)?))
             }
             DataType::FixedSizeList(inner, size)
             if inner.data_type() == &DataType::Float32 && *size >= 0 =>
@@ -328,7 +329,7 @@ impl TryFrom<&DataType> for VeinDataType {
                 }
             DataType::FixedSizeList(inner, size) => {
                 VeinDataType::FixedSizeList(
-                    Arc::new(Self::try_from(inner.data_type())?),
+                    Arc::new(Self::from_arrow_field(inner)?),
                     *size,
                 )
             }
@@ -341,7 +342,7 @@ impl TryFrom<&DataType> for VeinDataType {
                             crate::column::ColumnId(i),
                             f.name().clone(),
                             None,
-                            Self::try_from(f.data_type())?,
+                            Self::from_arrow_field(f)?,
                         )
                             .with_nullable(f.is_nullable()))
                     })
@@ -607,10 +608,10 @@ mod tests {
     #[test]
     fn numeric_aggregate_types_are_centralized() {
         let cases = [
-            (VeinDataType::Int8, VeinDataType::Int64),
-            (VeinDataType::Int16, VeinDataType::Int64),
-            (VeinDataType::Int32, VeinDataType::Int64),
-            (VeinDataType::Int64, VeinDataType::Int64),
+            (VeinDataType::Int8, VeinDataType::int128()),
+            (VeinDataType::Int16, VeinDataType::int128()),
+            (VeinDataType::Int32, VeinDataType::int128()),
+            (VeinDataType::Int64, VeinDataType::int128()),
             (VeinDataType::UInt8, VeinDataType::UInt64),
             (VeinDataType::UInt16, VeinDataType::UInt64),
             (VeinDataType::UInt32, VeinDataType::UInt64),
@@ -659,7 +660,7 @@ mod tests {
         let fallback = VeinDataType::Float64;
         assert_eq!(
             aggregate_return_type("sum", Some(&VeinDataType::Int32), fallback.clone()),
-            VeinDataType::Int64
+            VeinDataType::int128()
         );
         assert_eq!(
             aggregate_return_type("MIN", Some(&VeinDataType::Decimal128(15, 2)), fallback.clone()),

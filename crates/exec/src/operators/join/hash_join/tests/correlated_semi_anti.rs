@@ -1,6 +1,6 @@
 use super::*;
 
-fn run_correlated_shape(join_type: JoinType, empty_build: bool) -> Vec<i64> {
+async fn run_correlated_shape(join_type: JoinType, empty_build: bool) -> Vec<i64> {
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
     if !empty_build {
         table
@@ -39,8 +39,8 @@ fn run_correlated_shape(join_type: JoinType, empty_build: bool) -> Vec<i64> {
         nullable_ints(&[Some(10), Some(15), None, Some(8), Some(7)]),
         ints(&[101, 102, 103, 104, 105]),
     ]))
-        .expect("probe rows");
-    join.flush().expect("finish join");
+        .await.expect("probe rows");
+    join.flush().await.expect("finish join");
 
     let chunks = sink.0.lock().expect("collect lock");
     let mut ids = chunks
@@ -55,21 +55,21 @@ fn run_correlated_shape(join_type: JoinType, empty_build: bool) -> Vec<i64> {
     ids
 }
 
-#[test]
-fn semi_join_residual_handles_duplicate_matches_and_sql_nulls() {
-    assert_eq!(run_correlated_shape(JoinType::Semi, false), vec![101, 102]);
+#[tokio::test]
+async fn semi_join_residual_handles_duplicate_matches_and_sql_nulls() {
+    assert_eq!(run_correlated_shape(JoinType::Semi, false).await, vec![101, 102]);
 }
 
-#[test]
-fn anti_join_residual_handles_duplicate_matches_and_sql_nulls() {
-    assert_eq!(run_correlated_shape(JoinType::Anti, false), vec![103, 104, 105]);
+#[tokio::test]
+async fn anti_join_residual_handles_duplicate_matches_and_sql_nulls() {
+    assert_eq!(run_correlated_shape(JoinType::Anti, false).await, vec![103, 104, 105]);
 }
 
-#[test]
-fn empty_build_preserves_exists_and_not_exists_semantics() {
-    assert_eq!(run_correlated_shape(JoinType::Semi, true), Vec::<i64>::new());
+#[tokio::test]
+async fn empty_build_preserves_exists_and_not_exists_semantics() {
+    assert_eq!(run_correlated_shape(JoinType::Semi, true).await, Vec::<i64>::new());
     assert_eq!(
-        run_correlated_shape(JoinType::Anti, true),
+        run_correlated_shape(JoinType::Anti, true).await,
         vec![101, 102, 103, 104, 105]
     );
 }

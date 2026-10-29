@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn null_inputs_are_ignored_and_count_only_counts_non_null_values() {
+#[tokio::test]
+async fn null_inputs_are_ignored_and_count_only_counts_non_null_values() {
     let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(5)]));
     let plan = AggregatePlan {
         groups: 0,
@@ -26,7 +26,7 @@ fn null_inputs_are_ignored_and_count_only_counts_non_null_values() {
             VeinDataType::Float64,
         ],
     };
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![Some(1), None, Some(1)])),
@@ -36,7 +36,7 @@ fn null_inputs_are_ignored_and_count_only_counts_non_null_values() {
         values,
     ]))
         .unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let row = &output[0];
 
     assert_eq!(
@@ -45,7 +45,7 @@ fn null_inputs_are_ignored_and_count_only_counts_non_null_values() {
         2
     );
     assert_eq!(
-        crate::pipeline::test_support::materialized_column::<Int64Array>(row, 1)
+        int128_column(row, 1)
             .value(0),
         8
     );

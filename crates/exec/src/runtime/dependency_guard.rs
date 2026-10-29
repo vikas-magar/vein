@@ -47,15 +47,16 @@ impl PipelineDependencyGuard {
     }
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for PipelineDependencyGuard {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.ensure_ready()?;
-        self.inner.push(view)
+        self.inner.push(view).await
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         self.ensure_ready()?;
-        self.inner.flush()
+        self.inner.flush().await
     }
 
     fn finished(&self) -> bool {

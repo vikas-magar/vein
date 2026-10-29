@@ -34,18 +34,18 @@ impl<T: Any + Send + Sync> PipelineNodeDowncast for T {
     }
 }
 
-/// The synchronous trait implemented by all CPU-bound operators (Transforms
-/// and Sinks).
+/// Batch-oriented operators with cooperative downstream delivery.
 ///
 /// Every pipeline operator consumes and emits the engine's canonical
-/// reference-backed view. Implementations must NEVER yield to an asynchronous
-/// scheduler; they process the view and immediately return or push it onward.
+/// reference-backed view. CPU kernels remain synchronous; batch handoffs may
+/// suspend on backpressure so producers and consumers can share one scheduler.
+#[async_trait::async_trait]
 pub trait PipelineNode: PipelineNodeDowncast + Send + Sync {
     /// Pushes a view of columnar data into the operator.
-    fn push(&mut self, view: DataChunkView) -> Result<()>;
+    async fn push(&mut self, view: DataChunkView) -> Result<()>;
 
     /// Signals that no more data will be pushed.
-    fn flush(&mut self) -> Result<()>;
+    async fn flush(&mut self) -> Result<()>;
 
     /// Whether this node has all the data it will ever need, so the source
     /// feeding it may stop reading.
@@ -76,7 +76,6 @@ pub trait PipelineNode: PipelineNodeDowncast + Send + Sync {
             "pipeline node does not support local-state combination",
         ))
     }
-
 }
 
 /// The trait implemented by all data sources.
@@ -85,6 +84,12 @@ pub trait PipelineNode: PipelineNodeDowncast + Send + Sync {
 /// so independent tasks can be executed concurrently.
 #[async_trait::async_trait]
 pub trait Source: Send {
+    /// Transfers an incremental source into the shared scheduler cursor contract.
+    /// Sources awaiting migration report unsupported instead of buffering output.
+    fn into_cursor(self: Box<Self>) -> Result<crate::operators::source::scan::ScanCursor<'static>> {
+        Err(VeinError::unsupported("source has not migrated to incremental execution", None))
+    }
+
     /// Execute the source, pushing views into the next pipeline node.
     async fn execute(&mut self, next: &mut dyn PipelineNode) -> Result<()>;
 

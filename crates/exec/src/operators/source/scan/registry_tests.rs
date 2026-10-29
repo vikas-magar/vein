@@ -1,9 +1,7 @@
 use async_trait::async_trait;
 use catalog::DataFileFormatId;
-use common::Result;
 use error::VeinError;
 
-use crate::pipeline::PipelineNode;
 
 use super::{ScanProvider, ScanProviderRegistry, ScanRequest};
 
@@ -15,8 +13,8 @@ impl ScanProvider for NoopProvider {
         &self.0
     }
 
-    async fn execute(&self, _request: ScanRequest<'_>, _next: &mut dyn PipelineNode) -> Result<()> {
-        Ok(())
+    fn open<'a>(&'a self, _request: ScanRequest<'a>) -> crate::operators::source::scan::ScanCursor<'a> {
+        Box::pin(futures::stream::empty())
     }
 }
 

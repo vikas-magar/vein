@@ -2,6 +2,7 @@
 
 pub mod expression;
 pub mod encoding;
+pub mod extension;
 pub mod operators;
 pub mod pipeline_graph;
 pub mod task;

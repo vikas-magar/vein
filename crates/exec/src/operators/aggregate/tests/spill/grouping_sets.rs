@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn aggregate_spill_preserves_null_keys_and_grouping_set_identity() {
+#[tokio::test]
+async fn aggregate_spill_preserves_null_keys_and_grouping_set_identity() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -39,7 +39,7 @@ fn aggregate_spill_preserves_null_keys_and_grouping_set_identity() {
         }
         Ok(())
     })
-        .expect("merge grouping-set spill runs");
+        .await.expect("merge grouping-set spill runs");
     null_key_counts.sort_unstable();
     let null_rows = keys.iter().filter(|key| key.is_none()).count() as i64;
     assert_eq!(null_key_counts, [null_rows, input_rows]);

@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
+#[tokio::test]
+async fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
     let values: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
     let plan = AggregatePlan {
         groups: 0,
@@ -24,7 +24,7 @@ fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
             VeinDataType::Float64,
         ],
     };
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         values.clone(),
@@ -33,10 +33,10 @@ fn int32_aggregates_widen_sum_and_preserve_min_max_layout() {
         values,
     ]))
         .unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
 
     assert_eq!(
-        crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0)
+        int128_column(&output[0], 0)
             .value(0),
         4
     );

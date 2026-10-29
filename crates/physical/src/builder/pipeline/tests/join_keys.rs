@@ -1,5 +1,5 @@
-use super::support::{equality, test_column};
 use super::super::extract_equi_join_keys;
+use super::support::{equality, test_column};
 use parser::ast::expr::BinaryOp;
 use plan::schema::{ColumnId, ResolvedColumn, VeinDataType, VeinSchema};
 use plan::{LogicalExpr, LogicalLiteral};
@@ -66,7 +66,7 @@ fn keeps_same_side_equality_residual_when_extracting_join_keys() {
     assert_eq!(residuals, vec![same_side]);
 }
 #[test]
-fn rejects_a_join_condition_without_a_supported_hash_key_type() {
+fn non_hashable_equality_remains_an_exact_residual() {
     let probe_key = Arc::new(ResolvedColumn::new(
         ColumnId(31),
         "probe_key",
@@ -83,10 +83,10 @@ fn rejects_a_join_condition_without_a_supported_hash_key_type() {
     let build = VeinSchema::new(vec![Arc::clone(&build_key)]);
     let conjunct = equality(probe_key, build_key);
 
-    let error = extract_equi_join_keys(&[&conjunct], &probe, &build)
-        .expect_err("an unsupported equality cannot be handed to the hash table");
-
-    assert!(error.to_string().contains("matching supported hash-key type"));
+    let ((probe_keys, build_keys), residual) =
+        extract_equi_join_keys(&[&conjunct], &probe, &build).unwrap();
+    assert!(probe_keys.is_empty() && build_keys.is_empty());
+    assert_eq!(residual, vec![conjunct]);
 }
 #[test]
 fn int32_equality_is_extracted_as_hash_key_alongside_int64() {
@@ -144,12 +144,9 @@ fn expression_equality_remains_residual_when_a_supported_hash_key_exists() {
         return_type: VeinDataType::Boolean,
     };
 
-    let ((probe_keys, build_keys), residuals) = extract_equi_join_keys(
-        &[&supported, &expression_equality],
-        &probe,
-        &build,
-    )
-        .expect("the direct equality supplies a hash key");
+    let ((probe_keys, build_keys), residuals) =
+        extract_equi_join_keys(&[&supported, &expression_equality], &probe, &build)
+            .expect("the direct equality supplies a hash key");
 
     assert_eq!(probe_keys, vec![0]);
     assert_eq!(build_keys, vec![0]);

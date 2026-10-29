@@ -41,6 +41,7 @@ pub(super) fn resolve_candidates(
         VeinError::internal(format!("cannot reserve aggregate batch groups: {error}"))
     })?;
     let group_memory_before_batch = memory.bytes();
+    let mut reservation = crate::memory::batch::BatchReservation::new(memory, "aggregate group state");
     let resolution_started = Instant::now();
     let resolution = index.resolve_rows(hashes, batch_group_ids, |candidate, existing_slot| {
         let set_id = if dictionary_fast_path {
@@ -139,12 +140,13 @@ pub(super) fn resolve_candidates(
                         }
                     })
                     .ok_or_else(|| VeinError::internal("aggregate group size overflow"))?;
-                memory.grow(group_bytes, "aggregate group state")?;
+                reservation.charge(group_bytes, candidate_count - candidate)?;
                 new_groups.push(candidate);
                 Ok(ProbeResolution::Insert(slot))
             }
         }
     });
+    drop(reservation);
     let index_metrics = match resolution {
         Ok(metrics) => metrics,
         Err(error) => {

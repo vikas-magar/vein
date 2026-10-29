@@ -23,13 +23,14 @@ impl Default for DiscardSink {
     }
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for DiscardSink {
-    fn push(&mut self, batch: DataChunkView) -> Result<()> {
+    async fn push(&mut self, batch: DataChunkView) -> Result<()> {
         self.rows_seen += batch.num_rows();
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         info!(
             "DiscardSink finished, discarded {} total rows",
             self.rows_seen
@@ -50,21 +51,21 @@ mod tests {
     use crate::pipeline::DataChunkView;
     use common::arrow::SelectionVector;
 
-    #[test]
-    fn discard_counts_chunk_and_view_rows_without_materialization() {
+    #[tokio::test]
+    async fn discard_counts_chunk_and_view_rows_without_materialization() {
         let mut sink = DiscardSink::new();
         sink.push(DataChunkView::from_arrays(
             vec![],
             2,
             SelectionVector::new_dense(2),
-        ).unwrap()).unwrap();
+        ).unwrap()).await.unwrap();
         sink.push(DataChunkView::from_arrays(
             vec![],
             3,
             SelectionVector::new_dense(3),
-        ).unwrap()).unwrap();
+        ).unwrap()).await.unwrap();
         assert_eq!(Sink::row_count(&sink), 5);
         assert!(Sink::collect(&mut sink).is_empty());
-        PipelineNode::flush(&mut sink).unwrap();
+        PipelineNode::flush(&mut sink).await.unwrap();
     }
 }

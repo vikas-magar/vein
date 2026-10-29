@@ -66,3 +66,20 @@ async fn automatic_backend_falls_back_to_storage_for_non_local_paths() {
         b"remote"
     );
 }
+
+#[tokio::test]
+async fn automatic_backend_accepts_storage_objects_without_os_paths() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    std::fs::write(directory.path().join("object.parquet"), b"range bytes").unwrap();
+    let source = ParquetIoBackend::Auto
+        .open_source(
+            &local_storage(directory.path()),
+            "object.parquet",
+            std::path::Path::new(""),
+            11,
+        )
+        .await
+        .expect("storage source requires no OS path");
+    assert_eq!(source.representation(), "storage_range_buffer");
+    assert_eq!(source.read_range(0..5).await.unwrap().as_ref(), b"range");
+}

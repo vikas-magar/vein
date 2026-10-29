@@ -28,21 +28,19 @@ impl ScanProvider for EmittingProvider {
         &self.format_id
     }
 
-    async fn execute(
-        &self,
-        _request: ScanRequest<'_>,
-        next: &mut dyn PipelineNode,
-    ) -> Result<()> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let values = Arc::new(Int64Array::from(vec![41, 42]));
-        let view = DataChunkView::from_arrays(
-            vec![values],
-            2,
-            SelectionVector::new_dense(2),
-        )?
-            .with_schema(schema)?;
-        next.push(view)
+    fn open<'a>(&'a self, _request: ScanRequest<'a>) -> crate::operators::source::scan::ScanCursor<'a> {
+        Box::pin(futures::stream::once(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let values = Arc::new(Int64Array::from(vec![41, 42]));
+            let view = DataChunkView::from_arrays(
+                vec![values],
+                2,
+                SelectionVector::new_dense(2),
+            )?
+                .with_schema(schema)?;
+            Ok(view)
+        }))
     }
 }
 
@@ -88,13 +86,14 @@ struct CountingSink {
     rows: usize,
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for CountingSink {
-    fn push(&mut self, view: DataChunkView) -> Result<()> {
+    async fn push(&mut self, view: DataChunkView) -> Result<()> {
         self.rows += view.num_rows();
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }

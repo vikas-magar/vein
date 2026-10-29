@@ -34,10 +34,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Build workspace
         run: cargo build --workspace --locked
+      - name: Test workspace
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --workspace --locked
 
-  wasm-portable:
-    name: Build portable crates (wasm32-unknown-unknown)
+  wasm-browser:
+    name: Package browser playground
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -47,5 +53,63 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Build portable crates
-        run: cargo build --locked --target wasm32-unknown-unknown -p error -p types -p parser -p functions
+      - name: Build browser engine
+        run: cargo build --locked --release --target wasm32-unknown-unknown -p vein-wasm
+      - name: Install matching wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Prepare browser package directory
+        run: mkdir -p assets/website/public/wasm
+      - name: Generate JavaScript bindings
+        run: >-
+          wasm-bindgen target/wasm32-unknown-unknown/release/vein_wasm.wasm
+          --target web --out-dir assets/website/public/wasm --out-name vein_wasm
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: assets/website/package-lock.json
+      - name: Install website dependencies
+        working-directory: assets/website
+        run: npm ci
+      - name: Check website types
+        working-directory: assets/website
+        run: npm run typecheck
+      - name: Test website worker modules
+        working-directory: assets/website
+        run: npm run test:worker
+      - name: Install browser test engines
+        working-directory: assets/website
+        run: npx playwright install --with-deps chromium webkit
+      - name: Test website in Chromium and WebKit
+        working-directory: assets/website
+        run: npm run test:browser
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Build static website
+        working-directory: assets/website
+        env:
+          NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: npm run build
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: assets/website/out/
+
+  deploy-pages:
+    name: Deploy website
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: wasm-browser
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

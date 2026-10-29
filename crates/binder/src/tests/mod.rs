@@ -8,6 +8,8 @@
 use crate::testing;
 use plan::{LogicalExpr, LogicalPlan, PlanTraversal};
 
+mod q18;
+
 /// Binds `sql` and unwraps the plan (tests assume the query is valid).
 pub async fn bind(sql: &str) -> LogicalPlan {
     testing::plan(sql).await.expect("query should bind")
@@ -878,7 +880,7 @@ mod extended_features {
     }
 
     #[tokio::test]
-    async fn extract_and_year_accept_temporal_inputs_and_return_int32() {
+    async fn extract_and_year_accept_temporal_inputs_and_return_int64() {
         let plan = bind(
             "FROM dates |> SELECT EXTRACT(YEAR FROM order_date), EXTRACT(MONTH FROM date64), EXTRACT(HOUR FROM time_of_day), EXTRACT(MINUTE FROM timestamp), YEAR(order_date)",
         )
@@ -891,7 +893,7 @@ mod extended_features {
             let LogicalExpr::FunctionCall { return_type, .. } = expr else {
                 panic!("expected temporal function call");
             };
-            assert_eq!(return_type, plan::VeinDataType::Int32);
+            assert_eq!(return_type, plan::VeinDataType::Int64);
         }
 
         for query in [
@@ -1101,7 +1103,7 @@ mod aggregate_types {
             panic!("expected Aggregate plan");
         };
 
-        assert_eq!(schema.fields[0].data_type, VeinDataType::Int64);
+        assert_eq!(schema.fields[0].data_type, VeinDataType::int128());
         assert_eq!(schema.fields[1].data_type, VeinDataType::Int64);
         assert_eq!(schema.fields[2].data_type, VeinDataType::Float64);
     }
@@ -1148,9 +1150,9 @@ mod aggregate_types {
         };
 
         let expected = [
-            VeinDataType::Int64,
-            VeinDataType::Int64,
-            VeinDataType::Int64,
+            VeinDataType::int128(),
+            VeinDataType::int128(),
+            VeinDataType::int128(),
             VeinDataType::UInt64,
             VeinDataType::UInt64,
             VeinDataType::UInt64,
@@ -1180,7 +1182,7 @@ mod aggregate_types {
         };
         let common_type = left.data_type();
         assert_eq!(right.data_type(), common_type);
-        assert_eq!(common_type, VeinDataType::Decimal128(35, 8));
+        assert_eq!(common_type, VeinDataType::Decimal128(20, 6));
         assert!(
             matches!(left.as_ref(), LogicalExpr::Cast { target_type, .. } if *target_type == common_type),
             "the narrower decimal operand must be cast to the comparison type: {left:?}"

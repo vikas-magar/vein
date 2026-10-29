@@ -39,6 +39,8 @@ impl QueryBinder {
     pub fn catalog(&self) -> &Arc<dyn CatalogProvider> {
         &self.catalog
     }
+    /// Access the same function catalog used to resolve query expressions.
+    pub fn functions(&self) -> &Arc<dyn FunctionRegistry> { &self.functions }
 }
 
 #[async_trait]
@@ -62,10 +64,10 @@ impl LogicalBinder for QueryBinder {
         // single operator is bound. For a two-table query `bind` measured 12x the
         // optimizer and 24x the planner combined, so which half that is decides
         // whether the cost is metadata or binding.
-        let session_started = std::time::Instant::now();
+        let session_started = common::time::Instant::now();
         let planning_session = self.catalog.begin_planning_session().await?;
         let session_us = session_started.elapsed().as_micros() as u64;
-        let binding_started = std::time::Instant::now();
+        let binding_started = common::time::Instant::now();
         let mut context =
             BinderContext::with_planning_session(catalog_ref, functions_ref, planning_session);
         let mut scopes = ScopeStack::new();

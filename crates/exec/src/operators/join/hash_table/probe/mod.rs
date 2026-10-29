@@ -5,7 +5,7 @@ use crate::pipeline::{DataChunkView, MaterializationReport};
 use common::Result;
 use error::VeinError;
 use std::mem::size_of;
-use std::time::Instant;
+use common::time::Instant;
 
 pub(crate) mod control;
 pub(crate) mod metrics;
@@ -22,9 +22,10 @@ use window::ProbeRow;
 pub(crate) type JoinMatch = (u32, (u32, u32));
 
 /// A local cursor over an immutable table. Only hashes and row indexes enter scratch storage.
-pub(crate) struct HashProbe<'a> {
-    table: &'a HashTable,
-    view: &'a DataChunkView,
+pub(crate) struct HashProbe<T, V> {
+
+    table: T,
+    view: V,
     keys: ChunkKeys,
     position: usize,
     next_window: usize,
@@ -39,13 +40,14 @@ pub(crate) struct HashProbe<'a> {
     pub(crate) metrics: ProbeMetrics,
 }
 
-impl HashProbe<'_> {
+impl<T, V> HashProbe<T, V>
+where T: std::ops::Deref<Target=HashTable>, V: std::ops::Deref<Target=DataChunkView> {
     pub(crate) fn report(&self) -> MaterializationReport { MaterializationReport::default() }
     pub(crate) fn matched(&self, row: usize) -> bool { self.accepted[row] }
     pub(crate) fn accept(&mut self, row: usize) -> bool {
         std::mem::replace(&mut self.accepted[row], true)
     }
-    pub(crate) fn is_null(&self, row: usize) -> Result<bool> { self.keys.any_null(self.view, row) }
+    pub(crate) fn is_null(&self, row: usize) -> Result<bool> { self.keys.any_null(&self.view, row) }
 
     #[inline]
     fn poll_control(&mut self, budget: &mut WorkBudget, finished: &mut impl FnMut() -> bool) -> Result<bool> {

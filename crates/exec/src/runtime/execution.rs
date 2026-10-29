@@ -37,15 +37,15 @@ impl DefaultTaskExecutor {
         ) -> Result<Box<dyn Sink>>
         + Send,
     ) -> Result<TaskResult> {
-        self.execute_with_output_and_resources(task, cancel, None, make_sink)
+        let resources = self.create_query_resources(task, cancel)?;
+        self.execute_with_output_and_resources(task, resources, make_sink)
             .await
     }
 
     pub(super) async fn execute_with_output_and_resources(
         &self,
         task: &ExecuteTask,
-        cancel: CancellationToken,
-        resources: Option<Arc<QueryExecutionResources>>,
+        resources: Arc<QueryExecutionResources>,
         make_sink: impl FnOnce(
             &dyn ExecutorBuilder,
             &DataSink,
@@ -53,16 +53,15 @@ impl DefaultTaskExecutor {
         ) -> Result<Box<dyn Sink>>
         + Send,
     ) -> Result<TaskResult> {
+        resources.validate_task(task)?;
+        let cancel = resources.cancellation().clone();
         let start = Instant::now();
         if cancel.is_cancelled() {
             return Err(VeinError::cancelled());
         }
         let query_id = task.query_id.to_string();
         let task_id = task.task_id.to_string();
-        let statistics_context = task
-            .statistics_context
-            .clone()
-            .unwrap_or_else(|| Arc::new(QueryStatisticsContext::new([])));
+        let statistics_context = Arc::clone(resources.statistics_context());
         let mut trace = ExecutionTrace::new_with_query_context(
             &task.plan.root,
             query_id.clone(),
@@ -75,6 +74,14 @@ impl DefaultTaskExecutor {
         trace.log_plan();
         Self::trace_data_flow(&task.plan.root, task, &trace, 0);
         task.plan.validate()?;
+        if task.plan.has_extensions() {
+            let registry = self.builder.operator_factory_registry().ok_or_else(|| {
+                VeinError::planning("physical plan requires an operator factory registry", None)
+            })?;
+            let _prepared = crate::pipeline::resumable::PreparedExtensionPlan::prepare(&task.plan, &registry)?;
+            return Err(VeinError::unsupported(
+                "registered physical extensions require the resumable pipeline scheduler", None));
+        }
         let PhysicalPlanOperator::Sink {
             input,
             sink: sink_plan,
@@ -86,22 +93,12 @@ impl DefaultTaskExecutor {
             ));
         };
         let schedule = PipelineExecutionSchedule::derive(&task.plan, &trace)?;
-        let memory = match resources {
-            Some(resources) => resources.memory.clone(),
-            None => {
-                let spill_storage = self.spill_storage_factory.create_for_query()?;
-                QueryMemoryTracker::with_spill_storage(
-                    self.resource_limits,
-                    cancel.clone(),
-                    spill_storage,
-                )
-            }
-        };
+        let memory = resources.memory_tracker().clone();
         trace.attach_memory_tracker(memory.clone());
 
         let sink_started = Instant::now();
         let sink = make_sink(self.builder.as_ref(), sink_plan, &memory)?;
-        let sink: Arc<Mutex<Box<dyn Sink>>> = Arc::new(Mutex::new(sink));
+        let sink = Arc::new(tokio::sync::Mutex::new(sink));
         let sink_build_us = sink_started.elapsed().as_micros() as u64;
         let task_span = tracing::info_span!(
             target: "vein.audit",
@@ -127,6 +124,8 @@ impl DefaultTaskExecutor {
             schedule: &schedule,
             trace: &trace,
         };
+        // Source waits observe cancellation locally. Keep the coordinator alive
+        // so blocking workers are drained and their original failure survives.
         let execution_result = self.execute_input(input, head, &execution_context, 0).await;
         root_guard.finish(&execution_result);
         let bytes_read = execution_result?;
@@ -138,7 +137,7 @@ impl DefaultTaskExecutor {
         let collect_started = Instant::now();
         let mut sink = sink
             .lock()
-            .map_err(|_| VeinError::internal("sink mutex poisoned"))?;
+            .await;
         let output = sink.collect();
         let row_count = sink
             .row_count()

@@ -1,6 +1,6 @@
 //! Applies dictionary evidence and attaches page byte locations to selections.
 
-use std::time::Instant;
+use common::time::Instant;
 
 use parquet::arrow::arrow_reader::RowGroupSelection;
 use parquet::file::metadata::ParquetMetaData;

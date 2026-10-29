@@ -17,19 +17,33 @@ use super::{DefaultTaskExecutor, QueryExecutionResources, TaskExecutor, TaskResu
 impl TaskExecutor for DefaultTaskExecutor {
     fn create_query_resources(
         &self,
+        task: &ExecuteTask,
         cancel: CancellationToken,
     ) -> common::Result<Arc<QueryExecutionResources>> {
         let spill_storage = self.spill_storage_factory.create_for_query()?;
-        let memory = crate::memory::QueryMemoryTracker::with_spill_storage(
+        Ok(Arc::new(QueryExecutionResources::new(
+            task,
             self.resource_limits,
             cancel,
             spill_storage,
-        );
-        Ok(Arc::new(QueryExecutionResources { memory }))
+        )?))
     }
 
     async fn execute(&self, task: &ExecuteTask, cancel: CancellationToken) -> Result<TaskResult> {
-        self.execute_with_output(task, cancel, |builder, sink, _memory| builder.build_sink(sink))
+        self.execute_with_output(task, cancel, |builder, sink, _memory| {
+            builder.build_sink(sink)
+        })
+            .await
+    }
+
+    async fn execute_with_resources(
+        &self,
+        task: &ExecuteTask,
+        resources: Arc<QueryExecutionResources>,
+    ) -> Result<TaskResult> {
+        self.execute_with_output_and_resources(task, resources, |builder, sink, _| {
+            builder.build_sink(sink)
+        })
             .await
     }
 
@@ -38,14 +52,14 @@ impl TaskExecutor for DefaultTaskExecutor {
         task: &ExecuteTask,
         cancel: CancellationToken,
     ) -> Result<CheckpointTaskResult> {
-        let resources = self.create_query_resources(cancel.clone())?;
-        self.execute_to_checkpoint_with_resources(task, cancel, resources).await
+        let resources = self.create_query_resources(task, cancel)?;
+        self.execute_to_checkpoint_with_resources(task, resources)
+            .await
     }
 
     async fn execute_to_checkpoint_with_resources(
         &self,
         task: &ExecuteTask,
-        cancel: CancellationToken,
         resources: Arc<QueryExecutionResources>,
     ) -> Result<CheckpointTaskResult> {
         let relation_slot = Arc::new(Mutex::new(None));
@@ -53,8 +67,7 @@ impl TaskExecutor for DefaultTaskExecutor {
         let result = self
             .execute_with_output_and_resources(
                 task,
-                cancel,
-                Some(Arc::clone(&resources)),
+                Arc::clone(&resources),
                 move |_builder, sink, memory| {
                     let DataSink::Client { schema } = sink else {
                         return Err(VeinError::planning(
@@ -62,13 +75,12 @@ impl TaskExecutor for DefaultTaskExecutor {
                             None,
                         ));
                     };
-                    let relation = IntermediateRelation::new(
-                        Arc::new(schema.to_arrow()),
-                        memory.clone(),
-                    );
-                    *slot.lock().map_err(|_| {
-                        VeinError::internal("checkpoint result slot poisoned")
-                    })? = Some(relation.clone());
+                    let relation =
+                        IntermediateRelation::new(Arc::new(schema.to_arrow()), memory.clone());
+                    *slot
+                        .lock()
+                        .map_err(|_| VeinError::internal("checkpoint result slot poisoned"))? =
+                        Some(relation.clone());
                     Ok(Box::new(relation.sink()))
                 },
             )
@@ -91,7 +103,8 @@ impl TaskExecutor for DefaultTaskExecutor {
         source_id: IntermediateSourceId,
         relation: IntermediateRelation,
     ) -> common::Result<crate::runtime::checkpoint::IntermediateSourceRegistration> {
-        self.intermediate_sources.register(query_id, source_id, relation)
+        self.intermediate_sources
+            .register(query_id, source_id, relation)
     }
 
     async fn execute_streaming(
@@ -109,16 +122,12 @@ impl TaskExecutor for DefaultTaskExecutor {
     async fn execute_streaming_with_resources(
         &self,
         task: &ExecuteTask,
-        cancel: CancellationToken,
         output: flume::Sender<DataChunkView>,
         resources: Arc<QueryExecutionResources>,
     ) -> Result<TaskResult> {
-        self.execute_with_output_and_resources(
-            task,
-            cancel,
-            Some(resources),
-            move |builder, sink, _memory| builder.build_streaming_sink(sink, output),
-        )
+        self.execute_with_output_and_resources(task, resources, move |builder, sink, _memory| {
+            builder.build_streaming_sink(sink, output)
+        })
             .await
     }
 }

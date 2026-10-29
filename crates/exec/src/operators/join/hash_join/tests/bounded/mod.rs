@@ -33,8 +33,8 @@ fn expected(kind: JoinType, probe: &[Option<i64>], build: &[Option<i64>]) -> Vec
     rows
 }
 
-#[test]
-fn bounded_join_matches_scalar_oracle_for_duplicates_nulls_and_empty_inputs() {
+#[tokio::test]
+async fn bounded_join_matches_scalar_oracle_for_duplicates_nulls_and_empty_inputs() {
     for kind in [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full,
         JoinType::Semi, JoinType::Anti, JoinType::NullAwareAnti, JoinType::Cross] {
         for probe in [vec![], vec![None], vec![Some(7)], vec![Some(9), Some(7), None]] {
@@ -51,9 +51,9 @@ fn bounded_join_matches_scalar_oracle_for_duplicates_nulls_and_empty_inputs() {
                                              vec![DataType::Int64], vec![DataType::Int64], Box::new(sink.clone()));
                 // One-row input and build chunks force a candidate boundary after every match.
                 for &value in &probe {
-                    join.push(crate::pipeline::test_support::dense_view(vec![nullable_ints(&[value])])).unwrap();
+                    join.push(crate::pipeline::test_support::dense_view(vec![nullable_ints(&[value])])).await.unwrap();
                 }
-                join.flush().unwrap();
+                join.flush().await.unwrap();
                 let mut actual: Vec<Vec<Option<i64>>> = Vec::new();
                 for batch in sink.0.lock().unwrap().iter() {
                     for row in 0..batch.num_rows() {
@@ -68,19 +68,19 @@ fn bounded_join_matches_scalar_oracle_for_duplicates_nulls_and_empty_inputs() {
     }
 }
 
-#[test]
-fn existence_join_skips_duplicate_chain_after_first_accepted_match() {
+#[tokio::test]
+async fn existence_join_skips_duplicate_chain_after_first_accepted_match() {
     let sink = Collect::default();
     let mut join = HashJoin::new(Arc::new(build(&vec![7; 1000])), JoinType::Semi,
                                  vec![OutputColumn::Probe(0)], vec![DataType::Int64], vec![DataType::Int64], Box::new(sink));
-    join.push(crate::pipeline::test_support::dense_view(vec![ints(&[7, 7, 8])])).unwrap();
+    join.push(crate::pipeline::test_support::dense_view(vec![ints(&[7, 7, 8])])).await.unwrap();
     assert_eq!(join.matched_rows, 2);
     assert_eq!(join.candidate_rows_examined, 2);
     assert_eq!(join.max_candidate_batch_rows, 2);
 }
 
-#[test]
-fn existence_residual_retries_rejected_matches_then_stops_accepted_rows() {
+#[tokio::test]
+async fn existence_residual_retries_rejected_matches_then_stops_accepted_rows() {
     use common::protocol::BinaryExprOp;
     use types::VeinDataType;
     let mut table = HashTable::new(JoinKeys::new(vec![0]), JoinKeys::new(vec![0]));
@@ -95,8 +95,8 @@ fn existence_residual_retries_rejected_matches_then_stops_accepted_rows() {
     let mut join = HashJoin::new(Arc::new(table), JoinType::Semi,
                                  vec![OutputColumn::Probe(1)], vec![DataType::Int64; 2], vec![DataType::Int64; 2], Box::new(sink.clone()))
         .with_residual_filter(vec![OutputColumn::Probe(1), OutputColumn::Build(1)], Box::new(transform), output);
-    join.push(crate::pipeline::test_support::dense_view(vec![ints(&[7, 7]), ints(&[30, 20])])).unwrap();
-    join.flush().unwrap();
+    join.push(crate::pipeline::test_support::dense_view(vec![ints(&[7, 7]), ints(&[30, 20])])).await.unwrap();
+    join.flush().await.unwrap();
     let actual = sink.0.lock().unwrap().iter().flat_map(|batch| cells(batch, 0)).collect::<Vec<_>>();
     assert_eq!(actual, vec![Some(30), Some(20)]);
     assert_eq!(join.candidate_rows_examined, 16, "three candidates then thirteen; no remaining duplicate scans");

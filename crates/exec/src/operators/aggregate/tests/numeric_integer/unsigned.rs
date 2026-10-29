@@ -32,7 +32,7 @@ macro_rules! assert_unsigned_layout {
             input,
         ]))
         .unwrap();
-        let output = sink.finish().unwrap();
+        let output = sink.finish().await.unwrap();
         assert_eq!(
             crate::pipeline::test_support::materialized_column::<UInt64Array>(&output[0], 0)
                 .value(0),
@@ -56,8 +56,8 @@ macro_rules! assert_unsigned_layout {
     }};
 }
 
-#[test]
-fn unsigned_layouts_share_typed_states_and_ignore_nulls() {
+#[tokio::test]
+async fn unsigned_layouts_share_typed_states_and_ignore_nulls() {
     assert_unsigned_layout!(
         UInt8Array,
         VeinDataType::UInt8,
@@ -92,8 +92,8 @@ fn unsigned_layouts_share_typed_states_and_ignore_nulls() {
     );
 }
 
-#[test]
-fn uint64_sum_checks_overflow_and_average_uses_wide_exact_state() {
+#[tokio::test]
+async fn uint64_sum_checks_overflow_and_average_uses_wide_exact_state() {
     let sum_plan = AggregatePlan {
         groups: 0,
         estimated_groups: None,
@@ -135,7 +135,7 @@ fn uint64_sum_checks_overflow_and_average_uses_wide_exact_state() {
             vec![u64::MAX],
         ))]))
         .unwrap();
-    let output = avg_sink.finish().unwrap();
+    let output = avg_sink.finish().await.unwrap();
     let average = crate::pipeline::test_support::materialized_column::<Float64Array>(&output[0], 0);
     assert_eq!(average.value(0), u64::MAX as f64);
 }

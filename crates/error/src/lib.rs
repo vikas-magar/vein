@@ -12,6 +12,7 @@ mod external;
 mod parse;
 mod resource;
 mod span;
+mod diagnostic;
 
 pub use category::ErrorCategory;
 pub use external::{BoxError, ExternalError, VeinResultExt};

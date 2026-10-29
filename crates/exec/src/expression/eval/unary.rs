@@ -33,5 +33,10 @@ pub(super) fn evaluate_unary(
             ops::eval_mapped_unary_predicate(&value, rows, Some(false), ops::eval_is_not_null)?
         }
     };
+    let result = if physical.return_type.is_int128() {
+        ops::eval_mapped_unary_value(&result, rows,
+            |len| Ok(arrow::array::new_null_array(&types::wide_integer::INT128_STORAGE, len)),
+            ops::wide_integer::normalize)?
+    } else { result };
     Ok(super::normalize_scalar(result, value.is_scalar()))
 }

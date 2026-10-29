@@ -2,13 +2,15 @@
 
 use crate::pipeline::{DataChunkView, PipelineNode, Transform};
 use common::Result;
+/// Resumable LIMIT state and stage adapters.
+pub mod resumable;
+mod window;
+pub use resumable::LimitState;
+use window::LimitWindow;
 
 /// A synchronous [`Transform`] that limits the number of rows produced by a pipeline.
 pub struct LimitTransform {
-    offset: u64,
-    count: u64,
-    rows_seen: u64,
-    rows_emitted: u64,
+    window: LimitWindow,
     next: Box<dyn PipelineNode>,
 }
 
@@ -20,63 +22,28 @@ impl LimitTransform {
         next: Box<dyn PipelineNode>,
     ) -> Self {
         Self {
-            offset,
-            count,
-            rows_seen: 0,
-            rows_emitted: 0,
+            window: LimitWindow::new(offset, count),
             next,
         }
     }
 }
 
+#[async_trait::async_trait]
 impl PipelineNode for LimitTransform {
-    fn push(&mut self, chunk: DataChunkView) -> Result<()> {
-        if self.rows_emitted >= self.count {
-            // Maximum rows already reached; drop further pushes
-            return Ok(());
+    async fn push(&mut self, chunk: DataChunkView) -> Result<()> {
+        if let Some(limited) = self.window.apply(chunk)? {
+            self.next.push(limited).await?;
         }
-
-        let chunk_rows = chunk.num_rows();
-        if chunk_rows == 0 {
-            return Ok(());
-        }
-
-        // Check how many rows of this chunk fall before `offset`
-        if self.rows_seen + (chunk_rows as u64) <= self.offset {
-            // Whole chunk is before offset
-            self.rows_seen += chunk_rows as u64;
-            return Ok(());
-        }
-
-        let start_in_chunk = if self.rows_seen < self.offset {
-            (self.offset - self.rows_seen) as usize
-        } else {
-            0
-        };
-
-        let remaining_to_emit = (self.count - self.rows_emitted) as usize;
-        let available = chunk_rows - start_in_chunk;
-        let take_count = available.min(remaining_to_emit);
-
-        self.rows_seen += chunk_rows as u64;
-        self.rows_emitted += take_count as u64;
-
-        if take_count == 0 {
-            return Ok(());
-        }
-
-        let selection = chunk.selection().slice(start_in_chunk, take_count);
-        let limited = chunk.into_selection(selection)?;
-        self.next.push(limited)
+        Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
-        self.next.flush()
+    async fn flush(&mut self) -> Result<()> {
+        self.next.flush().await
     }
 
     /// Once the window is full, nothing further down can matter.
     fn finished(&self) -> bool {
-        self.rows_emitted >= self.count
+        self.window.is_complete()
     }
 }
 

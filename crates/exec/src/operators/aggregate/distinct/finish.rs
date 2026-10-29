@@ -2,7 +2,7 @@ use super::super::*;
 use super::DistinctCollector;
 
 impl AggregateSink {
-    pub(in crate::operators::aggregate) fn finish_distinct_counts(
+    pub(in crate::operators::aggregate) async fn finish_distinct_counts(
         &mut self,
         batch_rows: NonZeroUsize,
     ) -> Result<()> {
@@ -22,12 +22,12 @@ impl AggregateSink {
                     &parent_columns,
                     &batch,
                 )
-            })?;
+            }).await?;
         }
         Ok(())
     }
 
-    fn merge_distinct_batch(
+    pub(in crate::operators::aggregate) fn merge_distinct_batch(
         &mut self,
         aggregate_index: usize,
         grouping_set_id: usize,
@@ -90,8 +90,8 @@ impl AggregateSink {
             .map(|(index, ((op, input_type), result_type))| {
                 let mut state = self.registry.create_aggregate_accumulator(
                     op.name(),
-                    &[input_type.to_arrow()],
-                    &result_type.to_arrow(),
+                    std::slice::from_ref(input_type),
+                    result_type,
                 )?;
                 state.ensure_groups(1)?;
                 if index == count_index {

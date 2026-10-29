@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
+#[tokio::test]
+async fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
     let plan = AggregatePlan {
         groups: 1,
         estimated_groups: None,
@@ -13,7 +13,7 @@ fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
         aggregate_input_types: vec![VeinDataType::Int64],
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![1])),
         Arc::new(Int64Array::from(vec![10])),
@@ -61,10 +61,10 @@ fn hash_collisions_keep_distinct_groups_and_update_matching_group() {
     assert_eq!(metrics.group_index_hits, 1);
     assert_eq!(metrics.group_index_misses, 2);
 
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
     let batch = &output[0];
     let keys = materialized_column::<Int64Array>(batch, 0);
-    let sums = materialized_column::<Int64Array>(batch, 1);
+    let sums = int128_column(batch, 1);
 
     assert_eq!(batch.num_rows(), 2);
     assert_eq!((keys.value(0), sums.value(0)), (1, 10));
@@ -83,7 +83,7 @@ fn retained_group_keys_share_input_arrow_buffers() {
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
-    let mut sink = AggregateSink::with_memory_tracker(plan, tracker.clone())
+    let mut sink = AggregateSink::with_memory_tracker(inferred_results(plan), tracker.clone())
         .expect("create aggregate sink");
     let keys = Arc::new(Int64Array::from(vec![10, 20, 30]));
     let source_values = keys.values().as_ptr();
@@ -129,7 +129,7 @@ fn duplicate_only_batch_does_not_retain_or_charge_its_key_array() {
         types: vec![VeinDataType::Int64, VeinDataType::Int64],
     };
     let tracker = QueryMemoryTracker::unlimited(common::cancellation::CancellationToken::new());
-    let mut sink = AggregateSink::with_memory_tracker(plan, tracker.clone())
+    let mut sink = AggregateSink::with_memory_tracker(inferred_results(plan), tracker.clone())
         .expect("create aggregate sink");
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         Arc::new(Int64Array::from(vec![10])),

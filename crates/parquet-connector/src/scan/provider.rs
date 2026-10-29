@@ -5,7 +5,6 @@ use catalog::DataFileFormatId;
 use common::Result;
 use common::protocol::{DataSource, FileScanTask};
 use exec::operators::source::scan::{ScanPlanningRequest, ScanProvider, ScanRequest};
-use exec::pipeline::PipelineNode;
 use types::ColumnId;
 
 use super::parquet::execute_parquet_scan;
@@ -50,8 +49,8 @@ impl ScanProvider for ParquetScanProvider {
             .all(|id| scan.projected.fields.iter().any(|column| column.id == *id))
     }
 
-    async fn execute(&self, request: ScanRequest<'_>, next: &mut dyn PipelineNode) -> Result<()> {
-        execute_parquet_scan(request, next).await
+    fn open<'a>(&'a self, request: ScanRequest<'a>) -> exec::operators::source::scan::ScanCursor<'a> {
+        execute_parquet_scan(request)
     }
 }
 

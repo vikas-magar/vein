@@ -1,6 +1,6 @@
 //! Footer, page-index, and page-header pruning for one assigned file range.
 
-use std::time::Instant;
+use common::time::Instant;
 
 use arrow::datatypes::Schema;
 use parquet::arrow::arrow_reader::RowGroupSelection;

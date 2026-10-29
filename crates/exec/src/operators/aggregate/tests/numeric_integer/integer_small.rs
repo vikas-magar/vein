@@ -2,8 +2,8 @@
 
 use super::*;
 
-#[test]
-fn int8_and_int16_aggregates_share_int64_state() {
+#[tokio::test]
+async fn int8_and_int16_aggregates_share_int64_state() {
     let int8_values: ArrayRef = Arc::new(Int8Array::from(vec![Some(100), None, Some(-10)]));
     let int16_values: ArrayRef = Arc::new(Int16Array::from(vec![Some(1_000), None, Some(-10)]));
     let plan = AggregatePlan {
@@ -42,7 +42,7 @@ fn int8_and_int16_aggregates_share_int64_state() {
             VeinDataType::Float64,
         ],
     };
-    let mut sink = AggregateSink::new(plan).unwrap();
+    let mut sink = AggregateSink::new(inferred_results(plan)).unwrap();
 
     sink.accumulate(crate::pipeline::test_support::dense_view(vec![
         int8_values.clone(),
@@ -55,10 +55,10 @@ fn int8_and_int16_aggregates_share_int64_state() {
         int16_values,
     ]))
         .unwrap();
-    let output = sink.finish().unwrap();
+    let output = sink.finish().await.unwrap();
 
     assert_eq!(
-        crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 0)
+        int128_column(&output[0], 0)
             .value(0),
         90
     );
@@ -78,7 +78,7 @@ fn int8_and_int16_aggregates_share_int64_state() {
         45.0
     );
     assert_eq!(
-        crate::pipeline::test_support::materialized_column::<Int64Array>(&output[0], 4)
+        int128_column(&output[0], 4)
             .value(0),
         990
     );

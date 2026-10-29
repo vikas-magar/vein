@@ -6,7 +6,8 @@ use arrow::datatypes::i256;
 
 fn sum_state(input_type: DataType, result_type: DataType) -> Box<dyn AggregateAccumulator> {
     FunctionRegistry::with_builtins()
-        .create_aggregate_accumulator("sum", &[input_type], &result_type)
+        .create_aggregate_accumulator("sum", &[types::VeinDataType::try_from(&input_type).unwrap()],
+            &types::VeinDataType::try_from(&result_type).unwrap())
         .expect("create registered SUM accumulator")
 }
 
