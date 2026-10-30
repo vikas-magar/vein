@@ -71,13 +71,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME"
-          --verify-tag
-          --generate-notes
-          --title "$GITHUB_REF_NAME"
-          release-assets/*.tar.gz
-          release-assets/*.sha256
+        run: |
+          set -e
+          tag="${GITHUB_REF_NAME}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; uploading assets only"
+            gh release upload "$tag" release-assets/*.tar.gz release-assets/*.sha256 --clobber
+          else
+            echo "Creating new release $tag"
+            gh release create "$tag" \
+              --verify-tag \
+              --generate-notes \
+              --title "$tag" \
+              release-assets/*.tar.gz \
+              release-assets/*.sha256
+          fi
 
   wasm:
     name: Build browser package
